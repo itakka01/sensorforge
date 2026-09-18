@@ -1,0 +1,45 @@
+# Arduino / ESP32 build output
+build/
+
+# PlatformIO / Arduino cache
+.pio/
+.pioenvs/
+.pio/libdeps/
+.pio/build/
+
+# Backup folders
+#backup_*/
+#backup_temp/
+
+# Local configs
+#config_secrets.*
+#config.txt
+#CONFIGS/
+
+# Logs
+*.log
+consolelog.txt
+
+# Video recordings / downloads
+#*.avi
+#*.mp4
+#*.srt
+sensorforge_downloads/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Keys / certificates
+*.pem
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.vscode/
+.idea/
+
+# Temporary files
+temp.txt

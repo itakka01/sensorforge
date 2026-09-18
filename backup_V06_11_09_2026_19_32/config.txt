@@ -1,0 +1,224 @@
+############################################################
+# ESP32-S3 Kamera-System – Konfigurationsdatei
+############################################################
+
+###########################
+# AUTHENTICATION        
+###########################
+
+
+web_auth_enabled=1
+web_username=ja1
+# passwort min 8  max 62 characters!
+web_password=sensor4337
+
+
+############################
+# KAMERA
+############################
+
+# Kamera-Modell:
+#   OV2640
+#   OV3660
+#   OV5640
+camera=OV3660
+
+# Auflösung:
+#   160x120
+#   320x240
+#   640x480
+#   800x600
+#   1024x768
+#   1280x1024
+#   1600x1200
+#   2048x1536
+resolution=1024x768
+
+# Bildrotation:
+# 0
+# 180
+rotation=0
+
+
+
+# Bilder pro Sekunde
+fps=5
+
+# JPEG-Qualität:
+# 0 = beste Qualität
+# 63 = schlechteste Qualität
+quality=12
+
+
+
+
+
+# Belichtungsautomatik:
+# 1 = Auto Exposure aktiv
+# 0 = Auto Exposure deaktiviert
+camera_auto_exposure=1
+
+# Zielhelligkeit der Auto Exposure:
+# Bereich -2..2
+# Negativer = dunkleres Belichtungsziel; kann Bewegungsunschärfe reduzieren
+# Startwert für Bewegung: -1
+camera_ae_level=-2
+
+# OV3660 Sensor-Crop.
+# 1.0 = volles Sichtfeld (bisheriges Verhalten)
+# 1.5 / 2.0 = engerer Sensor-Ausschnitt bei gleicher Ausgabeaufloesung.
+# Position ist ein 3x3 Raster: X 0=links,1=Mitte,2=rechts; Y 0=oben,1=Mitte,2=unten.
+# Bei anderen Sensoren wird der Crop nicht angewendet.
+camera_crop_zoom=1.0
+camera_crop_x=1
+camera_crop_y=1
+
+
+
+############################
+# AUFNAHME / TRIGGER
+############################
+
+# Recording-Container:
+#   avi = MJPEG AVI + separate standard .srt subtitle file
+#   mkv = MJPEG in Matroska + embedded UTF-8 subtitle track
+#
+# Hinweis: MKV wird in einem späteren Implementierungsschritt aktiviert.
+recording_format=avi
+
+# Datum/Uhrzeit als Untertitel erzeugen:
+#   1 = aktiviert
+#   0 = deaktiviert
+timestamp_enabled=1
+
+# Zeitgesteuerte Scharfschaltung fuer automatische Aufnahmen.
+# off = keine Zeitsperre, Aufnahme sofort erlaubt
+# sonst lokale Zeit gemaess timezone im Format YYYY-MM-DDTHH:MM:SS
+# Beispiel: recording_not_before=2026-09-10T05:30:00
+# Im Webinterface wird dieser Wert ueber Auswahlmenues gesetzt.
+recording_not_before=off
+
+# Nachlaufzeit nach letzter Bewegung (ms)
+post_record_ms=3000
+
+# Maximale Dauer eines einzelnen Aufnahme-Segments in Sekunden.
+# 0 = keine zeitliche Segmentbegrenzung
+recording_segment_seconds=30
+
+# Maximale Groesse eines einzelnen Video-Segments in MB.
+# 0 = keine zusaetzliche Groessenbegrenzung
+recording_segment_max_mb=20
+
+
+# Sicherheitsgrenze fuer ein komplettes Aufnahmeereignis ueber alle Segmente.
+# 0 = unbegrenzt / Sicherheitsgrenze deaktiviert
+recording_event_max_seconds=65
+
+# Pause nach Erreichen der Ereignis-Sicherheitsgrenze.
+# Waehrend dieser Zeit startet keine neue Aufnahme, auch bei dauernder Bewegung.
+# 0 = keine Pause (nicht empfohlen)
+recording_event_cooldown_seconds=120
+
+
+############################
+# SLEEP / STROMSPAREN
+############################
+
+# Sleep-Modus bei Inaktivitaet und ausgeschaltetem WLAN:
+#   off         = kein Sleep, ESP32 bleibt wach
+#   light_sleep = schneller Wake, Programmzustand bleibt erhalten
+#   deep_sleep  = maximal stromsparend, Wake fuehrt zu einem Neustart
+sleep_mode=light_sleep
+
+# Wartezeit nach Aufnahmeende / letzter Aktivitaet vor Sleep (ms)
+# Bereich: 0..60000
+# Standard: 2000
+sleep_delay_ms=2000
+
+
+
+
+############################
+# LED
+############################
+
+# 1 = LED während Aufnahme
+# 0 = LED aus
+led_enabled=1
+
+############################
+# SPEICHER / SD-SICHERHEIT
+############################
+
+# Mindestreserve auf der SD-Karte in MB.
+# Standard: 100 MB
+min_free_space_mb=100
+
+# Verhalten beim Erreichen der Mindestreserve:
+# rollover = älteste vollständige Aufnahmen löschen
+# stop     = keine weitere Aufnahme, bis wieder genug Platz frei ist
+disk_full_action=rollover
+
+
+
+
+############################
+# WLAN / NTP
+############################
+
+# WLAN-Verhalten beim Systemstart:
+# off             = WLAN beim Systemstart nicht einschalten
+# on              = WLAN beim Systemstart einschalten
+# on_missing_time = WLAN beim Systemstart nur einschalten,
+#                   wenn keine gueltige Uhrzeit vorhanden ist
+wifi_on_system_start=on
+
+# Automatische WLAN-Abschaltung nach Inaktivität in Sekunden.
+# 0 = WLAN wird nicht automatisch/manuell abgeschaltet
+# Standard: 60 Sekunden
+wifi_timeout_sec=60
+
+
+hostname=printer51
+wifi_ssid=wlan-ny
+wifi_pass=klammer123
+
+#wifi_ssid=cp902
+#wifi_pass=Amen.4#4.Amen
+
+# Wenn hotspot_enabled so wird der hostname als hotspot verwendet
+hotspot_enabled=1
+hotspot_password=sensor4337
+hotspot_hidden=0
+
+
+
+############################
+# ZEITZONE
+############################
+
+# Zeitzone im POSIX-TZ-Format.
+#
+# Österreich / Mitteleuropa:
+#   Winterzeit = CET  (UTC+1)
+#   Sommerzeit = CEST (UTC+2)
+timezone=CET-1CEST,M3.5.0,M10.5.0/3
+
+# Beispiel London / UK:
+#   Winterzeit = GMT  (UTC+0)
+#   Sommerzeit = BST  (UTC+1)
+# timezone=GMT0BST,M3.5.0/1,M10.5.0/2
+
+
+
+############################
+# DEBUG
+############################
+
+# 1 = Debug aktiv
+# 0 = Debug aus
+debug_enabled=0
+
+log_file=/log.txt
+
+

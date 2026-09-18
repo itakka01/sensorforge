@@ -1,0 +1,169 @@
+INSTALLATIONS-CHECKLISTE
+ESP32-S3 Kamera-System
+
+
+Voraussetzungen
+
+VSCode mit PlatformIO installiert
+
+USB-C Kabel
+
+SD-Karte FAT32
+
+config.txt im Root der SD-Karte
+
+Passendes Board: Freenove ESP32-S3 WROOM oder XIAO ESP32S3 Sense
+
+Projekt vorbereiten
+
+Projektordner öffnen
+
+platformio.ini prüfen
+
+Environment freenove oder xiao vorhanden
+
+Kamera-Pins und Board-Pins sind im Code hinterlegt
+
+SD-Karte vorbereiten
+
+FAT32 formatieren
+
+config.txt ins Root kopieren
+
+SD-Karte ins Board einsetzen
+
+Board anschließen
+
+USB-C verbinden
+
+Board wird automatisch erkannt
+
+Keine Treiber notwendig
+
+Environment auswählen
+Freenove:
+env:freenove
+board esp32-s3-devkitc-1
+build_flags -DBOARD_FREENOVE
+
+XIAO:
+env:xiao
+board seeed_xiao_esp32s3
+build_flags -DBOARD_XIAO
+
+Firmware bauen
+pio run -e freenove
+oder
+pio run -e xiao
+
+Firmware hochladen
+pio run -e freenove -t upload
+oder
+pio run -e xiao -t upload
+
+Seriellen Monitor öffnen
+
+Baudrate 115200
+
+Bootmeldungen prüfen
+
+Board-Info wird angezeigt
+
+PSRAM-Test läuft
+
+SD-Benchmark läuft
+
+Funktionstest
+
+PIR auslösen
+
+LED geht an
+
+Aufnahme startet
+
+AVI-Datei wird auf SD geschrieben
+
+Aufnahme stoppt nach post_record_ms
+
+Webinterface aufrufen
+
+WLAN-Daten müssen in config.txt korrekt sein
+
+Board verbindet sich mit WLAN
+
+IP-Adresse im seriellen Monitor ablesen
+
+Browser öffnen
+http://IP-Adresse
+
+Diagnose
+
+System Info
+
+Board Info
+
+PSRAM Test
+
+SD Benchmark
+
+Log Viewer
+
+AVI Browser
+
+Snapshot
+
+Reboot
+
+Fehlerbehebung
+Kamera schwarz:
+
+falsches Environment
+
+falsche Kamera-Pins
+
+PSRAM nicht aktiv
+
+SD-Fehler:
+
+falscher CS-Pin
+
+SD-Karte defekt
+
+Formatierung nötig
+
+Webinterface nicht erreichbar:
+
+WLAN-Daten falsch
+
+wifi_mode=never gesetzt
+
+Aufnahme stoppt sofort:
+
+post_record_ms zu niedrig
+
+Hinweise
+
+SD-Karte muss FAT32 sein
+
+config.txt muss im Root liegen
+
+Board-spezifische Pins werden automatisch gesetzt
+
+Webinterface nur aktiv, wenn WLAN verbunden ist.
+
+
+---> Verdrahtung des Radar Moduls inkl. serieller Steuerleitungen: 
+LD2410S             ESP32-S3
+3V3       →         3.3V
+GND       →         GND
+OT2       →         GPIO21
+OT1 / TX  →         GPIO41   (ESP RX)
+RX        ←         GPIO42   (ESP TX)
+
+
+LD2410S             XIAO
+3V3       →         3.3V
+GND       →         GND
+OT2       →         GPIO4 / D3
+OT1 / TX  →         GPIO44 / D7
+RX        ←         GPIO43 / D6
