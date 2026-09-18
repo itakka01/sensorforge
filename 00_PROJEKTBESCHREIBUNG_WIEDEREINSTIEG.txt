@@ -21,13 +21,19 @@ Wichtig:
 - Bereits geloeste Themen sollen nicht ohne konkreten Grund neu designt werden.
 - Bei groesseren Aenderungen immer auf dem letzten funktionierenden Stand
   aufbauen.
-- Der Benutzer bevorzugt komplette austauschbare Dateien bzw. komplette
-  Dateipakete und keine schwer anzuwendenden Patch-Schnipsel.
+- Der Benutzer bevorzugt komplette austauschbare Dateien und keine schwer
+  anzuwendenden Patch-Schnipsel.
+- WICHTIGE PAKETREGEL: Bei Codeaenderungen duerfen ZIP-/Dateipakete nur die
+  tatsaechlich geaenderten bzw. neu hinzugekommenen Projektdateien enthalten.
+  Unveraenderte Dateien nicht erneut mitsenden und kein komplettes Projektarchiv
+  erzeugen, ausser der Benutzer fordert das ausdruecklich an. Projektdateien
+  immer unter ihrem originalen Dateinamen liefern.
 
 Der aktuelle Quellstand besteht im Kern aus:
 
 - sensorforge.ino
 - config.cpp / config.h
+- image_motion.cpp / image_motion.h
 - webconfig.cpp
 - language.cpp / language.h
 - license.cpp / license.h
@@ -58,6 +64,21 @@ sie verschluesselt bei recording_encryption=1 sowohl den normalen Logger als
 auch das fruehe Transport-Journal. Der zuletzt gefundene WebConfig-Clear-
 Randfall wurde im Quellstand behoben und muss nach diesem Fix noch einmal auf
 echter Hardware bestaetigt werden.
+
+Die bildbasierte Bewegungsbestaetigung ("Image Motion" / image_verify) ist
+inzwischen als zusaetzliche, standardmaessig deaktivierte Entscheidungsschicht
+implementiert. Radar/OT2 bleibt die stromsparende Wakequelle; der bisherige
+direkte Aufnahmeweg bleibt Default. WebConfig besitzt ROI-/Test-/Tuning-
+Funktionen. Dieser neue Bildanalysepfad ist NOCH NICHT abschliessend auf echter
+Hardware und im Feld validiert und bleibt deshalb ein ausdruecklicher TODO-Punkt.
+
+Die XIAO-microSD laeuft im aktuellen Zwischenstand im normalen Recordingbetrieb
+mit 20 MHz SPI statt 4 MHz. Die Umstellung wurde mit synthetischem SD-Test und
+mit dem realen OV3660->AVI->SFENC1-Aufnahmepfad auf echter Hardware verifiziert;
+beide Testdateien wurden fehlerfrei zurueckgelesen. Die Frame-/Storage-Latenzen
+verbesserten sich deutlich. Die Sync-API muss bei NORMAL=MAX=20 MHz nicht mehr
+zwischen zwei SD-Taktraten remounten.
+
 Die konkrete Funktionseinschraenkung fuer UNLICENSED ist bewusst noch nicht
 definiert und bleibt ein eigener naechster Entwicklungsschritt.
 
@@ -132,7 +153,10 @@ microSD auf XIAO Sense:
 - SCK: GPIO7
 - MISO: GPIO8
 - MOSI: GPIO9
-- SPI normal 4 MHz; im Sync-API-Exclusive-Modus temporaer 20 MHz
+- SPI normal 20 MHz
+- SPI MAX/HIGHSPEED ebenfalls 20 MHz
+- Sync-API-Exclusive behaelt damit denselben SD-Takt; ein unnoetiger 20->20-MHz-
+  Remount wird im aktuellen Code uebersprungen
 
 Besonderheit GPIO21:
 
@@ -314,6 +338,30 @@ Der Code akzeptiert:
 
 und WebConfig besitzt dafuer eine Auswahl. Eine Aenderung wird nach Neustart
 wirksam.
+
+Bildbasierte Bewegungsentscheidung / Image Motion:
+
+- motion_recording_decision=direct
+- image_motion_enabled=0
+- image_motion_sensitivity=5
+- image_motion_min_area_pct=6
+- image_motion_confirm_frames=2
+- image_motion_release_frames=2
+- image_motion_background_learning=4
+- image_motion_global_mean_delta=24
+- image_motion_global_change_pct=70
+- image_motion_roi_mask=volle Ueberwachungsmaske als Firmware-Default
+
+Der sichere Rueckwaertskompatibilitaets-Default ist:
+
+- Recording Decision = direct
+- Bildanalyse = deaktiviert
+
+Fehlen diese spaeter hinzugefuegten optionalen Keys in einer alten config.txt,
+bleibt die Config gueltig und die Firmware verwendet die eingebauten Defaults
+im RAM. Der Bootvorgang schreibt fehlende Image-Motion-Keys NICHT ungefragt in
+die bestehende config.txt. Erst bewusstes Speichern auf der Bildbewegungsseite
+persistiert die Einstellungen ueber den bestehenden Config-Pfad.
 
 Aufnahme:
 
@@ -618,6 +666,21 @@ Wichtig:
 
 Der WebPlayer besitzt weiterhin den separaten Anzeigezoom, inklusive Fit und
 Prozentstufen. Dieser darf durch Sensor-Crop-Aenderungen nicht regressieren.
+
+Datenschutz / Privacy:
+
+Eine frei platzierbare schwarze Privacy-Maske innerhalb des JPEG-Bildes wurde
+technisch geprueft. Fuer den aktuellen OV3660-/esp32-camera-Pfad ist keine
+geeignete hardwareseitige Region-Mask/Overlay-Funktion bekannt, die beliebige
+Bildbereiche vor der JPEG-Kompression ohne ESP32-Frameverarbeitung ausblendet.
+Eine Softwaremaske wuerde pro Frame Bildverarbeitung bzw. typischerweise
+Dekodieren/Maskieren/Neu-Encoding erfordern und ist wegen der zusaetzlichen
+CPU-/RAM-/Strom-/Latenzlast bewusst NICHT vorgesehen.
+
+Wenn ein unerwuenschter Bereich geometrisch am Bildrand liegt, bleibt der
+vorhandene OV3660-Sensor-Crop die bevorzugte datenschutzfreundliche Loesung:
+Der Bereich wird bereits durch den Kameraausschnitt ausgeschlossen, ohne eine
+zusaetzliche per-Frame Privacy-Verarbeitung einzufuehren.
 
 
 ======================================================================
@@ -1949,6 +2012,102 @@ ungefragt veraendert.
 
 
 ======================================================================
+BILDBASIERTE MOTION DETECTION / IMAGE VERIFY
+======================================================================
+
+Ziel:
+
+Radar/OT2 bleibt die stromsparende Wakequelle. Die Kamera wird NICHT als
+dauerhaft aktive Wakequelle verwendet. Optional kann nach einem echten
+Sensortrigger eine leichte Bildanalyse entscheiden, ob die Aufnahme bestaetigt
+wird.
+
+Default / Regressionsschutz:
+
+- motion_recording_decision=direct
+- image_motion_enabled=0
+- der bisherige direkte Radar/OT2->Recording-Pfad bleibt damit Standard
+- Image Motion muss bewusst aktiviert und spaeter auch als Recording Decision
+  "image_verify" gewaehlt werden
+- waehrend einer bereits laufenden Aufnahme wird die Analyse nicht permanent
+  weitergerechnet
+
+Analysepfad:
+
+- vorhandenes Kamera-JPEG wird fuer die Analyse mit JPEG-Scale 1/8 dekodiert
+- bei 1024x768 werden damit 128x96 Analysepixel verarbeitet
+- direkte Aggregation in ein 20x15-Blockraster
+- Grauwert/Luma statt ML/AI
+- kein Full-Resolution-RGB-Framebuffer fuer die Analyse
+- ROI als kompakte 300-Bit-/38-Byte-Maske; persistent als Hex-String
+- adaptives Hintergrundmodell und gelernter Noise Floor pro Block
+- Sensitivity 1..10
+- Mindestflaeche fuer zusammenhaengende Bewegung
+- 8-Nachbar Connected-Component-Auswertung
+- Confirm-/Release-Hysterese
+- Erkennung starker globaler Helligkeitswechsel
+- zusaetzliche Schwellenreserve in dunklen Szenen
+
+Recording-Integration:
+
+- image_verify wird erst nach realem Radar/OT2-Trigger ausgewertet
+- bei einem internen Analysefehler wird fuer reale Ereignisse fail-open
+  aufgenommen, statt eine echte Bewegung still zu verlieren
+- ein abgelehnter Trigger wird bis zum Ende des aktuellen physischen
+  Radar-Motion-Holds gelatcht, damit die Analyse nicht in einer Schleife immer
+  wieder gestartet wird
+- bestehende Thermal-, Storage-, Cooldown-, WebConfig-Pause-, Preview- und
+  Recorder-Gates bleiben erhalten
+- simulierte Software-Motion bleibt fuer deterministische Recorder-Tests direkt
+
+WebConfig:
+
+- eigene Seite Sensor -> Bildbewegung / Image motion
+- Livebild mit editierbarer Ueberwachungsmaske
+- KEINE rote Markierung = aktiv ueberwacht
+- ROETLICH markiert = von der Bildanalyse ignoriert
+- Aktivierungsauswahl eindeutig als 0 = deaktiviert / 1 = aktiviert
+- Parameter besitzen kurze Laien-Hilfetexte, Info-Popups und Standardwerte
+- "Standardwerte einsetzen" setzt nur das Formular zurueck; dauerhaft wird erst
+  mit Speichern uebernommen
+- "Referenzbild neu lernen" verwirft den gelernten Hintergrund, z.B. nach
+  Kameraversetzen oder dauerhafter Szenenaenderung
+- "Bildanalyse jetzt testen" startet KEINE automatische Aufnahme
+- Testseite zeigt zuerst ein Klartextresultat und technische Messwerte nur
+  zusaetzlich/aufklappbar
+
+Hintergrund-Invalidierung:
+
+Der gelernte Hintergrund wird automatisch verworfen, wenn fuer die Analyse
+wesentliche Kamera-/Motion-Einstellungen geaendert wurden, darunter Aufloesung,
+Rotation, AE, Crop/Zoom, Sensitivity oder ROI.
+
+Separater PIR:
+
+Noch NICHT implementiert. Im aktuellen XIAO-board_config ist PIR_PIN nur ein
+Kompatibilitaetsalias fuer den vorhandenen LD2410S-OT2-/Presence-Pin GPIO4.
+Ein spaeterer echter PIR benoetigt zuerst den real gewaehlten GPIO und die
+aktive Polaritaet; diese duerfen nicht erfunden werden.
+
+TESTSTATUS / TODO:
+
+Die Implementierung und WebConfig-Oberflaeche sind vorhanden, aber die
+bildbasierte Motion Detection ist noch NICHT abschliessend auf echter Hardware
+und im Feld validiert. Spaeter gezielt pruefen:
+
+- direkte Radar-Aufnahme mit Defaults auf Regression
+- ROI-Maske in realen Szenen
+- Personenbewegung vs. leere Szene
+- Licht ein/aus, wandernde Schatten, Tag/Nacht und dunkle Szenen
+- Sensitivity / Mindestflaeche / Confirm / Release
+- False Positives und False Negatives
+- Analysezeit, Wake->Decision und Wake->erster geschriebener Frame
+- Stromverbrauch und Temperatur
+- erst nach gemessenen Resultaten image_verify als Produktionsentscheidung
+  bewerten/tunen
+
+
+======================================================================
 NORMALER LIGHT-SLEEP WAKE
 ======================================================================
 
@@ -2080,19 +2239,80 @@ Aktuell:
 - Runtime Recovery: bis zu 3 Versuche
 - SPI Preclock: 400 kHz
 
-Die normale SD-SPI-Frequenz ist 4 MHz. Diese niedrige Frequenz bleibt fuer den
-normalen batterieorientierten Betrieb und fuer Recording bewusst erhalten.
+Die normale SD-SPI-Frequenz ist im aktuellen XIAO-Produktionsstand 20 MHz.
 
 Die SD-Taktpolitik liegt in board_config.h und nicht in config.txt:
 
-- XIAO / STORAGE_SPI: NORMAL = 4 MHz
+- XIAO / STORAGE_SPI: NORMAL = 20 MHz
 - XIAO / STORAGE_SPI: MAX/HIGHSPEED = 20 MHz
-- API Exclusive remountet die SD temporaer mit 20 MHz
-- bei Exclusive OFF oder Lease-Timeout wird automatisch auf 4 MHz remountet
-- BOARD_FREENOVE verwendet SD_MMC; die SPI-Frequenzpolitik gilt dort nicht
+- Recording und normaler SD-Betrieb verwenden damit den real getesteten
+  20-MHz-Wert
+- API Exclusive behaelt denselben Takt; der aktuelle Sync-API-Code ueberspringt
+  den frueher noetigen Remount, wenn NORMAL == MAX
+- BOARD_FREENOVE verwendet SD_MMC; die XIAO-SPI-Frequenzpolitik gilt dort nicht
 
-MAX/HIGHSPEED bedeutet hier den sinnvoll getesteten Betriebswert und nicht eine
-theoretische Hardware-Maximalfrequenz.
+20 MHz ist hier ein auf dem aktuellen XIAO-Aufbau real verifizierter
+Produktionswert und nicht die theoretische elektrische Maximalfrequenz des
+ESP32-S3 bzw. einer beliebigen SD-Karte.
+
+Realer A/B-Test am 2026-09-18:
+
+1. Synthetischer sequentieller SD-Test, je drei Durchlaeufe mit vollstaendigem
+   Readback/Verify:
+
+   4 MHz:
+   - sustained/committed etwa 0.436 bis 0.437 MiB/s
+   - P95 Blocklatenz etwa 72.1 ms
+   - Worst etwa 95 bis 190 ms
+   - alle Verify-Durchlaeufe OK
+
+   20 MHz:
+   - sustained/committed etwa 1.708 bis 1.719 MiB/s
+   - P95 Blocklatenz etwa 18.8 ms
+   - Worst etwa 42 bis 137 ms
+   - alle Verify-Durchlaeufe OK
+
+2. Realer SensorForge-Aufnahmepfad mit OV3660, 1024x768, 5 fps, quality 12,
+   AVI und SFENC1:
+
+   4 MHz:
+   - 150 Frames / 30 s / 5.000 fps
+   - Active Path Rate 0.323 MiB/s
+   - P95 102.310 ms
+   - P99 103.837 ms
+   - Worst 123.147 ms
+   - Finalize 1707 ms
+   - 0 Frame-Budget-Ueberschreitungen
+   - 0 fehlgeschlagene Versuche
+   - kompletter logischer AVI-Readback VERIFY OK
+
+   20 MHz:
+   - 150 Frames / 30 s / 5.000 fps
+   - Active Path Rate 0.729 MiB/s
+   - P95 47.192 ms
+   - P99 48.893 ms
+   - Worst 54.420 ms
+   - Finalize 660 ms
+   - 0 Frame-Budget-Ueberschreitungen
+   - 0 fehlgeschlagene Versuche
+   - kompletter logischer AVI-Readback VERIFY OK
+
+Der reale Recording-Test zeigt damit ungefaehr Faktor 2.26 beim aktiven
+Kamera/AVI/Storage-Pfad und mehr als eine Halbierung der typischen/worst
+Frame-Call-Latenzen.
+
+Strommessung waehrend der beiden realen Recordingphasen:
+
+- grob etwa 0.13 bis 0.14 A aktiv
+- Messwert schwankte waehrend der Aufnahme
+- zwischen einzelnen Ablesungen maximal grob 20 bis 30 mA Unterschied
+- kein klarer, reproduzierbarer Mehrverbrauch von 20 MHz erkennbar
+
+Diese Strommessung ist als praktische Groessenordnung zu verstehen, nicht als
+praezise Labor-A/B-Messung. Bei spaeteren Karten-/Boardrevisionen 20 MHz weiter
+auf Stabilitaet, Temperatur und Strom beobachten. Nicht allein aufgrund der
+Taktzahl auf hoeheren Energieverbrauch schliessen; die SD-Transaktionen sind bei
+20 MHz deutlich schneller beendet.
 
 Deep-Sleep-Wakes ueberspringen den langen Cold-Boot-Settle, damit die
 Aufnahmelatenz niedrig bleibt.
@@ -2194,8 +2414,10 @@ API Exclusive:
 - blockiert neue Recording-Starts waehrend der Lease
 - erneuert sich bei API-Aktivitaet
 - faellt bei Client-Abbruch/Untaetigkeit automatisch aus
-- XIAO SD wird bei Exclusive von 4 auf 20 MHz umgeschaltet
-- Release oder Lease-Timeout schaltet wieder auf 4 MHz zurueck
+- XIAO SD laeuft inzwischen bereits im Normalbetrieb mit 20 MHz
+- NORMAL und MAX sind auf XIAO aktuell beide 20 MHz
+- deshalb wird bei Exclusive ON/OFF kein unnoetiger 20->20-MHz-Remount mehr
+  ausgefuehrt; die Exclusive-/Storage-Sperrsemantik bleibt trotzdem erhalten
 
 Der aktuelle schnelle Transferpfad verwendet im Exclusive-Modus:
 
@@ -2311,6 +2533,17 @@ Radar:
 - Live Gate Energy
 - Kalibrierung
 - Trigger-Vorschlaege
+
+Bildbewegung / Image Motion:
+
+- Aktivierung und Recording Decision direct/image_verify
+- Livebild mit editierbarer ROI-/Ueberwachungsmaske
+- rot markierte Bereiche werden ignoriert; nicht rot markierte ueberwacht
+- laienverstaendliche Hilfetexte + Info-Popups + Standardwerte
+- Standardwerte ins Formular einsetzen
+- Referenzbild neu lernen
+- Bildanalyse testen, ohne dabei automatisch eine Aufnahme zu starten
+- technische Diagnosewerte optional einblendbar
 
 Aufnahmen:
 
@@ -2817,8 +3050,10 @@ etwa 216 bis 217 ms im bewaehrten Messstand
 
 SD:
 
-GUT
-Cold-Boot-Settle, Retry und Runtime-Recovery vorhanden
+SEHR GUT / 20-MHZ-RECORDING AUF TESTHARDWARE VERIFIZIERT
+Cold-Boot-Settle, Retry und Runtime-Recovery vorhanden. XIAO Recording-SPI wurde
+nach realem A/B-Test von 4 auf 20 MHz umgestellt. Realer OV3660/AVI/SFENC1-Pfad:
+P95 etwa 102.3 -> 47.2 ms, Worst etwa 123.1 -> 54.4 ms, Verify jeweils OK.
 
 Radar:
 
@@ -2834,6 +3069,14 @@ Bildqualitaet bei Bewegung:
 
 NOCH WEITER ZU BEOBACHTEN
 ae_level=-2 ist der aktuelle Test-/Produktwert
+
+Bildbasierte Motion Detection:
+
+IMPLEMENTIERT, DETAIL-/FELDTEST NOCH OFFEN
+Image-Motion-Engine, ROI, WebConfig-Testseite und optionales image_verify sind
+vorhanden. Defaults bleiben direct + image_motion_enabled=0. Vor produktiver
+Nutzung von image_verify muessen Erkennungsqualitaet, Licht/Schatten, Tag/Nacht,
+Parameter, Wake-Latenz, Strom und Temperatur auf echter Hardware getestet werden.
 
 Config-Secrets / SFSEC1:
 
@@ -2861,9 +3104,10 @@ werden, falls das nach den letzten Aenderungen noch nicht erfolgt ist
 Sync API / PC-Download:
 
 FUNKTIONAL GETESTET
-Der bewaehrte Transferpfad mit Exclusive-Lease, 4/20-MHz-SD-Umschaltung,
-Range/Resume und Double-Buffer-Transfer wurde auf echter XIAO-Hardware
-verifiziert. Host API ist inzwischen 1.10; die neuen Storage-/Sensor-/Snapshot-
+Der bewaehrte Transferpfad mit Exclusive-Lease, 20-MHz-SD, Range/Resume und
+Double-Buffer-Transfer wurde auf echter XIAO-Hardware verifiziert. Da NORMAL
+und MAX inzwischen beide 20 MHz sind, wird kein unnoetiger 20->20-MHz-Remount
+mehr ausgefuehrt. Host API ist inzwischen 1.10; die neuen Storage-/Sensor-/Snapshot-
 Endpunkte sind read-only. Reale Transferleistung des Downloadpfads liegt
 typischerweise bei etwa 0.80 bis 0.81 MB/s.
 
@@ -3058,6 +3302,30 @@ OFFENE PUNKTE NACH PRIORITAET
 
     Nur falls die etwa 150 ms irgendwann wieder relevant werden.
 
+22. BILDBASIERTE MOTION DETECTION / IMAGE_VERIFY DETAILTEST
+
+    Implementierung und UI sind vorhanden, aber noch nicht als fertiger
+    Produktionspfad betrachten. Spaeter mit echter Hardware systematisch testen:
+
+    - zuerst direct + image_motion_enabled=0 als Regressionsreferenz
+    - dann Bildanalyse aktivieren, Recording Decision zunaechst noch direct
+    - ROI und Testseite mit Person / leerer Szene / kleinen Objekten pruefen
+    - Licht ein/aus, Schatten, Sonnenlicht, Tag/Nacht und dunkle Szenen
+    - Sensitivity, Mindestflaeche, Confirm/Release und Hintergrundlernen tunen
+    - False Positives und False Negatives dokumentieren
+    - analyze/decode-Zeit sowie Wake->Decision und Wake->erster SD-Frame messen
+    - Stromverbrauch und Temperatur vergleichen
+    - erst danach motion_recording_decision=image_verify produktiv bewerten
+
+23. XIAO SD 20 MHZ LANGZEIT-/VARIANTENBEOBACHTUNG
+
+    20 MHz ist auf dem aktuellen XIAO/SD-Aufbau mit synthetischem Readback und
+    realem OV3660/AVI/SFENC1-Pfad positiv verifiziert und ist der aktuelle
+    Produktionswert. Bei anderen SD-Karten, Boardchargen oder groesseren
+    Aufloesungen/FPS trotzdem auf Write-Spikes, SD-Recovery, Temperatur und
+    Strom achten. Bei Problemen zuerst messen und reproduzieren; nicht vorschnell
+    die Storage-Architektur oder SD_MMC des Freenove-Pfads umbauen.
+
 
 ======================================================================
 WICHTIGE ENTWICKLUNGSREGELN
@@ -3074,8 +3342,9 @@ WICHTIGE ENTWICKLUNGSREGELN
 - Performance zuerst messen, dann optimieren.
 
 - SD-SPI-Taktwerte als Board-/Storage-Policy in board_config.h halten, nicht als
-  Benutzeroption in config.txt. Normalbetrieb auf XIAO 4 MHz, Sync Exclusive
-  temporaer 20 MHz.
+  Benutzeroption in config.txt. Aktueller XIAO-Produktionsstand: NORMAL=20 MHz,
+  MAX=20 MHz, real mit AVI/SFENC1/Verify getestet. Freenove/SD_MMC davon getrennt
+  behandeln.
 
 - Die bewaehrte Sync-API-Semantik mit Auth, Exclusive-Lease und Range/Resume
   bei spaeteren Client-/App-Implementierungen kompatibel halten. Aktueller Host
@@ -3136,8 +3405,14 @@ WICHTIGE ENTWICKLUNGSREGELN
   Storage-, Recovery- und andere Sicherheitsfunktionen niemals lizenzabhaengig
   deaktivieren.
 
-- Bei groesseren Aenderungen komplette Dateien liefern und den Ausgangsstand
-  eindeutig benennen.
+- Bei Codeaenderungen komplette austauschbare Versionen der BETROFFENEN Dateien
+  liefern und den Ausgangsstand eindeutig benennen. Keine Patch-Schnipsel, wenn
+  eine vollstaendige geaenderte Datei praktikabel ist.
+
+- ZIP-/Dateipakete enthalten standardmaessig NUR Dateien, die gegenueber dem
+  letzten gemeinsamen Stand geaendert oder neu hinzugekommen sind. Unveraenderte
+  Projektdateien NICHT erneut mitsenden. Original-Projektdateinamen beibehalten.
+  Ein komplettes Projektarchiv nur auf ausdruecklichen Wunsch erzeugen.
 
 - Keine Annahme treffen, dass ein frueher erzeugtes ZIP noch der aktuelle Stand
   ist. Bei Unsicherheit die zuletzt hochgeladenen Dateien erneut vergleichen.
@@ -3157,6 +3432,9 @@ WICHTIGE ARBEITSREGELN:
   autoritativ. Nicht aus alten Projektbeschreibungen oder Erinnerungen raten.
 - Aenderungen nur auf tatsaechlich gesehenem aktuellen Code vornehmen.
 - Dateien bei Rueckgabe unter ihrem Original-Projektdateinamen liefern.
+- Bei Codeaenderungen nur die tatsaechlich geaenderten bzw. neuen Dateien
+  mitsenden; ZIPs standardmaessig NICHT mit unveraenderten Projektdateien fuellen.
+  Komplettes Projektarchiv nur auf ausdruecklichen Wunsch.
 - Keine bereits funktionierenden Bereiche ohne konkreten Anlass neu designen.
 - Recording-, Storage-, Recovery- und Thermal-Sicherheit haben Vorrang vor
   Performance-Mikrooptimierungen.
@@ -3175,6 +3453,14 @@ verwendet typischerweise 1024x768, 5 fps, quality 12, Auto Exposure,
 ae_level=-2, Crop 1.0 / X1 / Y1. XCLK ist im aktuellen config.txt nicht
 explizit gesetzt und faellt auf dem XIAO auf 20 MHz Firmware-Default zurueck.
 10/16/20 MHz sind im Code unterstuetzt.
+
+microSD auf XIAO verwendet SPI auf CS21/SCK7/MISO8/MOSI9. Der aktuelle
+Produktionsstand verwendet NORMAL=20 MHz und MAX=20 MHz. Die Umstellung von
+4 MHz wurde auf echter Hardware mit synthetischem SD-Verify und realem
+OV3660/AVI/SFENC1-Recording verifiziert. Realer P95-Frame-Call verbesserte sich
+dabei von etwa 102.3 auf 47.2 ms; Worst von etwa 123.1 auf 54.4 ms, Verify OK.
+API Exclusive behaelt 20 MHz und ueberspringt unnoetige 20->20-MHz-Remounts.
+Freenove/SD_MMC bleibt davon unberuehrt.
 
 Der XIAO-Firmware-Default fuer cfg_camera in config.cpp ist weiterhin bewusst
 OV2640, obwohl die reale Produkt-Hardware und aktive Config OV3660 verwenden.
@@ -3199,6 +3485,29 @@ WebConfig besitzt eine RAM-only Recording-Pause. web_recording_auto_pause=1
 pausiert die Aufnahmeautomatik beim Oeffnen normaler WebConfig-UI-Sessions.
 Normale Lease etwa 35 s; Transportvorbereitung besitzt einen laengeren
 Sicherheits-Hold. API-Verkehr allein zaehlt nicht als Web-UI-Session.
+
+IMAGE MOTION / IMAGE_VERIFY:
+
+Neue Module image_motion.cpp/.h. Defaults bleiben
+motion_recording_decision=direct und image_motion_enabled=0, damit der bisherige
+Radar/OT2-Aufnahmepfad unveraendert bleibt. Optional kann ein realer Sensortrigger
+durch eine leichte Bildanalyse bestaetigt werden. Analyse: JPEG 1/8, bei XGA
+128x96, Aggregation in 20x15 Blocks, adaptive Background/Noise-Floor,
+Connected-Area, Confirm/Release und Global-Light-Rejection; kein ML und kein
+Full-Resolution-RGB-Puffer.
+
+WebConfig besitzt eine selbsterklaerende Bildbewegungsseite mit ROI:
+nicht rot = ueberwacht, roetlich = ignoriert. Test startet keine Aufnahme.
+Referenzbild kann neu gelernt werden; Standardwerte koennen ins Formular
+eingesetzt werden. Fehlende neue Config-Keys werden bei alten config.txt durch
+Firmware-Defaults ersetzt, aber beim Boot nicht automatisch in die Datei
+geschrieben.
+
+WICHTIG: Dieser Bildanalysepfad ist implementiert, aber NOCH NICHT abschliessend
+im Feld getestet. Vor produktiver Nutzung von image_verify Erkennungsqualitaet,
+Licht/Schatten, Tag/Nacht, Parameter, Wake-Latenz, Strom und Temperatur messen.
+Ein separater PIR ist noch nicht implementiert; PIR_PIN aliasiert aktuell nur
+LD2410S OT2 GPIO4.
 
 RECORDING ENCRYPTION / SFENC1:
 
@@ -3324,8 +3633,10 @@ Lizenz-Hardware-ID.
 Der Client legt Dateien unter
 <dest>/<device_id>/<DD_MM_YYYY>/...
 ab und verwendet einen sicheren Fallback fuer alte Firmware ohne device_id.
-Der bewaehrte Transferpfad nutzt Exclusive-Lease 60 s, SD 4->20 MHz auf XIAO,
-Range/Resume, 2 x 32 KB Double Buffer, 32-KB-Writes und SD-Reader auf Core 0.
+Der bewaehrte Transferpfad nutzt Exclusive-Lease 60 s, XIAO-SD dauerhaft
+20 MHz, Range/Resume, 2 x 32 KB Double Buffer, 32-KB-Writes und SD-Reader auf
+Core 0. Da NORMAL==MAX, wird bei Exclusive kein reiner 20->20-MHz-Remount mehr
+benoetigt.
 Realer Transfer liegt typischerweise bei etwa 0.80-0.81 MB/s.
 
 LIZENZSYSTEM - AKTUELLER STAND:
@@ -3446,6 +3757,10 @@ WEITERE PRIORITAETEN:
 - vollstaendige historische UI-Uebersetzung spaeter systematisch abschliessen
 - Camera Settings Tool mit Live Exposure/Gain entwickeln
 - Motion Blur mit ae_level=-2 weiter bewerten
+- Image Motion / image_verify spaeter systematisch auf echter Hardware und im Feld
+  testen; bis dahin direct + image_motion_enabled=0 als sicherer Default
+- XIAO-SD 20 MHz bei weiteren Karten/Boardchargen und hoeheren Aufloesungen/FPS
+  weiter auf Latenzspikes, Recovery, Temperatur und Strom beobachten
 - XCLK 16 vs 20 MHz nur bei neuer Energieoptimierungs-Prioritaet A/B testen
 - Watchdog/Radar/SD-Randfaelle weiter beobachten
 - XIAO camera default OV2640 vs reale OV3660-Hardware bewusst spaeter entscheiden
@@ -3453,6 +3768,9 @@ WEITERE PRIORITAETEN:
 Bitte bei weiterer Entwicklung den funktionierenden aktuellen Stand erhalten,
 keine bereits geloesten Themen neu designen, keine APIs/Funktionen erfinden und
 Codeaenderungen nur auf dem zuletzt wirklich gesehenen Quellstand vornehmen.
+Bei Rueckgabe von Code standardmaessig nur geaenderte/neue Dateien unter ihren
+Originalnamen mitsenden; keine unveraenderten Dateien in Update-ZIPs aufnehmen.
+
 
 
 

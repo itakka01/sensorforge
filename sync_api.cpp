@@ -215,12 +215,12 @@ static void serviceExclusiveLease()
         return;
 
 #if defined(STORAGE_SPI)
-    // Recording cannot normally be active while exclusive is held. If another
-    // storage operation currently owns the card, defer expiry until it is safe
-    // to remount instead of racing an open SD handle.
+    // Keep the established lease/storage coordination even when NORMAL and MAX
+    // use the same clock. If the clocks differ, expiry also needs a safe remount.
     if (g_storageLocked || recording || recorderIsOpen())
         return;
 
+#if SD_SPI_NORMAL_FREQUENCY_HZ != SD_SPI_MAX_FREQUENCY_HZ
     SpiClockSwitchResult result = switchSpiStorageClock(
         SD_SPI_NORMAL_FREQUENCY_HZ,
         SD_SPI_NORMAL_FREQUENCY_HZ,
@@ -237,6 +237,7 @@ static void serviceExclusiveLease()
         );
         return;
     }
+#endif
 #endif
 
     syncExclusiveActiveState = false;
@@ -1553,6 +1554,7 @@ static void handleExclusivePost()
             return;
         }
 
+#if SD_SPI_NORMAL_FREQUENCY_HZ != SD_SPI_MAX_FREQUENCY_HZ
         SpiClockSwitchResult result = switchSpiStorageClock(
             SD_SPI_NORMAL_FREQUENCY_HZ,
             SD_SPI_NORMAL_FREQUENCY_HZ,
@@ -1568,6 +1570,7 @@ static void handleExclusivePost()
             );
             return;
         }
+#endif
 #endif
 
         syncExclusiveActiveState = false;
@@ -1599,6 +1602,7 @@ static void handleExclusivePost()
     }
 
 #if defined(STORAGE_SPI)
+#if SD_SPI_NORMAL_FREQUENCY_HZ != SD_SPI_MAX_FREQUENCY_HZ
     SpiClockSwitchResult result = switchSpiStorageClock(
         SD_SPI_MAX_FREQUENCY_HZ,
         SD_SPI_NORMAL_FREQUENCY_HZ,
@@ -1616,6 +1620,7 @@ static void handleExclusivePost()
         );
         return;
     }
+#endif
 #endif
 
     syncExclusiveActiveState = true;
@@ -2141,5 +2146,4 @@ void syncApiRegisterRoutes(WebServer &webServer)
     webServer.on("/api/v1/test_sd_spi", HTTP_GET, handleTestSdSpi);
     webServer.on("/api/v1/test_wifi", HTTP_GET, handleTestWifi);
 }
-
 

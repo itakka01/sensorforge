@@ -130,21 +130,22 @@
 
 // SD-SPI clock policy for this board.
 //
-// NORMAL is the conservative clock used for the normal battery-powered
-// SensorForge workload, including recording. It intentionally preserves the
-// long-established 4 MHz operating point.
+// NORMAL is the production clock used for the normal SensorForge workload,
+// including recording. A real XIAO ESP32S3 Sense camera/AVI/SFENC1 benchmark
+// verified 20 MHz with full read-back integrity and substantially lower frame
+// write latency than the former 4 MHz setting. Power measurements showed no
+// material increase for the tested workload.
 //
-// MAX is the board-approved production high-speed clock. The Sync API uses it
-// automatically only while an authenticated API-exclusive lease is active;
-// when the lease is released or expires, the card is remounted at NORMAL.
-// This value is firmware/board knowledge and therefore does NOT belong in
-// config.txt. It is the highest clock approved for normal product operation,
-// not necessarily the electrical/theoretical limit of the ESP32-S3 or card.
+// MAX is the board-approved upper production clock used by Sync API diagnostics
+// and any future high-speed policy. NORMAL and MAX are intentionally equal on
+// this board now, so entering/leaving API-exclusive mode does not require an SD
+// remount solely to change the clock. These values are firmware/board knowledge
+// and therefore do NOT belong in config.txt.
 //
 // On the current XIAO ESP32S3 Sense hardware, measurements showed that 20 MHz
 // reaches the practical throughput plateau; higher diagnostic test clocks did
 // not provide useful additional transfer speed.
-#define SD_SPI_NORMAL_FREQUENCY_HZ 4000000UL
+#define SD_SPI_NORMAL_FREQUENCY_HZ 20000000UL
 #define SD_SPI_MAX_FREQUENCY_HZ    20000000UL
 
 #if SD_SPI_NORMAL_FREQUENCY_HZ == 0 || SD_SPI_MAX_FREQUENCY_HZ == 0
