@@ -1,6 +1,7 @@
 #include "config.h"
 #include "board_config.h"
 #include "config_secrets.h"
+#include "image_motion.h"
 
 #include <FS.h>
 #include <LittleFS.h>
@@ -46,6 +47,17 @@ int cfg_recording_segment_max_mb  = 20;
 int cfg_recording_event_max_seconds = 60;
 int cfg_recording_event_cooldown_seconds = 120;
 String cfg_recording_not_before = "off";
+
+String cfg_motion_recording_decision = "direct";
+int cfg_image_motion_enabled = 0;
+int cfg_image_motion_sensitivity = 5;
+int cfg_image_motion_min_area_pct = 6;
+int cfg_image_motion_confirm_frames = 2;
+int cfg_image_motion_release_frames = 2;
+int cfg_image_motion_background_learning = 4;
+int cfg_image_motion_global_mean_delta = 24;
+int cfg_image_motion_global_change_pct = 70;
+String cfg_image_motion_roi_mask = imageMotionDefaultRoiMask();
 
 String cfg_sleep_mode = "off";
 int cfg_sleep_delay_ms = 2000;
@@ -139,6 +151,16 @@ struct ConfigValues {
     int recordingEventMaxSeconds;
     int recordingEventCooldownSeconds;
     String recordingNotBefore;
+    String motionRecordingDecision;
+    int imageMotionEnabled;
+    int imageMotionSensitivity;
+    int imageMotionMinAreaPct;
+    int imageMotionConfirmFrames;
+    int imageMotionReleaseFrames;
+    int imageMotionBackgroundLearning;
+    int imageMotionGlobalMeanDelta;
+    int imageMotionGlobalChangePct;
+    String imageMotionRoiMask;
     int postMs;
     int ledEnabled;
 
@@ -199,6 +221,16 @@ struct ConfigSeen {
     bool recordingEventMaxSeconds;
     bool recordingEventCooldownSeconds;
     bool recordingNotBefore;
+    bool motionRecordingDecision;
+    bool imageMotionEnabled;
+    bool imageMotionSensitivity;
+    bool imageMotionMinAreaPct;
+    bool imageMotionConfirmFrames;
+    bool imageMotionReleaseFrames;
+    bool imageMotionBackgroundLearning;
+    bool imageMotionGlobalMeanDelta;
+    bool imageMotionGlobalChangePct;
+    bool imageMotionRoiMask;
     bool postMs;
     bool ledEnabled;
 
@@ -311,6 +343,36 @@ static ConfigValues makeDefaultValues()
 
     values.recordingNotBefore =
         "off";
+
+    values.motionRecordingDecision =
+        "direct";
+
+    values.imageMotionEnabled =
+        0;
+
+    values.imageMotionSensitivity =
+        5;
+
+    values.imageMotionMinAreaPct =
+        6;
+
+    values.imageMotionConfirmFrames =
+        2;
+
+    values.imageMotionReleaseFrames =
+        2;
+
+    values.imageMotionBackgroundLearning =
+        4;
+
+    values.imageMotionGlobalMeanDelta =
+        24;
+
+    values.imageMotionGlobalChangePct =
+        70;
+
+    values.imageMotionRoiMask =
+        imageMotionDefaultRoiMask();
 
     values.postMs =
         3000;
@@ -876,6 +938,59 @@ static bool validateValues(
         error =
             "recording_encryption must be 0 or 1";
 
+        return false;
+    }
+
+    if (
+        values.motionRecordingDecision != "direct" &&
+        values.motionRecordingDecision != "image_verify"
+    ) {
+        error = "motion_recording_decision must be direct or image_verify";
+        return false;
+    }
+
+    if (values.imageMotionEnabled != 0 && values.imageMotionEnabled != 1) {
+        error = "image_motion_enabled must be 0 or 1";
+        return false;
+    }
+
+    if (values.imageMotionSensitivity < 1 || values.imageMotionSensitivity > 10) {
+        error = "image_motion_sensitivity out of range (1..10)";
+        return false;
+    }
+
+    if (values.imageMotionMinAreaPct < 1 || values.imageMotionMinAreaPct > 100) {
+        error = "image_motion_min_area_pct out of range (1..100)";
+        return false;
+    }
+
+    if (values.imageMotionConfirmFrames < 1 || values.imageMotionConfirmFrames > 6) {
+        error = "image_motion_confirm_frames out of range (1..6)";
+        return false;
+    }
+
+    if (values.imageMotionReleaseFrames < 1 || values.imageMotionReleaseFrames > 10) {
+        error = "image_motion_release_frames out of range (1..10)";
+        return false;
+    }
+
+    if (values.imageMotionBackgroundLearning < 1 || values.imageMotionBackgroundLearning > 64) {
+        error = "image_motion_background_learning out of range (1..64)";
+        return false;
+    }
+
+    if (values.imageMotionGlobalMeanDelta < 5 || values.imageMotionGlobalMeanDelta > 100) {
+        error = "image_motion_global_mean_delta out of range (5..100)";
+        return false;
+    }
+
+    if (values.imageMotionGlobalChangePct < 20 || values.imageMotionGlobalChangePct > 100) {
+        error = "image_motion_global_change_pct out of range (20..100)";
+        return false;
+    }
+
+    if (!imageMotionValidateRoiMask(values.imageMotionRoiMask)) {
+        error = "image_motion_roi_mask must be a valid 20x15 compact hex mask";
         return false;
     }
 
@@ -1714,6 +1829,46 @@ static bool parseConfigText(
 
                 values.recordingNotBefore =
                     value;
+
+            } else if (key == "motion_recording_decision") {
+                if (!markOnce(seen.motionRecordingDecision, key, error)) return false;
+                values.motionRecordingDecision = value;
+
+            } else if (key == "image_motion_enabled") {
+                if (!markOnce(seen.imageMotionEnabled, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid image_motion_enabled"; return false; }
+                values.imageMotionEnabled = (int)numericValue;
+
+            } else if (key == "image_motion_sensitivity") {
+                if (!markOnce(seen.imageMotionSensitivity, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid image_motion_sensitivity"; return false; }
+                values.imageMotionSensitivity = (int)numericValue;
+
+            } else if (key == "image_motion_min_area_pct") {
+                if (!markOnce(seen.imageMotionMinAreaPct, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid image_motion_min_area_pct"; return false; }
+                values.imageMotionMinAreaPct = (int)numericValue;
+
+            } else if (key == "image_motion_confirm_frames") {
+                if (!markOnce(seen.imageMotionConfirmFrames, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid image_motion_confirm_frames"; return false; }
+                values.imageMotionConfirmFrames = (int)numericValue;
+
+            } else if (key == "image_motion_release_frames") {
+                if (!markOnce(seen.imageMotionReleaseFrames, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid image_motion_release_frames"; return false; }
+                values.imageMotionReleaseFrames = (int)numericValue;
+
+            } else if (key == "image_motion_background_learning") {
+                if (!markOnce(seen.imageMotionBackgroundLearning, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid image_motion_background_learning"; return false; }
+                values.imageMotionBackgroundLearning = (int)numericValue;
+
+            } else if (key == "image_motion_global_mean_delta") {
+                if (!markOnce(seen.imageMotionGlobalMeanDelta, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid image_motion_global_mean_delta"; return false; }
+                values.imageMotionGlobalMeanDelta = (int)numericValue;
+
+            } else if (key == "image_motion_global_change_pct") {
+                if (!markOnce(seen.imageMotionGlobalChangePct, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid image_motion_global_change_pct"; return false; }
+                values.imageMotionGlobalChangePct = (int)numericValue;
+
+            } else if (key == "image_motion_roi_mask") {
+                if (!markOnce(seen.imageMotionRoiMask, key, error)) return false;
+                values.imageMotionRoiMask = value;
 
             } else if (
                 key == "recording_event_max_seconds"
@@ -2565,6 +2720,17 @@ static void applyValues(
 
     cfg_recording_not_before =
         values.recordingNotBefore;
+
+    cfg_motion_recording_decision = values.motionRecordingDecision;
+    cfg_image_motion_enabled = values.imageMotionEnabled;
+    cfg_image_motion_sensitivity = values.imageMotionSensitivity;
+    cfg_image_motion_min_area_pct = values.imageMotionMinAreaPct;
+    cfg_image_motion_confirm_frames = values.imageMotionConfirmFrames;
+    cfg_image_motion_release_frames = values.imageMotionReleaseFrames;
+    cfg_image_motion_background_learning = values.imageMotionBackgroundLearning;
+    cfg_image_motion_global_mean_delta = values.imageMotionGlobalMeanDelta;
+    cfg_image_motion_global_change_pct = values.imageMotionGlobalChangePct;
+    cfg_image_motion_roi_mask = values.imageMotionRoiMask;
 
     cfg_post_ms =
         values.postMs;
@@ -4516,6 +4682,99 @@ ConfigSaveResult configSaveWebLanguage(
             normalized;
     }
 
+
+    return result;
+}
+
+
+ConfigSaveResult configSaveImageMotion(
+    const String &recordingDecision,
+    int enabled,
+    int sensitivity,
+    int minAreaPct,
+    int confirmFrames,
+    int releaseFrames,
+    int backgroundLearning,
+    int globalMeanDelta,
+    int globalChangePct,
+    const String &roiMask,
+    bool writeToSd,
+    String &error
+)
+{
+    error = "";
+
+    String decision = recordingDecision;
+    decision.trim();
+    decision.toLowerCase();
+
+    if (decision != "direct" && decision != "image_verify") {
+        error = "motion_recording_decision must be direct or image_verify";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if ((enabled != 0 && enabled != 1) ||
+        sensitivity < 1 || sensitivity > 10 ||
+        minAreaPct < 1 || minAreaPct > 100 ||
+        confirmFrames < 1 || confirmFrames > 6 ||
+        releaseFrames < 1 || releaseFrames > 10 ||
+        backgroundLearning < 1 || backgroundLearning > 64 ||
+        globalMeanDelta < 5 || globalMeanDelta > 100 ||
+        globalChangePct < 20 || globalChangePct > 100 ||
+        !imageMotionValidateRoiMask(roiMask)) {
+        error = "invalid image motion settings";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String text;
+    bool sourceRead = false;
+
+    if (activeConfigSource == CONFIG_SOURCE_SD && sdAvailableState && STORAGE.exists("/config.txt"))
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    if (!sourceRead && internalAvailableState && LittleFS.exists("/config.txt"))
+        sourceRead = readTextFile(LittleFS, "/config.txt", text);
+    if (!sourceRead && sdAvailableState && STORAGE.exists("/config.txt"))
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+
+    if (!sourceRead) {
+        error = "no persistent config.txt available for image motion save";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (!replaceOrAppendConfigKey(text, "motion_recording_decision", decision) ||
+        !replaceOrAppendConfigKey(text, "image_motion_enabled", String(enabled)) ||
+        !replaceOrAppendConfigKey(text, "image_motion_sensitivity", String(sensitivity)) ||
+        !replaceOrAppendConfigKey(text, "image_motion_min_area_pct", String(minAreaPct)) ||
+        !replaceOrAppendConfigKey(text, "image_motion_confirm_frames", String(confirmFrames)) ||
+        !replaceOrAppendConfigKey(text, "image_motion_release_frames", String(releaseFrames)) ||
+        !replaceOrAppendConfigKey(text, "image_motion_background_learning", String(backgroundLearning)) ||
+        !replaceOrAppendConfigKey(text, "image_motion_global_mean_delta", String(globalMeanDelta)) ||
+        !replaceOrAppendConfigKey(text, "image_motion_global_change_pct", String(globalChangePct)) ||
+        !replaceOrAppendConfigKey(text, "image_motion_roi_mask", roiMask)) {
+        error = "could not patch image motion keys";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String validationError;
+    if (!configValidateText(text, validationError)) {
+        error = "patched config invalid: " + validationError;
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    ConfigSaveResult result = configSaveText(text, writeToSd, error);
+
+    if (result == CONFIG_SAVE_BOTH || result == CONFIG_SAVE_INTERNAL_ONLY) {
+        cfg_motion_recording_decision = decision;
+        cfg_image_motion_enabled = enabled;
+        cfg_image_motion_sensitivity = sensitivity;
+        cfg_image_motion_min_area_pct = minAreaPct;
+        cfg_image_motion_confirm_frames = confirmFrames;
+        cfg_image_motion_release_frames = releaseFrames;
+        cfg_image_motion_background_learning = backgroundLearning;
+        cfg_image_motion_global_mean_delta = globalMeanDelta;
+        cfg_image_motion_global_change_pct = globalChangePct;
+        cfg_image_motion_roi_mask = roiMask;
+    }
 
     return result;
 }

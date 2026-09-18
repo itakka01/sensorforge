@@ -213,6 +213,69 @@ static const UiTextEntry UI_TEXTS[] = {
     {"Sprache", "Language"}, // UI_LANGUAGE
     {"Sprache konnte nicht gespeichert werden", "Language could not be saved"}, // UI_LANGUAGE_SAVE_FAILED
     {"Gespeicherte WLAN-, Hotspot- und Web-Passwörter sind in dieser Datei gerätegebunden als SFSEC1 verschlüsselt und nicht im Klartext enthalten.", "Stored Wi-Fi, hotspot and web passwords are device-bound and encrypted as SFSEC1 in this file; they are not stored in plaintext."}, // UI_CONFIG_SECRETS_DOWNLOAD_NOTE
+    {"Bildbewegung", "Image motion"}, // UI_NAV_IMAGE_MOTION
+    {"Bewegungserkennung im Bild", "Motion detection in the image"}, // UI_IMAGE_MOTION_TITLE
+    {"Radar/OT2 bleibt die stromsparende Wake-Quelle. Auf Wunsch prüft die Kamera zusätzlich, ob sich im ausgewählten Bildbereich wirklich etwas bewegt, bevor eine neue Aufnahme startet.", "Radar/OT2 remains the low-power wake source. If desired, the camera additionally checks whether something is really moving in the selected image area before a new recording starts."}, // UI_IMAGE_MOTION_SUBTITLE
+    {"Bildanalyse verwenden", "Use image analysis"}, // UI_IMAGE_MOTION_ACTIVE
+    {"Wann soll eine Aufnahme starten?", "When should a recording start?"}, // UI_IMAGE_MOTION_DECISION
+    {"Direkt – Sensor startet Aufnahme sofort", "Direct – sensor starts recording immediately"}, // UI_IMAGE_MOTION_DIRECT
+    {"Mit Bildbestätigung – Sensor + erkannte Bildbewegung", "With image verification – sensor + detected image motion"}, // UI_IMAGE_MOTION_VERIFY
+    {"Empfindlichkeit (1–10)", "Sensitivity (1–10)"}, // UI_IMAGE_MOTION_SENSITIVITY
+    {"Mindestgröße der Bewegung (%)", "Minimum motion size (%)"}, // UI_IMAGE_MOTION_MIN_AREA
+    {"Bestätigung über mehrere Bilder", "Confirmation across multiple images"}, // UI_IMAGE_MOTION_CONFIRM
+    {"Bewegungsende nach ruhigen Bildern", "End motion after quiet images"}, // UI_IMAGE_MOTION_RELEASE
+    {"Anpassung an langsame Änderungen", "Adaptation to slow changes"}, // UI_IMAGE_MOTION_BG_LEARNING
+    {"Helligkeitssprung-Schwelle", "Brightness-jump threshold"}, // UI_IMAGE_MOTION_GLOBAL_MEAN
+    {"Großflächige Änderung ab (%)", "Large-area change from (%)"}, // UI_IMAGE_MOTION_GLOBAL_CHANGE
+    {"Überwachungsbereich im Bild", "Monitored area in the image"}, // UI_IMAGE_MOTION_ROI
+    {"Bereiche ohne rote Markierung werden auf Bewegung geprüft. Rötlich markierte Bereiche werden ignoriert. Tippe oder ziehe über das Bild, um Bereiche ein- oder auszuschließen.", "Areas without a red overlay are checked for motion. Red-shaded areas are ignored. Tap or drag across the image to include or exclude areas."}, // UI_IMAGE_MOTION_ROI_HELP
+    {"Gesamtes Bild überwachen", "Monitor entire image"}, // UI_IMAGE_MOTION_SELECT_ALL
+    {"Gesamtes Bild ignorieren", "Ignore entire image"}, // UI_IMAGE_MOTION_CLEAR
+    {"Invertieren", "Invert"}, // UI_IMAGE_MOTION_INVERT
+    {"Einstellungen speichern", "Save settings"}, // UI_IMAGE_MOTION_SAVE
+    {"Bildanalyse jetzt testen", "Test image analysis now"}, // UI_IMAGE_MOTION_TEST
+    {"Referenzbild neu lernen", "Relearn reference image"}, // UI_IMAGE_MOTION_RESET_BG
+    {"Testergebnis", "Test result"}, // UI_IMAGE_MOTION_DIAGNOSTICS
+    {"Solange diese Seite geöffnet ist, sind neue automatische Aufnahmen gesperrt. Der Test prüft nur die Bildanalyse und startet niemals selbst eine Aufnahme.", "While this page is open, new automatic recordings are blocked. The test only checks image analysis and never starts a recording itself."}, // UI_IMAGE_MOTION_TEST_NOTE
+    {"Bildbewegungs-Einstellungen gespeichert.", "Image-motion settings saved."}, // UI_IMAGE_MOTION_SAVED
+    {"Bildbewegungs-Einstellungen konnten nicht gespeichert werden", "Image-motion settings could not be saved"}, // UI_IMAGE_MOTION_SAVE_FAILED
+    {"Bildanalyse-Test fehlgeschlagen", "Image-analysis test failed"}, // UI_IMAGE_MOTION_TEST_FAILED
+    {"0 – Deaktiviert", "0 – Disabled"}, // UI_IMAGE_MOTION_ENABLED_OFF
+    {"1 – Aktiviert", "1 – Enabled"}, // UI_IMAGE_MOTION_ENABLED_ON
+    {"Aktiviert die Bildanalyse. Standard: deaktiviert (0). Im Modus 'Direkt' ändert die Bildanalyse das Aufnahmeverhalten nicht; bei 'Mit Bildbestätigung' muss zusätzlich Bewegung im Bild erkannt werden.", "Enables image analysis. Default: disabled (0). In Direct mode, image analysis does not change recording behavior; with image verification, motion must also be detected in the image."}, // UI_IMAGE_MOTION_ACTIVE_HELP
+    {"Standard: Direkt. 'Direkt' entspricht dem bisherigen Verhalten: Radar/OT2 kann sofort eine Aufnahme starten. 'Mit Bildbestätigung' startet erst, wenn der Sensor auslöst und die Bildanalyse Bewegung bestätigt. Dafür muss die Bildanalyse aktiviert sein.", "Default: Direct. Direct matches the previous behavior: radar/OT2 can start recording immediately. With image verification, recording starts only when the sensor triggers and image analysis confirms motion. Image analysis must be enabled for this."}, // UI_IMAGE_MOTION_DECISION_HELP
+    {"1 = unempfindlich, 10 = maximale Empfindlichkeit. Ein höherer Wert reagiert auf kleinere Bildänderungen, kann aber eher Fehlalarme auslösen. Standard: 5.", "1 = low sensitivity, 10 = maximum sensitivity. A higher value reacts to smaller image changes but may cause more false triggers. Default: 5."}, // UI_IMAGE_MOTION_SENSITIVITY_HELP
+    {"Wie groß die zusammenhängende veränderte Fläche mindestens sein muss. Kleine Werte erkennen kleinere Objekte, größere Werte ignorieren kleine lokale Änderungen. Bezogen wird der Wert nur auf die nicht rot markierten Überwachungsbereiche. Standard: 6 %.", "Minimum size of one connected changed area. Small values detect smaller objects; larger values ignore small local changes. The percentage refers only to monitored areas that are not shaded red. Default: 6%."}, // UI_IMAGE_MOTION_MIN_AREA_HELP
+    {"Wie viele aufeinanderfolgende Analysebilder Bewegung zeigen müssen, bevor sie bestätigt wird. Weniger Bilder reagieren schneller, mehr Bilder sind robuster gegen einzelne Störungen. Standard: 2.", "How many consecutive analysis images must show motion before it is confirmed. Fewer images react faster; more images are more robust against single disturbances. Default: 2."}, // UI_IMAGE_MOTION_CONFIRM_HELP
+    {"Wie viele ruhige Analysebilder nötig sind, bis eine bereits bestätigte Bildbewegung wieder als beendet gilt. Höhere Werte halten den Bewegungszustand länger. Standard: 2.", "How many quiet analysis images are required before already confirmed image motion is considered finished. Higher values keep the motion state active longer. Default: 2."}, // UI_IMAGE_MOTION_RELEASE_HELP
+    {"Bestimmt, wie schnell sich das gelernte Referenzbild an langsame, dauerhafte Änderungen anpasst, z. B. wandernde Schatten. Höher = schnellere Anpassung, niedriger = stabilere Referenz. Bereich 1–64, Standard: 4.", "Controls how quickly the learned reference image adapts to slow, lasting changes such as moving shadows. Higher = faster adaptation, lower = more stable reference. Range 1–64, default: 4."}, // UI_IMAGE_MOTION_BG_LEARNING_HELP
+    {"Schützt vor Fehlalarmen durch plötzliches Ein-/Ausschalten von Licht oder starke Helligkeitswechsel. Wird die mittlere Helligkeit stärker verändert als dieser Wert, behandelt die Analyse das Ereignis als Beleuchtungsänderung statt als Bewegung. Niedriger = stärkere Unterdrückung. Standard: 24.", "Protects against false triggers caused by lights switching on/off or strong brightness changes. If the average brightness changes by more than this value, the event is treated as a lighting change rather than motion. Lower = stronger suppression. Default: 24."}, // UI_IMAGE_MOTION_GLOBAL_MEAN_HELP
+    {"Wenn gleichzeitig mindestens dieser Anteil des überwachten Bildbereichs stark verändert ist, wird die Änderung als großflächig bewertet – typisch für Lichtwechsel statt eines einzelnen Objekts. Niedriger = großflächige Änderungen werden früher ausgefiltert. Standard: 70 %.", "If at least this share of the monitored image area changes strongly at the same time, the change is treated as large-area – typical of lighting changes rather than one object. Lower = large-area changes are filtered earlier. Default: 70%."}, // UI_IMAGE_MOTION_GLOBAL_CHANGE_HELP
+    {"Ohne rote Markierung = aktiv überwacht", "No red overlay = actively monitored"}, // UI_IMAGE_MOTION_ROI_ACTIVE_LEGEND
+    {"Rötlich markiert = von der Bildanalyse ignoriert", "Red shaded = ignored by image analysis"}, // UI_IMAGE_MOTION_ROI_EXCLUDED_LEGEND
+    {"Standardwerte einsetzen", "Insert default values"}, // UI_IMAGE_MOTION_RESET_DEFAULTS
+    {"Setzt alle Felder und den Überwachungsbereich im Formular auf die SensorForge-Standardwerte zurück. Es wird noch nichts gespeichert; erst 'Einstellungen speichern' übernimmt die Werte dauerhaft.", "Resets all fields and the monitored area in the form to the SensorForge defaults. Nothing is saved yet; only Save settings stores the values permanently."}, // UI_IMAGE_MOTION_RESET_DEFAULTS_HELP
+    {"Standardwerte wurden in das Formular eingesetzt. Zum Übernehmen bitte Einstellungen speichern.", "Default values were inserted into the form. Save settings to apply them."}, // UI_IMAGE_MOTION_RESET_DEFAULTS_DONE
+    {"Analysiert die aktuelle Kameraszene mit den gespeicherten Einstellungen. Es wird keine Aufnahme gestartet. Das Ergebnis wird darunter in verständlicher Form angezeigt. Nach Änderungen an den Feldern zuerst speichern.", "Analyzes the current camera scene using the saved settings. No recording is started. The result is shown below in an understandable form. Save first after changing any fields."}, // UI_IMAGE_MOTION_TEST_HELP
+    {"Vergisst das bisher gelernte Referenzbild der ruhigen Szene. Sinnvoll, wenn die Kamera versetzt wurde oder sich die Umgebung dauerhaft verändert hat. Beim nächsten Test oder Sensortrigger wird die aktuelle Szene wieder als Referenz gelernt. Die Einstellungen selbst bleiben unverändert.", "Forgets the previously learned reference image of the quiet scene. Useful if the camera was moved or the environment changed permanently. On the next test or sensor trigger, the current scene is learned again as the reference. Settings themselves remain unchanged."}, // UI_IMAGE_MOTION_RESET_BG_HELP
+    {"Das bisherige Referenzbild wurde verworfen. Beim nächsten Test oder Sensortrigger wird die aktuelle Szene neu gelernt.", "The previous reference image was discarded. The current scene will be learned again on the next test or sensor trigger."}, // UI_IMAGE_MOTION_RESET_BG_DONE
+    {"Hier erscheint nach einem Test zuerst eine einfache Aussage wie 'Bewegung erkannt' oder 'keine ausreichende Bewegung'. Technische Messwerte sind darunter optional aufklappbar.", "After a test, this first shows a simple result such as 'motion detected' or 'no sufficient motion'. Technical measurements can optionally be expanded below."}, // UI_IMAGE_MOTION_DIAGNOSTICS_HELP
+    {"Technische Diagnose anzeigen", "Show technical diagnostics"}, // UI_IMAGE_MOTION_TECH_DETAILS
+    {"Info", "Info"}, // UI_IMAGE_MOTION_INFO
+    {"Schließen", "Close"}, // UI_IMAGE_MOTION_INFO_CLOSE
+    {"Ergebnis", "Result"}, // UI_IMAGE_MOTION_RESULT_TITLE
+    {"Bewegung erkannt – die Bildanalyse würde diesen Trigger bestätigen.", "Motion detected – image analysis would confirm this trigger."}, // UI_IMAGE_MOTION_RESULT_MOTION
+    {"Keine ausreichende Bewegung erkannt.", "No sufficient motion detected."}, // UI_IMAGE_MOTION_RESULT_NONE
+    {"Bildanalyse ist deaktiviert. Aktiviere sie und speichere die Einstellung, bevor du testest.", "Image analysis is disabled. Enable it and save the setting before testing."}, // UI_IMAGE_MOTION_RESULT_DISABLED
+    {"Das Referenzbild wurde neu gelernt. Führe den Test erneut aus, während sich etwas im überwachten Bereich bewegt.", "The reference image was relearned. Run the test again while something moves in the monitored area."}, // UI_IMAGE_MOTION_RESULT_LEARNING
+    {"Eine Bildänderung wurde erkannt, aber noch nicht oft genug hintereinander bestätigt.", "An image change was detected but has not yet been confirmed in enough consecutive images."}, // UI_IMAGE_MOTION_RESULT_CONFIRMING
+    {"Großflächiger Helligkeitswechsel erkannt. Er wurde bewusst nicht als Bewegung gewertet.", "Large-area brightness change detected. It was deliberately not treated as motion."}, // UI_IMAGE_MOTION_RESULT_GLOBAL_LIGHT
+    {"Es ist kein Bildbereich zur Überwachung aktiviert. Markiere mindestens einen Bereich als aktiv und speichere die Einstellung.", "No image area is enabled for monitoring. Enable at least one area and save the setting."}, // UI_IMAGE_MOTION_RESULT_NO_ROI
+    {"Die Bildanalyse konnte nicht korrekt ausgewertet werden. Siehe technische Diagnose.", "Image analysis could not be evaluated correctly. See technical diagnostics."}, // UI_IMAGE_MOTION_RESULT_ERROR
+    {"Analysezeit", "Analysis time"}, // UI_IMAGE_MOTION_RESULT_TIME
+    {"Größte zusammenhängende Änderung", "Largest connected change"}, // UI_IMAGE_MOTION_RESULT_AREA
+    {"Eingestellte Mindestgröße", "Configured minimum size"}, // UI_IMAGE_MOTION_RESULT_LIMIT
+    {"Der Test verwendet die zuletzt gespeicherten Werte.", "The test uses the most recently saved values."}, // UI_IMAGE_MOTION_TEST_USES_SAVED
 };
 
 static_assert(

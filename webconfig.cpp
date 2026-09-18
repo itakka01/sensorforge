@@ -29,6 +29,7 @@
 #include "license.h"
 #include "recording_crypto.h"
 #include "recording_storage.h"
+#include "image_motion.h"
 
 
 // High-level recording state from the main firmware loop.
@@ -38,6 +39,10 @@ extern bool recording;
 // Gracefully finalizes an active recording when the operator explicitly
 // pauses the recording automation from WebConfig.
 extern void stopRecording();
+
+// Camera-backed image-motion test supplied by the main firmware. Test mode
+// analyzes frames only and never starts a recording.
+extern bool imageMotionWebTest(String &json, String &error);
 
 // OV3660 crop runtime control implemented by the main camera module.
 extern bool cameraApplyCropRuntime(
@@ -930,6 +935,8 @@ static String htmlHeader()
         htmlText(UI_NAV_SENSOR) +
         "</summary><div class='dropdown'><a href='/radar_config'>" +
         htmlText(UI_NAV_RADAR_CONFIG) +
+        "</a><a href='/image_motion'>" +
+        htmlText(UI_NAV_IMAGE_MOTION) +
         "</a><a href='/#simulation'>" +
         htmlText(UI_NAV_SIMULATE_MOTION) +
         "</a></div></details>";
@@ -1129,7 +1136,7 @@ static String htmlFooter()
         "if(p==='/')group='home';"
         "else if(p==='/config'||p==='/save')group='config';"
         "else if(p.indexOf('/files')===0||p==='/file'||p==='/play')group='recordings';"
-        "else if(p==='/preview'||p==='/snapshot')group='camera';"
+        "else if(p==='/preview'||p==='/snapshot')group='camera';else if(p==='/image_motion')group='sensor';"
         "else if(p.indexOf('/radar_')===0)group='sensor';"
         "else group='system';"
         "var active=document.querySelector('[data-nav=\"'+group+'\"]');"
@@ -7869,6 +7876,330 @@ static void handleCameraCropSave()
         storageText +
         "\"}"
     );
+}
+
+
+static String imageMotionJsonEscape(const String &input)
+{
+    String out;
+    out.reserve(input.length() + 8);
+
+    for (size_t i = 0; i < input.length(); ++i) {
+        char c = input[i];
+        if (c == '\\' || c == '"') {
+            out += '\\';
+            out += c;
+        } else if (c == '\n') {
+            out += "\\n";
+        } else if (c == '\r') {
+            out += "\\r";
+        } else if ((uint8_t)c >= 0x20U) {
+            out += c;
+        }
+    }
+
+    return out;
+}
+
+
+static int imageMotionArgInt(const char *name, int fallback)
+{
+    if (!server.hasArg(name))
+        return fallback;
+
+    String value = server.arg(name);
+    value.trim();
+
+    if (!value.length())
+        return fallback;
+
+    return value.toInt();
+}
+
+
+static void handleImageMotionSave()
+{
+    String decision = server.arg("decision");
+    String roiMask = server.arg("roi");
+    roiMask.trim();
+    roiMask.toLowerCase();
+
+    String error;
+    ConfigSaveResult result = configSaveImageMotion(
+        decision,
+        imageMotionArgInt("enabled", cfg_image_motion_enabled),
+        imageMotionArgInt("sensitivity", cfg_image_motion_sensitivity),
+        imageMotionArgInt("min_area", cfg_image_motion_min_area_pct),
+        imageMotionArgInt("confirm", cfg_image_motion_confirm_frames),
+        imageMotionArgInt("release", cfg_image_motion_release_frames),
+        imageMotionArgInt("learning", cfg_image_motion_background_learning),
+        imageMotionArgInt("global_mean", cfg_image_motion_global_mean_delta),
+        imageMotionArgInt("global_change", cfg_image_motion_global_change_pct),
+        roiMask,
+        true,
+        error
+    );
+
+    if (
+        result != CONFIG_SAVE_BOTH &&
+        result != CONFIG_SAVE_INTERNAL_ONLY
+    ) {
+        server.send(
+            400,
+            "application/json; charset=utf-8",
+            String("{\"ok\":false,\"error\":\"") +
+            imageMotionJsonEscape(error.length() ? error : String("save failed")) +
+            "\"}"
+        );
+        return;
+    }
+
+    // Settings/ROI changes invalidate the old scene model deliberately.
+    imageMotionResetBackground();
+
+    server.send(
+        200,
+        "application/json; charset=utf-8",
+        String("{\"ok\":true,\"storage\":\"") +
+        (result == CONFIG_SAVE_BOTH ? "sd+internal" : "internal") +
+        "\"}"
+    );
+}
+
+
+static void handleImageMotionTest()
+{
+    if (recorderIsOpen()) {
+        server.send(
+            409,
+            "application/json; charset=utf-8",
+            "{\"ok\":false,\"error\":\"recording active\"}"
+        );
+        return;
+    }
+
+    // Keep the same camera-ownership gate used by Live Preview. This guarantees
+    // that a diagnostic request can never race an automatic recording start.
+    noteCameraPreviewActivity();
+
+    String json;
+    String error;
+
+    if (!imageMotionWebTest(json, error)) {
+        server.send(
+            500,
+            "application/json; charset=utf-8",
+            String("{\"ok\":false,\"error\":\"") +
+            imageMotionJsonEscape(error) +
+            "\"}"
+        );
+        return;
+    }
+
+    server.send(
+        200,
+        "application/json; charset=utf-8",
+        String("{\"ok\":true,\"diagnostics\":") + json + "}"
+    );
+}
+
+
+static void handleImageMotionResetBackground()
+{
+    imageMotionResetBackground();
+    server.send(
+        200,
+        "application/json; charset=utf-8",
+        "{\"ok\":true}"
+    );
+}
+
+
+static String imageMotionInfoButton(
+    UiTextId titleId,
+    UiTextId helpId
+)
+{
+    return
+        "<button type='button' class='im-info' data-title='" +
+        htmlText(titleId) +
+        "' data-info='" +
+        htmlText(helpId) +
+        "' aria-label='" +
+        htmlText(UI_IMAGE_MOTION_INFO) +
+        "'>i</button>";
+}
+
+
+static void handleImageMotionPage()
+{
+    String html = htmlHeader();
+
+    html += "<h2>" + htmlText(UI_IMAGE_MOTION_TITLE) + "</h2>";
+    html += "<p class='muted'>" + htmlText(UI_IMAGE_MOTION_SUBTITLE) + "</p>";
+
+    if (recorderIsOpen()) {
+        stopCameraPreview();
+        html += "<div class='flash-notice error'><strong>" +
+            htmlText(UI_STATUS_RECORDING_RUNNING) +
+            "</strong></div>";
+    } else if (!esp_camera_sensor_get()) {
+        stopCameraPreview();
+        html += "<p>" + htmlText(UI_NOT_DETECTED) + "</p>";
+    } else {
+        noteCameraPreviewActivity();
+
+        html += R"HTML(
+<style>
+.im-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:14px 0}.im-card{border:1px solid #d7dde5;border-radius:10px;padding:14px;background:#fff}.im-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.im-field{border:1px solid #e5e7eb;border-radius:8px;padding:10px;background:#fafbfc}.im-label-row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}.im-label-row label{font-weight:600}.im-help{font-size:.86rem;line-height:1.35;color:#5f6b7a;margin-top:6px}.im-info{flex:0 0 auto;width:26px;height:26px;padding:0;border-radius:50%;font-weight:700;line-height:24px}.im-stage{position:relative;display:inline-block;max-width:100%;touch-action:none}.im-stage img{display:block;max-width:100%;height:auto}.im-stage canvas{position:absolute;inset:0;width:100%;height:100%;cursor:crosshair;touch-action:none}.im-actions{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0}.im-legend{display:flex;flex-wrap:wrap;gap:10px;margin:8px 0 12px}.im-legend span{display:inline-flex;align-items:center;gap:6px;font-size:.86rem}.im-swatch{width:18px;height:14px;border:1px solid #9ca3af;border-radius:3px;background:#fff}.im-swatch.excluded{background:rgba(220,38,38,.35)}.im-result{border:1px solid #d7dde5;border-radius:8px;padding:12px;background:#f8fafc;margin:10px 0}.im-result-title{font-weight:700;margin-bottom:6px}.im-result-text{font-size:1rem;margin-bottom:8px}.im-result-meta{display:flex;flex-wrap:wrap;gap:8px 16px;font-size:.88rem;color:#4b5563}.im-diag{white-space:pre-wrap;overflow-wrap:anywhere;background:#111827;color:#e5e7eb;padding:12px;border-radius:8px;min-height:100px;font-family:monospace;font-size:.82rem}.im-details{margin-top:10px}.im-details summary{cursor:pointer;font-weight:600}.im-modal-backdrop{position:fixed;inset:0;background:rgba(15,23,42,.5);display:none;align-items:center;justify-content:center;padding:18px;z-index:10000}.im-modal-backdrop.open{display:flex}.im-modal{width:min(560px,100%);max-height:80vh;overflow:auto;background:#fff;border-radius:12px;padding:18px;box-shadow:0 18px 50px rgba(0,0,0,.25)}.im-modal h3{margin-top:0}.im-modal-actions{display:flex;justify-content:flex-end;margin-top:14px}@media(max-width:760px){.im-grid,.im-fields{grid-template-columns:1fr}}
+</style>
+)HTML";
+
+        html += "<div class='flash-notice' style='border-left-color:var(--accent);background:#eef4ff'><strong>" +
+            htmlText(UI_IMAGE_MOTION_TEST_NOTE) + "</strong></div>";
+
+        html += "<div class='im-grid'><div class='im-card'><h3>" +
+            htmlText(UI_IMAGE_MOTION_ROI) + "</h3><p class='muted'>" +
+            htmlText(UI_IMAGE_MOTION_ROI_HELP) + "</p>";
+
+        html += "<div class='im-legend'><span><i class='im-swatch'></i>" +
+            htmlText(UI_IMAGE_MOTION_ROI_ACTIVE_LEGEND) +
+            "</span><span><i class='im-swatch excluded'></i>" +
+            htmlText(UI_IMAGE_MOTION_ROI_EXCLUDED_LEGEND) +
+            "</span></div>";
+
+        html += "<div class='im-stage' id='imStage'><img id='imImage' alt='" +
+            htmlText(UI_IMAGE_MOTION_TITLE) +
+            "'><canvas id='imCanvas'></canvas></div>";
+        html += "<div class='im-actions'><button type='button' id='imAll'>" + htmlText(UI_IMAGE_MOTION_SELECT_ALL) +
+            "</button><button type='button' id='imClear'>" + htmlText(UI_IMAGE_MOTION_CLEAR) +
+            "</button><button type='button' id='imInvert'>" + htmlText(UI_IMAGE_MOTION_INVERT) + "</button></div></div>";
+
+        html += "<div class='im-card'><h3>" + htmlText(UI_IMAGE_MOTION_TITLE) + "</h3><div class='im-fields'>";
+
+        html += "<div class='im-field'><div class='im-label-row'><label for='imEnabled'>" + htmlText(UI_IMAGE_MOTION_ACTIVE) + "</label>" +
+            imageMotionInfoButton(UI_IMAGE_MOTION_ACTIVE, UI_IMAGE_MOTION_ACTIVE_HELP) +
+            "</div><select id='imEnabled'><option value='0'" + String(cfg_image_motion_enabled ? "" : " selected") + ">" + htmlText(UI_IMAGE_MOTION_ENABLED_OFF) +
+            "</option><option value='1'" + String(cfg_image_motion_enabled ? " selected" : "") + ">" + htmlText(UI_IMAGE_MOTION_ENABLED_ON) +
+            "</option></select><div class='im-help'>" + htmlText(UI_IMAGE_MOTION_ACTIVE_HELP) + "</div></div>";
+
+        html += "<div class='im-field'><div class='im-label-row'><label for='imDecision'>" + htmlText(UI_IMAGE_MOTION_DECISION) + "</label>" +
+            imageMotionInfoButton(UI_IMAGE_MOTION_DECISION, UI_IMAGE_MOTION_DECISION_HELP) +
+            "</div><select id='imDecision'><option value='direct'" + String(cfg_motion_recording_decision == "direct" ? " selected" : "") + ">" + htmlText(UI_IMAGE_MOTION_DIRECT) +
+            "</option><option value='image_verify'" + String(cfg_motion_recording_decision == "image_verify" ? " selected" : "") + ">" + htmlText(UI_IMAGE_MOTION_VERIFY) +
+            "</option></select><div class='im-help'>" + htmlText(UI_IMAGE_MOTION_DECISION_HELP) + "</div></div>";
+
+        html += "<div class='im-field'><div class='im-label-row'><label for='imSensitivity'>" + htmlText(UI_IMAGE_MOTION_SENSITIVITY) + "</label>" +
+            imageMotionInfoButton(UI_IMAGE_MOTION_SENSITIVITY, UI_IMAGE_MOTION_SENSITIVITY_HELP) +
+            "</div><input id='imSensitivity' type='number' min='1' max='10' value='" + String(cfg_image_motion_sensitivity) +
+            "'><div class='im-help'>" + htmlText(UI_IMAGE_MOTION_SENSITIVITY_HELP) + "</div></div>";
+
+        html += "<div class='im-field'><div class='im-label-row'><label for='imMinArea'>" + htmlText(UI_IMAGE_MOTION_MIN_AREA) + "</label>" +
+            imageMotionInfoButton(UI_IMAGE_MOTION_MIN_AREA, UI_IMAGE_MOTION_MIN_AREA_HELP) +
+            "</div><input id='imMinArea' type='number' min='1' max='100' value='" + String(cfg_image_motion_min_area_pct) +
+            "'><div class='im-help'>" + htmlText(UI_IMAGE_MOTION_MIN_AREA_HELP) + "</div></div>";
+
+        html += "<div class='im-field'><div class='im-label-row'><label for='imConfirm'>" + htmlText(UI_IMAGE_MOTION_CONFIRM) + "</label>" +
+            imageMotionInfoButton(UI_IMAGE_MOTION_CONFIRM, UI_IMAGE_MOTION_CONFIRM_HELP) +
+            "</div><input id='imConfirm' type='number' min='1' max='6' value='" + String(cfg_image_motion_confirm_frames) +
+            "'><div class='im-help'>" + htmlText(UI_IMAGE_MOTION_CONFIRM_HELP) + "</div></div>";
+
+        html += "<div class='im-field'><div class='im-label-row'><label for='imRelease'>" + htmlText(UI_IMAGE_MOTION_RELEASE) + "</label>" +
+            imageMotionInfoButton(UI_IMAGE_MOTION_RELEASE, UI_IMAGE_MOTION_RELEASE_HELP) +
+            "</div><input id='imRelease' type='number' min='1' max='10' value='" + String(cfg_image_motion_release_frames) +
+            "'><div class='im-help'>" + htmlText(UI_IMAGE_MOTION_RELEASE_HELP) + "</div></div>";
+
+        html += "<div class='im-field'><div class='im-label-row'><label for='imLearning'>" + htmlText(UI_IMAGE_MOTION_BG_LEARNING) + "</label>" +
+            imageMotionInfoButton(UI_IMAGE_MOTION_BG_LEARNING, UI_IMAGE_MOTION_BG_LEARNING_HELP) +
+            "</div><input id='imLearning' type='number' min='1' max='64' value='" + String(cfg_image_motion_background_learning) +
+            "'><div class='im-help'>" + htmlText(UI_IMAGE_MOTION_BG_LEARNING_HELP) + "</div></div>";
+
+        html += "<div class='im-field'><div class='im-label-row'><label for='imGlobalMean'>" + htmlText(UI_IMAGE_MOTION_GLOBAL_MEAN) + "</label>" +
+            imageMotionInfoButton(UI_IMAGE_MOTION_GLOBAL_MEAN, UI_IMAGE_MOTION_GLOBAL_MEAN_HELP) +
+            "</div><input id='imGlobalMean' type='number' min='5' max='100' value='" + String(cfg_image_motion_global_mean_delta) +
+            "'><div class='im-help'>" + htmlText(UI_IMAGE_MOTION_GLOBAL_MEAN_HELP) + "</div></div>";
+
+        html += "<div class='im-field'><div class='im-label-row'><label for='imGlobalChange'>" + htmlText(UI_IMAGE_MOTION_GLOBAL_CHANGE) + "</label>" +
+            imageMotionInfoButton(UI_IMAGE_MOTION_GLOBAL_CHANGE, UI_IMAGE_MOTION_GLOBAL_CHANGE_HELP) +
+            "</div><input id='imGlobalChange' type='number' min='20' max='100' value='" + String(cfg_image_motion_global_change_pct) +
+            "'><div class='im-help'>" + htmlText(UI_IMAGE_MOTION_GLOBAL_CHANGE_HELP) + "</div></div>";
+
+        html += "</div><div class='im-actions'><button type='button' id='imSave'>" + htmlText(UI_IMAGE_MOTION_SAVE) +
+            "</button><button type='button' id='imDefaults'>" + htmlText(UI_IMAGE_MOTION_RESET_DEFAULTS) +
+            "</button>" + imageMotionInfoButton(UI_IMAGE_MOTION_RESET_DEFAULTS, UI_IMAGE_MOTION_RESET_DEFAULTS_HELP) + "</div>";
+
+        html += "<div class='im-card' style='margin-top:14px'><h3>" + htmlText(UI_IMAGE_MOTION_TEST) + "</h3><p class='muted'>" +
+            htmlText(UI_IMAGE_MOTION_TEST_HELP) + " <strong>" + htmlText(UI_IMAGE_MOTION_TEST_USES_SAVED) + "</strong></p>";
+        html += "<div class='im-actions'><button type='button' id='imTest'>" + htmlText(UI_IMAGE_MOTION_TEST) +
+            "</button>" + imageMotionInfoButton(UI_IMAGE_MOTION_TEST, UI_IMAGE_MOTION_TEST_HELP) +
+            "<button type='button' id='imResetBg'>" + htmlText(UI_IMAGE_MOTION_RESET_BG) +
+            "</button>" + imageMotionInfoButton(UI_IMAGE_MOTION_RESET_BG, UI_IMAGE_MOTION_RESET_BG_HELP) + "</div>";
+        html += "<div id='imStatus' class='muted'></div><h3>" + htmlText(UI_IMAGE_MOTION_DIAGNOSTICS) + "</h3><p class='muted'>" +
+            htmlText(UI_IMAGE_MOTION_DIAGNOSTICS_HELP) + "</p><div class='im-result'><div class='im-result-title'>" +
+            htmlText(UI_IMAGE_MOTION_RESULT_TITLE) + "</div><div id='imResultText' class='im-result-text'>-</div><div id='imResultMeta' class='im-result-meta'></div></div>";
+        html += "<details class='im-details'><summary>" + htmlText(UI_IMAGE_MOTION_TECH_DETAILS) +
+            "</summary><div id='imDiag' class='im-diag'>-</div></details></div></div></div>";
+
+        html += "<div id='imInfoBackdrop' class='im-modal-backdrop' role='dialog' aria-modal='true'><div class='im-modal'><h3 id='imInfoTitle'></h3><div id='imInfoBody'></div><div class='im-modal-actions'><button type='button' id='imInfoClose'>" +
+            htmlText(UI_IMAGE_MOTION_INFO_CLOSE) + "</button></div></div></div>";
+
+        String defaultRoi = imageMotionDefaultRoiMask();
+        html += "<script>const IM_W=20,IM_H=15;let imMask='" + cfg_image_motion_roi_mask + "';let imSavedMinArea=" + String(cfg_image_motion_min_area_pct) + ";";
+        html += "const IM_DEFAULTS={enabled:'0',decision:'direct',sensitivity:'5',minArea:'6',confirm:'2',release:'2',learning:'4',globalMean:'24',globalChange:'70',roi:'" + defaultRoi + "'};";
+        html += "const IM_TEXT={saved:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_SAVED))) +
+            "\",saveFailed:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_SAVE_FAILED))) +
+            "\",testFailed:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_TEST_FAILED))) +
+            "\",defaultsDone:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESET_DEFAULTS_DONE))) +
+            "\",resetBgDone:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESET_BG_DONE))) +
+            "\",resultMotion:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESULT_MOTION))) +
+            "\",resultNone:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESULT_NONE))) +
+            "\",resultDisabled:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESULT_DISABLED))) +
+            "\",resultLearning:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESULT_LEARNING))) +
+            "\",resultConfirming:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESULT_CONFIRMING))) +
+            "\",resultGlobalLight:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESULT_GLOBAL_LIGHT))) +
+            "\",resultNoRoi:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESULT_NO_ROI))) +
+            "\",resultError:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESULT_ERROR))) +
+            "\",resultTime:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESULT_TIME))) +
+            "\",resultArea:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESULT_AREA))) +
+            "\",resultLimit:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESULT_LIMIT))) + "\"};";
+
+        html += R"JS(
+const imImage=document.getElementById('imImage'),imCanvas=document.getElementById('imCanvas'),imCtx=imCanvas.getContext('2d');
+const imStatus=document.getElementById('imStatus'),imDiag=document.getElementById('imDiag'),imResultText=document.getElementById('imResultText'),imResultMeta=document.getElementById('imResultMeta');
+const imInfoBackdrop=document.getElementById('imInfoBackdrop'),imInfoTitle=document.getElementById('imInfoTitle'),imInfoBody=document.getElementById('imInfoBody');
+function maskBytes(){const a=[];for(let i=0;i<imMask.length;i+=2)a.push(parseInt(imMask.slice(i,i+2),16)||0);return a}
+function setMaskBytes(a){imMask=a.map(v=>v.toString(16).padStart(2,'0')).join('')}
+function bit(i){const a=maskBytes();return !!(a[i>>3]&(1<<(i&7)))}
+function setBit(i,on){const a=maskBytes();if(on)a[i>>3]|=1<<(i&7);else a[i>>3]&=~(1<<(i&7));setMaskBytes(a)}
+function drawGrid(){const r=imCanvas.getBoundingClientRect();imCanvas.width=Math.max(1,Math.round(r.width*devicePixelRatio));imCanvas.height=Math.max(1,Math.round(r.height*devicePixelRatio));imCtx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);const w=r.width,h=r.height,cw=w/IM_W,ch=h/IM_H;for(let y=0;y<IM_H;y++)for(let x=0;x<IM_W;x++){const i=y*IM_W+x;if(!bit(i)){imCtx.fillStyle='rgba(220,38,38,.35)';imCtx.fillRect(x*cw,y*ch,cw,ch)}imCtx.strokeStyle='rgba(255,255,255,.55)';imCtx.strokeRect(x*cw,y*ch,cw,ch)}}
+let painting=false,paintValue=true;
+function cellAt(e){const r=imCanvas.getBoundingClientRect(),x=Math.floor((e.clientX-r.left)/r.width*IM_W),y=Math.floor((e.clientY-r.top)/r.height*IM_H);if(x<0||x>=IM_W||y<0||y>=IM_H)return-1;return y*IM_W+x}
+imCanvas.addEventListener('pointerdown',e=>{const i=cellAt(e);if(i<0)return;painting=true;paintValue=!bit(i);setBit(i,paintValue);imCanvas.setPointerCapture(e.pointerId);drawGrid()});
+imCanvas.addEventListener('pointermove',e=>{if(!painting)return;const i=cellAt(e);if(i>=0){setBit(i,paintValue);drawGrid()}});imCanvas.addEventListener('pointerup',()=>painting=false);imCanvas.addEventListener('pointercancel',()=>painting=false);
+document.getElementById('imAll').onclick=()=>{const a=new Array(38).fill(255);a[37]&=15;setMaskBytes(a);drawGrid()};
+document.getElementById('imClear').onclick=()=>{setMaskBytes(new Array(38).fill(0));drawGrid()};
+document.getElementById('imInvert').onclick=()=>{const a=maskBytes().map(v=>(~v)&255);a[37]&=15;setMaskBytes(a);drawGrid()};
+function refresh(){imImage.src='/snapshot?t='+Date.now()}imImage.onload=()=>{drawGrid();setTimeout(refresh,700)};imImage.onerror=()=>setTimeout(refresh,1200);window.addEventListener('resize',drawGrid);refresh();
+function params(){const p=new URLSearchParams();p.set('enabled',document.getElementById('imEnabled').value);p.set('decision',document.getElementById('imDecision').value);p.set('sensitivity',document.getElementById('imSensitivity').value);p.set('min_area',document.getElementById('imMinArea').value);p.set('confirm',document.getElementById('imConfirm').value);p.set('release',document.getElementById('imRelease').value);p.set('learning',document.getElementById('imLearning').value);p.set('global_mean',document.getElementById('imGlobalMean').value);p.set('global_change',document.getElementById('imGlobalChange').value);p.set('roi',imMask);return p}
+function openInfo(title,body){imInfoTitle.textContent=title;imInfoBody.textContent=body;imInfoBackdrop.classList.add('open')}
+function closeInfo(){imInfoBackdrop.classList.remove('open')}
+document.querySelectorAll('.im-info').forEach(b=>b.addEventListener('click',()=>openInfo(b.dataset.title||'',b.dataset.info||'')));
+document.getElementById('imInfoClose').onclick=closeInfo;imInfoBackdrop.addEventListener('click',e=>{if(e.target===imInfoBackdrop)closeInfo()});document.addEventListener('keydown',e=>{if(e.key==='Escape')closeInfo()});
+function setDefaults(){document.getElementById('imEnabled').value=IM_DEFAULTS.enabled;document.getElementById('imDecision').value=IM_DEFAULTS.decision;document.getElementById('imSensitivity').value=IM_DEFAULTS.sensitivity;document.getElementById('imMinArea').value=IM_DEFAULTS.minArea;document.getElementById('imConfirm').value=IM_DEFAULTS.confirm;document.getElementById('imRelease').value=IM_DEFAULTS.release;document.getElementById('imLearning').value=IM_DEFAULTS.learning;document.getElementById('imGlobalMean').value=IM_DEFAULTS.globalMean;document.getElementById('imGlobalChange').value=IM_DEFAULTS.globalChange;imMask=IM_DEFAULTS.roi;drawGrid();imStatus.textContent=IM_TEXT.defaultsDone}
+document.getElementById('imDefaults').onclick=setDefaults;
+document.getElementById('imSave').onclick=async()=>{imStatus.textContent='...';try{const r=await fetch('/image_motion_save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:params()});const j=await r.json();if(!r.ok||!j.ok)throw new Error(IM_TEXT.saveFailed+(j.error?': '+j.error:''));imSavedMinArea=parseInt(document.getElementById('imMinArea').value,10)||imSavedMinArea;imStatus.textContent=IM_TEXT.saved}catch(e){imStatus.textContent=e.message}};
+function friendlyResult(d){if(d.motion_active||d.image_motion_state==='confirmed')return IM_TEXT.resultMotion;switch(d.reject_reason){case'disabled':return IM_TEXT.resultDisabled;case'background_init':return IM_TEXT.resultLearning;case'confirming':return IM_TEXT.resultConfirming;case'global_light':return IM_TEXT.resultGlobalLight;case'no_roi':return IM_TEXT.resultNoRoi;case'decode':case'invalid_frame':return IM_TEXT.resultError;default:return IM_TEXT.resultNone}}
+function renderDiagnostics(d){imResultText.textContent=friendlyResult(d);const area=Number(d.changed_area_pct||0).toFixed(1)+' %';const limit=imSavedMinArea+' %';imResultMeta.innerHTML='';[[IM_TEXT.resultTime,(d.analyze_frame_ms!==undefined?d.analyze_frame_ms:'-')+' ms'],[IM_TEXT.resultArea,area],[IM_TEXT.resultLimit,limit]].forEach(([k,v])=>{const span=document.createElement('span');span.textContent=k+': '+v;imResultMeta.appendChild(span)});imDiag.textContent=JSON.stringify(d,null,2)}
+document.getElementById('imTest').onclick=async()=>{imStatus.textContent='...';try{const r=await fetch('/image_motion_test',{method:'POST'}),j=await r.json();if(!r.ok||!j.ok)throw new Error(IM_TEXT.testFailed+(j.error?': '+j.error:''));renderDiagnostics(j.diagnostics||{});imStatus.textContent='OK'}catch(e){imResultText.textContent=IM_TEXT.resultError;imStatus.textContent=e.message}};
+document.getElementById('imResetBg').onclick=async()=>{imStatus.textContent='...';try{const r=await fetch('/image_motion_reset',{method:'POST'}),j=await r.json();if(!r.ok||!j.ok)throw new Error(IM_TEXT.testFailed);imResultText.textContent=IM_TEXT.resetBgDone;imResultMeta.textContent='';imDiag.textContent='-';imStatus.textContent=IM_TEXT.resetBgDone}catch(e){imStatus.textContent=e.message}};
+function release(){fetch('/preview_stop',{method:'POST',keepalive:true}).catch(()=>{})}window.addEventListener('pagehide',release);document.addEventListener('visibilitychange',()=>{if(document.hidden)release();});
+)JS";
+        html += "</script>";
+    }
+
+    html += htmlFooter();
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "text/html; charset=utf-8", html);
 }
 
 
@@ -15156,6 +15487,11 @@ void webConfigStart()
     server.on("/radar_calibration_action", HTTP_POST, handleRadarCalibrationAction);
     server.on("/radar_config_save", HTTP_POST, handleRadarConfigSave);
     server.on("/radar_config_defaults", HTTP_POST, handleRadarConfigDefaults);
+
+    server.on("/image_motion", HTTP_GET, handleImageMotionPage);
+    server.on("/image_motion_save", HTTP_POST, handleImageMotionSave);
+    server.on("/image_motion_test", HTTP_POST, handleImageMotionTest);
+    server.on("/image_motion_reset", HTTP_POST, handleImageMotionResetBackground);
 
     server.on("/sdstatus", HTTP_GET, handleSDStatus);
     server.on("/sd_maintenance", HTTP_GET, handleSDMaintenance);

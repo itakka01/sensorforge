@@ -125,6 +125,27 @@ recording_encryption=0
 # Im Webinterface wird dieser Wert ueber Auswahlmenues gesetzt.
 recording_not_before=off
 
+# Motion recording decision:
+# direct       = existing behavior; sensor trigger starts recording immediately
+# image_verify = radar/OT2 trigger wakes the camera, image analysis must confirm
+#                local motion before a new recording starts
+motion_recording_decision=direct
+
+# Image-motion engine. Keep disabled for a regression-free first flash, then
+# enable/configure from WebConfig -> Sensor -> Image motion.
+image_motion_enabled=0
+image_motion_sensitivity=5
+image_motion_min_area_pct=6
+image_motion_confirm_frames=2
+image_motion_release_frames=2
+image_motion_background_learning=4
+image_motion_global_mean_delta=24
+image_motion_global_change_pct=70
+
+# 20x15 ROI bit mask = 300 cells = 38 bytes = 76 hex characters.
+# Default: all 300 cells active (upper unused 4 bits in the last byte are zero).
+image_motion_roi_mask=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0f
+
 # Nachlaufzeit nach letzter Bewegung (ms)
 post_record_ms=3000
 

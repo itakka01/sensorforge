@@ -41,6 +41,7 @@
 #include "license.h"
 #include "recording_crypto.h"
 #include "log_storage.h"
+#include "image_motion.h"
 
 
 // =============================================================
@@ -161,6 +162,11 @@ static uint32_t recordingSafetyCooldownDurationSeconds = 0;
 // Reset after recording ends, after WiFi shuts down, and whenever
 // motion is seen while the recorder is idle.
 static unsigned long sleepIdleSinceMs = 0;
+
+// Image verification is a recording-decision layer above the existing radar/OT2
+// motion source. A rejected trigger is latched until physical motion clears so a
+// 2-second radar hold cannot repeatedly wake the camera analyzer in a tight loop.
+static bool imageVerifyRejectedUntilMotionClear = false;
 
 
 // Sleep diagnostics are state-based so the serial console stays readable.
@@ -287,6 +293,8 @@ static bool watchdogEnabled = false;
 // Sleep helper is defined later next to the power-management code,
 // but stopRecording() starts the idle timer.
 static void resetSleepDelayTimer();
+bool initCamera(const String &model, const String &resolution, int quality);
+static bool cameraExitSoftPowerDown();
 static bool rotateRecordingSegment(const String &reason);
 static void serviceRecordingSafetyCooldown();
 static void triggerRecordingEventSafetyLimit();
@@ -1132,6 +1140,297 @@ bool motionDetected()
     return
         physicalMotionActive() ||
         simulatedMotionActive();
+}
+
+
+static bool imageVerificationRequired()
+{
+    return
+        cfg_image_motion_enabled &&
+        cfg_motion_recording_decision == "image_verify";
+}
+
+
+static void finishDeferredWakeWithoutRecording(
+    const char *outcome
+)
+{
+    if (!wakeCriticalPathActive)
+        return;
+
+    wakeCriticalPathActive = false;
+    wakeTimingActive = false;
+
+    if (deferredWakeConsolePending) {
+        powerConsole(
+            "Wake from light sleep | cause=%s(%d) | slept=%llu ms | camera_wake=%llu us%s | console=deferred-%s",
+            sleepWakeCauseName(deferredWakeCause),
+            (int)deferredWakeCause,
+            (unsigned long long)(deferredWakeSleptUs / 1000ULL),
+            (unsigned long long)deferredWakeCameraWakeUs,
+            deferredWakeFastCameraSleep
+                ? (deferredWakeCameraWakeOk ? "" : " FAILED")
+                : " (normal-init fallback)",
+            outcome ? outcome : "no-recording"
+        );
+        deferredWakeConsolePending = false;
+    }
+
+    if (deferredMotionConsolePending) {
+        consoleWrite(
+            "MOTION",
+            deferredMotionConsoleMessage
+        );
+        deferredMotionConsolePending = false;
+        deferredMotionConsoleMessage = "";
+    }
+
+    if (deferredSleepLogPending) {
+        logSleepCycle(
+            "light",
+            deferredWakeCause,
+            deferredWakeSleptUs / 1000ULL
+        );
+        deferredSleepLogPending = false;
+    }
+}
+
+
+static bool runImageMotionVerification(
+    const char *context,
+    String *diagnosticsJson = nullptr,
+    String *errorOut = nullptr
+)
+{
+    if (errorOut)
+        *errorOut = "";
+
+    if (!cfg_image_motion_enabled) {
+        // Keep WebConfig diagnostics deterministic even if a previous test left
+        // a different last state behind. imageMotionAnalyzeJpeg() exits before
+        // touching the frame when analysis is disabled and records DISABLED.
+        ImageMotionDiagnostics disabledDiagnostics;
+        imageMotionAnalyzeJpeg(
+            nullptr,
+            0,
+            0,
+            0,
+            disabledDiagnostics
+        );
+
+        if (diagnosticsJson)
+            *diagnosticsJson = imageMotionDiagnosticsJson();
+        return true;
+    }
+
+    if (!initCamera(
+            cfg_camera,
+            cfg_resolution,
+            cfg_quality
+        )) {
+        if (errorOut)
+            *errorOut = "camera initialization failed";
+
+        // Fail open for an operational trigger: an analyzer fault must not make
+        // the surveillance path silently miss an event. Web test callers can
+        // distinguish this through errorOut.
+        return true;
+    }
+
+    if (cameraSoftPowerDownActive) {
+        if (!cameraExitSoftPowerDown()) {
+            if (errorOut)
+                *errorOut = "camera wake failed";
+            return true;
+        }
+    }
+
+    imageMotionBeginVerification();
+
+    uint8_t framesToAnalyze = (uint8_t)constrain(
+        cfg_image_motion_confirm_frames + 2,
+        3,
+        7
+    );
+
+    bool analyzerFailure = false;
+    String analyzerError;
+
+    for (uint8_t frameIndex = 0; frameIndex < framesToAnalyze; ++frameIndex) {
+        feedWatchdog();
+
+        camera_fb_t *frame = esp_camera_fb_get();
+
+        if (!frame) {
+            analyzerFailure = true;
+            analyzerError = "camera frame unavailable";
+            break;
+        }
+
+        ImageMotionDiagnostics diagnostics;
+        bool analyzed = false;
+
+        if (
+            frame->format == PIXFORMAT_JPEG &&
+            frame->buf &&
+            frame->len > 0
+        ) {
+            analyzed = imageMotionAnalyzeJpeg(
+                frame->buf,
+                frame->len,
+                frame->width,
+                frame->height,
+                diagnostics
+            );
+        }
+
+        esp_camera_fb_return(frame);
+
+        if (!analyzed) {
+            analyzerFailure = true;
+            analyzerError = "JPEG analysis failed";
+            break;
+        }
+
+        if (diagnostics.motionActive) {
+            if (diagnosticsJson)
+                *diagnosticsJson = imageMotionDiagnosticsJson();
+
+            if (!wakeCriticalPathActive) {
+                consolePrintf(
+                    "IMAGE_MOTION",
+                    "accepted | context=%s | frame_ms=%lu | decode_ms=%lu | cluster=%u/%u | area=%.1f%% | mean=%.1f | delta=%.1f | score=%.2f",
+                    context ? context : "trigger",
+                    (unsigned long)diagnostics.analyzeFrameMs,
+                    (unsigned long)diagnostics.decodeMs,
+                    (unsigned)diagnostics.largestClusterBlocks,
+                    (unsigned)diagnostics.activeRoiBlocks,
+                    diagnostics.changedAreaPct,
+                    diagnostics.globalMean,
+                    diagnostics.globalMeanDelta,
+                    diagnostics.motionScore
+                );
+            }
+
+            return true;
+        }
+    }
+
+    if (diagnosticsJson)
+        *diagnosticsJson = imageMotionDiagnosticsJson();
+
+    if (analyzerFailure) {
+        if (errorOut)
+            *errorOut = analyzerError;
+
+        if (!wakeCriticalPathActive) {
+            consoleWrite(
+                "IMAGE_MOTION",
+                "analyzer error | " + analyzerError + " | fail-open"
+            );
+        }
+
+        return true;
+    }
+
+    const ImageMotionDiagnostics &diagnostics = imageMotionLastDiagnostics();
+
+    String rejectMessage =
+        "rejected | context=" +
+        String(context ? context : "trigger") +
+        " | state=" +
+        imageMotionStateName(diagnostics.state) +
+        " | reason=" +
+        imageMotionRejectReasonName(diagnostics.rejectReason) +
+        " | frame_ms=" +
+        String(diagnostics.analyzeFrameMs) +
+        " | cluster=" +
+        String(diagnostics.largestClusterBlocks) +
+        "/" +
+        String(diagnostics.activeRoiBlocks) +
+        " | area=" +
+        String(diagnostics.changedAreaPct, 1) +
+        "% | global_change=" +
+        String(diagnostics.globalChangePct, 1) +
+        "%";
+
+    // Do not reintroduce blocking Serial/SD logging into the optimized
+    // post-light-sleep decision path. Detailed reject diagnostics are available
+    // in WebConfig; optional debug output is deferred until the critical path is
+    // released by finishDeferredWakeWithoutRecording().
+    if (wakeCriticalPathActive) {
+        if (cfg_debug_enabled) {
+            deferredMotionConsolePending = true;
+            deferredMotionConsoleMessage =
+                "IMAGE_MOTION | " + rejectMessage;
+        }
+    } else if (cfg_debug_enabled) {
+        consoleWrite(
+            "IMAGE_MOTION",
+            rejectMessage
+        );
+
+        if (sdReady) {
+            logWrite(
+                "IMAGE_MOTION | " +
+                rejectMessage
+            );
+        }
+    }
+
+    return false;
+}
+
+
+static bool recordingDecisionAllowsStart(
+    bool physicalTrigger,
+    const char *context
+)
+{
+    // Simulation remains a deterministic test of the recorder itself. Image
+    // verification applies only to a real low-power sensor trigger.
+    if (!physicalTrigger || !imageVerificationRequired())
+        return true;
+
+    if (imageVerifyRejectedUntilMotionClear)
+        return false;
+
+    bool accepted = runImageMotionVerification(context);
+
+    if (!accepted)
+        imageVerifyRejectedUntilMotionClear = true;
+
+    return accepted;
+}
+
+
+bool imageMotionWebTest(
+    String &json,
+    String &error
+)
+{
+    json = "";
+    error = "";
+
+    if (recording || recorderIsOpen()) {
+        error = "recording active";
+        return false;
+    }
+
+    // Test mode never starts a recording. WebConfig's preview gate remains the
+    // owner of the camera while the browser is on the Image Motion page.
+    bool result = runImageMotionVerification(
+        "web_test",
+        &json,
+        &error
+    );
+
+    if (error.length())
+        return false;
+
+    // A negative motion decision is still a successful diagnostic request.
+    (void)result;
+    return true;
 }
 
 
@@ -8572,7 +8871,11 @@ void setup() {
             "Wake by presence"
         );
 
-        if (!startRecording()) {
+        if (recordingDecisionAllowsStart(true, "deep_sleep_presence")) {
+            if (!startRecording()) {
+                resetSleepDelayTimer();
+            }
+        } else {
             resetSleepDelayTimer();
         }
 
@@ -8594,7 +8897,13 @@ void setup() {
             "Motion active on boot"
         );
 
-        if (!startRecording()) {
+        bool bootPhysicalMotion = physicalMotionActive();
+
+        if (recordingDecisionAllowsStart(bootPhysicalMotion, "normal_boot")) {
+            if (!startRecording()) {
+                resetSleepDelayTimer();
+            }
+        } else {
             resetSleepDelayTimer();
         }
 
@@ -8656,6 +8965,13 @@ void loop() {
     // Consume the LD2410S compact UART report stream.
     // Recording decisions still use the dedicated OT2 GPIO.
     radarLoop();
+
+    if (
+        imageVerifyRejectedUntilMotionClear &&
+        !physicalMotionActive()
+    ) {
+        imageVerifyRejectedUntilMotionClear = false;
+    }
 
     // Independent thermal guard. It remains active during WebConfig and
     // recording and can force a timer-only deep-sleep cooldown.
@@ -8911,6 +9227,20 @@ void loop() {
 
         if (motionDetected()) {
 
+            bool physicalTrigger = physicalMotionActive();
+            bool simulatedTrigger = simulatedMotionActive();
+
+            if (
+                physicalTrigger &&
+                !simulatedTrigger &&
+                !recordingDecisionAllowsStart(true, "awake_trigger")
+            ) {
+                resetSleepDelayTimer();
+                finishDeferredWakeWithoutRecording("image-rejected");
+                delay(10);
+                return;
+            }
+
             if (
                 wakeTimingActive &&
                 wakeTimingMotionAcceptedUs == 0
@@ -8936,8 +9266,8 @@ void loop() {
             String motionMessage;
 
             if (
-                simulatedMotionActive() &&
-                !physicalMotionActive()
+                simulatedTrigger &&
+                !physicalTrigger
             ) {
                 motionMessage = "simulated";
             } else if (

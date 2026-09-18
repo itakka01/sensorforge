@@ -37,6 +37,19 @@ extern int cfg_recording_event_cooldown_seconds;
 // "off" = no time gate; otherwise strict local ISO format YYYY-MM-DDTHH:MM:SS.
 extern String cfg_recording_not_before;
 
+// Motion recording decision. Existing radar/OT2 wake remains authoritative;
+// image_verify adds a camera confirmation step before a NEW recording starts.
+extern String cfg_motion_recording_decision; // "direct" or "image_verify"
+extern int cfg_image_motion_enabled;
+extern int cfg_image_motion_sensitivity;
+extern int cfg_image_motion_min_area_pct;
+extern int cfg_image_motion_confirm_frames;
+extern int cfg_image_motion_release_frames;
+extern int cfg_image_motion_background_learning;
+extern int cfg_image_motion_global_mean_delta;
+extern int cfg_image_motion_global_change_pct;
+extern String cfg_image_motion_roi_mask; // 20x15 compact bit mask, 76 hex chars
+
 // Sleep / power management
 extern String cfg_sleep_mode;         // "off", "light_sleep", "deep_sleep"
 extern int cfg_sleep_delay_ms;        // 0..60000 ms idle delay before sleep
@@ -200,6 +213,23 @@ ConfigSaveResult configSaveCameraCrop(
 // field names remain language-neutral.
 ConfigSaveResult configSaveWebLanguage(
     const String &languageCode,
+    bool writeToSd,
+    String &error
+);
+
+// Persist the image-motion decision/settings/ROI mask while preserving the
+// complete active config text and all unrelated/future keys.
+ConfigSaveResult configSaveImageMotion(
+    const String &recordingDecision,
+    int enabled,
+    int sensitivity,
+    int minAreaPct,
+    int confirmFrames,
+    int releaseFrames,
+    int backgroundLearning,
+    int globalMeanDelta,
+    int globalChangePct,
+    const String &roiMask,
     bool writeToSd,
     String &error
 );
