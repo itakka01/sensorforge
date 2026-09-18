@@ -6,8 +6,8 @@
 // BOARD AUSWÄHLEN
 // =============================================================
 
-//#define BOARD_FREENOVE
-#define BOARD_XIAO
+#define BOARD_FREENOVE
+//#define BOARD_XIAO
 
 
 #if defined(BOARD_FREENOVE) && defined(BOARD_XIAO)
@@ -41,11 +41,11 @@
 // If this board is changed to a different storage backend in the future, its
 // clock policy belongs here in the board profile, not in config.txt.
 
-// Presence input: LD2410S OT2 (HIGH = person present).
+// Presence input: LD2410S OT2 or AM312 PIR (HIGH = person present).
 // PIR_PIN is retained as a compatibility alias for existing code.
-#define PRESENCE_PIN        GPIO_NUM_21
+#define PRESENCE_PIN        GPIO_NUM_21      // (gelb)
 #define PIR_PIN             PRESENCE_PIN
-#define MAGNET_SWITCH_PIN   GPIO_NUM_14
+#define MAGNET_SWITCH_PIN   GPIO_NUM_14     // (braun) andere Seite Magnetswitch auf GND
 
 // LD2410S UART:
 //   sensor OT1/TX -> RADAR_RX_PIN
@@ -55,8 +55,8 @@
 
 // RTC / I2C bus.
 // GPIO1 and GPIO47 are exposed and unused by camera, SD, radar and magnet input.
-#define RTC_SDA_PIN          GPIO_NUM_1
-#define RTC_SCL_PIN          GPIO_NUM_47
+#define RTC_SDA_PIN          GPIO_NUM_1   // (grün)
+#define RTC_SCL_PIN          GPIO_NUM_47  // (blau)
 
 // User-facing camera rotation is relative to the physically mounted camera.
 // This board profile currently needs no additional base rotation.
@@ -70,6 +70,19 @@
 #define SD_MMC_CMD          GPIO_NUM_38
 #define SD_MMC_CLK          GPIO_NUM_39
 #define SD_MMC_D0           GPIO_NUM_40
+
+// Recording performance guard.
+//
+// This is a coarse configuration safety ceiling, not a claimed physical bus
+// throughput. The generic config layer computes a weighted pixel rate:
+//
+//   width * height * fps * JPEG-quality-weight
+//
+// A value of 0 means that no board-specific ceiling has been qualified yet.
+// The Freenove SD_MMC path has not been benchmarked with the same production
+// camera/AVI/SFENC1 methodology as the XIAO profile, so do not invent a limit
+// here. Once measured, place the validated conservative ceiling here.
+#define RECORDING_MAX_WEIGHTED_PIXEL_RATE 0UL
 
 
 // =============================================================
@@ -95,11 +108,11 @@
 // D7 = GPIO44
 
 
-// Presence input: LD2410S OT2 (HIGH = person present).
+// Presence input: LD2410S OT2 or AM312 PIR (HIGH = person present).
 // PIR_PIN is retained as a compatibility alias for existing code.
 #define PRESENCE_PIN        GPIO_NUM_4      // D3 ← OT2 vom Radar (gelb)
 #define PIR_PIN             PRESENCE_PIN
-#define MAGNET_SWITCH_PIN   GPIO_NUM_1      // D0 ← Magnetswitch (zweite Leitung Magnetswitch auf GND)
+#define MAGNET_SWITCH_PIN   GPIO_NUM_1      // D0 ← Magnetswitch (zweite Leitung Magnetswitch auf GND) (braun)
 
 // XIAO hardware UART pins D7/RX and D6/TX.
 #define RADAR_RX_PIN GPIO_NUM_44  // D7 ← OT1 vom Radar (weiß)
@@ -155,6 +168,32 @@
 #if SD_SPI_NORMAL_FREQUENCY_HZ > SD_SPI_MAX_FREQUENCY_HZ
 #error "SD_SPI_NORMAL_FREQUENCY_HZ must not exceed SD_SPI_MAX_FREQUENCY_HZ"
 #endif
+
+// Recording performance guard for configuration validation.
+//
+// This is deliberately a conservative UPPER CONFIGURATION CEILING, not an
+// exact throughput model and not a promise that every scene/card will sustain
+// the limit. The generic config layer computes:
+//
+//   weighted_pixel_rate = width * height * fps * quality_weight / 100
+//
+// quality_weight is 100% at JPEG quality=12 and for numerically larger
+// (lower-image-quality) values. Numerically smaller JPEG quality values create
+// larger JPEGs, so the generic guard adds 5% load per step below 12, capped at
+// 160%. Lower JPEG quality must never be used to raise this board ceiling.
+//
+// Why 8,000,000:
+// - real XIAO ESP32S3 Sense + OV3660 + AVI + SFENC1 + SD-SPI 20 MHz benchmark
+// - 1024x768 @ 5 fps, JPEG quality 12: VERIFIED, read-back VERIFY=OK
+// - P95 frame call about 47 ms, P99 about 49 ms, worst about 54 ms
+// - 10 fps gives a 100 ms frame budget and therefore a deliberately useful
+//   safety margin over the measured production path
+// - 1024x768 @ quality 12 therefore allows max 10 fps (7,864,320 score)
+//   while 11 fps is rejected (8,650,752 score)
+//
+// Re-benchmark before increasing this value, after changing SD backend/clock,
+// or when qualifying substantially different camera/board hardware.
+#define RECORDING_MAX_WEIGHTED_PIXEL_RATE 8000000UL
 
 #if CAMERA_BASE_ROTATION_DEGREES != 0 && CAMERA_BASE_ROTATION_DEGREES != 180
 #error "CAMERA_BASE_ROTATION_DEGREES must be 0 or 180"

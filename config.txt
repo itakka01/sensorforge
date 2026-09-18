@@ -304,3 +304,9 @@ debug_enabled=0
 log_file=/log.txt
 
 
+# Bootloop-/Unterspannungsschutz
+# Erkennt mehrere kurze, instabile Neustarts in Folge und versetzt das
+# Gerät anschließend für eine längere Zeit in Deep Sleep.
+# Verhindert dauernde Neustarts bei leerem bzw. instabilem Akku.
+# 1 = aktiviert, 0 = deaktiviert
+bootloop_protection=1

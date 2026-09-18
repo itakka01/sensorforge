@@ -104,6 +104,13 @@ static bool commandInProgress =
 static bool motionTrackingConfigured =
     false;
 
+// Latched for the current boot after any valid LD2410S configuration
+// handshake. This is intentionally separate from live report freshness and
+// from motionTrackingConfigured so a present-but-degraded radar is not
+// mistaken for a standalone PIR.
+static bool radarHardwareDetected =
+    false;
+
 static RadarSettings motionSettings;
 
 static uint32_t standardModeStartedMs =
@@ -1898,6 +1905,9 @@ static void parseStandardByte(
 
 void radarBegin()
 {
+    radarHardwareDetected =
+        false;
+
     radarSerial.begin(
         RADAR_BAUD,
         SERIAL_8N1,
@@ -2038,6 +2048,9 @@ bool radarStartMotionTracking(
         return false;
     }
 
+
+    radarHardwareDetected =
+        true;
 
     cacheMotionSettings(
         settings
@@ -2632,6 +2645,12 @@ uint8_t radarLastTargetState()
 uint16_t radarLastTargetDistanceCm()
 {
     return lastTargetDistanceCm;
+}
+
+
+bool radarSensorDetected()
+{
+    return radarHardwareDetected;
 }
 
 

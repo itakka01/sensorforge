@@ -30,6 +30,7 @@
 #include "recording_crypto.h"
 #include "recording_storage.h"
 #include "image_motion.h"
+#include "motion_diagnostics.h"
 
 
 // High-level recording state from the main firmware loop.
@@ -467,6 +468,45 @@ static String htmlText(
 }
 
 
+static bool radarConfigAvailable()
+{
+    // This is the result of the robust four-attempt LD2410S startup check.
+    // It deliberately does not depend on current report freshness.
+    return radarSensorDetected();
+}
+
+
+static UiTextId motionSensorTypeUiId()
+{
+    return
+        radarConfigAvailable()
+        ? UI_MOTION_SENSOR_RADAR
+        : UI_MOTION_SENSOR_PIR;
+}
+
+
+static bool rejectRadarConfigurationUnavailable()
+{
+    if (radarConfigAvailable())
+        return false;
+
+    server.sendHeader(
+        "Cache-Control",
+        "no-store"
+    );
+
+    server.send(
+        409,
+        "text/plain; charset=utf-8",
+        String(tr(UI_RADAR_CONFIG_UNAVAILABLE)) +
+        "\n\n" +
+        String(tr(UI_RADAR_CONFIG_PIR_NOTE))
+    );
+
+    return true;
+}
+
+
 static const char *configSourceUiName()
 {
     switch (configGetSource()) {
@@ -758,6 +798,9 @@ static String htmlHeader()
         ".dropdown a{display:block;text-decoration:none;color:var(--text);"
         "padding:9px 10px;border-radius:6px;margin:0;}"
         ".dropdown a:hover,.dropdown a.active{background:#eef4ff;color:#174ea6;}"
+        ".dropdown .nav-disabled{display:block;color:#98a2b3;padding:9px 10px;border-radius:6px;"
+        "margin:0;cursor:not-allowed;background:#f8fafc;}"
+        ".button.disabled{opacity:.5;cursor:not-allowed;pointer-events:none;}"
         ".dropdown .sep{height:1px;background:var(--line);margin:6px 4px;}"
         ".dropdown .danger-link{color:var(--danger);}"
         ".page{max-width:1200px;margin:20px auto;padding:0 14px 30px;}"
@@ -933,9 +976,26 @@ static String htmlHeader()
     html +=
         "<details class='navdrop' id='navSensor'><summary data-nav='sensor'>" +
         htmlText(UI_NAV_SENSOR) +
-        "</summary><div class='dropdown'><a href='/radar_config'>" +
-        htmlText(UI_NAV_RADAR_CONFIG) +
-        "</a><a href='/image_motion'>" +
+        "</summary><div class='dropdown'>";
+
+    if (radarConfigAvailable()) {
+        html +=
+            "<a href='/radar_config'>" +
+            htmlText(UI_NAV_RADAR_CONFIG) +
+            "</a>";
+    } else {
+        html +=
+            "<span class='nav-disabled' title='" +
+            htmlText(UI_RADAR_CONFIG_PIR_NOTE) +
+            "'>" +
+            htmlText(UI_NAV_RADAR_CONFIG) +
+            " &middot; " +
+            htmlText(UI_MOTION_SENSOR_PIR) +
+            "</span>";
+    }
+
+    html +=
+        "<a href='/image_motion'>" +
         htmlText(UI_NAV_IMAGE_MOTION) +
         "</a><a href='/#simulation'>" +
         htmlText(UI_NAV_SIMULATE_MOTION) +
@@ -1287,6 +1347,106 @@ static void handleUiStatus()
         String(SENSORFORGE_THERMAL_RTC_EMERGENCY_C, 1) +
         ",\"thermal_rtc_recovery_c\":" +
         String(SENSORFORGE_THERMAL_RTC_RECOVERY_C, 1) +
+        "}";
+
+    server.sendHeader(
+        "Cache-Control",
+        "no-store"
+    );
+
+    server.send(
+        200,
+        "application/json",
+        json
+    );
+}
+
+
+static void handleMotionStatus()
+{
+    MotionDiagnosticsSnapshot diagnostics;
+    motionDiagnosticsGetSnapshot(diagnostics);
+
+    bool radarDetected =
+        radarConfigAvailable();
+
+    bool radarTrackingAvailable =
+        radarMotionTrackingAvailable();
+
+    bool useRadarTrigger =
+        radarDetected &&
+        radarTrackingAvailable;
+
+    bool physicalMotionActive =
+        useRadarTrigger
+        ? diagnostics.radarMotionActive
+        : diagnostics.presenceActive;
+
+    bool simulatedMotion =
+        webConfigMotionActive();
+
+    bool operationalMotionActive =
+        physicalMotionActive ||
+        simulatedMotion;
+
+    uint32_t primaryTriggerCount =
+        useRadarTrigger
+        ? diagnostics.radarTriggerCount
+        : diagnostics.presenceTriggerCount;
+
+    bool primaryLastTriggerValid =
+        useRadarTrigger
+        ? diagnostics.radarLastTriggerValid
+        : diagnostics.presenceLastTriggerValid;
+
+    uint32_t primaryLastTriggerAgeMs =
+        useRadarTrigger
+        ? diagnostics.radarLastTriggerAgeMs
+        : diagnostics.presenceLastTriggerAgeMs;
+
+    String json =
+        String("{\"sensor_type\":\"") +
+        (radarDetected ? "radar" : "pir") +
+        "\",\"presence_pin\":" +
+        String((int)PRESENCE_PIN) +
+        ",\"presence_active\":" +
+        (diagnostics.presenceActive ? "true" : "false") +
+        ",\"presence_trigger_count\":" +
+        String(diagnostics.presenceTriggerCount) +
+        ",\"presence_last_trigger_valid\":" +
+        (diagnostics.presenceLastTriggerValid ? "true" : "false") +
+        ",\"presence_last_trigger_age_ms\":" +
+        String(diagnostics.presenceLastTriggerAgeMs) +
+        ",\"radar_detected\":" +
+        (radarDetected ? "true" : "false") +
+        ",\"radar_tracking_available\":" +
+        (radarTrackingAvailable ? "true" : "false") +
+        ",\"radar_motion_active\":" +
+        (diagnostics.radarMotionActive ? "true" : "false") +
+        ",\"radar_trigger_count\":" +
+        String(diagnostics.radarTriggerCount) +
+        ",\"radar_last_trigger_valid\":" +
+        (diagnostics.radarLastTriggerValid ? "true" : "false") +
+        ",\"radar_last_trigger_age_ms\":" +
+        String(diagnostics.radarLastTriggerAgeMs) +
+        ",\"radar_last_gate\":" +
+        String(radarLastMotionGate()) +
+        ",\"radar_last_energy_db\":" +
+        String(radarLastMotionEnergyDb(), 1) +
+        ",\"primary_source\":\"" +
+        (useRadarTrigger ? "radar" : "presence") +
+        "\",\"primary_trigger_count\":" +
+        String(primaryTriggerCount) +
+        ",\"primary_last_trigger_valid\":" +
+        (primaryLastTriggerValid ? "true" : "false") +
+        ",\"primary_last_trigger_age_ms\":" +
+        String(primaryLastTriggerAgeMs) +
+        ",\"physical_motion_active\":" +
+        (physicalMotionActive ? "true" : "false") +
+        ",\"simulated_motion\":" +
+        (simulatedMotion ? "true" : "false") +
+        ",\"motion_active\":" +
+        (operationalMotionActive ? "true" : "false") +
         "}";
 
     server.sendHeader(
@@ -1661,16 +1821,29 @@ static void handleRoot()
     bool simulatedMotion =
         webConfigMotionActive();
 
-    bool radarMotion =
-        radarMotionActive();
+    bool radarDetected =
+        radarConfigAvailable();
 
-    bool ot2Active =
-        digitalRead(PIR_PIN) == HIGH;
+    bool radarTrackingAvailable =
+        radarMotionTrackingAvailable();
+
+    MotionDiagnosticsSnapshot motionDiagnostics;
+    motionDiagnosticsGetSnapshot(motionDiagnostics);
+
+    bool radarMotion =
+        motionDiagnostics.radarMotionActive;
+
+    bool presenceInputActive =
+        motionDiagnostics.presenceActive;
+
+    bool physicalMotionActive =
+        radarDetected && radarTrackingAvailable
+        ? radarMotion
+        : presenceInputActive;
 
     bool motionActive =
         simulatedMotion ||
-        radarMotion ||
-        ot2Active;
+        physicalMotionActive;
 
     float cpuTempC =
         thermalCpuTemperatureC();
@@ -2000,19 +2173,79 @@ static void handleRoot()
     html +=
         "<section class='dash-card'><div class='card-label'>" +
         htmlText(UI_CARD_MOTION) +
-        "</div><div class='card-value'>" +
+        "</div><div id='motionCardValue' class='card-value'>" +
         htmlText(
             motionActive
             ? UI_MOTION_DETECTED
             : UI_MOTION_NONE
         ) +
-        "</div><div class='card-note'>OT2=" +
-        String(ot2Active ? "1" : "0") +
-        " &middot; Radar=" +
-        String(radarMotion ? "1" : "0") +
-        " &middot; Simulation=" +
+        "</div><div class='card-note'>" +
+        htmlText(UI_MOTION_SENSOR_TYPE) +
+        ": <b>" +
+        htmlText(motionSensorTypeUiId()) +
+        "</b><br><span id='motionPresenceLabel'>" +
+        htmlText(
+            radarDetected
+            ? UI_MOTION_OT2_GPIO
+            : UI_MOTION_PIR_GPIO
+        ) +
+        " " +
+        String((int)PRESENCE_PIN) +
+        "</span>: <b id='motionPresenceState' class='status-pill " +
+        String(presenceInputActive ? "danger" : "ok") +
+        "'>" +
+        String(presenceInputActive ? "HIGH" : "LOW") +
+        "</b>";
+
+    html +=
+        "<span id='motionRadarRow' style='" +
+        String(radarDetected ? "" : "display:none") +
+        "'> &middot; " +
+        htmlText(UI_MOTION_RADAR_INTERNAL) +
+        ": <b id='motionRadarState'>" +
+        (
+            radarTrackingAvailable
+            ? htmlText(
+                radarMotion
+                ? UI_STATUS_ACTIVE
+                : UI_MOTION_NONE
+            )
+            : htmlText(UI_MOTION_RADAR_FALLBACK)
+        ) +
+        "</b> &middot; " +
+        htmlText(UI_MOTION_GATE) +
+        "=<span id='motionRadarGate'>" +
+        (radarLastMotionGate() >= 0 ? String(radarLastMotionGate()) : String("-")) +
+        "</span> &middot; " +
+        htmlText(UI_MOTION_ENERGY) +
+        "=<span id='motionRadarEnergy'>" +
+        (radarLastMotionGate() >= 0 ? String(radarLastMotionEnergyDb(), 1) : String("-")) +
+        "</span> dB</span>";
+
+    html +=
+        "<br>Simulation=<span id='motionSimulationState'>" +
         String(simulatedMotion ? "1" : "0") +
+        "</span> &middot; " +
+        htmlText(UI_MOTION_LAST_TRIGGER) +
+        ": <b id='motionLastTrigger'>" +
+        htmlText(UI_MOTION_NO_TRIGGER_YET) +
+        "</b> &middot; " +
+        htmlText(UI_MOTION_TRIGGERS_SINCE_OPEN) +
+        ": <b id='motionTriggerCount'>0</b>" +
         "</div></section>";
+
+    html +=
+        "<div id='motionLiveConfig' hidden"
+        " data-base-presence='" + String(motionDiagnostics.presenceTriggerCount) + "'"
+        " data-base-radar='" + String(motionDiagnostics.radarTriggerCount) + "'"
+        " data-detected='" + htmlText(UI_MOTION_DETECTED) + "'"
+        " data-none='" + htmlText(UI_MOTION_NONE) + "'"
+        " data-active='" + htmlText(UI_STATUS_ACTIVE) + "'"
+        " data-fallback='" + htmlText(UI_MOTION_RADAR_FALLBACK) + "'"
+        " data-no-trigger='" + htmlText(UI_MOTION_NO_TRIGGER_YET) + "'"
+        " data-ago='" + htmlText(UI_MOTION_AGO) + "'"
+        " data-ago-suffix='" + htmlText(UI_MOTION_AGO_SUFFIX) + "'"
+        "></div>";
 
     html +=
         "<section class='dash-card'><div class='card-label'>" +
@@ -2428,14 +2661,68 @@ static void handleRoot()
         "</script>";
 
     html +=
+        "<script>"
+        "(function(){"
+        "var c=document.getElementById('motionLiveConfig');if(!c)return;"
+        "var value=document.getElementById('motionCardValue');"
+        "var pState=document.getElementById('motionPresenceState');"
+        "var radarRow=document.getElementById('motionRadarRow');"
+        "var radarState=document.getElementById('motionRadarState');"
+        "var radarGate=document.getElementById('motionRadarGate');"
+        "var radarEnergy=document.getElementById('motionRadarEnergy');"
+        "var simState=document.getElementById('motionSimulationState');"
+        "var lastEl=document.getElementById('motionLastTrigger');"
+        "var countEl=document.getElementById('motionTriggerCount');"
+        "var basePresence=Number(c.dataset.basePresence)||0;"
+        "var baseRadar=Number(c.dataset.baseRadar)||0;"
+        "function ageText(valid,ms){if(!valid)return c.dataset.noTrigger;ms=Math.max(0,Number(ms)||0);"
+            "if(ms<10000)return c.dataset.ago+(c.dataset.ago?' ':'')+(ms/1000).toFixed(1)+' s'+c.dataset.agoSuffix;"
+            "if(ms<60000)return c.dataset.ago+(c.dataset.ago?' ':'')+Math.floor(ms/1000)+' s'+c.dataset.agoSuffix;"
+            "var sec=Math.floor(ms/1000);var min=Math.floor(sec/60);sec%=60;return c.dataset.ago+(c.dataset.ago?' ':'')+min+' min '+sec+' s'+c.dataset.agoSuffix;}"
+        "function applyMotion(s){"
+            "if(value)value.textContent=s.motion_active?c.dataset.detected:c.dataset.none;"
+            "if(pState){pState.textContent=s.presence_active?'HIGH':'LOW';pState.classList.toggle('danger',!!s.presence_active);pState.classList.toggle('ok',!s.presence_active);}"
+            "if(simState)simState.textContent=s.simulated_motion?'1':'0';"
+            "if(radarRow)radarRow.style.display=s.radar_detected?'':'none';"
+            "if(radarState)radarState.textContent=s.radar_tracking_available?(s.radar_motion_active?c.dataset.active:c.dataset.none):c.dataset.fallback;"
+            "if(radarGate)radarGate.textContent=Number(s.radar_last_gate)>=0?String(Number(s.radar_last_gate)):'-';"
+            "if(radarEnergy)radarEnergy.textContent=Number(s.radar_last_gate)>=0?Number(s.radar_last_energy_db).toFixed(1):'-';"
+            "if(lastEl)lastEl.textContent=ageText(!!s.primary_last_trigger_valid,s.primary_last_trigger_age_ms);"
+            "if(countEl){var base=s.primary_source==='radar'?baseRadar:basePresence;countEl.textContent=String(Math.max(0,(Number(s.primary_trigger_count)||0)-base));}"
+        "}"
+        "function pollMotion(){if(document.hidden)return;fetch('/motion_status?t='+Date.now(),{cache:'no-store',credentials:'same-origin'})"
+            ".then(function(r){if(!r.ok)throw new Error();return r.json();}).then(applyMotion).catch(function(){});}"
+        "pollMotion();setInterval(pollMotion,250);"
+        "document.addEventListener('visibilitychange',function(){if(!document.hidden)pollMotion();});"
+        "})();"
+        "</script>";
+
+    html +=
         "<div class='quick-actions'>"
         "<a class='button primary' href='/files'>" +
         htmlText(UI_NAV_RECORDINGS) +
         "</a><a class='button' href='/preview'>" +
         htmlText(UI_NAV_LIVE_PREVIEW) +
-        "</a><a class='button' href='/radar_config'>" +
-        htmlText(UI_RADAR) +
-        "</a><a class='button' href='/config'>" +
+        "</a>";
+
+    if (radarConfigAvailable()) {
+        html +=
+            "<a class='button' href='/radar_config'>" +
+            htmlText(UI_RADAR) +
+            "</a>";
+    } else {
+        html +=
+            "<span class='button disabled' title='" +
+            htmlText(UI_RADAR_CONFIG_PIR_NOTE) +
+            "'>" +
+            htmlText(UI_RADAR) +
+            " &middot; " +
+            htmlText(UI_MOTION_SENSOR_PIR) +
+            "</span>";
+    }
+
+    html +=
+        "<a class='button' href='/config'>" +
         htmlText(UI_NAV_CONFIGURATION) +
         "</a><a class='button' href='/transport'>" +
         htmlText(UI_NAV_TRANSPORT) +
@@ -3003,15 +3290,57 @@ static void handleConfig()
     html += "camera: <input name='camera' value='" +
             htmlEscape(cfg_camera) + "'><br>";
 
-    html += "resolution: <input name='resolution' value='" +
+    html += "resolution: <input id='cfgResolution' name='resolution' value='" +
             htmlEscape(cfg_resolution) + "'><br>";
 
-    html += "fps: <input name='fps' type='number' min='1' max='30' value='" +
+    int recordingPerformanceMaxFps =
+        configRecordingPerformanceMaxFps(
+            cfg_resolution,
+            cfg_quality
+        );
+
+    if (recordingPerformanceMaxFps < 1)
+        recordingPerformanceMaxFps = 30;
+
+    html += "fps: <input id='cfgFps' name='fps' type='number' min='1' max='" +
+            String(recordingPerformanceMaxFps) + "' value='" +
             String(cfg_fps) + "'><br>";
 
-    html += "quality: <input name='quality' type='number' min='0' max='63' value='" +
+    html += "quality: <input id='cfgQuality' name='quality' type='number' min='0' max='63' value='" +
             String(cfg_quality) + "'>"
-            " <small>(kleiner = bessere JPEG-Qualität, Testwert: 12)</small><br>";
+            " <small>(kleiner = bessere JPEG-Qualität und meist größere Dateien; Referenzwert: 12)</small><br>";
+
+    html +=
+        "<small id='recordingPerformanceHint' class='muted'></small><br>";
+
+    html += "<script>(function(){";
+    html += "const cap=" +
+            String((unsigned long)configRecordingPerformanceLimit()) +
+            ";";
+    html +=
+        "const px={'160x120':19200,'320x240':76800,'640x480':307200,"
+        "'800x600':480000,'1024x768':786432,'1280x1024':1310720,"
+        "'1600x1200':1920000,'2048x1536':3145728};"
+        "const r=document.getElementById('cfgResolution');"
+        "const f=document.getElementById('cfgFps');"
+        "const q=document.getElementById('cfgQuality');"
+        "const h=document.getElementById('recordingPerformanceHint');"
+        "function qw(v){v=Math.max(0,Math.min(63,Number(v)||0));"
+        "if(v>=12)return 100;return Math.min(160,100+(12-v)*5);}"
+        "function update(){"
+        "const p=px[(r.value||'').trim()];"
+        "if(!cap){f.max=30;h.textContent='Für dieses Board ist noch kein Performance-Oberdeckel qualifiziert.';return;}"
+        "if(!p){f.max=30;h.textContent='Performance-Limit wird nach Eingabe einer unterstützten Auflösung angezeigt.';return;}"
+        "const w=qw(q.value);"
+        "const m=Math.max(0,Math.min(30,Math.floor((cap*100)/(p*w))));"
+        "f.max=Math.max(1,m);"
+        "if(m<1){h.textContent='Diese Auflösung/JPEG-Qualität überschreitet bereits bei 1 fps das Board-Limit.';return;}"
+        "const load=Math.ceil((p*(Number(f.value)||0)*w)/100);"
+        "h.textContent='Board-Leistungsgrenze: max. '+m+' fps für diese Auflösung/Qualität. '+"
+        "'Aktueller Lastwert: '+load.toLocaleString('de-DE')+' / '+cap.toLocaleString('de-DE')+'.';"
+        "}"
+        "r.addEventListener('input',update);q.addEventListener('input',update);f.addEventListener('input',update);update();"
+        "})();</script>";
 
     html += "camera_xclk_mhz: <select name='camera_xclk_mhz'>";
     html += "<option value='10'" +
@@ -3362,7 +3691,23 @@ static void handleConfig()
     html += "sleep_delay_ms: <input name='sleep_delay_ms' type='number' "
             "min='0' max='60000' value='" +
             String(cfg_sleep_delay_ms) +
-            "'> <small>(0..60000 ms)</small><br>";
+            "'> <small>(0..60000 ms)</small><br><br>";
+
+    html +=
+        "<b>Bootloop-/Unterspannungsschutz</b><br>"
+        "<span class='muted'>Schützt SensorForge vor wiederholten kurzen Neustarts, "
+        "z. B. wenn ein fast leerer oder instabiler Akku beim Hochfahren immer wieder einbricht. "
+        "Nach mehreren unvollständigen Starts legt das Gerät automatisch eine längere Deep-Sleep-Pause ein. "
+        "Normales Ausschalten nach stabilem Betrieb wird nicht als Fehler gewertet.</span><br>";
+
+    html += "bootloop_protection: <select name='bootloop_protection'>";
+    html += "<option value='1'" +
+            String(cfg_bootloop_protection ? " selected" : "") +
+            ">1 - aktiviert (empfohlen)</option>";
+    html += "<option value='0'" +
+            String(!cfg_bootloop_protection ? " selected" : "") +
+            ">0 - deaktiviert</option>";
+    html += "</select> <small>(vollständige Wirkung ab dem nächsten Neustart)</small><br>";
 
 
     html += "</div><div class='settings-section'><h3>Transportmodus</h3>";
@@ -3887,6 +4232,12 @@ static void handleSave()
         );
 
 
+    int bootloopProtection =
+        server.hasArg("bootloop_protection")
+        ? (server.arg("bootloop_protection").toInt() ? 1 : 0)
+        : cfg_bootloop_protection;
+
+
     int transportCheckSeconds =
         constrain(
             server.arg("transport_check_seconds").toInt(),
@@ -4076,6 +4427,53 @@ static void handleSave()
     resolution.trim();
 
 
+    {
+        int performanceMaxFps =
+            configRecordingPerformanceMaxFps(
+                resolution,
+                quality
+            );
+
+        if (
+            configRecordingPerformanceLimit() > 0 &&
+            performanceMaxFps > 0
+        ) {
+            uint32_t performanceLoad = 0;
+            uint32_t performanceLimit = 0;
+
+            if (!configRecordingPerformanceAllowed(
+                    resolution,
+                    fps,
+                    quality,
+                    performanceLoad,
+                    performanceLimit
+                )) {
+
+                String message =
+                    "Recording-Performance-Limit ueberschritten. "
+                    "Fuer " +
+                    resolution +
+                    " und quality=" +
+                    String(quality) +
+                    " sind auf diesem Board maximal " +
+                    String(performanceMaxFps) +
+                    " fps zugelassen. Last=" +
+                    String((unsigned long)performanceLoad) +
+                    ", Limit=" +
+                    String((unsigned long)performanceLimit) +
+                    ".";
+
+                server.send(
+                    400,
+                    "text/plain; charset=utf-8",
+                    message
+                );
+                return;
+            }
+        }
+    }
+
+
     String hostname =
         server.arg("hostname");
 
@@ -4207,6 +4605,10 @@ static void handleSave()
 
     text += "sleep_delay_ms=";
     text += String(sleepDelayMs);
+    text += '\n';
+
+    text += "bootloop_protection=";
+    text += String(bootloopProtection);
     text += '\n';
 
     // transport_mode is an operational flag controlled by the dedicated
@@ -4387,13 +4789,26 @@ static void handleSave()
 
         case CONFIG_SAVE_BOTH:
 
-            // Sleep policy is safe to apply immediately. Other settings
-            // may still require a reboot (camera, recording format, etc.).
+            // Sleep policy is safe to apply immediately. FPS is also a
+            // runtime recorder/pacing setting and can be applied safely here
+            // because config saves are rejected while recording is active.
+            // Camera sensor settings (resolution/quality/etc.) may still
+            // require a reboot/reinit before the hardware uses them.
+            cfg_fps =
+                fps;
+
             cfg_sleep_mode =
                 sleepMode;
 
             cfg_sleep_delay_ms =
                 sleepDelayMs;
+
+            // Keep the rendered WebConfig state in sync with the just-saved
+            // value. Enabling is armed on the next cold boot; disabling stops
+            // the runtime stability timer immediately and clears persisted
+            // bootloop state on the next boot.
+            cfg_bootloop_protection =
+                bootloopProtection;
 
             cfg_transport_check_seconds =
                 transportCheckSeconds;
@@ -4460,13 +4875,25 @@ static void handleSave()
 
         case CONFIG_SAVE_INTERNAL_ONLY:
 
-            // The running system should honor the just-saved sleep policy
-            // immediately even when only the internal fallback was written.
+            // The running system should honor the just-saved FPS and sleep
+            // policy immediately even when only the internal fallback was
+            // written. Config saves are rejected while recording is active,
+            // so changing the recorder/pacing FPS here is safe.
+            cfg_fps =
+                fps;
+
             cfg_sleep_mode =
                 sleepMode;
 
             cfg_sleep_delay_ms =
                 sleepDelayMs;
+
+            // Keep the rendered WebConfig state in sync with the just-saved
+            // value. Enabling is armed on the next cold boot; disabling stops
+            // the runtime stability timer immediately and clears persisted
+            // bootloop state on the next boot.
+            cfg_bootloop_protection =
+                bootloopProtection;
 
             cfg_transport_check_seconds =
                 transportCheckSeconds;
@@ -7026,6 +7453,12 @@ static void redirectSdMaintenanceResult(
     // subsystems. Even though all known SD users are closed/reopened during
     // maintenance, reboot after a successful Format/Secure Erase gives every
     // module a completely fresh mount and avoids stale state in future code.
+    //
+    // Normal Format returns directly to the dashboard. The dashboard already
+    // renders the one-shot success notice and immediately replaces the browser
+    // history URL with "/", so a later reload cannot get stuck on a stale
+    // "format completed" subpage. Secure Erase keeps its dedicated reboot page
+    // because that path has its own asynchronous progress workflow.
     if (
         result == SD_MAINT_RESULT_OK &&
         (
@@ -7042,7 +7475,7 @@ static void redirectSdMaintenanceResult(
         server.sendHeader(
             "Location",
             mode == SD_MAINT_FORMAT
-            ? "/rebooting?reason=sd_format"
+            ? "/?notice=sd_format_done"
             : "/rebooting?reason=sd_secure"
         );
 
@@ -8958,6 +9391,9 @@ static void appendRadarRateOptions(
 
 static void handleRadarLive()
 {
+    if (rejectRadarConfigurationUnavailable())
+        return;
+
     // This endpoint only returns values already cached in RAM by radarLoop().
     // It does not enter configuration mode and does not touch the SD card.
     //
@@ -9146,6 +9582,9 @@ static void appendRadarCalibrationSessionJson(
 
 static void handleRadarCalibrationStatus()
 {
+    if (rejectRadarConfigurationUnavailable())
+        return;
+
     String json;
 
     json.reserve(
@@ -9195,6 +9634,9 @@ static void handleRadarCalibrationStatus()
 
 static void handleRadarCalibrationAction()
 {
+    if (rejectRadarConfigurationUnavailable())
+        return;
+
     String action =
         server.arg("action");
 
@@ -9280,6 +9722,9 @@ static void handleRadarCalibrationAction()
 
 static void handleRadarConfig()
 {
+    if (rejectRadarConfigurationUnavailable())
+        return;
+
     // Opening/navigating to Radar Config is explicit operator activity. If the
     // recording automation is paused, refresh its lease immediately before the
     // synchronous UART settings read below.
@@ -10017,6 +10462,9 @@ static void handleRadarConfig()
 
 static void handleRadarConfigSave()
 {
+    if (rejectRadarConfigurationUnavailable())
+        return;
+
     bool recordingActive =
         recorderIsOpen();
 
@@ -10159,6 +10607,9 @@ static void handleRadarConfigSave()
 
 static void handleRadarConfigDefaults()
 {
+    if (rejectRadarConfigurationUnavailable())
+        return;
+
     bool recordingActive =
         recorderIsOpen();
 
@@ -15122,6 +15573,33 @@ static void handleSysInfo()
 
     html +=
         "<section class='settings-section'>"
+        "<h3>" +
+        htmlText(UI_MOTION_SENSOR_TYPE) +
+        "</h3><p><span class='status-pill ok'>" +
+        htmlText(motionSensorTypeUiId()) +
+        "</span></p>" +
+        htmlText(UI_PRESENCE_INPUT) +
+        ": GPIO" +
+        String((int)PIR_PIN);
+
+    if (radarConfigAvailable()) {
+        html +=
+            "<br>UART: RX=GPIO" +
+            String((int)RADAR_RX_PIN) +
+            " / TX=GPIO" +
+            String((int)RADAR_TX_PIN);
+    } else {
+        html +=
+            "<p class='muted'>" +
+            htmlText(UI_RADAR_CONFIG_PIR_NOTE) +
+            "</p>";
+    }
+
+    html +=
+        "</section>";
+
+    html +=
+        "<section class='settings-section'>"
         "<h3>Echtzeituhr (RTC)</h3>";
 
     if (rtcDetected()) {
@@ -15457,6 +15935,7 @@ void webConfigStart()
         });
 
         server.on("/ui_status", HTTP_GET, handleUiStatus);
+        server.on("/motion_status", HTTP_GET, handleMotionStatus);
         server.on("/language", HTTP_POST, handleLanguageChange);
         server.on("/recording_pause", HTTP_POST, handleRecordingPause);
         server.on("/recording_pause_keepalive", HTTP_POST, handleRecordingPauseKeepalive);

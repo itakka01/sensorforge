@@ -17,6 +17,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include <math.h>
+#include <Preferences.h>
 
 #include "esp_sleep.h"
 #include "esp_timer.h"
@@ -42,6 +43,7 @@
 #include "recording_crypto.h"
 #include "log_storage.h"
 #include "image_motion.h"
+#include "motion_diagnostics.h"
 
 
 // =============================================================
@@ -148,6 +150,38 @@ static bool bootStartedWithoutSd = false;
 unsigned long lastMotionMs = 0;
 uint32_t lastFrameUs = 0;
 static unsigned long recordingSegmentStartMs = 0;
+
+// Runtime recording-performance monitor. This intentionally does NOT add a
+// frame queue or change/drop frames. It only measures how long the existing
+// synchronous camera+container+storage call takes compared with the configured
+// frame budget. Logging is deferred to safe segment/event boundaries so the
+// monitor itself does not add SD/Serial work to the per-frame critical path.
+struct RecordingPerformanceStats {
+    uint32_t frameCalls;
+    uint32_t nearBudgetFrames;
+    uint32_t overBudgetFrames;
+    uint32_t worstCallUs;
+    uint64_t totalCallUs;
+};
+
+static RecordingPerformanceStats recordingPerformanceSegment = {};
+static RecordingPerformanceStats recordingPerformanceEvent = {};
+
+// Explicit prototypes are required in the .ino because Arduino's sketch
+// preprocessor otherwise auto-generates prototypes before the custom struct
+// above is visible, which causes "RecordingPerformanceStats was not declared".
+static void recordingPerformanceReset(
+    RecordingPerformanceStats &stats
+);
+static void recordingPerformanceNoteCall(
+    RecordingPerformanceStats &stats,
+    uint32_t callUs,
+    uint32_t frameBudgetUs
+);
+static void recordingPerformanceLogSummary(
+    const char *scope,
+    const RecordingPerformanceStats &stats
+);
 
 // Recording-event safety limit. Unlike recording_segment_seconds, this timer
 // spans every segment that belongs to the same continuous recording event.
@@ -348,9 +382,9 @@ static bool handleTransportModeBoot(
 // PIR STARTUP GUARD
 // =============================================================
 
-// The SR602 output can be HIGH for roughly two seconds after its
-// supply is applied. On a normal/cold boot this must not be treated
-// as real motion. Three seconds gives a conservative margin.
+// Small digital PIR modules such as AM312/SR602 can assert their output
+// briefly while settling after power is applied. On a normal/cold boot this
+// must not be treated as real motion. Three seconds gives a conservative margin.
 //
 // On wake from deep sleep the sensor remains powered, so the guard
 // is deliberately skipped: PIR HIGH is then the real wake event.
@@ -367,7 +401,8 @@ static unsigned long pirStartupGuardUntilMs = 0;
 //   switch closed -> LOW
 //
 // The state is runtime-only. It does not alter config.txt.
-// While awake, a stable HIGH->LOW edge toggles WiFi immediately.
+// While awake, a stable HIGH->LOW edge can only switch WiFi/WebConfig ON.
+// If WiFi/WebConfig is already running, further magnet pulses are ignored.
 // During light/deep sleep, LOW is also a wake source; a magnet wake
 // explicitly starts WiFi/WebConfig.
 static const unsigned long MAGNET_DEBOUNCE_MS = 60UL;
@@ -635,6 +670,376 @@ static const char *resetReasonName(
         case ESP_RST_SDIO:      return "SDIO";
         default:                return "UNKNOWN";
     }
+}
+
+
+// =============================================================
+// LOW-POWER / BOOT-LOOP PROTECTION
+// =============================================================
+//
+// Goal:
+// Prevent a depleted/unstable supply from repeatedly booting SensorForge,
+// starting high-load subsystems, collapsing, and immediately booting again.
+//
+// This deliberately does NOT interpret every hard power cut as a fault. The
+// persistent marker is cleared after 60 seconds of stable runtime. Therefore
+// a normal user power-off after a healthy session does not contribute to the
+// failure streak. Only consecutive cold boots that never become stable count.
+// Normal deep-sleep wakes are explicitly excluded.
+//
+// The state lives in ESP32 NVS, so no DS3231/AT24C32 is required. The feature
+// can be disabled with bootloop_protection=0 in config.txt. When disabled, all
+// stored protection state is cleared immediately after the config is loaded.
+static const char BOOTLOOP_NVS_NAMESPACE[] = "sfboot";
+static const uint8_t BOOTLOOP_FAILURE_THRESHOLD = 3;
+static const uint32_t BOOTLOOP_STABLE_AFTER_MS = 60000UL;
+
+static bool bootloopProtectionArmed = false;
+static uint32_t bootloopProtectionArmedMs = 0;
+
+
+static uint64_t bootloopProtectionBackoffUs(
+    uint8_t level
+)
+{
+    // level 0 -> 30 min, level 1 -> 2 h, level >=2 -> 6 h.
+    if (level == 0) {
+        return 30ULL * 60ULL * 1000000ULL;
+    }
+
+    if (level == 1) {
+        return 2ULL * 60ULL * 60ULL * 1000000ULL;
+    }
+
+    return 6ULL * 60ULL * 60ULL * 1000000ULL;
+}
+
+
+static void bootloopProtectionClearPersistentState()
+{
+    Preferences prefs;
+
+    if (!prefs.begin(
+            BOOTLOOP_NVS_NAMESPACE,
+            false
+        )) {
+        Serial.println(
+            "BOOTLOOP protection: NVS unavailable while clearing state"
+        );
+        return;
+    }
+
+    bool hasState =
+        prefs.getBool("pending", false) ||
+        prefs.getUChar("failures", 0) != 0 ||
+        prefs.getUChar("level", 0) != 0 ||
+        prefs.getBool("guard_sleep", false);
+
+    if (hasState) {
+        prefs.clear();
+    }
+
+    prefs.end();
+}
+
+
+static void bootloopProtectionEnterSleep(
+    uint64_t sleepUs,
+    uint8_t failureCount,
+    uint8_t backoffLevel
+)
+{
+    uint64_t sleepSeconds =
+        sleepUs /
+        1000000ULL;
+
+    Serial.println();
+    Serial.println(
+        "============================================================"
+    );
+    Serial.println(
+        "LOW-POWER BOOT-LOOP PROTECTION ACTIVE"
+    );
+    Serial.printf(
+        "Detected %u consecutive unstable cold boots.\n",
+        (unsigned)failureCount
+    );
+    Serial.printf(
+        "High-load startup is stopped. Sleeping for %llu seconds.\n",
+        (unsigned long long)sleepSeconds
+    );
+    Serial.printf(
+        "Backoff level: %u | config: bootloop_protection=1\n",
+        (unsigned)backoffLevel
+    );
+    Serial.println(
+        "After the timer wake SensorForge will make one new normal boot attempt."
+    );
+    Serial.println(
+        "Set bootloop_protection=0 to disable this protection if required."
+    );
+    Serial.println(
+        "============================================================"
+    );
+
+    // Config has already been loaded, but camera/WiFi/recording have not been
+    // started. Release the SD bus before sleeping so the low-power lockout is
+    // as quiet as possible.
+    if (sdReady) {
+        STORAGE.end();
+        sdReady = false;
+    }
+
+#if defined(STORAGE_SPI)
+    SPI.end();
+#endif
+
+    // Protection sleep must be timer-only. Presence/magnet wake sources would
+    // otherwise turn a depleted unit back into a tight wake loop.
+    esp_sleep_disable_wakeup_source(
+        ESP_SLEEP_WAKEUP_ALL
+    );
+
+    esp_sleep_enable_timer_wakeup(
+        sleepUs
+    );
+
+    Serial.flush();
+    delay(30);
+    esp_deep_sleep_start();
+
+    // Defensive fallback; deep sleep should never return.
+    ESP.restart();
+}
+
+
+static bool bootloopProtectionHandleBoot(
+    esp_reset_reason_t resetReason
+)
+{
+    bootloopProtectionArmed = false;
+    bootloopProtectionArmedMs = 0;
+
+    if (!cfg_bootloop_protection) {
+        bootloopProtectionClearPersistentState();
+        Serial.println(
+            "BOOTLOOP protection: disabled by config"
+        );
+        return false;
+    }
+
+    Preferences prefs;
+
+    if (!prefs.begin(
+            BOOTLOOP_NVS_NAMESPACE,
+            false
+        )) {
+        // Fail open: this protection is a resilience feature and must never
+        // brick a unit merely because NVS is unavailable/corrupt.
+        Serial.println(
+            "BOOTLOOP protection: NVS unavailable - protection skipped"
+        );
+        return false;
+    }
+
+    bool pending =
+        prefs.getBool(
+            "pending",
+            false
+        );
+
+    uint8_t failures =
+        prefs.getUChar(
+            "failures",
+            0
+        );
+
+    uint8_t backoffLevel =
+        prefs.getUChar(
+            "level",
+            0
+        );
+
+    bool protectionSleep =
+        prefs.getBool(
+            "guard_sleep",
+            false
+        );
+
+    // A timer wake from our own protection sleep is a deliberate retry, not a
+    // failed boot. Preserve the backoff level so repeated low-battery episodes
+    // escalate 30 min -> 2 h -> 6 h.
+    if (protectionSleep) {
+        pending = false;
+        failures = 0;
+        prefs.putBool(
+            "guard_sleep",
+            false
+        );
+
+        Serial.printf(
+            "BOOTLOOP protection: retry after protection sleep | level=%u\n",
+            (unsigned)backoffLevel
+        );
+    }
+
+    // Any ordinary deep-sleep wake proves that the preceding SensorForge boot
+    // progressed far enough to enter an intentional sleep path. Do not let
+    // normal deep-sleep operation look like a battery boot loop.
+    if (
+        resetReason == ESP_RST_DEEPSLEEP &&
+        !protectionSleep
+    ) {
+        if (
+            pending ||
+            failures != 0 ||
+            backoffLevel != 0
+        ) {
+            prefs.clear();
+        }
+
+        prefs.end();
+
+        Serial.println(
+            "BOOTLOOP protection: normal deep-sleep wake - not counted"
+        );
+        return false;
+    }
+
+    const bool powerRelatedColdReset =
+        resetReason == ESP_RST_POWERON ||
+        resetReason == ESP_RST_BROWNOUT;
+
+    if (powerRelatedColdReset) {
+        if (pending) {
+            if (failures < 255) {
+                ++failures;
+            }
+
+            Serial.printf(
+                "BOOTLOOP protection: previous cold boot did not become stable | count=%u/%u | reset=%s\n",
+                (unsigned)failures,
+                (unsigned)BOOTLOOP_FAILURE_THRESHOLD,
+                resetReasonName(resetReason)
+            );
+        } else {
+            failures = 0;
+        }
+    } else if (!protectionSleep) {
+        // PANIC/WDT/SW/EXT are software/service/reset categories, not evidence
+        // of a depleted battery. Break a possible power-failure streak so a
+        // firmware problem cannot be hidden behind the low-power lockout.
+        failures = 0;
+        backoffLevel = 0;
+    }
+
+    if (
+        powerRelatedColdReset &&
+        failures >= BOOTLOOP_FAILURE_THRESHOLD
+    ) {
+        uint8_t sleepLevel =
+            backoffLevel;
+
+        uint64_t sleepUs =
+            bootloopProtectionBackoffUs(
+                sleepLevel
+            );
+
+        uint8_t nextLevel =
+            sleepLevel < 2
+            ? (uint8_t)(sleepLevel + 1)
+            : (uint8_t)2;
+
+        // Reset the short-boot counter before sleeping. If power is physically
+        // removed during the protection sleep, the next real power-on gets one
+        // clean recovery attempt instead of being permanently locked out.
+        prefs.putBool(
+            "pending",
+            false
+        );
+        prefs.putUChar(
+            "failures",
+            0
+        );
+        prefs.putUChar(
+            "level",
+            nextLevel
+        );
+        prefs.putBool(
+            "guard_sleep",
+            true
+        );
+        prefs.end();
+
+        bootloopProtectionEnterSleep(
+            sleepUs,
+            failures,
+            sleepLevel
+        );
+
+        return true;
+    }
+
+    // Arm the current COLD/recovery boot. A later POWERON/BROWNOUT before the
+    // stable timer expires will see this marker and count one incomplete boot.
+    prefs.putBool(
+        "pending",
+        true
+    );
+    prefs.putUChar(
+        "failures",
+        failures
+    );
+    prefs.putUChar(
+        "level",
+        backoffLevel
+    );
+    prefs.putBool(
+        "guard_sleep",
+        false
+    );
+    prefs.end();
+
+    bootloopProtectionArmed = true;
+    bootloopProtectionArmedMs = millis();
+
+    Serial.printf(
+        "BOOTLOOP protection: armed | stable_after=%lu s | incomplete_count=%u/%u\n",
+        (unsigned long)(BOOTLOOP_STABLE_AFTER_MS / 1000UL),
+        (unsigned)failures,
+        (unsigned)BOOTLOOP_FAILURE_THRESHOLD
+    );
+
+    return false;
+}
+
+
+static void bootloopProtectionLoop()
+{
+    if (
+        !bootloopProtectionArmed ||
+        !cfg_bootloop_protection
+    ) {
+        return;
+    }
+
+    if (
+        (uint32_t)(
+            millis() -
+            bootloopProtectionArmedMs
+        ) <
+        BOOTLOOP_STABLE_AFTER_MS
+    ) {
+        return;
+    }
+
+    bootloopProtectionClearPersistentState();
+    bootloopProtectionArmed = false;
+    bootloopProtectionArmedMs = 0;
+
+    Serial.println(
+        "BOOTLOOP protection: boot stable for 60 s - failure streak cleared"
+    );
 }
 
 
@@ -1077,12 +1482,14 @@ bool simulatedMotionActive()
 
 bool physicalMotionActive()
 {
-    // Normal awake recording uses the fast UART gate-energy detector.
-    // OT2 is intentionally NOT used here because its internal presence
-    // state has a minimum ~10-second no-person hold.
+    // When an LD2410S was detected, normal awake recording uses the fast UART
+    // gate-energy detector. OT2 is intentionally not preferred because its
+    // internal presence state has a comparatively long no-person hold.
     //
-    // If the UART motion mode could not be initialized, fall back to OT2
-    // so the camera still remains functional.
+    // If no LD2410S was detected after the robust boot retries, the same
+    // PRESENCE_PIN is a standalone PIR/digital motion input (for example AM312).
+    // If a detected radar later loses fresh UART reports, the digital OT2 input
+    // remains the safe fallback.
     if (radarMotionTrackingAvailable()) {
         return radarMotionActive();
     }
@@ -5647,6 +6054,103 @@ bool recoverCamera()
 // START RECORDING
 // =============================================================
 
+static void recordingPerformanceReset(
+    RecordingPerformanceStats &stats
+)
+{
+    stats.frameCalls = 0;
+    stats.nearBudgetFrames = 0;
+    stats.overBudgetFrames = 0;
+    stats.worstCallUs = 0;
+    stats.totalCallUs = 0;
+}
+
+
+static void recordingPerformanceNoteCall(
+    RecordingPerformanceStats &stats,
+    uint32_t callUs,
+    uint32_t frameBudgetUs
+)
+{
+    stats.frameCalls++;
+    stats.totalCallUs +=
+        (uint64_t)callUs;
+
+    if (callUs > stats.worstCallUs)
+        stats.worstCallUs = callUs;
+
+    // 80% is an early pressure indicator. It does not mean a frame was lost;
+    // only calls above 100% have consumed more than one complete frame budget.
+    uint32_t nearBudgetUs =
+        (uint32_t)(
+            ((uint64_t)frameBudgetUs * 80ULL) /
+            100ULL
+        );
+
+    if (callUs >= nearBudgetUs)
+        stats.nearBudgetFrames++;
+
+    if (callUs > frameBudgetUs)
+        stats.overBudgetFrames++;
+}
+
+
+static void recordingPerformanceLogSummary(
+    const char *scope,
+    const RecordingPerformanceStats &stats
+)
+{
+    if (stats.frameCalls == 0)
+        return;
+
+    uint32_t frameBudgetUs =
+        1000000UL /
+        (uint32_t)max(cfg_fps, 1);
+
+    uint32_t averageUs =
+        (uint32_t)(
+            stats.totalCallUs /
+            (uint64_t)stats.frameCalls
+        );
+
+    String message =
+        String(
+            stats.overBudgetFrames > 0
+                ? "RECORDING PERFORMANCE WARNING"
+                : "RECORDING PERFORMANCE"
+        ) +
+        " | scope=" +
+        String(scope ? scope : "unknown") +
+        " | target_fps=" +
+        String(cfg_fps) +
+        " | budget_ms=" +
+        String((float)frameBudgetUs / 1000.0f, 1) +
+        " | calls=" +
+        String((unsigned long)stats.frameCalls) +
+        " | near80=" +
+        String((unsigned long)stats.nearBudgetFrames) +
+        " | over_budget=" +
+        String((unsigned long)stats.overBudgetFrames) +
+        " | avg_ms=" +
+        String((float)averageUs / 1000.0f, 1) +
+        " | worst_ms=" +
+        String((float)stats.worstCallUs / 1000.0f, 1);
+
+    logWrite(
+        message
+    );
+
+    // Only surface an immediate console warning when the actual frame budget
+    // was exceeded. Normal statistics stay in the log to keep the console quiet.
+    if (stats.overBudgetFrames > 0) {
+        consoleWrite(
+            "REC",
+            message
+        );
+    }
+}
+
+
 bool startRecording() {
 
     // Timestamp function entry before doing any recorder prechecks. This lets
@@ -5697,6 +6201,38 @@ bool startRecording() {
         webConfigRecordingPaused()
     ) {
         return false;
+    }
+
+    {
+        uint32_t performanceLoad = 0;
+        uint32_t performanceLimit = 0;
+
+        if (!configRecordingPerformanceAllowed(
+                cfg_resolution,
+                cfg_fps,
+                cfg_quality,
+                performanceLoad,
+                performanceLimit
+            )) {
+
+            String message =
+                "BLOCKED | recording performance limit | score=" +
+                String((unsigned long)performanceLoad) +
+                " | limit=" +
+                String((unsigned long)performanceLimit);
+
+            consoleWrite(
+                "REC",
+                message
+            );
+
+            logWrite(
+                "Recording " +
+                message
+            );
+
+            return false;
+        }
     }
 
     if (!sdReady) {
@@ -5914,6 +6450,13 @@ bool startRecording() {
     recordingEventStartMs = recordingStartMs;
     consecutiveFrameFailures = 0;
 
+    recordingPerformanceReset(
+        recordingPerformanceSegment
+    );
+    recordingPerformanceReset(
+        recordingPerformanceEvent
+    );
+
     // Start a fresh event-level thermal accumulator. The regular thermal
     // monitor will add samples in RAM while recording is active.
     recordingThermalReset();
@@ -5969,6 +6512,12 @@ static bool rotateRecordingSegment(const String &reason)
 
         return false;
     }
+
+
+    recordingPerformanceLogSummary(
+        "segment",
+        recordingPerformanceSegment
+    );
 
 
     // A segment boundary is also a safe point for the storage guard:
@@ -6085,6 +6634,10 @@ static bool rotateRecordingSegment(const String &reason)
     lastSpaceCheckMs = millis();
     consecutiveFrameFailures = 0;
 
+    recordingPerformanceReset(
+        recordingPerformanceSegment
+    );
+
     return true;
 }
 
@@ -6100,6 +6653,11 @@ void stopRecording() {
 
     bool finalized =
         recorderEnd();
+
+    recordingPerformanceLogSummary(
+        "event",
+        recordingPerformanceEvent
+    );
 
     if (!finalized) {
 
@@ -7403,6 +7961,12 @@ static bool enterLightSleep()
     esp_sleep_wakeup_cause_t wakeCause =
         esp_sleep_get_wakeup_cause();
 
+    // Preserve a real PIR/OT2 wake immediately. This is RAM-only and adds no
+    // SD/log work to the latency-sensitive wake path.
+    if (wakeCause == ESP_SLEEP_WAKEUP_EXT1) {
+        motionDiagnosticsNotePresenceTrigger();
+    }
+
     const bool wakeCanStartRecording =
         configRecordingAllowedNow() &&
         !recordingSafetyCooldownActive();
@@ -7830,7 +8394,7 @@ void startWebConfig()
 
 
 // =============================================================
-// MAGNET / REED WIFI TOGGLE
+// MAGNET / REED WIFI ON SWITCH
 // =============================================================
 
 void stopWebConfigWifi(
@@ -7873,16 +8437,13 @@ void stopWebConfigWifi(
 }
 
 
-void toggleWifiByMagnet()
+void enableWifiByMagnet()
 {
-    // Manual magnet action is always immediate.
-    // cfg_wifi_timeout_sec controls ONLY automatic inactivity shutdown.
+    // Magnet action is intentionally ON-only. The reed contact is a reliable
+    // service/wake request, never a toggle: repeated passes with the magnet must
+    // not accidentally turn WiFi/WebConfig off. Automatic inactivity shutdown
+    // remains controlled exclusively by cfg_wifi_timeout_sec.
     if (webConfigStarted) {
-
-        stopWebConfigWifi(
-            "Magnet switch: WiFi OFF"
-        );
-
         return;
     }
 
@@ -7962,7 +8523,7 @@ void initMagnetSwitch()
 
     // Adopt the physical boot state without generating an event.
     // If a magnet/button is already present, it must be released
-    // once before a later close can toggle WiFi.
+    // once before a later close can request WiFi ON.
     magnetRawState =
         digitalRead(
             MAGNET_SWITCH_PIN
@@ -8015,13 +8576,14 @@ void handleMagnetSwitch()
             rawState;
 
 
-        // Toggle exactly once on the stable HIGH -> LOW edge.
+        // Handle exactly once on the stable HIGH -> LOW edge. The action is ON-only;
+        // when WiFi/WebConfig is already active this becomes a deliberate no-op.
         if (
             magnetStableState ==
             LOW
         ) {
 
-            toggleWifiByMagnet();
+            enableWifiByMagnet();
         }
     }
 }
@@ -8178,16 +8740,29 @@ static bool startRadarMotionTrackingRobust()
     }
 
 
-    Serial.println(
-        "LD2410S fast motion unavailable after retries: " +
-        lastError +
-        " - falling back to OT2"
-    );
+    if (radarSensorDetected()) {
+        Serial.println(
+            "LD2410S detected but fast motion tracking unavailable after retries: " +
+            lastError +
+            " - falling back to OT2"
+        );
 
-    logWrite(
-        "LD2410S fast motion unavailable after retries: " +
-        lastError
-    );
+        logWrite(
+            "LD2410S detected | fast motion tracking unavailable | OT2 fallback: " +
+            lastError
+        );
+    } else {
+        Serial.println(
+            "LD2410S not detected after 4 attempts: " +
+            lastError +
+            " - motion sensor mode=PIR/digital input"
+        );
+
+        logWrite(
+            "Motion sensor mode=PIR/digital input | LD2410S unavailable after retries: " +
+            lastError
+        );
+    }
 
 
     return false;
@@ -8385,7 +8960,7 @@ void setup() {
 
 
     Serial.printf(
-        "Presence/OT2 GPIO: %d\n",
+        "Presence/PIR GPIO: %d\n",
         PIR_PIN
     );
 
@@ -8478,6 +9053,23 @@ void setup() {
     loadConfig(
         sdReady
     );
+
+
+    // ---------------------------------------------------------
+    // Low-power / boot-loop protection
+    //
+    // Config must be known first because bootloop_protection is an explicit
+    // operator switch. This still runs before license crypto provisioning,
+    // camera, radar and WiFi startup. A depleted unit therefore avoids the
+    // dominant high-load startup work once a short-boot streak is detected.
+    // ---------------------------------------------------------
+
+    if (bootloopProtectionHandleBoot(
+            resetReason
+        )) {
+        // Protection deep sleep normally never returns.
+        return;
+    }
 
 
     // ---------------------------------------------------------
@@ -8805,7 +9397,24 @@ void setup() {
     // LD2410S fast UART motion mode
     // ---------------------------------------------------------
 
-    startRadarMotionTrackingRobust();
+    const bool radarTrackingReady =
+        startRadarMotionTrackingRobust();
+
+    if (radarSensorDetected()) {
+        Serial.printf(
+            "Motion sensor mode: LD2410S RADAR | fast_tracking=%s\n",
+            radarTrackingReady ? "ready" : "fallback-to-OT2"
+        );
+        logWrite(
+            String("Motion sensor mode=LD2410S radar | fast_tracking=") +
+            (radarTrackingReady ? "ready" : "OT2-fallback")
+        );
+    } else {
+        Serial.printf(
+            "Motion sensor mode: PIR/digital input | GPIO=%d\n",
+            PIR_PIN
+        );
+    }
 
 
     // Sleep wake sources are configured only immediately before
@@ -8831,7 +9440,7 @@ void setup() {
 
             if (!guardAnnounced) {
                 Serial.println(
-                    "PIR startup guard active"
+                    "Presence/PIR startup guard active"
                 );
                 guardAnnounced = true;
             }
@@ -8849,12 +9458,17 @@ void setup() {
         }
 
         Serial.printf(
-            "Presence/OT2 ready, state=%s\n",
+            "Presence input ready, state=%s\n",
             digitalRead(PIR_PIN) == HIGH
                 ? "HIGH"
                 : "LOW"
         );
     }
+
+    // Start RAM-only motion diagnostics only after the normal PIR startup guard
+    // has completed. A presence wake is recorded explicitly so a short pulse
+    // remains visible later in WebConfig.
+    motionDiagnosticsBegin(wokeByPresence);
 
 
     // ---------------------------------------------------------
@@ -8885,9 +9499,9 @@ void setup() {
         motionDetected()
     ) {
 
-        // On a normal power-on, use the fast UART motion detector.
-        // OT2 is used here only automatically if UART motion tracking
-        // failed and physicalMotionActive() falls back to it.
+        // On a normal power-on, use the fast UART detector when LD2410S was
+        // detected. Otherwise physicalMotionActive() uses the standalone
+        // PIR/digital presence input automatically.
 
         Serial.println(
             "Motion active on normal boot"
@@ -8955,6 +9569,10 @@ void loop() {
 
     feedWatchdog();
 
+    // A cold boot that survives the configured stabilization period is marked
+    // healthy in NVS. This is intentionally tiny/non-blocking after arming.
+    bootloopProtectionLoop();
+
     // Non-blocking recording/fault LED state.
     updateStatusLed();
 
@@ -8962,9 +9580,12 @@ void loop() {
     // Active only while the ESP32 is awake.
     handleMagnetSwitch();
 
-    // Consume the LD2410S compact UART report stream.
-    // Recording decisions still use the dedicated OT2 GPIO.
+    // Consume the LD2410S UART report stream. Fast radar decisions use the
+    // gate-energy reports; PRESENCE_PIN remains the wake/fallback input.
     radarLoop();
+
+    // RAM-only edge tracking for the WebConfig live motion display.
+    motionDiagnosticsLoop();
 
     if (
         imageVerifyRejectedUntilMotionClear &&
@@ -9282,8 +9903,12 @@ void loop() {
                     radarLastMotionEnergyDb()
                 );
                 motionMessage = String(motionBuffer);
-            } else {
+            } else if (
+                radarSensorDetected()
+            ) {
                 motionMessage = "OT2 fallback";
+            } else {
+                motionMessage = "PIR/digital input";
             }
 
             if (wakeCriticalPathActive) {
@@ -9405,23 +10030,35 @@ void loop() {
         uint32_t framesBefore =
             recorderGetFrameCount();
 
-        uint64_t frameCallStartUs = 0;
+        uint64_t frameCallStartUs =
+            (uint64_t)esp_timer_get_time();
 
         if (wakeTimingActive) {
-            frameCallStartUs =
-                (uint64_t)esp_timer_get_time();
-
             wakeTimingFrameAttempts++;
         }
 
         recorderAddFrame();
 
-        uint64_t frameCallDoneUs = 0;
+        uint64_t frameCallDoneUs =
+            (uint64_t)esp_timer_get_time();
 
-        if (wakeTimingActive) {
-            frameCallDoneUs =
-                (uint64_t)esp_timer_get_time();
-        }
+        uint32_t frameCallDurationUs =
+            (uint32_t)(
+                frameCallDoneUs -
+                frameCallStartUs
+            );
+
+        recordingPerformanceNoteCall(
+            recordingPerformanceSegment,
+            frameCallDurationUs,
+            frameIntervalUs
+        );
+
+        recordingPerformanceNoteCall(
+            recordingPerformanceEvent,
+            frameCallDurationUs,
+            frameIntervalUs
+        );
 
         uint32_t framesAfter =
             recorderGetFrameCount();

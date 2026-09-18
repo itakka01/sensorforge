@@ -53,6 +53,7 @@ extern String cfg_image_motion_roi_mask; // 20x15 compact bit mask, 76 hex chars
 // Sleep / power management
 extern String cfg_sleep_mode;         // "off", "light_sleep", "deep_sleep"
 extern int cfg_sleep_delay_ms;        // 0..60000 ms idle delay before sleep
+extern int cfg_bootloop_protection;   // 0/1, persistent unstable-cold-boot protection
 
 // Transport mode.
 // transport_mode is an operational persistent flag set from WebConfig.
@@ -159,6 +160,35 @@ bool configCopyInternalToSd(
 // unless a valid internal LittleFS copy is available first.
 bool configDeleteSdCopy(
     String &error
+);
+
+
+// Board-specific recording performance guard.
+//
+// The limit itself lives in board_config.h because it describes qualified
+// hardware performance, not a user preference. The score is a deliberately
+// coarse weighted pixel rate used only as an upper configuration ceiling:
+//
+//   width * height * fps * JPEG-quality-weight / 100
+//
+// A board limit of 0 means that no board-specific ceiling has been qualified.
+uint32_t configRecordingPerformanceLimit();
+uint16_t configRecordingQualityWeightPercent(int quality);
+uint32_t configRecordingPerformanceLoad(
+    const String &resolution,
+    int fps,
+    int quality
+);
+int configRecordingPerformanceMaxFps(
+    const String &resolution,
+    int quality
+);
+bool configRecordingPerformanceAllowed(
+    const String &resolution,
+    int fps,
+    int quality,
+    uint32_t &load,
+    uint32_t &limit
 );
 
 

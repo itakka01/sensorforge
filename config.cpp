@@ -61,6 +61,7 @@ String cfg_image_motion_roi_mask = imageMotionDefaultRoiMask();
 
 String cfg_sleep_mode = "off";
 int cfg_sleep_delay_ms = 2000;
+int cfg_bootloop_protection = 1;
 
 int cfg_transport_mode = 0;
 int cfg_transport_check_seconds = 120;
@@ -166,6 +167,7 @@ struct ConfigValues {
 
     String sleepMode;
     int sleepDelayMs;
+    int bootloopProtection;
 
     int transportMode;
     int transportCheckSeconds;
@@ -236,6 +238,7 @@ struct ConfigSeen {
 
     bool sleepMode;
     bool sleepDelayMs;
+    bool bootloopProtection;
 
     bool transportMode;
     bool transportCheckSeconds;
@@ -386,6 +389,9 @@ static ConfigValues makeDefaultValues()
     values.sleepDelayMs =
         2000;
 
+    values.bootloopProtection =
+        1;
+
     values.transportMode =
         0;
 
@@ -532,6 +538,179 @@ static bool isSupportedResolution(
         value == "1280x1024" ||
         value == "1600x1200" ||
         value == "2048x1536";
+}
+
+
+static uint32_t resolutionPixelCount(
+    const String &value
+)
+{
+    if (value == "160x120")
+        return 160UL * 120UL;
+
+    if (value == "320x240")
+        return 320UL * 240UL;
+
+    if (value == "640x480")
+        return 640UL * 480UL;
+
+    if (value == "800x600")
+        return 800UL * 600UL;
+
+    if (value == "1024x768")
+        return 1024UL * 768UL;
+
+    if (value == "1280x1024")
+        return 1280UL * 1024UL;
+
+    if (value == "1600x1200")
+        return 1600UL * 1200UL;
+
+    if (value == "2048x1536")
+        return 2048UL * 1536UL;
+
+    return 0;
+}
+
+
+uint32_t configRecordingPerformanceLimit()
+{
+    return
+        (uint32_t)RECORDING_MAX_WEIGHTED_PIXEL_RATE;
+}
+
+
+uint16_t configRecordingQualityWeightPercent(int quality)
+{
+    // esp32-camera JPEG quality uses a smaller numeric value for better image
+    // quality and normally larger JPEG frames. The performance guard therefore
+    // adds a conservative 5% load per step below the tested reference value 12.
+    // Numerically larger values never increase the allowed board ceiling: the
+    // minimum weight remains 100%. The maximum 160% also covers quality=0.
+    if (quality >= 12)
+        return 100;
+
+    if (quality < 0)
+        quality = 0;
+
+    int percent =
+        100 +
+        (12 - quality) * 5;
+
+    if (percent > 160)
+        percent = 160;
+
+    return
+        (uint16_t)percent;
+}
+
+
+uint32_t configRecordingPerformanceLoad(
+    const String &resolution,
+    int fps,
+    int quality
+)
+{
+    uint32_t pixels =
+        resolutionPixelCount(
+            resolution
+        );
+
+    if (pixels == 0 || fps <= 0)
+        return 0;
+
+    uint32_t qualityWeight =
+        configRecordingQualityWeightPercent(
+            quality
+        );
+
+    uint64_t weighted =
+        (uint64_t)pixels *
+        (uint64_t)fps *
+        (uint64_t)qualityWeight;
+
+    weighted =
+        (weighted + 99ULL) /
+        100ULL;
+
+    if (weighted > UINT32_MAX)
+        return UINT32_MAX;
+
+    return
+        (uint32_t)weighted;
+}
+
+
+int configRecordingPerformanceMaxFps(
+    const String &resolution,
+    int quality
+)
+{
+    uint32_t limit =
+        configRecordingPerformanceLimit();
+
+    // 0 explicitly means: this board has no qualified performance ceiling yet.
+    if (limit == 0)
+        return 30;
+
+    uint32_t pixels =
+        resolutionPixelCount(
+            resolution
+        );
+
+    if (pixels == 0)
+        return 0;
+
+    uint32_t qualityWeight =
+        configRecordingQualityWeightPercent(
+            quality
+        );
+
+    uint64_t denominator =
+        (uint64_t)pixels *
+        (uint64_t)qualityWeight;
+
+    if (denominator == 0)
+        return 0;
+
+    uint64_t maxFps =
+        ((uint64_t)limit * 100ULL) /
+        denominator;
+
+    if (maxFps > 30ULL)
+        maxFps = 30ULL;
+
+    return
+        (int)maxFps;
+}
+
+
+bool configRecordingPerformanceAllowed(
+    const String &resolution,
+    int fps,
+    int quality,
+    uint32_t &load,
+    uint32_t &limit
+)
+{
+    load =
+        configRecordingPerformanceLoad(
+            resolution,
+            fps,
+            quality
+        );
+
+    limit =
+        configRecordingPerformanceLimit();
+
+    if (limit == 0)
+        return true;
+
+    if (load == 0)
+        return false;
+
+    return
+        load <= limit;
 }
 
 
@@ -830,6 +1009,43 @@ static bool validateValues(
     }
 
 
+    {
+        uint32_t performanceLoad = 0;
+        uint32_t performanceLimit = 0;
+
+        if (!configRecordingPerformanceAllowed(
+                values.resolution,
+                values.fps,
+                values.quality,
+                performanceLoad,
+                performanceLimit
+            )) {
+
+            int maxFps =
+                configRecordingPerformanceMaxFps(
+                    values.resolution,
+                    values.quality
+                );
+
+            error =
+                "recording performance limit exceeded: " +
+                values.resolution +
+                " @ " +
+                String(values.fps) +
+                " fps, quality=" +
+                String(values.quality) +
+                ", score=" +
+                String((unsigned long)performanceLoad) +
+                ", board_limit=" +
+                String((unsigned long)performanceLimit) +
+                ", max_fps=" +
+                String(maxFps);
+
+            return false;
+        }
+    }
+
+
     if (
         values.cameraXclkMhz != 10 &&
         values.cameraXclkMhz != 16 &&
@@ -1099,6 +1315,18 @@ static bool validateValues(
 
         error =
             "sleep_delay_ms out of range (0..60000)";
+
+        return false;
+    }
+
+
+    if (
+        values.bootloopProtection != 0 &&
+        values.bootloopProtection != 1
+    ) {
+
+        error =
+            "bootloop_protection must be 0 or 1";
 
         return false;
     }
@@ -2054,6 +2282,30 @@ static bool parseConfigText(
                     (int)numericValue;
 
             } else if (
+                key == "bootloop_protection"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.bootloopProtection,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid bootloop_protection";
+
+                    return false;
+                }
+
+                values.bootloopProtection =
+                    (int)numericValue;
+
+            } else if (
                 key == "transport_mode"
             ) {
 
@@ -2743,6 +2995,9 @@ static void applyValues(
 
     cfg_sleep_delay_ms =
         values.sleepDelayMs;
+
+    cfg_bootloop_protection =
+        values.bootloopProtection;
 
     cfg_transport_mode =
         values.transportMode;
@@ -3688,7 +3943,9 @@ config_loaded:
         "Config Sleep: mode=" +
         cfg_sleep_mode +
         " delay_ms=" +
-        String(cfg_sleep_delay_ms)
+        String(cfg_sleep_delay_ms) +
+        " bootloop_protection=" +
+        String(cfg_bootloop_protection)
     );
 
 
@@ -3726,6 +3983,39 @@ config_loaded:
         "Config Recording encryption: enabled=" +
         String(cfg_recording_encryption)
     );
+
+    {
+        uint32_t performanceLoad =
+            configRecordingPerformanceLoad(
+                cfg_resolution,
+                cfg_fps,
+                cfg_quality
+            );
+
+        uint32_t performanceLimit =
+            configRecordingPerformanceLimit();
+
+        int performanceMaxFps =
+            configRecordingPerformanceMaxFps(
+                cfg_resolution,
+                cfg_quality
+            );
+
+        Serial.println(
+            "Config Recording performance: resolution=" +
+            cfg_resolution +
+            " fps=" +
+            String(cfg_fps) +
+            " quality=" +
+            String(cfg_quality) +
+            " score=" +
+            String((unsigned long)performanceLoad) +
+            " board_limit=" +
+            String((unsigned long)performanceLimit) +
+            " max_fps=" +
+            String(performanceMaxFps)
+        );
+    }
 
 
     // Diagnostic output deliberately never prints the password.

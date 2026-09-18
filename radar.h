@@ -88,6 +88,14 @@ uint16_t radarLastTargetDistanceCm();
 // reaches its configured LD2410S trigger threshold. The event then remains
 // active for 2000 ms without requiring the sensor's 10-second presence hold.
 bool radarMotionTrackingAvailable();
+
+// True after any valid LD2410S configuration handshake during the current
+// boot. Unlike radarMotionTrackingAvailable(), this is a hardware-presence
+// decision and stays true if live standard reports later become stale. If all
+// startup attempts fail without a valid LD2410S response, SensorForge treats
+// PRESENCE_PIN/PIR_PIN as a standalone digital PIR/motion input.
+bool radarSensorDetected();
+
 bool radarMotionActive();
 uint32_t radarMotionRemainingMs();
 

@@ -133,7 +133,9 @@ UART 115200 Baud, 8N1
 
 GPIO-Zuordnung XIAO:
 
-- Magnetkontakt: GPIO1, aktiv LOW
+- Magnetkontakt: GPIO1 / XIAO D0, aktiv LOW; Reedkontakt zwischen GPIO1 und GND
+- Magnetfunktion: ausschliesslich WiFi/WebConfig EIN; kein Toggle und kein WiFi-AUS
+  durch erneutes Betaetigen
 - Presence / LD2410S OT2: GPIO4, HIGH = praesent
 - Radar UART RX: GPIO44
 - Radar UART TX: GPIO43
@@ -2127,7 +2129,24 @@ Das ist aktuell akzeptiert, sollte aber spaeter hinsichtlich Batterielaufzeit
 noch einmal bewertet werden.
 
 Der Magnetkontakt dient ausserdem dazu, WiFi/WebConfig im Betrieb bzw. nach
-Wake gezielt zu toggeln/starten.
+Wake gezielt EINZUSCHALTEN. Er ist bewusst KEIN Toggle-Schalter mehr.
+
+Aktuelles Magnet-Verhalten:
+
+- Reedkontakt ist aktiv LOW: XIAO D0 / GPIO1 gegen GND.
+- Magnet-Wake aus Light-/Deep-Sleep startet WiFi/WebConfig.
+- Im Wachbetrieb loest eine entprellte HIGH->LOW-Flanke ebenfalls nur
+  "WiFi/WebConfig EIN" aus.
+- Ist WiFi/WebConfig bereits aktiv, hat ein weiterer Magnetimpuls keine Wirkung.
+- Wiederholtes Darueberstreichen mit dem Magneten darf WiFi niemals ausschalten.
+- Nach einem Wake wird der bereits anliegende LOW-Zustand uebernommen, damit
+  derselbe physische Magnetkontakt nicht sofort ein zweites Ereignis erzeugt.
+- WiFi wird weiterhin nur ueber die bestehenden Systempfade ausgeschaltet,
+  insbesondere den Inaktivitaets-Timeout wifi_timeout_sec bzw. andere explizite
+  System-/Sicherheitsfunktionen.
+
+Diese ON-only-Semantik ist absichtlich gewaehlt, damit der Bediener nie den
+aktuellen WiFi-Zustand kennen muss, bevor er den Magneten verwendet.
 
 
 ======================================================================
@@ -3361,6 +3380,10 @@ WICHTIGE ENTWICKLUNGSREGELN
 - Transportmodus muss timer-only bleiben; Radar/PIR/Magnet duerfen waehrend
   Transport nicht wecken.
 
+- Magnetkontakt im Normalbetrieb ist ON-only: Magnet darf WiFi/WebConfig
+  einschalten bzw. aus Sleep wecken, aber niemals als Toggle zum Ausschalten
+  verwendet werden. Diese Semantik bei spaeteren Aenderungen beibehalten.
+
 - Eine laufende Aufnahme muss vor kamera- oder storagekritischen Wartungsaktionen
   sauber beendet werden.
 
@@ -3770,6 +3793,7 @@ keine bereits geloesten Themen neu designen, keine APIs/Funktionen erfinden und
 Codeaenderungen nur auf dem zuletzt wirklich gesehenen Quellstand vornehmen.
 Bei Rueckgabe von Code standardmaessig nur geaenderte/neue Dateien unter ihren
 Originalnamen mitsenden; keine unveraenderten Dateien in Update-ZIPs aufnehmen.
+
 
 
 
