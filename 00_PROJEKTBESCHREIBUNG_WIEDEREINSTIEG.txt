@@ -1,6 +1,6 @@
-SENSORFORGE / XIAO ESP32S3 SENSE CAMERA
+SENSORFORGE / ESP32-S3 CAMERA (XIAO + FREENOVE)
 PROJEKTBESCHREIBUNG, RELEASESTAND UND WIEDEREINSTIEGSPROMPT
-Stand: 2026-09-18
+Stand: 2026-09-19
 Produktname: SensorForge
 Plattformname: Fabric Node
 Core-Version im Branding: 7.1.0
@@ -34,6 +34,7 @@ Der aktuelle Quellstand besteht im Kern aus:
 - sensorforge.ino
 - config.cpp / config.h
 - image_motion.cpp / image_motion.h
+- motion_diagnostics.cpp / motion_diagnostics.h
 - webconfig.cpp
 - language.cpp / language.h
 - license.cpp / license.h
@@ -49,6 +50,42 @@ Der aktuelle Quellstand besteht im Kern aus:
 - sensorforge_license.py fuer PC-seitige Lizenzcode-Erzeugung
 - den dazugehoerigen bestehenden Headern und Modulen fuer Recorder, Logger,
   Radar, RTC, Thermal, Storage Guard und WebPlayer
+
+======================================================================
+WICHTIGER AKTUELLER HARDWARE-/STABILITAETSHINWEIS (2026-09-19)
+======================================================================
+
+Der aktuelle stabile Freenove-PIR-Stand verwendet AUSSCHLIESSLICH den SR602.
+
+VERBINDLICHE PRODUKTREGEL FUER FREENOVE + PIR:
+
+- unterstuetzter/freigegebener PIR: SR602
+- AM312 ist fuer SensorForge auf dem Freenove FNK0085 NICHT freigegeben
+- AM312 nicht mehr fuer neue Aufbauten verwenden und nicht als Ersatzteil
+  einplanen
+- Grund: auf echter Hardware traten mit AM312 wiederholt unzuverlaessige
+  Wake-Ereignisse aus Light Sleep auf; derselbe Firmwarestand arbeitet mit
+  SR602 reproduzierbar stabil
+- die exakte elektrische Ursache des AM312-Randfalls wurde mangels
+  Oszilloskop/Multimeter nicht abschliessend vermessen. Die Produktentscheidung
+  ist trotzdem eindeutig: SR602 verwenden, AM312 nicht verwenden
+- LD2410S Radar bleibt weiterhin unterstuetzt; seine OT2-Leitung kann denselben
+  board-spezifischen Presence-Eingang verwenden
+
+Der funktionierende Light-Sleep-Pfad darf nach diesem Teststand nicht ohne
+reproduzierbaren Fehler neu designt werden:
+
+- Presence/PIR/OT2 HIGH -> EXT0
+- Magnet LOW -> EXT1
+- Wakequellen werden vor jedem Light-Sleep-Zyklus neu konfiguriert
+- OV3660 bleibt im Fast-Standby und wird nach Wake nur per Register aufgeweckt
+- USB/Serial kann im Light Sleep vom Host verschwinden; das ist kein
+  Funktionsfehler und darf nicht als Kriterium fuer einen fehlgeschlagenen Wake
+  verwendet werden
+
+Auf echter Freenove-Hardware wurden mit SR602 mehrere aufeinanderfolgende
+Light-Sleep -> PIR-Wake -> Recording -> Light-Sleep-Zyklen erfolgreich
+beobachtet, darunter auch ein Wake nach mehr als 13 Minuten Sleep.
 
 Der aktuelle Sync-API-Stand ist Host API 1.10. Der aktuelle Python-Sync-Client
 ist 1.4. Die boardgebundene Offline-Lizenzierung ist als technisches Fundament
@@ -78,6 +115,21 @@ mit dem realen OV3660->AVI->SFENC1-Aufnahmepfad auf echter Hardware verifiziert;
 beide Testdateien wurden fehlerfrei zurueckgelesen. Die Frame-/Storage-Latenzen
 verbesserten sich deutlich. Die Sync-API muss bei NORMAL=MAX=20 MHz nicht mehr
 zwischen zwei SD-Taktraten remounten.
+
+Seit dem Stand vom 2026-09-18 wurden ausserdem folgende wesentliche
+Betriebs-/Stabilitaetsthemen integriert und auf Freenove-Hardware getestet:
+
+- Bootloop-/Unterspannungsschutz mit internem 60-s-Stabilitaetsfenster
+- Magnetkontakt ist ON-only fuer WiFi/WebConfig
+- automatische LD2410S-vs.-PIR-Erkennung ohne Config-Key
+- dedizierte Motion-Live-Diagnostik im Webinterface
+- Freenove Awake-Presence liest bei WiFi-Off ueber RTC-GPIO
+- sleep_mode=off haelt die Kamera warm statt nach jedem Event kalt zu
+  deinitialisieren
+- finaler Light-Sleep-Wake: Presence EXT0 HIGH, Magnet EXT1 LOW
+- Freenove-PIR-Hardwareentscheidung: SR602 freigegeben, AM312 ausgeschlossen
+- SD-Format-Webflow kehrt nach erfolgreichem normalen Format zur Hauptseite
+  zurueck; Secure-Erase behielt seinen separaten Progress-/Reboot-Flow
 
 Die konkrete Funktionseinschraenkung fuer UNLICENSED ist bewusst noch nicht
 definiert und bleibt ein eigener naechster Entwicklungsschritt.
@@ -111,9 +163,18 @@ Hauptziele:
 AKTUELL VERWENDETE HARDWARE
 ======================================================================
 
-Board:
+SensorForge unterstuetzt derzeit zwei ESP32-S3-Hardwarepfade:
 
-Seeed Studio XIAO ESP32S3 Sense
+1. Seeed Studio XIAO ESP32S3 Sense
+   - mehrere Geraete produktiv im Einsatz
+   - typischer Presence-Sensor: LD2410S Radar mit OT2-Hardware-Wake
+   - microSD per SPI
+
+2. Freenove FNK0085 ESP32-S3 Camera Board, 8-MB-Flash-Variante
+   - aktueller Entwicklungs-/Testaufbau
+   - Presence wahlweise LD2410S oder PIR
+   - fuer PIR ist AUSSCHLIESSLICH SR602 freigegeben
+   - microSD per SD_MMC
 
 Physisch verwendeter Kamerasensor:
 
@@ -126,6 +187,10 @@ Die Firmware darf Kamerafunktionen nicht allein aus dem Boardnamen ableiten.
 OV3660-spezifische Funktionen werden anhand des real erkannten Sensor-PID
 freigeschaltet.
 
+----------------------------------------------------------------------
+XIAO ESP32S3 SENSE
+----------------------------------------------------------------------
+
 Presence / Radar:
 
 LD2410S
@@ -134,15 +199,15 @@ UART 115200 Baud, 8N1
 GPIO-Zuordnung XIAO:
 
 - Magnetkontakt: GPIO1 / XIAO D0, aktiv LOW; Reedkontakt zwischen GPIO1 und GND
-- Magnetfunktion: ausschliesslich WiFi/WebConfig EIN; kein Toggle und kein WiFi-AUS
-  durch erneutes Betaetigen
+- Magnetfunktion: ausschliesslich WiFi/WebConfig EIN; kein Toggle und kein
+  WiFi-AUS durch erneutes Betaetigen
 - Presence / LD2410S OT2: GPIO4, HIGH = praesent
 - Radar UART RX: GPIO44
 - Radar UART TX: GPIO43
 - RTC SDA: GPIO5
 - RTC SCL: GPIO6
 
-RTC:
+RTC XIAO:
 
 - DS3231
 - I2C SDA GPIO5
@@ -157,12 +222,12 @@ microSD auf XIAO Sense:
 - MOSI: GPIO9
 - SPI normal 20 MHz
 - SPI MAX/HIGHSPEED ebenfalls 20 MHz
-- Sync-API-Exclusive behaelt damit denselben SD-Takt; ein unnoetiger 20->20-MHz-
-  Remount wird im aktuellen Code uebersprungen
+- Sync-API-Exclusive behaelt damit denselben SD-Takt; ein unnoetiger
+  20->20-MHz-Remount wird im aktuellen Code uebersprungen
 
-Besonderheit GPIO21:
+Besonderheit XIAO GPIO21:
 
-Bei diesem XIAO Sense Aufbau liegt microSD-CS auf GPIO21. GPIO21 ist zugleich
+Bei diesem XIAO-Sense-Aufbau liegt microSD-CS auf GPIO21. GPIO21 ist zugleich
 mit der onboard USER LED verbunden. Deshalb wird die Status-LED auf diesem
 Board nicht separat angesteuert, solange SD verwendet wird.
 
@@ -188,16 +253,78 @@ Kamera-Pins XIAO Sense:
 Der standardmaessige XIAO-Sense-Kameraanschluss besitzt keinen separat
 verfuegbaren Camera-PWDN-Pin.
 
+----------------------------------------------------------------------
+FREENOVE FNK0085, 8 MB FLASH
+----------------------------------------------------------------------
+
+Aktueller Presence-/PIR-Aufbau:
+
+- freigegebener PIR: SR602
+- SR602 + / VCC -> 3.3 V
+- SR602 OUT -> GPIO21
+- SR602 - / GND -> GND
+- HIGH = Bewegung
+- AM312 ist fuer diesen SensorForge-Aufbau NICHT freigegeben und soll nicht
+  mehr eingesetzt werden
+
+Alternativ LD2410S:
+
+- OT2 -> GPIO21, HIGH = Presence
+- Radar UART RX -> GPIO41
+- Radar UART TX -> GPIO42
+
+Weitere GPIO-Zuordnung Freenove:
+
+- Presence / PIR / OT2: GPIO21
+- Magnetkontakt: GPIO14, aktiv LOW gegen GND
+- RTC SDA: GPIO1
+- RTC SCL: GPIO47
+- Status-LED: GPIO2, aktiv HIGH
+- SD_MMC CMD: GPIO38
+- SD_MMC CLK: GPIO39
+- SD_MMC D0: GPIO40
+
+Kamera-Pins Freenove:
+
+- XCLK: GPIO15
+- SCCB SDA: GPIO4
+- SCCB SCL: GPIO5
+- D7: GPIO16
+- D6: GPIO17
+- D5: GPIO18
+- D4: GPIO12
+- D3: GPIO10
+- D2: GPIO8
+- D1: GPIO9
+- D0: GPIO11
+- VSYNC: GPIO6
+- HREF: GPIO7
+- PCLK: GPIO13
+
+GPIO21 kollidiert in diesem Pinout weder mit Kamera noch SD_MMC und ist
+absichtlich fuer Presence/PIR reserviert.
+
+Freenove-Strommessungen im aktuellen Aufbau:
+
+- aktiv grob um 180 mA, abhaengig von Kamera/WiFi/Recording
+- Light Sleep mit OV3660 Fast-Standby grob um 8 mA
+- Deep Sleep wird fuer den normalen Bewegungsbetrieb nicht verwendet, weil der
+  Full-Reboot fuer den gewuenschten schnellen Aufnahmestart zu langsam ist
 
 ======================================================================
 BOARD-AUSWAHL UND ARDUINO BUILD-UMGEBUNG
 ======================================================================
 
-Die Quellcode-Boardauswahl erfolgt in board_config.h:
+Die Quellcode-Boardauswahl erfolgt in board_config.h.
 
-#define BOARD_XIAO
+Aktueller Entwicklungs-/Teststand:
 
-BOARD_FREENOVE ist dabei deaktiviert.
+#define BOARD_FREENOVE
+//#define BOARD_XIAO
+
+Die XIAO-Variante bleibt weiterhin unterstuetzt und ist auf mehreren
+Produktionsgeraeten im Einsatz. Vor einem Build immer pruefen, welches
+Board-Makro im aktuellen board_config.h aktiv ist.
 
 Diese Source-Makro-Auswahl ist unabhaengig von der Arduino-FQBN-Auswahl.
 
@@ -326,11 +453,13 @@ Kamera:
 - camera_crop_x=1
 - camera_crop_y=1
 
-camera_xclk_mhz ist im zuletzt hochgeladenen config.txt noch nicht explizit
-vorhanden. Da der Parser diesen spaeter eingefuehrten Key optional behandelt,
-greift auf XIAO aktuell der Firmware-Default:
+Im aktuellen Freenove-Teststand ist explizit gesetzt:
 
-20 MHz
+camera_xclk_mhz=10
+
+Fuer aeltere XIAO-Configs kann camera_xclk_mhz weiterhin fehlen; dort greift
+der board-/firmwareseitige Default. 10/16/20 MHz bleiben als unterstuetzte
+Werte erhalten.
 
 Der Code akzeptiert:
 
@@ -374,7 +503,7 @@ Aufnahme:
 - recording_segment_seconds=30
 - recording_segment_max_mb=20
 - recording_event_max_seconds=65
-- recording_event_cooldown_seconds=120
+- recording_event_cooldown_seconds=30
 - recording_encryption=1 im aktuellen Encryption-Teststand
 
 recording_encryption akzeptiert 0 oder 1. Der Key ist fuer alte Configs
@@ -386,6 +515,16 @@ Sleep:
 
 - sleep_mode=light_sleep
 - sleep_delay_ms=2000
+- bootloop_protection=1
+
+Bootloop-/Unterspannungsschutz:
+
+- NVS-basiert, kein Spannungs-/Stromsensor erforderlich
+- Schutz wird nach 60 s stabiler Laufzeit intern als erfolgreich markiert
+- mehrere kurze instabile Cold-/Brownout-Starts fuehren zu gestaffeltem
+  Timer-Deep-Sleep-Backoff
+- normale Light-/Deep-Sleep-Wakes zaehlen nicht als instabile Boots
+- die 60-s-Stabilitaetszeit ist absichtlich kein Config-Key
 
 Transport:
 
@@ -448,6 +587,32 @@ SensorForge-XIAO-Produkt der Default langfristig ebenfalls OV3660 sein soll.
 
 Nicht unbemerkt aendern; zuerst bewusst entscheiden und testen.
 
+
+======================================================================
+BOOTLOOP-/UNTERSPANNUNGSSCHUTZ
+======================================================================
+
+Config-Key:
+
+bootloop_protection=1
+
+Ziel:
+
+Mehrere kurze instabile Neustarts bei leerem bzw. einbrechendem Akku sollen
+nicht zu einer dauernden Reboot-Schleife fuehren. Gleichzeitig darf ein normaler
+harter Power-Off des Benutzers nicht automatisch als Fehlerfall interpretiert
+werden.
+
+Aktueller Stand:
+
+- NVS-basierter Bootstatus
+- keine Abhaengigkeit vom DS3231
+- interne Stabilitaetsmarke nach 60 s Laufzeit
+- nur relevante kalte/instabile Startfolgen werden gezaehlt
+- normale Sleep-Wakes werden nicht als Fehlerfolge behandelt
+- gestaffelter Backoff ueber Timer-Deep-Sleep
+- WebConfig besitzt nur den Ein/Aus-Schalter
+- die interne 60-s-Grenze wird nicht als Benutzerparameter exponiert
 
 ======================================================================
 CONFIG-SYSTEM UND PERSISTENZ
@@ -944,11 +1109,11 @@ Aktuelle Grenzwerte:
 - Segment: 30 s
 - Segment-Maximum: 20 MB
 - komplettes Aufnahmeereignis: 65 s
-- Sicherheits-Cooldown danach: 120 s
+- Sicherheits-Cooldown danach: 30 s
 - Nachlauf nach Bewegung: 3000 ms
 
 Der Event-Timer laeuft ueber Segmentrotationen hinweg. Erreicht ein
-zusammenhaengendes Ereignis 65 s, wird sauber beendet und fuer 120 s keine neue
+zusammenhaengendes Ereignis 65 s, wird sauber beendet und fuer 30 s keine neue
 Aufnahme gestartet.
 
 
@@ -1940,33 +2105,92 @@ rekonstruierbar sein.
 
 
 ======================================================================
-BEWEGUNGSERKENNUNG / LD2410S
+BEWEGUNGSERKENNUNG / LD2410S + SR602 / AUTO-DETECT
 ======================================================================
 
-LD2410S UART:
+SensorForge verwendet fuer den physischen Presence-Eingang einen gemeinsamen
+board-spezifischen Pin:
 
-- 115200 Baud
-- RX GPIO44
-- TX GPIO43
+- XIAO: GPIO4
+- Freenove: GPIO21
 
-OT2:
+Die Firmware besitzt KEINEN Config-Schalter fuer "Radar" vs. "PIR". Der Typ wird
+beim echten Boot automatisch erkannt.
 
-- GPIO4
+LD2410S Auto-Detect:
+
+- UART 115200 Baud
+- XIAO RX/TX: GPIO44/GPIO43
+- Freenove RX/TX: GPIO41/GPIO42
+- es werden vier robuste Initialisierungsversuche durchgefuehrt
+- sobald ein gueltiger LD2410S-UART-Handshake erkannt wurde, gilt der Sensor als
+  Radar
+- auch wenn danach einzelne Standard-Reports fehlschlagen, darf ein real
+  erkannter Radar nicht faelschlich als PIR klassifiziert werden
+- nach vier Versuchen ohne gueltige Radar-Antwort wird auf PIR/digital input
+  umgeschaltet
+
+LD2410S:
+
+- OT2 liegt auf dem gemeinsamen Presence-Pin
 - HIGH = Presence
-- wichtige Hardware-Wakequelle im normalen Light-Sleep-Betrieb
+- UART wird fuer Gate-Energie, schnelle Motion-Auswertung, Config und
+  Kalibrierung verwendet
+- wenn das schnelle UART-Tracking nicht verfuegbar ist, bleibt OT2 als
+  physischer Fallback erhalten
 
-UART wird zusaetzlich fuer schnellere ESP-seitige Bewegungsbewertung und
-Konfiguration verwendet.
+Freenove-PIR:
 
-Der ESP-seitige Radar-Motion-State wird nach einem Trigger etwa 2 s gehalten.
+- einzig freigegebener PIR: SR602
+- OUT -> GPIO21
+- HIGH = Bewegung
+- AM312 ist NICHT freigegeben und soll nicht mehr verwendet werden
+- mit AM312 traten reproduzierbar unzuverlaessige Light-Sleep-Wakes auf
+- mit SR602 liefen mehrere aufeinanderfolgende Wake-/Recording-Zyklen stabil
 
-Die letzten Gate-Energien werden im RAM gecacht und koennen von WebConfig fuer
-Live-Anzeige und Kalibrierung verwendet werden, ohne fuer jede Anzeige neue
-Konfigurationskommandos an den Radar zu senden.
+Awake-Erkennung Freenove:
 
-Gelegentliche LD2410S UART Startup Timeouts wurden beobachtet. Die Retry-Logik
-hat bisher funktioniert. Weiter beobachten, derzeit kein akuter Blocker.
+- WiFi/WebConfig aktiv: Presence wird ueber normalen Digital-GPIO gelesen
+- WiFi aus + sleep_mode=off: Presence wird ueber den RTC-GPIO-Backend gelesen
+- diese Umschaltung behebt einen real beobachteten Fall, bei dem GPIO21 nach
+  WiFi-Off im normalen Digitalpfad keine Bewegung mehr lieferte
 
+Light-Sleep-Wake, aktueller stabiler Stand:
+
+- Presence/PIR/OT2 HIGH -> EXT0
+- Magnet LOW -> EXT1
+- XIAO: Presence GPIO4, Magnet GPIO1
+- Freenove: Presence GPIO21, Magnet GPIO14
+- Wakequellen werden vor jedem Sleep-Zyklus neu gesetzt
+- nach Presence-Wake geht der zeitkritische Pfad direkt in die Aufnahme
+- nach Magnet-Wake wird WiFi/WebConfig eingeschaltet
+- dieser EXT0/EXT1-Aufbau ist nach den Freenove/SR602-Tests der einzufrierende
+  Referenzstand und darf nicht ohne reproduzierbaren Fehler erneut umgebaut
+  werden
+
+Motion-Diagnostik:
+
+Neue Module:
+
+- motion_diagnostics.cpp
+- motion_diagnostics.h
+
+WebConfig besitzt eine eigene Bewegungskarte mit schnellem Statuspolling
+(ungefaehr 250 ms), getrennt vom langsameren allgemeinen Dashboardstatus.
+
+Angezeigt werden je nach Sensortyp unter anderem:
+
+- automatisch erkannter Sensortyp
+- Presence-/PIR-GPIO LOW/HIGH
+- Radar-interner Motion-State
+- Gate / Energie
+- letzter Trigger
+- Ereigniszaehler
+- Backend digital bzw. rtc
+- der Statusindikator ist bei LOW hellgruen und bei HIGH hellrot
+
+Die Diagnose ist RAM-only und erzeugt keine zusaetzliche permanente
+SD-Ereignisprotokollierung im schnellen Triggerpfad.
 
 ======================================================================
 RADAR WEBCONFIG UND KALIBRIERUNG
@@ -2019,16 +2243,16 @@ BILDBASIERTE MOTION DETECTION / IMAGE VERIFY
 
 Ziel:
 
-Radar/OT2 bleibt die stromsparende Wakequelle. Die Kamera wird NICHT als
-dauerhaft aktive Wakequelle verwendet. Optional kann nach einem echten
-Sensortrigger eine leichte Bildanalyse entscheiden, ob die Aufnahme bestaetigt
-wird.
+Der physische Presence-Sensor bleibt die stromsparende Wakequelle: LD2410S/OT2
+oder auf Freenove der freigegebene SR602. Die Kamera wird NICHT als dauerhaft
+aktive Wakequelle verwendet. Optional kann nach einem echten Sensortrigger eine
+leichte Bildanalyse entscheiden, ob die Aufnahme bestaetigt wird.
 
 Default / Regressionsschutz:
 
 - motion_recording_decision=direct
 - image_motion_enabled=0
-- der bisherige direkte Radar/OT2->Recording-Pfad bleibt damit Standard
+- der bisherige direkte physische Sensor->Recording-Pfad bleibt damit Standard
 - Image Motion muss bewusst aktiviert und spaeter auch als Recording Decision
   "image_verify" gewaehlt werden
 - waehrend einer bereits laufenden Aufnahme wird die Analyse nicht permanent
@@ -2052,7 +2276,7 @@ Analysepfad:
 
 Recording-Integration:
 
-- image_verify wird erst nach realem Radar/OT2-Trigger ausgewertet
+- image_verify wird erst nach realem LD2410S/OT2- oder SR602-Trigger ausgewertet
 - bei einem internen Analysefehler wird fuer reale Ereignisse fail-open
   aufgenommen, statt eine echte Bewegung still zu verlieren
 - ein abgelehnter Trigger wird bis zum Ende des aktuellen physischen
@@ -2084,12 +2308,19 @@ Der gelernte Hintergrund wird automatisch verworfen, wenn fuer die Analyse
 wesentliche Kamera-/Motion-Einstellungen geaendert wurden, darunter Aufloesung,
 Rotation, AE, Crop/Zoom, Sensitivity oder ROI.
 
-Separater PIR:
+PIR-Stand:
 
-Noch NICHT implementiert. Im aktuellen XIAO-board_config ist PIR_PIN nur ein
-Kompatibilitaetsalias fuer den vorhandenen LD2410S-OT2-/Presence-Pin GPIO4.
-Ein spaeterer echter PIR benoetigt zuerst den real gewaehlten GPIO und die
-aktive Polaritaet; diese duerfen nicht erfunden werden.
+Ein echter PIR ist inzwischen auf dem Freenove-Pfad implementiert. Der
+Presence-Eingang wird automatisch als PIR/digital input verwendet, wenn nach
+vier LD2410S-UART-Initialisierungsversuchen kein Radar erkannt wird.
+
+VERBINDLICH:
+
+- Freenove PIR = SR602
+- OUT auf GPIO21, aktiv HIGH
+- AM312 nicht verwenden / nicht freigegeben
+- XIAO-Produktionsgeraete verwenden weiterhin typischerweise LD2410S + OT2 auf
+  GPIO4
 
 TESTSTATUS / TODO:
 
@@ -2113,41 +2344,83 @@ und im Feld validiert. Spaeter gezielt pruefen:
 NORMALER LIGHT-SLEEP WAKE
 ======================================================================
 
-Normale Wakequellen:
+Der aktuelle stabile Light-Sleep-Wake-Aufbau verwendet dedizierte RTC-Wake-
+Quellen mit getrennter Polaritaet:
 
-- Presence GPIO4 HIGH
-- Magnet GPIO1 LOW
+Presence / PIR / OT2:
 
-OT2 kann wegen der internen Presence-Haltezeit des LD2410S laenger HIGH
-bleiben.
+- EXT0
+- aktiv HIGH
 
-Dann kann nach einem Event z.B. weiterhin gelten:
+Magnet:
 
-Sleep blocked | PRESENCE_PIN HIGH
+- EXT1
+- aktiv LOW
 
-Das ist aktuell akzeptiert, sollte aber spaeter hinsichtlich Batterielaufzeit
-noch einmal bewertet werden.
+Board-Pins:
 
-Der Magnetkontakt dient ausserdem dazu, WiFi/WebConfig im Betrieb bzw. nach
-Wake gezielt EINZUSCHALTEN. Er ist bewusst KEIN Toggle-Schalter mehr.
+XIAO:
+- Presence / LD2410S OT2: GPIO4 HIGH
+- Magnet: GPIO1 LOW
 
-Aktuelles Magnet-Verhalten:
+Freenove:
+- Presence / SR602 OUT bzw. LD2410S OT2: GPIO21 HIGH
+- Magnet: GPIO14 LOW
 
-- Reedkontakt ist aktiv LOW: XIAO D0 / GPIO1 gegen GND.
-- Magnet-Wake aus Light-/Deep-Sleep startet WiFi/WebConfig.
-- Im Wachbetrieb loest eine entprellte HIGH->LOW-Flanke ebenfalls nur
-  "WiFi/WebConfig EIN" aus.
-- Ist WiFi/WebConfig bereits aktiv, hat ein weiterer Magnetimpuls keine Wirkung.
-- Wiederholtes Darueberstreichen mit dem Magneten darf WiFi niemals ausschalten.
-- Nach einem Wake wird der bereits anliegende LOW-Zustand uebernommen, damit
-  derselbe physische Magnetkontakt nicht sofort ein zweites Ereignis erzeugt.
-- WiFi wird weiterhin nur ueber die bestehenden Systempfade ausgeschaltet,
-  insbesondere den Inaktivitaets-Timeout wifi_timeout_sec bzw. andere explizite
-  System-/Sicherheitsfunktionen.
+Wichtig:
 
-Diese ON-only-Semantik ist absichtlich gewaehlt, damit der Bediener nie den
-aktuellen WiFi-Zustand kennen muss, bevor er den Magneten verwendet.
+- Wakequellen werden vor JEDEM Light-Sleep-Zyklus neu konfiguriert
+- der Presence-Pin wird als RTC-faehiger Eingang vorbereitet
+- der Magnet-Pin wird als RTC-faehiger Eingang vorbereitet
+- nach Wake wird die Ursache ausgewertet
+- Presence-Wake startet den zeitkritischen Recordingpfad
+- Magnet-Wake startet WiFi/WebConfig
+- der frueher getestete allgemeine GPIO-Wake-Pfad wird fuer diesen finalen
+  Light-Sleep-Stand nicht verwendet
 
+Freenove/SR602 Hardwaretest 2026-09-19:
+
+Mehrere aufeinanderfolgende Zyklen wurden erfolgreich beobachtet:
+
+Light Sleep
+-> EXT0 Presence-Wake
+-> Kamera warm aufwecken
+-> Recording
+-> erneut Light Sleep
+-> erneuter EXT0 Wake
+
+Beobachtete Wake-Serien enthielten unter anderem:
+
+- mehrere direkte Folge-Wakes
+- einen erfolgreichen PIR-Wake nach mehr als 13 Minuten Light Sleep
+- Kamera-Wake typischerweise ungefaehr 1 ms
+- presence_age_ms im stabilen Test grob 111 bis 131 ms
+- camera_entry=warm
+
+USB / Serial:
+
+Bei ESP32-S3 Native USB kann die Arduino-IDE-/Serial-Monitor-Verbindung beim
+Eintritt in Light Sleep verschwinden. Das ist erwartbar und kein Beweis fuer
+einen Absturz. Der funktionierende SR602-Test hat gezeigt, dass PIR-Wakes auch
+bei bereits verschwundener Console weiter funktionieren.
+
+Kamera bei sleep_mode=off:
+
+- die Kamera bleibt nach einer Aufnahme initialisiert/warm
+- sie wird nicht nach jedem Event unnoetig deinitialisiert
+- dadurch entfaellt der beobachtete Cold-Start von grob 400+ ms
+- warmes Awake-Recording lag im Test typischerweise grob im Bereich unter
+  100 bis etwa 130 ms Trigger->Recorder
+
+Magnet-Verhalten:
+
+- Magnet ist ON-only
+- Magnet darf WiFi/WebConfig einschalten bzw. aus Sleep wecken
+- Magnet darf WiFi niemals als Toggle ausschalten
+- WiFi wird nur ueber bestehende Systempfade wie den Inaktivitaets-Timeout
+  abgeschaltet
+
+Dieser Wake-Pfad ist nach den aktuellen Tests als stabile Baseline zu behandeln.
 
 ======================================================================
 RTC UND ZEIT
@@ -2515,6 +2788,9 @@ Dashboard:
 - Aufnahmezustand
 - Pause-Zustand
 - Bewegung
+- eigene schnelle Bewegungskarte mit etwa 250-ms-Polling
+- erkannter Sensortyp (LD2410S Radar oder PIR/digital input)
+- Presence-GPIO LOW/HIGH, letzter Trigger und Ereigniszaehler
 - SD-Status
 - Netzwerk
 - Config-Quelle
@@ -2552,6 +2828,8 @@ Radar:
 - Live Gate Energy
 - Kalibrierung
 - Trigger-Vorschlaege
+- bei automatisch erkanntem PIR-Modus sind Radar-spezifische Seiten/Funktionen
+  deaktiviert bzw. gesperrt
 
 Bildbewegung / Image Motion:
 
@@ -2585,6 +2863,18 @@ System:
 - PSRAM Test
 - SD Benchmark
 - Reboot
+
+Hardware-Hinweis / UI-Regel fuer Freenove:
+
+Im Webinterface soll bei Freenove + PIR deutlich erkennbar sein:
+
+"Unterstuetzter PIR: SR602. AM312 wird nicht unterstuetzt."
+
+Dieser Hinweis ist als Hardware-/Servicehinweis zu behandeln und sollte
+mindestens in System-/Board-Info oder im Bewegungsbereich sichtbar sein. Falls
+er im aktuellen UI-Quellstand noch nicht umgesetzt ist, ist das eine reine
+UI-Dokumentationsaufgabe; dafuer darf der stabile Wake-/Recordingpfad nicht
+veraendert werden.
 
 Zusaetzlich:
 
@@ -3446,8 +3736,10 @@ EMPFOHLENER WIEDEREINSTIEGSPROMPT FUER EINEN NEUEN CHAT
 ======================================================================
 
 Wir entwickeln SensorForge / Fabric Node, Core v7.1.0, eine batterieversorgte
-bewegungsgetriggerte Kamera auf Basis eines Seeed XIAO ESP32S3 Sense mit
-physischem OV3660, LD2410S Radar, DS3231 RTC und microSD.
+bewegungsgetriggerte ESP32-S3-Kamera. Unterstuetzte Hardwarepfade sind
+Seeed XIAO ESP32S3 Sense und Freenove FNK0085 (8 MB). Physischer Kamerasensor
+ist OV3660. XIAO-Produktionsgeraete verwenden typischerweise LD2410S Radar;
+der aktuelle Freenove-PIR-Referenzaufbau verwendet SR602.
 
 WICHTIGE ARBEITSREGELN:
 
@@ -3467,15 +3759,16 @@ WICHTIGE ARBEITSREGELN:
 
 BUILD / HARDWARE:
 
-Board-Makro im Code ist BOARD_XIAO. Der bewaehrte Arduino-Build verwendet
-ESP32S3 Dev Module mit Arduino-ESP32 3.3.11, 8 MB Flash, DIO, OPI PSRAM und der
+Aktueller Entwicklungs-/Teststand hat BOARD_FREENOVE aktiv; XIAO bleibt
+unterstuetzt und produktiv im Feld. Vor jedem Build board_config.h pruefen.
+Der bewaehrte Arduino-Build verwendet ESP32S3 Dev Module mit Arduino-ESP32 3.3.11, 8 MB Flash, DIO, OPI PSRAM und der
 8-MB-OTA-Partitionierung. Nicht ohne Grund auf eine andere FQBN umstellen.
 
-Physischer Kamerasensor ist OV3660, PID 0x3660. Der aktuelle aktive Config-Stand
+Physischer Kamerasensor ist OV3660, PID 0x3660. Der aktuelle Freenove-Teststand
 verwendet typischerweise 1024x768, 5 fps, quality 12, Auto Exposure,
-ae_level=-2, Crop 1.0 / X1 / Y1. XCLK ist im aktuellen config.txt nicht
-explizit gesetzt und faellt auf dem XIAO auf 20 MHz Firmware-Default zurueck.
-10/16/20 MHz sind im Code unterstuetzt.
+ae_level=-2, Crop 1.0 / X1 / Y1 und camera_xclk_mhz=10. 10/16/20 MHz sind im
+Code unterstuetzt. Aeltere XIAO-Configs koennen weiterhin auf ihren
+board-/firmwareseitigen Default fallen.
 
 microSD auf XIAO verwendet SPI auf CS21/SCK7/MISO8/MOSI9. Der aktuelle
 Produktionsstand verwendet NORMAL=20 MHz und MAX=20 MHz. Die Umstellung von
@@ -3493,15 +3786,26 @@ werden.
 POWER / WAKE:
 
 OV3660 Fast Light Sleep verwendet Software Power Down ueber Register 0x3008,
-Bit 6 und nur bei real erkanntem PID 0x3660. Light-Sleep-Strom liegt etwa bei
-3.4 mA. OV3660 Software Wake etwa 1 ms. Frischer JPEG isoliert etwa 38 ms.
-Bewaehrter Wake-bis-erster-SD-Frame etwa 216-217 ms. USB/Serial-Ausgaben duerfen
-den kritischen ersten Frame nicht blockieren.
+Bit 6 und nur bei real erkanntem PID 0x3660. XIAO lag historisch bei etwa
+3.4 mA Light Sleep; der aktuelle Freenove-Aufbau liegt grob bei 8 mA.
+OV3660 Software Wake liegt etwa bei 1 ms.
+
+Aktueller stabiler Light-Sleep-Wake:
+- Presence/PIR/OT2 HIGH -> EXT0
+- Magnet LOW -> EXT1
+- XIAO Presence GPIO4 / Magnet GPIO1
+- Freenove Presence GPIO21 / Magnet GPIO14
+- Wakequellen vor jedem Zyklus neu konfigurieren
+
+Freenove-PIR: AUSSCHLIESSLICH SR602 freigegeben. AM312 nicht verwenden.
+Mit SR602 wurden mehrere Folge-Wakes inklusive >13 Minuten Sleep stabil
+beobachtet. USB/Serial darf im Light Sleep vom Host verschwinden; das ist kein
+Fehlerkriterium.
 
 RECORDING:
 
 Aktuell AVI/MJPEG, Timestamp/SRT aktiv. Segment 30 s, Segment-Maximum 20 MB,
-Event-Gesamtgrenze 65 s, danach 120 s Cooldown, post_record_ms=3000.
+Event-Gesamtgrenze 65 s, danach 30 s Cooldown, post_record_ms=3000.
 recording_not_before ist vorhanden und aktuell off.
 
 WebConfig besitzt eine RAM-only Recording-Pause. web_recording_auto_pause=1
@@ -3529,8 +3833,9 @@ geschrieben.
 WICHTIG: Dieser Bildanalysepfad ist implementiert, aber NOCH NICHT abschliessend
 im Feld getestet. Vor produktiver Nutzung von image_verify Erkennungsqualitaet,
 Licht/Schatten, Tag/Nacht, Parameter, Wake-Latenz, Strom und Temperatur messen.
-Ein separater PIR ist noch nicht implementiert; PIR_PIN aliasiert aktuell nur
-LD2410S OT2 GPIO4.
+Ein echter PIR ist im Freenove-Pfad implementiert. Freigegeben ist nur SR602
+auf GPIO21; AM312 ist nicht freigegeben. XIAO verwendet typischerweise
+LD2410S/OT2 auf GPIO4.
 
 RECORDING ENCRYPTION / SFENC1:
 
@@ -3785,6 +4090,12 @@ WEITERE PRIORITAETEN:
 - XIAO-SD 20 MHz bei weiteren Karten/Boardchargen und hoeheren Aufloesungen/FPS
   weiter auf Latenzspikes, Recovery, Temperatur und Strom beobachten
 - XCLK 16 vs 20 MHz nur bei neuer Energieoptimierungs-Prioritaet A/B testen
+- Freenove-PIR-Referenzhardware ist SR602; AM312 nicht wieder einfuehren oder
+  als gleichwertigen Ersatz dokumentieren
+- den funktionierenden EXT0-Presence / EXT1-Magnet-Light-Sleep-Pfad einfrieren
+  und nur bei reproduzierbarem Fehler veraendern
+- bei XIAO-Produktionsgeraeten mit LD2410S spaeter gezielt einen mehrzyklischen
+  Sleep->OT2-Wake->Recording->Sleep-Dauertest als Canary durchfuehren
 - Watchdog/Radar/SD-Randfaelle weiter beobachten
 - XIAO camera default OV2640 vs reale OV3660-Hardware bewusst spaeter entscheiden
 
@@ -3793,6 +4104,7 @@ keine bereits geloesten Themen neu designen, keine APIs/Funktionen erfinden und
 Codeaenderungen nur auf dem zuletzt wirklich gesehenen Quellstand vornehmen.
 Bei Rueckgabe von Code standardmaessig nur geaenderte/neue Dateien unter ihren
 Originalnamen mitsenden; keine unveraenderten Dateien in Update-ZIPs aufnehmen.
+
 
 
 

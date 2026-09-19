@@ -27,6 +27,7 @@
 #include "esp_idf_version.h"
 #include "esp_ota_ops.h"
 #include "driver/rtc_io.h"
+#include "driver/gpio.h"
 
 #include "board_config.h"
 #include "camera_select.h"
@@ -201,6 +202,15 @@ static unsigned long sleepIdleSinceMs = 0;
 // motion source. A rejected trigger is latched until physical motion clears so a
 // 2-second radar hold cannot repeatedly wake the camera analyzer in a tight loop.
 static bool imageVerifyRejectedUntilMotionClear = false;
+
+// WiFi-off motion diagnostics. The baseline is captured when WebConfig/WiFi
+// shuts down and summarized once when the magnet brings WiFi back. This adds
+// no SD writes to the motion-critical offline period itself.
+static bool offlineMotionBaselineValid = false;
+static uint32_t offlinePresenceTriggerBaseline = 0;
+static uint32_t offlinePresenceRawRiseBaseline = 0;
+static uint32_t offlinePresenceGlitchBaseline = 0;
+static bool offlinePresenceRtcBackendActive = false;
 
 
 // Sleep diagnostics are state-based so the serial console stays readable.
@@ -1291,6 +1301,84 @@ static void powerConsole(
 
 static const char *sleepWakeCauseName(
     esp_sleep_wakeup_cause_t cause
+);
+
+
+// Emit the post-light-sleep wake diagnostic as one fully formatted Serial
+// buffer. Native USB/CDC can be fragile around light sleep; avoiding a printf
+// made of multiple formatting/write steps reduces the chance of a visibly
+// truncated prefix. This is diagnostic-only and runs after the critical first
+// frame path (or after that path is abandoned).
+static void emitDeferredWakeConsole(
+    const char *outcome
+)
+{
+    if (!deferredWakeConsolePending)
+        return;
+
+    char timestamp[40];
+    formatConsoleTimestamp(
+        timestamp,
+        sizeof(timestamp)
+    );
+
+    char consoleState[72];
+    if (outcome && outcome[0]) {
+        snprintf(
+            consoleState,
+            sizeof(consoleState),
+            "deferred-%s",
+            outcome
+        );
+    } else {
+        snprintf(
+            consoleState,
+            sizeof(consoleState),
+            "deferred"
+        );
+    }
+
+    char message[224];
+    snprintf(
+        message,
+        sizeof(message),
+        "Wake from light sleep | cause=%s(%d) | slept=%llu ms | camera_wake=%llu us%s | console=%s",
+        sleepWakeCauseName(deferredWakeCause),
+        (int)deferredWakeCause,
+        (unsigned long long)(deferredWakeSleptUs / 1000ULL),
+        (unsigned long long)deferredWakeCameraWakeUs,
+        deferredWakeFastCameraSleep
+            ? (deferredWakeCameraWakeOk ? "" : " FAILED")
+            : " (normal-init fallback)",
+        consoleState
+    );
+
+    char line[320];
+    const int lineLength = snprintf(
+        line,
+        sizeof(line),
+        "[%s] [POWER] %s\n",
+        timestamp,
+        message
+    );
+
+    if (lineLength > 0) {
+        size_t bytesToWrite = (size_t)lineLength;
+        if (bytesToWrite >= sizeof(line))
+            bytesToWrite = sizeof(line) - 1;
+
+        Serial.write(
+            (const uint8_t *)line,
+            bytesToWrite
+        );
+    }
+
+    deferredWakeConsolePending = false;
+}
+
+
+static const char *sleepWakeCauseName(
+    esp_sleep_wakeup_cause_t cause
 )
 {
     switch (cause) {
@@ -1482,20 +1570,113 @@ bool simulatedMotionActive()
 
 bool physicalMotionActive()
 {
-    // When an LD2410S was detected, normal awake recording uses the fast UART
-    // gate-energy detector. OT2 is intentionally not preferred because its
-    // internal presence state has a comparatively long no-person hold.
+    // Ongoing motion semantics while already recording:
+    // - LD2410S with healthy UART tracking: use the fast gate-energy detector.
+    // - standalone PIR, or degraded radar tracking: use the digital presence pin.
     //
-    // If no LD2410S was detected after the robust boot retries, the same
-    // PRESENCE_PIN is a standalone PIR/digital motion input (for example AM312).
-    // If a detected radar later loses fresh UART reports, the digital OT2 input
-    // remains the safe fallback.
+    // OT2 is intentionally not used as a continuous radar-motion level while
+    // fast tracking is healthy because its no-person hold is comparatively long.
     if (radarMotionTrackingAvailable()) {
         return radarMotionActive();
     }
 
+    // Keep the operational PIR/OT2 hold path independent of diagnostics.
+    // A physical HIGH is authoritative and must never be filtered away.
+    return motionDiagnosticsPresenceActive();
+}
+
+
+static const uint32_t AWAKE_PRESENCE_TRIGGER_PENDING_MAX_MS =
+    30000UL;
+
+// Capture the accepted awake PIR/OT2 trigger immediately before entering
+// startRecording(). This keeps presence_age_ms meaningful even if camera or
+// storage preparation takes a few hundred milliseconds, and it does not rely
+// on the one-shot diagnostics latch still being pending afterwards.
+static bool recordingStartPresenceDecisionValid = false;
+static uint32_t recordingStartPresenceDecisionMs = 0;
+static bool recordingStartPresenceDecisionRtcBackend = false;
+
+// Cosmetic/logging counter only: one count per successfully opened recording
+// whose start source was the physical PIR/OT2 presence input. Unlike the raw
+// diagnostics counter, this does not increase for PIR retriggers while the
+// same recording is already running.
+static uint32_t presenceRecordingEventCount = 0;
+
+static void clearRecordingStartPresenceDiagnostics()
+{
+    recordingStartPresenceDecisionValid = false;
+    recordingStartPresenceDecisionMs = 0;
+    recordingStartPresenceDecisionRtcBackend = false;
+}
+
+static void captureRecordingStartPresenceDiagnostics()
+{
+    MotionDiagnosticsSnapshot snapshot;
+    motionDiagnosticsGetSnapshot(snapshot);
+
+    const uint32_t now = millis();
+
+    recordingStartPresenceDecisionValid = true;
+    recordingStartPresenceDecisionRtcBackend =
+        motionDiagnosticsPresenceRtcSamplingActive();
+
+    if (
+        snapshot.presenceLastTriggerValid &&
+        snapshot.presenceLastTriggerAgeMs <=
+            AWAKE_PRESENCE_TRIGGER_PENDING_MAX_MS
+    ) {
+        recordingStartPresenceDecisionMs =
+            now - snapshot.presenceLastTriggerAgeMs;
+    } else {
+        // Raw HIGH is operationally authoritative. If diagnostics did not have
+        // a latched edge (for example after a backend ownership transition),
+        // use the actual recording decision time rather than omitting latency
+        // information from the REC START line.
+        recordingStartPresenceDecisionMs = now;
+    }
+}
+
+
+static bool physicalRecordingStartTriggerActive()
+{
+    // Raw GPIO HIGH is the primary, authoritative start signal. The RAM latch
+    // below is only a backup for a pulse observed between recording decisions.
+    const bool presenceLevel =
+        motionDiagnosticsPresenceActive();
+
+    const bool pendingPresenceEdge =
+        motionDiagnosticsPresenceStartPending(
+            AWAKE_PRESENCE_TRIGGER_PENDING_MAX_MS
+        );
+
+    // A standalone PIR is itself the authoritative motion source. Use the
+    // debounced operational level plus the one-shot RAM trigger retained by
+    // motion_diagnostics. The raw GPIO level is diagnostic-only.
+    if (!radarSensorDetected()) {
+        return
+            presenceLevel ||
+            pendingPresenceEdge;
+    }
+
+    // For a detected LD2410S, retain the fast UART gate-energy detector as the
+    // normal awake motion source. However, an OT2 rising edge is authoritative
+    // enough to START a recording, just as it is when the same pin wakes us from
+    // light sleep. Only the edge is latched here; the long OT2 presence level is
+    // not used to extend an already-running recording while fast UART tracking
+    // is healthy. This makes sleep=off and light-sleep trigger behavior
+    // consistent without reintroducing the long OT2 hold into post-record timing.
+    if (radarMotionTrackingAvailable()) {
+        return
+            radarMotionActive() ||
+            pendingPresenceEdge;
+    }
+
+    // Detected radar but no fresh UART tracking: fall back to OT2 exactly as
+    // before, with the same pending edge event for robustness.
     return
-        digitalRead(PIR_PIN) == HIGH;
+        presenceLevel ||
+        pendingPresenceEdge;
 }
 
 
@@ -1545,7 +1726,9 @@ bool motionDetected()
     }
 
     return
-        physicalMotionActive() ||
+        (recording
+            ? physicalMotionActive()
+            : physicalRecordingStartTriggerActive()) ||
         simulatedMotionActive();
 }
 
@@ -1569,18 +1752,9 @@ static void finishDeferredWakeWithoutRecording(
     wakeTimingActive = false;
 
     if (deferredWakeConsolePending) {
-        powerConsole(
-            "Wake from light sleep | cause=%s(%d) | slept=%llu ms | camera_wake=%llu us%s | console=deferred-%s",
-            sleepWakeCauseName(deferredWakeCause),
-            (int)deferredWakeCause,
-            (unsigned long long)(deferredWakeSleptUs / 1000ULL),
-            (unsigned long long)deferredWakeCameraWakeUs,
-            deferredWakeFastCameraSleep
-                ? (deferredWakeCameraWakeOk ? "" : " FAILED")
-                : " (normal-init fallback)",
+        emitDeferredWakeConsole(
             outcome ? outcome : "no-recording"
         );
-        deferredWakeConsolePending = false;
     }
 
     if (deferredMotionConsolePending) {
@@ -6167,6 +6341,12 @@ bool startRecording() {
     if (recording)
         return true;
 
+    const bool cameraInitializedAtEntry =
+        cameraInitialized;
+
+    const bool cameraStandbyAtEntry =
+        cameraSoftPowerDownActive;
+
     const bool measureWakeStages =
         wakeTimingActive &&
         cfg_debug_enabled;
@@ -6411,6 +6591,25 @@ bool startRecording() {
     }
 
 
+    // Cosmetic event counter for REC START diagnostics. Count only a physical
+    // PIR/OT2 start that actually opened the recorder successfully. Retriggers
+    // while the same recording is running therefore do not inflate the value.
+    const bool presenceEventForThisStart =
+        recordingStartPresenceDecisionValid ||
+        motionDiagnosticsPresenceStartPending(
+            AWAKE_PRESENCE_TRIGGER_PENDING_MAX_MS
+        );
+
+    uint32_t presenceEventCountForThisStart = 0;
+    if (presenceEventForThisStart) {
+        if (presenceRecordingEventCount != UINT32_MAX)
+            ++presenceRecordingEventCount;
+
+        presenceEventCountForThisStart =
+            presenceRecordingEventCount;
+    }
+
+
     String formatName =
         cfg_recording_format;
 
@@ -6426,6 +6625,58 @@ bool startRecording() {
         " @ " +
         String(cfg_fps) +
         " fps";
+
+    // Add trigger/start diagnostics to the existing REC START line. Awake
+    // PIR/OT2 starts use the decision snapshot captured immediately before
+    // startRecording(), so diagnostics remain present even after a cold camera
+    // init or another preparation delay. Boot/light-sleep paths retain the
+    // existing one-shot fallback. No additional SD write is created.
+    if (recordingStartPresenceDecisionValid) {
+        startMessage +=
+            " | presence_age_ms=" +
+            String((uint32_t)(
+                millis() - recordingStartPresenceDecisionMs
+            )) +
+            " | presence_count=" +
+            String(presenceEventCountForThisStart) +
+            " | presence_backend=" +
+            String(
+                recordingStartPresenceDecisionRtcBackend
+                    ? "rtc"
+                    : "digital"
+            );
+    } else if (motionDiagnosticsPresenceStartPending(
+            AWAKE_PRESENCE_TRIGGER_PENDING_MAX_MS
+        )) {
+
+        MotionDiagnosticsSnapshot startDiagnostics;
+        motionDiagnosticsGetSnapshot(startDiagnostics);
+
+        if (startDiagnostics.presenceLastTriggerValid) {
+            startMessage +=
+                " | presence_age_ms=" +
+                String(startDiagnostics.presenceLastTriggerAgeMs) +
+                " | presence_count=" +
+                String(presenceEventCountForThisStart) +
+                " | presence_backend=" +
+                String(
+                    motionDiagnosticsPresenceRtcSamplingActive()
+                        ? "rtc"
+                        : "digital"
+                );
+        }
+    }
+
+    startMessage +=
+        " | camera_entry=";
+
+    if (!cameraInitializedAtEntry) {
+        startMessage += "cold";
+    } else if (cameraStandbyAtEntry) {
+        startMessage += "standby";
+    } else {
+        startMessage += "warm";
+    }
 
     if (wakeCriticalPathActive) {
         deferredRecordingStartMessage = startMessage;
@@ -6462,6 +6713,11 @@ bool startRecording() {
     recordingThermalReset();
 
     recording = true;
+
+    // Consume the one-shot physical event only after the recorder has opened
+    // successfully. A transient start failure may therefore retry.
+    motionDiagnosticsConsumePresenceStartTrigger();
+    clearRecordingStartPresenceDiagnostics();
 
     return true;
 }
@@ -6683,9 +6939,17 @@ void stopRecording() {
         : "finalization_failed"
     );
 
-    // Preserve the legacy behavior for every sensor except a physically
-    // detected OV3660. Only that sensor has a verified fast standby path.
+    // Camera lifetime policy:
+    // - sleep_mode=off means the unit is intentionally kept awake, so retain
+    //   the initialized camera for the lowest possible next-trigger latency.
+    // - light_sleep retains the verified OV3660 fast-standby path.
+    // - all other cases preserve the legacy deinit/reinit behavior.
     // WebConfig still keeps the camera active for live preview as before.
+    bool keepCameraReadyWhileAwake =
+        !webConfigStarted &&
+        cameraInitialized &&
+        cfg_sleep_mode == "off";
+
     bool keepCameraForFastLightSleep =
         !webConfigStarted &&
         cameraInitialized &&
@@ -6695,6 +6959,7 @@ void stopRecording() {
     if (
         !webConfigStarted &&
         cameraInitialized &&
+        !keepCameraReadyWhileAwake &&
         !keepCameraForFastLightSleep
     ) {
         cameraDeinitRuntime();
@@ -6895,8 +7160,7 @@ static bool presenceWakeIsClear()
     // Both a classic PIR and LD2410S OT2 use this same physical
     // presence input. Sleeping while HIGH would cause an immediate
     // presence wake.
-    return
-        digitalRead(PIR_PIN) == LOW;
+    return !motionDiagnosticsPresenceActive();
 }
 
 
@@ -6912,6 +7176,11 @@ static bool magnetWakeIsClear()
 
 static bool configureSleepWakeSources()
 {
+    // Hand PRESENCE_PIN from the normal GPIO interrupt path to the RTC wake
+    // controller. The interrupt is restored after a light-sleep wake; deep
+    // sleep reboots and initializes it again in setup().
+    motionDiagnosticsSuspendPresenceInterrupt();
+
     // We need opposite wake polarities:
     //   MAGNET_SWITCH_PIN: LOW
     //   PRESENCE/PIR_PIN:  HIGH
@@ -7032,9 +7301,133 @@ static bool configureSleepWakeSources()
             INPUT_PULLDOWN
         );
 
+        motionDiagnosticsResumePresenceInterrupt();
+
         return false;
     }
 
+
+    return true;
+}
+
+
+static bool configureLightSleepWakeSources()
+{
+    // Light sleep uses the dedicated RTC wake controllers:
+    //
+    //   EXT0 = presence / PIR / LD2410S OT2, active HIGH
+    //   EXT1 = magnet / reed, active LOW
+    //
+    // Both Freenove pins are RTC GPIOs on ESP32-S3. Keeping the two signals on
+    // separate RTC wake sources avoids the generic GPIO-wakeup re-arm path and
+    // gives each input the polarity it actually needs.
+    motionDiagnosticsSuspendPresenceInterrupt();
+
+    esp_sleep_disable_wakeup_source(
+        ESP_SLEEP_WAKEUP_ALL
+    );
+
+    // EXT0 requires RTC_PERIPH to remain powered. Keeping it ON also keeps the
+    // internal pull-down/pull-up levels defined for both wake inputs.
+    esp_sleep_pd_config(
+        ESP_PD_DOMAIN_RTC_PERIPH,
+        ESP_PD_OPTION_ON
+    );
+
+    rtc_gpio_hold_dis(PIR_PIN);
+    rtc_gpio_hold_dis(MAGNET_SWITCH_PIN);
+
+    // Presence / PIR / OT2: active HIGH.
+    esp_err_t presenceRtcErr =
+        rtc_gpio_init(PIR_PIN);
+
+    if (presenceRtcErr == ESP_OK) {
+        presenceRtcErr =
+            rtc_gpio_set_direction(
+                PIR_PIN,
+                RTC_GPIO_MODE_INPUT_ONLY
+            );
+    }
+
+    if (presenceRtcErr == ESP_OK) {
+        rtc_gpio_pullup_dis(PIR_PIN);
+        rtc_gpio_pulldown_en(PIR_PIN);
+    }
+
+    // Magnet / reed: active LOW.
+    esp_err_t magnetRtcErr =
+        rtc_gpio_init(MAGNET_SWITCH_PIN);
+
+    if (magnetRtcErr == ESP_OK) {
+        magnetRtcErr =
+            rtc_gpio_set_direction(
+                MAGNET_SWITCH_PIN,
+                RTC_GPIO_MODE_INPUT_ONLY
+            );
+    }
+
+    if (magnetRtcErr == ESP_OK) {
+        rtc_gpio_pullup_en(MAGNET_SWITCH_PIN);
+        rtc_gpio_pulldown_dis(MAGNET_SWITCH_PIN);
+    }
+
+    esp_err_t presenceErr = ESP_FAIL;
+    esp_err_t magnetErr = ESP_FAIL;
+
+    if (
+        presenceRtcErr == ESP_OK &&
+        magnetRtcErr == ESP_OK
+    ) {
+        // Dedicated RTC_IO wake: PIR/OT2 HIGH.
+        presenceErr =
+            esp_sleep_enable_ext0_wakeup(
+                PIR_PIN,
+                1
+            );
+
+        // Dedicated RTC controller wake: magnet LOW.
+        const uint64_t magnetMask =
+            1ULL <<
+            (uint32_t)MAGNET_SWITCH_PIN;
+
+        magnetErr =
+            esp_sleep_enable_ext1_wakeup(
+                magnetMask,
+                ESP_EXT1_WAKEUP_ANY_LOW
+            );
+    }
+
+    if (
+        presenceRtcErr != ESP_OK ||
+        magnetRtcErr != ESP_OK ||
+        presenceErr != ESP_OK ||
+        magnetErr != ESP_OK
+    ) {
+        powerConsole(
+            "Light sleep RTC wake setup failed | presence_rtc=0x%x | magnet_rtc=0x%x | ext0_presence=0x%x | ext1_magnet=0x%x",
+            presenceRtcErr,
+            magnetRtcErr,
+            presenceErr,
+            magnetErr
+        );
+
+        esp_sleep_disable_wakeup_source(
+            ESP_SLEEP_WAKEUP_EXT0
+        );
+
+        esp_sleep_disable_wakeup_source(
+            ESP_SLEEP_WAKEUP_EXT1
+        );
+
+        rtc_gpio_deinit(PIR_PIN);
+        rtc_gpio_deinit(MAGNET_SWITCH_PIN);
+
+        pinMode(PIR_PIN, INPUT_PULLDOWN);
+        pinMode(MAGNET_SWITCH_PIN, INPUT_PULLUP);
+
+        motionDiagnosticsResumePresenceInterrupt();
+        return false;
+    }
 
     return true;
 }
@@ -7721,12 +8114,12 @@ static bool enterLightSleep()
     deferredRecordingStartMessage = "";
     deferredSleepLogPending = false;
 
-    if (!configureSleepWakeSources())
+    if (!configureLightSleepWakeSources())
         return false;
 
 
     powerConsole(
-        "Entering light sleep | wake=presence GPIO%d HIGH OR magnet GPIO%d LOW",
+        "Entering light sleep | RTC wake=presence EXT0 GPIO%d HIGH OR magnet EXT1 GPIO%d LOW",
         PIR_PIN,
         MAGNET_SWITCH_PIN
     );
@@ -7909,34 +8302,39 @@ static bool enterLightSleep()
     }
 
 
-    // Execution continues here after a light-sleep wake.
-    // EXT1 may have used the HOLD mechanism; release both RTC pads before
-    // returning them to normal GPIO operation.
-    rtc_gpio_hold_dis(
-        PIR_PIN
+    // Execution continues here after a light-sleep wake. EXT0 is dedicated
+    // to presence/PIR HIGH; EXT1 is dedicated to magnet LOW. The wake cause
+    // therefore identifies the source directly without sampling a second
+    // generic GPIO wake layer.
+    esp_sleep_wakeup_cause_t wakeCause =
+        esp_sleep_get_wakeup_cause();
+
+    const bool wokeByPresence =
+        wakeCause ==
+        ESP_SLEEP_WAKEUP_EXT0;
+
+    const bool wokeByMagnet =
+        wakeCause ==
+        ESP_SLEEP_WAKEUP_EXT1;
+
+    esp_sleep_disable_wakeup_source(
+        ESP_SLEEP_WAKEUP_EXT0
     );
 
-    rtc_gpio_hold_dis(
-        MAGNET_SWITCH_PIN
+    esp_sleep_disable_wakeup_source(
+        ESP_SLEEP_WAKEUP_EXT1
     );
 
-    rtc_gpio_deinit(
-        PIR_PIN
-    );
+    // Magnet always returns to the normal awake GPIO backend.
+    rtc_gpio_hold_dis(MAGNET_SWITCH_PIN);
+    rtc_gpio_deinit(MAGNET_SWITCH_PIN);
+    pinMode(MAGNET_SWITCH_PIN, INPUT_PULLUP);
 
-    rtc_gpio_deinit(
-        MAGNET_SWITCH_PIN
-    );
-
-    pinMode(
-        PIR_PIN,
-        INPUT_PULLDOWN
-    );
-
-    pinMode(
-        MAGNET_SWITCH_PIN,
-        INPUT_PULLUP
-    );
+    // Restore normal awake presence sampling. In Freenove offline-awake mode
+    // the diagnostics layer intentionally keeps GPIO21 in RTC sampling; with
+    // WebConfig active it returns to the normal digital GPIO backend.
+    rtc_gpio_hold_dis(PIR_PIN);
+    motionDiagnosticsResumePresenceInterrupt();
 
 
     feedWatchdog();
@@ -7958,12 +8356,9 @@ static bool enterLightSleep()
     }
 
 
-    esp_sleep_wakeup_cause_t wakeCause =
-        esp_sleep_get_wakeup_cause();
-
-    // Preserve a real PIR/OT2 wake immediately. This is RAM-only and adds no
-    // SD/log work to the latency-sensitive wake path.
-    if (wakeCause == ESP_SLEEP_WAKEUP_EXT1) {
+    // Preserve a real PIR/OT2 EXT0 wake immediately. This is RAM-only and adds
+    // no SD/log work to the latency-sensitive wake path.
+    if (wokeByPresence) {
         motionDiagnosticsNotePresenceTrigger();
     }
 
@@ -7976,7 +8371,7 @@ static bool enterLightSleep()
     // a recording wake and therefore must not enter the deferred-console path.
     if (
         cfg_debug_enabled &&
-        wakeCause == ESP_SLEEP_WAKEUP_EXT1 &&
+        wokeByPresence &&
         wakeCanStartRecording
     ) {
         wakeTimingActive = true;
@@ -7995,13 +8390,13 @@ static bool enterLightSleep()
         wakeTimingPrechecksDoneUs = 0;
     }
 
-    // EXT1 is the time-critical recording wake. Do not touch USB/Serial here:
+    // EXT0 is the time-critical recording wake. Do not touch USB/Serial here:
     // some hosts stall the first Serial.printf() for hundreds of milliseconds
     // after light sleep. Preserve the same information and print it only after
     // the first frame has been written. Non-recording wake causes keep the
     // immediate diagnostic behavior.
     if (
-        wakeCause == ESP_SLEEP_WAKEUP_EXT1 &&
+        wokeByPresence &&
         wakeCanStartRecording
     ) {
         wakeCriticalPathActive = true;
@@ -8040,12 +8435,9 @@ static bool enterLightSleep()
     }
 
 
-    if (
-        wakeCause ==
-        ESP_SLEEP_WAKEUP_EXT0
-    ) {
+    if (wokeByMagnet) {
 
-        // EXT0 is reserved for the active-LOW magnet switch.
+        // Light-sleep EXT1 wake detected the active-LOW magnet switch.
         // Adopt LOW as the stable state so the same physical magnet
         // does not immediately create a second toggle event.
         magnetRawState =
@@ -8079,8 +8471,8 @@ static bool enterLightSleep()
         SLEEP_DIAG_UNKNOWN;
 
 
-    // Give the next idle period a fresh delay. If presence caused the wake,
-    // the next loop iteration starts recording immediately.
+    // Give the next idle period a fresh delay. If presence caused the EXT0
+    // wake, the next loop iteration starts recording immediately.
     resetSleepDelayTimer();
 
     return true;
@@ -8292,6 +8684,12 @@ static bool tryEnterConfiguredSleep()
 
 void startWebConfig()
 {
+#if defined(BOARD_FREENOVE)
+    // GPIO21 is sampled through the normal digital GPIO path while WebConfig
+    // is active. Offline-awake mode switches it to RTC GPIO below.
+    motionDiagnosticsSetPresenceRtcSampling(false);
+#endif
+
     Serial.println(
         "Starting WiFi hotspot for web config..."
     );
@@ -8422,6 +8820,29 @@ void stopWebConfigWifi(
         WIFI_OFF
     );
 
+    // Keep the physical motion input completely independent of the WiFi
+    // lifecycle. On Freenove, GPIO21 is an RTC-capable input and the RTC path
+    // is already proven by reliable EXT1 wake. Use that same hardware input
+    // path while WiFi is OFF even when sleep_mode=off. This avoids losing
+    // presence after the radio stack is torn down.
+#if defined(BOARD_FREENOVE)
+    offlinePresenceRtcBackendActive =
+        motionDiagnosticsSetPresenceRtcSampling(true);
+#else
+    offlinePresenceRtcBackendActive = false;
+    motionDiagnosticsResumePresenceInterrupt();
+#endif
+
+    MotionDiagnosticsSnapshot offlineBaseline;
+    motionDiagnosticsGetSnapshot(offlineBaseline);
+    offlinePresenceTriggerBaseline =
+        offlineBaseline.presenceTriggerCount;
+    offlinePresenceRawRiseBaseline =
+        offlineBaseline.presenceRawRiseCount;
+    offlinePresenceGlitchBaseline =
+        offlineBaseline.presenceRejectedGlitchCount;
+    offlineMotionBaselineValid = true;
+
     Serial.println(
         reason
     );
@@ -8469,6 +8890,43 @@ void enableWifiByMagnet()
         logWrite(
             "Magnet switch: WiFi ON"
         );
+
+        if (offlineMotionBaselineValid) {
+            MotionDiagnosticsSnapshot offlineSummary;
+            motionDiagnosticsGetSnapshot(offlineSummary);
+
+            uint32_t offlinePresenceTriggers =
+                offlineSummary.presenceTriggerCount -
+                offlinePresenceTriggerBaseline;
+
+            uint32_t offlineRawRises =
+                offlineSummary.presenceRawRiseCount -
+                offlinePresenceRawRiseBaseline;
+
+            uint32_t offlineRejectedGlitches =
+                offlineSummary.presenceRejectedGlitchCount -
+                offlinePresenceGlitchBaseline;
+
+            String summary =
+                "MOTION OFFLINE SUMMARY | presence_triggers=" +
+                String(offlinePresenceTriggers) +
+                " | raw_rises=" +
+                String(offlineRawRises) +
+                " | rejected_glitches=" +
+                String(offlineRejectedGlitches) +
+                " | input_backend=" +
+                String(offlinePresenceRtcBackendActive ? "rtc" : "digital");
+
+            if (offlineSummary.presenceLastTriggerValid) {
+                summary +=
+                    " | last_presence_age_ms=" +
+                    String(offlineSummary.presenceLastTriggerAgeMs);
+            }
+
+            logWrite(summary);
+            offlineMotionBaselineValid = false;
+            offlinePresenceRtcBackendActive = false;
+        }
 
     } else {
 
@@ -9471,6 +9929,31 @@ void setup() {
     motionDiagnosticsBegin(wokeByPresence);
 
 
+    // With sleep explicitly disabled, keep the camera initialized continuously
+    // so the first and all subsequent awake motion events avoid a full camera
+    // cold-start. If WebConfig was started above, its preview init already did
+    // this and the call is skipped. A failed eager init is non-fatal because
+    // startRecording() retains its normal recovery/init path.
+    if (
+        cfg_sleep_mode == "off" &&
+        !cameraInitialized
+    ) {
+        Serial.println(
+            "Sleep off - initializing camera for fast motion start..."
+        );
+
+        if (!initCamera(
+                cfg_camera,
+                cfg_resolution,
+                cfg_quality
+            )) {
+            logWrite(
+                "Awake-ready camera init failed - recording will retry on trigger"
+            );
+        }
+    }
+
+
     // ---------------------------------------------------------
     // Decide what to do after boot
     // ---------------------------------------------------------
@@ -9490,6 +9973,7 @@ void setup() {
                 resetSleepDelayTimer();
             }
         } else {
+            motionDiagnosticsConsumePresenceStartTrigger();
             resetSleepDelayTimer();
         }
 
@@ -9511,13 +9995,16 @@ void setup() {
             "Motion active on boot"
         );
 
-        bool bootPhysicalMotion = physicalMotionActive();
+        bool bootPhysicalMotion =
+            physicalRecordingStartTriggerActive();
 
         if (recordingDecisionAllowsStart(bootPhysicalMotion, "normal_boot")) {
             if (!startRecording()) {
                 resetSleepDelayTimer();
             }
         } else {
+            if (bootPhysicalMotion)
+                motionDiagnosticsConsumePresenceStartTrigger();
             resetSleepDelayTimer();
         }
 
@@ -9584,8 +10071,16 @@ void loop() {
     // gate-energy reports; PRESENCE_PIN remains the wake/fallback input.
     radarLoop();
 
-    // RAM-only edge tracking for the WebConfig live motion display.
+    // RAM-only level/edge tracking for the WebConfig live motion display and
+    // backup awake trigger. Raw GPIO HIGH remains authoritative. A trigger that
+    // occurs while a recording is
+    // already active belongs to that event; it must not queue a second event
+    // immediately after finalization.
     motionDiagnosticsLoop();
+
+    if (recording) {
+        motionDiagnosticsConsumePresenceStartTrigger();
+    }
 
     if (
         imageVerifyRejectedUntilMotionClear &&
@@ -9646,17 +10141,7 @@ void loop() {
             wakeCriticalPathActive = false;
 
             if (deferredWakeConsolePending) {
-                powerConsole(
-                    "Wake from light sleep | cause=%s(%d) | slept=%llu ms | camera_wake=%llu us%s | console=deferred-timeout",
-                    sleepWakeCauseName(deferredWakeCause),
-                    (int)deferredWakeCause,
-                    (unsigned long long)(deferredWakeSleptUs / 1000ULL),
-                    (unsigned long long)deferredWakeCameraWakeUs,
-                    deferredWakeFastCameraSleep
-                        ? (deferredWakeCameraWakeOk ? "" : " FAILED")
-                        : " (normal-init fallback)"
-                );
-                deferredWakeConsolePending = false;
+                emitDeferredWakeConsole("timeout");
             }
 
             if (deferredMotionConsolePending) {
@@ -9691,7 +10176,7 @@ void loop() {
     ) {
 
         int ot2 =
-            digitalRead(PIR_PIN);
+            motionDiagnosticsPresenceActive() ? 1 : 0;
 
         int radarMotion =
             radarMotionActive() ? 1 : 0;
@@ -9848,7 +10333,8 @@ void loop() {
 
         if (motionDetected()) {
 
-            bool physicalTrigger = physicalMotionActive();
+            bool physicalTrigger =
+                physicalRecordingStartTriggerActive();
             bool simulatedTrigger = simulatedMotionActive();
 
             if (
@@ -9856,6 +10342,7 @@ void loop() {
                 !simulatedTrigger &&
                 !recordingDecisionAllowsStart(true, "awake_trigger")
             ) {
+                motionDiagnosticsConsumePresenceStartTrigger();
                 resetSleepDelayTimer();
                 finishDeferredWakeWithoutRecording("image-rejected");
                 delay(10);
@@ -9892,7 +10379,8 @@ void loop() {
             ) {
                 motionMessage = "simulated";
             } else if (
-                radarMotionTrackingAvailable()
+                radarMotionTrackingAvailable() &&
+                radarMotionActive()
             ) {
                 char motionBuffer[96];
                 snprintf(
@@ -9906,7 +10394,7 @@ void loop() {
             } else if (
                 radarSensorDetected()
             ) {
-                motionMessage = "OT2 fallback";
+                motionMessage = "OT2 edge/fallback";
             } else {
                 motionMessage = "PIR/digital input";
             }
@@ -9914,11 +10402,6 @@ void loop() {
             if (wakeCriticalPathActive) {
                 deferredMotionConsoleMessage = motionMessage;
                 deferredMotionConsolePending = true;
-            } else {
-                consoleWrite(
-                    "MOTION",
-                    motionMessage
-                );
             }
 
             if (
@@ -9929,24 +10412,43 @@ void loop() {
                     (uint64_t)esp_timer_get_time();
             }
 
-            if (!startRecording()) {
+            const bool presenceStartSource =
+                !simulatedTrigger &&
+                (
+                    motionDiagnosticsPresenceActive() ||
+                    motionDiagnosticsPresenceStartPending(
+                        AWAKE_PRESENCE_TRIGGER_PENDING_MAX_MS
+                    )
+                );
+
+            if (presenceStartSource) {
+                captureRecordingStartPresenceDiagnostics();
+            } else {
+                clearRecordingStartPresenceDiagnostics();
+            }
+
+            bool recordingStarted =
+                startRecording();
+
+            if (
+                recordingStarted &&
+                !wakeCriticalPathActive
+            ) {
+                // Serial output must not sit in front of recorder initialization.
+                consoleWrite(
+                    "MOTION",
+                    motionMessage
+                );
+            }
+
+            if (!recordingStarted) {
                 // No first frame will arrive to release the deferred console
                 // messages. Restore normal diagnostics immediately on failure.
                 if (wakeCriticalPathActive) {
                     wakeCriticalPathActive = false;
 
                     if (deferredWakeConsolePending) {
-                        powerConsole(
-                            "Wake from light sleep | cause=%s(%d) | slept=%llu ms | camera_wake=%llu us%s | console=deferred",
-                            sleepWakeCauseName(deferredWakeCause),
-                            (int)deferredWakeCause,
-                            (unsigned long long)(deferredWakeSleptUs / 1000ULL),
-                            (unsigned long long)deferredWakeCameraWakeUs,
-                            deferredWakeFastCameraSleep
-                                ? (deferredWakeCameraWakeOk ? "" : " FAILED")
-                                : " (normal-init fallback)"
-                        );
-                        deferredWakeConsolePending = false;
+                        emitDeferredWakeConsole(nullptr);
                     }
 
                     if (deferredMotionConsolePending) {
@@ -10114,17 +10616,7 @@ void loop() {
                 wakeCriticalPathActive = false;
 
                 if (deferredWakeConsolePending) {
-                    powerConsole(
-                        "Wake from light sleep | cause=%s(%d) | slept=%llu ms | camera_wake=%llu us%s | console=deferred",
-                        sleepWakeCauseName(deferredWakeCause),
-                        (int)deferredWakeCause,
-                        (unsigned long long)(deferredWakeSleptUs / 1000ULL),
-                        (unsigned long long)deferredWakeCameraWakeUs,
-                        deferredWakeFastCameraSleep
-                            ? (deferredWakeCameraWakeOk ? "" : " FAILED")
-                            : " (normal-init fallback)"
-                    );
-                    deferredWakeConsolePending = false;
+                    emitDeferredWakeConsole(nullptr);
                 }
 
                 if (deferredMotionConsolePending) {

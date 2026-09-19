@@ -127,6 +127,8 @@ static const UiTextEntry UI_TEXTS[] = {
     {"Bewegungssensor", "Motion sensor"}, // UI_MOTION_SENSOR_TYPE
     {"LD2410S Radar", "LD2410S radar"}, // UI_MOTION_SENSOR_RADAR
     {"PIR / digitaler Eingang", "PIR / digital input"}, // UI_MOTION_SENSOR_PIR
+    {"SR602 PIR", "SR602 PIR"}, // UI_MOTION_SENSOR_SR602_PIR
+    {"Für den PIR-Betrieb am Freenove-Board ist ausschließlich der SR602 getestet und freigegeben. Andere PIR-Module, einschließlich AM312, sind nicht validiert.", "For PIR operation on the Freenove board, only the SR602 has been tested and approved. Other PIR modules, including the AM312, are not validated."}, // UI_MOTION_PIR_FREENOVE_NOTE
     {"Eingang", "Input"}, // UI_PRESENCE_INPUT
     {"PIR GPIO", "PIR GPIO"}, // UI_MOTION_PIR_GPIO
     {"OT2 GPIO", "OT2 GPIO"}, // UI_MOTION_OT2_GPIO

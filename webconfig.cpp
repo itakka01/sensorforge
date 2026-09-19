@@ -478,10 +478,24 @@ static bool radarConfigAvailable()
 
 static UiTextId motionSensorTypeUiId()
 {
-    return
-        radarConfigAvailable()
-        ? UI_MOTION_SENSOR_RADAR
-        : UI_MOTION_SENSOR_PIR;
+    if (radarConfigAvailable())
+        return UI_MOTION_SENSOR_RADAR;
+
+#if defined(BOARD_FREENOVE)
+    return UI_MOTION_SENSOR_SR602_PIR;
+#else
+    return UI_MOTION_SENSOR_PIR;
+#endif
+}
+
+
+static bool freenovePirCompatibilityNoteApplies()
+{
+#if defined(BOARD_FREENOVE)
+    return !radarConfigAvailable();
+#else
+    return false;
+#endif
 }
 
 
@@ -495,12 +509,21 @@ static bool rejectRadarConfigurationUnavailable()
         "no-store"
     );
 
+    String message =
+        String(tr(UI_RADAR_CONFIG_UNAVAILABLE)) +
+        "\n\n" +
+        String(tr(UI_RADAR_CONFIG_PIR_NOTE));
+
+    if (freenovePirCompatibilityNoteApplies()) {
+        message +=
+            "\n\n" +
+            String(tr(UI_MOTION_PIR_FREENOVE_NOTE));
+    }
+
     server.send(
         409,
         "text/plain; charset=utf-8",
-        String(tr(UI_RADAR_CONFIG_UNAVAILABLE)) +
-        "\n\n" +
-        String(tr(UI_RADAR_CONFIG_PIR_NOTE))
+        message
     );
 
     return true;
@@ -984,13 +1007,22 @@ static String htmlHeader()
             htmlText(UI_NAV_RADAR_CONFIG) +
             "</a>";
     } else {
+        String radarUnavailableTitle =
+            htmlText(UI_RADAR_CONFIG_PIR_NOTE);
+
+        if (freenovePirCompatibilityNoteApplies()) {
+            radarUnavailableTitle +=
+                " " +
+                htmlText(UI_MOTION_PIR_FREENOVE_NOTE);
+        }
+
         html +=
             "<span class='nav-disabled' title='" +
-            htmlText(UI_RADAR_CONFIG_PIR_NOTE) +
+            radarUnavailableTitle +
             "'>" +
             htmlText(UI_NAV_RADAR_CONFIG) +
             " &middot; " +
-            htmlText(UI_MOTION_SENSOR_PIR) +
+            htmlText(motionSensorTypeUiId()) +
             "</span>";
     }
 
@@ -2231,7 +2263,16 @@ static void handleRoot()
         htmlText(UI_MOTION_NO_TRIGGER_YET) +
         "</b> &middot; " +
         htmlText(UI_MOTION_TRIGGERS_SINCE_OPEN) +
-        ": <b id='motionTriggerCount'>0</b>" +
+        ": <b id='motionTriggerCount'>0</b>";
+
+    if (freenovePirCompatibilityNoteApplies()) {
+        html +=
+            "<br><span class='muted' style='display:inline-block;margin-top:8px'>" +
+            htmlText(UI_MOTION_PIR_FREENOVE_NOTE) +
+            "</span>";
+    }
+
+    html +=
         "</div></section>";
 
     html +=
