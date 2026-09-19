@@ -257,6 +257,17 @@ static const uint8_t SD_BOOT_MAX_ATTEMPTS = 5;
 static const uint8_t SD_RUNTIME_RECOVERY_MAX_ATTEMPTS = 3;
 static const unsigned long SD_COLD_BOOT_SETTLE_MS = 1200UL;
 static const unsigned long SD_SPI_PRECLOCK_HZ = 400000UL;
+
+// A persistent storage fault must not keep the ESP32-S3, camera and radio
+// awake indefinitely. After the normal boot/runtime recovery attempts fail,
+// SensorForge enters a dedicated deep-sleep fault mode as soon as WebConfig
+// is no longer active. Only the magnet/reed service input and a periodic timer
+// can wake it. Periodic fault wakes retry SD quickly without starting WiFi,
+// radar or the normal camera stack when the card is still unavailable.
+static const uint32_t STORAGE_FAULT_RETRY_SECONDS = 300UL;
+static const uint32_t STORAGE_FAULT_WEB_IDLE_TIMEOUT_SECONDS = 120UL;
+static const uint8_t SD_STORAGE_FAULT_WAKE_MAX_ATTEMPTS = 2;
+
 static const uint8_t MAX_CONSECUTIVE_FRAME_FAILURES = 5;
 
 // Thermal protection is intentionally firmware-owned rather than configurable
@@ -296,6 +307,17 @@ RTC_DATA_ATTR uint32_t transportRtcLastSleepSeconds = 0;
 static const uint32_t NORMAL_DEEP_SLEEP_RTC_MAGIC = 0x53464453UL; // "SFDS"
 RTC_DATA_ATTR uint32_t normalDeepSleepRtcMagic = 0;
 RTC_DATA_ATTR int64_t normalDeepSleepStartedEpoch = 0;
+
+// Dedicated storage-fault sleep marker. This is deliberately independent of
+// normal deep sleep and transport mode so a timer wake can retry only the SD
+// path and return to low power immediately if storage is still unavailable.
+static const uint32_t STORAGE_FAULT_RTC_MAGIC = 0x53465344UL; // "SFSD"
+RTC_DATA_ATTR uint32_t storageFaultRtcMagic = 0;
+RTC_DATA_ATTR uint32_t storageFaultRtcCycle = 0;
+
+static void storageFaultClearRtcState();
+static bool enterStorageFaultLowPowerSleep(const char *reason);
+static bool tryEnterStorageFaultLowPower();
 
 static bool thermalWarningState = false;
 static bool thermalEmergencyState = false;
@@ -3456,6 +3478,17 @@ static bool recoveredSdHasValidConfig(
 
 
 // =============================================================
+// STORAGE-FAULT LOW-POWER STATE
+// =============================================================
+
+static void storageFaultClearRtcState()
+{
+    storageFaultRtcMagic = 0;
+    storageFaultRtcCycle = 0;
+}
+
+
+// =============================================================
 // SD RECOVERY
 // =============================================================
 
@@ -3490,6 +3523,8 @@ bool recoverSD()
 
     sdReady =
         true;
+
+    storageFaultClearRtcState();
 
     logInit();
 
@@ -3578,6 +3613,1077 @@ bool recoverSD()
 
     return true;
 }
+
+
+
+// =============================================================
+// MANUAL READ-ONLY SD RECOVERY / DIAGNOSTIC (XIAO SPI)
+// =============================================================
+//
+// This path is intentionally operator-triggered from WebConfig. It is meant
+// for an SD card that failed the normal boot/runtime mount attempts.
+//
+// Safety properties:
+// - no format
+// - no wipe
+// - no raw-sector writes
+// - SD.begin(..., format_if_mount_failed=false)
+// - no automatic reboot
+//
+// If a filesystem mount succeeds, SensorForge adopts the recovered mount and
+// returns storage to normal operation. Normal operation may then write logs or
+// recordings as usual; the recovery probes themselves do not deliberately
+// modify card contents.
+
+#if defined(STORAGE_SPI)
+
+static void sdManualRecoveryReportf(
+    String &report,
+    const char *format,
+    ...
+)
+{
+    char buffer[256];
+
+    va_list args;
+    va_start(args, format);
+
+    vsnprintf(
+        buffer,
+        sizeof(buffer),
+        format,
+        args
+    );
+
+    va_end(args);
+
+    report += buffer;
+}
+
+
+static void sdManualRecoveryDeselect()
+{
+    digitalWrite(
+        SD_CS_PIN,
+        HIGH
+    );
+
+    SPI.transfer(0xFF);
+}
+
+
+static void sdManualRecoverySelect()
+{
+    digitalWrite(
+        SD_CS_PIN,
+        LOW
+    );
+}
+
+
+static bool sdManualRecoveryWaitReady(
+    uint32_t timeoutMs
+)
+{
+    uint32_t start =
+        millis();
+
+    do {
+        if (SPI.transfer(0xFF) == 0xFF)
+            return true;
+
+        delayMicroseconds(50);
+        feedWatchdog();
+
+    } while (
+        (uint32_t)(
+            millis() -
+            start
+        ) <
+        timeoutMs
+    );
+
+    return false;
+}
+
+
+static uint8_t sdManualRecoveryCommandSelected(
+    uint8_t command,
+    uint32_t argument,
+    uint8_t crc
+)
+{
+    if (!sdManualRecoveryWaitReady(300UL))
+        return 0xFF;
+
+    SPI.transfer(
+        0x40U |
+        command
+    );
+
+    SPI.transfer(
+        (uint8_t)(
+            argument >>
+            24
+        )
+    );
+
+    SPI.transfer(
+        (uint8_t)(
+            argument >>
+            16
+        )
+    );
+
+    SPI.transfer(
+        (uint8_t)(
+            argument >>
+            8
+        )
+    );
+
+    SPI.transfer(
+        (uint8_t)argument
+    );
+
+    SPI.transfer(crc);
+
+    for (
+        uint8_t i = 0;
+        i < 16;
+        ++i
+    ) {
+        uint8_t response =
+            SPI.transfer(0xFF);
+
+        if (
+            (response & 0x80U) ==
+            0
+        ) {
+            return response;
+        }
+    }
+
+    return 0xFF;
+}
+
+
+static uint8_t sdManualRecoveryCommand(
+    uint8_t command,
+    uint32_t argument,
+    uint8_t crc
+)
+{
+    sdManualRecoveryDeselect();
+    sdManualRecoverySelect();
+
+    uint8_t response =
+        sdManualRecoveryCommandSelected(
+            command,
+            argument,
+            crc
+        );
+
+    sdManualRecoveryDeselect();
+
+    return response;
+}
+
+
+static bool sdManualRecoveryRawInit(
+    String &report,
+    bool &blockAddressing
+)
+{
+    report +=
+        "=== RAW SPI RESET / INIT @ 400 kHz ===\n";
+
+    blockAddressing =
+        false;
+
+    resetStorageInterface();
+
+    delay(100);
+
+    pinMode(
+        SD_CS_PIN,
+        OUTPUT
+    );
+
+    digitalWrite(
+        SD_CS_PIN,
+        HIGH
+    );
+
+    SPI.begin(
+        SD_SCK_PIN,
+        SD_MISO_PIN,
+        SD_MOSI_PIN,
+        SD_CS_PIN
+    );
+
+    SPI.beginTransaction(
+        SPISettings(
+            400000UL,
+            MSBFIRST,
+            SPI_MODE0
+        )
+    );
+
+    // SD SPI power-up requires >=74 clocks while CS is HIGH.
+    digitalWrite(
+        SD_CS_PIN,
+        HIGH
+    );
+
+    for (
+        uint8_t i = 0;
+        i < 20;
+        ++i
+    ) {
+        SPI.transfer(0xFF);
+    }
+
+    uint8_t cmd0 =
+        0xFF;
+
+    for (
+        uint8_t attempt = 1;
+        attempt <= 5;
+        ++attempt
+    ) {
+        cmd0 =
+            sdManualRecoveryCommand(
+                0,
+                0,
+                0x95
+            );
+
+        sdManualRecoveryReportf(
+            report,
+            "CMD0 attempt %u -> R1=0x%02X\n",
+            (unsigned)attempt,
+            (unsigned)cmd0
+        );
+
+        if (cmd0 == 0x01)
+            break;
+
+        delay(50);
+        feedWatchdog();
+    }
+
+    if (cmd0 != 0x01) {
+        report +=
+            "RAW: card did not enter SPI idle state.\n";
+
+        SPI.endTransaction();
+        SPI.end();
+
+        return false;
+    }
+
+
+    sdManualRecoveryDeselect();
+    sdManualRecoverySelect();
+
+    uint8_t cmd8 =
+        sdManualRecoveryCommandSelected(
+            8,
+            0x000001AAUL,
+            0x87
+        );
+
+    uint8_t r7[4] = {
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF
+    };
+
+    if (cmd8 != 0xFF) {
+        for (
+            uint8_t i = 0;
+            i < 4;
+            ++i
+        ) {
+            r7[i] =
+                SPI.transfer(0xFF);
+        }
+    }
+
+    sdManualRecoveryDeselect();
+
+    sdManualRecoveryReportf(
+        report,
+        "CMD8 -> R1=0x%02X R7=%02X %02X %02X %02X\n",
+        (unsigned)cmd8,
+        (unsigned)r7[0],
+        (unsigned)r7[1],
+        (unsigned)r7[2],
+        (unsigned)r7[3]
+    );
+
+    bool sdV2 =
+        cmd8 == 0x01 &&
+        r7[2] == 0x01 &&
+        r7[3] == 0xAA;
+
+    bool legacy =
+        (cmd8 & 0x04U) !=
+        0;
+
+    if (
+        !sdV2 &&
+        !legacy
+    ) {
+        report +=
+            "RAW warning: unexpected CMD8 response.\n";
+    }
+
+
+    uint32_t acmdArgument =
+        sdV2
+        ? 0x40000000UL
+        : 0UL;
+
+    uint8_t acmd41 =
+        0xFF;
+
+    uint32_t initStart =
+        millis();
+
+    while (
+        (uint32_t)(
+            millis() -
+            initStart
+        ) <
+        3000UL
+    ) {
+        uint8_t cmd55 =
+            sdManualRecoveryCommand(
+                55,
+                0,
+                0x01
+            );
+
+        if (cmd55 != 0xFF) {
+            acmd41 =
+                sdManualRecoveryCommand(
+                    41,
+                    acmdArgument,
+                    0x01
+                );
+
+            if (acmd41 == 0x00)
+                break;
+        }
+
+        delay(20);
+        feedWatchdog();
+    }
+
+    sdManualRecoveryReportf(
+        report,
+        "ACMD41 final -> R1=0x%02X\n",
+        (unsigned)acmd41
+    );
+
+    if (acmd41 != 0x00) {
+        report +=
+            "RAW: card stayed in idle / initialization failed.\n";
+
+        SPI.endTransaction();
+        SPI.end();
+
+        return false;
+    }
+
+
+    sdManualRecoveryDeselect();
+    sdManualRecoverySelect();
+
+    uint8_t cmd58 =
+        sdManualRecoveryCommandSelected(
+            58,
+            0,
+            0x01
+        );
+
+    uint8_t ocr[4] = {
+        0,
+        0,
+        0,
+        0
+    };
+
+    if (cmd58 != 0xFF) {
+        for (
+            uint8_t i = 0;
+            i < 4;
+            ++i
+        ) {
+            ocr[i] =
+                SPI.transfer(0xFF);
+        }
+    }
+
+    sdManualRecoveryDeselect();
+
+    sdManualRecoveryReportf(
+        report,
+        "CMD58 -> R1=0x%02X OCR=%02X %02X %02X %02X\n",
+        (unsigned)cmd58,
+        (unsigned)ocr[0],
+        (unsigned)ocr[1],
+        (unsigned)ocr[2],
+        (unsigned)ocr[3]
+    );
+
+    if (cmd58 != 0x00) {
+        report +=
+            "RAW: card initialized, but OCR read failed.\n";
+
+        SPI.endTransaction();
+        SPI.end();
+
+        return false;
+    }
+
+
+    blockAddressing =
+        (ocr[0] & 0x40U) !=
+        0;
+
+    sdManualRecoveryReportf(
+        report,
+        "RAW addressing: %s\n",
+        blockAddressing
+        ? "SDHC/SDXC block"
+        : "SDSC byte"
+    );
+
+
+    if (!blockAddressing) {
+        uint8_t cmd16 =
+            sdManualRecoveryCommand(
+                16,
+                512,
+                0x01
+            );
+
+        sdManualRecoveryReportf(
+            report,
+            "CMD16(512) -> R1=0x%02X\n",
+            (unsigned)cmd16
+        );
+    }
+
+
+    report +=
+        "RAW: card controller reached READY.\n";
+
+    SPI.endTransaction();
+
+    return true;
+}
+
+
+static bool sdManualRecoveryReadSector0(
+    bool blockAddressing,
+    uint8_t *sector,
+    String &report
+)
+{
+    if (!sector)
+        return false;
+
+
+    SPI.beginTransaction(
+        SPISettings(
+            400000UL,
+            MSBFIRST,
+            SPI_MODE0
+        )
+    );
+
+    sdManualRecoveryDeselect();
+    sdManualRecoverySelect();
+
+    // Sector zero is address zero for both byte and block addressed cards.
+    (void)blockAddressing;
+
+    uint8_t cmd17 =
+        sdManualRecoveryCommandSelected(
+            17,
+            0,
+            0x01
+        );
+
+    if (cmd17 != 0x00) {
+        sdManualRecoveryReportf(
+            report,
+            "CMD17 sector0 -> R1=0x%02X\n",
+            (unsigned)cmd17
+        );
+
+        sdManualRecoveryDeselect();
+        SPI.endTransaction();
+
+        return false;
+    }
+
+
+    uint8_t token =
+        0xFF;
+
+    uint32_t tokenStart =
+        millis();
+
+    while (
+        (uint32_t)(
+            millis() -
+            tokenStart
+        ) <
+        1000UL
+    ) {
+        token =
+            SPI.transfer(0xFF);
+
+        if (
+            token == 0xFE ||
+            token != 0xFF
+        ) {
+            break;
+        }
+
+        feedWatchdog();
+    }
+
+
+    if (token != 0xFE) {
+        sdManualRecoveryReportf(
+            report,
+            "CMD17 sector0 -> data token=0x%02X\n",
+            (unsigned)token
+        );
+
+        sdManualRecoveryDeselect();
+        SPI.endTransaction();
+
+        return false;
+    }
+
+
+    for (
+        size_t i = 0;
+        i < 512U;
+        ++i
+    ) {
+        sector[i] =
+            SPI.transfer(0xFF);
+    }
+
+    // Discard data CRC.
+    SPI.transfer(0xFF);
+    SPI.transfer(0xFF);
+
+    sdManualRecoveryDeselect();
+    SPI.endTransaction();
+
+    bool signature =
+        sector[510] == 0x55 &&
+        sector[511] == 0xAA;
+
+    bool directFat32 =
+        memcmp(
+            &sector[82],
+            "FAT32   ",
+            8
+        ) == 0;
+
+    bool directFat16 =
+        memcmp(
+            &sector[54],
+            "FAT16   ",
+            8
+        ) == 0;
+
+    bool directFat12 =
+        memcmp(
+            &sector[54],
+            "FAT12   ",
+            8
+        ) == 0;
+
+    bool directExfat =
+        memcmp(
+            &sector[3],
+            "EXFAT   ",
+            8
+        ) == 0;
+
+    sdManualRecoveryReportf(
+        report,
+        "Sector 0 read: OK | signature_55AA=%s | FAT32=%s | FAT16=%s | FAT12=%s | exFAT=%s\n",
+        signature ? "yes" : "no",
+        directFat32 ? "yes" : "no",
+        directFat16 ? "yes" : "no",
+        directFat12 ? "yes" : "no",
+        directExfat ? "yes" : "no"
+    );
+
+
+    if (
+        signature &&
+        !directFat32 &&
+        !directFat16 &&
+        !directFat12 &&
+        !directExfat
+    ) {
+        for (
+            uint8_t partition = 0;
+            partition < 4;
+            ++partition
+        ) {
+            const uint8_t *entry =
+                &sector[
+                    446U +
+                    (uint16_t)partition *
+                    16U
+                ];
+
+            uint8_t type =
+                entry[4];
+
+            uint32_t startLba =
+                (uint32_t)entry[8] |
+                ((uint32_t)entry[9] << 8) |
+                ((uint32_t)entry[10] << 16) |
+                ((uint32_t)entry[11] << 24);
+
+            uint32_t sectorCount =
+                (uint32_t)entry[12] |
+                ((uint32_t)entry[13] << 8) |
+                ((uint32_t)entry[14] << 16) |
+                ((uint32_t)entry[15] << 24);
+
+            if (
+                type == 0 &&
+                startLba == 0 &&
+                sectorCount == 0
+            ) {
+                continue;
+            }
+
+            sdManualRecoveryReportf(
+                report,
+                "Partition %u: type=0x%02X start_lba=%lu sectors=%lu\n",
+                (unsigned)(
+                    partition +
+                    1
+                ),
+                (unsigned)type,
+                (unsigned long)startLba,
+                (unsigned long)sectorCount
+            );
+        }
+    }
+
+
+    return true;
+}
+
+
+static bool sdManualRecoveryTryMountAtHz(
+    uint32_t frequencyHz,
+    String &report
+)
+{
+    resetStorageInterface();
+
+    delay(100);
+
+    pinMode(
+        SD_CS_PIN,
+        OUTPUT
+    );
+
+    digitalWrite(
+        SD_CS_PIN,
+        HIGH
+    );
+
+    SPI.begin(
+        SD_SCK_PIN,
+        SD_MISO_PIN,
+        SD_MOSI_PIN,
+        SD_CS_PIN
+    );
+
+    sdSpiSendIdleClocks();
+
+    bool mounted =
+        SD.begin(
+            SD_CS_PIN,
+            SPI,
+            frequencyHz,
+            "/sd",
+            5,
+            false
+        );
+
+    if (!mounted) {
+        sdManualRecoveryReportf(
+            report,
+            "Mount @ %.3f MHz -> FAILED\n",
+            (double)frequencyHz /
+                1000000.0
+        );
+
+        resetStorageInterface();
+
+        return false;
+    }
+
+
+    uint8_t cardType =
+        SD.cardType();
+
+    File root =
+        SD.open(
+            "/",
+            FILE_READ
+        );
+
+    bool rootOk =
+        root &&
+        root.isDirectory();
+
+    if (root)
+        root.close();
+
+
+    if (
+        cardType == CARD_NONE ||
+        !rootOk
+    ) {
+        sdManualRecoveryReportf(
+            report,
+            "Mount @ %.3f MHz -> card/filesystem unavailable\n",
+            (double)frequencyHz /
+                1000000.0
+        );
+
+        resetStorageInterface();
+
+        return false;
+    }
+
+
+    uint64_t cardSizeMb =
+        SD.cardSize() /
+        (1024ULL * 1024ULL);
+
+    sdManualRecoveryReportf(
+        report,
+        "Mount @ %.3f MHz -> OK | card=%s | size=%llu MB | root=OK\n",
+        (double)frequencyHz /
+            1000000.0,
+        cardType == CARD_MMC
+            ? "MMC"
+            : (
+                cardType == CARD_SD
+                ? "SDSC"
+                : (
+                    cardType == CARD_SDHC
+                    ? "SDHC/SDXC"
+                    : "UNKNOWN"
+                )
+            ),
+        (unsigned long long)cardSizeMb
+    );
+
+    return true;
+}
+
+
+bool sdManualReadOnlyRecovery(
+    String &report,
+    uint32_t &mountedFrequencyHz,
+    bool &rawCardReady,
+    bool &sector0Readable
+)
+{
+    report = "";
+    report.reserve(4096);
+
+    mountedFrequencyHz =
+        0;
+
+    rawCardReady =
+        false;
+
+    sector0Readable =
+        false;
+
+
+    report +=
+        "SensorForge manual SD recovery\n"
+        "Mode: non-destructive / no format / no wipe / no raw writes\n\n";
+
+
+    if (recording) {
+        report +=
+            "ABORTED: recording is active.\n";
+
+        return false;
+    }
+
+
+    if (g_storageLocked) {
+        report +=
+            "ABORTED: storage is currently locked by another operation.\n";
+
+        return false;
+    }
+
+
+    if (sdReady) {
+        report +=
+            "ABORTED: SD is already mounted and marked ready.\n";
+
+        return true;
+    }
+
+
+    bool previousRecordingBlock =
+        g_recordingStartBlocked;
+
+    bool previousStorageLock =
+        g_storageLocked;
+
+
+    g_recordingStartBlocked =
+        true;
+
+    g_storageLocked =
+        true;
+
+
+    // The boot path has no active SD logger when sdReady=false, but close it
+    // defensively before taking exclusive ownership of the SPI storage bus.
+    logClose();
+
+    resetStorageInterface();
+
+    sdReady =
+        false;
+
+
+    bool blockAddressing =
+        false;
+
+    rawCardReady =
+        sdManualRecoveryRawInit(
+            report,
+            blockAddressing
+        );
+
+
+    if (rawCardReady) {
+        uint8_t sector0[512];
+
+        memset(
+            sector0,
+            0,
+            sizeof(sector0)
+        );
+
+        sector0Readable =
+            sdManualRecoveryReadSector0(
+                blockAddressing,
+                sector0,
+                report
+            );
+
+        if (!sector0Readable) {
+            report +=
+                "Sector 0 read: FAILED\n";
+        }
+
+        resetStorageInterface();
+    }
+
+
+    report +=
+        "\n=== FILESYSTEM MOUNT SWEEP ===\n";
+
+    const uint32_t frequencies[] = {
+        400000UL,
+        1000000UL,
+        2000000UL,
+        4000000UL,
+        8000000UL,
+        SD_SPI_NORMAL_FREQUENCY_HZ
+    };
+
+    uint32_t bestFrequency =
+        0;
+
+    uint32_t lastFrequency =
+        0;
+
+
+    for (
+        size_t i = 0;
+        i <
+        sizeof(frequencies) /
+        sizeof(frequencies[0]);
+        ++i
+    ) {
+        uint32_t frequency =
+            frequencies[i];
+
+        if (frequency == lastFrequency)
+            continue;
+
+        lastFrequency =
+            frequency;
+
+
+        bool mounted =
+            sdManualRecoveryTryMountAtHz(
+                frequency,
+                report
+            );
+
+
+        if (mounted) {
+            bestFrequency =
+                frequency;
+
+            // Continue upwards to find the highest currently stable clock.
+            resetStorageInterface();
+
+            delay(100);
+            feedWatchdog();
+
+            continue;
+        }
+
+
+        // Once a lower clock has mounted successfully, stop at the first
+        // higher failure and fall back to the best known working clock.
+        if (bestFrequency != 0)
+            break;
+    }
+
+
+    bool recovered =
+        false;
+
+
+    if (bestFrequency != 0) {
+        report +=
+            "\nRemounting best working clock...\n";
+
+        recovered =
+            sdManualRecoveryTryMountAtHz(
+                bestFrequency,
+                report
+            );
+
+        if (recovered) {
+            mountedFrequencyHz =
+                bestFrequency;
+
+            sdReady =
+                true;
+
+            storageFaultClearRtcState();
+
+            sdManualRecoveryReportf(
+                report,
+                "\nRECOVERY SUCCESS | mounted=%.3f MHz%s\n",
+                (double)bestFrequency /
+                    1000000.0,
+                bestFrequency <
+                    SD_SPI_NORMAL_FREQUENCY_HZ
+                    ? " | DEGRADED CLOCK"
+                    : ""
+            );
+
+
+            if (bootStartedWithoutSd) {
+                String configError;
+
+                bool validSdConfig =
+                    recoveredSdHasValidConfig(
+                        configError
+                    );
+
+                if (validSdConfig) {
+                    report +=
+                        "Valid SD /config.txt detected. Current RAM configuration is kept until a deliberate reboot.\n";
+                } else {
+                    report +=
+                        "No valid SD /config.txt requiring priority restoration: " +
+                        configError +
+                        "\n";
+                }
+            }
+
+
+            report +=
+                "Incomplete-recording cleanup was NOT run by this recovery action.\n";
+        }
+    }
+
+
+    if (!recovered) {
+        resetStorageInterface();
+
+        sdReady =
+            false;
+
+        report +=
+            "\nRECOVERY FAILED: no readable filesystem mount was obtained.\n";
+
+        if (rawCardReady) {
+            report +=
+                "The SD controller answered at raw SPI level; filesystem/partition damage remains plausible.\n";
+        } else {
+            report +=
+                "The SD controller did not reach READY at raw SPI level; card/controller/contact/power failure is more likely.\n";
+        }
+    }
+
+
+    g_storageLocked =
+        previousStorageLock;
+
+    g_recordingStartBlocked =
+        previousRecordingBlock;
+
+
+    if (recovered) {
+        // Recovery probing itself is read-only. Once exclusive recovery ends,
+        // restore the normal logger so the running SensorForge instance can
+        // resume ordinary operation on the recovered mount.
+        logInit();
+
+        logWrite(
+            "SD manual recovery successful | mounted_hz=" +
+            String(mountedFrequencyHz)
+        );
+    }
+
+
+    return recovered;
+}
+
+#endif // STORAGE_SPI
 
 
 // =============================================================
@@ -8020,6 +9126,145 @@ static void thermalMonitorLoop()
 }
 
 
+static bool enterStorageFaultLowPowerSleep(
+    const char *reason
+)
+{
+    // This path is intentionally independent of cfg_sleep_mode. A missing SD
+    // disables recording anyway; remaining fully awake would only turn a
+    // storage/contact fault into a battery-depletion fault.
+    esp_sleep_disable_wakeup_source(
+        ESP_SLEEP_WAKEUP_ALL
+    );
+
+    esp_sleep_pd_config(
+        ESP_PD_DOMAIN_RTC_PERIPH,
+        ESP_PD_OPTION_ON
+    );
+
+    // Service wake: magnet/reed LOW only. Presence/radar is deliberately not a
+    // wake source while recording storage is unavailable.
+    rtc_gpio_init(
+        MAGNET_SWITCH_PIN
+    );
+
+    rtc_gpio_set_direction(
+        MAGNET_SWITCH_PIN,
+        RTC_GPIO_MODE_INPUT_ONLY
+    );
+
+    rtc_gpio_pullup_en(
+        MAGNET_SWITCH_PIN
+    );
+
+    rtc_gpio_pulldown_dis(
+        MAGNET_SWITCH_PIN
+    );
+
+    esp_err_t magnetErr =
+        esp_sleep_enable_ext0_wakeup(
+            MAGNET_SWITCH_PIN,
+            0
+        );
+
+    esp_err_t timerErr =
+        esp_sleep_enable_timer_wakeup(
+            (uint64_t)STORAGE_FAULT_RETRY_SECONDS *
+            1000000ULL
+        );
+
+    if (
+        magnetErr != ESP_OK ||
+        timerErr != ESP_OK
+    ) {
+        powerConsole(
+            "STORAGE FAULT sleep setup failed | magnet=0x%x | timer=0x%x",
+            magnetErr,
+            timerErr
+        );
+
+        // Do not enter a sleep from which service/retry wake is uncertain.
+        esp_sleep_disable_wakeup_source(
+            ESP_SLEEP_WAKEUP_ALL
+        );
+
+        rtc_gpio_deinit(
+            MAGNET_SWITCH_PIN
+        );
+
+        pinMode(
+            MAGNET_SWITCH_PIN,
+            INPUT_PULLUP
+        );
+
+        return false;
+    }
+
+    storageFaultRtcMagic =
+        STORAGE_FAULT_RTC_MAGIC;
+
+    if (storageFaultRtcCycle < UINT32_MAX)
+        storageFaultRtcCycle++;
+
+    powerConsole(
+        "STORAGE FAULT low-power sleep | reason=%s | retry=%lu s | cycle=%lu | wake=timer OR magnet",
+        reason ? reason : "SD unavailable",
+        (unsigned long)STORAGE_FAULT_RETRY_SECONDS,
+        (unsigned long)storageFaultRtcCycle
+    );
+
+    prepareCommonSleepState();
+
+    // The filesystem is already unavailable, but force the backend into a
+    // known quiescent state before cutting CPU power.
+    logClose();
+    STORAGE.end();
+    sdReady = false;
+
+#if defined(STORAGE_SPI)
+    SPI.end();
+    sdSpiDeselect();
+#endif
+
+    delay(100);
+    esp_deep_sleep_start();
+
+    // Defensive only: esp_deep_sleep_start() does not return on success.
+    return true;
+}
+
+
+static bool tryEnterStorageFaultLowPower()
+{
+    if (sdReady)
+        return false;
+
+    if (recording)
+        return false;
+
+    // An operator actively using WebConfig must retain control. Once the normal
+    // WiFi inactivity timeout shuts the UI/radio down, the next loop turn may
+    // enter the storage-fault sleeper.
+    if (
+        webConfigStarted ||
+        WiFi.getMode() != WIFI_OFF
+    ) {
+        return false;
+    }
+
+    // If the service magnet is already present, remain awake so the ordinary
+    // magnet/WebConfig path can establish service access instead of immediately
+    // sleeping on an already-active wake level.
+    if (!magnetWakeIsClear())
+        return false;
+
+    return
+        enterStorageFaultLowPowerSleep(
+            "SD unavailable after recovery"
+        );
+}
+
+
 static void enterDeepSleep()
 {
     if (!configureSleepWakeSources())
@@ -8513,13 +9758,14 @@ static bool tryEnterConfiguredSleep()
     }
 
 
-    // Stay awake on storage failure so the visible fault pattern remains
-    // available and periodic recoverSD() attempts can continue.
+    // Storage failure has its own dedicated low-power path and is handled
+    // before configured sleep. Keep this defensive guard in case a future
+    // caller reaches this function directly while storage is unavailable.
     if (!sdReady) {
 
         setSleepDiagState(
             SLEEP_DIAG_SD,
-            "Sleep blocked | SD unavailable"
+            "Configured sleep bypassed | storage fault mode owns power state"
         );
 
         return false;
@@ -9260,6 +10506,11 @@ void setup() {
     esp_reset_reason_t resetReason =
         esp_reset_reason();
 
+    const bool storageFaultTimerWake =
+        resetReason == ESP_RST_DEEPSLEEP &&
+        wakeCause == ESP_SLEEP_WAKEUP_TIMER &&
+        storageFaultRtcMagic == STORAGE_FAULT_RTC_MAGIC;
+
     if (resetReason != ESP_RST_DEEPSLEEP) {
         normalDeepSleepRtcMagic = 0;
         normalDeepSleepStartedEpoch = 0;
@@ -9295,6 +10546,15 @@ void setup() {
         // EXT1 is the presence / PIR / LD2410S OT2 input.
         rtc_gpio_deinit(
             PIR_PIN
+        );
+    }
+
+    if (storageFaultTimerWake) {
+        // Storage-fault sleep configured the magnet pad as RTC EXT0 even though
+        // this particular wake came from the timer. Restore it before normal
+        // GPIO setup touches the pin.
+        rtc_gpio_deinit(
+            MAGNET_SWITCH_PIN
         );
     }
 
@@ -9464,14 +10724,35 @@ void setup() {
     // Use more attempts at boot than during normal operation. Each failed
     // attempt fully tears down SPI/SD, leaves CS HIGH, waits with backoff,
     // sends 128 idle clocks, and starts the card/filesystem again.
+    const uint8_t sdBootAttempts =
+        storageFaultTimerWake
+        ? SD_STORAGE_FAULT_WAKE_MAX_ATTEMPTS
+        : SD_BOOT_MAX_ATTEMPTS;
+
+    if (storageFaultTimerWake) {
+        Serial.printf(
+            "STORAGE FAULT timer wake | cycle=%lu | SD retry attempts=%u\n",
+            (unsigned long)storageFaultRtcCycle,
+            (unsigned)sdBootAttempts
+        );
+    }
+
     sdReady =
         initSDWithRetries(
             "boot",
-            SD_BOOT_MAX_ATTEMPTS
+            sdBootAttempts
         );
 
 
-    if (!sdReady) {
+    if (sdReady) {
+        if (storageFaultRtcMagic == STORAGE_FAULT_RTC_MAGIC) {
+            Serial.println(
+                "STORAGE FAULT recovered - normal operation restored"
+            );
+        }
+
+        storageFaultClearRtcState();
+    } else {
 
         Serial.println(
             "WARNING: SD init failed after robust cold-boot recovery"
@@ -9527,6 +10808,38 @@ void setup() {
         )) {
         // Protection deep sleep normally never returns.
         return;
+    }
+
+
+    // ---------------------------------------------------------
+    // Periodic storage-fault retry fast path
+    //
+    // When the preceding storage-fault deep sleep woke only to retry SD, do
+    // not start normal product subsystems if the card is still unavailable.
+    // Active transport mode keeps precedence because it has its own timer-only
+    // power policy. A magnet wake is not a timer wake and therefore always
+    // reaches the normal service/WebConfig path.
+    // ---------------------------------------------------------
+
+    if (
+        storageFaultTimerWake &&
+        !sdReady &&
+        cfg_transport_mode == 0 &&
+        magnetWakeIsClear()
+    ) {
+        Serial.println(
+            "STORAGE FAULT periodic retry failed - returning to low-power sleep"
+        );
+
+        if (enterStorageFaultLowPowerSleep(
+                "periodic SD retry failed"
+            )) {
+            return;
+        }
+
+        Serial.println(
+            "STORAGE FAULT low-power sleep unavailable - continuing normal boot"
+        );
     }
 
 
@@ -10272,11 +11585,6 @@ void loop() {
 
     if (!recording) {
 
-        if (tryEnterConfiguredSleep()) {
-            return;
-        }
-
-
         if (!sdReady) {
 
             static unsigned long lastSdRetryMs = 0;
@@ -10285,6 +11593,26 @@ void loop() {
                 webConfigStarted &&
                 webConfigCameraPreviewActive();
 
+            // Storage failure gets its own finite unattended service window,
+            // even if the normal WiFi timeout is configured as unlimited or
+            // much longer. An actively used browser keeps the session alive via
+            // the existing heartbeat, so operator service is never cut off.
+            if (
+                webConfigStarted &&
+                webConfigInactiveFor(
+                    STORAGE_FAULT_WEB_IDLE_TIMEOUT_SECONDS
+                )
+            ) {
+                stopWebConfigWifi(
+                    "WiFi OFF: storage fault idle timeout"
+                );
+            }
+
+            // Preserve the existing one-minute active recovery opportunity.
+            // On the initial fault boot this overlaps the normal WebConfig/WiFi
+            // service window. If recovery still fails and the UI/radio has gone
+            // inactive, transition to periodic low-power retries instead of
+            // remaining awake indefinitely.
             if (
                 !previewActive &&
                 millis() - lastSdRetryMs >
@@ -10297,7 +11625,18 @@ void loop() {
                 recoverSD();
             }
 
-            delay(10);
+            if (!sdReady) {
+                if (tryEnterStorageFaultLowPower()) {
+                    return;
+                }
+
+                delay(10);
+                return;
+            }
+        }
+
+
+        if (tryEnterConfiguredSleep()) {
             return;
         }
 

@@ -5,6 +5,7 @@
 
 #include <FS.h>
 #include <LittleFS.h>
+#include <Preferences.h>
 #include <time.h>
 #include <stdlib.h>
 #include <string.h>
@@ -124,6 +125,225 @@ static bool internalValidState =
 // This prevents a corrupted file from consuming excessive heap.
 static const size_t CONFIG_MAX_BYTES =
     32U * 1024U;
+
+
+// =============================================================
+// TRANSPORT MODE SD/INTERNAL RECONCILIATION
+// =============================================================
+//
+// transport_mode is operational state, not just a preference. If the SD card
+// disappears while transport mode is released (or enabled), only the internal
+// config can be updated at that moment. A stale SD /config.txt must therefore
+// not later win by normal SD priority and resurrect the old transport state.
+//
+// Keep the last transport_mode change that could not be synchronized to SD in
+// NVS. As soon as a valid SD config is available again, loadConfig() reconciles
+// only transport_mode into that SD config while preserving every other setting,
+// then clears this marker.
+//
+// This is intentionally separate from /config.txt and LittleFS shadow data:
+// the shadow is normally replaced 1:1 when a valid SD config wins, which is
+// exactly the condition this marker must survive.
+static const char CONFIG_SYNC_PREFS_NAMESPACE[] =
+    "sfcfgsync";
+
+static const char CONFIG_SYNC_TRANSPORT_KEY[] =
+    "trpend";
+
+
+static bool transportModePendingRead(
+    int &mode
+)
+{
+    mode =
+        -1;
+
+    Preferences prefs;
+
+    if (!prefs.begin(
+            CONFIG_SYNC_PREFS_NAMESPACE,
+            true
+        )) {
+        return false;
+    }
+
+    uint8_t stored =
+        prefs.getUChar(
+            CONFIG_SYNC_TRANSPORT_KEY,
+            0xFF
+        );
+
+    prefs.end();
+
+    if (
+        stored != 0 &&
+        stored != 1
+    ) {
+        return false;
+    }
+
+    mode =
+        (int)stored;
+
+    return true;
+}
+
+
+static bool transportModePendingStore(
+    int mode
+)
+{
+    if (
+        mode != 0 &&
+        mode != 1
+    ) {
+        return false;
+    }
+
+    Preferences prefs;
+
+    if (!prefs.begin(
+            CONFIG_SYNC_PREFS_NAMESPACE,
+            false
+        )) {
+        return false;
+    }
+
+    size_t written =
+        prefs.putUChar(
+            CONFIG_SYNC_TRANSPORT_KEY,
+            (uint8_t)mode
+        );
+
+    prefs.end();
+
+    return
+        written == sizeof(uint8_t);
+}
+
+
+static void transportModePendingClear()
+{
+    Preferences prefs;
+
+    if (!prefs.begin(
+            CONFIG_SYNC_PREFS_NAMESPACE,
+            false
+        )) {
+        return;
+    }
+
+    prefs.remove(
+        CONFIG_SYNC_TRANSPORT_KEY
+    );
+
+    prefs.end();
+}
+
+
+// Apply a transport_mode change that was durably saved internally while the SD
+// copy was unavailable or could not be updated. The pending value always wins
+// for this single operational key. Other settings continue to follow the normal
+// SD > internal > defaults priority.
+static void reconcilePendingTransportMode()
+{
+    int pendingMode =
+        -1;
+
+    if (!transportModePendingRead(
+            pendingMode
+        )) {
+        return;
+    }
+
+    bool validSdIsAuthoritative =
+        activeConfigSource == CONFIG_SOURCE_SD &&
+        sdAvailableState &&
+        sdPresentState &&
+        sdValidState;
+
+    if (
+        validSdIsAuthoritative &&
+        cfg_transport_mode == pendingMode
+    ) {
+        transportModePendingClear();
+
+        Serial.printf(
+            "Config transport reconciliation: SD already matches pending mode=%d - marker cleared\n",
+            pendingMode
+        );
+
+        return;
+    }
+
+    if (
+        !validSdIsAuthoritative &&
+        cfg_transport_mode == pendingMode
+    ) {
+        Serial.printf(
+            "Config transport reconciliation: pending mode=%d retained until SD config is available\n",
+            pendingMode
+        );
+
+        return;
+    }
+
+    String error;
+
+    ConfigSaveResult result =
+        configSaveTransportMode(
+            pendingMode,
+            true,
+            error
+        );
+
+    if (result == CONFIG_SAVE_BOTH) {
+        Serial.printf(
+            "Config transport reconciliation: stale SD transport_mode corrected to %d | SD+internal synchronized\n",
+            pendingMode
+        );
+
+        return;
+    }
+
+    if (result == CONFIG_SAVE_INTERNAL_ONLY) {
+        Serial.printf(
+            "Config transport reconciliation: mode=%d applied internally | SD synchronization still pending\n",
+            pendingMode
+        );
+
+        return;
+    }
+
+    // CONFIG_SAVE_SD_FAILED means the internal shadow already contains the
+    // requested value but SD synchronization failed. For boot behavior the
+    // NVS marker is authoritative, so never let a stale SD value reactivate an
+    // old transport state. The marker remains and the next boot retries.
+    if (result == CONFIG_SAVE_SD_FAILED) {
+        cfg_transport_mode =
+            pendingMode;
+
+        Serial.printf(
+            "Config transport reconciliation: mode=%d forced for runtime | SD write failed, marker retained | %s\n",
+            pendingMode,
+            error.c_str()
+        );
+
+        return;
+    }
+
+    // Even if the persistent config could not be patched in this boot, the NVS
+    // marker is itself durable evidence of the newer operational state. Apply
+    // it to runtime and keep the marker for a later reconciliation attempt.
+    cfg_transport_mode =
+        pendingMode;
+
+    Serial.printf(
+        "Config transport reconciliation: mode=%d forced for runtime | persistent patch failed, marker retained | %s\n",
+        pendingMode,
+        error.c_str()
+    );
+}
 
 
 // =============================================================
@@ -3891,6 +4111,12 @@ config_loaded:
 
     migrateLoadedConfigSecrets();
 
+    // transport_mode may have been changed while the SD card was unavailable.
+    // Reconcile that newer operational state before any subsystem consumes
+    // cfg_transport_mode. This prevents a stale SD config from resurrecting a
+    // transport session that was already ended using the internal fallback.
+    reconcilePendingTransportMode();
+
     // If SD was valid, internalValidState was set by the shadow
     // write above. If internal was selected, it is already true.
     // When SD wins but LittleFS existed beforehand and shadow
@@ -5192,12 +5418,38 @@ ConfigSaveResult configSaveTransportMode(
         );
 
 
-    if (
-        result == CONFIG_SAVE_BOTH ||
-        result == CONFIG_SAVE_INTERNAL_ONLY
-    ) {
+    if (result == CONFIG_SAVE_BOTH) {
+        // Both persistent copies now carry the requested state. Any older
+        // deferred reconciliation request is obsolete.
+        transportModePendingClear();
+
         cfg_transport_mode =
             mode;
+
+    } else if (
+        result == CONFIG_SAVE_INTERNAL_ONLY ||
+        result == CONFIG_SAVE_SD_FAILED
+    ) {
+        // The internal copy already contains the newer transport state but the
+        // SD copy is absent or was not writable. Persist the intended value
+        // independently so a stale SD config cannot later win by normal source
+        // priority and resurrect the old mode.
+        if (!transportModePendingStore(
+                mode
+            )) {
+            error =
+                error.length()
+                ? error + "; transport SD reconciliation marker write failed"
+                : String("transport SD reconciliation marker write failed");
+
+            return
+                CONFIG_SAVE_INTERNAL_FAILED;
+        }
+
+        if (result == CONFIG_SAVE_INTERNAL_ONLY) {
+            cfg_transport_mode =
+                mode;
+        }
     }
 
 

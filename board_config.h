@@ -6,8 +6,8 @@
 // BOARD AUSWÄHLEN
 // =============================================================
 
-#define BOARD_FREENOVE
-//#define BOARD_XIAO
+//#define BOARD_FREENOVE
+#define BOARD_XIAO
 
 
 #if defined(BOARD_FREENOVE) && defined(BOARD_XIAO)

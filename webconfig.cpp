@@ -36,6 +36,16 @@
 // High-level recording state from the main firmware loop.
 // This is the same state used by the periodic STATUS line.
 extern bool recording;
+extern bool sdReady;
+
+#if defined(STORAGE_SPI)
+extern bool sdManualReadOnlyRecovery(
+    String &report,
+    uint32_t &mountedFrequencyHz,
+    bool &rawCardReady,
+    bool &sector0Readable
+);
+#endif
 
 // Gracefully finalizes an active recording when the operator explicitly
 // pauses the recording automation from WebConfig.
@@ -1040,6 +1050,9 @@ static String htmlHeader()
 
     html +=
         "<a href='/sdstatus'>" + htmlText(UI_NAV_SD_STATUS) + "</a>"
+#if defined(STORAGE_SPI)
+        "<a href='/sd_recovery'>" + htmlText(UI_NAV_SD_RECOVERY) + "</a>"
+#endif
         "<a href='/log'>" + htmlText(UI_NAV_LOG_VIEWER) + "</a>"
         "<a href='/sysinfo'>" + htmlText(UI_NAV_SYSTEM_INFO) + "</a>"
         "<a href='/board'>" + htmlText(UI_NAV_BOARD_INFO) + "</a>"
@@ -5851,6 +5864,9 @@ static void handleSDStatus()
     html +=
         " MB"
         "</section>"
+#if defined(STORAGE_SPI)
+        "<a class='button' href='/sd_recovery'>" + htmlText(UI_NAV_SD_RECOVERY) + "</a>"
+#endif
         "<a class='button danger' href='/sd_maintenance'>SD Maintenance</a>"
         "<a class='button' href='/'>Zur Übersicht</a>";
 
@@ -5858,6 +5874,292 @@ static void handleSDStatus()
 
     server.send(200, "text/html; charset=utf-8", html);
 }
+
+
+
+#if defined(STORAGE_SPI)
+
+static String sdRecoveryPage(
+    const String *report = nullptr,
+    bool success = false,
+    uint32_t mountedFrequencyHz = 0,
+    bool rawCardReady = false,
+    bool sector0Readable = false
+)
+{
+    bool de =
+        cfg_web_language !=
+        "en";
+
+    String html =
+        htmlHeader();
+
+    html +=
+        "<div class='page-title'><div>"
+        "<h2>" +
+        htmlText(UI_NAV_SD_RECOVERY) +
+        "</h2><p>" +
+        String(
+            de
+            ? "Nicht-destruktive Wiederbelebung und Diagnose der XIAO-SPI-SD"
+            : "Non-destructive recovery and diagnostics for the XIAO SPI SD"
+        ) +
+        "</p></div></div>";
+
+
+    html +=
+        "<div class='flash-notice' style='border-left-color:var(--accent);background:#eef4ff'>"
+        "<strong style='color:#174ea6'>" +
+        String(
+            de
+            ? "Sicherer Recovery-Modus"
+            : "Safe recovery mode"
+        ) +
+        "</strong><span class='muted'>" +
+        String(
+            de
+            ? "Dieser Vorgang formatiert oder löscht die SD-Karte nicht und führt keine RAW-Schreiboperation aus. "
+              "Er setzt den SPI-Kartencontroller bei 400 kHz zurück, prüft Sektor 0 lesend und versucht anschließend "
+              "Filesystem-Mounts mit mehreren SPI-Takten. Nach erfolgreichem Mount übernimmt SensorForge die Karte wieder "
+              "für den normalen Betrieb; ab diesem Zeitpunkt können normale Logger-/Aufnahmezugriffe wieder schreiben."
+            : "This operation does not format or erase the SD card and performs no raw-sector writes. "
+              "It resets the SPI card controller at 400 kHz, reads sector 0 for diagnostics and then tries "
+              "filesystem mounts at several SPI clocks. After a successful mount SensorForge adopts the card "
+              "for normal operation; normal logger/recording activity may write from that point onward."
+        ) +
+        "</span></div>";
+
+
+    html +=
+        "<section class='settings-section'><h3>" +
+        String(
+            de
+            ? "Aktueller Zustand"
+            : "Current state"
+        ) +
+        "</h3>";
+
+    if (sdReady) {
+        html +=
+            "<p><span class='status-pill ok'>" +
+            String(
+                de
+                ? "SD GEMOUNTET"
+                : "SD MOUNTED"
+            ) +
+            "</span></p><p class='muted'>" +
+            String(
+                de
+                ? "Die Firmware meldet die SD aktuell als betriebsbereit. Die Recovery wird deshalb nicht gestartet."
+                : "The firmware currently reports the SD as ready. Recovery is therefore not started."
+            ) +
+            "</p>";
+    } else {
+        html +=
+            "<p><span class='status-pill danger'>" +
+            String(
+                de
+                ? "SD NICHT VERFÜGBAR"
+                : "SD UNAVAILABLE"
+            ) +
+            "</span></p><p class='muted'>" +
+            String(
+                de
+                ? "Die Recovery darf jetzt exklusiv auf den SPI-Bus zugreifen."
+                : "Recovery may now take exclusive ownership of the SPI bus."
+            ) +
+            "</p>";
+    }
+
+    html +=
+        "</section>";
+
+
+    if (report) {
+        html +=
+            "<section class='settings-section'><h3>" +
+            String(
+                de
+                ? "Recovery-Ergebnis"
+                : "Recovery result"
+            ) +
+            "</h3>";
+
+        if (success) {
+            html +=
+                "<p><span class='status-pill ok'>" +
+                String(
+                    de
+                    ? "RECOVERY ERFOLGREICH"
+                    : "RECOVERY SUCCESSFUL"
+                ) +
+                "</span></p>";
+
+            if (mountedFrequencyHz > 0) {
+                html +=
+                    "<p class='muted'>" +
+                    String(
+                        de
+                        ? "Gemounteter SPI-Takt: "
+                        : "Mounted SPI clock: "
+                    ) +
+                    String(
+                        (double)mountedFrequencyHz /
+                        1000000.0,
+                        3
+                    ) +
+                    " MHz</p>";
+            }
+        } else {
+            html +=
+                "<p><span class='status-pill danger'>" +
+                String(
+                    de
+                    ? "RECOVERY NICHT ERFOLGREICH"
+                    : "RECOVERY NOT SUCCESSFUL"
+                ) +
+                "</span></p>";
+        }
+
+        html +=
+            "<p class='muted'>RAW controller: <b>" +
+            String(
+                rawCardReady
+                ? "READY"
+                : "NO READY"
+            ) +
+            "</b> &middot; Sector 0: <b>" +
+            String(
+                sector0Readable
+                ? "READABLE"
+                : "NOT READABLE"
+            ) +
+            "</b></p>"
+            "<pre style='white-space:pre-wrap;word-break:break-word;max-height:520px;overflow:auto;padding:12px;"
+            "border:1px solid var(--border);border-radius:10px;background:var(--surface-2)'>" +
+            htmlEscape(*report) +
+            "</pre></section>";
+    }
+
+
+    if (!sdReady) {
+        html +=
+            "<section class='settings-section'><h3>" +
+            String(
+                de
+                ? "Recovery starten"
+                : "Start recovery"
+            ) +
+            "</h3><p class='muted'>" +
+            String(
+                de
+                ? "Während des Tests werden neue Aufnahme-Starts und andere SD-Zugriffe gesperrt. "
+                  "Die Seite antwortet erst nach Abschluss der Diagnose; das kann einige Sekunden dauern."
+                : "New recording starts and other SD access are blocked while the test runs. "
+                  "The page responds after diagnostics finish; this can take several seconds."
+            ) +
+            "</p><form method='POST' action='/sd_recovery_run' "
+            "onsubmit=\"this.querySelector('button').disabled=true;this.querySelector('button').textContent='" +
+            String(
+                de
+                ? "Recovery läuft..."
+                : "Recovery running..."
+            ) +
+            "';\">"
+            "<button class='primary' type='submit'>" +
+            String(
+                de
+                ? "READ-ONLY SD RECOVERY STARTEN"
+                : "START READ-ONLY SD RECOVERY"
+            ) +
+            "</button></form></section>";
+    }
+
+
+    html +=
+        "<a class='button' href='/sdstatus'>" +
+        htmlText(UI_NAV_SD_STATUS) +
+        "</a>"
+        "<a class='button' href='/'>" +
+        String(
+            de
+            ? "Zur Übersicht"
+            : "Back to overview"
+        ) +
+        "</a>";
+
+    html +=
+        htmlFooter();
+
+    return html;
+}
+
+
+static void handleSDRecovery()
+{
+    String html =
+        sdRecoveryPage();
+
+    server.send(
+        200,
+        "text/html; charset=utf-8",
+        html
+    );
+}
+
+
+static void handleSDRecoveryRun()
+{
+    if (recording) {
+        server.send(
+            409,
+            "text/plain; charset=utf-8",
+            "Recording active"
+        );
+
+        return;
+    }
+
+
+    String report;
+
+    uint32_t mountedFrequencyHz =
+        0;
+
+    bool rawCardReady =
+        false;
+
+    bool sector0Readable =
+        false;
+
+
+    bool recovered =
+        sdManualReadOnlyRecovery(
+            report,
+            mountedFrequencyHz,
+            rawCardReady,
+            sector0Readable
+        );
+
+
+    String html =
+        sdRecoveryPage(
+            &report,
+            recovered,
+            mountedFrequencyHz,
+            rawCardReady,
+            sector0Readable
+        );
+
+
+    server.send(
+        200,
+        "text/html; charset=utf-8",
+        html
+    );
+}
+
+#endif // STORAGE_SPI
 
 
 enum SdMaintenanceMode : uint8_t {
@@ -16014,6 +16316,10 @@ void webConfigStart()
     server.on("/image_motion_reset", HTTP_POST, handleImageMotionResetBackground);
 
     server.on("/sdstatus", HTTP_GET, handleSDStatus);
+#if defined(STORAGE_SPI)
+    server.on("/sd_recovery", HTTP_GET, handleSDRecovery);
+    server.on("/sd_recovery_run", HTTP_POST, handleSDRecoveryRun);
+#endif
     server.on("/sd_maintenance", HTTP_GET, handleSDMaintenance);
     server.on("/sdformat", HTTP_GET, handleSDFormat);
     server.on("/sdformat_do", HTTP_POST, handleSDFormatDo);

@@ -19,6 +19,7 @@ static const UiTextEntry UI_TEXTS[] = {
     {"Bewegung simulieren", "Simulate motion"}, // UI_NAV_SIMULATE_MOTION
     {"System", "System"}, // UI_NAV_SYSTEM
     {"SD Status", "SD status"}, // UI_NAV_SD_STATUS
+    {"SD Recovery", "SD recovery"}, // UI_NAV_SD_RECOVERY
     {"Log Viewer", "Log viewer"}, // UI_NAV_LOG_VIEWER
     {"System Info", "System info"}, // UI_NAV_SYSTEM_INFO
     {"Board Info", "Board info"}, // UI_NAV_BOARD_INFO
