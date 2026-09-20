@@ -42,6 +42,7 @@
 #include "sync_api.h"
 #include "license.h"
 #include "recording_crypto.h"
+#include "recording_storage.h"
 #include "log_storage.h"
 #include "image_motion.h"
 #include "motion_diagnostics.h"
@@ -307,6 +308,26 @@ RTC_DATA_ATTR uint32_t transportRtcLastSleepSeconds = 0;
 static const uint32_t NORMAL_DEEP_SLEEP_RTC_MAGIC = 0x53464453UL; // "SFDS"
 RTC_DATA_ATTR uint32_t normalDeepSleepRtcMagic = 0;
 RTC_DATA_ATTR int64_t normalDeepSleepStartedEpoch = 0;
+
+// Periodic snapshot deep-sleep marker. It distinguishes the normal periodic
+// photo timer from transport/thermal/storage-fault timer wakes and preserves
+// the exact scheduled wall-clock slot across the deep-sleep reboot.
+static const uint32_t SNAPSHOT_DEEP_SLEEP_RTC_MAGIC = 0x53465048UL; // "SFPH"
+RTC_DATA_ATTR uint32_t snapshotDeepSleepRtcMagic = 0;
+RTC_DATA_ATTR int64_t snapshotDeepSleepScheduledEpoch = 0;
+
+// Runtime periodic-snapshot scheduler. Wall-clock mode is aligned to fixed
+// epoch/minute slots, so capture/processing time never accumulates as drift.
+// If no valid clock is available, awake/light-sleep operation falls back to a
+// monotonic deadline that is also incremented from the previous deadline rather
+// than from capture completion.
+static const uint8_t SNAPSHOT_WARMUP_FRAMES = 3;
+static const uint32_t SNAPSHOT_DUE_TOLERANCE_SECONDS = 2UL;
+static int snapshotScheduleCachedMinutes = -1;
+static bool snapshotScheduleWallClockMode = false;
+static int64_t snapshotLastHandledWallSlotEpoch = -1;
+static uint64_t snapshotFallbackNextDueUs = 0;
+static int64_t snapshotLightSleepScheduledEpoch = 0;
 
 // Dedicated storage-fault sleep marker. This is deliberately independent of
 // normal deep sleep and transport mode so a timer wake can retry only the SD
@@ -8243,6 +8264,703 @@ static void triggerRecordingEventSafetyLimit()
 
 
 // =============================================================
+// PERIODIC JPEG SNAPSHOTS
+// =============================================================
+//
+// Alarm video and periodic snapshots deliberately use different camera
+// priorities:
+//   - alarm recording keeps the existing fastest-possible first-frame path;
+//   - a periodic snapshot discards three frames so auto exposure/gain can settle.
+//
+// Scheduling is anchored to fixed time slots. A 10-minute interval therefore
+// remains :00/:10/:20/... even though waking, warm-up and SD writing take time.
+// A missed slot is skipped rather than captured late, so there is no cumulative
+// drift and an alarm always wins over a snapshot.
+
+static void periodicSnapshotRefreshScheduleState()
+{
+    int minutes =
+        constrain(
+            cfg_periodic_snapshot_minutes,
+            0,
+            1440
+        );
+
+    if (snapshotScheduleCachedMinutes == minutes)
+        return;
+
+    snapshotScheduleCachedMinutes = minutes;
+    snapshotScheduleWallClockMode = false;
+    snapshotLastHandledWallSlotEpoch = -1;
+    snapshotFallbackNextDueUs = 0;
+    snapshotLightSleepScheduledEpoch = 0;
+}
+
+
+static bool periodicSnapshotWallClockNowUs(
+    int64_t &nowUs
+)
+{
+    nowUs = 0;
+
+    struct timeval tv;
+
+    if (gettimeofday(&tv, nullptr) != 0)
+        return false;
+
+    if (tv.tv_sec < (time_t)1609459200)
+        return false;
+
+    nowUs =
+        (int64_t)tv.tv_sec *
+        1000000LL +
+        (int64_t)tv.tv_usec;
+
+    return true;
+}
+
+
+static bool periodicSnapshotNextWakeDelayUs(
+    uint64_t &delayUs,
+    int64_t &scheduledEpoch
+)
+{
+    delayUs = 0;
+    scheduledEpoch = 0;
+
+    periodicSnapshotRefreshScheduleState();
+
+    if (snapshotScheduleCachedMinutes <= 0)
+        return false;
+
+    uint64_t intervalUs =
+        (uint64_t)snapshotScheduleCachedMinutes *
+        60ULL *
+        1000000ULL;
+
+    int64_t wallNowUs = 0;
+
+    if (periodicSnapshotWallClockNowUs(wallNowUs)) {
+        snapshotScheduleWallClockMode = true;
+        snapshotFallbackNextDueUs = 0;
+
+        int64_t intervalSeconds =
+            (int64_t)snapshotScheduleCachedMinutes *
+            60LL;
+
+        int64_t nowSeconds =
+            wallNowUs /
+            1000000LL;
+
+        int64_t targetSeconds =
+            (
+                nowSeconds /
+                intervalSeconds +
+                1LL
+            ) *
+            intervalSeconds;
+
+        int64_t targetUs =
+            targetSeconds *
+            1000000LL;
+
+        int64_t remainingUs =
+            targetUs -
+            wallNowUs;
+
+        if (remainingUs < 1000LL)
+            remainingUs = 1000LL;
+
+        delayUs =
+            (uint64_t)remainingUs;
+
+        scheduledEpoch =
+            targetSeconds;
+
+        return true;
+    }
+
+    // No valid RTC/NTP time: keep a monotonic fixed-deadline schedule for
+    // awake/light-sleep operation. Deep sleep can still wake periodically, but
+    // wall-clock alignment is naturally available only once a valid clock exists.
+    snapshotScheduleWallClockMode = false;
+    snapshotLastHandledWallSlotEpoch = -1;
+
+    uint64_t nowMonoUs =
+        (uint64_t)esp_timer_get_time();
+
+    if (snapshotFallbackNextDueUs == 0) {
+        snapshotFallbackNextDueUs =
+            nowMonoUs +
+            intervalUs;
+    }
+
+    while (
+        snapshotFallbackNextDueUs <=
+        nowMonoUs
+    ) {
+        snapshotFallbackNextDueUs +=
+            intervalUs;
+    }
+
+    delayUs =
+        snapshotFallbackNextDueUs -
+        nowMonoUs;
+
+    scheduledEpoch = 0;
+
+    return true;
+}
+
+
+static void periodicSnapshotMarkScheduledHandled(
+    int64_t scheduledEpoch
+)
+{
+    periodicSnapshotRefreshScheduleState();
+
+    if (scheduledEpoch > 0) {
+        snapshotScheduleWallClockMode = true;
+
+        if (
+            scheduledEpoch >
+            snapshotLastHandledWallSlotEpoch
+        ) {
+            snapshotLastHandledWallSlotEpoch =
+                scheduledEpoch;
+        }
+
+        return;
+    }
+
+    if (snapshotScheduleCachedMinutes <= 0)
+        return;
+
+    uint64_t intervalUs =
+        (uint64_t)snapshotScheduleCachedMinutes *
+        60ULL *
+        1000000ULL;
+
+    uint64_t nowMonoUs =
+        (uint64_t)esp_timer_get_time();
+
+    if (snapshotFallbackNextDueUs == 0) {
+        snapshotFallbackNextDueUs =
+            nowMonoUs +
+            intervalUs;
+        return;
+    }
+
+    while (
+        snapshotFallbackNextDueUs <=
+        nowMonoUs
+    ) {
+        snapshotFallbackNextDueUs +=
+            intervalUs;
+    }
+}
+
+
+static bool periodicSnapshotAlarmHasPriority()
+{
+    // Keep the ordinary sensor parsers fresh during snapshot warm-up/write.
+    // No logging is done here: if motion appears, the normal alarm path should
+    // get control with as little extra latency as possible.
+    radarLoop();
+    motionDiagnosticsLoop();
+
+    return
+        motionDetected();
+}
+
+
+static bool periodicSnapshotBuildPath(
+    int64_t scheduledEpoch,
+    String &finalPath,
+    String &tempPath
+)
+{
+    finalPath = "";
+    tempPath = "";
+
+    String folder;
+    String filename;
+
+    if (scheduledEpoch >= (int64_t)1609459200) {
+        time_t slot =
+            (time_t)scheduledEpoch;
+
+        struct tm localTime;
+
+        if (!localtime_r(
+                &slot,
+                &localTime
+            )) {
+            return false;
+        }
+
+        char folderBuffer[24];
+        char fileBuffer[24];
+
+        if (
+            strftime(
+                folderBuffer,
+                sizeof(folderBuffer),
+                "/%Y%m%d",
+                &localTime
+            ) == 0 ||
+            strftime(
+                fileBuffer,
+                sizeof(fileBuffer),
+                "%H%M%S.jpg",
+                &localTime
+            ) == 0
+        ) {
+            return false;
+        }
+
+        folder =
+            String(folderBuffer);
+
+        filename =
+            String(fileBuffer);
+
+    } else {
+        folder =
+            "/fallback";
+
+        filename =
+            "snapshot_" +
+            String((unsigned long)millis()) +
+            ".jpg";
+    }
+
+    if (!STORAGE.exists(folder.c_str())) {
+        if (!STORAGE.mkdir(folder.c_str()))
+            return false;
+    }
+
+    finalPath =
+        folder +
+        "/" +
+        filename;
+
+    tempPath =
+        finalPath +
+        ".part";
+
+    return true;
+}
+
+
+static bool periodicSnapshotCapture(
+    int64_t scheduledEpoch
+)
+{
+    if (
+        cfg_periodic_snapshot_minutes <= 0 ||
+        recording ||
+        recorderIsOpen() ||
+        !sdReady ||
+        g_storageLocked ||
+        syncApiExclusiveActive() ||
+        thermalEmergencyState
+    ) {
+        return false;
+    }
+
+    if (
+        webConfigStarted &&
+        (
+            webConfigCameraPreviewActive() ||
+            webConfigRecordingPaused()
+        )
+    ) {
+        return false;
+    }
+
+    // Never consume the configured recording reserve for a housekeeping image.
+    // Alarm recording retains priority over periodic photography when storage
+    // becomes tight.
+    if (!storageHasRequiredFreeSpace())
+        return false;
+
+    if (periodicSnapshotAlarmHasPriority())
+        return false;
+
+    if (!initCamera(
+            cfg_camera,
+            cfg_resolution,
+            cfg_quality
+        )) {
+        logWrite(
+            "Snapshot failed | camera init"
+        );
+        return false;
+    }
+
+    if (!cameraExitSoftPowerDown()) {
+        if (!recoverCamera()) {
+            logWrite(
+                "Snapshot failed | camera wake/recovery"
+            );
+            return false;
+        }
+    }
+
+    // Allow auto exposure/gain to settle independently from the alarm-video
+    // fast path. The three discarded frames are intentional product behavior.
+    for (
+        uint8_t i = 0;
+        i < SNAPSHOT_WARMUP_FRAMES;
+        ++i
+    ) {
+        if (periodicSnapshotAlarmHasPriority())
+            return false;
+
+        camera_fb_t *warmup =
+            esp_camera_fb_get();
+
+        if (!warmup) {
+            logWrite(
+                "Snapshot failed | warmup frame unavailable"
+            );
+            return false;
+        }
+
+        esp_camera_fb_return(
+            warmup
+        );
+
+        feedWatchdog();
+        yield();
+    }
+
+    if (periodicSnapshotAlarmHasPriority())
+        return false;
+
+    camera_fb_t *frame =
+        esp_camera_fb_get();
+
+    if (!frame) {
+        logWrite(
+            "Snapshot failed | capture frame unavailable"
+        );
+        return false;
+    }
+
+    if (
+        frame->format != PIXFORMAT_JPEG ||
+        !frame->buf ||
+        frame->len == 0
+    ) {
+        esp_camera_fb_return(frame);
+        logWrite(
+            "Snapshot failed | camera frame is not JPEG"
+        );
+        return false;
+    }
+
+    // Motion that starts while the final JPEG is waiting in the camera queue
+    // still wins before any SD write begins.
+    if (periodicSnapshotAlarmHasPriority()) {
+        esp_camera_fb_return(frame);
+        return false;
+    }
+
+    String finalPath;
+    String tempPath;
+
+    if (!periodicSnapshotBuildPath(
+            scheduledEpoch,
+            finalPath,
+            tempPath
+        )) {
+        esp_camera_fb_return(frame);
+        logWrite(
+            "Snapshot failed | path creation"
+        );
+        return false;
+    }
+
+    // A duplicate means this exact wall-clock slot already produced a valid
+    // image (for example after an unusual UI/retry sequence). Never overwrite.
+    if (STORAGE.exists(finalPath.c_str())) {
+        esp_camera_fb_return(frame);
+        return true;
+    }
+
+    if (STORAGE.exists(tempPath.c_str()))
+        STORAGE.remove(tempPath.c_str());
+
+    RecordingStorageFile output;
+
+    if (!output.openWrite(
+            tempPath,
+            cfg_recording_encryption != 0
+        )) {
+        esp_camera_fb_return(frame);
+        logWrite(
+            "Snapshot failed | storage open"
+        );
+        return false;
+    }
+
+    bool writeOk = true;
+    bool alarmPreempted = false;
+    size_t offset = 0;
+    static const size_t SNAPSHOT_WRITE_CHUNK = 8U * 1024U;
+
+    while (offset < frame->len) {
+        if (periodicSnapshotAlarmHasPriority()) {
+            alarmPreempted = true;
+            writeOk = false;
+            break;
+        }
+
+        size_t remaining =
+            frame->len -
+            offset;
+
+        size_t chunk =
+            remaining < SNAPSHOT_WRITE_CHUNK
+            ? remaining
+            : SNAPSHOT_WRITE_CHUNK;
+
+        size_t written =
+            output.write(
+                frame->buf + offset,
+                chunk
+            );
+
+        if (written != chunk) {
+            writeOk = false;
+            break;
+        }
+
+        offset +=
+            written;
+
+        feedWatchdog();
+        yield();
+    }
+
+    size_t jpegBytes =
+        frame->len;
+
+    esp_camera_fb_return(frame);
+
+    bool closeOk =
+        output.closeChecked();
+
+    writeOk =
+        writeOk &&
+        closeOk;
+
+    if (!writeOk) {
+        STORAGE.remove(
+            tempPath.c_str()
+        );
+
+        if (!alarmPreempted) {
+            logWrite(
+                "Snapshot failed | SD/encryption write"
+            );
+        }
+
+        return false;
+    }
+
+    if (!STORAGE.rename(
+            tempPath.c_str(),
+            finalPath.c_str()
+        )) {
+        STORAGE.remove(
+            tempPath.c_str()
+        );
+
+        logWrite(
+            "Snapshot failed | final rename"
+        );
+
+        return false;
+    }
+
+    logWrite(
+        "Snapshot saved | " +
+        finalPath +
+        " | bytes=" +
+        String((unsigned long)jpegBytes) +
+        " | warmup=" +
+        String((unsigned)SNAPSHOT_WARMUP_FRAMES) +
+        " | encrypted=" +
+        String(cfg_recording_encryption ? 1 : 0)
+    );
+
+    return true;
+}
+
+
+static bool periodicSnapshotServiceDue()
+{
+    periodicSnapshotRefreshScheduleState();
+
+    if (snapshotScheduleCachedMinutes <= 0)
+        return false;
+
+    int64_t wallNowUs = 0;
+
+    if (periodicSnapshotWallClockNowUs(wallNowUs)) {
+        if (!snapshotScheduleWallClockMode) {
+            snapshotScheduleWallClockMode = true;
+            snapshotFallbackNextDueUs = 0;
+            snapshotLastHandledWallSlotEpoch = -1;
+        }
+
+        int64_t intervalSeconds =
+            (int64_t)snapshotScheduleCachedMinutes *
+            60LL;
+
+        int64_t nowSeconds =
+            wallNowUs /
+            1000000LL;
+
+        int64_t slotEpoch =
+            (
+                nowSeconds /
+                intervalSeconds
+            ) *
+            intervalSeconds;
+
+        if (
+            slotEpoch <=
+            snapshotLastHandledWallSlotEpoch
+        ) {
+            return false;
+        }
+
+        int64_t slotAgeUs =
+            wallNowUs -
+            slotEpoch *
+            1000000LL;
+
+        // Consume a missed slot instead of taking a late photo. This is what
+        // keeps a long alarm recording from shifting every later snapshot.
+        snapshotLastHandledWallSlotEpoch =
+            slotEpoch;
+
+        if (
+            slotAgeUs >
+            (int64_t)SNAPSHOT_DUE_TOLERANCE_SECONDS *
+            1000000LL
+        ) {
+            return false;
+        }
+
+        if (periodicSnapshotAlarmHasPriority())
+            return false;
+
+        return
+            periodicSnapshotCapture(
+                slotEpoch
+            );
+    }
+
+    // Monotonic fallback for systems that do not yet have valid wall-clock time.
+    snapshotScheduleWallClockMode = false;
+    snapshotLastHandledWallSlotEpoch = -1;
+
+    uint64_t intervalUs =
+        (uint64_t)snapshotScheduleCachedMinutes *
+        60ULL *
+        1000000ULL;
+
+    uint64_t nowMonoUs =
+        (uint64_t)esp_timer_get_time();
+
+    if (snapshotFallbackNextDueUs == 0) {
+        snapshotFallbackNextDueUs =
+            nowMonoUs +
+            intervalUs;
+        return false;
+    }
+
+    if (nowMonoUs < snapshotFallbackNextDueUs)
+        return false;
+
+    uint64_t dueUs =
+        snapshotFallbackNextDueUs;
+
+    do {
+        snapshotFallbackNextDueUs +=
+            intervalUs;
+    } while (
+        snapshotFallbackNextDueUs <=
+        nowMonoUs
+    );
+
+    if (
+        nowMonoUs -
+        dueUs >
+        (uint64_t)SNAPSHOT_DUE_TOLERANCE_SECONDS *
+        1000000ULL
+    ) {
+        return false;
+    }
+
+    if (periodicSnapshotAlarmHasPriority())
+        return false;
+
+    return
+        periodicSnapshotCapture(
+            0
+        );
+}
+
+
+static bool periodicSnapshotHandleScheduledWake(
+    int64_t scheduledEpoch
+)
+{
+    periodicSnapshotRefreshScheduleState();
+
+    if (snapshotScheduleCachedMinutes <= 0)
+        return false;
+
+    if (scheduledEpoch > 0) {
+        int64_t intervalSeconds =
+            (int64_t)snapshotScheduleCachedMinutes *
+            60LL;
+
+        // If config.txt changed while the device was asleep, do not create an
+        // image for a slot that no longer belongs to the active interval.
+        if (
+            intervalSeconds <= 0 ||
+            scheduledEpoch %
+                intervalSeconds != 0
+        ) {
+            periodicSnapshotMarkScheduledHandled(
+                scheduledEpoch
+            );
+            return false;
+        }
+    }
+
+    periodicSnapshotMarkScheduledHandled(
+        scheduledEpoch
+    );
+
+    if (periodicSnapshotAlarmHasPriority())
+        return false;
+
+    return
+        periodicSnapshotCapture(
+            scheduledEpoch
+        );
+}
+
+
+// =============================================================
 // SLEEP / POWER MANAGEMENT
 // =============================================================
 
@@ -8412,6 +9130,35 @@ static bool configureSleepWakeSources()
         return false;
     }
 
+    snapshotDeepSleepRtcMagic = 0;
+    snapshotDeepSleepScheduledEpoch = 0;
+
+    uint64_t snapshotDelayUs = 0;
+    int64_t snapshotScheduledEpoch = 0;
+
+    if (periodicSnapshotNextWakeDelayUs(
+            snapshotDelayUs,
+            snapshotScheduledEpoch
+        )) {
+        esp_err_t timerErr =
+            esp_sleep_enable_timer_wakeup(
+                snapshotDelayUs
+            );
+
+        if (timerErr == ESP_OK) {
+            snapshotDeepSleepRtcMagic =
+                SNAPSHOT_DEEP_SLEEP_RTC_MAGIC;
+
+            snapshotDeepSleepScheduledEpoch =
+                snapshotScheduledEpoch;
+        } else if (cfg_debug_enabled) {
+            powerConsole(
+                "Snapshot deep-sleep timer setup failed | error=0x%x",
+                timerErr
+            );
+        }
+    }
+
 
     return true;
 }
@@ -8533,6 +9280,31 @@ static bool configureLightSleepWakeSources()
 
         motionDiagnosticsResumePresenceInterrupt();
         return false;
+    }
+
+    snapshotLightSleepScheduledEpoch = 0;
+
+    uint64_t snapshotDelayUs = 0;
+    int64_t snapshotScheduledEpoch = 0;
+
+    if (periodicSnapshotNextWakeDelayUs(
+            snapshotDelayUs,
+            snapshotScheduledEpoch
+        )) {
+        esp_err_t timerErr =
+            esp_sleep_enable_timer_wakeup(
+                snapshotDelayUs
+            );
+
+        if (timerErr == ESP_OK) {
+            snapshotLightSleepScheduledEpoch =
+                snapshotScheduledEpoch;
+        } else if (cfg_debug_enabled) {
+            powerConsole(
+                "Snapshot light-sleep timer setup failed | error=0x%x",
+                timerErr
+            );
+        }
     }
 
     return true;
@@ -9272,9 +10044,12 @@ static void enterDeepSleep()
 
 
     powerConsole(
-        "Entering deep sleep | wake=presence GPIO%d HIGH OR magnet GPIO%d LOW",
+        "Entering deep sleep | wake=presence GPIO%d HIGH OR magnet GPIO%d LOW%s",
         PIR_PIN,
-        MAGNET_SWITCH_PIN
+        MAGNET_SWITCH_PIN,
+        cfg_periodic_snapshot_minutes > 0
+            ? " OR periodic snapshot timer"
+            : ""
     );
 
     sleepDiagState =
@@ -9364,9 +10139,12 @@ static bool enterLightSleep()
 
 
     powerConsole(
-        "Entering light sleep | RTC wake=presence EXT0 GPIO%d HIGH OR magnet EXT1 GPIO%d LOW",
+        "Entering light sleep | RTC wake=presence EXT0 GPIO%d HIGH OR magnet EXT1 GPIO%d LOW%s",
         PIR_PIN,
-        MAGNET_SWITCH_PIN
+        MAGNET_SWITCH_PIN,
+        cfg_periodic_snapshot_minutes > 0
+            ? " OR periodic snapshot timer"
+            : ""
     );
 
     sleepDiagState =
@@ -9562,12 +10340,20 @@ static bool enterLightSleep()
         wakeCause ==
         ESP_SLEEP_WAKEUP_EXT1;
 
+    const bool wokeBySnapshotTimer =
+        wakeCause ==
+        ESP_SLEEP_WAKEUP_TIMER;
+
     esp_sleep_disable_wakeup_source(
         ESP_SLEEP_WAKEUP_EXT0
     );
 
     esp_sleep_disable_wakeup_source(
         ESP_SLEEP_WAKEUP_EXT1
+    );
+
+    esp_sleep_disable_wakeup_source(
+        ESP_SLEEP_WAKEUP_TIMER
     );
 
     // Magnet always returns to the normal awake GPIO backend.
@@ -9601,22 +10387,44 @@ static bool enterLightSleep()
     }
 
 
-    // Preserve a real PIR/OT2 EXT0 wake immediately. This is RAM-only and adds
-    // no SD/log work to the latency-sensitive wake path.
-    if (wokeByPresence) {
+    // Preserve a real PIR/OT2 EXT0 wake immediately. A timer wake may coincide
+    // with a rising presence signal; sample that physical input before doing any
+    // snapshot work so alarm recording still gets the same priority.
+    if (
+        wokeByPresence ||
+        (
+            wokeBySnapshotTimer &&
+            digitalRead(PIR_PIN) == HIGH
+        )
+    ) {
         motionDiagnosticsNotePresenceTrigger();
     }
+
+    if (wokeBySnapshotTimer) {
+        // Drain the live radar/diagnostics once before classifying a simultaneous
+        // TIMER + motion condition. This is RAM/UART work only; no SD/log delay.
+        radarLoop();
+        motionDiagnosticsLoop();
+    }
+
+    const bool timerWakeMotionActive =
+        wokeBySnapshotTimer &&
+        motionDetected();
+
+    const bool recordingWakeFromSleep =
+        wokeByPresence ||
+        timerWakeMotionActive;
 
     const bool wakeCanStartRecording =
         configRecordingAllowedNow() &&
         !recordingSafetyCooldownActive();
 
-    // Arm the end-to-end timing sample only for a presence/OT2 wake that can
-    // lead directly to a recording. A wake before recording_not_before is not
-    // a recording wake and therefore must not enter the deferred-console path.
+    // Arm the end-to-end timing sample for every sleep wake that can immediately
+    // lead to recording. A coincident TIMER + motion event is treated exactly
+    // like a presence wake so snapshot scheduling cannot add console latency.
     if (
         cfg_debug_enabled &&
-        wokeByPresence &&
+        recordingWakeFromSleep &&
         wakeCanStartRecording
     ) {
         wakeTimingActive = true;
@@ -9635,13 +10443,13 @@ static bool enterLightSleep()
         wakeTimingPrechecksDoneUs = 0;
     }
 
-    // EXT0 is the time-critical recording wake. Do not touch USB/Serial here:
-    // some hosts stall the first Serial.printf() for hundreds of milliseconds
-    // after light sleep. Preserve the same information and print it only after
-    // the first frame has been written. Non-recording wake causes keep the
-    // immediate diagnostic behavior.
+    // A recording-capable sleep wake is time critical. Do not touch USB/Serial
+    // here: some hosts stall the first Serial.printf() for hundreds of
+    // milliseconds after light sleep. This also covers a timer wake that lands
+    // at the same moment as motion; the alarm path must remain faster than the
+    // periodic snapshot path.
     if (
-        wokeByPresence &&
+        recordingWakeFromSleep &&
         wakeCanStartRecording
     ) {
         wakeCriticalPathActive = true;
@@ -9677,6 +10485,26 @@ static bool enterLightSleep()
             wakeCause,
             sleptUs / 1000ULL
         );
+    }
+
+
+    if (wokeBySnapshotTimer) {
+        // Consume this exact schedule slot once. A simultaneous alarm or magnet
+        // deliberately skips the photo rather than taking it late afterwards.
+        if (
+            timerWakeMotionActive ||
+            digitalRead(MAGNET_SWITCH_PIN) == LOW
+        ) {
+            periodicSnapshotMarkScheduledHandled(
+                snapshotLightSleepScheduledEpoch
+            );
+        } else {
+            periodicSnapshotHandleScheduledWake(
+                snapshotLightSleepScheduledEpoch
+            );
+        }
+
+        snapshotLightSleepScheduledEpoch = 0;
     }
 
 
@@ -10511,6 +11339,22 @@ void setup() {
         wakeCause == ESP_SLEEP_WAKEUP_TIMER &&
         storageFaultRtcMagic == STORAGE_FAULT_RTC_MAGIC;
 
+    const bool periodicSnapshotTimerWake =
+        resetReason == ESP_RST_DEEPSLEEP &&
+        wakeCause == ESP_SLEEP_WAKEUP_TIMER &&
+        snapshotDeepSleepRtcMagic == SNAPSHOT_DEEP_SLEEP_RTC_MAGIC;
+
+    const int64_t periodicSnapshotWakeEpoch =
+        periodicSnapshotTimerWake
+        ? snapshotDeepSleepScheduledEpoch
+        : 0;
+
+    // Consume the snapshot sleep marker exactly once. Presence/magnet wakes from
+    // the same deep-sleep cycle must never leave a stale TIMER classification for
+    // a later reboot.
+    snapshotDeepSleepRtcMagic = 0;
+    snapshotDeepSleepScheduledEpoch = 0;
+
     if (resetReason != ESP_RST_DEEPSLEEP) {
         normalDeepSleepRtcMagic = 0;
         normalDeepSleepStartedEpoch = 0;
@@ -10555,6 +11399,18 @@ void setup() {
         // GPIO setup touches the pin.
         rtc_gpio_deinit(
             MAGNET_SWITCH_PIN
+        );
+    }
+
+    if (periodicSnapshotTimerWake) {
+        // Normal deep sleep configured BOTH service inputs as RTC wake pads.
+        // A timer wake leaves neither one as the reported wake cause, so restore
+        // both explicitly before ordinary GPIO/diagnostic initialization.
+        rtc_gpio_deinit(
+            MAGNET_SWITCH_PIN
+        );
+        rtc_gpio_deinit(
+            PIR_PIN
         );
     }
 
@@ -10772,7 +11628,19 @@ void setup() {
     // into the new image.
     // ---------------------------------------------------------
 
-    if (sdReady) {
+    bool skipSdFirmwareUpdateOnce =
+        firmwareInfoConsumeSkipSdUpdateOnce();
+
+    if (skipSdFirmwareUpdateOnce) {
+        Serial.println(
+            "Firmware update: SD auto-update skipped once after direct WiFi OTA"
+        );
+    }
+
+    if (
+        sdReady &&
+        !skipSdFirmwareUpdateOnce
+    ) {
 
         if (firmwareUpdateFromSdIfPresent()) {
 
@@ -11323,6 +12191,20 @@ void setup() {
 
     }
 
+    else if (periodicSnapshotTimerWake) {
+
+        Serial.println(
+            "Wake reason: PERIODIC SNAPSHOT"
+        );
+
+        periodicSnapshotHandleScheduledWake(
+            periodicSnapshotWakeEpoch
+        );
+
+        resetSleepDelayTimer();
+
+    }
+
     else {
 
         Serial.println(
@@ -11575,6 +12457,15 @@ void loop() {
     ) {
         // WiFi has just gone OFF. Start the configured idle delay
         // instead of sleeping immediately.
+        resetSleepDelayTimer();
+    }
+
+
+    // Keep the snapshot clock serviced even while an alarm video is running.
+    // periodicSnapshotServiceDue() consumes the current fixed slot before it
+    // attempts a capture; because capture is blocked during recording, an
+    // overlapping snapshot is therefore skipped instead of being taken late.
+    if (periodicSnapshotServiceDue()) {
         resetSleepDelayTimer();
     }
 

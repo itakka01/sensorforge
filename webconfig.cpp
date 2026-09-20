@@ -9,13 +9,17 @@
 #include <WebServer.h>
 #include <esp_camera.h>
 #include <esp_system.h>
+#include <esp_sleep.h>
 #include <esp_task_wdt.h>
 #include <esp_arduino_version.h>
+#include <esp_ota_ops.h>
+#include <esp_err.h>
 #include <vector>
 #include <algorithm>
 #include <time.h>
 #include <stdlib.h>
 #include <math.h>
+#include <string.h>
 #include "logger.h"
 #include "log_storage.h"
 #include "webplayer.h"
@@ -71,15 +75,9 @@ extern bool cameraMeasureTransportBlackReference(
     String &error
 );
 
-// Firmware-image validation helpers supplied by the existing SD auto-updater.
-// WebConfig stages the upload on SD and reuses these exact checks instead of
-// maintaining a second, potentially divergent OTA validator.
-extern bool firmwareValidateStagedImage(
-    const String &candidatePath,
-    size_t &firmwareSize,
-    String &error
-);
-extern size_t firmwareInactiveOtaCapacity();
+// Firmware compatibility information supplied by the main firmware.
+// The browser update streams directly into the inactive internal OTA partition
+// and uses the same board-specific marker as the SD auto-updater.
 extern const char *firmwareExpectedCompatibilityMarker();
 
 // Recording-event safety cooldown state supplied by the main firmware loop.
@@ -115,17 +113,85 @@ static bool webRoutesRegistered = false;
 // so an open browser session is not mistaken for inactivity.
 static uint32_t webLastActivityMs = 0;
 
+// Radar configuration is a synchronous UART maintenance operation. Keep WiFi
+// alive explicitly while it runs and for a short grace period afterwards so a
+// redirect/browser reconnect cannot race the normal WebConfig inactivity timer.
+static const uint32_t RADAR_WEB_MAINTENANCE_GRACE_MS = 120000UL;
+static const uint32_t RADAR_CALIBRATION_MAX_IDLE_HOLD_MS = 10UL * 60UL * 1000UL;
+static uint8_t radarWebMaintenanceDepth = 0;
+static uint32_t radarWebMaintenanceHoldUntilMs = 0;
+
 // Reboot is scheduled instead of executed directly inside the HTTP handler.
 // This gives the browser enough time to follow the POST/Redirect/GET flow and
 // render the reboot notice before the network connection disappears.
 static bool rebootScheduled = false;
 static uint32_t rebootAtMs = 0;
 
+// Manual software shutdown. Unlike the normal power-management sleep path,
+// this deliberately enables NO wake source. The ESP32-S3 therefore remains in
+// deep sleep until external reset or power is removed and applied again.
+static bool shutdownScheduled = false;
+static uint32_t shutdownAtMs = 0;
+
 static void noteWebActivity()
 {
     webLastActivityMs =
         millis();
 }
+
+static void radarWebMaintenanceBegin()
+{
+    if (radarWebMaintenanceDepth < 0xFFU)
+        radarWebMaintenanceDepth++;
+
+    noteWebActivity();
+}
+
+static void radarWebMaintenanceEnd()
+{
+    if (radarWebMaintenanceDepth > 0)
+        radarWebMaintenanceDepth--;
+
+    noteWebActivity();
+
+    if (radarWebMaintenanceDepth == 0) {
+        radarWebMaintenanceHoldUntilMs =
+            millis() + RADAR_WEB_MAINTENANCE_GRACE_MS;
+    }
+}
+
+static bool radarWebMaintenanceGraceActive()
+{
+    if (radarWebMaintenanceHoldUntilMs == 0)
+        return false;
+
+    if (
+        (int32_t)(
+            radarWebMaintenanceHoldUntilMs - millis()
+        ) > 0
+    ) {
+        return true;
+    }
+
+    radarWebMaintenanceHoldUntilMs = 0;
+    return false;
+}
+
+class RadarWebMaintenanceGuard {
+public:
+    RadarWebMaintenanceGuard()
+    {
+        radarWebMaintenanceBegin();
+    }
+
+    ~RadarWebMaintenanceGuard()
+    {
+        radarWebMaintenanceEnd();
+    }
+
+    RadarWebMaintenanceGuard(const RadarWebMaintenanceGuard &) = delete;
+    RadarWebMaintenanceGuard &operator=(const RadarWebMaintenanceGuard &) = delete;
+};
 
 static void serviceWebLongOperation()
 {
@@ -901,6 +967,20 @@ static String htmlHeader()
         ".modal-card p{margin:8px 0;color:var(--muted);line-height:1.5;}"
         ".modal-actions{display:flex;flex-wrap:wrap;gap:6px;margin-top:18px;}"
         ".modal-state{margin-top:12px;font-size:.88rem;color:var(--muted);}"
+        ".radar-cal-modal-card{width:min(600px,100%);text-align:center;padding:28px;}"
+        ".radar-cal-kicker{font-size:.78rem;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);}"
+        ".radar-cal-modal-card h3{font-size:1.45rem;margin:8px 0 4px;}"
+        ".radar-cal-big{font-size:4.4rem;line-height:1;font-weight:850;letter-spacing:-.04em;margin:24px 0 6px;color:var(--accent);}"
+        ".radar-cal-big-label{font-size:1rem;font-weight:700;color:#263445;margin-bottom:18px;}"
+        ".radar-cal-progress{height:12px;background:#e5e9ef;border-radius:999px;overflow:hidden;margin:18px 0 10px;}"
+        ".radar-cal-progress>span{display:block;width:0;height:100%;background:var(--accent);transition:width .3s ease;}"
+        ".radar-cal-hint{min-height:2.8em;margin:8px auto 18px;color:var(--muted);line-height:1.45;max-width:470px;}"
+        ".radar-cal-meta{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin:18px 0;}"
+        ".radar-cal-meta>div{border:1px solid var(--line);border-radius:9px;background:#f7f9fb;padding:12px 8px;}"
+        ".radar-cal-meta b{display:block;font-size:1.15rem;margin-bottom:3px;color:#1f2937;}"
+        ".radar-cal-meta span{display:block;font-size:.78rem;color:var(--muted);line-height:1.25;}"
+        ".radar-cal-modal-card .modal-actions{justify-content:center;}"
+        "@media(max-width:520px){.radar-cal-big{font-size:3.6rem}.radar-cal-meta{grid-template-columns:1fr}.radar-cal-modal-card{padding:22px 16px;}}"
         ".operation-card{max-width:620px;margin:26px auto;text-align:center;border:1px solid var(--line);"
         "border-radius:12px;padding:28px 22px;background:#fafbfc;}"
         ".operation-card .countdown{font-size:2.4rem;font-weight:700;margin:14px 0 4px;}"
@@ -1063,6 +1143,9 @@ static String htmlHeader()
         "<a href='/transport'>" + htmlText(UI_NAV_TRANSPORT) + "</a>"
         "<div class='sep'></div><a class='danger-link' href='/reboot'>" +
         htmlText(UI_NAV_REBOOT) +
+        "</a>"
+        "<a class='danger-link' href='/shutdown'>" +
+        htmlText(UI_NAV_SHUTDOWN) +
         "</a></div></details>";
 
     html +=
@@ -2215,6 +2298,19 @@ static void handleRoot()
         String(cfg_fps) +
         " fps</div></section>";
 
+    String presencePillClass;
+
+    if (!presenceInputActive) {
+        presencePillClass = "ok";
+    } else if (radarDetected && !radarMotion) {
+        // OT2 can remain HIGH for the sensor's own hold/absence time even
+        // after the fast UART gate evaluation has returned to idle. Do not
+        // present that raw hardware level as an active alarm.
+        presencePillClass = "warn";
+    } else {
+        presencePillClass = "danger";
+    }
+
     html +=
         "<section class='dash-card'><div class='card-label'>" +
         htmlText(UI_CARD_MOTION) +
@@ -2228,7 +2324,9 @@ static void handleRoot()
         htmlText(UI_MOTION_SENSOR_TYPE) +
         ": <b>" +
         htmlText(motionSensorTypeUiId()) +
-        "</b><br><span id='motionPresenceLabel'>" +
+        "</b><br><b>" +
+        htmlText(UI_MOTION_CURRENT_SENSOR_STATUS) +
+        ":</b> <span id='motionPresenceLabel'>" +
         htmlText(
             radarDetected
             ? UI_MOTION_OT2_GPIO
@@ -2237,7 +2335,7 @@ static void handleRoot()
         " " +
         String((int)PRESENCE_PIN) +
         "</span>: <b id='motionPresenceState' class='status-pill " +
-        String(presenceInputActive ? "danger" : "ok") +
+        presencePillClass +
         "'>" +
         String(presenceInputActive ? "HIGH" : "LOW") +
         "</b>";
@@ -2245,36 +2343,47 @@ static void handleRoot()
     html +=
         "<span id='motionRadarRow' style='" +
         String(radarDetected ? "" : "display:none") +
-        "'> &middot; " +
-        htmlText(UI_MOTION_RADAR_INTERNAL) +
-        ": <b id='motionRadarState'>" +
+        "'> &middot; <b>" +
+        htmlText(UI_MOTION_RADAR_EVALUATION) +
+        ":</b> <span id='motionRadarState'>" +
         (
             radarTrackingAvailable
             ? htmlText(
                 radarMotion
-                ? UI_STATUS_ACTIVE
-                : UI_MOTION_NONE
+                ? UI_MOTION_RADAR_EVALUATION_ACTIVE
+                : UI_MOTION_RADAR_EVALUATION_NONE
             )
             : htmlText(UI_MOTION_RADAR_FALLBACK)
         ) +
-        "</b> &middot; " +
+        "</span></span>";
+
+    html +=
+        "<span id='motionRadarLastRow' style='" +
+        String(radarDetected ? "" : "display:none") +
+        "'><br><b>" +
+        htmlText(UI_MOTION_LAST_RADAR_TRIGGER) +
+        ":</b> " +
         htmlText(UI_MOTION_GATE) +
-        "=<span id='motionRadarGate'>" +
+        " <span id='motionRadarGate'>" +
         (radarLastMotionGate() >= 0 ? String(radarLastMotionGate()) : String("-")) +
         "</span> &middot; " +
         htmlText(UI_MOTION_ENERGY) +
-        "=<span id='motionRadarEnergy'>" +
+        " <span id='motionRadarEnergy'>" +
         (radarLastMotionGate() >= 0 ? String(radarLastMotionEnergyDb(), 1) : String("-")) +
-        "</span> dB</span>";
+        "</span> dB &middot; <b id='motionRadarLastTriggerAge'>" +
+        htmlText(UI_MOTION_NO_TRIGGER_YET) +
+        "</b></span>";
 
     html +=
         "<br>Simulation=<span id='motionSimulationState'>" +
         String(simulatedMotion ? "1" : "0") +
-        "</span> &middot; " +
+        "</span><span id='motionPirLastTriggerRow' style='" +
+        String(radarDetected ? "display:none" : "") +
+        "'> &middot; " +
         htmlText(UI_MOTION_LAST_TRIGGER) +
         ": <b id='motionLastTrigger'>" +
         htmlText(UI_MOTION_NO_TRIGGER_YET) +
-        "</b> &middot; " +
+        "</b></span> &middot; " +
         htmlText(UI_MOTION_TRIGGERS_SINCE_OPEN) +
         ": <b id='motionTriggerCount'>0</b>";
 
@@ -2295,6 +2404,8 @@ static void handleRoot()
         " data-detected='" + htmlText(UI_MOTION_DETECTED) + "'"
         " data-none='" + htmlText(UI_MOTION_NONE) + "'"
         " data-active='" + htmlText(UI_STATUS_ACTIVE) + "'"
+        " data-radar-active='" + htmlText(UI_MOTION_RADAR_EVALUATION_ACTIVE) + "'"
+        " data-radar-none='" + htmlText(UI_MOTION_RADAR_EVALUATION_NONE) + "'"
         " data-fallback='" + htmlText(UI_MOTION_RADAR_FALLBACK) + "'"
         " data-no-trigger='" + htmlText(UI_MOTION_NO_TRIGGER_YET) + "'"
         " data-ago='" + htmlText(UI_MOTION_AGO) + "'"
@@ -2721,9 +2832,12 @@ static void handleRoot()
         "var value=document.getElementById('motionCardValue');"
         "var pState=document.getElementById('motionPresenceState');"
         "var radarRow=document.getElementById('motionRadarRow');"
+        "var radarLastRow=document.getElementById('motionRadarLastRow');"
         "var radarState=document.getElementById('motionRadarState');"
         "var radarGate=document.getElementById('motionRadarGate');"
         "var radarEnergy=document.getElementById('motionRadarEnergy');"
+        "var radarLastAge=document.getElementById('motionRadarLastTriggerAge');"
+        "var pirLastRow=document.getElementById('motionPirLastTriggerRow');"
         "var simState=document.getElementById('motionSimulationState');"
         "var lastEl=document.getElementById('motionLastTrigger');"
         "var countEl=document.getElementById('motionTriggerCount');"
@@ -2735,12 +2849,19 @@ static void handleRoot()
             "var sec=Math.floor(ms/1000);var min=Math.floor(sec/60);sec%=60;return c.dataset.ago+(c.dataset.ago?' ':'')+min+' min '+sec+' s'+c.dataset.agoSuffix;}"
         "function applyMotion(s){"
             "if(value)value.textContent=s.motion_active?c.dataset.detected:c.dataset.none;"
-            "if(pState){pState.textContent=s.presence_active?'HIGH':'LOW';pState.classList.toggle('danger',!!s.presence_active);pState.classList.toggle('ok',!s.presence_active);}"
+            "if(pState){pState.textContent=s.presence_active?'HIGH':'LOW';"
+                "pState.classList.remove('danger','warn','ok');"
+                "if(!s.presence_active)pState.classList.add('ok');"
+                "else if(s.radar_detected&&!s.radar_motion_active)pState.classList.add('warn');"
+                "else pState.classList.add('danger');}"
             "if(simState)simState.textContent=s.simulated_motion?'1':'0';"
             "if(radarRow)radarRow.style.display=s.radar_detected?'':'none';"
-            "if(radarState)radarState.textContent=s.radar_tracking_available?(s.radar_motion_active?c.dataset.active:c.dataset.none):c.dataset.fallback;"
+            "if(radarLastRow)radarLastRow.style.display=s.radar_detected?'':'none';"
+            "if(pirLastRow)pirLastRow.style.display=s.radar_detected?'none':'';"
+            "if(radarState)radarState.textContent=s.radar_tracking_available?(s.radar_motion_active?c.dataset.radarActive:c.dataset.radarNone):c.dataset.fallback;"
             "if(radarGate)radarGate.textContent=Number(s.radar_last_gate)>=0?String(Number(s.radar_last_gate)):'-';"
             "if(radarEnergy)radarEnergy.textContent=Number(s.radar_last_gate)>=0?Number(s.radar_last_energy_db).toFixed(1):'-';"
+            "if(radarLastAge)radarLastAge.textContent=ageText(!!s.radar_last_trigger_valid,s.radar_last_trigger_age_ms);"
             "if(lastEl)lastEl.textContent=ageText(!!s.primary_last_trigger_valid,s.primary_last_trigger_age_ms);"
             "if(countEl){var base=s.primary_source==='radar'?baseRadar:basePresence;countEl.textContent=String(Math.max(0,(Number(s.primary_trigger_count)||0)-base));}"
         "}"
@@ -3570,6 +3691,18 @@ static void handleConfig()
         }
     }
 
+    html +=
+        "<div style='margin-top:18px;padding:14px;border:1px solid #d8dee6;border-radius:8px;background:#f8fbff'>"
+        "<b>Periodische Snapshots</b><br>"
+        "<span class='muted'>Zusätzlich zu Alarmvideos kann SensorForge in einem festen Zeitraster einzelne JPEG-Bilder speichern. "
+        "Alarmaufnahmen haben immer Vorrang. Für einen sauber belichteten Snapshot werden drei Kamerabilder verworfen und erst das vierte gespeichert. "
+        "Bei aktivierter Aufnahmeverschlüsselung werden auch Snapshots verschlüsselt gespeichert.</span><br><br>"
+        "Intervall: <input name='periodic_snapshot_minutes' type='number' min='0' max='1440' step='1' value='" +
+        String(cfg_periodic_snapshot_minutes) +
+        "' style='width:90px'> Minuten "
+        "<small>(0 = aus; z. B. 10 = 00, 10, 20, 30 ... Minuten)</small>"
+        "</div>";
+
     html += "post_record_ms: <input name='post_record_ms' type='number' min='0' value='" +
             String(cfg_post_ms) + "'><br>";
 
@@ -4164,6 +4297,13 @@ static void handleSave()
         ? 1
         : 0;
 
+    int periodicSnapshotMinutes =
+        constrain(
+            server.arg("periodic_snapshot_minutes").toInt(),
+            0,
+            1440
+        );
+
 
     String recordingNotBefore = "off";
 
@@ -4569,7 +4709,7 @@ static void handleSave()
     String text;
 
     text.reserve(
-        1400
+        1500
     );
 
 
@@ -4627,6 +4767,10 @@ static void handleSave()
 
     text += "recording_encryption=";
     text += String(recordingEncryption);
+    text += '\n';
+
+    text += "periodic_snapshot_minutes=";
+    text += String(periodicSnapshotMinutes);
     text += '\n';
 
     text += "recording_not_before=";
@@ -4897,6 +5041,9 @@ static void handleSave()
             cfg_recording_encryption =
                 recordingEncryption;
 
+            cfg_periodic_snapshot_minutes =
+                periodicSnapshotMinutes;
+
             cfg_timezone =
                 timezone;
 
@@ -4981,6 +5128,9 @@ static void handleSave()
             // auto-detected independently when they are read.
             cfg_recording_encryption =
                 recordingEncryption;
+
+            cfg_periodic_snapshot_minutes =
+                periodicSnapshotMinutes;
 
             cfg_timezone =
                 timezone;
@@ -9755,7 +9905,7 @@ static void handleRadarLive()
     String json;
 
     json.reserve(
-        512
+        1024
     );
 
     json +=
@@ -9823,6 +9973,34 @@ static void handleRadarLive()
 
 
     json +=
+        "],\"last_trigger_age_ms\":[";
+
+
+    for (
+        uint8_t gate = 0;
+        gate < 16;
+        ++gate
+    ) {
+        if (gate > 0) {
+            json += ',';
+        }
+
+        uint32_t ageMs = 0;
+
+        if (
+            radarGateLastTriggerAgeMs(
+                gate,
+                ageMs
+            )
+        ) {
+            json += String(ageMs);
+        } else {
+            json += "-1";
+        }
+    }
+
+
+    json +=
         "]}";
 
 
@@ -9871,6 +10049,36 @@ static void appendRadarCalibrationSessionJson(
                 mode
             )
         ) +
+        ",\"countdown_ms\":" +
+        String(
+            radarCalibrationCountdownRemainingMs(
+                mode
+            )
+        ) +
+        ",\"measurement_started\":" +
+        String(
+            radarCalibrationMeasurementStarted(mode)
+            ? "true"
+            : "false"
+        ) +
+        ",\"auto_completed\":" +
+        String(
+            radarCalibrationAutoCompleted(mode)
+            ? "true"
+            : "false"
+        ) +
+        ",\"quality_limited\":" +
+        String(
+            radarCalibrationQualityLimited(mode)
+            ? "true"
+            : "false"
+        ) +
+        ",\"aborted\":" +
+        String(
+            radarCalibrationAborted(mode)
+            ? "true"
+            : "false"
+        ) +
         ",\"gates\":[";
 
     for (
@@ -9907,6 +10115,8 @@ static void appendRadarCalibrationSessionJson(
             String(stats.minimumDb, 1) +
             ",\"mean\":" +
             String(stats.meanDb, 1) +
+            ",\"p10\":" +
+            String(stats.p10Db, 1) +
             ",\"p50\":" +
             String(stats.p50Db, 1) +
             ",\"p95\":" +
@@ -9944,7 +10154,15 @@ static void handleRadarCalibrationStatus()
                 active
             )
         ) +
-        "\",\"quiet\":";
+        "\",\"target_samples\":" +
+        String(
+            radarCalibrationTargetValidSamples()
+        ) +
+        ",\"max_reports\":" +
+        String(
+            radarCalibrationMaxReports()
+        ) +
+        ",\"quiet\":";
 
     appendRadarCalibrationSessionJson(
         json,
@@ -9980,6 +10198,8 @@ static void handleRadarCalibrationAction()
     if (rejectRadarConfigurationUnavailable())
         return;
 
+    RadarWebMaintenanceGuard maintenanceGuard;
+
     String action =
         server.arg("action");
 
@@ -9995,11 +10215,17 @@ static void handleRadarCalibrationAction()
             ? RADAR_CALIBRATION_QUIET
             : RADAR_CALIBRATION_MOTION;
 
-        if (!radarCalibrationStart(mode)) {
+        String calibrationError;
+
+        if (!radarCalibrationStart(
+                mode,
+                calibrationError
+            )) {
             server.send(
                 409,
                 "text/plain; charset=utf-8",
-                "Radar-Gate-Energien sind momentan nicht verfügbar."
+                "Radar-Kalibrierung konnte nicht gestartet werden: " +
+                calibrationError
             );
             return;
         }
@@ -10011,20 +10237,34 @@ static void handleRadarCalibrationAction()
 
         consoleWrite(
             "RADAR",
-            "Kalibrierung gestartet | " +
-            label
+            "Kalibrierung vorbereitet | " +
+            label +
+            " | Start in 10 s"
         );
 
         logWrite(
-            "Radar calibration started | " +
-            label
+            "Radar calibration armed | " +
+            label +
+            " | countdown=10s"
         );
 
     } else if (action == "stop") {
         RadarCalibrationMode previous =
             radarCalibrationActiveMode();
 
-        radarCalibrationStop();
+        String calibrationError;
+
+        if (!radarCalibrationStop(
+                calibrationError
+            )) {
+            server.send(
+                500,
+                "text/plain; charset=utf-8",
+                "Messung wurde gestoppt, aber der normale Gate-Bereich konnte nicht wiederhergestellt werden: " +
+                calibrationError
+            );
+            return;
+        }
 
         if (previous != RADAR_CALIBRATION_NONE) {
             consoleWrite(
@@ -10068,6 +10308,8 @@ static void handleRadarConfig()
     if (rejectRadarConfigurationUnavailable())
         return;
 
+    RadarWebMaintenanceGuard maintenanceGuard;
+
     // Opening/navigating to Radar Config is explicit operator activity. If the
     // recording automation is paused, refresh its lease immediately before the
     // synchronous UART settings read below.
@@ -10080,32 +10322,76 @@ static void handleRadarConfig()
     bool recordingActive =
         recorderIsOpen();
 
+    bool justSaved =
+        server.hasArg("saved") &&
+        server.arg("saved") == "1";
+
+    bool justRestoredDefaults =
+        server.hasArg("defaults") &&
+        server.arg("defaults") == "1";
+
     bool readOk =
         false;
 
+    bool uartReadTimedOutButCacheAvailable =
+        false;
 
-    // While recording, do not interrupt normal radar reports just
-    // to render this page. Use the settings cached at startup or
-    // after the most recent successful write.
-    if (recordingActive) {
+
+    // radarWriteSettings() already performs a complete read-back verification
+    // inside the SAME configuration session and caches those verified values.
+    // Do not immediately open a second LD2410S configuration session after the
+    // POST/Redirect/GET cycle. Some modules need a short recovery period after
+    // returning to standard-report mode and occasionally miss that second
+    // enable-config ACK even though the write itself was fully successful.
+    if (
+        recordingActive ||
+        justSaved ||
+        justRestoredDefaults
+    ) {
 
         readOk =
             radarGetCachedSettings(
                 settings
             );
 
-        if (!readOk) {
+        if (!readOk && recordingActive) {
             error =
                 "no cached radar settings available while recording";
         }
+    }
 
-    } else {
 
-        readOk =
+    // Normal page opens still request a fresh hardware read. If that one
+    // synchronous configuration transaction happens to time out while the
+    // radar is otherwise alive, fall back to the most recently verified cache
+    // instead of presenting a misleading wiring/sensor failure to the user.
+    if (!readOk && !recordingActive) {
+
+        String freshReadError;
+
+        bool freshReadOk =
             radarReadSettings(
                 settings,
-                error
+                freshReadError
             );
+
+        if (freshReadOk) {
+            readOk = true;
+            error = "";
+
+        } else {
+            RadarSettings cachedSettings;
+
+            if (radarGetCachedSettings(cachedSettings)) {
+                settings = cachedSettings;
+                readOk = true;
+                uartReadTimedOutButCacheAvailable = true;
+                error = freshReadError;
+
+            } else {
+                error = freshReadError;
+            }
+        }
     }
 
 
@@ -10123,6 +10409,14 @@ static void handleRadarConfig()
             "Live-Energien laufen weiter. Speichern ist erlaubt; "
             "waehrend des kurzen UART-Schreibvorgangs kann es zu einer "
             "kleinen Luecke zwischen Videoframes kommen.</p>";
+
+    } else if (uartReadTimedOutButCacheAvailable) {
+        html +=
+            "<div class='flash-notice' style='border-color:#d6a100'>"
+            "<strong>Radar antwortet, Konfigurations-Lesen war kurzzeitig beschaeftigt</strong>"
+            "<span class='muted'>Die zuletzt erfolgreich gelesenen bzw. verifizierten Radar-Werte werden angezeigt. "
+            "Das ist kein Hinweis auf eine defekte Verdrahtung. Mit <b>Read again</b> kann jederzeit neu gelesen werden.</span>"
+            "</div>";
     }
 
 
@@ -10216,25 +10510,25 @@ static void handleRadarConfig()
     }
 
 
-    if (
-        server.hasArg("saved") &&
-        server.arg("saved") == "1"
-    ) {
+    if (justSaved) {
+
+        bool calibrationApplied =
+            server.hasArg("calibration") &&
+            server.arg("calibration") == "1";
 
         html +=
-            "<p style='color:#087a00'><b>Gespeichert und erfolgreich zurueckgelesen.</b></p>";
+            calibrationApplied
+            ? "<p style='color:#087a00'><b>Kalibrierung übernommen, in den LD2410S geschrieben und erfolgreich verifiziert.</b></p>"
+            : "<p style='color:#087a00'><b>Gespeichert und erfolgreich verifiziert.</b></p>";
     }
 
 
-    if (
-        server.hasArg("defaults") &&
-        server.arg("defaults") == "1"
-    ) {
+    if (justRestoredDefaults) {
 
         html +=
             "<div class='flash-notice'>"
             "<strong>Hi-Link Standardwerte wiederhergestellt</strong>"
-            "<span class='muted'>Die Radar-Parameter wurden geschrieben und erfolgreich zurueckgelesen.</span>"
+            "<span class='muted'>Die Radar-Parameter wurden geschrieben und erfolgreich verifiziert.</span>"
             "</div>";
     }
 
@@ -10243,7 +10537,9 @@ static void handleRadarConfig()
         "<h3>Live Gate Energy</h3>"
         "<p>Aktualisierung ca. 4x pro Sekunde. "
         "Energie und Trigger-Schwelle benutzen dieselbe dB-Skala. "
-        "Positiver Margin bedeutet: Gate liegt ueber der Trigger-Schwelle.</p>";
+        "Positiver Margin bedeutet: Gate liegt ueber der Trigger-Schwelle. "
+        "<b>Letzter Trigger</b> wird direkt im ESP aus jedem Radarreport gespeichert; "
+        "auch ein kurzer Trigger zwischen zwei Browser-Aktualisierungen bleibt daher sichtbar.</p>";
 
     html +=
         "<p><b>Live status:</b> "
@@ -10267,6 +10563,7 @@ static void handleRadarConfig()
         "<th style='padding:5px;border-bottom:1px solid #aaa'>Trigger dB</th>"
         "<th style='padding:5px;border-bottom:1px solid #aaa'>Margin</th>"
         "<th style='padding:5px;border-bottom:1px solid #aaa'>Status</th>"
+        "<th style='padding:5px;border-bottom:1px solid #aaa'>Letzter Trigger</th>"
         "</tr>";
 
 
@@ -10326,6 +10623,9 @@ static void handleRadarConfig()
             "<td id='liveState" +
             String(gate) +
             "' style='padding:4px'>-</td>"
+            "<td id='liveLastTrigger" +
+            String(gate) +
+            "' style='padding:4px;text-align:right;white-space:nowrap'>-</td>"
             "</tr>";
     }
 
@@ -10338,6 +10638,19 @@ static void handleRadarConfig()
         "<script>"
         "(function(){"
         "var busy=false;"
+        "function formatTriggerAge(ms){"
+            "ms=Number(ms);"
+            "if(!Number.isFinite(ms)||ms<0)return '-';"
+            "if(ms<1000)return '<1s';"
+            "var sec=Math.floor(ms/1000);"
+            "if(sec<60)return sec+'s';"
+            "var min=Math.floor(sec/60);"
+            "var rem=sec%60;"
+            "if(min<60)return min+'m'+(rem<10?'0':'')+rem+'s';"
+            "var hour=Math.floor(min/60);"
+            "var minRem=min%60;"
+            "return hour+'h'+(minRem<10?'0':'')+minRem+'m';"
+        "}"
         "function updateRadarLive(){"
             "if(busy)return;"
             "busy=true;"
@@ -10357,7 +10670,9 @@ static void handleRadarConfig()
                     "var t=document.getElementById('liveThreshold'+i);"
                     "var g=document.getElementById('liveMargin'+i);"
                     "var q=document.getElementById('liveState'+i);"
-                    "if(!e||!t||!g||!q)continue;"
+                    "var a=document.getElementById('liveLastTrigger'+i);"
+                    "if(!e||!t||!g||!q||!a)continue;"
+                    "a.textContent=(d.last_trigger_age_ms&&i<d.last_trigger_age_ms.length)?formatTriggerAge(d.last_trigger_age_ms[i]):'-';"
                     "if(!d.recent){"
                         "e.textContent='-';g.textContent='-';q.textContent='-';"
                         "continue;"
@@ -10386,27 +10701,41 @@ static void handleRadarConfig()
     html +=
         "<div id='radarCalibration' class='settings-section' style='margin-top:18px'>"
         "<h3>Radar Kalibrierung</h3>"
-        "<p class='muted'>Die Messung sammelt die 16 Gate-Energien direkt im Gerät. "
-        "Für eine Ruhemessung den Raum möglichst leer und unverändert lassen; etwa fünf Minuten "
-        "sind ein guter Ausgangspunkt. Danach eine separate Bewegungsmessung starten und den "
-        "relevanten Bereich mehrmals durchqueren.</p>"
+        "<p class='muted'>Die Kalibrierung ist bewusst einfach: Messart starten, den überwachten Bereich verlassen bzw. "
+        "für die Bewegungsmessung die gewünschte Bewegung vorbereiten. Danach läuft zuerst ein <b>10-Sekunden-Countdown</b>. "
+        "Erst anschließend werden Messwerte gesammelt. Die Messung beendet sich automatisch, sobald jedes Gate 100 gültige "
+        "Werte erreicht hat. Ein Gate mit 100 verworfenen Werten gilt als unzuverlässig; spätestens nach 150 Radar-Reports wird ebenfalls beendet. "
+        "Gates mit zu vielen Fehlwerten werden "
+        "bei der späteren Empfehlung vom nächstgelegenen brauchbaren Gate abgeleitet.</p>"
+        "<p class='muted'>Während der Messung wird der LD2410S vorübergehend auf Gate 0–16 erweitert. Der normale Min./Max.-Gate-Bereich "
+        "wird danach automatisch wiederhergestellt. Ausgeblendete Gates werden dadurch nur kalibriert und nicht für die normale "
+        "Alarmierung aktiviert.</p>"
         "<p><b>Status:</b> <span id='radarCalState'>keine Messung aktiv</span> "
         "&nbsp; <b>Laufzeit:</b> <span id='radarCalElapsed'>00:00</span> "
         "&nbsp; <b>Messzyklen:</b> <span id='radarCalSamples'>0</span></p>"
-        "<div style='display:flex;flex-wrap:wrap;gap:6px;margin:10px 0'>"
+        "<div style='display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 14px'>"
         "<button type='button' id='calStartQuiet'>Ruhemessung starten</button>"
         "<button type='button' id='calStartMotion'>Bewegungsmessung starten</button>"
-        "<button type='button' id='calStop'>Messung stoppen</button>"
         "</div>"
-        "<div style='display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 14px'>"
-        "<button type='button' id='calResetQuiet'>Ruhewerte löschen</button>"
-        "<button type='button' id='calResetMotion'>Bewegungswerte löschen</button>"
-        "<button type='button' id='calResetAll'>Alle Messwerte löschen</button>"
+        "<div id='radarCalProgressModal' class='modal-backdrop' hidden>"
+        "<div class='modal-card radar-cal-modal-card' role='dialog' aria-modal='true' aria-labelledby='radarCalModalTitle'>"
+        "<div class='radar-cal-kicker'>Radar-Kalibrierung</div>"
+        "<h3 id='radarCalModalTitle'>Messung</h3>"
+        "<div id='radarCalModalBig' class='radar-cal-big'>10</div>"
+        "<div id='radarCalModalBigLabel' class='radar-cal-big-label'>Sekunden bis Messbeginn</div>"
+        "<div class='radar-cal-progress'><span id='radarCalModalProgressBar'></span></div>"
+        "<div id='radarCalModalHint' class='radar-cal-hint'>Messbereich jetzt verlassen.</div>"
+        "<div class='radar-cal-meta'>"
+        "<div><b id='radarCalModalCompleted'>0 / 16</b><span>Gates abgeschlossen</span></div>"
+        "<div><b id='radarCalModalWeakest'>0 / 100</b><span>Wenigste gültige Werte</span></div>"
+        "<div><b id='radarCalModalReports'>0 / 150</b><span>Radar-Reports</span></div>"
         "</div>"
-        "<p class='muted'>Starten löscht jeweils nur die gewählte Messung. Die andere Messung bleibt "
-        "für den Vergleich erhalten. Die Messdaten liegen nur im RAM und verändern keine Radar-Konfiguration. "
-        "Ungültige 0-Werte des Radars werden pro Gate verworfen und beeinflussen Min, Mittelwert, "
-        "Perzentile und Peak nicht.</p>"
+        "<div class='modal-actions'>"
+        "<button type='button' id='radarCalModalCancel'>Messung abbrechen</button>"
+        "<button type='button' id='radarCalModalApply' class='primary' hidden>Werte übernehmen + auf Radar schreiben</button>"
+        "<button type='button' id='radarCalModalClose' hidden>Nur Ergebnisse anzeigen</button>"
+        "</div>"
+        "</div></div>"
 
         "<h4>Ruhemessung</h4>"
         "<div style='overflow-x:auto'><table style='border-collapse:collapse;min-width:760px'>"
@@ -10450,6 +10779,7 @@ static void handleRadarConfig()
         "<th style='padding:5px;border-bottom:1px solid #aaa'>Verworfen</th>"
         "<th style='padding:5px;border-bottom:1px solid #aaa'>Min</th>"
         "<th style='padding:5px;border-bottom:1px solid #aaa'>Ø</th>"
+        "<th style='padding:5px;border-bottom:1px solid #aaa'>P10</th>"
         "<th style='padding:5px;border-bottom:1px solid #aaa'>P95</th>"
         "<th style='padding:5px;border-bottom:1px solid #aaa'>P99</th>"
         "<th style='padding:5px;border-bottom:1px solid #aaa'>Peak</th>"
@@ -10464,6 +10794,7 @@ static void handleRadarConfig()
             "<td id='calMotionDiscarded" + String(gate) + "' style='padding:4px;text-align:right'>-</td>"
             "<td id='calMotionMin" + String(gate) + "' style='padding:4px;text-align:right'>-</td>"
             "<td id='calMotionMean" + String(gate) + "' style='padding:4px;text-align:right'>-</td>"
+            "<td id='calMotionP10" + String(gate) + "' style='padding:4px;text-align:right'>-</td>"
             "<td id='calMotionP95" + String(gate) + "' style='padding:4px;text-align:right'>-</td>"
             "<td id='calMotionP99" + String(gate) + "' style='padding:4px;text-align:right'>-</td>"
             "<td id='calMotionPeak" + String(gate) + "' style='padding:4px;text-align:right'>-</td>"
@@ -10473,18 +10804,31 @@ static void handleRadarConfig()
 
     html +=
         "</table></div>"
+        "<p class='muted'>P10 ist ein bewusst niedriger Bewegungswert: Etwa 90 % der gültigen "
+        "Bewegungsmessungen liegen auf oder über diesem Wert. Er wird nur für einen vorläufigen "
+        "Vorschlag verwendet, wenn keine Ruhemessung vorhanden ist.</p>"
 
-        "<h4>Vergleich und Trigger-Vorschlag</h4>"
-        "<p class='muted'>Der Vorschlag vergleicht den robusten oberen Ruhewert (P99) mit dem "
-        "robusten Bewegungswert (P99). Einzelne Peaks werden dafür bewusst nicht verwendet. "
-        "Je größer der Abstand, desto verlässlicher lässt sich dieses Gate trennen.</p>"
+        "<h4>Vergleich und Trigger-/Hold-Vorschlag</h4>"
+        "<p class='muted'>Am zuverlässigsten ist eine Messung mit <b>Ruhe und Bewegung</b>. Dann bleibt "
+        "die bisherige Vergleichslogik aktiv. Wenn nur eine Phase verfügbar ist, kann SensorForge "
+        "trotzdem klar als vorläufig markierte Werte vorschlagen: <b>nur Ruhe: Trigger = P99 + 3 dB</b>, "
+        "<b>nur Bewegung: Trigger = P10 - 3 dB</b>. Hold wird automatisch passend darunter gesetzt. "
+        "Wenn Ruhewerte vorhanden sind, bleibt Hold oberhalb des gemessenen Ruhepegels; bei nur Bewegung "
+        "wird Hold vorläufig 3 dB unter Trigger gesetzt. Pro Gate werden mindestens 100 gültige Messwerte "
+        "benötigt. Ein vorläufiger Wert sollte später möglichst mit einer vollständigen Ruhe-/Bewegungsmessung "
+        "kontrolliert werden. Erreicht ein Gate innerhalb der maximal 150 Radar-Reports keine 100 gültigen Werte, "
+        "wird sein Vorschlag vom nächstgelegenen brauchbaren Gate abgeleitet. Für näher liegende Gates werden "
+        "Trigger und Hold dabei konservativ um 3 dB pro Gate angehoben; solche Werte sind ausdrücklich als "
+        "<b>abgeleitet</b> gekennzeichnet.</p>"
         "<div style='overflow-x:auto'><table style='border-collapse:collapse;min-width:720px'>"
         "<tr><th style='padding:5px;border-bottom:1px solid #aaa'>Gate</th>"
         "<th style='padding:5px;border-bottom:1px solid #aaa'>Ruhe P99</th>"
         "<th style='padding:5px;border-bottom:1px solid #aaa'>Bewegung P99</th>"
         "<th style='padding:5px;border-bottom:1px solid #aaa'>Abstand</th>"
-        "<th style='padding:5px;border-bottom:1px solid #aaa'>Aktuell</th>"
-        "<th style='padding:5px;border-bottom:1px solid #aaa'>Vorschlag</th>"
+        "<th style='padding:5px;border-bottom:1px solid #aaa'>Trigger aktuell</th>"
+        "<th style='padding:5px;border-bottom:1px solid #aaa'>Hold aktuell</th>"
+        "<th style='padding:5px;border-bottom:1px solid #aaa'>Trigger Vorschlag</th>"
+        "<th style='padding:5px;border-bottom:1px solid #aaa'>Hold Vorschlag</th>"
         "<th style='padding:5px;border-bottom:1px solid #aaa'>Qualität</th></tr>";
 
     for (uint8_t gate = 0; gate < 16; ++gate) {
@@ -10494,9 +10838,12 @@ static void handleRadarConfig()
             "<td id='calCmpQuiet" + String(gate) + "' style='padding:4px;text-align:right'>-</td>"
             "<td id='calCmpMotion" + String(gate) + "' style='padding:4px;text-align:right'>-</td>"
             "<td id='calCmpGap" + String(gate) + "' style='padding:4px;text-align:right'>-</td>"
-            "<td id='calCmpCurrent" + String(gate) + "' style='padding:4px;text-align:right'>" +
+            "<td id='calCmpCurrentTrigger" + String(gate) + "' style='padding:4px;text-align:right'>" +
             String(settings.triggerThreshold[gate]) + "</td>"
-            "<td id='calCmpSuggested" + String(gate) + "' style='padding:4px;text-align:right'>-</td>"
+            "<td id='calCmpCurrentHold" + String(gate) + "' style='padding:4px;text-align:right'>" +
+            String(settings.holdThreshold[gate]) + "</td>"
+            "<td id='calCmpSuggestedTrigger" + String(gate) + "' style='padding:4px;text-align:right'>-</td>"
+            "<td id='calCmpSuggestedHold" + String(gate) + "' style='padding:4px;text-align:right'>-</td>"
             "<td id='calCmpQuality" + String(gate) + "' style='padding:4px'>-</td>"
             "</tr>";
     }
@@ -10505,66 +10852,147 @@ static void handleRadarConfig()
         "</table></div>"
         "<div style='margin-top:12px'>"
         "<button type='button' id='calApplyRecommendations' disabled>"
-        "Vorgeschlagene Trigger-Werte übernehmen</button>"
+        "Vorgeschlagene Trigger + Hold-Werte übernehmen + verifizieren</button>"
         "</div>"
-        "<p class='muted'>Übernehmen ändert nur die Trigger-Eingabefelder weiter unten auf dieser Seite. "
-        "Die Hold-Werte bleiben unverändert. In den Radar-Sensor geschrieben wird weiterhin erst mit "
-        "<b>Write + Verify</b>.</p>"
+        "<p class='muted'>Nach einer erfolgreich abgeschlossenen Messung werden die Vorschlagswerte automatisch in die "
+        "Eingabefelder weiter unten übernommen. Erst <b>Werte übernehmen + auf Radar schreiben</b> schreibt die komplette "
+        "Radar-Konfiguration mit Write + Verify in den LD2410S. Danach wird die Seite mit den tatsächlich bestätigten "
+        "Sensorwerten neu geladen. Die Kalibrierung schlägt für Hold niemals 0 vor.</p>"
         "</div>";
 
 
     html +=
         "<script>"
         "(function(){"
-        "var busy=false,lastData=null,lastDisplayMode='quiet',suggested=new Array(16).fill(null);"
+        "var busy=false,lastData=null,lastDisplayMode='quiet',modalCompletionVisible=false,suggestedTrigger=new Array(16).fill(null),suggestedHold=new Array(16).fill(null);"
         "function el(id){return document.getElementById(id);}"
         "function db(v){return Number(v).toFixed(1);}"
         "function timeText(ms){var s=Math.floor(Number(ms||0)/1000),m=Math.floor(s/60);s%=60;return String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');}"
         "function setText(id,v){var x=el(id);if(x)x.textContent=v;}"
-        "function renderSession(prefix,session){"
+        "function renderSession(prefix,session,target){"
+            "target=Number(target||100);"
             "for(var i=0;i<16;i++){"
                 "var g=session&&session.gates?session.gates[i]:null;"
-                "var ok=!!(g&&g.valid&&Number(g.samples)>0);"
-                "setText(prefix+'Samples'+i,g?String(Number(g.samples)||0):'-');"
+                "var samples=g?Number(g.samples)||0:0;"
+                "var ok=!!(g&&g.valid&&samples>0);"
+                "setText(prefix+'Samples'+i,g?String(samples):'-');"
                 "setText(prefix+'Discarded'+i,g?String(Number(g.discarded)||0):'-');"
                 "setText(prefix+'Min'+i,ok?db(g.min):'-');"
                 "setText(prefix+'Mean'+i,ok?db(g.mean):'-');"
+                "setText(prefix+'P10'+i,ok?db(g.p10):'-');"
                 "setText(prefix+'P95'+i,ok?db(g.p95):'-');"
                 "setText(prefix+'P99'+i,ok?db(g.p99):'-');"
                 "setText(prefix+'Peak'+i,ok?db(g.peak):'-');"
                 "var note='-';"
-                "if(ok&&Number(g.samples)>=100&&Number(g.peak)-Number(g.p99)>=6){note='Einzelspitze +'+db(Number(g.peak)-Number(g.p99))+' dB';}"
+                "if(session&&session.quality_limited&&samples<target)note='zu viele Fehlwerte · wird abgeleitet';"
+                "else if(session&&session.aborted&&samples<target)note='abgebrochen · unvollständig';"
+                "else if(ok&&samples>=target&&Number(g.peak)-Number(g.p99)>=6)note='Einzelspitze +'+db(Number(g.peak)-Number(g.p99))+' dB';"
+                "else if(samples>=target)note='OK';"
                 "setText(prefix+'Note'+i,note);"
             "}"
         "}"
+        "function holdFromQuiet(trigger,quiet){"
+            "if(!isFinite(trigger)||!isFinite(quiet)||trigger<2)return null;"
+            "var hold=Math.max(Math.ceil(quiet+1),trigger-3,1);"
+            "hold=Math.min(95,trigger-1,hold);"
+            "return hold>=1&&hold<trigger?hold:null;"
+        "}"
+        "function holdFromMotionOnly(trigger){"
+            "if(!isFinite(trigger)||trigger<2)return null;"
+            "var hold=Math.max(1,Math.min(95,trigger-3));"
+            "return hold<trigger?hold:null;"
+        "}"
         "function recommendation(q,m){"
-            "if(!q||!m||!q.valid||!m.valid||Number(q.samples)<100||Number(m.samples)<100)return null;"
-            "var quiet=Number(q.p99),move=Number(m.p99),gap=move-quiet;"
-            "if(!isFinite(gap)||gap<4)return {gap:gap,value:null,quality:'unzureichend'};"
-            "var margin=Math.max(3,Math.min(8,gap*0.25));"
-            "var value=Math.ceil(quiet+margin);"
-            "var upper=Math.floor(move-2);"
-            "if(value>upper)value=upper;"
-            "value=Math.max(0,Math.min(95,value));"
-            "if(value<=quiet)return {gap:gap,value:null,quality:'unzureichend'};"
-            "var quality=gap>=12?'sehr gut':(gap>=8?'gut':'knapp');"
-            "return {gap:gap,value:value,quality:quality};"
+            "var qReady=!!(q&&q.valid&&Number(q.samples)>=100&&isFinite(Number(q.p99)));"
+            "var mReady=!!(m&&m.valid&&Number(m.samples)>=100&&isFinite(Number(m.p99))&&isFinite(Number(m.p10)));"
+            "if(qReady&&mReady){"
+                "var quiet=Number(q.p99),move=Number(m.p99),gap=move-quiet;"
+                "if(!isFinite(gap)||gap<4)return {gap:gap,trigger:null,hold:null,quality:'unzureichend · Ruhe und Bewegung zu nah'};"
+                "var margin=Math.max(3,Math.min(8,gap*0.25));"
+                "var trigger=Math.ceil(quiet+margin);"
+                "var upper=Math.floor(move-2);"
+                "if(trigger>upper)trigger=upper;"
+                "trigger=Math.max(0,Math.min(95,trigger));"
+                "if(trigger<=quiet)return {gap:gap,trigger:null,hold:null,quality:'unzureichend · kein sicherer Spielraum'};"
+                "var hold=holdFromQuiet(trigger,quiet);"
+                "if(hold===null)return {gap:gap,trigger:null,hold:null,quality:'unzureichend · kein sicherer Hold-Spielraum'};"
+                "var quality=gap>=12?'sehr gut':(gap>=8?'gut':'knapp');"
+                "return {gap:gap,trigger:trigger,hold:hold,quality:'vollständig · '+quality};"
+            "}"
+            "if(qReady){"
+                "var quietOnly=Number(q.p99);"
+                "var quietTrigger=Math.max(0,Math.min(95,Math.ceil(quietOnly+3)));"
+                "if(quietTrigger<=quietOnly)return {gap:null,trigger:null,hold:null,quality:'kein Spielraum über dem Ruhewert'};"
+                "var quietHold=holdFromQuiet(quietTrigger,quietOnly);"
+                "if(quietHold===null)return {gap:null,trigger:null,hold:null,quality:'kein sicherer Hold-Spielraum'};"
+                "return {gap:null,trigger:quietTrigger,hold:quietHold,quality:'vorläufig · nur Ruhe (Trigger +3 dB, Hold über Ruhe)'};"
+            "}"
+            "if(mReady){"
+                "var motionLow=Number(m.p10);"
+                "var motionTrigger=Math.max(0,Math.min(95,Math.floor(motionLow-3)));"
+                "if(motionTrigger>=motionLow)return {gap:null,trigger:null,hold:null,quality:'kein Spielraum unter dem Bewegungswert'};"
+                "var motionHold=holdFromMotionOnly(motionTrigger);"
+                "if(motionHold===null)return {gap:null,trigger:null,hold:null,quality:'kein sicherer Hold-Spielraum'};"
+                "return {gap:null,trigger:motionTrigger,hold:motionHold,quality:'vorläufig · nur Bewegung (Trigger P10 - 3 dB, Hold -3 dB)'};"
+            "}"
+            "return null;"
+        "}"
+        "function gateHasAnyValidSamples(q,m){"
+            "return !!((q&&q.valid&&Number(q.samples)>0)||(m&&m.valid&&Number(m.samples)>0));"
+        "}"
+        "function gateNeedsDerived(index,data){"
+            "var target=Number(data.target_samples||100);"
+            "var q=data.quiet&&!data.quiet.aborted&&data.quiet.gates?data.quiet.gates[index]:null;"
+            "var m=data.motion&&!data.motion.aborted&&data.motion.gates?data.motion.gates[index]:null;"
+            "var qBad=!!(data.quiet&&!data.quiet.aborted&&data.quiet.quality_limited&&q&&Number(q.samples)<target);"
+            "var mBad=!!(data.motion&&!data.motion.aborted&&data.motion.quality_limited&&m&&Number(m.samples)<target);"
+            "return qBad||mBad;"
+        "}"
+        "function deriveMissingRecommendation(index,direct,data){"
+            "var q=data.quiet&&!data.quiet.aborted&&data.quiet.gates?data.quiet.gates[index]:null;"
+            "var m=data.motion&&!data.motion.aborted&&data.motion.gates?data.motion.gates[index]:null;"
+            "if(!gateNeedsDerived(index,data)&&gateHasAnyValidSamples(q,m))return null;"
+            "var best=-1,bestDistance=99;"
+            "for(var j=0;j<16;j++){"
+                "var candidate=direct[j];"
+                "if(!candidate||candidate.trigger===null||candidate.hold===null)continue;"
+                "var distance=Math.abs(j-index);"
+                "if(distance<bestDistance||(distance===bestDistance&&j<best)){best=j;bestDistance=distance;}"
+            "}"
+            "if(best<0)return null;"
+            "var source=direct[best];"
+            "var nearBoost=index<best?(best-index)*3:0;"
+            "var trigger=Math.max(2,Math.min(95,Number(source.trigger)+nearBoost));"
+            "var hold=Math.max(1,Math.min(trigger-1,Number(source.hold)+nearBoost));"
+            "if(!isFinite(trigger)||!isFinite(hold)||hold>=trigger)return null;"
+            "var detail=nearBoost>0?' +'+nearBoost+' dB Nahbereich':'';"
+            "return {gap:null,trigger:trigger,hold:hold,quality:'abgeleitet · Gate '+best+detail,derived:true,sourceGate:best};"
         "}"
         "function renderComparison(d){"
-            "var usable=0;"
+            "var usable=0,direct=new Array(16).fill(null),finalRec=new Array(16).fill(null);"
             "for(var i=0;i<16;i++){"
-                "var q=d.quiet&&d.quiet.gates?d.quiet.gates[i]:null;"
-                "var m=d.motion&&d.motion.gates?d.motion.gates[i]:null;"
-                "var qok=!!(q&&q.valid),mok=!!(m&&m.valid);"
+                "var q=d.quiet&&!d.quiet.aborted&&d.quiet.gates?d.quiet.gates[i]:null;"
+                "var m=d.motion&&!d.motion.aborted&&d.motion.gates?d.motion.gates[i]:null;"
+                "direct[i]=recommendation(q,m);"
+                "finalRec[i]=gateNeedsDerived(i,d)?null:direct[i];"
+            "}"
+            "for(var i=0;i<16;i++){if(!finalRec[i]||finalRec[i].trigger===null||finalRec[i].hold===null){var derived=deriveMissingRecommendation(i,direct,d);if(derived)finalRec[i]=derived;}}"
+            "for(var i=0;i<16;i++){"
+                "var q=d.quiet&&!d.quiet.aborted&&d.quiet.gates?d.quiet.gates[i]:null;"
+                "var m=d.motion&&!d.motion.aborted&&d.motion.gates?d.motion.gates[i]:null;"
+                "var target=Number(d.target_samples||100),qok=!!(q&&q.valid&&Number(q.samples)>=target),mok=!!(m&&m.valid&&Number(m.samples)>=target);"
                 "setText('calCmpQuiet'+i,qok?db(q.p99):'-');"
                 "setText('calCmpMotion'+i,mok?db(m.p99):'-');"
-                "var r=recommendation(q,m);suggested[i]=r&&r.value!==null?r.value:null;"
-                "setText('calCmpGap'+i,r&&isFinite(r.gap)?((r.gap>=0?'+':'')+db(r.gap)):'-');"
-                "setText('calCmpSuggested'+i,suggested[i]!==null?String(suggested[i]):'-');"
+                "var r=finalRec[i];"
+                "suggestedTrigger[i]=r&&r.trigger!==null?r.trigger:null;"
+                "suggestedHold[i]=r&&r.hold!==null?r.hold:null;"
+                "setText('calCmpGap'+i,r&&r.gap!==null&&isFinite(r.gap)?((r.gap>=0?'+':'')+db(r.gap)):(r&&r.derived?'abgeleitet':(r&&r.trigger!==null?'nicht messbar':'-')));"
+                "setText('calCmpSuggestedTrigger'+i,suggestedTrigger[i]!==null?String(suggestedTrigger[i]):'-');"
+                "setText('calCmpSuggestedHold'+i,suggestedHold[i]!==null?String(suggestedHold[i]):'-');"
                 "setText('calCmpQuality'+i,r?r.quality:'zu wenig Daten');"
-                "if(suggested[i]!==null)usable++;"
+                "if(suggestedTrigger[i]!==null&&suggestedHold[i]!==null)usable++;"
             "}"
-            "var b=el('calApplyRecommendations');if(b){b.disabled=usable===0;b.textContent=usable?'Vorgeschlagene Trigger-Werte übernehmen ('+usable+' Gates)':'Vorgeschlagene Trigger-Werte übernehmen';}"
+            "var b=el('calApplyRecommendations');if(b){b.disabled=usable===0;b.textContent=usable?'Vorgeschlagene Trigger + Hold-Werte übernehmen + verifizieren ('+usable+' Gates)':'Vorgeschlagene Trigger + Hold-Werte übernehmen + verifizieren';}"
         "}"
         "function renderLiveCalibration(d){"
             "var mode=d.active!=='none'?d.active:lastDisplayMode;"
@@ -10580,14 +11008,72 @@ static void handleRadarConfig()
                 "setText('liveCalPeak'+i,ok?db(g.peak):'-');"
             "}"
         "}"
+        "function calibrationProgress(session,target){"
+            "target=Number(target||100);var completed=0,failed=0,incomplete=0,weakest=target;"
+            "for(var i=0;i<16;i++){var g=session&&session.gates?session.gates[i]:null;var samples=g?Number(g.samples)||0:0;var discarded=g?Number(g.discarded)||0:0;var bad=samples<target&&discarded>=target;if(samples<target)incomplete++;if(samples>=target||bad)completed++;if(bad)failed++;if(!bad&&samples<target)weakest=Math.min(weakest,samples);}"
+            "if(completed>=16)weakest=target;return {completed:completed,failed:failed,incomplete:incomplete,weakest:weakest};"
+        "}"
+        "function showCalibrationModal(d,previousActive){"
+            "var modal=el('radarCalProgressModal'),cancel=el('radarCalModalCancel'),apply=el('radarCalModalApply'),close=el('radarCalModalClose');if(!modal||!cancel||!apply||!close)return;"
+            "var active=d.active||'none';"
+            "if(active!=='none'){"
+                "modalCompletionVisible=false;modal.hidden=false;cancel.hidden=false;apply.hidden=true;close.hidden=true;"
+                "var session=active==='motion'?d.motion:d.quiet,label=active==='motion'?'Bewegungsmessung':'Ruhemessung';var target=Number(d.target_samples||100),maxReports=Number(d.max_reports||150);"
+                "setText('radarCalModalTitle',label);setText('radarCalModalReports',String(Number(session&&session.samples||0))+' / '+String(maxReports));"
+                "var remaining=Number(session&&session.countdown_ms||0);"
+                "if(remaining>0){"
+                    "setText('radarCalModalBig',String(Math.max(1,Math.ceil(remaining/1000))));setText('radarCalModalBigLabel','Sekunden bis Messbeginn');setText('radarCalModalHint',active==='quiet'?'Messbereich jetzt verlassen.':'Position einnehmen – die Bewegungsmessung startet danach automatisch.');"
+                    "setText('radarCalModalCompleted','0 / 16');setText('radarCalModalWeakest','0 / '+String(target));var bar=el('radarCalModalProgressBar');if(bar)bar.style.width='0%';return;"
+                "}"
+                "var p=calibrationProgress(session,target);setText('radarCalModalBig',String(p.completed)+' / 16');setText('radarCalModalBigLabel','Gates abgeschlossen');setText('radarCalModalCompleted',String(p.completed)+' / 16');setText('radarCalModalWeakest',String(p.weakest)+' / '+String(target));"
+                "setText('radarCalModalHint',p.failed?(String(p.failed)+' Gate'+(p.failed===1?' liefert':'s liefern')+' zu viele Fehlwerte und '+(p.failed===1?'wird':'werden')+' später abgeleitet.'):'Messung läuft automatisch bis genügend gültige Werte vorliegen.');"
+                "var bar=el('radarCalModalProgressBar');if(bar)bar.style.width=String(Math.max(0,Math.min(100,p.completed/16*100)))+'%';return;"
+            "}"
+            "if(previousActive!=='none'){"
+                "var session=previousActive==='motion'?d.motion:d.quiet,label=previousActive==='motion'?'Bewegungsmessung':'Ruhemessung';var target=Number(d.target_samples||100),maxReports=Number(d.max_reports||150),p=calibrationProgress(session,target);"
+                "modalCompletionVisible=true;modal.hidden=false;cancel.hidden=true;close.hidden=false;setText('radarCalModalTitle',label);var derived=session&&session.quality_limited?p.incomplete:p.failed;"
+                "if(session&&session.aborted){apply.hidden=true;close.textContent='Schließen';setText('radarCalModalBig','Abgebrochen');setText('radarCalModalBigLabel','Messung beendet');setText('radarCalModalHint','Die Teilmessung wird nicht für neue Empfehlungen verwendet.');setText('radarCalModalCompleted',String(p.completed)+' / 16');}"
+                "else{stageSuggestedValues();apply.hidden=false;close.textContent='Nur Ergebnisse anzeigen';setText('radarCalModalBig','Fertig');setText('radarCalModalBigLabel','Messung abgeschlossen');setText('radarCalModalHint',(derived?(String(derived)+' Gate'+(derived===1?' wird':'s werden')+' aus benachbarten Messwerten abgeleitet. '):'')+'Die neuen Werte sind im Formular vorbereitet. Mit dem grünen Knopf werden sie auf den Radar geschrieben und verifiziert.');setText('radarCalModalCompleted','16 / 16');}"
+                "setText('radarCalModalWeakest',String(p.weakest)+' / '+String(target));setText('radarCalModalReports',String(Number(session&&session.samples||0))+' / '+String(maxReports));var bar=el('radarCalModalProgressBar');if(bar)bar.style.width='100%';return;"
+            "}"
+            "if(!modalCompletionVisible)modal.hidden=true;"
+        "}"
+        "function stageSuggestedValues(){"
+            "var n=0;for(var i=0;i<16;i++){if(suggestedTrigger[i]===null||suggestedHold[i]===null)continue;var triggerInput=el('radarTriggerInput'+i);var holdInput=el('radarHoldInput'+i);if(triggerInput&&holdInput){triggerInput.value=String(suggestedTrigger[i]);holdInput.value=String(suggestedHold[i]);n++;}}return n;"
+        "}"
+        "function applySuggestedValues(){"
+            "var n=stageSuggestedValues();if(!n){alert('Keine verwendbaren Kalibrierungsvorschläge vorhanden.');return;}"
+            "var form=el('radarConfigForm');var marker=el('radarCalibrationApply');if(!form||!marker){alert('Radar-Konfigurationsformular nicht gefunden. Seite bitte neu laden.');return;}"
+            "if(!confirm(n+' vorgeschlagene Trigger-/Hold-Paare jetzt in den LD2410S schreiben und verifizieren?'))return;"
+            "marker.value='1';var applyModal=el('radarCalModalApply');var applyPage=el('calApplyRecommendations');if(applyModal){applyModal.disabled=true;applyModal.textContent='Schreibe + verifiziere...';}if(applyPage){applyPage.disabled=true;applyPage.textContent='Schreibe + verifiziere...';}"
+            "if(typeof form.requestSubmit==='function')form.requestSubmit();else form.submit();"
+        "}"
+        "function renderCalibrationControls(d){"
+            "var active=d.active||'none',q=el('calStartQuiet'),m=el('calStartMotion');"
+            "if(!q||!m)return;"
+            "if(active==='quiet'){q.style.display='';m.style.display='none';q.textContent='Ruhemessung abbrechen';return;}"
+            "if(active==='motion'){m.style.display='';q.style.display='none';m.textContent='Bewegungsmessung abbrechen';return;}"
+            "q.style.display='';m.style.display='';q.textContent='Ruhemessung starten';m.textContent='Bewegungsmessung starten';"
+        "}"
         "function render(d){"
-            "lastData=d;"
-            "var active=d.active||'none',session=active==='quiet'?d.quiet:(active==='motion'?d.motion:null);"
-            "setText('radarCalState',active==='quiet'?'Ruhemessung läuft':(active==='motion'?'Bewegungsmessung läuft':'keine Messung aktiv'));"
+            "var previousActive=lastData&&lastData.active?lastData.active:'none';lastData=d;"
+            "var active=d.active||'none',mode=active!=='none'?active:lastDisplayMode;"
+            "var session=mode==='motion'?d.motion:d.quiet;"
+            "if(active!=='none')lastDisplayMode=active;"
+            "var label=mode==='motion'?'Bewegungsmessung':'Ruhemessung';"
+            "var state='keine Messung aktiv';"
+            "if(active!=='none'){"
+                "var remaining=Number(session&&session.countdown_ms||0);"
+                "if(remaining>0)state=label+' startet in '+Math.max(1,Math.ceil(remaining/1000))+' s – Messbereich jetzt verlassen';"
+                "else if(session&&!session.measurement_started)state=label+' startet …';"
+                "else state=label+' läuft · Ziel '+String(d.target_samples||100)+' gültige Werte je Gate';"
+            "}else if(session&&session.auto_completed){"
+                "state=label+(session.quality_limited?' abgeschlossen · fehlerhafte Gates werden abgeleitet':' automatisch abgeschlossen');"
+            "}else if(session&&session.aborted){state=label+' abgebrochen';}"
+            "setText('radarCalState',state);"
             "setText('radarCalElapsed',session?timeText(session.elapsed_ms):'00:00');"
-            "setText('radarCalSamples',session?String(session.samples||0):'0');"
-            "renderSession('calQuiet',d.quiet);renderSession('calMotion',d.motion);renderComparison(d);renderLiveCalibration(d);"
-            "var stop=el('calStop');if(stop)stop.disabled=active==='none';"
+            "setText('radarCalSamples',session?(String(session.samples||0)+' / '+String(d.max_reports||150)):'0');"
+            "renderSession('calQuiet',d.quiet,d.target_samples);renderSession('calMotion',d.motion,d.target_samples);renderComparison(d);renderLiveCalibration(d);renderCalibrationControls(d);showCalibrationModal(d,previousActive);"
         "}"
         "function poll(){"
             "if(busy)return;busy=true;"
@@ -10602,16 +11088,12 @@ static void handleRadarConfig()
             ".then(render).catch(function(e){alert('Radar-Kalibrierung: '+e.message);});"
         "}"
         "var b;"
-        "b=el('calStartQuiet');if(b)b.onclick=function(){lastDisplayMode='quiet';action('start_quiet','Eine neue Ruhemessung löscht die bisherigen Ruhewerte. Starten?');};"
-        "b=el('calStartMotion');if(b)b.onclick=function(){lastDisplayMode='motion';action('start_motion','Eine neue Bewegungsmessung löscht die bisherigen Bewegungswerte. Starten?');};"
-        "b=el('calStop');if(b)b.onclick=function(){action('stop');};"
-        "b=el('calResetQuiet');if(b)b.onclick=function(){action('reset_quiet','Ruhewerte wirklich löschen?');};"
-        "b=el('calResetMotion');if(b)b.onclick=function(){action('reset_motion','Bewegungswerte wirklich löschen?');};"
-        "b=el('calResetAll');if(b)b.onclick=function(){action('reset_all','Alle Kalibrierungswerte wirklich löschen?');};"
-        "b=el('calApplyRecommendations');if(b)b.onclick=function(){"
-            "var n=0;for(var i=0;i<16;i++){if(suggested[i]===null)continue;var input=document.querySelector('input[name=\\\"trigger_'+i+'\\\"]');if(input){input.value=String(suggested[i]);setText('calCmpCurrent'+i,String(suggested[i]));n++;}}"
-            "if(n){alert(n+' Trigger-Werte wurden in die Eingabefelder übernommen. Noch nicht in den Radar geschrieben – bitte unten mit Write + Verify speichern.');}"
-        "};"
+        "b=el('calStartQuiet');if(b)b.onclick=function(){lastDisplayMode='quiet';if(lastData&&lastData.active==='quiet'){action('stop');return;}if(lastData&&lastData.active!=='none')return;action('start_quiet','Neue Ruhemessung starten? Die bisherigen Ruhewerte werden ersetzt. Danach bleiben 10 Sekunden, um den Messbereich zu verlassen.');};"
+        "b=el('calStartMotion');if(b)b.onclick=function(){lastDisplayMode='motion';if(lastData&&lastData.active==='motion'){action('stop');return;}if(lastData&&lastData.active!=='none')return;action('start_motion','Neue Bewegungsmessung starten? Die bisherigen Bewegungswerte werden ersetzt. Die Messung beginnt nach 10 Sekunden.');};"
+        "b=el('radarCalModalCancel');if(b)b.onclick=function(){if(lastData&&lastData.active!=='none')action('stop');};"
+        "b=el('radarCalModalApply');if(b)b.onclick=applySuggestedValues;"
+        "b=el('radarCalModalClose');if(b)b.onclick=function(){modalCompletionVisible=false;var modal=el('radarCalProgressModal');if(modal)modal.hidden=true;};"
+        "b=el('calApplyRecommendations');if(b)b.onclick=applySuggestedValues;"
         "poll();setInterval(poll,1000);"
         "document.addEventListener('visibilitychange',function(){if(!document.hidden)poll();});"
         "})();"
@@ -10619,7 +11101,8 @@ static void handleRadarConfig()
 
 
     html +=
-        "<form method='POST' action='/radar_config_save'>";
+        "<form id='radarConfigForm' method='POST' action='/radar_config_save'>"
+        "<input type='hidden' id='radarCalibrationApply' name='calibration_apply' value='0'>";
 
     html +=
         "<h3>Allgemeine Parameter</h3>";
@@ -10709,7 +11192,9 @@ static void handleRadarConfig()
     html +=
         "<p>Niedrigerer dB-Wert = empfindlicher. "
         "Die Hi-Link-Protokollbeispiele enthalten auch Werte unter 10; "
-        "daher erlaubt diese Seite 0..95 und bewahrt vorhandene Werte.</p>";
+        "daher erlaubt diese Seite 0..95 und bewahrt vorhandene Werte. "
+        "<b>Hinweis:</b> Hold=0 kann einen bereits erkannten Presence-Zustand sehr lange festhalten. "
+        "Die Kalibrierung schlägt deshalb für Hold niemals 0 vor.</p>";
 
     html +=
         "<div style='overflow-x:auto'>"
@@ -10741,7 +11226,9 @@ static void handleRadarConfig()
             " m</td>"
             "<td style='padding:4px'>"
             "<input type='number' min='0' max='95' "
-            "name='trigger_" +
+            "id='radarTriggerInput" +
+            String(gate) +
+            "' name='trigger_" +
             String(gate) +
             "' value='" +
             String(
@@ -10750,7 +11237,9 @@ static void handleRadarConfig()
             "' style='width:70px'></td>"
             "<td style='padding:4px'>"
             "<input type='number' min='0' max='95' "
-            "name='hold_" +
+            "id='radarHoldInput" +
+            String(gate) +
+            "' name='hold_" +
             String(gate) +
             "' value='" +
             String(
@@ -10807,6 +11296,8 @@ static void handleRadarConfigSave()
 {
     if (rejectRadarConfigurationUnavailable())
         return;
+
+    RadarWebMaintenanceGuard maintenanceGuard;
 
     bool recordingActive =
         recorderIsOpen();
@@ -10935,9 +11426,15 @@ static void handleRadarConfigSave()
     );
 
 
+    bool calibrationApply =
+        server.hasArg("calibration_apply") &&
+        server.arg("calibration_apply") == "1";
+
     server.sendHeader(
         "Location",
-        "/radar_config?saved=1"
+        calibrationApply
+        ? "/radar_config?saved=1&calibration=1"
+        : "/radar_config?saved=1"
     );
 
     server.send(
@@ -10952,6 +11449,16 @@ static void handleRadarConfigDefaults()
 {
     if (rejectRadarConfigurationUnavailable())
         return;
+
+    RadarWebMaintenanceGuard maintenanceGuard;
+
+    Serial.println(
+        "LD2410S defaults restore | begin"
+    );
+
+    logWrite(
+        "LD2410S defaults restore started"
+    );
 
     bool recordingActive =
         recorderIsOpen();
@@ -10985,6 +11492,16 @@ static void handleRadarConfigDefaults()
 
     if (!writeOk) {
 
+        Serial.println(
+            "LD2410S defaults restore | failed | " +
+            error
+        );
+
+        logWrite(
+            "LD2410S defaults restore failed | " +
+            error
+        );
+
         String html =
             htmlHeader();
 
@@ -11011,11 +11528,11 @@ static void handleRadarConfigDefaults()
 
 
     Serial.println(
-        "LD2410S Hi-Link defaults written and verified"
+        "LD2410S defaults restore | success | written and verified"
     );
 
     logWrite(
-        "LD2410S Hi-Link defaults written and verified"
+        "LD2410S defaults restore successful | written and verified"
     );
 
 
@@ -11036,32 +11553,53 @@ static void handleRadarConfigDefaults()
 // WIFI FIRMWARE UPDATE
 // -------------------------------------------------------------
 //
-// The browser upload never flashes the running application directly.
-// It is first written to a non-.bin staging file on SD, validated with the
-// existing SD auto-update validator, and renamed to *.bin only after the
-// operator explicitly presses INSTALL. The next controlled reboot therefore
-// enters the already proven SD OTA path.
+// Browser uploads are staged directly in the inactive internal OTA partition.
+// The SD card is deliberately not part of the WiFi update path. This keeps
+// remote recovery available when the SD card is absent, damaged or unstable.
+//
+// Safety model:
+//   1. Upload writes only to the inactive OTA partition.
+//   2. ESP image magic, partition capacity and SensorForge board marker are
+//      checked while streaming.
+//   3. esp_ota_end() validates the completed application image.
+//   4. The running/boot partition is NOT changed by the upload.
+//   5. Only the explicit INSTALL action calls esp_ota_set_boot_partition().
+//
+// A failed/interrupted upload therefore leaves the currently running firmware
+// selected. The next upload simply overwrites the inactive OTA partition again.
 
-static const char *WEB_FW_DIR =
-    "/firmware";
-static const char *WEB_FW_UPLOAD_TEMP =
-    "/firmware/.wifi_upload.part";
-static const char *WEB_FW_UPLOAD_READY =
-    "/firmware/.wifi_upload.ready";
-static const char *WEB_FW_INSTALL_CANDIDATE =
-    "/firmware/wifi_update.bin";
+static const uint8_t WEB_FW_ESP_IMAGE_MAGIC = 0xE9U;
+static const size_t WEB_FW_MARKER_MAX_BYTES = 96U;
 
-static File webFirmwareUploadFile;
 static bool webFirmwareUploadAttempted = false;
 static bool webFirmwareUploadSucceeded = false;
 static bool webFirmwareUploadLocksHeld = false;
-static bool webFirmwareUploadOwnsTemp = false;
 static bool webFirmwarePreviousRecordingBlock = false;
-static bool webFirmwarePreviousStorageLock = false;
 static size_t webFirmwareUploadBytes = 0;
 static size_t webFirmwareUploadCapacity = 0;
 static String webFirmwareUploadFilename;
 static String webFirmwareUploadError;
+
+static bool webFirmwareOtaActive = false;
+static esp_ota_handle_t webFirmwareOtaHandle = 0;
+static const esp_partition_t *webFirmwareUploadPartition = nullptr;
+
+// A successfully uploaded image remains staged only in RAM state until the
+// operator either installs it or discards it. The image bytes themselves live
+// in the inactive OTA partition, but that partition is not selected for boot.
+static bool webFirmwareReady = false;
+static const esp_partition_t *webFirmwareReadyPartition = nullptr;
+static size_t webFirmwareReadyBytes = 0;
+static String webFirmwareReadyFilename;
+
+// Streaming SensorForge compatibility-marker matcher. The prefix table allows
+// matches to span arbitrary HTTP upload chunk boundaries without buffering the
+// complete firmware image in RAM.
+static size_t webFirmwareMarkerLength = 0;
+static size_t webFirmwareMarkerMatched = 0;
+static size_t webFirmwareMarkerPrefix[WEB_FW_MARKER_MAX_BYTES] = {};
+static bool webFirmwareMarkerFound = false;
+static bool webFirmwareImageMagicChecked = false;
 
 
 static String webFirmwareBaseName(
@@ -11108,100 +11646,21 @@ static String webFirmwareFormatBytes(
 }
 
 
-static bool webFirmwareEnsureDirectory(
-    String &error
+static String webFirmwareEspError(
+    esp_err_t result
 )
 {
-    error = "";
-
-    if (STORAGE.exists(WEB_FW_DIR)) {
-        File directory =
-            STORAGE.open(
-                WEB_FW_DIR,
-                FILE_READ
-            );
-
-        bool ok =
-            directory &&
-            directory.isDirectory();
-
-        if (directory)
-            directory.close();
-
-        if (!ok) {
-            error =
-                "/firmware exists but is not a directory";
-            return false;
-        }
-
-        return true;
-    }
-
-    if (!STORAGE.mkdir(WEB_FW_DIR)) {
-        error =
-            "cannot create /firmware directory";
-        return false;
-    }
-
-    return true;
-}
-
-
-static int webFirmwareCountBinCandidates(
-    String &firstCandidate
-)
-{
-    firstCandidate = "";
-
-    File directory =
-        STORAGE.open(
-            WEB_FW_DIR,
-            FILE_READ
+    const char *name =
+        esp_err_to_name(
+            result
         );
 
-    if (!directory || !directory.isDirectory()) {
-        if (directory)
-            directory.close();
-        return 0;
-    }
+    if (name && name[0] != '\0')
+        return String(name);
 
-    int count = 0;
-
-    File entry =
-        directory.openNextFile();
-
-    while (entry) {
-        if (!entry.isDirectory()) {
-            String name =
-                String(entry.name());
-
-            String lower =
-                name;
-            lower.toLowerCase();
-
-            if (lower.endsWith(".bin")) {
-                ++count;
-
-                if (count == 1) {
-                    firstCandidate =
-                        webFirmwareBaseName(
-                            name
-                        );
-                }
-            }
-        }
-
-        entry.close();
-
-        if (count > 1)
-            break;
-
-        entry =
-            directory.openNextFile();
-    }
-
-    directory.close();
-    return count;
+    return
+        String("ESP error ") +
+        String((int)result);
 }
 
 
@@ -11213,31 +11672,27 @@ static void webFirmwareReleaseUploadLocks()
     g_recordingStartBlocked =
         webFirmwarePreviousRecordingBlock;
 
-    g_storageLocked =
-        webFirmwarePreviousStorageLock;
-
     webFirmwareUploadLocksHeld = false;
+}
+
+
+static void webFirmwareAbortActiveOta()
+{
+    if (webFirmwareOtaActive) {
+        esp_ota_abort(
+            webFirmwareOtaHandle
+        );
+    }
+
+    webFirmwareOtaActive = false;
+    webFirmwareOtaHandle = 0;
+    webFirmwareUploadPartition = nullptr;
 }
 
 
 static void webFirmwareCleanupPartial()
 {
-    if (webFirmwareUploadFile)
-        webFirmwareUploadFile.close();
-
-    webFirmwareUploadFile = File();
-
-    // Only remove the temp file when this upload attempt actually created it.
-    // A request rejected because another subsystem owns the storage lock must
-    // not touch SD at all.
-    if (
-        webFirmwareUploadOwnsTemp &&
-        STORAGE.exists(WEB_FW_UPLOAD_TEMP)
-    ) {
-        STORAGE.remove(WEB_FW_UPLOAD_TEMP);
-    }
-
-    webFirmwareUploadOwnsTemp = false;
+    webFirmwareAbortActiveOta();
 }
 
 
@@ -11249,6 +11704,153 @@ static void webFirmwareFailUpload(
         webFirmwareUploadError = error;
 
     webFirmwareUploadSucceeded = false;
+}
+
+
+static bool webFirmwarePrepareMarkerMatcher(
+    String &error
+)
+{
+    error = "";
+
+    const char *marker =
+        firmwareExpectedCompatibilityMarker();
+
+    if (!marker || marker[0] == '\0') {
+        error =
+            "Firmware compatibility marker is unavailable.";
+        return false;
+    }
+
+    webFirmwareMarkerLength =
+        strlen(marker);
+
+    if (
+        webFirmwareMarkerLength == 0 ||
+        webFirmwareMarkerLength > WEB_FW_MARKER_MAX_BYTES
+    ) {
+        error =
+            "Firmware compatibility marker has an unsupported length.";
+        return false;
+    }
+
+    memset(
+        webFirmwareMarkerPrefix,
+        0,
+        sizeof(webFirmwareMarkerPrefix)
+    );
+
+    for (
+        size_t i = 1, prefix = 0;
+        i < webFirmwareMarkerLength;
+        ++i
+    ) {
+        while (
+            prefix > 0 &&
+            marker[i] != marker[prefix]
+        ) {
+            prefix =
+                webFirmwareMarkerPrefix[
+                    prefix - 1
+                ];
+        }
+
+        if (marker[i] == marker[prefix])
+            ++prefix;
+
+        webFirmwareMarkerPrefix[i] =
+            prefix;
+    }
+
+    webFirmwareMarkerMatched = 0;
+    webFirmwareMarkerFound = false;
+    return true;
+}
+
+
+static void webFirmwareScanCompatibilityMarker(
+    const uint8_t *data,
+    size_t length
+)
+{
+    if (
+        webFirmwareMarkerFound ||
+        !data ||
+        length == 0 ||
+        webFirmwareMarkerLength == 0
+    ) {
+        return;
+    }
+
+    const char *marker =
+        firmwareExpectedCompatibilityMarker();
+
+    if (!marker)
+        return;
+
+    for (size_t i = 0; i < length; ++i) {
+        char current =
+            (char)data[i];
+
+        while (
+            webFirmwareMarkerMatched > 0 &&
+            current != marker[webFirmwareMarkerMatched]
+        ) {
+            webFirmwareMarkerMatched =
+                webFirmwareMarkerPrefix[
+                    webFirmwareMarkerMatched - 1
+                ];
+        }
+
+        if (
+            current ==
+            marker[webFirmwareMarkerMatched]
+        ) {
+            ++webFirmwareMarkerMatched;
+        }
+
+        if (
+            webFirmwareMarkerMatched ==
+            webFirmwareMarkerLength
+        ) {
+            webFirmwareMarkerFound = true;
+            webFirmwareMarkerMatched =
+                webFirmwareMarkerPrefix[
+                    webFirmwareMarkerMatched - 1
+                ];
+            return;
+        }
+    }
+}
+
+
+static void webFirmwareClearReadyState()
+{
+    webFirmwareReady = false;
+    webFirmwareReadyPartition = nullptr;
+    webFirmwareReadyBytes = 0;
+    webFirmwareReadyFilename = "";
+}
+
+
+static bool webFirmwareReadyStateValid()
+{
+    if (
+        !webFirmwareReady ||
+        !webFirmwareReadyPartition ||
+        webFirmwareReadyBytes == 0
+    ) {
+        return false;
+    }
+
+    const esp_partition_t *running =
+        esp_ota_get_running_partition();
+
+    return
+        running &&
+        webFirmwareReadyPartition != running &&
+        webFirmwareReadyBytes <=
+            webFirmwareReadyPartition->size;
 }
 
 
@@ -11294,15 +11896,19 @@ static void handleFirmwareUploadData()
                 upload.filename
             );
         webFirmwareUploadError = "";
+        webFirmwareImageMagicChecked = false;
+        webFirmwareMarkerFound = false;
+        webFirmwareMarkerMatched = 0;
+        webFirmwareMarkerLength = 0;
 
-        // Recover only our in-memory lock state here. Do not touch SD until
-        // recording/storage ownership has been checked below.
+        // Recover from a malformed/interrupted previous HTTP request before
+        // accepting a new upload. A successfully staged image is retained and
+        // must be installed or discarded explicitly.
+        webFirmwareAbortActiveOta();
         webFirmwareReleaseUploadLocks();
-        webFirmwareUploadOwnsTemp = false;
-        webFirmwareUploadFile = File();
 
         // Defense in depth: multipart upload callbacks may run while the
-        // request body is being parsed. Never write unauthenticated upload
+        // request body is being parsed. Never write unauthenticated firmware
         // bytes even if route middleware behavior changes in a future core.
         if (
             cfg_web_auth_enabled &&
@@ -11335,181 +11941,231 @@ static void handleFirmwareUploadData()
             return;
         }
 
-        if (g_storageLocked) {
+        if (webFirmwareReady) {
             webFirmwareFailUpload(
-                "SD/storage is currently locked by another operation."
+                "A validated firmware image is already staged. Install or discard it first."
             );
             return;
         }
 
-        String directoryError;
-
-        if (!webFirmwareEnsureDirectory(
-                directoryError
-            )) {
-            webFirmwareFailUpload(
-                directoryError
-            );
-            return;
-        }
-
-        if (STORAGE.exists(WEB_FW_UPLOAD_READY)) {
-            webFirmwareFailUpload(
-                "A validated WiFi firmware image is already staged. Install or discard it first."
-            );
-            return;
-        }
-
-        // Safe now: no recorder and no competing storage owner. Remove only a
-        // stale partial file from an earlier interrupted WiFi upload.
-        if (STORAGE.exists(WEB_FW_UPLOAD_TEMP))
-            STORAGE.remove(WEB_FW_UPLOAD_TEMP);
-
-        String firstCandidate;
-        int binCount =
-            webFirmwareCountBinCandidates(
-                firstCandidate
+        const esp_partition_t *target =
+            esp_ota_get_next_update_partition(
+                nullptr
             );
 
-        if (binCount > 0) {
-            webFirmwareFailUpload(
-                "A .bin firmware candidate already exists in /firmware (" +
-                firstCandidate +
-                "). Reboot/install or remove it before another WiFi upload."
-            );
-            return;
-        }
+        const esp_partition_t *running =
+            esp_ota_get_running_partition();
 
-        webFirmwareUploadCapacity =
-            firmwareInactiveOtaCapacity();
-
-        if (webFirmwareUploadCapacity == 0) {
+        if (
+            !target ||
+            !running ||
+            target == running ||
+            target->size == 0
+        ) {
             webFirmwareFailUpload(
                 "No inactive OTA application partition is available."
             );
             return;
         }
 
+        webFirmwareUploadCapacity =
+            target->size;
+
+        String markerError;
+
+        if (!webFirmwarePrepareMarkerMatcher(
+                markerError
+            )) {
+            webFirmwareFailUpload(
+                markerError
+            );
+            return;
+        }
+
         webFirmwarePreviousRecordingBlock =
             g_recordingStartBlocked;
-        webFirmwarePreviousStorageLock =
-            g_storageLocked;
-
         g_recordingStartBlocked = true;
-        g_storageLocked = true;
         webFirmwareUploadLocksHeld = true;
 
-        // Release any recording-player file before opening the staging image.
+        // Release a playback file and reduce unnecessary SD activity. The SD
+        // itself is not required for this update path and is never locked here.
         webPlayerStop();
 
-        webFirmwareUploadFile =
-            STORAGE.open(
-                WEB_FW_UPLOAD_TEMP,
-                FILE_WRITE
+        esp_ota_handle_t otaHandle = 0;
+        esp_err_t beginResult =
+            esp_ota_begin(
+                target,
+                OTA_WITH_SEQUENTIAL_WRITES,
+                &otaHandle
             );
 
-        if (!webFirmwareUploadFile) {
+        if (beginResult != ESP_OK) {
             webFirmwareFailUpload(
-                "Cannot create firmware staging file on SD."
+                "Could not prepare the internal OTA partition: " +
+                webFirmwareEspError(
+                    beginResult
+                )
             );
             webFirmwareReleaseUploadLocks();
             return;
         }
 
-        webFirmwareUploadOwnsTemp = true;
+        webFirmwareOtaHandle =
+            otaHandle;
+        webFirmwareOtaActive = true;
+        webFirmwareUploadPartition =
+            target;
         return;
     }
 
     if (upload.status == UPLOAD_FILE_WRITE) {
         if (
             webFirmwareUploadError.length() ||
-            !webFirmwareUploadFile
+            !webFirmwareOtaActive ||
+            !webFirmwareUploadPartition
         ) {
             return;
+        }
+
+        if (upload.currentSize == 0)
+            return;
+
+        if (!webFirmwareImageMagicChecked) {
+            if (
+                webFirmwareUploadBytes != 0 ||
+                upload.buf[0] !=
+                    WEB_FW_ESP_IMAGE_MAGIC
+            ) {
+                webFirmwareFailUpload(
+                    "Firmware rejected: invalid ESP32 application image header."
+                );
+                webFirmwareAbortActiveOta();
+                return;
+            }
+
+            webFirmwareImageMagicChecked = true;
         }
 
         if (
+            webFirmwareUploadBytes >
+                webFirmwareUploadCapacity ||
             upload.currentSize >
-            webFirmwareUploadCapacity -
-                webFirmwareUploadBytes
+                webFirmwareUploadCapacity -
+                    webFirmwareUploadBytes
         ) {
             webFirmwareFailUpload(
-                "Firmware image is larger than the inactive OTA partition."
+                "Firmware rejected: image is larger than the inactive OTA partition."
             );
-            webFirmwareCleanupPartial();
+            webFirmwareAbortActiveOta();
             return;
         }
 
-        size_t written =
-            webFirmwareUploadFile.write(
+        webFirmwareScanCompatibilityMarker(
+            upload.buf,
+            upload.currentSize
+        );
+
+        esp_err_t writeResult =
+            esp_ota_write(
+                webFirmwareOtaHandle,
                 upload.buf,
                 upload.currentSize
             );
 
-        if (written != upload.currentSize) {
+        if (writeResult != ESP_OK) {
             webFirmwareFailUpload(
-                "SD write failed while receiving firmware image."
+                "Firmware upload failed while writing internal flash: " +
+                webFirmwareEspError(
+                    writeResult
+                )
             );
-            webFirmwareCleanupPartial();
+            webFirmwareAbortActiveOta();
             return;
         }
 
         webFirmwareUploadBytes +=
-            written;
+            upload.currentSize;
 
         serviceWebLongOperation();
         return;
     }
 
     if (upload.status == UPLOAD_FILE_END) {
-        if (webFirmwareUploadFile) {
-            webFirmwareUploadFile.flush();
-            webFirmwareUploadFile.close();
-        }
-
-        webFirmwareUploadFile = File();
-
-        if (!webFirmwareUploadError.length()) {
-            if (webFirmwareUploadBytes == 0) {
-                webFirmwareFailUpload(
-                    "Uploaded firmware image is empty."
-                );
-            } else {
-                size_t validatedSize = 0;
-                String validationError;
-
-                if (!firmwareValidateStagedImage(
-                        WEB_FW_UPLOAD_TEMP,
-                        validatedSize,
-                        validationError
-                    )) {
-                    webFirmwareFailUpload(
-                        "Firmware rejected: " +
-                        validationError
-                    );
-                } else if (
-                    validatedSize !=
-                    webFirmwareUploadBytes
-                ) {
-                    webFirmwareFailUpload(
-                        "Firmware staging size mismatch."
-                    );
-                } else if (!STORAGE.rename(
-                               WEB_FW_UPLOAD_TEMP,
-                               WEB_FW_UPLOAD_READY
-                           )) {
-                    webFirmwareFailUpload(
-                        "Firmware validated, but staging rename failed."
-                    );
-                } else {
-                    webFirmwareUploadOwnsTemp = false;
-                    webFirmwareUploadSucceeded = true;
-                }
-            }
-        }
-
-        if (!webFirmwareUploadSucceeded)
+        if (webFirmwareUploadError.length()) {
             webFirmwareCleanupPartial();
+            webFirmwareReleaseUploadLocks();
+            return;
+        }
+
+        if (
+            !webFirmwareOtaActive ||
+            !webFirmwareUploadPartition ||
+            webFirmwareUploadBytes == 0 ||
+            !webFirmwareImageMagicChecked
+        ) {
+            webFirmwareFailUpload(
+                "Firmware upload did not contain a complete application image."
+            );
+            webFirmwareCleanupPartial();
+            webFirmwareReleaseUploadLocks();
+            return;
+        }
+
+        if (
+            upload.totalSize != 0 &&
+            upload.totalSize !=
+                webFirmwareUploadBytes
+        ) {
+            webFirmwareFailUpload(
+                "Firmware upload size mismatch - upload may have been interrupted."
+            );
+            webFirmwareCleanupPartial();
+            webFirmwareReleaseUploadLocks();
+            return;
+        }
+
+        if (!webFirmwareMarkerFound) {
+            webFirmwareFailUpload(
+                "Firmware rejected: compatibility marker missing or wrong board."
+            );
+            webFirmwareCleanupPartial();
+            webFirmwareReleaseUploadLocks();
+            return;
+        }
+
+        const esp_partition_t *completedPartition =
+            webFirmwareUploadPartition;
+
+        esp_err_t endResult =
+            esp_ota_end(
+                webFirmwareOtaHandle
+            );
+
+        // esp_ota_end() consumes the OTA handle whether validation succeeds or
+        // fails. Do not call esp_ota_abort() on this handle afterwards.
+        webFirmwareOtaActive = false;
+        webFirmwareOtaHandle = 0;
+        webFirmwareUploadPartition = nullptr;
+
+        if (endResult != ESP_OK) {
+            webFirmwareFailUpload(
+                "Firmware rejected during final OTA image verification: " +
+                webFirmwareEspError(
+                    endResult
+                )
+            );
+            webFirmwareReleaseUploadLocks();
+            return;
+        }
+
+        webFirmwareReady = true;
+        webFirmwareReadyPartition =
+            completedPartition;
+        webFirmwareReadyBytes =
+            webFirmwareUploadBytes;
+        webFirmwareReadyFilename =
+            webFirmwareUploadFilename;
+        webFirmwareUploadSucceeded = true;
 
         webFirmwareReleaseUploadLocks();
         return;
@@ -11528,7 +12184,7 @@ static void handleFirmwareUploadData()
 static void handleFirmwareUploadFinished()
 {
     // Defensive cleanup: malformed/interrupted multipart requests must never
-    // leave an open staging file or one of our cooperative locks behind.
+    // leave an OTA handle or the recording-start gate behind.
     if (!webFirmwareUploadSucceeded)
         webFirmwareCleanupPartial();
 
@@ -11563,49 +12219,11 @@ static void sendFirmwareUpdatePage(
     bool blockedByRecording =
         recorderIsOpen();
 
-    bool blockedByStorage =
-        g_storageLocked;
+    bool readyExists =
+        webFirmwareReady;
 
-    bool canInspectStorage =
-        !blockedByRecording &&
-        !blockedByStorage;
-
-    bool readyExists = false;
-    bool readyValid = false;
-    size_t readySize = 0;
-    String readyError;
-    int existingBinCount = 0;
-    String existingBin;
-
-    if (canInspectStorage) {
-        String directoryError;
-
-        if (webFirmwareEnsureDirectory(
-                directoryError
-            )) {
-            readyExists =
-                STORAGE.exists(
-                    WEB_FW_UPLOAD_READY
-                );
-
-            if (readyExists) {
-                readyValid =
-                    firmwareValidateStagedImage(
-                        WEB_FW_UPLOAD_READY,
-                        readySize,
-                        readyError
-                    );
-            }
-
-            existingBinCount =
-                webFirmwareCountBinCandidates(
-                    existingBin
-                );
-        } else {
-            readyError =
-                directoryError;
-        }
-    }
+    bool readyValid =
+        webFirmwareReadyStateValid();
 
     String html =
         htmlHeader();
@@ -11645,8 +12263,8 @@ static void sendFirmwareUpdatePage(
         html +=
             "<div class='flash-notice'>"
             "<strong>Firmware erfolgreich hochgeladen und geprüft</strong>"
-            "<span class='muted'>Das Image liegt nur als Staging-Datei auf der SD-Karte. "
-            "Es wird erst nach ausdrücklicher Installationsbestätigung als .bin freigegeben.</span>"
+            "<span class='muted'>Die neue Firmware liegt sicher im internen Update-Speicher. "
+            "Die aktuell laufende Firmware wurde noch nicht umgeschaltet.</span>"
             "</div>";
 
     } else if (
@@ -11671,44 +12289,17 @@ static void sendFirmwareUpdatePage(
             "<strong>Aufnahme läuft</strong>"
             "<span class='muted'>Firmware-Upload und Installation sind bis zum sauberen Ende der laufenden Aufnahme gesperrt.</span>"
             "</div>";
-
-    } else if (blockedByStorage) {
-        html +=
-            "<div class='flash-notice error'>"
-            "<strong>SD-Karte momentan gesperrt</strong>"
-            "<span class='muted'>Eine andere Wartungsoperation verwendet den Storage-Lock. Bitte später erneut versuchen.</span>"
-            "</div>";
-    }
-
-    if (
-        canInspectStorage &&
-        existingBinCount > 0
-    ) {
-        html +=
-            "<div class='flash-notice error'>"
-            "<strong>Bereits vorhandener .bin-Kandidat</strong>"
-            "<span class='muted'>In <code>/firmware</code> liegt bereits " +
-            htmlEscape(
-                existingBinCount == 1
-                ? existingBin
-                : String("mehr als eine .bin-Datei")
-            ) +
-            ". Der bestehende SD-Updater verlangt genau einen Kandidaten; ein weiterer WiFi-Upload wird daher nicht zugelassen.</span>"
-            "</div>";
     }
 
     html +=
         "<div class='settings-section'>"
-        "<h3>1. Firmware hochladen</h3>"
-        "<p class='muted'>Bitte die kompilierte <code>.bin</code>-Datei auswählen. "
-        "Während des Uploads wird die laufende Firmware nicht verändert. Ein abgebrochener Upload bleibt als nicht bootfähige <code>.part</code>-Datei liegen und wird beim nächsten Upload bereinigt.</p>"
-        "<p><b>Kompatibilität:</b><br>"
-        "Die Firmware wird vor der Installation automatisch auf Kompatibilität mit diesem Gerät geprüft.</p>";
+        "<h3>1. Firmware auswählen</h3>"
+        "<p class='muted'>Wähle die kompilierte <code>.bin</code>-Datei. SensorForge prüft automatisch, "
+        "ob das Image vollständig ist, in den internen Update-Speicher passt und zu diesem Gerät gehört. "
+        "Die SD-Karte wird für ein WiFi-Update nicht benötigt.</p>";
 
     if (
         !blockedByRecording &&
-        !blockedByStorage &&
-        existingBinCount == 0 &&
         !readyExists
     ) {
         html +=
@@ -11739,24 +12330,19 @@ static void sendFirmwareUpdatePage(
                 "<p>✓ ESP32 Application Image<br>"
                 "✓ Größe: <b>" +
                 webFirmwareFormatBytes(
-                    readySize
+                    webFirmwareReadyBytes
                 ) +
                 "</b><br>"
-                "✓ Inaktive OTA-Partition: <b>" +
+                "✓ Interner Update-Speicher: <b>" +
                 webFirmwareFormatBytes(
-                    firmwareInactiveOtaCapacity()
+                    webFirmwareReadyPartition->size
                 ) +
                 "</b><br>"
                 "✓ Firmware ist mit diesem Gerät kompatibel</p>"
-                "<p class='muted'>Mit <b>JETZT INSTALLIEREN</b> wird die geprüfte Staging-Datei zu "
-                "<code>/firmware/wifi_update.bin</code> umbenannt. Danach startet SensorForge kontrolliert neu; "
-                "beim Boot übernimmt der bestehende SD-Auto-Updater die eigentliche OTA-Installation und prüft das Image nochmals.</p>";
+                "<p class='muted'>Mit <b>JETZT INSTALLIEREN</b> wird die bereits geprüfte Firmware "
+                "für den nächsten Neustart aktiviert. Bis dahin bleibt die aktuell laufende Firmware unverändert.</p>";
 
-            if (
-                !blockedByRecording &&
-                !blockedByStorage &&
-                existingBinCount == 0
-            ) {
+            if (!blockedByRecording) {
                 html +=
                     "<form method='POST' action='/firmware_install' "
                     "onsubmit=\"return confirm('Firmware wirklich installieren? Das Gerät startet danach automatisch neu.');\">"
@@ -11770,27 +12356,18 @@ static void sendFirmwareUpdatePage(
         } else {
             html +=
                 "<div class='flash-notice error'>"
-                "<strong>Staging-Datei ist nicht gültig</strong>"
-                "<span class='muted'>" +
-                htmlEscape(
-                    readyError.length()
-                    ? readyError
-                    : String("Validierung fehlgeschlagen")
-                ) +
-                "</span></div>";
+                "<strong>Bereitgestellte Firmware ist nicht mehr verfügbar</strong>"
+                "<span class='muted'>Bitte die Firmware erneut hochladen und prüfen.</span></div>";
         }
 
-        if (
-            !blockedByRecording &&
-            !blockedByStorage
-        ) {
+        if (!blockedByRecording) {
             html +=
                 "<form method='POST' action='/firmware_discard' "
                 "onsubmit=\"return confirm('Bereitgestellte Firmware verwerfen?');\">"
                 "<input type='hidden' name='token' value='" +
                 String(webBootSessionId) +
                 "'>"
-                "<button type='submit'>Staging-Datei verwerfen</button>"
+                "<button type='submit'>Bereitgestellte Firmware verwerfen</button>"
                 "</form>";
         }
 
@@ -11801,11 +12378,12 @@ static void sendFirmwareUpdatePage(
     html +=
         "<div class='settings-section'>"
         "<h3>Sicherheitsablauf</h3>"
-        "<p class='muted'>WiFi-Upload → SD-Staging → vollständige Validierung → manuelle Bestätigung → "
-        "Umbenennen zu <code>.bin</code> → kontrollierter Neustart → bestehender SD-Auto-Updater → "
-        "inaktive OTA-Partition → Verifikation → Neustart in die neue Firmware.</p>"
+        "<p class='muted'>WiFi-Upload → inaktive interne OTA-Partition → vollständige Image- und Geräteprüfung → "
+        "manuelle Bestätigung → neue Boot-Partition freigeben → kontrollierter Neustart.</p>"
+        "<p class='muted'>Bricht der Upload vorher ab, bleibt die bisherige Firmware als Boot-Firmware ausgewählt. "
+        "Auch eine fehlende oder defekte SD-Karte verhindert das WiFi-Update nicht.</p>"
         "<p><b>Wichtig:</b> Ein technisch gültiges, aber fehlerhaft programmiertes Image kann nach dem Update trotzdem den WiFi-Zugang verlieren. "
-        "Remote daher nur zuvor auf einem zweiten XIAO getestete Builds installieren.</p>"
+        "Remote daher nur Builds installieren, die vorher auf einem passenden zweiten Gerät getestet wurden.</p>"
         "</div>";
 
     html +=
@@ -11822,8 +12400,8 @@ static void sendFirmwareUpdatePage(
         html
     );
 
-    // The page has consumed the one-shot upload message. The persistent
-    // staged-file state is always rediscovered from SD on the next request.
+    // Clear only the one-shot upload result. A successfully staged image has
+    // separate RAM state and remains available until install/discard/reboot.
     if (
         notice == "upload_ok" ||
         notice == "upload_failed"
@@ -11864,43 +12442,12 @@ static void handleFirmwareDiscard()
         return;
     }
 
-    if (g_storageLocked) {
-        sendFirmwareUpdatePage(
-            409,
-            "SD/storage is currently locked by another operation."
-        );
-        return;
-    }
-
-    bool removed = true;
-
-    if (STORAGE.exists(WEB_FW_UPLOAD_READY)) {
-        removed =
-            STORAGE.remove(
-                WEB_FW_UPLOAD_READY
-            ) &&
-            removed;
-    }
-
-    if (STORAGE.exists(WEB_FW_UPLOAD_TEMP)) {
-        removed =
-            STORAGE.remove(
-                WEB_FW_UPLOAD_TEMP
-            ) &&
-            removed;
-    }
+    webFirmwareClearReadyState();
 
     server.sendHeader(
         "Location",
-        removed
-        ? "/firmware_update"
-        : "/firmware_update?notice=upload_failed"
+        "/firmware_update"
     );
-
-    if (!removed) {
-        webFirmwareUploadError =
-            "Could not remove the staged firmware file from SD.";
-    }
 
     server.send(
         303,
@@ -11929,15 +12476,8 @@ static void handleFirmwareInstall()
         return;
     }
 
-    if (g_storageLocked) {
-        sendFirmwareUpdatePage(
-            409,
-            "SD/storage is currently locked by another operation."
-        );
-        return;
-    }
-
-    if (!STORAGE.exists(WEB_FW_UPLOAD_READY)) {
+    if (!webFirmwareReadyStateValid()) {
+        webFirmwareClearReadyState();
         sendFirmwareUpdatePage(
             404,
             "No validated WiFi firmware image is staged."
@@ -11945,66 +12485,65 @@ static void handleFirmwareInstall()
         return;
     }
 
-    String firstCandidate;
-    int binCount =
-        webFirmwareCountBinCandidates(
-            firstCandidate
-        );
+    bool previousRecordingBlock =
+        g_recordingStartBlocked;
 
-    if (binCount > 0) {
-        sendFirmwareUpdatePage(
-            409,
-            "A .bin firmware candidate already exists in /firmware; installation would be ambiguous."
-        );
-        return;
-    }
-
-    size_t firmwareSize = 0;
-    String validationError;
-
-    if (!firmwareValidateStagedImage(
-            WEB_FW_UPLOAD_READY,
-            firmwareSize,
-            validationError
-        )) {
-        sendFirmwareUpdatePage(
-            400,
-            "Firmware rejected before installation: " +
-            validationError
-        );
-        return;
-    }
-
-    if (STORAGE.exists(WEB_FW_INSTALL_CANDIDATE)) {
-        sendFirmwareUpdatePage(
-            409,
-            "Install candidate already exists. Reboot or remove it before continuing."
-        );
-        return;
-    }
-
-    if (!STORAGE.rename(
-            WEB_FW_UPLOAD_READY,
-            WEB_FW_INSTALL_CANDIDATE
-        )) {
-        sendFirmwareUpdatePage(
-            500,
-            "Could not arm the validated image for the SD auto-updater."
-        );
-        return;
-    }
-
-    // From this point onward an explicit install was confirmed. Prevent any
-    // new recording start during the short hand-off to reboot. The boot-time
-    // SD updater performs the same full validation once again before flashing.
     g_recordingStartBlocked = true;
     webPlayerStop();
 
+    // The first boot of the newly selected WiFi image must not immediately be
+    // replaced by a stale .bin file that happens to be present on SD. The
+    // one-shot NVS flag is consumed at the next firmware boot before the SD
+    // auto-updater is considered.
+    if (!firmwareInfoArmDirectOtaBoot()) {
+        g_recordingStartBlocked =
+            previousRecordingBlock;
+
+        sendFirmwareUpdatePage(
+            500,
+            "Could not persist the safe first-boot guard for the firmware update."
+        );
+        return;
+    }
+
+    esp_err_t bootResult =
+        esp_ota_set_boot_partition(
+            webFirmwareReadyPartition
+        );
+
+    if (bootResult != ESP_OK) {
+        firmwareInfoCancelDirectOtaBoot();
+        g_recordingStartBlocked =
+            previousRecordingBlock;
+
+        sendFirmwareUpdatePage(
+            500,
+            "Could not activate the validated firmware image: " +
+            webFirmwareEspError(
+                bootResult
+            )
+        );
+        return;
+    }
+
+    if (!firmwareInfoMarkWifiUpdate(
+            webFirmwareReadyFilename
+        )) {
+        consoleWrite(
+            "FW",
+            "WiFi OTA selected, but installation metadata could not be persisted"
+        );
+    }
+
     logWrite(
-        "Firmware WiFi upload armed for SD auto-update | file=wifi_update.bin | bytes=" +
-        String((unsigned long)firmwareSize)
+        "Firmware WiFi OTA armed | file=" +
+        webFirmwareReadyFilename +
+        " | bytes=" +
+        String((unsigned long)webFirmwareReadyBytes)
     );
     logFlush();
+
+    webFirmwareClearReadyState();
 
     rebootScheduled = true;
     rebootAtMs =
@@ -12021,6 +12560,8 @@ static void handleFirmwareInstall()
         ""
     );
 }
+
+
 
 
 // -------------------------------------------------------------
@@ -12245,6 +12786,255 @@ static void handleRebootDo()
         "text/plain; charset=utf-8",
         ""
     );
+}
+
+
+// -------------------------------------------------------------
+// SHUTDOWN
+// -------------------------------------------------------------
+
+static String shutdownRecordingBlockedModalHtml()
+{
+    bool de =
+        cfg_web_language == "de";
+
+    return
+        "<div id='shutdownBlockedModal' class='modal-backdrop'>"
+        "<div class='modal-card' role='dialog' aria-modal='true' "
+        "aria-labelledby='shutdownBlockedTitle'>"
+        "<span class='status-pill danger'>" +
+        String(de ? "AUFNAHME AKTIV" : "RECORDING ACTIVE") +
+        "</span>"
+        "<h3 id='shutdownBlockedTitle'>" +
+        String(de ? "Herunterfahren momentan gesperrt" : "Shutdown currently blocked") +
+        "</h3><p>" +
+        String(
+            de
+            ? "Eine Aufnahme läuft gerade. Zum Schutz der Videodatei und der SD-Karte ist das Herunterfahren vorübergehend deaktiviert."
+            : "A recording is currently running. Shutdown is temporarily disabled to protect the video file and SD card."
+        ) +
+        "</p><p>" +
+        String(
+            de
+            ? "Dieses Fenster verschwindet automatisch, sobald die Aufnahme beendet ist."
+            : "This window closes automatically when the recording has finished."
+        ) +
+        "</p><div class='modal-actions'><a class='button' href='/'>" +
+        String(de ? "Zur Übersicht" : "Back to overview") +
+        "</a></div>"
+        "<div id='shutdownBlockedState' class='modal-state'>" +
+        String(de ? "Warte auf Aufnahmeende ..." : "Waiting for recording to finish ...") +
+        "</div></div></div>"
+        "<script>"
+        "(function(){"
+            "var modal=document.getElementById('shutdownBlockedModal');"
+            "var state=document.getElementById('shutdownBlockedState');"
+            "function poll(){"
+                "fetch('/ui_status?ts='+Date.now(),{cache:'no-store'})"
+                ".then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();})"
+                ".then(function(s){"
+                    "if(!s.recorder_open){"
+                        "if(state)state.textContent='" +
+                        String(de ? "Aufnahme beendet - Herunterfahren wieder verfügbar." : "Recording finished - shutdown available again.") +
+                        "';setTimeout(function(){if(modal)modal.hidden=true;},450);return;"
+                    "}setTimeout(poll,1000);"
+                "}).catch(function(){setTimeout(poll,1500);});"
+            "}setTimeout(poll,800);"
+        "})();"
+        "</script>";
+}
+
+
+static void sendShutdownPage(
+    int statusCode
+)
+{
+    bool de =
+        cfg_web_language == "de";
+
+    String html =
+        htmlHeader();
+
+    html +=
+        "<div class='page-title'><div><h2>" +
+        String(de ? "Herunterfahren" : "Shutdown") +
+        "</h2><p>" +
+        String(de ? "SensorForge in den Aus-Zustand versetzen" : "Put SensorForge into its off state") +
+        "</p></div></div>"
+        "<div class='settings-section'><h3>" +
+        String(de ? "System herunterfahren" : "Shut down system") +
+        "</h3><p class='muted'>" +
+        String(
+            de
+            ? "SensorForge beendet die Web-Sitzung, deaktiviert alle Wakequellen und geht in Deep Sleep. Radar, Magnetkontakt und der Snapshot-Timer können das Board danach nicht mehr aufwecken."
+            : "SensorForge ends the web session, disables all wake sources and enters deep sleep. Radar, magnet switch and the snapshot timer cannot wake the board afterwards."
+        ) +
+        "</p><p class='muted'><b>" +
+        String(de ? "Wieder einschalten:" : "Power on again:") +
+        "</b> " +
+        String(
+            de
+            ? "Stromversorgung trennen und wieder anlegen oder den Hardware-RESET betätigen."
+            : "Remove and reapply power, or press the hardware RESET button."
+        ) +
+        "</p><p class='muted'>" +
+        String(
+            de
+            ? "Hinweis: Das ist der tiefste Software-Aus-Zustand des ESP32-S3. Direkt versorgte Peripherie kann weiterhin einen kleinen Strom aufnehmen."
+            : "Note: this is the deepest software-off state of the ESP32-S3. Directly powered peripherals may still consume a small amount of current."
+        ) +
+        "</p>"
+        "<form method='POST' action='/shutdown_do' onsubmit=\"return confirm('" +
+        String(
+            de
+            ? "SensorForge wirklich herunterfahren? Danach ist das Webinterface nicht mehr erreichbar, bis die Stromversorgung neu angelegt oder RESET gedrückt wurde."
+            : "Really shut down SensorForge? The web interface will remain unavailable until power is reapplied or RESET is pressed."
+        ) +
+        "');\">"
+        "<button class='danger' type='submit'>" +
+        String(de ? "Jetzt herunterfahren" : "Shut down now") +
+        "</button><a class='button' href='/'>" +
+        String(de ? "Abbrechen" : "Cancel") +
+        "</a></form></div>";
+
+    if (recorderIsOpen())
+        html += shutdownRecordingBlockedModalHtml();
+
+    html +=
+        htmlFooter();
+
+    server.sendHeader(
+        "Cache-Control",
+        "no-store"
+    );
+
+    server.send(
+        statusCode,
+        "text/html; charset=utf-8",
+        html
+    );
+}
+
+
+static void handleShutdown()
+{
+    sendShutdownPage(
+        200
+    );
+}
+
+
+static void handleShuttingDown()
+{
+    bool de =
+        cfg_web_language == "de";
+
+    String html =
+        htmlHeader();
+
+    html +=
+        "<div class='operation-card'>"
+        "<span class='status-pill danger'>SHUTDOWN</span>"
+        "<h2 style='margin-top:16px'>" +
+        String(de ? "SensorForge wird heruntergefahren" : "SensorForge is shutting down") +
+        "</h2><p class='muted'>" +
+        String(
+            de
+            ? "Die Verbindung wird gleich beendet. Danach bleibt das Board ausgeschaltet, bis die Stromversorgung neu angelegt oder RESET gedrückt wird."
+            : "The connection will close shortly. The board then remains off until power is reapplied or RESET is pressed."
+        ) +
+        "</p><div class='countdown'>OFF</div></div>";
+
+    html +=
+        htmlFooter();
+
+    server.sendHeader(
+        "Cache-Control",
+        "no-store"
+    );
+
+    server.send(
+        200,
+        "text/html; charset=utf-8",
+        html
+    );
+}
+
+
+static void handleShutdownDo()
+{
+    // Keep a server-side guard in case a recording starts between opening the
+    // page and pressing the shutdown button.
+    if (recorderIsOpen()) {
+        sendShutdownPage(
+            409
+        );
+        return;
+    }
+
+    // Prevent a new recording from starting during the short HTTP grace period
+    // before the actual power-down sequence.
+    g_recordingStartBlocked = true;
+
+    shutdownScheduled = true;
+    shutdownAtMs =
+        millis() + 2000UL;
+
+    server.sendHeader(
+        "Location",
+        "/shutting_down"
+    );
+
+    server.send(
+        303,
+        "text/plain; charset=utf-8",
+        ""
+    );
+}
+
+
+static void performManualShutdown()
+{
+    shutdownScheduled = false;
+    rebootScheduled = false;
+    g_recordingStartBlocked = true;
+
+    if (recorderIsOpen())
+        stopRecording();
+
+    consoleWrite(
+        "POWER",
+        "Manual shutdown | no wake sources"
+    );
+    logWrite(
+        "Manual shutdown | deep sleep without wake sources"
+    );
+    logFlush();
+
+    // webConfigStop() also restores a temporary LD2410S all-gate calibration
+    // range before the UART/WebConfig session disappears.
+    webConfigStop();
+
+    stopCameraPreview();
+    esp_camera_deinit();
+
+    WiFi.softAPdisconnect(true);
+    WiFi.disconnect(
+        true,
+        false
+    );
+    WiFi.mode(WIFI_OFF);
+
+    delay(100);
+
+    // Deliberately remove every normal wake source. Unlike ordinary light/deep
+    // sleep, no presence, magnet or timer wake is armed for manual shutdown.
+    esp_sleep_disable_wakeup_source(
+        ESP_SLEEP_WAKEUP_ALL
+    );
+
+    Serial.flush();
+    esp_deep_sleep_start();
 }
 
 
@@ -13098,6 +13888,7 @@ struct RecordingEntry {
     String fullPath;
     uint64_t size;
     bool isMkv;
+    bool isJpeg;
     bool hasSrt;
 };
 
@@ -13349,8 +14140,12 @@ static void handleFilesDay()
                 bool isMkv =
                     lowerName.endsWith(".mkv");
 
+                bool isJpeg =
+                    lowerName.endsWith(".jpg") ||
+                    lowerName.endsWith(".jpeg");
 
-                if (isAvi || isMkv) {
+
+                if (isAvi || isMkv || isJpeg) {
 
                     RecordingEntry entry;
 
@@ -13367,6 +14162,9 @@ static void handleFilesDay()
 
                     entry.isMkv =
                         isMkv;
+
+                    entry.isJpeg =
+                        isJpeg;
 
                     entry.hasSrt =
                         false;
@@ -13421,7 +14219,7 @@ static void handleFilesDay()
             entry.size = logicalSize;
         }
 
-        if (!entry.isMkv) {
+        if (!entry.isMkv && !entry.isJpeg) {
             entry.hasSrt =
                 hasMatchingSrt(
                     entry.name,
@@ -13461,12 +14259,24 @@ static void handleFilesDay()
 
         server.sendContent(
             "<div class='recording'>"
-            "Keine Aufnahmen an diesem Tag."
+            "Keine Aufnahmen oder Snapshots an diesem Tag."
             "</div>"
         );
 
         return;
     }
+
+
+    server.sendContent(
+        "<div class='dayMediaFilter'>"
+        "<button type='button' class='active' "
+        "onclick=\"filterDayMedia(this,'all')\">Show all</button>"
+        "<button type='button' "
+        "onclick=\"filterDayMedia(this,'videos')\">Show videos</button>"
+        "<button type='button' "
+        "onclick=\"filterDayMedia(this,'images')\">Show images/snapshots</button>"
+        "</div>"
+    );
 
 
     for (
@@ -13479,7 +14289,9 @@ static void handleFilesDay()
 
 
         row +=
-            "<div class='recording'>";
+            entry.isJpeg
+            ? "<div class='recording' data-media='image'>"
+            : "<div class='recording' data-media='video'>";
 
 
         row +=
@@ -13500,9 +14312,13 @@ static void handleFilesDay()
             "<span class='recmeta'>";
 
         row +=
-            entry.isMkv
-            ? "MKV"
-            : "AVI";
+            entry.isJpeg
+            ? "JPG"
+            : (
+                entry.isMkv
+                ? "MKV"
+                : "AVI"
+            );
 
         row +=
             " &nbsp; ";
@@ -13516,9 +14332,12 @@ static void handleFilesDay()
             "</span>";
 
 
-        // AVI and MKV use the same WebPlayer UI.
+        // Images and videos share the same viewer page so Previous/Next can
+        // navigate consistently according to the active day filter. The
+        // client-side openDayMedia() helper appends mode=all|videos|images
+        // immediately before navigation.
         row +=
-            "<a href='/play?path=";
+            "<a class='mediaOpen' onclick='return openDayMedia(this)' href='/play?path=";
 
         row +=
             urlEncode(
@@ -13526,7 +14345,15 @@ static void handleFilesDay()
             );
 
         row +=
-            "'><button>Play</button></a>";
+            "&mode=all'><button>";
+
+        row +=
+            entry.isJpeg
+            ? "Show"
+            : "Play";
+
+        row +=
+            "</button></a>";
 
 
         row +=
@@ -13543,6 +14370,7 @@ static void handleFilesDay()
 
         if (
             !entry.isMkv &&
+            !entry.isJpeg &&
             entry.hasSrt
         ) {
 
@@ -13612,7 +14440,9 @@ static bool isRecordingFileForDayDownload(
     return
         lower.endsWith(".avi") ||
         lower.endsWith(".mkv") ||
-        lower.endsWith(".srt");
+        lower.endsWith(".srt") ||
+        lower.endsWith(".jpg") ||
+        lower.endsWith(".jpeg");
 }
 
 
@@ -14452,9 +15282,13 @@ static bool isRecordingFileForDayDelete(
         lower.endsWith(".avi") ||
         lower.endsWith(".mkv") ||
         lower.endsWith(".srt") ||
+        lower.endsWith(".jpg") ||
+        lower.endsWith(".jpeg") ||
         lower.endsWith(".avi.part") ||
         lower.endsWith(".mkv.part") ||
-        lower.endsWith(".srt.part");
+        lower.endsWith(".srt.part") ||
+        lower.endsWith(".jpg.part") ||
+        lower.endsWith(".jpeg.part");
 }
 
 
@@ -15022,6 +15856,19 @@ static void handleFiles()
         ".deleteDayBtn{"
             "background:#b00020;color:white;border:1px solid #b00020;"
         "}"
+        ".dayMediaFilter{"
+            "display:flex;gap:6px;align-items:center;flex-wrap:wrap;"
+            "margin:2px 0 10px 0;padding-bottom:8px;"
+            "border-bottom:1px solid #d6d6d6;"
+        "}"
+        ".dayMediaFilter button{"
+            "width:auto;margin:0;padding:5px 9px;"
+            "border:1px solid #98a2b3;background:#f8fafc;color:#344054;"
+            "border-radius:4px;font-size:12px;cursor:pointer;"
+        "}"
+        ".dayMediaFilter button.active{"
+            "background:#344054;color:#fff;border-color:#344054;"
+        "}"
         ".daycontent{background:rgba(255,255,255,0.55);}"
         "@media(max-width:700px){"
             ".day summary{"
@@ -15106,7 +15953,7 @@ static void handleFiles()
             "if(/^\\d{8}$/.test(day)){"
                 "label=day.substring(6,8)+'.'+day.substring(4,6)+'.'+day.substring(0,4);"
             "}"
-            "if(!confirm('Alle Videos vom '+label+' wirklich löschen?\\n\\nDiese Aktion kann nicht rückgängig gemacht werden.'))return;"
+            "if(!confirm('Alle Videos und Bilder vom '+label+' wirklich löschen?\\n\\nDiese Aktion kann nicht rückgängig gemacht werden.'))return;"
             "ev.target.disabled=true;"
             "ev.target.textContent='Lösche...';"
             "fetch('/delete_day',{"
@@ -15137,12 +15984,39 @@ static void handleFiles()
             "});"
         "}"
 
+        "function filterDayMedia(button,mode){"
+            "const d=button.closest('details.day');"
+            "if(!d)return;"
+            "const content=d.querySelector('.daycontent');"
+            "if(!content)return;"
+            "if(mode!=='videos'&&mode!=='images')mode='all';"
+            "content.dataset.mediaMode=mode;"
+            "content.querySelectorAll('.recording[data-media]').forEach(function(row){"
+                "row.hidden=(mode==='videos'&&row.dataset.media!=='video')||(mode==='images'&&row.dataset.media!=='image');"
+            "});"
+            "content.querySelectorAll('.dayMediaFilter button').forEach(function(b){b.classList.remove('active');});"
+            "button.classList.add('active');"
+        "}"
+
+        "function openDayMedia(link){"
+            "if(!link)return false;"
+            "const content=link.closest('.daycontent');"
+            "let mode=content&&content.dataset.mediaMode?content.dataset.mediaMode:'all';"
+            "if(mode!=='videos'&&mode!=='images')mode='all';"
+            "try{"
+                "const u=new URL(link.getAttribute('href'),location.origin);"
+                "u.searchParams.set('mode',mode);"
+                "location.href=u.pathname+u.search;"
+            "}catch(e){location.href=link.href;}"
+            "return false;"
+        "}"
+
         "function updateDayCount(d){"
             "const c=d.querySelector('.daycontent');"
-            "const n=c.querySelectorAll('.recording').length;"
+            "const n=c.querySelectorAll('.recording[data-media]').length;"
             "const count=d.querySelector('.count');"
             "if(count){"
-                "count.textContent=n===1?' (1 Video)':' ('+n+' Videos)';"
+                "count.textContent=n===1?' (1 Datei)':' ('+n+' Dateien)';"
             "}"
         "}"
 
@@ -15153,6 +16027,7 @@ static void handleFiles()
             "if(!cached)return false;"
             "const c=d.querySelector('.daycontent');"
             "c.innerHTML=cached;"
+            "c.dataset.mediaMode='all';"
             "d.dataset.loaded='1';"
             "updateDayCount(d);"
             "return true;"
@@ -15177,6 +16052,7 @@ static void handleFiles()
             "})"
             ".then(function(t){"
                 "c.innerHTML=t;"
+                "c.dataset.mediaMode='all';"
                 "try{sessionStorage.setItem(CACHE_PREFIX+d.dataset.day,t);}catch(e){}"
                 "updateDayCount(d);"
             "})"
@@ -15274,14 +16150,16 @@ static void handleFile()
     bool allowedFile =
         lowerPath.endsWith(".avi") ||
         lowerPath.endsWith(".mkv") ||
-        lowerPath.endsWith(".srt");
+        lowerPath.endsWith(".srt") ||
+        lowerPath.endsWith(".jpg") ||
+        lowerPath.endsWith(".jpeg");
 
     if (!allowedFile) {
 
         server.send(
             403,
             "text/plain; charset=utf-8",
-            "Only AVI, MKV and SRT files are allowed"
+            "Only AVI, MKV, SRT and JPEG files are allowed"
         );
 
         return;
@@ -15331,9 +16209,18 @@ static void handleFile()
     // Download Header
     // ---------------------------------------------------------
 
+    bool inlineDisplay =
+        (
+            lowerPath.endsWith(".jpg") ||
+            lowerPath.endsWith(".jpeg")
+        ) &&
+        server.hasArg("inline") &&
+        server.arg("inline") == "1";
+
     server.sendHeader(
         "Content-Disposition",
-        "attachment; filename=\"" +
+        String(inlineDisplay ? "inline" : "attachment") +
+        "; filename=\"" +
         downloadName +
         "\""
     );
@@ -15359,7 +16246,12 @@ static void handleFile()
         : (
             lowerPath.endsWith(".srt")
             ? "application/x-subrip"
-            : "video/x-msvideo"
+            : (
+                lowerPath.endsWith(".jpg") ||
+                lowerPath.endsWith(".jpeg")
+                ? "image/jpeg"
+                : "video/x-msvideo"
+            )
         );
 
     uint64_t logicalSize =
@@ -16351,6 +17243,9 @@ void webConfigStart()
     server.on("/reboot", HTTP_GET, handleReboot);
     server.on("/rebooting", HTTP_GET, handleRebooting);
     server.on("/reboot_do", HTTP_POST, handleRebootDo);
+    server.on("/shutdown", HTTP_GET, handleShutdown);
+    server.on("/shutting_down", HTTP_GET, handleShuttingDown);
+    server.on("/shutdown_do", HTTP_POST, handleShutdownDo);
 
     server.on("/log", HTTP_GET, handleLog);
     server.on("/log_raw", HTTP_GET, handleLogRaw);
@@ -16403,6 +17298,38 @@ void webConfigStop()
     if (!webActive)
         return;
 
+    // Never leave the LD2410S in the temporary all-gate calibration range when
+    // WebConfig/WiFi is closed. This is especially important for an inactivity
+    // timeout after the operator has left a calibration page open.
+    if (
+        radarCalibrationActiveMode() !=
+            RADAR_CALIBRATION_NONE
+    ) {
+        String calibrationError;
+
+        if (!radarCalibrationStop(
+                calibrationError
+            )) {
+            Serial.println(
+                "LD2410S calibration cleanup before WebConfig stop failed | " +
+                calibrationError
+            );
+
+            logWrite(
+                "Radar calibration cleanup before WebConfig stop failed | " +
+                calibrationError
+            );
+        } else {
+            Serial.println(
+                "LD2410S calibration stopped before WebConfig shutdown"
+            );
+
+            logWrite(
+                "Radar calibration stopped before WebConfig shutdown"
+            );
+        }
+    }
+
     // A temporary maintenance pause is never allowed to survive the WebConfig
     // session that created it.
     if (recordingAutomationPaused) {
@@ -16435,7 +17362,9 @@ bool webConfigInactiveFor(
     if (
         !webActive ||
         timeoutSec == 0 ||
-        sdSecureJobActive
+        sdSecureJobActive ||
+        radarWebMaintenanceDepth > 0 ||
+        radarWebMaintenanceGraceActive()
     ) {
         return false;
     }
@@ -16445,6 +17374,19 @@ bool webConfigInactiveFor(
             millis() -
             webLastActivityMs
         );
+
+    // During an intentional radar calibration the operator may move away from
+    // the browser for several minutes. Keep WebConfig available for a bounded
+    // maintenance window even if browser timers are throttled. A truly
+    // abandoned calibration still falls back to the normal WiFi timeout after
+    // ten minutes without any authenticated web activity.
+    if (
+        radarCalibrationActiveMode() !=
+            RADAR_CALIBRATION_NONE &&
+        elapsedMs < RADAR_CALIBRATION_MAX_IDLE_HOLD_MS
+    ) {
+        return false;
+    }
 
     uint64_t timeoutMs =
         (uint64_t)timeoutSec *
@@ -16462,6 +17404,17 @@ bool webConfigInactiveFor(
 
 void webConfigLoop()
 {
+    if (
+        shutdownScheduled &&
+        (int32_t)(
+            millis() -
+            shutdownAtMs
+        ) >= 0
+    ) {
+        performManualShutdown();
+        return;
+    }
+
     if (
         rebootScheduled &&
         (int32_t)(

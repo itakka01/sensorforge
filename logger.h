@@ -26,5 +26,15 @@ String firmwareInstallTimestamp();
 String firmwareInstallSource();
 bool firmwareInstallTimePending();
 bool firmwareInfoMarkSdUpdate(const String &sourceFilename);
+bool firmwareInfoMarkWifiUpdate(const String &sourceFilename);
+
+// Direct WiFi OTA first-boot guard. A successful direct OTA update arms this
+// one-shot NVS flag before switching the boot partition. The next firmware boot
+// consumes it before the SD auto-updater runs, preventing a stale SD .bin from
+// immediately replacing the just-installed WiFi image.
+bool firmwareInfoArmDirectOtaBoot();
+void firmwareInfoCancelDirectOtaBoot();
+bool firmwareInfoConsumeSkipSdUpdateOnce();
+
 bool firmwareInfoFinalizePendingInstallTime();
 void firmwareInfoLogStatus();

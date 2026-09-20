@@ -43,6 +43,7 @@ int cfg_led_enabled = 1;
 String cfg_recording_format = "avi";
 int cfg_timestamp_enabled   = 1;
 int cfg_recording_encryption = 0;
+int cfg_periodic_snapshot_minutes = 0;
 int cfg_recording_segment_seconds = 30;
 int cfg_recording_segment_max_mb  = 20;
 int cfg_recording_event_max_seconds = 60;
@@ -367,6 +368,7 @@ struct ConfigValues {
     String recordingFormat;
     int timestampEnabled;
     int recordingEncryption;
+    int periodicSnapshotMinutes;
     int recordingSegmentSeconds;
     int recordingSegmentMaxMb;
     int recordingEventMaxSeconds;
@@ -438,6 +440,7 @@ struct ConfigSeen {
     bool recordingFormat;
     bool timestampEnabled;
     bool recordingEncryption;
+    bool periodicSnapshotMinutes;
     bool recordingSegmentSeconds;
     bool recordingSegmentMaxMb;
     bool recordingEventMaxSeconds;
@@ -550,6 +553,9 @@ static ConfigValues makeDefaultValues()
         1;
 
     values.recordingEncryption =
+        0;
+
+    values.periodicSnapshotMinutes =
         0;
 
     values.recordingSegmentSeconds =
@@ -1373,6 +1379,16 @@ static bool validateValues(
 
         error =
             "recording_encryption must be 0 or 1";
+
+        return false;
+    }
+
+    if (
+        values.periodicSnapshotMinutes < 0 ||
+        values.periodicSnapshotMinutes > 1440
+    ) {
+        error =
+            "periodic_snapshot_minutes out of range (0..1440)";
 
         return false;
     }
@@ -2261,6 +2277,30 @@ static bool parseConfigText(
                 }
 
                 values.recordingEncryption =
+                    (int)numericValue;
+
+            } else if (
+                key == "periodic_snapshot_minutes"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.periodicSnapshotMinutes,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid periodic_snapshot_minutes";
+
+                    return false;
+                }
+
+                values.periodicSnapshotMinutes =
                     (int)numericValue;
 
             } else if (
@@ -3177,6 +3217,9 @@ static void applyValues(
 
     cfg_recording_encryption =
         values.recordingEncryption;
+
+    cfg_periodic_snapshot_minutes =
+        values.periodicSnapshotMinutes;
 
     cfg_recording_segment_seconds =
         values.recordingSegmentSeconds;
@@ -4208,6 +4251,11 @@ config_loaded:
     Serial.println(
         "Config Recording encryption: enabled=" +
         String(cfg_recording_encryption)
+    );
+
+    Serial.println(
+        "Config Periodic snapshot: minutes=" +
+        String(cfg_periodic_snapshot_minutes)
     );
 
     {

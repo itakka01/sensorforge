@@ -28,6 +28,7 @@ static const UiTextEntry UI_TEXTS[] = {
     {"Firmware Update", "Firmware update"}, // UI_NAV_FIRMWARE_UPDATE
     {"Transportsicherung", "Transport protection"}, // UI_NAV_TRANSPORT
     {"Neustart", "Reboot"}, // UI_NAV_REBOOT
+    {"Herunterfahren", "Shutdown"}, // UI_NAV_SHUTDOWN
     {"Konfiguration", "Configuration"}, // UI_NAV_CONFIGURATION
     {"AUFNAHME: AN", "RECORDING: ON"}, // UI_RECORDING_SWITCH_ON
     {"AUFNAHME: AUS", "RECORDING: OFF"}, // UI_RECORDING_SWITCH_OFF
@@ -296,6 +297,11 @@ static const UiTextEntry UI_TEXTS[] = {
     {"Größte zusammenhängende Änderung", "Largest connected change"}, // UI_IMAGE_MOTION_RESULT_AREA
     {"Eingestellte Mindestgröße", "Configured minimum size"}, // UI_IMAGE_MOTION_RESULT_LIMIT
     {"Der Test verwendet die zuletzt gespeicherten Werte.", "The test uses the most recently saved values."}, // UI_IMAGE_MOTION_TEST_USES_SAVED
+    {"Aktueller Sensorstatus", "Current sensor status"}, // UI_MOTION_CURRENT_SENSOR_STATUS
+    {"Radar-Auswertung", "Radar evaluation"}, // UI_MOTION_RADAR_EVALUATION
+    {"Keine Bewegung", "No motion"}, // UI_MOTION_RADAR_EVALUATION_NONE
+    {"Bewegung erkannt", "Motion detected"}, // UI_MOTION_RADAR_EVALUATION_ACTIVE
+    {"Letzter Radar-Trigger", "Last radar trigger"}, // UI_MOTION_LAST_RADAR_TRIGGER
 };
 
 static_assert(

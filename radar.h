@@ -129,6 +129,16 @@ float radarGateEnergyDb(
     uint8_t gate
 );
 
+// Age of the most recent valid standard-report sample in which this gate
+// reached or exceeded its configured trigger threshold. This is tracked in
+// radarLoop() for all 16 gates, independently from WebConfig polling and from
+// the operational min/max gate range. Returns false if the gate has not crossed
+// its trigger threshold since boot / the last trigger-threshold change.
+bool radarGateLastTriggerAgeMs(
+    uint8_t gate,
+    uint32_t &ageMs
+);
+
 
 // =============================================================
 // RADAR CALIBRATION / DIAGNOSTIC STATISTICS
@@ -140,7 +150,10 @@ float radarGateEnergyDb(
 //
 // Starting a mode clears only that mode and begins a fresh measurement.
 // The other mode is retained so WebConfig can compare both distributions.
-// No values are written to the LD2410S, SD card, LittleFS or NVS here.
+// During calibration the sensor range is temporarily widened to all 16 gates
+// so even gates excluded from normal alarm detection receive real measurements.
+// The normal min/max range is restored when calibration stops; a small NVS
+// recovery marker protects that restoration across an unexpected reset.
 
 enum RadarCalibrationMode : uint8_t {
     RADAR_CALIBRATION_NONE = 0,
@@ -154,6 +167,7 @@ struct RadarCalibrationGateStats {
     uint32_t discardedSamples;
     float minimumDb;
     float meanDb;
+    float p10Db;
     float p50Db;
     float p95Db;
     float p99Db;
@@ -167,8 +181,17 @@ bool radarCalibrationStart(
     RadarCalibrationMode mode
 );
 
+bool radarCalibrationStart(
+    RadarCalibrationMode mode,
+    String &error
+);
+
 // Stop the currently active measurement while retaining its statistics.
 void radarCalibrationStop();
+
+bool radarCalibrationStop(
+    String &error
+);
 
 // Clear one retained measurement. If it is currently active, it is stopped.
 void radarCalibrationReset(
@@ -180,7 +203,33 @@ void radarCalibrationResetAll();
 
 RadarCalibrationMode radarCalibrationActiveMode();
 
-// Elapsed wall-clock time for the selected retained measurement.
+// Start delay and automatic-completion state used by the simplified WebConfig
+// workflow. The countdown runs inside the ESP, independent of browser timers.
+uint32_t radarCalibrationCountdownRemainingMs(
+    RadarCalibrationMode mode
+);
+
+bool radarCalibrationMeasurementStarted(
+    RadarCalibrationMode mode
+);
+
+bool radarCalibrationAutoCompleted(
+    RadarCalibrationMode mode
+);
+
+bool radarCalibrationQualityLimited(
+    RadarCalibrationMode mode
+);
+
+bool radarCalibrationAborted(
+    RadarCalibrationMode mode
+);
+
+uint32_t radarCalibrationTargetValidSamples();
+uint32_t radarCalibrationMaxReports();
+
+// Elapsed wall-clock time for the selected retained measurement. The 10-second
+// pre-measurement countdown is intentionally not included.
 uint32_t radarCalibrationElapsedMs(
     RadarCalibrationMode mode
 );
@@ -198,7 +247,8 @@ bool radarCalibrationHasData(
 // Read derived statistics for one gate. Raw energy == 0 is treated as an
 // invalid/missing measurement for that gate and is counted as discarded.
 // Percentiles are calculated from a compact 0.5-dB histogram; min/mean/peak
-// retain only actual valid measured values.
+// retain only actual valid measured values. P10 is also exposed so a useful
+// provisional trigger can be estimated when only a motion phase is available.
 bool radarCalibrationGetGateStats(
     RadarCalibrationMode mode,
     uint8_t gate,

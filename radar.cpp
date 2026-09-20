@@ -2,6 +2,7 @@
 #include "board_config.h"
 
 #include <HardwareSerial.h>
+#include <Preferences.h>
 #include <math.h>
 
 
@@ -136,8 +137,8 @@ static float latestGateEnergyDb[16] = {
 //
 // A 0.5-dB histogram gives robust percentiles without storing thousands of
 // individual samples. Two complete 16-gate sessions use only about 12.5 KiB
-// for histogram counters. The intended five-minute measurements are far below
-// the 60,000-sample cap; the cap also prevents uint16 histogram overflow.
+// for histogram counters. Automatic calibration collects at most 150 reports,
+// so uint16 histogram bins have ample headroom.
 
 static const uint16_t RADAR_CALIBRATION_BIN_COUNT =
     194U; // 0.0 .. 96.5 dB in 0.5-dB steps
@@ -145,8 +146,25 @@ static const uint16_t RADAR_CALIBRATION_BIN_COUNT =
 static const float RADAR_CALIBRATION_BIN_STEP_DB =
     0.5f;
 
-static const uint32_t RADAR_CALIBRATION_MAX_SAMPLES =
-    60000UL;
+static const uint32_t RADAR_CALIBRATION_COUNTDOWN_MS =
+    10000UL;
+
+static const uint32_t RADAR_CALIBRATION_TARGET_VALID_SAMPLES =
+    100UL;
+
+// A gate with this many discarded/invalid values is considered unreliable.
+// It no longer blocks the other gates and WebConfig derives its recommendation
+// from the nearest usable gate.
+static const uint32_t RADAR_CALIBRATION_MAX_DISCARDED_SAMPLES =
+    100UL;
+
+// A measurement ends automatically no later than this many complete radar
+// reports. Gates that still have fewer than TARGET_VALID_SAMPLES are treated
+// as unreliable by WebConfig and their recommendation is derived from the
+// nearest usable gate. This prevents one broken/noisy gate from keeping the
+// operator in calibration indefinitely.
+static const uint32_t RADAR_CALIBRATION_MAX_REPORTS =
+    150UL;
 
 
 struct RadarCalibrationAccumulator {
@@ -162,8 +180,13 @@ struct RadarCalibrationAccumulator {
 struct RadarCalibrationSessionState {
     RadarCalibrationAccumulator gate[16];
     uint32_t reportsReceived;
+    uint32_t countdownUntilMs;
     uint32_t startedMs;
     uint32_t elapsedMs;
+    bool measurementStarted;
+    bool autoCompleted;
+    bool qualityLimited;
+    bool aborted;
 };
 
 
@@ -172,6 +195,23 @@ static RadarCalibrationSessionState radarCalibrationMotion;
 
 static RadarCalibrationMode radarCalibrationActive =
     RADAR_CALIBRATION_NONE;
+
+// Calibration temporarily opens the sensor to all 16 gates so even gates that
+// are excluded from normal alarm detection receive real measurements. The
+// ESP-side motion detector continues to use motionSettings (the normal range).
+// A small NVS recovery marker protects the original range across an unexpected
+// reset while calibration is active.
+static const char RADAR_CAL_RANGE_PREFS_NAMESPACE[] = "sfradcal";
+static const char RADAR_CAL_RANGE_ACTIVE_KEY[] = "active";
+static const char RADAR_CAL_RANGE_MIN_KEY[] = "min";
+static const char RADAR_CAL_RANGE_MAX_KEY[] = "max";
+
+static bool radarCalibrationRangeOverrideActive = false;
+static bool radarCalibrationRangeOverrideChanged = false;
+static bool radarCalibrationRangeRestorePending = false;
+static uint32_t radarCalibrationOriginalMinGate = 0;
+static uint32_t radarCalibrationOriginalMaxGate = 0;
+static uint32_t radarCalibrationRestoreRetryAfterMs = 0;
 
 
 static RadarCalibrationSessionState *radarCalibrationSession(
@@ -201,7 +241,10 @@ static void radarCalibrationClearSession(
 
 
 static void radarCalibrationFinishActive(
-    uint32_t now
+    uint32_t now,
+    bool autoCompleted = false,
+    bool qualityLimited = false,
+    bool aborted = false
 )
 {
     RadarCalibrationSessionState *session =
@@ -210,18 +253,30 @@ static void radarCalibrationFinishActive(
         );
 
     if (session) {
-        session->elapsedMs +=
-            (uint32_t)(
-                now -
-                session->startedMs
-            );
+        if (
+            session->measurementStarted &&
+            session->startedMs != 0
+        ) {
+            session->elapsedMs +=
+                (uint32_t)(
+                    now -
+                    session->startedMs
+                );
+        }
 
-        session->startedMs =
-            0;
+        session->startedMs = 0;
+        session->countdownUntilMs = 0;
+        session->autoCompleted = autoCompleted;
+        session->qualityLimited = qualityLimited;
+        session->aborted = aborted;
     }
 
     radarCalibrationActive =
         RADAR_CALIBRATION_NONE;
+
+    if (radarCalibrationRangeOverrideActive) {
+        radarCalibrationRangeRestorePending = true;
+    }
 }
 
 
@@ -255,6 +310,41 @@ static uint16_t radarCalibrationBinForDb(
 }
 
 
+static bool radarCalibrationAllGatesResolved(
+    const RadarCalibrationSessionState &session,
+    bool &hasUnreliableGate
+)
+{
+    hasUnreliableGate = false;
+
+    for (uint8_t gate = 0; gate < 16; ++gate) {
+        const RadarCalibrationAccumulator &accumulator =
+            session.gate[gate];
+
+        if (
+            accumulator.samples >=
+                RADAR_CALIBRATION_TARGET_VALID_SAMPLES ||
+            accumulator.discardedSamples >=
+                RADAR_CALIBRATION_MAX_DISCARDED_SAMPLES
+        ) {
+            continue;
+        }
+
+        if (
+            accumulator.discardedSamples >=
+            RADAR_CALIBRATION_MAX_DISCARDED_SAMPLES
+        ) {
+            hasUnreliableGate = true;
+            continue;
+        }
+
+        return false;
+    }
+
+    return true;
+}
+
+
 static void radarCalibrationAccumulate(
     const uint32_t rawGateEnergy[16]
 )
@@ -267,18 +357,25 @@ static void radarCalibrationAccumulate(
     if (!session)
         return;
 
-    // Count complete reports separately from per-gate valid samples. A single
-    // gate may report raw energy 0 while the other 15 gates remain valid.
-    if (
-        session->reportsReceived >=
-        RADAR_CALIBRATION_MAX_SAMPLES
-    ) {
-        radarCalibrationFinishActive(
-            millis()
-        );
-        return;
+    uint32_t now = millis();
+
+    // The countdown is owned by the ESP rather than JavaScript so browser
+    // timer throttling cannot start a calibration too early or too late.
+    if (!session->measurementStarted) {
+        if (
+            session->countdownUntilMs != 0 &&
+            (int32_t)(now - session->countdownUntilMs) < 0
+        ) {
+            return;
+        }
+
+        session->measurementStarted = true;
+        session->countdownUntilMs = 0;
+        session->startedMs = now;
     }
 
+    // Count complete reports separately from per-gate valid samples. A single
+    // gate may report raw energy 0 while the other 15 gates remain valid.
     session->reportsReceived++;
 
     for (
@@ -288,6 +385,17 @@ static void radarCalibrationAccumulate(
     ) {
         RadarCalibrationAccumulator &accumulator =
             session->gate[gate];
+
+        // Once a gate has its requested 100 valid values its statistics are
+        // frozen. This keeps every accepted gate based on the same sample
+        // target even while a faulty neighboring gate uses the remaining
+        // report budget.
+        if (
+            accumulator.samples >=
+            RADAR_CALIBRATION_TARGET_VALID_SAMPLES
+        ) {
+            continue;
+        }
 
         // rawEnergy == 0 is the sentinel that previously appeared as a 0.0-dB
         // drop-out. Do not let it lower Min/Mean/percentiles or enter the
@@ -336,18 +444,46 @@ static void radarCalibrationAccumulate(
                 valueDb
             );
 
-        // reportsReceived is capped below 65535, so no histogram bin can
-        // overflow uint16_t even when every valid sample lands in one bin.
         accumulator.histogram[bin]++;
         accumulator.samples++;
     }
 
+    bool hasUnreliableGate = false;
+
+    if (
+        radarCalibrationAllGatesResolved(
+            *session,
+            hasUnreliableGate
+        )
+    ) {
+        Serial.println(
+            hasUnreliableGate
+            ? "LD2410S calibration auto-complete | unreliable gates will be derived"
+            : "LD2410S calibration auto-complete | 100 valid samples on all gates"
+        );
+
+        radarCalibrationFinishActive(
+            now,
+            true,
+            hasUnreliableGate,
+            false
+        );
+        return;
+    }
+
     if (
         session->reportsReceived >=
-        RADAR_CALIBRATION_MAX_SAMPLES
+        RADAR_CALIBRATION_MAX_REPORTS
     ) {
+        Serial.println(
+            "LD2410S calibration auto-complete | report limit reached; incomplete gates will be derived"
+        );
+
         radarCalibrationFinishActive(
-            millis()
+            now,
+            true,
+            true,
+            false
         );
     }
 }
@@ -412,6 +548,27 @@ static int lastMotionGate =
 
 static float lastMotionEnergyDb =
     0.0f;
+
+
+// Diagnostic history for the Radar Config live table.
+//
+// This is recorded directly while processing every standard LD2410S report,
+// not by the browser polling loop. A short threshold crossing therefore remains
+// visible even when the 250-ms WebConfig refresh happens between two reports.
+// All 16 gates are tracked, including gates outside the operational min/max
+// range; those rows are already visually dimmed by WebConfig. Invalid raw
+// energy==0 samples are never counted as real threshold crossings.
+static uint32_t lastGateTriggerMs[16] = {};
+static bool lastGateTriggerSeen[16] = {};
+
+
+static void resetGateTriggerHistory()
+{
+    for (uint8_t gate = 0; gate < 16; ++gate) {
+        lastGateTriggerMs[gate] = 0;
+        lastGateTriggerSeen[gate] = false;
+    }
+}
 
 
 // Temporary software guard used after a radar configuration write
@@ -1043,6 +1200,31 @@ static bool leaveConfigMode(
 }
 
 
+// Some LD2410S revisions need a short quiet period after END CONFIG before a
+// new ENABLE CONFIG handshake is reliable. This matters when WebConfig first
+// restores the temporary all-gate calibration range and then immediately writes
+// normal/default settings.
+static const uint32_t RADAR_CONFIG_REENTRY_RECOVERY_MS = 300UL;
+
+static void waitForConfigReentryRecovery()
+{
+    uint32_t startedMs =
+        millis();
+
+    while (
+        (uint32_t)(
+            millis() - startedMs
+        ) < RADAR_CONFIG_REENTRY_RECOVERY_MS
+    ) {
+        delay(1);
+    }
+
+    // Discard any standard-report bytes accumulated during the recovery pause.
+    // enterConfigMode() drains again defensively before sending ENABLE CONFIG.
+    drainInput();
+}
+
+
 // =============================================================
 // GENERAL PARAMETERS
 // =============================================================
@@ -1425,8 +1607,32 @@ static void cacheMotionSettings(
     const RadarSettings &settings
 )
 {
+    // Trigger history is only meaningful for the threshold set under which it
+    // was observed. Clear it when a verified write changes any trigger value,
+    // but keep it across ordinary re-reads of unchanged settings.
+    bool triggerThresholdChanged =
+        motionTrackingConfigured;
+
+    if (triggerThresholdChanged) {
+        triggerThresholdChanged = false;
+
+        for (uint8_t gate = 0; gate < 16; ++gate) {
+            if (
+                motionSettings.triggerThreshold[gate] !=
+                settings.triggerThreshold[gate]
+            ) {
+                triggerThresholdChanged = true;
+                break;
+            }
+        }
+    }
+
     motionSettings =
         settings;
+
+    if (triggerThresholdChanged) {
+        resetGateTriggerHistory();
+    }
 }
 
 
@@ -1474,6 +1680,381 @@ static bool setStandardOutputMode(
 
     return true;
 }
+
+
+static bool radarCalibrationRangeMarkerStore(
+    uint32_t minGate,
+    uint32_t maxGate
+)
+{
+    Preferences prefs;
+
+    if (!prefs.begin(
+            RADAR_CAL_RANGE_PREFS_NAMESPACE,
+            false
+        )) {
+        return false;
+    }
+
+    size_t minWritten =
+        prefs.putUInt(
+            RADAR_CAL_RANGE_MIN_KEY,
+            minGate
+        );
+
+    size_t maxWritten =
+        prefs.putUInt(
+            RADAR_CAL_RANGE_MAX_KEY,
+            maxGate
+        );
+
+    size_t activeWritten =
+        prefs.putBool(
+            RADAR_CAL_RANGE_ACTIVE_KEY,
+            true
+        );
+
+    prefs.end();
+
+    return
+        minWritten == sizeof(uint32_t) &&
+        maxWritten == sizeof(uint32_t) &&
+        activeWritten > 0;
+}
+
+
+static bool radarCalibrationRangeMarkerLoad(
+    uint32_t &minGate,
+    uint32_t &maxGate
+)
+{
+    minGate = 0;
+    maxGate = 0;
+
+    Preferences prefs;
+
+    if (!prefs.begin(
+            RADAR_CAL_RANGE_PREFS_NAMESPACE,
+            true
+        )) {
+        return false;
+    }
+
+    bool active =
+        prefs.getBool(
+            RADAR_CAL_RANGE_ACTIVE_KEY,
+            false
+        );
+
+    if (active) {
+        minGate =
+            prefs.getUInt(
+                RADAR_CAL_RANGE_MIN_KEY,
+                0
+            );
+
+        maxGate =
+            prefs.getUInt(
+                RADAR_CAL_RANGE_MAX_KEY,
+                0
+            );
+    }
+
+    prefs.end();
+
+    if (!active)
+        return false;
+
+    return
+        minGate <= 16 &&
+        maxGate >= 1 &&
+        maxGate <= 16 &&
+        minGate <= maxGate;
+}
+
+
+static void radarCalibrationRangeMarkerClear()
+{
+    Preferences prefs;
+
+    if (!prefs.begin(
+            RADAR_CAL_RANGE_PREFS_NAMESPACE,
+            false
+        )) {
+        return;
+    }
+
+    prefs.remove(
+        RADAR_CAL_RANGE_ACTIVE_KEY
+    );
+    prefs.remove(
+        RADAR_CAL_RANGE_MIN_KEY
+    );
+    prefs.remove(
+        RADAR_CAL_RANGE_MAX_KEY
+    );
+
+    prefs.end();
+}
+
+
+static bool radarGeneralSettingsMatch(
+    const RadarSettings &a,
+    const RadarSettings &b
+)
+{
+    return
+        a.maxGate == b.maxGate &&
+        a.minGate == b.minGate &&
+        a.absenceSec == b.absenceSec &&
+        a.statusRateX10 == b.statusRateX10 &&
+        a.distanceRateX10 == b.distanceRateX10 &&
+        a.responseSpeed == b.responseSpeed;
+}
+
+
+static bool radarCalibrationWriteTemporaryRange(
+    uint32_t minGate,
+    uint32_t maxGate,
+    String &error
+)
+{
+    error = "";
+
+    if (!motionTrackingConfigured) {
+        error = "radar motion tracking is not available";
+        return false;
+    }
+
+    RadarSettings requested =
+        motionSettings;
+
+    requested.minGate =
+        minGate;
+    requested.maxGate =
+        maxGate;
+
+    commandInProgress =
+        true;
+
+    bool configEntered =
+        false;
+
+    bool ok =
+        enterConfigMode(
+            error
+        );
+
+    RadarSettings verified;
+    memset(
+        &verified,
+        0,
+        sizeof(verified)
+    );
+
+    if (ok) {
+        configEntered = true;
+        ok =
+            writeGeneralSettings(
+                requested,
+                error
+            );
+    }
+
+    if (ok) {
+        ok =
+            readGeneralSettings(
+                verified,
+                error
+            );
+    }
+
+    if (
+        ok &&
+        !radarGeneralSettingsMatch(
+            requested,
+            verified
+        )
+    ) {
+        error =
+            "temporary calibration range verification failed";
+        ok = false;
+    }
+
+    if (ok) {
+        ok =
+            setStandardOutputMode(
+                error
+            );
+    }
+
+    if (configEntered) {
+        String exitError;
+        bool exitOk =
+            leaveConfigMode(
+                exitError
+            );
+
+        if (ok && !exitOk) {
+            Serial.println(
+                "LD2410S warning: calibration-range config-exit ACK timeout"
+            );
+        }
+    }
+
+    commandInProgress =
+        false;
+
+    resetReportParsers();
+    drainInput();
+
+    if (ok) {
+        standardModeStartedMs =
+            millis();
+        lastStandardReportMs =
+            0;
+    }
+
+    return ok;
+}
+
+
+static bool radarCalibrationEnableAllGateMeasurement(
+    String &error
+)
+{
+    error = "";
+
+    if (radarCalibrationRangeOverrideActive) {
+        radarCalibrationRangeRestorePending = false;
+        return true;
+    }
+
+    if (!motionTrackingConfigured) {
+        error = "radar motion tracking is not available";
+        return false;
+    }
+
+    radarCalibrationOriginalMinGate =
+        motionSettings.minGate;
+    radarCalibrationOriginalMaxGate =
+        motionSettings.maxGate;
+
+    radarCalibrationRangeOverrideChanged =
+        radarCalibrationOriginalMinGate != 0 ||
+        radarCalibrationOriginalMaxGate != 16;
+
+    if (!radarCalibrationRangeOverrideChanged) {
+        radarCalibrationRangeOverrideActive = true;
+        radarCalibrationRangeRestorePending = false;
+        return true;
+    }
+
+    if (!radarCalibrationRangeMarkerStore(
+            radarCalibrationOriginalMinGate,
+            radarCalibrationOriginalMaxGate
+        )) {
+        error =
+            "could not save calibration range recovery marker";
+        return false;
+    }
+
+    if (!radarCalibrationWriteTemporaryRange(
+            0,
+            16,
+            error
+        )) {
+        // The write may have reached the sensor even when an ACK/readback
+        // failed. Try to restore the normal range immediately; if that also
+        // fails, retain both the RAM retry state and the NVS recovery marker.
+        String startError =
+            error;
+        String restoreError;
+
+        if (radarCalibrationWriteTemporaryRange(
+                radarCalibrationOriginalMinGate,
+                radarCalibrationOriginalMaxGate,
+                restoreError
+            )) {
+            radarCalibrationRangeMarkerClear();
+            radarCalibrationRangeOverrideChanged = false;
+        } else {
+            radarCalibrationRangeOverrideActive = true;
+            radarCalibrationRangeRestorePending = true;
+            radarCalibrationRestoreRetryAfterMs =
+                millis() + 2000UL;
+        }
+
+        error =
+            startError;
+
+        if (restoreError.length()) {
+            error +=
+                " | restore: " +
+                restoreError;
+        }
+
+        return false;
+    }
+
+    radarCalibrationRangeOverrideActive = true;
+    radarCalibrationRangeRestorePending = false;
+
+    Serial.printf(
+        "LD2410S calibration range temporarily widened | normal=%lu..%lu | calibration=0..16\n",
+        (unsigned long)radarCalibrationOriginalMinGate,
+        (unsigned long)radarCalibrationOriginalMaxGate
+    );
+
+    return true;
+}
+
+
+static bool radarCalibrationRestoreOperatingRange(
+    String &error
+)
+{
+    error = "";
+
+    if (
+        !radarCalibrationRangeOverrideActive &&
+        !radarCalibrationRangeRestorePending
+    ) {
+        return true;
+    }
+
+    if (!radarCalibrationRangeOverrideChanged) {
+        radarCalibrationRangeOverrideActive = false;
+        radarCalibrationRangeRestorePending = false;
+        radarCalibrationRangeMarkerClear();
+        return true;
+    }
+
+    if (!radarCalibrationWriteTemporaryRange(
+            radarCalibrationOriginalMinGate,
+            radarCalibrationOriginalMaxGate,
+            error
+        )) {
+        radarCalibrationRangeRestorePending = true;
+        return false;
+    }
+
+    radarCalibrationRangeMarkerClear();
+
+    Serial.printf(
+        "LD2410S calibration range restored | normal=%lu..%lu\n",
+        (unsigned long)radarCalibrationOriginalMinGate,
+        (unsigned long)radarCalibrationOriginalMaxGate
+    );
+
+    radarCalibrationRangeOverrideActive = false;
+    radarCalibrationRangeOverrideChanged = false;
+    radarCalibrationRangeRestorePending = false;
+    radarCalibrationRestoreRetryAfterMs = 0;
+
+    return true;
+}
+
 
 
 static float gateEnergyDb(
@@ -1568,6 +2149,24 @@ static void processStandardPayload(
 
     if (!motionTrackingConfigured)
         return;
+
+
+    // Record every valid gate-level threshold crossing directly from the UART
+    // stream. This diagnostic is deliberately independent from the operational
+    // min/max range so the live table can reveal activity in excluded gates as
+    // well. It does not alter the actual motion/recording decision below.
+    for (uint8_t gate = 0; gate < 16; ++gate) {
+        if (rawGateEnergy[gate] == 0)
+            continue;
+
+        if (
+            latestGateEnergyDb[gate] >=
+            (float)motionSettings.triggerThreshold[gate]
+        ) {
+            lastGateTriggerMs[gate] = now;
+            lastGateTriggerSeen[gate] = true;
+        }
+    }
 
 
     // The general "minimum distance gate" is a distance boundary:
@@ -1946,6 +2545,8 @@ bool radarStartMotionTracking(
     lastMotionEnergyDb =
         0.0f;
 
+    resetGateTriggerHistory();
+
     lastStandardReportMs =
         0;
 
@@ -1995,6 +2596,90 @@ bool radarStartMotionTracking(
                 settings.triggerThreshold,
                 error
             );
+    }
+
+
+    if (ok) {
+
+        // The cached settings must contain the real HOLD thresholds too. The
+        // previous startup path left this array zero-initialized until an
+        // explicit config read, which could expose false HOLD=0 values.
+        ok =
+            readThresholdSet(
+                CMD_READ_HOLD,
+                settings.holdThreshold,
+                error
+            );
+    }
+
+
+    if (ok) {
+        uint32_t recoveryMinGate = 0;
+        uint32_t recoveryMaxGate = 0;
+
+        if (radarCalibrationRangeMarkerLoad(
+                recoveryMinGate,
+                recoveryMaxGate
+            )) {
+
+            RadarSettings restored =
+                settings;
+
+            restored.minGate =
+                recoveryMinGate;
+            restored.maxGate =
+                recoveryMaxGate;
+
+            ok =
+                writeGeneralSettings(
+                    restored,
+                    error
+                );
+
+            RadarSettings verifiedGeneral;
+            memset(
+                &verifiedGeneral,
+                0,
+                sizeof(verifiedGeneral)
+            );
+
+            if (ok) {
+                ok =
+                    readGeneralSettings(
+                        verifiedGeneral,
+                        error
+                    );
+            }
+
+            if (
+                ok &&
+                !radarGeneralSettingsMatch(
+                    restored,
+                    verifiedGeneral
+                )
+            ) {
+                error =
+                    "calibration range recovery verification failed";
+                ok = false;
+            }
+
+            if (ok) {
+                settings.maxGate = verifiedGeneral.maxGate;
+                settings.minGate = verifiedGeneral.minGate;
+                settings.absenceSec = verifiedGeneral.absenceSec;
+                settings.statusRateX10 = verifiedGeneral.statusRateX10;
+                settings.distanceRateX10 = verifiedGeneral.distanceRateX10;
+                settings.responseSpeed = verifiedGeneral.responseSpeed;
+
+                radarCalibrationRangeMarkerClear();
+
+                Serial.printf(
+                    "LD2410S calibration recovery restored range %lu..%lu\n",
+                    (unsigned long)settings.minGate,
+                    (unsigned long)settings.maxGate
+                );
+            }
+        }
     }
 
 
@@ -2116,6 +2801,33 @@ void radarLoop()
             parseCompactByte(
                 value
             );
+        }
+    }
+
+    if (
+        radarCalibrationRangeRestorePending &&
+        radarCalibrationActive == RADAR_CALIBRATION_NONE
+    ) {
+        uint32_t now =
+            millis();
+
+        if (
+            radarCalibrationRestoreRetryAfterMs == 0 ||
+            (int32_t)(now - radarCalibrationRestoreRetryAfterMs) >= 0
+        ) {
+            String restoreError;
+
+            if (!radarCalibrationRestoreOperatingRange(
+                    restoreError
+                )) {
+                Serial.println(
+                    "LD2410S calibration range restore failed: " +
+                    restoreError
+                );
+
+                radarCalibrationRestoreRetryAfterMs =
+                    now + 2000UL;
+            }
         }
     }
 }
@@ -2383,6 +3095,16 @@ bool radarReadSettings(
 
 
     if (ok) {
+        // A calibration session may have temporarily widened the sensor's
+        // hardware min/max range. Never expose/cache that maintenance-only
+        // range as the user's operational configuration.
+        if (radarCalibrationRangeOverrideActive) {
+            settings.minGate =
+                radarCalibrationOriginalMinGate;
+            settings.maxGate =
+                radarCalibrationOriginalMaxGate;
+        }
+
         cacheMotionSettings(
             settings
         );
@@ -2438,10 +3160,67 @@ bool radarWriteSettings(
     String &error
 )
 {
+    Serial.println(
+        "LD2410S write | begin"
+    );
+
+    // Writing a normal configuration while calibration is still active must
+    // first leave the temporary all-gate measurement range. This also makes
+    // the WebConfig "apply recommendations" path safe if the operator forgets
+    // to press Stop before Write + Verify.
+    bool calibrationStatePresent =
+        radarCalibrationActive != RADAR_CALIBRATION_NONE ||
+        radarCalibrationRangeOverrideActive ||
+        radarCalibrationRangeRestorePending;
+
+    bool calibrationRestoreUsesUart =
+        radarCalibrationRangeOverrideChanged &&
+        (
+            radarCalibrationRangeOverrideActive ||
+            radarCalibrationRangeRestorePending
+        );
+
+    if (calibrationStatePresent) {
+        Serial.println(
+            "LD2410S write | step=calibration_stop_restore"
+        );
+
+        String calibrationError;
+
+        if (!radarCalibrationStop(
+                calibrationError
+            )) {
+            error =
+                "could not restore normal radar range before write: " +
+                calibrationError;
+
+            Serial.println(
+                "LD2410S write | failed | " +
+                error
+            );
+
+            return false;
+        }
+
+        if (calibrationRestoreUsesUart) {
+            Serial.printf(
+                "LD2410S write | step=config_reentry_recovery | wait=%lu ms\n",
+                (unsigned long)RADAR_CONFIG_REENTRY_RECOVERY_MS
+            );
+
+            waitForConfigReentryRecovery();
+        }
+    }
+
     if (!radarValidateSettings(
             settings,
             error
         )) {
+
+        Serial.println(
+            "LD2410S write | validation failed | " +
+            error
+        );
 
         return false;
     }
@@ -2449,6 +3228,10 @@ bool radarWriteSettings(
 
     error =
         "";
+
+    Serial.println(
+        "LD2410S write | step=enter_config"
+    );
 
     commandInProgress =
         true;
@@ -2469,6 +3252,10 @@ bool radarWriteSettings(
         configEntered =
             true;
 
+        Serial.println(
+            "LD2410S write | step=write_general"
+        );
+
         ok =
             writeGeneralSettings(
                 settings,
@@ -2478,6 +3265,10 @@ bool radarWriteSettings(
 
 
     if (ok) {
+        Serial.println(
+            "LD2410S write | step=write_trigger"
+        );
+
         ok =
             writeThresholdSet(
                 CMD_WRITE_TRIGGER,
@@ -2488,6 +3279,10 @@ bool radarWriteSettings(
 
 
     if (ok) {
+        Serial.println(
+            "LD2410S write | step=write_hold"
+        );
+
         ok =
             writeThresholdSet(
                 CMD_WRITE_HOLD,
@@ -2505,6 +3300,10 @@ bool radarWriteSettings(
     // verification read. Some module/firmware revisions need recovery
     // time after returning to normal operating mode.
     if (ok) {
+        Serial.println(
+            "LD2410S write | step=verify_general"
+        );
+
         ok =
             readGeneralSettings(
                 verified,
@@ -2520,6 +3319,10 @@ bool radarWriteSettings(
 
 
     if (ok) {
+        Serial.println(
+            "LD2410S write | step=verify_trigger"
+        );
+
         ok =
             readThresholdSet(
                 CMD_READ_TRIGGER,
@@ -2536,6 +3339,10 @@ bool radarWriteSettings(
 
 
     if (ok) {
+        Serial.println(
+            "LD2410S write | step=verify_hold"
+        );
+
         ok =
             readThresholdSet(
                 CMD_READ_HOLD,
@@ -2570,6 +3377,10 @@ bool radarWriteSettings(
     // Always try to return the radar to normal operating mode once
     // configuration mode was entered, even when write/verification failed.
     if (configEntered) {
+
+        Serial.println(
+            "LD2410S write | step=exit_config"
+        );
 
         String exitError;
 
@@ -2613,6 +3424,15 @@ bool radarWriteSettings(
     if (ok) {
         cacheMotionSettings(
             verified
+        );
+
+        Serial.println(
+            "LD2410S write | success | verified"
+        );
+    } else {
+        Serial.println(
+            "LD2410S write | failed | " +
+            error
         );
     }
 
@@ -2851,21 +3671,49 @@ float radarGateEnergyDb(
 }
 
 
-bool radarCalibrationStart(
-    RadarCalibrationMode mode
+bool radarGateLastTriggerAgeMs(
+    uint8_t gate,
+    uint32_t &ageMs
 )
 {
+    ageMs = 0;
+
     if (
-        mode != RADAR_CALIBRATION_QUIET &&
-        mode != RADAR_CALIBRATION_MOTION
+        gate >= 16 ||
+        !lastGateTriggerSeen[gate]
     ) {
         return false;
     }
 
-    // Standard report mode is required because compact reports do not contain
-    // the 16 per-gate energy values.
-    if (!motionTrackingConfigured)
+    ageMs =
+        (uint32_t)(
+            millis() -
+            lastGateTriggerMs[gate]
+        );
+
+    return true;
+}
+
+
+bool radarCalibrationStart(
+    RadarCalibrationMode mode,
+    String &error
+)
+{
+    error = "";
+
+    if (
+        mode != RADAR_CALIBRATION_QUIET &&
+        mode != RADAR_CALIBRATION_MOTION
+    ) {
+        error = "invalid calibration mode";
         return false;
+    }
+
+    if (!motionTrackingConfigured) {
+        error = "standard radar gate-energy reporting is not available";
+        return false;
+    }
 
     uint32_t now =
         millis();
@@ -2874,9 +3722,21 @@ bool radarCalibrationStart(
         radarCalibrationActive !=
         RADAR_CALIBRATION_NONE
     ) {
+        // A direct switch between quiet and motion keeps the temporary full
+        // measurement range active instead of restoring and reopening it.
         radarCalibrationFinishActive(
-            now
+            now,
+            false,
+            false,
+            true
         );
+        radarCalibrationRangeRestorePending = false;
+    }
+
+    if (!radarCalibrationEnableAllGateMeasurement(
+            error
+        )) {
+        return false;
     }
 
     RadarCalibrationSessionState *session =
@@ -2884,15 +3744,26 @@ bool radarCalibrationStart(
             mode
         );
 
-    if (!session)
+    if (!session) {
+        error = "calibration session unavailable";
         return false;
+    }
 
     radarCalibrationClearSession(
         *session
     );
 
-    session->startedMs =
-        now;
+    uint32_t armedAtMs = millis();
+
+    session->countdownUntilMs =
+        armedAtMs +
+        RADAR_CALIBRATION_COUNTDOWN_MS;
+
+    session->measurementStarted = false;
+    session->startedMs = 0;
+    session->autoCompleted = false;
+    session->qualityLimited = false;
+    session->aborted = false;
 
     radarCalibrationActive =
         mode;
@@ -2901,18 +3772,65 @@ bool radarCalibrationStart(
 }
 
 
-void radarCalibrationStop()
+bool radarCalibrationStart(
+    RadarCalibrationMode mode
+)
 {
-    if (
-        radarCalibrationActive ==
-        RADAR_CALIBRATION_NONE
-    ) {
-        return;
+    String error;
+    bool ok =
+        radarCalibrationStart(
+            mode,
+            error
+        );
+
+    if (!ok && error.length()) {
+        Serial.println(
+            "LD2410S calibration start failed: " +
+            error
+        );
     }
 
-    radarCalibrationFinishActive(
-        millis()
-    );
+    return ok;
+}
+
+
+bool radarCalibrationStop(
+    String &error
+)
+{
+    error = "";
+
+    if (
+        radarCalibrationActive !=
+        RADAR_CALIBRATION_NONE
+    ) {
+        radarCalibrationFinishActive(
+            millis(),
+            false,
+            false,
+            true
+        );
+    }
+
+    return
+        radarCalibrationRestoreOperatingRange(
+            error
+        );
+}
+
+
+void radarCalibrationStop()
+{
+    String error;
+
+    if (!radarCalibrationStop(
+            error
+        )) {
+        Serial.println(
+            "LD2410S calibration stop: range restore failed: " +
+            error
+        );
+    }
 }
 
 
@@ -2929,8 +3847,7 @@ void radarCalibrationReset(
         return;
 
     if (radarCalibrationActive == mode) {
-        radarCalibrationActive =
-            RADAR_CALIBRATION_NONE;
+        radarCalibrationStop();
     }
 
     radarCalibrationClearSession(
@@ -2941,6 +3858,14 @@ void radarCalibrationReset(
 
 void radarCalibrationResetAll()
 {
+    if (
+        radarCalibrationActive != RADAR_CALIBRATION_NONE ||
+        radarCalibrationRangeOverrideActive ||
+        radarCalibrationRangeRestorePending
+    ) {
+        radarCalibrationStop();
+    }
+
     radarCalibrationActive =
         RADAR_CALIBRATION_NONE;
 
@@ -2957,6 +3882,112 @@ void radarCalibrationResetAll()
 RadarCalibrationMode radarCalibrationActiveMode()
 {
     return radarCalibrationActive;
+}
+
+
+uint32_t radarCalibrationCountdownRemainingMs(
+    RadarCalibrationMode mode
+)
+{
+    RadarCalibrationSessionState *session =
+        radarCalibrationSession(
+            mode
+        );
+
+    if (
+        !session ||
+        radarCalibrationActive != mode ||
+        session->measurementStarted ||
+        session->countdownUntilMs == 0
+    ) {
+        return 0;
+    }
+
+    uint32_t now = millis();
+
+    if (
+        (int32_t)(now - session->countdownUntilMs) >= 0
+    ) {
+        return 0;
+    }
+
+    return
+        (uint32_t)(
+            session->countdownUntilMs -
+            now
+        );
+}
+
+
+bool radarCalibrationMeasurementStarted(
+    RadarCalibrationMode mode
+)
+{
+    RadarCalibrationSessionState *session =
+        radarCalibrationSession(
+            mode
+        );
+
+    return
+        session &&
+        session->measurementStarted;
+}
+
+
+bool radarCalibrationAutoCompleted(
+    RadarCalibrationMode mode
+)
+{
+    RadarCalibrationSessionState *session =
+        radarCalibrationSession(
+            mode
+        );
+
+    return
+        session &&
+        session->autoCompleted;
+}
+
+
+bool radarCalibrationQualityLimited(
+    RadarCalibrationMode mode
+)
+{
+    RadarCalibrationSessionState *session =
+        radarCalibrationSession(
+            mode
+        );
+
+    return
+        session &&
+        session->qualityLimited;
+}
+
+
+bool radarCalibrationAborted(
+    RadarCalibrationMode mode
+)
+{
+    RadarCalibrationSessionState *session =
+        radarCalibrationSession(
+            mode
+        );
+
+    return
+        session &&
+        session->aborted;
+}
+
+
+uint32_t radarCalibrationTargetValidSamples()
+{
+    return RADAR_CALIBRATION_TARGET_VALID_SAMPLES;
+}
+
+
+uint32_t radarCalibrationMaxReports()
+{
+    return RADAR_CALIBRATION_MAX_REPORTS;
 }
 
 
@@ -3062,6 +4093,12 @@ bool radarCalibrationGetGateStats(
         (float)(
             accumulator.sumDb /
             (double)accumulator.samples
+        );
+
+    stats.p10Db =
+        radarCalibrationPercentileDb(
+            accumulator,
+            0.10f
         );
 
     stats.p50Db =

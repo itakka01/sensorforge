@@ -37,7 +37,7 @@ static WebServer *syncServer = nullptr;
 // firmware compile timestamp, so every newly compiled API identifies itself
 // with a fresh, chronologically increasing build version.
 static const uint16_t SYNC_API_VERSION_MAJOR = 1;
-static const uint16_t SYNC_API_VERSION_MINOR = 10;
+static const uint16_t SYNC_API_VERSION_MINOR = 11;
 
 static const size_t SYNC_TRANSFER_BUFFER_PREFERRED = 32U * 1024U;
 static const size_t SYNC_TRANSFER_BUFFER_MINIMUM = 4U * 1024U;
@@ -371,7 +371,11 @@ static bool isFinalRecordingName(const String &name)
 {
     String lower = name;
     lower.toLowerCase();
-    return lower.endsWith(".avi") || lower.endsWith(".mkv") || lower.endsWith(".srt");
+    return lower.endsWith(".avi") ||
+           lower.endsWith(".mkv") ||
+           lower.endsWith(".srt") ||
+           lower.endsWith(".jpg") ||
+           lower.endsWith(".jpeg");
 }
 
 static const char *contentTypeForPath(const String &path)
@@ -383,6 +387,8 @@ static const char *contentTypeForPath(const String &path)
         return "video/x-matroska";
     if (lower.endsWith(".srt"))
         return "application/x-subrip";
+    if (lower.endsWith(".jpg") || lower.endsWith(".jpeg"))
+        return "image/jpeg";
     return "video/x-msvideo";
 }
 
@@ -849,7 +855,8 @@ static void handleFiles()
         String lower = entries[i].name;
         lower.toLowerCase();
         const char *type = lower.endsWith(".mkv") ? "mkv" :
-                           (lower.endsWith(".srt") ? "srt" : "avi");
+                           (lower.endsWith(".srt") ? "srt" :
+                           ((lower.endsWith(".jpg") || lower.endsWith(".jpeg")) ? "jpg" : "avi"));
 
         server().sendContent(
             "{\"name\":\"" + jsonEscape(entries[i].name) +

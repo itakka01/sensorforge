@@ -30,7 +30,7 @@ static const uint64_t LOG_ROTATE_BYTES =
 // not depend on SD config.txt or LittleFS.
 //
 // epoch   = installation time in Unix seconds, when known
-// pending = SD update succeeded but there was no valid clock yet
+// pending = firmware update succeeded but there was no valid clock yet
 // source  = installation source of the current tracked firmware
 
 static const char *FW_PREF_NAMESPACE =
@@ -44,6 +44,9 @@ static const char *FW_PREF_PENDING =
 
 static const char *FW_PREF_SOURCE =
     "source";
+
+static const char *FW_PREF_SKIP_SD_ONCE =
+    "skip_sd_once";
 
 
 static bool firmwareClockIsValid()
@@ -220,8 +223,8 @@ bool firmwareInstallTimePending()
 }
 
 
-bool firmwareInfoMarkSdUpdate(
-    const String &sourceFilename
+static bool firmwareInfoMarkUpdateSource(
+    const String &source
 )
 {
     Preferences preferences;
@@ -232,16 +235,6 @@ bool firmwareInfoMarkSdUpdate(
         )) {
 
         return false;
-    }
-
-
-    String source =
-        "SD auto-update";
-
-    if (sourceFilename.length()) {
-        source +=
-            ": " +
-            sourceFilename;
     }
 
 
@@ -288,6 +281,118 @@ bool firmwareInfoMarkSdUpdate(
     preferences.end();
 
     return ok;
+}
+
+
+bool firmwareInfoMarkSdUpdate(
+    const String &sourceFilename
+)
+{
+    String source =
+        "SD auto-update";
+
+    if (sourceFilename.length()) {
+        source +=
+            ": " +
+            sourceFilename;
+    }
+
+    return
+        firmwareInfoMarkUpdateSource(
+            source
+        );
+}
+
+
+bool firmwareInfoMarkWifiUpdate(
+    const String &sourceFilename
+)
+{
+    String source =
+        "WiFi OTA";
+
+    if (sourceFilename.length()) {
+        source +=
+            ": " +
+            sourceFilename;
+    }
+
+    return
+        firmwareInfoMarkUpdateSource(
+            source
+        );
+}
+
+
+bool firmwareInfoArmDirectOtaBoot()
+{
+    Preferences preferences;
+
+    if (!preferences.begin(
+            FW_PREF_NAMESPACE,
+            false
+        )) {
+
+        return false;
+    }
+
+    bool ok =
+        preferences.putBool(
+            FW_PREF_SKIP_SD_ONCE,
+            true
+        ) == 1U;
+
+    preferences.end();
+    return ok;
+}
+
+
+void firmwareInfoCancelDirectOtaBoot()
+{
+    Preferences preferences;
+
+    if (!preferences.begin(
+            FW_PREF_NAMESPACE,
+            false
+        )) {
+
+        return;
+    }
+
+    preferences.remove(
+        FW_PREF_SKIP_SD_ONCE
+    );
+
+    preferences.end();
+}
+
+
+bool firmwareInfoConsumeSkipSdUpdateOnce()
+{
+    Preferences preferences;
+
+    if (!preferences.begin(
+            FW_PREF_NAMESPACE,
+            false
+        )) {
+
+        return false;
+    }
+
+    bool skip =
+        preferences.getBool(
+            FW_PREF_SKIP_SD_ONCE,
+            false
+        );
+
+    if (skip) {
+        preferences.remove(
+            FW_PREF_SKIP_SD_ONCE
+        );
+    }
+
+    preferences.end();
+    return skip;
 }
 
 

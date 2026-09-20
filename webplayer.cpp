@@ -8,7 +8,9 @@
 
 #include <FS.h>
 #include <WiFi.h>
+#include <algorithm>
 #include <string.h>
+#include <vector>
 
 
 // =============================================================
@@ -176,6 +178,98 @@ static bool isMkvPath(
 
     return
         lower.endsWith(".mkv");
+}
+
+
+static bool isJpegPath(
+    const String &path
+)
+{
+    String lower =
+        path;
+
+    lower.toLowerCase();
+
+    return
+        lower.endsWith(".jpg") ||
+        lower.endsWith(".jpeg");
+}
+
+
+static String playerJsonEscape(
+    const String &value
+)
+{
+    String escaped;
+    escaped.reserve(
+        value.length() + 8
+    );
+
+    for (size_t i = 0; i < value.length(); ++i) {
+        char c = value[i];
+
+        switch (c) {
+            case '\\': escaped += "\\\\"; break;
+            case '"':  escaped += "\\\""; break;
+            case '\r': escaped += "\\r"; break;
+            case '\n': escaped += "\\n"; break;
+            case '\t': escaped += "\\t"; break;
+            default:
+                if ((uint8_t)c < 0x20U) {
+                    char buffer[8];
+                    snprintf(
+                        buffer,
+                        sizeof(buffer),
+                        "\\u%04x",
+                        (unsigned int)(uint8_t)c
+                    );
+                    escaped += buffer;
+                } else {
+                    escaped += c;
+                }
+                break;
+        }
+    }
+
+    return escaped;
+}
+
+
+static String normalizedMediaMode(
+    String mode
+)
+{
+    mode.toLowerCase();
+
+    if (
+        mode != "videos" &&
+        mode != "images"
+    ) {
+        mode = "all";
+    }
+
+    return mode;
+}
+
+
+static bool mediaPathMatchesMode(
+    const String &path,
+    const String &mode
+)
+{
+    if (mode == "videos") {
+        return
+            isAviPath(path) ||
+            isMkvPath(path);
+    }
+
+    if (mode == "images")
+        return isJpegPath(path);
+
+    return
+        isAviPath(path) ||
+        isMkvPath(path) ||
+        isJpegPath(path);
 }
 
 
@@ -4537,14 +4631,15 @@ static void handlePlayerDelete()
         !validRecordingPath(path) ||
         (
             !isAviPath(path) &&
-            !isMkvPath(path)
+            !isMkvPath(path) &&
+            !isJpegPath(path)
         )
     ) {
 
         playerServer->send(
             400,
             "text/plain; charset=utf-8",
-            "Invalid recording path"
+            "Invalid media path"
         );
 
         return;
@@ -4718,6 +4813,217 @@ static void handlePlayerDelete()
 
 
 // =============================================================
+// MEDIA PREVIOUS / NEXT
+// =============================================================
+
+static void handlePlayerNeighbors()
+{
+    if (!playerServer)
+        return;
+
+    if (rejectPlayerWhileRecording())
+        return;
+
+    String path =
+        playerServer->arg("path");
+
+    String mode =
+        normalizedMediaMode(
+            playerServer->arg("mode")
+        );
+
+    if (
+        !validRecordingPath(path) ||
+        !mediaPathMatchesMode(
+            path,
+            mode
+        )
+    ) {
+        playerServer->send(
+            400,
+            "application/json; charset=utf-8",
+            "{\"error\":\"invalid media path or filter\"}"
+        );
+        return;
+    }
+
+    int slash =
+        path.lastIndexOf('/');
+
+    if (slash <= 0) {
+        playerServer->send(
+            400,
+            "application/json; charset=utf-8",
+            "{\"error\":\"invalid media folder\"}"
+        );
+        return;
+    }
+
+    String folderPath =
+        path.substring(
+            0,
+            slash
+        );
+
+    File root =
+        STORAGE.open(
+            folderPath.c_str(),
+            FILE_READ
+        );
+
+    if (
+        !root ||
+        !root.isDirectory()
+    ) {
+        if (root)
+            root.close();
+
+        playerServer->send(
+            404,
+            "application/json; charset=utf-8",
+            "{\"error\":\"media folder not found\"}"
+        );
+        return;
+    }
+
+    std::vector<String> mediaPaths;
+
+    File file =
+        root.openNextFile();
+
+    while (file) {
+        if (!file.isDirectory()) {
+            String name =
+                String(file.name());
+
+            int fileSlash =
+                name.lastIndexOf('/');
+
+            if (fileSlash >= 0) {
+                name =
+                    name.substring(
+                        fileSlash + 1
+                    );
+            }
+
+            String candidate =
+                folderPath +
+                "/" +
+                name;
+
+            if (mediaPathMatchesMode(
+                    candidate,
+                    mode
+                )) {
+                mediaPaths.push_back(
+                    candidate
+                );
+            }
+        }
+
+        file.close();
+        file = root.openNextFile();
+    }
+
+    root.close();
+
+    std::sort(
+        mediaPaths.begin(),
+        mediaPaths.end(),
+        [](const String &a, const String &b) {
+            return a.compareTo(b) > 0;
+        }
+    );
+
+    int currentIndex =
+        -1;
+
+    for (size_t i = 0; i < mediaPaths.size(); ++i) {
+        if (mediaPaths[i] == path) {
+            currentIndex =
+                (int)i;
+            break;
+        }
+    }
+
+    if (currentIndex < 0) {
+        playerServer->send(
+            404,
+            "application/json; charset=utf-8",
+            "{\"error\":\"media file not found in active filter\"}"
+        );
+        return;
+    }
+
+    String previousPath;
+    String nextPath;
+
+    if (currentIndex > 0) {
+        previousPath =
+            mediaPaths[
+                (size_t)currentIndex - 1U
+            ];
+    }
+
+    if (
+        (size_t)currentIndex + 1U <
+        mediaPaths.size()
+    ) {
+        nextPath =
+            mediaPaths[
+                (size_t)currentIndex + 1U
+            ];
+    }
+
+    String json;
+    json.reserve(
+        160 +
+        previousPath.length() +
+        nextPath.length()
+    );
+
+    json +=
+        "{\"mode\":\"" +
+        playerJsonEscape(mode) +
+        "\",\"previous\":";
+
+    if (previousPath.length()) {
+        json +=
+            "\"" +
+            playerJsonEscape(previousPath) +
+            "\"";
+    } else {
+        json += "null";
+    }
+
+    json +=
+        ",\"next\":";
+
+    if (nextPath.length()) {
+        json +=
+            "\"" +
+            playerJsonEscape(nextPath) +
+            "\"";
+    } else {
+        json += "null";
+    }
+
+    json += "}";
+
+    playerServer->sendHeader(
+        "Cache-Control",
+        "no-store"
+    );
+
+    playerServer->send(
+        200,
+        "application/json; charset=utf-8",
+        json
+    );
+}
+
+
+// =============================================================
 // PLAYER HTML PAGE
 // =============================================================
 
@@ -4738,14 +5044,15 @@ static void handlePlayerPage()
         !validRecordingPath(path) ||
         (
             !isAviPath(path) &&
-            !isMkvPath(path)
+            !isMkvPath(path) &&
+            !isJpegPath(path)
         )
     ) {
 
         playerServer->send(
             400,
             "text/plain; charset=utf-8",
-            "Invalid recording path"
+            "Invalid media path"
         );
 
         return;
@@ -4886,6 +5193,30 @@ h2{
     border-radius:10px;
     box-shadow:0 2px 12px rgba(16,24,40,.08);
 }
+.media-nav-layout{
+    display:grid;
+    grid-template-columns:minmax(92px,auto) minmax(0,1fr) minmax(92px,auto);
+    gap:10px;
+    align-items:center;
+}
+.media-nav-link{
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    min-height:54px;
+    padding:10px 12px;
+    border-radius:8px;
+    background:#e9edf2;
+    color:#1f2933;
+    text-decoration:none;
+    font-weight:700;
+    text-align:center;
+}
+.media-nav-link:hover{filter:brightness(.96);}
+.media-nav-link.disabled{
+    visibility:hidden;
+    pointer-events:none;
+}
 .viewer{
     width:100%;
     max-width:100%;
@@ -4994,6 +5325,8 @@ button:hover{filter:brightness(.96);}
     .dropdown{position:static;min-width:0;margin-top:3px;box-shadow:none;border-color:#566170;}
     .page{margin-top:12px;padding-left:8px;padding-right:8px;}
     .box{padding:15px;border-radius:8px;}
+    .media-nav-layout{grid-template-columns:58px minmax(0,1fr) 58px;gap:5px;}
+    .media-nav-link{min-height:48px;padding:7px 4px;font-size:.72rem;}
 }
 </style>
 </head>
@@ -5040,11 +5373,11 @@ R"HTML(</span></a>
 </div></nav>
 <main class="page"><div class="box">
 
-<h2>Recording Player</h2>
+<h2 id="viewerTitle">Recording Player</h2>
 
 <div class="controls">
-    <button class="playBtn">Play</button>
-    <button class="restartBtn">Restart</button>
+    <button class="playBtn videoOnly">Play</button>
+    <button class="restartBtn videoOnly">Restart</button>
     <button class="downloadBtn">Download</button>
     <button class="deleteBtn">Delete</button>
     <a href="/files"><button type="button">Back</button></a>
@@ -5059,25 +5392,30 @@ R"HTML(</span></a>
     <span class="zoom-hint">Tastatur: - / + / F / 0</span>
 </div>
 
-<div id="viewer" class="viewer fit">
-    <div class="stage-holder">
-        <div class="stage" id="stage">
-            <img id="frame" alt="Video frame">
-            <div id="timestamp"></div>
+<div class="media-nav-layout">
+    <a id="prevMediaLink" class="media-nav-link disabled" href="#" aria-disabled="true">&#9664; Previous</a>
+    <div id="viewer" class="viewer fit">
+        <div class="stage-holder">
+            <div class="stage" id="stage">
+                <img id="frame" alt="Media">
+                <div id="timestamp"></div>
+            </div>
         </div>
     </div>
+    <a id="nextMediaLink" class="media-nav-link disabled" href="#" aria-disabled="true">Next &#9654;</a>
 </div>
 
 <div class="controls">
-    <button class="playBtn">Play</button>
-    <button class="restartBtn">Restart</button>
+    <button class="playBtn videoOnly">Play</button>
+    <button class="restartBtn videoOnly">Restart</button>
     <button class="downloadBtn">Download</button>
     <button class="deleteBtn">Delete</button>
     <a href="/files"><button type="button">Back</button></a>
-    <br>
-    <input id="seek" type="range" min="0" max="0" value="0">
-    <br>
-    <span id="time">00:00 / 00:00</span>
+    <div class="videoOnly">
+        <input id="seek" type="range" min="0" max="0" value="0">
+        <br>
+        <span id="time">00:00 / 00:00</span>
+    </div>
 </div>
 
 <div id="status">Loading...</div>
@@ -5087,6 +5425,12 @@ R"HTML(</span></a>
 <script>
 const params = new URLSearchParams(location.search);
 const path = params.get('path');
+const requestedMediaMode = params.get('mode') || 'all';
+const mediaMode =
+    requestedMediaMode === 'videos' || requestedMediaMode === 'images'
+        ? requestedMediaMode
+        : 'all';
+const imageMode = /\.jpe?g$/i.test(path || '');
 
 document.addEventListener('click', function(e) {
     const openMenus = document.querySelectorAll('.navdrop[open]');
@@ -5112,6 +5456,9 @@ const zoomInBtn = document.getElementById('zoomInBtn');
 const zoomFitBtn = document.getElementById('zoomFitBtn');
 const zoom100Btn = document.getElementById('zoom100Btn');
 const zoomLabel = document.getElementById('zoomLabel');
+const viewerTitle = document.getElementById('viewerTitle');
+const prevMediaLink = document.getElementById('prevMediaLink');
+const nextMediaLink = document.getElementById('nextMediaLink');
 
 const zoomLevels = [0.5,0.75,1,1.25,1.5,2,2.5];
 const zoomStorageKey = 'sensorforge.viewer.zoom';
@@ -5128,6 +5475,78 @@ let subtitleRequestSerial = 0;
 
 let playbackGeneration = 0;
 let batchController = null;
+
+function viewerUrl(targetPath) {
+    return '/play?path=' +
+        encodeURIComponent(targetPath) +
+        '&mode=' +
+        encodeURIComponent(mediaMode);
+}
+
+function snapshotTimestampTextFromPath(targetPath) {
+    if (!targetPath)
+        return '';
+
+    const match = String(targetPath).match(
+        /\/(\d{8})\/(\d{6})\.(?:jpe?g)$/i
+    );
+
+    if (!match)
+        return '';
+
+    const day = match[1];
+    const time = match[2];
+
+    return (
+        day.substring(0, 4) + '-' +
+        day.substring(4, 6) + '-' +
+        day.substring(6, 8) + ' ' +
+        time.substring(0, 2) + ':' +
+        time.substring(2, 4) + ':' +
+        time.substring(4, 6)
+    );
+}
+
+function setNeighborLink(link, targetPath) {
+    if (!link) return;
+
+    if (!targetPath) {
+        link.classList.add('disabled');
+        link.setAttribute('aria-disabled','true');
+        link.href = '#';
+        return;
+    }
+
+    link.href = viewerUrl(targetPath);
+    link.classList.remove('disabled');
+    link.removeAttribute('aria-disabled');
+}
+
+async function initMediaNavigation() {
+    if (!path) return;
+
+    try {
+        const response = await fetch(
+            '/player_neighbors?path=' +
+            encodeURIComponent(path) +
+            '&mode=' +
+            encodeURIComponent(mediaMode) +
+            '&t=' +
+            Date.now(),
+            {cache:'no-store'}
+        );
+
+        if (!response.ok)
+            throw new Error('HTTP ' + response.status);
+
+        const data = await response.json();
+        setNeighborLink(prevMediaLink, data.previous || null);
+        setNeighborLink(nextMediaLink, data.next || null);
+    } catch (e) {
+        setNeighborLink(prevMediaLink, null);
+        setNeighborLink(nextMediaLink, null);
+    }
+}
 
 function readStoredZoom() {
     try {
@@ -6148,7 +6567,7 @@ function removeRecordingFromListCache(recordingPath) {
             0
         ) {
             holder.innerHTML =
-                "<div class='emptyrecording'>Keine Aufnahmen an diesem Tag.</div>";
+                "<div class='emptyrecording'>Keine Aufnahmen oder Snapshots an diesem Tag.</div>";
         }
 
 
@@ -6165,7 +6584,7 @@ async function deleteRecording() {
     if (!path)
         return;
 
-    if (!confirm('Delete this recording?'))
+    if (!confirm(imageMode ? 'Delete this snapshot?' : 'Delete this recording?'))
         return;
 
 
@@ -6388,7 +6807,68 @@ async function initPlayer() {
     if (!path) {
 
         statusEl.textContent =
-            'Missing recording path';
+            'Missing media path';
+
+        return;
+    }
+
+    initMediaNavigation();
+
+    if (imageMode) {
+        if (viewerTitle)
+            viewerTitle.textContent = 'Snapshot Viewer';
+
+        document.querySelectorAll('.videoOnly').forEach(function(element) {
+            element.hidden = true;
+        });
+
+        timestampEl.style.display = 'none';
+        timestampEl.textContent = '';
+
+        try {
+            await new Promise(function(resolve, reject) {
+                frameImg.onload = function() { resolve(); };
+                frameImg.onerror = function() { reject(new Error('Image load failed')); };
+                frameImg.src =
+                    '/file?inline=1&path=' +
+                    encodeURIComponent(path) +
+                    '&t=' +
+                    Date.now();
+            });
+
+            meta = {
+                width: frameImg.naturalWidth || 0,
+                height: frameImg.naturalHeight || 0,
+                fps: 1,
+                frames: 1,
+                duration_ms: 0,
+                format: 'jpg',
+                subtitles: false
+            };
+
+            const snapshotTimestamp =
+                snapshotTimestampTextFromPath(path);
+
+            if (snapshotTimestamp.length) {
+                timestampEl.textContent = snapshotTimestamp;
+                timestampEl.style.display = 'block';
+            }
+
+            applyZoom();
+
+            statusEl.textContent =
+                (meta.width && meta.height
+                    ? meta.width + 'x' + meta.height + ' | '
+                    : '') +
+                'JPG snapshot';
+
+        } catch (e) {
+            timestampEl.style.display = 'none';
+            timestampEl.textContent = '';
+            statusEl.textContent =
+                'Image error: ' +
+                e.message;
+        }
 
         return;
     }
@@ -6506,6 +6986,13 @@ void webPlayerRegisterRoutes(
         "/play",
         HTTP_GET,
         handlePlayerPage
+    );
+
+
+    server.on(
+        "/player_neighbors",
+        HTTP_GET,
+        handlePlayerNeighbors
     );
 
 

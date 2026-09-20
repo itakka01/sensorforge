@@ -96,7 +96,9 @@ static bool isVideoName(
 
     return
         lower.endsWith(".avi") ||
-        lower.endsWith(".mkv");
+        lower.endsWith(".mkv") ||
+        lower.endsWith(".jpg") ||
+        lower.endsWith(".jpeg");
 }
 
 
@@ -110,7 +112,9 @@ static bool isTemporaryRecordingName(
     return
         lower.endsWith(".avi.part") ||
         lower.endsWith(".mkv.part") ||
-        lower.endsWith(".srt.part");
+        lower.endsWith(".srt.part") ||
+        lower.endsWith(".jpg.part") ||
+        lower.endsWith(".jpeg.part");
 }
 
 

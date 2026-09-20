@@ -26,7 +26,8 @@ extern int cfg_post_ms;
 extern int cfg_led_enabled;
 extern String cfg_recording_format;   // "avi" or "mkv"
 extern int cfg_timestamp_enabled;     // 0/1
-extern int cfg_recording_encryption;  // 0/1, encrypt newly created video files on SD
+extern int cfg_recording_encryption;  // 0/1, encrypt newly created video/snapshot media on SD
+extern int cfg_periodic_snapshot_minutes; // 0 = off, fixed periodic JPEG schedule in minutes
 extern int cfg_recording_segment_seconds; // 0 = unlimited
 extern int cfg_recording_segment_max_mb;  // 0 = unlimited
 // Maximum duration of one complete motion event across segment rotations.
