@@ -41,8 +41,11 @@ static uint8_t workBlockMeans[IMAGE_MOTION_GRID_CELLS] = {};
 // exposure drift or a slow real object cannot inflate the noise threshold.
 static uint8_t previousBlockMeans[IMAGE_MOTION_GRID_CELLS] = {};
 static bool previousFrameReady = false;
+static uint32_t previousFrameCapturedMs = 0;
 static uint8_t workAbsDiff[IMAGE_MOTION_GRID_CELLS] = {};
 static bool workChanged[IMAGE_MOTION_GRID_CELLS] = {};
+static uint8_t workFrameAbsDiff[IMAGE_MOTION_GRID_CELLS] = {};
+static bool workFrameChanged[IMAGE_MOTION_GRID_CELLS] = {};
 static bool workVisited[IMAGE_MOTION_GRID_CELLS] = {};
 static uint16_t workStack[IMAGE_MOTION_GRID_CELLS] = {};
 
@@ -132,6 +135,19 @@ static void captureDiagnosticSample(
     sample.dynamicThresholdMax = diagnostics.dynamicThresholdMax;
     sample.meanAbsDiffX10 = diagnostics.meanAbsDiffX10;
     sample.maxAbsDiff = diagnostics.maxAbsDiff;
+    sample.frameDeltaIntervalMs = clampU16(diagnostics.frameDeltaIntervalMs);
+    sample.frameDeltaThreshold = diagnostics.frameDeltaThreshold;
+    sample.frameChangedBlocks = diagnostics.frameChangedBlocks;
+    sample.frameLargestClusterBlocks = diagnostics.frameLargestClusterBlocks;
+    sample.frameMeanAbsDiffX10 = diagnostics.frameMeanAbsDiffX10;
+    sample.frameMaxAbsDiff = diagnostics.frameMaxAbsDiff;
+    sample.frameDiffGe5 = diagnostics.frameDiffGe5;
+    sample.frameDiffGe10 = diagnostics.frameDiffGe10;
+    sample.frameDiffGe15 = diagnostics.frameDiffGe15;
+    sample.frameDiffGe20 = diagnostics.frameDiffGe20;
+    sample.frameClusterGe10 = diagnostics.frameClusterGe10;
+    sample.frameClusterGe15 = diagnostics.frameClusterGe15;
+    sample.frameClusterGe20 = diagnostics.frameClusterGe20;
     sample.diffGe5 = diagnostics.diffGe5;
     sample.diffGe10 = diagnostics.diffGe10;
     sample.diffGe15 = diagnostics.diffGe15;
@@ -154,12 +170,16 @@ static void captureDiagnosticSample(
     sample.rejectReason = (uint8_t)diagnostics.rejectReason;
     sample.flags =
         (diagnostics.backgroundReady ? 0x01U : 0U) |
-        (diagnostics.motionActive ? 0x02U : 0U);
+        (diagnostics.motionActive ? 0x02U : 0U) |
+        (diagnostics.frameDeltaReady ? 0x04U : 0U);
 
     memset(sample.changedMask, 0, sizeof(sample.changedMask));
+    memset(sample.frameChangedMask, 0, sizeof(sample.frameChangedMask));
     for (uint16_t i = 0; i < IMAGE_MOTION_GRID_CELLS; ++i) {
         if (workChanged[i])
             sample.changedMask[i >> 3] |= (uint8_t)(1U << (i & 7U));
+        if (workFrameChanged[i])
+            sample.frameChangedMask[i >> 3] |= (uint8_t)(1U << (i & 7U));
     }
 
     diagnosticBuffer[diagnosticHead] = sample;
@@ -219,6 +239,7 @@ static void resetLearnedState()
     releaseCounterState = 0;
     motionActiveState = false;
     previousFrameReady = false;
+    previousFrameCapturedMs = 0;
     memset(previousBlockMeans, 0, sizeof(previousBlockMeans));
     lastRecordingAnalyzeMs = 0;
     lastConfirmedDetectionMs = 0;
@@ -447,6 +468,72 @@ static uint16_t largestConnectedClusterAtDifference(
     return largest;
 }
 
+static uint16_t largestConnectedFrameClusterAtDifference(
+    uint8_t minimumDifference,
+    const uint8_t roiMask[IMAGE_MOTION_ROI_BYTES]
+)
+{
+    memset(workVisited, 0, sizeof(workVisited));
+    uint16_t largest = 0;
+
+    for (uint16_t start = 0; start < IMAGE_MOTION_GRID_CELLS; ++start) {
+        if (workVisited[start] || workFrameAbsDiff[start] < minimumDifference)
+            continue;
+        if ((roiMask[start >> 3] & (1U << (start & 7U))) == 0)
+            continue;
+
+        uint16_t count = 0;
+        uint16_t top = 0;
+        workStack[top++] = start;
+        workVisited[start] = true;
+
+        while (top > 0) {
+            uint16_t index = workStack[--top];
+            ++count;
+
+            int x = index % IMAGE_MOTION_GRID_WIDTH;
+            int y = index / IMAGE_MOTION_GRID_WIDTH;
+
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0)
+                        continue;
+
+                    int nx = x + dx;
+                    int ny = y + dy;
+                    if (
+                        nx < 0 || nx >= IMAGE_MOTION_GRID_WIDTH ||
+                        ny < 0 || ny >= IMAGE_MOTION_GRID_HEIGHT
+                    ) {
+                        continue;
+                    }
+
+                    uint16_t next =
+                        (uint16_t)ny * IMAGE_MOTION_GRID_WIDTH +
+                        (uint16_t)nx;
+
+                    if (
+                        workVisited[next] ||
+                        workFrameAbsDiff[next] < minimumDifference ||
+                        (roiMask[next >> 3] & (1U << (next & 7U))) == 0
+                    ) {
+                        continue;
+                    }
+
+                    workVisited[next] = true;
+                    workStack[top++] = next;
+                }
+            }
+        }
+
+        if (count > largest)
+            largest = count;
+    }
+
+    return largest;
+}
+
+
 static uint16_t sensitivityThreshold(uint8_t sensitivity, float globalMean)
 {
     if (sensitivity < 1)
@@ -543,6 +630,7 @@ static void initializeBackground(
         noiseQ8[i] = 2U << 8;
     }
     previousFrameReady = true;
+    previousFrameCapturedMs = millis();
 
     backgroundReadyState = true;
     confirmCounterState = 0;
@@ -770,6 +858,8 @@ bool imageMotionAnalyzeJpeg(
     memset(workBlockMeans, 0, sizeof(workBlockMeans));
     memset(workAbsDiff, 0, sizeof(workAbsDiff));
     memset(workChanged, 0, sizeof(workChanged));
+    memset(workFrameAbsDiff, 0, sizeof(workFrameAbsDiff));
+    memset(workFrameChanged, 0, sizeof(workFrameChanged));
 
     for (uint16_t y = 0; y < scaledHeight; ++y) {
         uint8_t by = (uint8_t)(
@@ -843,6 +933,82 @@ bool imageMotionAnalyzeJpeg(
 
     diagnostics.blockThreshold = baseThreshold;
     diagnostics.minimumMotionBlocks = minimumMotionBlocks(activeBlocks);
+
+    // Diagnostic-only true motion estimate: compare the current analyzed frame
+    // with the immediately preceding analyzed frame. This intentionally does
+    // not affect the existing background-model decision yet. At sensitivity 5
+    // the diagnostic threshold is ~13 gray levels, low enough to show real
+    // inter-frame motion while normal OV3660/JPEG jitter stays well below it.
+    uint16_t frameDeltaThreshold = (uint16_t)max(
+        6,
+        ((int)baseThreshold + 1) / 2
+    );
+    diagnostics.frameDeltaThreshold = frameDeltaThreshold;
+
+    if (previousFrameReady) {
+        diagnostics.frameDeltaReady = true;
+        if (previousFrameCapturedMs != 0)
+            diagnostics.frameDeltaIntervalMs = (uint32_t)(startedMs - previousFrameCapturedMs);
+
+        uint16_t frameChangedBlocks = 0;
+        uint32_t frameAbsDiffSum = 0;
+        uint16_t frameMaxAbsDiff = 0;
+        uint16_t frameDiffGe5 = 0;
+        uint16_t frameDiffGe10 = 0;
+        uint16_t frameDiffGe15 = 0;
+        uint16_t frameDiffGe20 = 0;
+
+        for (uint16_t i = 0; i < IMAGE_MOTION_GRID_CELLS; ++i) {
+            if ((roiMask[i >> 3] & (1U << (i & 7U))) == 0)
+                continue;
+
+            uint16_t difference = (uint16_t)abs(
+                (int)workBlockMeans[i] -
+                (int)previousBlockMeans[i]
+            );
+            workFrameAbsDiff[i] = (uint8_t)min((uint16_t)255U, difference);
+            frameAbsDiffSum += difference;
+            if (difference > frameMaxAbsDiff)
+                frameMaxAbsDiff = difference;
+            if (difference >= 5U) ++frameDiffGe5;
+            if (difference >= 10U) ++frameDiffGe10;
+            if (difference >= 15U) ++frameDiffGe15;
+            if (difference >= 20U) ++frameDiffGe20;
+
+            if (difference >= frameDeltaThreshold) {
+                workFrameChanged[i] = true;
+                ++frameChangedBlocks;
+            }
+        }
+
+        uint16_t frameLargestCluster = largestConnectedCluster(
+            workFrameChanged,
+            roiMask
+        );
+
+        diagnostics.frameChangedBlocks = frameChangedBlocks;
+        diagnostics.frameLargestClusterBlocks = frameLargestCluster;
+        diagnostics.frameMeanAbsDiffX10 =
+            activeBlocks > 0
+            ? (uint16_t)((frameAbsDiffSum * 10UL + activeBlocks / 2U) / activeBlocks)
+            : 0;
+        diagnostics.frameMaxAbsDiff = frameMaxAbsDiff;
+        diagnostics.frameDiffGe5 = frameDiffGe5;
+        diagnostics.frameDiffGe10 = frameDiffGe10;
+        diagnostics.frameDiffGe15 = frameDiffGe15;
+        diagnostics.frameDiffGe20 = frameDiffGe20;
+        diagnostics.frameClusterGe10 = largestConnectedFrameClusterAtDifference(10U, roiMask);
+        diagnostics.frameClusterGe15 = largestConnectedFrameClusterAtDifference(15U, roiMask);
+        diagnostics.frameClusterGe20 = largestConnectedFrameClusterAtDifference(20U, roiMask);
+        diagnostics.frameChangedPct =
+            activeBlocks > 0
+            ? ((float)frameChangedBlocks * 100.0f) / (float)activeBlocks
+            : 0.0f;
+        diagnostics.frameClusterPct =
+            activeBlocks > 0
+            ? ((float)frameLargestCluster * 100.0f) / (float)activeBlocks
+            : 0.0f;
+    }
 
     uint16_t changedBlocks = 0;
     int64_t backgroundGlobalSum = 0;
@@ -981,6 +1147,7 @@ bool imageMotionAnalyzeJpeg(
         diagnostics.analyzeFrameMs = millis() - startedMs;
         memcpy(previousBlockMeans, workBlockMeans, sizeof(previousBlockMeans));
         previousFrameReady = true;
+        previousFrameCapturedMs = millis();
         lastDiagnostics = diagnostics;
         lastAnalysisCompletedMs = millis();
         captureDiagnosticSample(diagnostics, sourceWidth, sourceHeight);
@@ -1073,6 +1240,7 @@ bool imageMotionAnalyzeJpeg(
 
     memcpy(previousBlockMeans, workBlockMeans, sizeof(previousBlockMeans));
     previousFrameReady = true;
+    previousFrameCapturedMs = millis();
 
     diagnostics.confirmCounter = confirmCounterState;
     diagnostics.releaseCounter = releaseCounterState;
@@ -1130,6 +1298,11 @@ bool imageMotionMotionActive()
     return motionActiveState;
 }
 
+uint32_t imageMotionLastAnalysisCompletedMs()
+{
+    return lastAnalysisCompletedMs;
+}
+
 const ImageMotionDiagnostics &imageMotionLastDiagnostics()
 {
     return lastDiagnostics;
@@ -1170,7 +1343,7 @@ String imageMotionDiagnosticsJson()
     const ImageMotionDiagnostics &d = lastDiagnostics;
 
     String json;
-    json.reserve(640);
+    json.reserve(1100);
     json += "{";
     json += "\"analyze_frame_ms\":" + String(d.analyzeFrameMs);
     json += ",\"decode_ms\":" + String(d.decodeMs);
@@ -1188,6 +1361,22 @@ String imageMotionDiagnosticsJson()
     json += ",\"dynamic_threshold_max\":" + String(d.dynamicThresholdMax);
     json += ",\"mean_abs_diff\":" + String((float)d.meanAbsDiffX10 / 10.0f, 1);
     json += ",\"max_abs_diff\":" + String(d.maxAbsDiff);
+    json += ",\"frame_delta_ready\":" + String(d.frameDeltaReady ? "true" : "false");
+    json += ",\"frame_delta_interval_ms\":" + String(d.frameDeltaIntervalMs);
+    json += ",\"frame_delta_threshold\":" + String(d.frameDeltaThreshold);
+    json += ",\"frame_changed_blocks\":" + String(d.frameChangedBlocks);
+    json += ",\"frame_changed_pct\":" + String(d.frameChangedPct, 2);
+    json += ",\"frame_largest_cluster_blocks\":" + String(d.frameLargestClusterBlocks);
+    json += ",\"frame_cluster_pct\":" + String(d.frameClusterPct, 2);
+    json += ",\"frame_mean_abs_diff\":" + String((float)d.frameMeanAbsDiffX10 / 10.0f, 1);
+    json += ",\"frame_max_abs_diff\":" + String(d.frameMaxAbsDiff);
+    json += ",\"frame_diff_ge_5\":" + String(d.frameDiffGe5);
+    json += ",\"frame_diff_ge_10\":" + String(d.frameDiffGe10);
+    json += ",\"frame_diff_ge_15\":" + String(d.frameDiffGe15);
+    json += ",\"frame_diff_ge_20\":" + String(d.frameDiffGe20);
+    json += ",\"frame_cluster_ge_10\":" + String(d.frameClusterGe10);
+    json += ",\"frame_cluster_ge_15\":" + String(d.frameClusterGe15);
+    json += ",\"frame_cluster_ge_20\":" + String(d.frameClusterGe20);
     json += ",\"diff_ge_5\":" + String(d.diffGe5);
     json += ",\"diff_ge_10\":" + String(d.diffGe10);
     json += ",\"diff_ge_15\":" + String(d.diffGe15);

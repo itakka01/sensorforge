@@ -52,6 +52,27 @@ struct ImageMotionDiagnostics {
     uint16_t dynamicThresholdMax = 0;
     uint16_t meanAbsDiffX10 = 0;
     uint16_t maxAbsDiff = 0;
+
+    // Diagnostic-only frame-to-frame motion. These values compare the current
+    // analyzed 20x15 block means with the immediately preceding analyzed frame.
+    // They do not currently influence motionActive/state.
+    uint32_t frameDeltaIntervalMs = 0;
+    uint16_t frameDeltaThreshold = 0;
+    uint16_t frameChangedBlocks = 0;
+    uint16_t frameLargestClusterBlocks = 0;
+    uint16_t frameMeanAbsDiffX10 = 0;
+    uint16_t frameMaxAbsDiff = 0;
+    uint16_t frameDiffGe5 = 0;
+    uint16_t frameDiffGe10 = 0;
+    uint16_t frameDiffGe15 = 0;
+    uint16_t frameDiffGe20 = 0;
+    uint16_t frameClusterGe10 = 0;
+    uint16_t frameClusterGe15 = 0;
+    uint16_t frameClusterGe20 = 0;
+    float frameChangedPct = 0.0f;
+    float frameClusterPct = 0.0f;
+    bool frameDeltaReady = false;
+
     uint16_t diffGe5 = 0;
     uint16_t diffGe10 = 0;
     uint16_t diffGe15 = 0;
@@ -97,6 +118,21 @@ struct ImageMotionDiagnosticSample {
     uint16_t dynamicThresholdMax = 0;
     uint16_t meanAbsDiffX10 = 0;
     uint16_t maxAbsDiff = 0;
+
+    uint16_t frameDeltaIntervalMs = 0;
+    uint16_t frameDeltaThreshold = 0;
+    uint16_t frameChangedBlocks = 0;
+    uint16_t frameLargestClusterBlocks = 0;
+    uint16_t frameMeanAbsDiffX10 = 0;
+    uint16_t frameMaxAbsDiff = 0;
+    uint16_t frameDiffGe5 = 0;
+    uint16_t frameDiffGe10 = 0;
+    uint16_t frameDiffGe15 = 0;
+    uint16_t frameDiffGe20 = 0;
+    uint16_t frameClusterGe10 = 0;
+    uint16_t frameClusterGe15 = 0;
+    uint16_t frameClusterGe20 = 0;
+
     uint16_t diffGe5 = 0;
     uint16_t diffGe10 = 0;
     uint16_t diffGe15 = 0;
@@ -119,6 +155,7 @@ struct ImageMotionDiagnosticSample {
     uint8_t rejectReason = 0;
     uint8_t flags = 0;
     uint8_t changedMask[IMAGE_MOTION_ROI_BYTES] = {};
+    uint8_t frameChangedMask[IMAGE_MOTION_ROI_BYTES] = {};
 };
 
 String imageMotionDefaultRoiMask();
@@ -150,6 +187,7 @@ void imageMotionObserveRecordingJpeg(
 );
 
 bool imageMotionMotionActive();
+uint32_t imageMotionLastAnalysisCompletedMs();
 
 const ImageMotionDiagnostics &imageMotionLastDiagnostics();
 const char *imageMotionStateName(ImageMotionState state);

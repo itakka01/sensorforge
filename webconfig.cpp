@@ -9088,6 +9088,8 @@ static void handleImageMotionStatus()
         String(imageMotionDiagnosticCount()) +
         ",\"diag_capacity\":" +
         String(imageMotionDiagnosticCapacity()) +
+        ",\"analysis_stamp_ms\":" +
+        String(imageMotionLastAnalysisCompletedMs()) +
         ",\"diagnostics\":" +
         imageMotionDiagnosticsJson() +
         "}";
@@ -9171,15 +9173,17 @@ static void handleImageMotionDiagnosticDownload()
     server.send(200, "text/plain; charset=utf-8", "");
 
     String line;
-    line.reserve(1200);
+    line.reserve(1900);
 
     line =
         "# SensorForge Image Motion RAM Diagnostic\n"
         "# RAM-only ring buffer; no SD/main-log writes.\n"
         "# One row is one analyzed JPEG frame; oldest retained sample first.\n"
-        "# changed = blocks above the real adaptive per-block threshold.\n"
+        "# changed = blocks above the real adaptive per-block threshold against the learned background.\n"
+        "# frame_delta = diagnostic-only difference to the immediately previous analyzed frame; it does NOT yet influence motion_active/state.\n"
         "# diff_ge_N = ROI blocks whose absolute gray difference from the learned background is >= N, before the adaptive threshold is applied.\n"
-        "# changed_mask_hex = one bit per 20x15 grid cell after the real adaptive threshold; bit 0 is cell 0.\n";
+        "# frame_diff_ge_N = ROI blocks whose frame-to-frame gray difference is >= N.\n"
+        "# changed_mask_hex/frame_changed_mask_hex = one bit per 20x15 grid cell; bit 0 is cell 0.\n";
     server.sendContent(line);
 
     line =
@@ -9202,7 +9206,7 @@ static void handleImageMotionDiagnosticDownload()
     server.sendContent(line);
 
     server.sendContent(
-        "seq\ttime\tuptime_ms\tsource_px\tstate\treject\tbackground_ready\tmotion_active\tconfirm\trelease\tactive_blocks\tchanged_blocks\ttotal_changed_pct\tlargest_cluster\tcluster_pct\tminimum_blocks\tbase_threshold\tdynamic_threshold_min\tdynamic_threshold_avg\tdynamic_threshold_max\tmean_abs_diff\tmax_abs_diff\tdiff_ge_5\tdiff_ge_10\tdiff_ge_15\tdiff_ge_20\tdiff_ge_25\tdiff_ge_30\tdiff_ge_35\tdiff_ge_40\tcluster_ge_10\tcluster_ge_15\tcluster_ge_20\tcluster_ge_25\tcluster_ge_30\tcluster_ge_35\tglobal_mean\tbackground_mean\tglobal_mean_delta\tanalyze_ms\tdecode_ms\tchanged_mask_hex\n"
+        "seq\ttime\tuptime_ms\tsource_px\tstate\treject\tbackground_ready\tmotion_active\tconfirm\trelease\tactive_blocks\tchanged_blocks\ttotal_changed_pct\tlargest_cluster\tcluster_pct\tminimum_blocks\tbase_threshold\tdynamic_threshold_min\tdynamic_threshold_avg\tdynamic_threshold_max\tmean_abs_diff\tmax_abs_diff\tframe_delta_ready\tframe_interval_ms\tframe_threshold\tframe_changed_blocks\tframe_changed_pct\tframe_largest_cluster\tframe_cluster_pct\tframe_mean_abs_diff\tframe_max_abs_diff\tframe_diff_ge_5\tframe_diff_ge_10\tframe_diff_ge_15\tframe_diff_ge_20\tframe_cluster_ge_10\tframe_cluster_ge_15\tframe_cluster_ge_20\tdiff_ge_5\tdiff_ge_10\tdiff_ge_15\tdiff_ge_20\tdiff_ge_25\tdiff_ge_30\tdiff_ge_35\tdiff_ge_40\tcluster_ge_10\tcluster_ge_15\tcluster_ge_20\tcluster_ge_25\tcluster_ge_30\tcluster_ge_35\tglobal_mean\tbackground_mean\tglobal_mean_delta\tanalyze_ms\tdecode_ms\tchanged_mask_hex\tframe_changed_mask_hex\n"
     );
 
     for (uint16_t index = 0; index < count; ++index) {
@@ -9215,6 +9219,12 @@ static void handleImageMotionDiagnosticDownload()
             : 0.0f;
         float clusterPct = sample.activeRoiBlocks > 0
             ? ((float)sample.largestClusterBlocks * 100.0f) / (float)sample.activeRoiBlocks
+            : 0.0f;
+        float frameChangedPct = sample.activeRoiBlocks > 0
+            ? ((float)sample.frameChangedBlocks * 100.0f) / (float)sample.activeRoiBlocks
+            : 0.0f;
+        float frameClusterPct = sample.activeRoiBlocks > 0
+            ? ((float)sample.frameLargestClusterBlocks * 100.0f) / (float)sample.activeRoiBlocks
             : 0.0f;
         int16_t backgroundMeanX10 = (int16_t)(
             (int32_t)sample.globalMeanX10 -
@@ -9244,6 +9254,22 @@ static void handleImageMotionDiagnosticDownload()
             String(sample.dynamicThresholdMax) + "\t" +
             String((float)sample.meanAbsDiffX10 / 10.0f, 1) + "\t" +
             String(sample.maxAbsDiff) + "\t" +
+            String((sample.flags & 0x04U) ? "1" : "0") + "\t" +
+            String(sample.frameDeltaIntervalMs) + "\t" +
+            String(sample.frameDeltaThreshold) + "\t" +
+            String(sample.frameChangedBlocks) + "\t" +
+            String(frameChangedPct, 1) + "\t" +
+            String(sample.frameLargestClusterBlocks) + "\t" +
+            String(frameClusterPct, 1) + "\t" +
+            String((float)sample.frameMeanAbsDiffX10 / 10.0f, 1) + "\t" +
+            String(sample.frameMaxAbsDiff) + "\t" +
+            String(sample.frameDiffGe5) + "\t" +
+            String(sample.frameDiffGe10) + "\t" +
+            String(sample.frameDiffGe15) + "\t" +
+            String(sample.frameDiffGe20) + "\t" +
+            String(sample.frameClusterGe10) + "\t" +
+            String(sample.frameClusterGe15) + "\t" +
+            String(sample.frameClusterGe20) + "\t" +
             String(sample.diffGe5) + "\t" +
             String(sample.diffGe10) + "\t" +
             String(sample.diffGe15) + "\t" +
@@ -9263,7 +9289,8 @@ static void handleImageMotionDiagnosticDownload()
             imageMotionDiagnosticDeci(sample.globalMeanDeltaX10) + "\t" +
             String(sample.analyzeFrameMs) + "\t" +
             String(sample.decodeMs) + "\t" +
-            imageMotionDiagnosticMaskHex(sample.changedMask) +
+            imageMotionDiagnosticMaskHex(sample.changedMask) + "\t" +
+            imageMotionDiagnosticMaskHex(sample.frameChangedMask) +
             "\n";
 
         server.sendContent(line);
@@ -9314,36 +9341,32 @@ static void handleImageMotionPage()
 
         html += R"HTML(
 <style>
-.im-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:14px 0}.im-card{border:1px solid #d7dde5;border-radius:10px;padding:14px;background:#fff}.im-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.im-field{border:1px solid #e5e7eb;border-radius:8px;padding:10px;background:#fafbfc}.im-label-row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}.im-label-row label{font-weight:600}.im-help{font-size:.86rem;line-height:1.35;color:#5f6b7a;margin-top:6px}.im-info{flex:0 0 auto;width:26px;height:26px;padding:0;border-radius:50%;font-weight:700;line-height:24px}.im-stage{position:relative;display:inline-block;max-width:100%;touch-action:none}.im-stage img{display:block;max-width:100%;height:auto}.im-stage canvas{position:absolute;inset:0;width:100%;height:100%;cursor:crosshair;touch-action:none}.im-actions{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0}.im-legend{display:flex;flex-wrap:wrap;gap:10px;margin:8px 0 12px}.im-legend span{display:inline-flex;align-items:center;gap:6px;font-size:.86rem}.im-swatch{width:18px;height:14px;border:1px solid #9ca3af;border-radius:3px;background:#fff}.im-swatch.excluded{background:rgba(220,38,38,.35)}.im-result{border:1px solid #d7dde5;border-radius:8px;padding:12px;background:#f8fafc;margin:10px 0}.im-result-title{font-weight:700;margin-bottom:6px}.im-result-text{font-size:1rem;margin-bottom:8px}.im-result-meta{display:flex;flex-wrap:wrap;gap:8px 16px;font-size:.88rem;color:#4b5563}.im-live-grid{display:grid;grid-template-columns:minmax(230px,42%) minmax(0,1fr);gap:9px 18px;align-items:start}.im-live-label{font-weight:700;white-space:normal;overflow-wrap:anywhere}.im-live-value{min-width:0;min-height:1.45em;overflow-wrap:anywhere}.im-live-card{margin:14px 0}.im-diag{white-space:pre-wrap;overflow-wrap:anywhere;background:#111827;color:#e5e7eb;padding:12px;border-radius:8px;min-height:100px;font-family:monospace;font-size:.82rem}.im-details{margin-top:10px}.im-details summary{cursor:pointer;font-weight:600}.im-modal-backdrop{position:fixed;inset:0;background:rgba(15,23,42,.5);display:none;align-items:center;justify-content:center;padding:18px;z-index:10000}.im-modal-backdrop.open{display:flex}.im-modal{width:min(560px,100%);max-height:80vh;overflow:auto;background:#fff;border-radius:12px;padding:18px;box-shadow:0 18px 50px rgba(0,0,0,.25)}.im-modal h3{margin-top:0}.im-modal-actions{display:flex;justify-content:flex-end;margin-top:14px}@media(max-width:760px){.im-grid,.im-fields{grid-template-columns:1fr}.im-live-grid{grid-template-columns:1fr;gap:3px}.im-live-label{margin-top:7px}.im-live-value{padding-bottom:3px}}
+.im-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:12px 0}.im-card{border:1px solid #d7dde5;border-radius:10px;padding:14px;background:#fff}.im-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.im-field{border:1px solid #e5e7eb;border-radius:8px;padding:10px;background:#fafbfc}.im-label-row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}.im-label-row label{font-weight:600}.im-help{font-size:.86rem;line-height:1.35;color:#5f6b7a;margin-top:6px}.im-info{flex:0 0 auto;width:26px;height:26px;padding:0;border-radius:50%;font-weight:700;line-height:24px}.im-stage{position:relative;display:inline-block;max-width:100%;touch-action:none}.im-stage img{display:block;max-width:100%;height:auto}.im-stage canvas{position:absolute;inset:0;width:100%;height:100%;cursor:crosshair;touch-action:none}.im-actions{display:flex;flex-wrap:wrap;gap:8px;margin:9px 0}.im-legend{display:flex;flex-wrap:wrap;gap:10px;margin:0 0 8px}.im-legend span{display:inline-flex;align-items:center;gap:6px;font-size:.86rem}.im-roi-hint{font-size:.84rem;line-height:1.25;margin:5px 0 8px}.im-swatch{width:18px;height:14px;border:1px solid #9ca3af;border-radius:3px;background:#fff}.im-swatch.excluded{background:rgba(220,38,38,.35)}.im-result{border:1px solid #d7dde5;border-radius:8px;padding:12px;background:#f8fafc;margin:10px 0}.im-result-title{font-weight:700;margin-bottom:6px}.im-result-text{font-size:1rem;margin-bottom:8px}.im-result-meta{display:flex;flex-wrap:wrap;gap:8px 16px;font-size:.88rem;color:#4b5563}.im-live-card{margin:10px 0;padding:10px 12px}.im-live-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:7px}.im-live-title{display:flex;align-items:center;gap:7px}.im-live-head h3{margin:0}.im-live-pulse{font-size:.72rem;line-height:1;opacity:.22;transition:opacity .08s}.im-live-pulse.tick{opacity:1}.im-live-tools{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;font-size:.84rem}.im-live-tools button{padding:6px 10px;margin:0}.im-live-grid{display:grid;grid-template-columns:minmax(205px,38%) minmax(0,1fr);gap:5px 14px;align-items:center;line-height:1.25}.im-live-label{font-weight:700;white-space:normal;overflow-wrap:anywhere}.im-live-value{min-width:0;min-height:1.25em;overflow-wrap:anywhere}.im-diag{white-space:pre-wrap;overflow-wrap:anywhere;background:#111827;color:#e5e7eb;padding:12px;border-radius:8px;min-height:100px;font-family:monospace;font-size:.82rem}.im-details{margin-top:10px}.im-details summary{cursor:pointer;font-weight:600}.im-modal-backdrop{position:fixed;inset:0;background:rgba(15,23,42,.5);display:none;align-items:center;justify-content:center;padding:18px;z-index:10000}.im-modal-backdrop.open{display:flex}.im-modal{width:min(560px,100%);max-height:80vh;overflow:auto;background:#fff;border-radius:12px;padding:18px;box-shadow:0 18px 50px rgba(0,0,0,.25)}.im-modal h3{margin-top:0}.im-modal-actions{display:flex;justify-content:flex-end;margin-top:14px}@media(max-width:760px){.im-grid,.im-fields{grid-template-columns:1fr}.im-live-head{align-items:flex-start;flex-direction:column}.im-live-tools{justify-content:flex-start}.im-live-grid{grid-template-columns:minmax(145px,42%) minmax(0,1fr);gap:5px 10px}.im-live-label{margin-top:0}.im-live-value{padding-bottom:0}}@media(max-width:480px){.im-live-grid{grid-template-columns:1fr;gap:2px}.im-live-label{margin-top:5px}}
 </style>
 )HTML";
 
         html += "<div class='flash-notice' style='border-left-color:var(--accent);background:#eef4ff'><strong>" +
             htmlText(UI_IMAGE_MOTION_TEST_NOTE) + "</strong></div>";
 
-        html += "<div class='im-card im-live-card'><h3>" +
+        html += "<div class='im-card im-live-card'><div class='im-live-head'><div class='im-live-title'><h3>" +
             htmlText(UI_IMAGE_MOTION_LIVE_TITLE) +
-            "</h3><p class='muted'>" + htmlText(UI_IMAGE_MOTION_TEST_USES_SAVED) + "</p><div class='im-live-grid'>" +
+            "</h3><span id='imLivePulse' class='im-live-pulse' aria-hidden='true'>●</span></div><div class='im-live-tools'><span class='muted'>RAM <b id='imDiagBufferStatus'>0 / " + String(imageMotionDiagnosticCapacity()) + "</b></span>" +
+            "<a href='/image_motion_diag_download'><button type='button'>" + htmlText(UI_IMAGE_MOTION_DIAG_DOWNLOAD) + "</button></a></div></div><div class='im-live-grid'>" +
             "<div class='im-live-label'>" + htmlText(UI_IMAGE_MOTION_LIVE_STATUS) + "</div>" +
             "<div class='im-live-value'><span id='imLiveState' class='status-pill warn'>" + htmlText(UI_IMAGE_MOTION_LIVE_WAITING) + "</span></div>" +
             "<div class='im-live-label'>" + htmlText(UI_IMAGE_MOTION_LIVE_CONFIRMATION) + "</div>" +
             "<div id='imLiveConfirm' class='im-live-value'>0 / " + String(cfg_image_motion_confirm_frames) + "</div>" +
-            "<div class='im-live-label'>" + htmlText(UI_IMAGE_MOTION_LIVE_CHANGED_AREA) + "</div>" +
-            "<div id='imLiveTotalArea' class='im-live-value'>0.0 %</div>" +
-            "<div class='im-live-label'>" + htmlText(UI_IMAGE_MOTION_RESULT_AREA) + "</div>" +
-            "<div id='imLiveArea' class='im-live-value'>0.0 %</div>" +
+            "<div class='im-live-label'>" + htmlText(UI_IMAGE_MOTION_LIVE_CURRENT_MOTION) + "</div>" +
+            "<div id='imLiveFrameMotion' class='im-live-value'>-</div>" +
+            "<div class='im-live-label'>" + htmlText(UI_IMAGE_MOTION_LIVE_BACKGROUND_DIFFERENCE) + "</div>" +
+            "<div id='imLiveBackground' class='im-live-value'>0.0 %</div>" +
             "<div class='im-live-label'>" + htmlText(UI_IMAGE_MOTION_RESULT_LIMIT) + "</div>" +
             "<div id='imLiveLimit' class='im-live-value'>" + String(cfg_image_motion_min_area_pct) + " %</div>" +
             "<div class='im-live-label'>" + htmlText(UI_IMAGE_MOTION_LIVE_LAST_DETECTION) + "</div>" +
             "<div id='imLiveLast' class='im-live-value'>" + htmlText(UI_IMAGE_MOTION_LIVE_NEVER) + "</div>" +
-            "</div><div class='im-actions' style='margin-top:14px'>" +
-            "<a href='/image_motion_diag_download'><button type='button'>" + htmlText(UI_IMAGE_MOTION_DIAG_DOWNLOAD) + "</button></a>" +
-            "<span class='muted'>" + htmlText(UI_IMAGE_MOTION_DIAG_BUFFER) + ": <b id='imDiagBufferStatus'>0 / " + String(imageMotionDiagnosticCapacity()) + "</b></span>" +
             "</div></div>";
 
-        html += "<div class='im-grid'><div class='im-card'><h3>" +
-            htmlText(UI_IMAGE_MOTION_ROI) + "</h3><p class='muted'>" +
-            htmlText(UI_IMAGE_MOTION_ROI_HELP) + "</p>";
+        html += "<div class='im-grid'><div class='im-card'>";
 
         html += "<div class='im-legend'><span><i class='im-swatch'></i>" +
             htmlText(UI_IMAGE_MOTION_ROI_ACTIVE_LEGEND) +
@@ -9354,6 +9377,7 @@ static void handleImageMotionPage()
         html += "<div class='im-stage' id='imStage'><img id='imImage' alt='" +
             htmlText(UI_IMAGE_MOTION_TITLE) +
             "'><canvas id='imCanvas'></canvas></div>";
+        html += "<p class='im-roi-hint muted'>" + htmlText(UI_IMAGE_MOTION_ROI_HELP) + "</p>";
         html += "<div class='im-actions'><button type='button' id='imAll'>" + htmlText(UI_IMAGE_MOTION_SELECT_ALL) +
             "</button><button type='button' id='imClear'>" + htmlText(UI_IMAGE_MOTION_CLEAR) +
             "</button><button type='button' id='imInvert'>" + htmlText(UI_IMAGE_MOTION_INVERT) + "</button></div></div>";
@@ -9434,6 +9458,10 @@ static void handleImageMotionPage()
             "\",resultArea:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESULT_AREA))) +
             "\",resultLimit:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESULT_LIMIT))) +
             "\",liveTotalArea:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_CHANGED_AREA))) +
+            "\",liveCurrentMotion:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_CURRENT_MOTION))) +
+            "\",liveBackgroundDifference:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_BACKGROUND_DIFFERENCE))) +
+            "\",liveTotalShort:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_TOTAL_SHORT))) +
+            "\",liveConnectedShort:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_CONNECTED_SHORT))) +
             "\",liveDetected:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_DETECTED))) +
             "\",liveNone:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_NONE))) +
             "\",liveLearning:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_LEARNING))) +
@@ -9448,7 +9476,7 @@ static void handleImageMotionPage()
         html += R"JS(
 const imImage=document.getElementById('imImage'),imCanvas=document.getElementById('imCanvas'),imCtx=imCanvas.getContext('2d');
 const imStatus=document.getElementById('imStatus'),imDiag=document.getElementById('imDiag'),imResultText=document.getElementById('imResultText'),imResultMeta=document.getElementById('imResultMeta'),imDiagBufferStatus=document.getElementById('imDiagBufferStatus');
-const imLiveState=document.getElementById('imLiveState'),imLiveConfirm=document.getElementById('imLiveConfirm'),imLiveTotalArea=document.getElementById('imLiveTotalArea'),imLiveArea=document.getElementById('imLiveArea'),imLiveLimit=document.getElementById('imLiveLimit'),imLiveLast=document.getElementById('imLiveLast');
+const imLiveState=document.getElementById('imLiveState'),imLiveConfirm=document.getElementById('imLiveConfirm'),imLiveFrameMotion=document.getElementById('imLiveFrameMotion'),imLiveBackground=document.getElementById('imLiveBackground'),imLiveLimit=document.getElementById('imLiveLimit'),imLiveLast=document.getElementById('imLiveLast'),imLivePulse=document.getElementById('imLivePulse');
 const imInfoBackdrop=document.getElementById('imInfoBackdrop'),imInfoTitle=document.getElementById('imInfoTitle'),imInfoBody=document.getElementById('imInfoBody');
 function maskBytes(){const a=[];for(let i=0;i<imMask.length;i+=2)a.push(parseInt(imMask.slice(i,i+2),16)||0);return a}
 function setMaskBytes(a){imMask=a.map(v=>v.toString(16).padStart(2,'0')).join('')}
@@ -9464,9 +9492,11 @@ document.getElementById('imClear').onclick=()=>{setMaskBytes(new Array(38).fill(
 document.getElementById('imInvert').onclick=()=>{const a=maskBytes().map(v=>(~v)&255);a[37]&=15;setMaskBytes(a);drawGrid()};
 function liveAgeText(valid,ms){if(!valid)return IM_TEXT.liveNever;ms=Math.max(0,Number(ms)||0);let v='';if(ms<1000)v='<1 s';else if(ms<60000)v=Math.floor(ms/1000)+' s';else{const sec=Math.floor(ms/1000),min=Math.floor(sec/60),rest=sec%60;v=min+' min '+rest+' s'}return IM_TEXT.ago+(IM_TEXT.ago?' ':'')+v+IM_TEXT.agoSuffix}
 function liveStateText(d){if(d.motion_active||d.image_motion_state==='confirmed')return IM_TEXT.liveDetected;if(d.image_motion_state==='background_init')return IM_TEXT.liveLearning;if(d.image_motion_state==='global_change')return IM_TEXT.liveGlobalLight;if(d.image_motion_state==='error')return IM_TEXT.liveError;return IM_TEXT.liveNone}
-function renderLive(payload){const d=(payload&&payload.diagnostics)||{};const required=Math.max(1,Number((payload&&payload.confirm_required)||0)||1);const current=Math.max(0,Number(d.confirm_counter)||0);const active=Math.max(0,Number(d.active_roi_blocks)||0);const changed=Math.max(0,Number(d.changed_blocks)||0);const cluster=Math.max(0,Number(d.largest_cluster_blocks)||0);const totalPct=Number(d.global_change_pct||0);const clusterPct=Number(d.changed_area_pct||0);if(imLiveState){imLiveState.textContent=liveStateText(d);imLiveState.classList.remove('danger','warn','ok');if(d.motion_active||d.image_motion_state==='confirmed')imLiveState.classList.add('danger');else if(d.image_motion_state==='candidate'||d.image_motion_state==='background_init'||d.image_motion_state==='global_change')imLiveState.classList.add('warn');else if(d.image_motion_state==='error')imLiveState.classList.add('danger');else imLiveState.classList.add('ok')}if(imLiveConfirm){imLiveConfirm.textContent=(d.motion_active||d.image_motion_state==='confirmed')?IM_TEXT.liveConfirmed+' ('+Math.min(required,Math.max(current,required))+' / '+required+')':Math.min(current,required)+' / '+required}if(imLiveTotalArea){imLiveTotalArea.textContent=totalPct.toFixed(1)+' %'+(active?' ('+changed+' / '+active+')':'')}if(imLiveArea){imLiveArea.textContent=clusterPct.toFixed(1)+' %'+(cluster?' ('+cluster+')':'')}if(imLiveLimit){imLiveLimit.textContent=Number((payload&&payload.area_limit_pct)||imSavedMinArea).toFixed(1)+' %'}if(imLiveLast)imLiveLast.textContent=liveAgeText(!!d.last_detection_valid,d.last_detection_age_ms);if(imDiagBufferStatus)imDiagBufferStatus.textContent=String(Number((payload&&payload.diag_count)||0))+' / '+String(Number((payload&&payload.diag_capacity)||0));imDiag.textContent=JSON.stringify(d,null,2)}
-async function pollLiveStatus(){try{const r=await fetch('/image_motion_status?t='+Date.now(),{cache:'no-store',credentials:'same-origin'});if(!r.ok)throw new Error();const j=await r.json();renderLive(j)}catch(e){if(imLiveState){imLiveState.textContent=IM_TEXT.liveWaiting;imLiveState.classList.remove('danger','ok');imLiveState.classList.add('warn')}}}
-let imRefreshTimer=0,imStatusTimer=0;function scheduleRefresh(ms){clearTimeout(imRefreshTimer);imRefreshTimer=setTimeout(refresh,ms)}function scheduleStatus(ms){clearTimeout(imStatusTimer);imStatusTimer=setTimeout(updateStatusLoop,ms)}function refresh(){if(document.hidden){scheduleRefresh(1000);return}imImage.src='/snapshot?im=1&t='+Date.now()}async function updateStatusLoop(){if(document.hidden){scheduleStatus(1000);return}await pollLiveStatus();scheduleStatus(500)}imImage.onload=()=>{drawGrid();scheduleRefresh(200)};imImage.onerror=()=>scheduleRefresh(500);window.addEventListener('resize',drawGrid);refresh();updateStatusLoop();
+let imLastAnalysisStamp=0,imLastAnalysisLocalMs=0,imStatusInFlight=false;
+function setLiveWaiting(clearValues){if(imLivePulse)imLivePulse.classList.remove('tick');if(imLiveState){imLiveState.textContent=IM_TEXT.liveWaiting;imLiveState.classList.remove('danger','ok');imLiveState.classList.add('warn')}if(clearValues){if(imLiveConfirm)imLiveConfirm.textContent='-';if(imLiveFrameMotion)imLiveFrameMotion.textContent='-';if(imLiveBackground)imLiveBackground.textContent='-'}}
+function motionPair(total,cluster){return Number(total||0).toFixed(1)+' % '+IM_TEXT.liveTotalShort+' · '+Number(cluster||0).toFixed(1)+' % '+IM_TEXT.liveConnectedShort}function renderLive(payload){const d=(payload&&payload.diagnostics)||{};const stamp=Math.max(0,Number((payload&&payload.analysis_stamp_ms)||0)||0);const age=Math.max(0,Number(d.last_analysis_age_ms)||0);if(imLiveLimit)imLiveLimit.textContent=Number((payload&&payload.area_limit_pct)||imSavedMinArea).toFixed(1)+' %';if(imLiveLast)imLiveLast.textContent=liveAgeText(!!d.last_detection_valid,d.last_detection_age_ms);if(imDiagBufferStatus)imDiagBufferStatus.textContent=String(Number((payload&&payload.diag_count)||0))+' / '+String(Number((payload&&payload.diag_capacity)||0));if(!stamp||!d.last_analysis_valid||age>1500){setLiveWaiting(true);return}if(stamp===imLastAnalysisStamp){return}imLastAnalysisStamp=stamp;imLastAnalysisLocalMs=Date.now();if(imLivePulse){imLivePulse.classList.add('tick');setTimeout(()=>imLivePulse.classList.remove('tick'),180)}const required=Math.max(1,Number((payload&&payload.confirm_required)||0)||1);const current=Math.max(0,Number(d.confirm_counter)||0);if(imLiveState){imLiveState.textContent=liveStateText(d);imLiveState.classList.remove('danger','warn','ok');if(d.motion_active||d.image_motion_state==='confirmed')imLiveState.classList.add('danger');else if(d.image_motion_state==='candidate'||d.image_motion_state==='background_init'||d.image_motion_state==='global_change')imLiveState.classList.add('warn');else if(d.image_motion_state==='error')imLiveState.classList.add('danger');else imLiveState.classList.add('ok')}if(imLiveConfirm){imLiveConfirm.textContent=(d.motion_active||d.image_motion_state==='confirmed')?IM_TEXT.liveConfirmed+' ('+Math.min(required,Math.max(current,required))+' / '+required+')':Math.min(current,required)+' / '+required}if(imLiveFrameMotion){imLiveFrameMotion.textContent=d.frame_delta_ready?motionPair(d.frame_changed_pct,d.frame_cluster_pct):'-'}if(imLiveBackground){imLiveBackground.textContent=motionPair(d.global_change_pct,d.changed_area_pct)}imDiag.textContent=JSON.stringify(d,null,2)}
+async function pollLiveStatus(){if(imStatusInFlight||document.hidden)return;imStatusInFlight=true;try{const r=await fetch('/image_motion_status?t='+Date.now(),{cache:'no-store',credentials:'same-origin'});if(!r.ok)throw new Error();const j=await r.json();renderLive(j)}catch(e){setLiveWaiting(true)}finally{imStatusInFlight=false}}
+let imRefreshTimer=0,imFreshnessTimer=0;function scheduleRefresh(ms){clearTimeout(imRefreshTimer);imRefreshTimer=setTimeout(refresh,ms)}function scheduleFreshness(ms){clearTimeout(imFreshnessTimer);imFreshnessTimer=setTimeout(checkFreshness,ms)}function refresh(){if(document.hidden){scheduleRefresh(1000);return}imImage.src='/snapshot?im=1&t='+Date.now()}function checkFreshness(){if(!document.hidden&&imLastAnalysisLocalMs&&Date.now()-imLastAnalysisLocalMs>1600)setLiveWaiting(true);scheduleFreshness(300)}imImage.onload=()=>{drawGrid();pollLiveStatus();scheduleRefresh(200)};imImage.onerror=()=>{setLiveWaiting(true);scheduleRefresh(500)};window.addEventListener('resize',drawGrid);refresh();pollLiveStatus();scheduleFreshness(300);
 function params(){const p=new URLSearchParams();p.set('sensitivity',document.getElementById('imSensitivity').value);p.set('min_area',document.getElementById('imMinArea').value);p.set('confirm',document.getElementById('imConfirm').value);p.set('release',document.getElementById('imRelease').value);p.set('learning',document.getElementById('imLearning').value);p.set('global_mean',document.getElementById('imGlobalMean').value);p.set('global_change',document.getElementById('imGlobalChange').value);p.set('roi',imMask);return p}
 function openInfo(title,body){imInfoTitle.textContent=title;imInfoBody.textContent=body;imInfoBackdrop.classList.add('open')}
 function closeInfo(){imInfoBackdrop.classList.remove('open')}
@@ -9476,10 +9506,10 @@ function setDefaults(){document.getElementById('imSensitivity').value=IM_DEFAULT
 document.getElementById('imDefaults').onclick=setDefaults;
 document.getElementById('imSave').onclick=async()=>{imStatus.textContent='...';try{const r=await fetch('/image_motion_save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:params()});const j=await r.json();if(!r.ok||!j.ok)throw new Error(IM_TEXT.saveFailed+(j.error?': '+j.error:''));imSavedMinArea=parseInt(document.getElementById('imMinArea').value,10)||imSavedMinArea;imStatus.textContent=IM_TEXT.saved}catch(e){imStatus.textContent=e.message}};
 function friendlyResult(d){if(d.motion_active||d.image_motion_state==='confirmed')return IM_TEXT.resultMotion;switch(d.reject_reason){case'disabled':return IM_TEXT.resultDisabled;case'background_init':return IM_TEXT.resultLearning;case'confirming':return IM_TEXT.resultConfirming;case'global_light':return IM_TEXT.resultGlobalLight;case'no_roi':return IM_TEXT.resultNoRoi;case'decode':case'invalid_frame':return IM_TEXT.resultError;default:return IM_TEXT.resultNone}}
-function renderDiagnostics(d){imResultText.textContent=friendlyResult(d);const active=Math.max(0,Number(d.active_roi_blocks)||0),changed=Math.max(0,Number(d.changed_blocks)||0),cluster=Math.max(0,Number(d.largest_cluster_blocks)||0);const total=Number(d.global_change_pct||0).toFixed(1)+' %'+(active?' ('+changed+' / '+active+')':'');const area=Number(d.changed_area_pct||0).toFixed(1)+' %'+(cluster?' ('+cluster+')':'');const limit=imSavedMinArea+' %';imResultMeta.innerHTML='';[[IM_TEXT.resultTime,(d.analyze_frame_ms!==undefined?d.analyze_frame_ms:'-')+' ms'],[IM_TEXT.liveTotalArea,total],[IM_TEXT.resultArea,area],[IM_TEXT.resultLimit,limit]].forEach(([k,v])=>{const span=document.createElement('span');span.textContent=k+': '+v;imResultMeta.appendChild(span)});imDiag.textContent=JSON.stringify(d,null,2)}
+function renderDiagnostics(d){imResultText.textContent=friendlyResult(d);const active=Math.max(0,Number(d.active_roi_blocks)||0),changed=Math.max(0,Number(d.changed_blocks)||0),cluster=Math.max(0,Number(d.largest_cluster_blocks)||0),frameChanged=Math.max(0,Number(d.frame_changed_blocks)||0),frameCluster=Math.max(0,Number(d.frame_largest_cluster_blocks)||0);const total=Number(d.global_change_pct||0).toFixed(1)+' %'+(active?' ('+changed+' / '+active+')':'');const area=Number(d.changed_area_pct||0).toFixed(1)+' %'+(cluster?' ('+cluster+')':'');const frameTotal=d.frame_delta_ready?(Number(d.frame_changed_pct||0).toFixed(1)+' %'+(active?' ('+frameChanged+' / '+active+')':'')):'-';const frameArea=d.frame_delta_ready?(Number(d.frame_cluster_pct||0).toFixed(1)+' %'+(frameCluster?' ('+frameCluster+')':'')):'-';const limit=imSavedMinArea+' %';imResultMeta.innerHTML='';[[IM_TEXT.resultTime,(d.analyze_frame_ms!==undefined?d.analyze_frame_ms:'-')+' ms'],[IM_TEXT.liveCurrentMotion,frameTotal+' / '+frameArea+' '+IM_TEXT.liveConnectedShort],[IM_TEXT.liveBackgroundDifference,total+' / '+area+' '+IM_TEXT.liveConnectedShort],[IM_TEXT.resultLimit,limit]].forEach(([k,v])=>{const span=document.createElement('span');span.textContent=k+': '+v;imResultMeta.appendChild(span)});imDiag.textContent=JSON.stringify(d,null,2)}
 document.getElementById('imTest').onclick=async()=>{imStatus.textContent='...';try{const r=await fetch('/image_motion_test',{method:'POST'}),j=await r.json();if(!r.ok||!j.ok)throw new Error(IM_TEXT.testFailed+(j.error?': '+j.error:''));renderDiagnostics(j.diagnostics||{});imStatus.textContent='OK'}catch(e){imResultText.textContent=IM_TEXT.resultError;imStatus.textContent=e.message}};
 document.getElementById('imResetBg').onclick=async()=>{imStatus.textContent='...';try{const r=await fetch('/image_motion_reset',{method:'POST'}),j=await r.json();if(!r.ok||!j.ok)throw new Error(IM_TEXT.testFailed);imResultText.textContent=IM_TEXT.resetBgDone;imResultMeta.textContent='';imDiag.textContent='-';imStatus.textContent=IM_TEXT.resetBgDone}catch(e){imStatus.textContent=e.message}};
-function release(){fetch('/preview_stop?im=1',{method:'POST',keepalive:true}).catch(()=>{})}window.addEventListener('pagehide',release);document.addEventListener('visibilitychange',()=>{if(document.hidden){clearTimeout(imRefreshTimer);clearTimeout(imStatusTimer);release()}else{clearTimeout(imRefreshTimer);clearTimeout(imStatusTimer);refresh();updateStatusLoop()}});
+function release(){fetch('/preview_stop?im=1',{method:'POST',keepalive:true}).catch(()=>{})}window.addEventListener('pagehide',release);document.addEventListener('visibilitychange',()=>{if(document.hidden){clearTimeout(imRefreshTimer);clearTimeout(imFreshnessTimer);release()}else{clearTimeout(imRefreshTimer);clearTimeout(imFreshnessTimer);imLastAnalysisStamp=0;imLastAnalysisLocalMs=0;refresh();pollLiveStatus();scheduleFreshness(300)}});
 )JS";
         html += "</script>";
     }

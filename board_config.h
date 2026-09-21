@@ -58,9 +58,11 @@
 #define RTC_SDA_PIN          GPIO_NUM_1   // (grün)
 #define RTC_SCL_PIN          GPIO_NUM_47  // (blau)
 
-// User-facing camera rotation is relative to the physically mounted camera.
-// This board profile currently needs no additional base rotation.
-#define CAMERA_BASE_ROTATION_DEGREES 0
+// Board-specific native sensor orientation correction.
+// User-facing rotation=0 is defined as the normal, non-mirrored product image.
+// Freenove currently needs no additional mirror/flip correction.
+#define CAMERA_BASE_HMIRROR 0
+#define CAMERA_BASE_VFLIP   0
 
 #define STATUS_LED_AVAILABLE 1
 #define LED_PIN             GPIO_NUM_2
@@ -122,11 +124,14 @@
 #define RTC_SDA_PIN          GPIO_NUM_5      // D4 ← RTC SDA (grün)
 #define RTC_SCL_PIN          GPIO_NUM_6      // D5 ← RTC SCL (blau)
 
-// User-facing camera rotation is relative to the physically mounted camera.
-// On the current SensorForge XIAO camera assembly the native image orientation
-// is 180 degrees from the desired 0-degree display orientation. Keep this
-// board/mount correction here instead of changing the generic rotation meaning.
-#define CAMERA_BASE_ROTATION_DEGREES 180
+// Board-specific native sensor orientation correction.
+// On the current SensorForge XIAO + OV3660 assembly the native sensor feed is
+// horizontally mirrored relative to the desired product image. Correct that
+// mirror here. User-facing rotation=180 is then composed on top by toggling
+// both axes, so it remains a true 180-degree rotation without introducing a
+// mirror.
+#define CAMERA_BASE_HMIRROR 1
+#define CAMERA_BASE_VFLIP   0
 
 // This XIAO Sense hardware revision routes microSD CS to GPIO21.
 // GPIO21 is also the onboard USER LED, so the firmware must not drive
@@ -195,8 +200,12 @@
 // or when qualifying substantially different camera/board hardware.
 #define RECORDING_MAX_WEIGHTED_PIXEL_RATE 8000000UL
 
-#if CAMERA_BASE_ROTATION_DEGREES != 0 && CAMERA_BASE_ROTATION_DEGREES != 180
-#error "CAMERA_BASE_ROTATION_DEGREES must be 0 or 180"
+#if CAMERA_BASE_HMIRROR != 0 && CAMERA_BASE_HMIRROR != 1
+#error "CAMERA_BASE_HMIRROR must be 0 or 1"
+#endif
+
+#if CAMERA_BASE_VFLIP != 0 && CAMERA_BASE_VFLIP != 1
+#error "CAMERA_BASE_VFLIP must be 0 or 1"
 #endif
 
 #endif

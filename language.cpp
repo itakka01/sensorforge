@@ -249,7 +249,7 @@ static const UiTextEntry UI_TEXTS[] = {
     {"Helligkeitssprung-Schwelle", "Brightness-jump threshold"}, // UI_IMAGE_MOTION_GLOBAL_MEAN
     {"Großflächige Änderung ab (%)", "Large-area change from (%)"}, // UI_IMAGE_MOTION_GLOBAL_CHANGE
     {"Überwachungsbereich im Bild", "Monitored area in the image"}, // UI_IMAGE_MOTION_ROI
-    {"Bereiche ohne rote Markierung werden auf Bewegung geprüft. Rötlich markierte Bereiche werden ignoriert. Tippe oder ziehe über das Bild, um Bereiche ein- oder auszuschließen.", "Areas without a red overlay are checked for motion. Red-shaded areas are ignored. Tap or drag across the image to include or exclude areas."}, // UI_IMAGE_MOTION_ROI_HELP
+    {"Felder per Klick oder Ziehen ein- bzw. ausschalten.", "Click or drag over the image to enable or exclude grid cells."}, // UI_IMAGE_MOTION_ROI_HELP
     {"Gesamtes Bild überwachen", "Monitor entire image"}, // UI_IMAGE_MOTION_SELECT_ALL
     {"Gesamtes Bild ignorieren", "Ignore entire image"}, // UI_IMAGE_MOTION_CLEAR
     {"Invertieren", "Invert"}, // UI_IMAGE_MOTION_INVERT
@@ -313,6 +313,10 @@ static const UiTextEntry UI_TEXTS[] = {
     {"Bildbewegung", "Image motion"}, // UI_IMAGE_MOTION_LIVE_STATUS
     {"Bestätigung", "Confirmation"}, // UI_IMAGE_MOTION_LIVE_CONFIRMATION
     {"Bild insgesamt verändert", "Total image changed"}, // UI_IMAGE_MOTION_LIVE_CHANGED_AREA
+    {"Aktuelle Bewegung", "Current motion"}, // UI_IMAGE_MOTION_LIVE_CURRENT_MOTION
+    {"Abweichung vom Hintergrund", "Background difference"}, // UI_IMAGE_MOTION_LIVE_BACKGROUND_DIFFERENCE
+    {"gesamt", "total"}, // UI_IMAGE_MOTION_LIVE_TOTAL_SHORT
+    {"zusammenhängend", "connected"}, // UI_IMAGE_MOTION_LIVE_CONNECTED_SHORT
     {"Letzte Erkennung", "Last detection"}, // UI_IMAGE_MOTION_LIVE_LAST_DETECTION
     {"BEWEGUNG", "MOTION"}, // UI_IMAGE_MOTION_LIVE_DETECTED
     {"Keine Bewegung", "No motion"}, // UI_IMAGE_MOTION_LIVE_NONE
@@ -323,7 +327,7 @@ static const UiTextEntry UI_TEXTS[] = {
     {"noch keine", "none yet"}, // UI_IMAGE_MOTION_LIVE_NEVER
     {"warte auf Daten", "waiting for data"}, // UI_IMAGE_MOTION_LIVE_WAITING
     {"Nicht aktiv", "Inactive"}, // UI_IMAGE_MOTION_LIVE_INACTIVE
-    {"Bildanalyse-Diagnose herunterladen", "Download image-motion diagnostic"}, // UI_IMAGE_MOTION_DIAG_DOWNLOAD
+    {"Diagnose herunterladen", "Download diagnostics"}, // UI_IMAGE_MOTION_DIAG_DOWNLOAD
     {"RAM-Puffer; keine SD-/Hauptlog-Einträge", "RAM buffer; no SD/main-log writes"}, // UI_IMAGE_MOTION_DIAG_BUFFER
 };
 

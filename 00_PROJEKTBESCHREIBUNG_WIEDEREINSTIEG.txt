@@ -102,12 +102,16 @@ auch das fruehe Transport-Journal. Der zuletzt gefundene WebConfig-Clear-
 Randfall wurde im Quellstand behoben und muss nach diesem Fix noch einmal auf
 echter Hardware bestaetigt werden.
 
-Die bildbasierte Bewegungsbestaetigung ("Image Motion" / image_verify) ist
-inzwischen als zusaetzliche, standardmaessig deaktivierte Entscheidungsschicht
-implementiert. Radar/OT2 bleibt die stromsparende Wakequelle; der bisherige
-direkte Aufnahmeweg bleibt Default. WebConfig besitzt ROI-/Test-/Tuning-
-Funktionen. Dieser neue Bildanalysepfad ist NOCH NICHT abschliessend auf echter
-Hardware und im Feld validiert und bleibt deshalb ein ausdruecklicher TODO-Punkt.
+Die bildbasierte Bewegungserkennung ("Image Motion") ist inzwischen als
+vollwertiger Aufnahme-Entscheidungspfad mit drei Modi integriert:
+direct, image_verify und image_only. Ein separates image_motion_enabled gibt es
+nicht mehr; der Modus wird ueber die normale Konfiguration gewaehlt. direct bleibt
+der sichere Default. image_verify bestaetigt reale Sensorereignisse per Bildanalyse,
+waehrend image_only auch eine Aufnahme durch erkannte Bildbewegung ausloesen kann.
+Die Live-/Diagnosefunktionen wurden deutlich erweitert, inklusive RAM-only
+Image-Motion-Diagnoselog mit bis zu 400 Frames und zusaetzlicher Frame-to-Frame-
+Bewegungsmessung. Der Pfad ist funktional, aber weiterhin noch nicht abschliessend
+im Feld validiert und bleibt deshalb ein ausdruecklicher TODO-Punkt.
 
 Die XIAO-microSD laeuft im aktuellen Zwischenstand im normalen Recordingbetrieb
 mit 20 MHz SPI statt 4 MHz. Die Umstellung wurde mit synthetischem SD-Test und
@@ -181,9 +185,28 @@ aktuellen Entwicklungsstand integriert:
 - reale Diagnosetests zeigten: einzelne schnelle UART-Gate-Trigger koennen vom
   LD2410S intern verworfen werden, waehrend OT2/Target-Presence die bestaetigte
   Sensorentscheidung deutlich stabiler abbilden
-- daraus wurde die aktuelle HYBRID-Aufnahmelogik abgeleitet: schneller
-  Aufnahmebeginn bleibt erhalten, OT2 uebernimmt danach die verlaessliche
-  Presence-/Haltefunktion
+- daraus wurde die aktuelle HYBRID-Aufnahmelogik abgeleitet: OT2 weckt aus
+  Light Sleep, ein bereits waches Geraet kann ueber die schnelle UART-Gate-
+  Erkennung sofort die Aufnahme starten, und bestaetigte OT2/Target-Presence
+  uebernimmt danach die verlaessliche Presence-/Haltefunktion
+- Image Motion wurde auf die drei Aufnahme-Modi direct, image_verify und
+  image_only erweitert; ein separates image_motion_enabled wurde entfernt
+- die Image-Motion-Live-Seite zeigt den aktuellen Bewegungsstatus laufend an;
+  auch das Haupt-Dashboard zeigt den aktuellen Bildbewegungsstatus
+- Image-Motion-Diagnosewerte trennen Gesamtveraenderung, groesste
+  zusammenhaengende Veraenderung und den aktuell verwendeten Schwellwert
+- separater RAM-only Image-Motion-Diagnosepuffer mit bis zu 400 Frames
+- die adaptive Schwelle wurde nach realen Diagnoselogs korrigiert: Sensitivity 5
+  liegt nun bei etwa 25 Basiswert statt zuvor etwa 29; die dynamische Reserve ist
+  deutlich kleiner und wird aus kurzfristigem Frame-Jitter statt aus der
+  Hintergrundabweichung gelernt
+- zusaetzliche echte Frame-to-Frame-Bewegungsmessung trennt aktuelle Bewegung von
+  der Abweichung zum Hintergrund; sie ist derzeit Diagnose und beeinflusst die
+  Aufnahmeentscheidung noch nicht
+- XIAO-Kameraorientierung korrigiert: die fruehere 180-Grad-Grundrotation wurde
+  durch die passende board-spezifische Mirror-/Flip-Korrektur ersetzt; bei
+  rotation=0 sind Livebild, Motion-Seite und Aufnahmen jetzt korrekt orientiert
+  und nicht gespiegelt
 
 WICHTIGE RADAR-ENTSCHEIDUNG:
 
@@ -533,7 +556,8 @@ wirksam.
 Bildbasierte Bewegungsentscheidung / Image Motion:
 
 - motion_recording_decision=direct
-- image_motion_enabled=0
+  Gueltige Modi: direct / image_verify / image_only
+- ein separates image_motion_enabled gibt es nicht mehr
 - image_motion_sensitivity=5
 - image_motion_min_area_pct=6
 - image_motion_confirm_frames=2
@@ -546,13 +570,21 @@ Bildbasierte Bewegungsentscheidung / Image Motion:
 Der sichere Rueckwaertskompatibilitaets-Default ist:
 
 - Recording Decision = direct
-- Bildanalyse = deaktiviert
 
-Fehlen diese spaeter hinzugefuegten optionalen Keys in einer alten config.txt,
-bleibt die Config gueltig und die Firmware verwendet die eingebauten Defaults
-im RAM. Der Bootvorgang schreibt fehlende Image-Motion-Keys NICHT ungefragt in
-die bestehende config.txt. Erst bewusstes Speichern auf der Bildbewegungsseite
-persistiert die Einstellungen ueber den bestehenden Config-Pfad.
+Aktueller Image-Motion-Teststand:
+
+- Sensitivity 5
+- Confirm 2
+- Release 2
+- Background Learning 4
+- Mindestflaeche derzeit 6 Prozent; als naechster Test sind etwa 2 Prozent
+  vorgesehen, um Bewegungen in groesserer Entfernung besser zu erfassen
+
+Fehlen spaeter hinzugefuegte optionale Image-Motion-Keys in einer alten
+config.txt, bleibt die Config gueltig und die Firmware verwendet die eingebauten
+Defaults im RAM. Der Bootvorgang schreibt fehlende Image-Motion-Keys NICHT
+ungefragt in die bestehende config.txt. Erst bewusstes Speichern auf der
+Bildbewegungsseite persistiert die Einstellungen ueber den bestehenden Config-Pfad.
 
 Aufnahme:
 
@@ -851,7 +883,13 @@ Aktuell wird die Kamera mit folgenden wesentlichen Laufzeitparametern gesetzt:
 - Auto Exposure aus cfg_camera_auto_exposure
 - AE-Level aus cfg_camera_ae_level
 - Rotation 0 oder 180
+- board-spezifische Mirror-/Flip-Grundkorrektur fuer die reale Kameraausrichtung
 - optionaler OV3660-Sensor-Crop
+
+Fuer XIAO wurde die bisherige falsche 180-Grad-Grundrotation entfernt und durch
+die passende board-spezifische Mirror-/Flip-Korrektur ersetzt. Damit sind bei
+rotation=0 Livebild, Image-Motion-Seite und gespeicherte Aufnahmen korrekt
+ausgerichtet und nicht gespiegelt.
 
 90 und 270 Grad werden von der vorhandenen Sensor-Hardware nicht direkt
 unterstuetzt und werden deterministisch auf 0 Grad zurueckgesetzt.
@@ -2449,25 +2487,28 @@ Die bestehende LD2410S-Trigger/Hold-Logik soll nicht unnoetig im ESP doppelt
 nachprogrammiert werden.
 
 ======================================================================
-BILDBASIERTE MOTION DETECTION / IMAGE VERIFY
+BILDBASIERTE MOTION DETECTION / IMAGE MOTION
 ======================================================================
 
 Ziel:
 
-Der physische Presence-Sensor bleibt die stromsparende Wakequelle: LD2410S/OT2
-oder auf Freenove der freigegebene SR602. Die Kamera wird NICHT als dauerhaft
-aktive Wakequelle verwendet. Optional kann nach einem echten Sensortrigger eine
-leichte Bildanalyse entscheiden, ob die Aufnahme bestaetigt wird.
+Image Motion ist nicht mehr nur eine optionale Bestaetigungsschicht, sondern ein
+normal konfigurierbarer Aufnahme-Entscheidungspfad. Der physische Presence-Sensor
+bleibt fuer den stromsparenden Light-Sleep-Betrieb die Wakequelle: LD2410S/OT2
+oder auf Freenove der freigegebene SR602. Im wachen Betrieb kann je nach Modus
+aber auch die Kamera selbst eine Aufnahme ausloesen.
 
-Default / Regressionsschutz:
+Aufnahme-Modi:
 
 - motion_recording_decision=direct
-- image_motion_enabled=0
-- der bisherige direkte physische Sensor->Recording-Pfad bleibt damit Standard
-- Image Motion muss bewusst aktiviert und spaeter auch als Recording Decision
-  "image_verify" gewaehlt werden
-- waehrend einer bereits laufenden Aufnahme wird die Analyse nicht permanent
-  weitergerechnet
+  Der physische Sensor entscheidet direkt; dies bleibt der sichere Default.
+- motion_recording_decision=image_verify
+  Ein reales LD2410S/OT2- oder SR602-Ereignis wird zusaetzlich per Bildanalyse
+  bestaetigt.
+- motion_recording_decision=image_only
+  Erkannte Bildbewegung kann selbst den Aufnahmestart ausloesen.
+- ein separates image_motion_enabled gibt es nicht mehr; die Auswahl des Modus
+  befindet sich in der normalen Konfiguration.
 
 Analysepfad:
 
@@ -2485,33 +2526,73 @@ Analysepfad:
 - Erkennung starker globaler Helligkeitswechsel
 - zusaetzliche Schwellenreserve in dunklen Szenen
 
+Schwellen-/Rauschmodell - aktueller Tuningstand:
+
+Die RAM-Diagnose zeigte, dass die adaptive Bewegungsschwelle zuvor zu hoch war.
+Daraufhin wurden Sensitivity-Kurve und Rauschkompensation korrigiert:
+
+- Sensitivity 5 liegt nun bei etwa 25 Basiswert statt zuvor etwa 29
+- die dynamische Zusatzreserve ist deutlich kleiner
+- die Zusatzreserve wird aus kurzfristigem Frame-Jitter gelernt und nicht mehr
+  aus der Abweichung des aktuellen Bildes vom Hintergrundmodell
+- grosse Bewegungen wurden dadurch in den anschliessenden Diagnosetests deutlich
+  plausibler erkannt
+
+Aktuelle Tuningwerte bleiben:
+
+- Sensitivity 5
+- Confirm 2
+- Release 2
+- Background Learning 4
+- Mindestflaeche derzeit 6 Prozent
+- naechster vorgesehener Test: Mindestflaeche auf etwa 2 Prozent reduzieren, um
+  Bewegungen in groesserer Entfernung besser zu erfassen
+
 Recording-Integration:
 
-- image_verify wird erst nach realem LD2410S/OT2- oder SR602-Trigger ausgewertet
-- bei einem internen Analysefehler wird fuer reale Ereignisse fail-open
-  aufgenommen, statt eine echte Bewegung still zu verlieren
-- ein abgelehnter Trigger wird bis zum Ende des aktuellen physischen
-  Radar-Motion-Holds gelatcht, damit die Analyse nicht in einer Schleife immer
-  wieder gestartet wird
+- direct behaelt den bewaehrten direkten Sensor->Recording-Pfad
+- image_verify wird nach realem LD2410S/OT2- oder SR602-Trigger ausgewertet
+- image_only erlaubt einen Aufnahmestart durch die Bildbewegungserkennung selbst
+- bei einem internen Analysefehler im image_verify-Pfad wird fuer reale Ereignisse
+  fail-open aufgenommen, statt eine echte Bewegung still zu verlieren
+- ein im image_verify-Pfad abgelehnter Trigger wird bis zum Ende des aktuellen
+  physischen Radar-Motion-Holds gelatcht, damit die Analyse nicht in einer
+  Schleife immer wieder gestartet wird
 - bestehende Thermal-, Storage-, Cooldown-, WebConfig-Pause-, Preview- und
   Recorder-Gates bleiben erhalten
 - simulierte Software-Motion bleibt fuer deterministische Recorder-Tests direkt
 
-WebConfig:
+Live-/WebConfig-Stand:
 
 - eigene Seite Sensor -> Bildbewegung / Image motion
 - Livebild mit editierbarer Ueberwachungsmaske
 - KEINE rote Markierung = aktiv ueberwacht
 - ROETLICH markiert = von der Bildanalyse ignoriert
-- Aktivierungsauswahl eindeutig als 0 = deaktiviert / 1 = aktiviert
+- kompakter Statusblock mit laufender Anzeige des aktuellen Motion-Status
+- Download-Button fuer den RAM-Diagnoselog direkt im Statusblock
+- weniger ROI-Erklaertext im Livebereich
+- Vorschau wurde fuer fluessigere Aktualisierung optimiert
+- Frischekontrolle verhindert, dass veraltete Analysewerte als aktuell erscheinen
+- auch das Haupt-Dashboard zeigt den aktuellen Bildbewegungsstatus
 - Parameter besitzen kurze Laien-Hilfetexte, Info-Popups und Standardwerte
 - "Standardwerte einsetzen" setzt nur das Formular zurueck; dauerhaft wird erst
   mit Speichern uebernommen
 - "Referenzbild neu lernen" verwirft den gelernten Hintergrund, z.B. nach
   Kameraversetzen oder dauerhafter Szenenaenderung
 - "Bildanalyse jetzt testen" startet KEINE automatische Aufnahme
-- Testseite zeigt zuerst ein Klartextresultat und technische Messwerte nur
-  zusaetzlich/aufklappbar
+
+Image-Motion-Diagnose:
+
+- Diagnose zeigt Gesamtveraenderung, groesste zusammenhaengende Veraenderung und
+  den aktuell verwendeten Schwellwert getrennt
+- separater RAM-only Ringpuffer mit bis zu 400 Frames
+- keine SD-Schreiblast und kein Spam im normalen Hauptlog
+- der Diagnoselog wurde um die neue Frame-to-Frame-Messung erweitert
+- zusaetzlich zur Abweichung vom Hintergrund wird echte Veraenderung von Frame zu
+  Frame gemessen; damit sind "aktuelle Bewegung" und "Abweichung vom Hintergrund"
+  diagnostisch getrennt sichtbar
+- die Frame-to-Frame-Messung beeinflusst die Aufnahmeentscheidung derzeit noch
+  NICHT und dient zunaechst nur Diagnose/Tuning
 
 Hintergrund-Invalidierung:
 
@@ -3052,6 +3133,7 @@ Dashboard:
 - Aufnahmezustand
 - Pause-Zustand
 - Bewegung
+- aktueller Bildbewegungs-/Image-Motion-Status
 - eigene schnelle Bewegungskarte mit etwa 250-ms-Polling
 - erkannter Sensortyp (LD2410S Radar oder PIR/digital input)
 - Presence-GPIO LOW/HIGH, letzter Trigger und Ereigniszaehler
@@ -3099,14 +3181,21 @@ Radar:
 
 Bildbewegung / Image Motion:
 
-- Aktivierung und Recording Decision direct/image_verify
+- Recording Decision direct / image_verify / image_only; kein separates
+  image_motion_enabled mehr
 - Livebild mit editierbarer ROI-/Ueberwachungsmaske
 - rot markierte Bereiche werden ignoriert; nicht rot markierte ueberwacht
+- kompakter Live-Statusblock mit aktuellem Motion-Status und Diagnose-Download
+- fluessigere Vorschau und Frischekontrolle fuer Analysewerte
 - laienverstaendliche Hilfetexte + Info-Popups + Standardwerte
 - Standardwerte ins Formular einsetzen
 - Referenzbild neu lernen
 - Bildanalyse testen, ohne dabei automatisch eine Aufnahme zu starten
-- technische Diagnosewerte optional einblendbar
+- Diagnose trennt Gesamtveraenderung, groesste zusammenhaengende Aenderung und
+  Schwellwert
+- separater RAM-only Image-Motion-Diagnoselog mit bis zu 400 Frames
+- Frame-to-Frame-Bewegung wird zusaetzlich diagnostisch gemessen, beeinflusst die
+  Aufnahmeentscheidung derzeit aber noch nicht
 
 Aufnahmen:
 
@@ -3695,11 +3784,16 @@ ae_level=-2 ist der aktuelle Test-/Produktwert
 
 Bildbasierte Motion Detection:
 
-IMPLEMENTIERT, DETAIL-/FELDTEST NOCH OFFEN
-Image-Motion-Engine, ROI, WebConfig-Testseite und optionales image_verify sind
-vorhanden. Defaults bleiben direct + image_motion_enabled=0. Vor produktiver
-Nutzung von image_verify muessen Erkennungsqualitaet, Licht/Schatten, Tag/Nacht,
-Parameter, Wake-Latenz, Strom und Temperatur auf echter Hardware getestet werden.
+IMPLEMENTIERT UND ERWEITERT, DETAIL-/FELDTEST NOCH OFFEN
+Image-Motion-Engine, ROI, Live-Status, RAM-only 400-Frame-Diagnoselog sowie die
+Modi direct, image_verify und image_only sind vorhanden. direct bleibt Default;
+ein separates image_motion_enabled gibt es nicht mehr. Die adaptive Schwelle
+wurde nach realen Diagnoselogs korrigiert; Sensitivity 5 liegt nun bei etwa 25
+Basiswert und die dynamische Reserve wird aus kurzfristigem Frame-Jitter gelernt.
+Eine zusaetzliche Frame-to-Frame-Bewegungsmessung ist als Diagnose integriert,
+beeinflusst die Aufnahmeentscheidung derzeit aber noch nicht. Vor produktiver
+Nutzung muessen Erkennungsqualitaet, Licht/Schatten, Tag/Nacht, Parameter,
+Wake-Latenz, Strom und Temperatur auf echter Hardware weiter getestet werden.
 
 Config-Secrets / SFSEC1:
 
@@ -3929,20 +4023,26 @@ OFFENE PUNKTE NACH PRIORITAET
 
     Nur falls die etwa 150 ms irgendwann wieder relevant werden.
 
-22. BILDBASIERTE MOTION DETECTION / IMAGE_VERIFY DETAILTEST
+22. BILDBASIERTE MOTION DETECTION / IMAGE MOTION DETAILTEST
 
     Implementierung und UI sind vorhanden, aber noch nicht als fertiger
-    Produktionspfad betrachten. Spaeter mit echter Hardware systematisch testen:
+    Produktionspfad betrachten. Mit echter Hardware systematisch weiter testen:
 
-    - zuerst direct + image_motion_enabled=0 als Regressionsreferenz
-    - dann Bildanalyse aktivieren, Recording Decision zunaechst noch direct
-    - ROI und Testseite mit Person / leerer Szene / kleinen Objekten pruefen
+    - direct als Regressionsreferenz beibehalten
+    - image_verify und image_only getrennt pruefen
+    - als naechsten konkreten Test image_motion_min_area_pct von 6 auf etwa 2
+      reduzieren, um Bewegungen in groesserer Entfernung besser zu erfassen
+    - aktuellen Tuningstand Sensitivity 5 / Confirm 2 / Release 2 /
+      Background Learning 4 zunaechst beibehalten
+    - ROI und Live-Seite mit Person / leerer Szene / kleinen Objekten pruefen
+    - Gesamtveraenderung, groesste Connected-Area, Schwellwert, Hintergrunddelta
+      und Frame-to-Frame-Bewegung im 400-Frame-RAM-Log gemeinsam auswerten
     - Licht ein/aus, Schatten, Sonnenlicht, Tag/Nacht und dunkle Szenen
-    - Sensitivity, Mindestflaeche, Confirm/Release und Hintergrundlernen tunen
     - False Positives und False Negatives dokumentieren
     - analyze/decode-Zeit sowie Wake->Decision und Wake->erster SD-Frame messen
     - Stromverbrauch und Temperatur vergleichen
-    - erst danach motion_recording_decision=image_verify produktiv bewerten
+    - Frame-to-Frame-Messung vorerst nur diagnostisch verwenden und erst nach
+      Messdaten entscheiden, ob sie spaeter die Aufnahmeentscheidung beeinflussen soll
 
 23. XIAO SD 20 MHZ LANGZEIT-/VARIANTENBEOBACHTUNG
 
@@ -4086,7 +4186,10 @@ Physischer Kamerasensor ist OV3660, PID 0x3660. Der aktuelle Freenove-Teststand
 verwendet typischerweise 1024x768, 5 fps, quality 12, Auto Exposure,
 ae_level=-2, Crop 1.0 / X1 / Y1 und camera_xclk_mhz=10. 10/16/20 MHz sind im
 Code unterstuetzt. Aeltere XIAO-Configs koennen weiterhin auf ihren
-board-/firmwareseitigen Default fallen.
+board-/firmwareseitigen Default fallen. Fuer XIAO wurde die fruehere falsche
+180-Grad-Grundrotation durch die korrekte board-spezifische Mirror-/Flip-
+Korrektur ersetzt; rotation=0 ist in Livebild, Image Motion und Aufnahme korrekt
+orientiert und nicht gespiegelt.
 
 microSD auf XIAO verwendet SPI auf CS21/SCK7/MISO8/MOSI9. Der aktuelle
 Produktionsstand verwendet NORMAL=20 MHz und MAX=20 MHz. Die Umstellung von
@@ -4131,26 +4234,35 @@ pausiert die Aufnahmeautomatik beim Oeffnen normaler WebConfig-UI-Sessions.
 Normale Lease etwa 35 s; Transportvorbereitung besitzt einen laengeren
 Sicherheits-Hold. API-Verkehr allein zaehlt nicht als Web-UI-Session.
 
-IMAGE MOTION / IMAGE_VERIFY:
+IMAGE MOTION:
 
-Neue Module image_motion.cpp/.h. Defaults bleiben
-motion_recording_decision=direct und image_motion_enabled=0, damit der bisherige
-Radar/OT2-Aufnahmepfad unveraendert bleibt. Optional kann ein realer Sensortrigger
-durch eine leichte Bildanalyse bestaetigt werden. Analyse: JPEG 1/8, bei XGA
-128x96, Aggregation in 20x15 Blocks, adaptive Background/Noise-Floor,
-Connected-Area, Confirm/Release und Global-Light-Rejection; kein ML und kein
-Full-Resolution-RGB-Puffer.
+Neue Module image_motion.cpp/.h. Der normale Config-Key
+motion_recording_decision unterstuetzt direct, image_verify und image_only.
+direct bleibt der sichere Default. Ein separates image_motion_enabled wurde
+entfernt. image_verify bestaetigt einen realen Sensortrigger per Bildanalyse;
+image_only erlaubt, dass erkannte Bildbewegung selbst die Aufnahme ausloest.
+Analyse: JPEG 1/8, bei XGA 128x96, Aggregation in 20x15 Blocks, adaptive
+Background/Noise-Floor, Connected-Area, Confirm/Release und Global-Light-
+Rejection; kein ML und kein Full-Resolution-RGB-Puffer.
 
-WebConfig besitzt eine selbsterklaerende Bildbewegungsseite mit ROI:
-nicht rot = ueberwacht, roetlich = ignoriert. Test startet keine Aufnahme.
-Referenzbild kann neu gelernt werden; Standardwerte koennen ins Formular
-eingesetzt werden. Fehlende neue Config-Keys werden bei alten config.txt durch
-Firmware-Defaults ersetzt, aber beim Boot nicht automatisch in die Datei
-geschrieben.
+Aktueller Tuningstand: Sensitivity 5, Confirm 2, Release 2, Background Learning 4,
+Mindestflaeche 6 Prozent. Nach Auswertung des RAM-Diagnoselogs wurde die vorher
+zu hohe adaptive Schwelle korrigiert: Sensitivity 5 liegt nun bei etwa 25 statt
+etwa 29 Basiswert; die dynamische Reserve ist deutlich kleiner und wird aus
+kurzfristigem Frame-Jitter statt der Hintergrundabweichung gelernt. Als naechster
+Test ist vorgesehen, die Mindestflaeche auf etwa 2 Prozent zu reduzieren.
 
-WICHTIG: Dieser Bildanalysepfad ist implementiert, aber NOCH NICHT abschliessend
-im Feld getestet. Vor produktiver Nutzung von image_verify Erkennungsqualitaet,
-Licht/Schatten, Tag/Nacht, Parameter, Wake-Latenz, Strom und Temperatur messen.
+WebConfig besitzt eine Live-Bildbewegungsseite mit ROI, kompaktem Statusblock,
+Diagnose-Download, fluessigerer Vorschau und Frischekontrolle. Auch das Dashboard
+zeigt den Image-Motion-Status. Die Diagnose trennt Gesamtveraenderung, groesste
+zusammenhaengende Aenderung und Schwellwert. Ein RAM-only Ringpuffer speichert bis
+zu 400 Frames. Zusaetzlich wird echte Frame-to-Frame-Bewegung gemessen und damit
+von der Abweichung zum Hintergrund getrennt; diese Messung ist derzeit nur
+Diagnose und beeinflusst die Aufnahmeentscheidung noch nicht.
+
+WICHTIG: Der Bildanalysepfad ist funktional, aber NOCH NICHT abschliessend im
+Feld getestet. image_verify und image_only weiter auf Erkennungsqualitaet,
+Licht/Schatten, Tag/Nacht, Parameter, Wake-Latenz, Strom und Temperatur pruefen.
 Ein echter PIR ist im Freenove-Pfad implementiert. Freigegeben ist nur SR602
 auf GPIO21; AM312 ist nicht freigegeben. XIAO verwendet typischerweise
 LD2410S/OT2 auf GPIO4.
@@ -4405,8 +4517,12 @@ WEITERE PRIORITAETEN:
 - vollstaendige historische UI-Uebersetzung spaeter systematisch abschliessen
 - Camera Settings Tool mit Live Exposure/Gain entwickeln
 - Motion Blur mit ae_level=-2 weiter bewerten
-- Image Motion / image_verify spaeter systematisch auf echter Hardware und im Feld
-  testen; bis dahin direct + image_motion_enabled=0 als sicherer Default
+- Image Motion mit direct / image_verify / image_only systematisch auf echter
+  Hardware und im Feld weiter testen; direct bleibt der sichere Default
+- als naechsten Image-Motion-Test Mindestflaeche von 6 auf etwa 2 Prozent senken;
+  Sensitivity 5 / Confirm 2 / Release 2 / Background Learning 4 zunaechst halten
+- Frame-to-Frame-Motion vorerst nur diagnostisch auswerten; noch nicht in die
+  Aufnahmeentscheidung einbeziehen
 - XIAO-SD 20 MHz bei weiteren Karten/Boardchargen und hoeheren Aufloesungen/FPS
   weiter auf Latenzspikes, Recovery, Temperatur und Strom beobachten
 - XCLK 16 vs 20 MHz nur bei neuer Energieoptimierungs-Prioritaet A/B testen
@@ -4427,6 +4543,7 @@ keine bereits geloesten Themen neu designen, keine APIs/Funktionen erfinden und
 Codeaenderungen nur auf dem zuletzt wirklich gesehenen Quellstand vornehmen.
 Bei Rueckgabe von Code standardmaessig nur geaenderte/neue Dateien unter ihren
 Originalnamen mitsenden; keine unveraenderten Dateien in Update-ZIPs aufnehmen.
+
 
 
 

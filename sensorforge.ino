@@ -4889,18 +4889,28 @@ static uint16_t cameraCropAxisStart(
 }
 
 
-static int cameraEffectiveRotationDegrees()
+static void cameraEffectiveOrientation(
+    bool &hmirror,
+    bool &vflip
+)
 {
-    int rotation =
-        cfg_rotation +
-        CAMERA_BASE_ROTATION_DEGREES;
+    // Board-specific native sensor correction comes first. The user-facing
+    // rotation setting is relative to that corrected product orientation.
+    hmirror =
+        CAMERA_BASE_HMIRROR != 0;
 
-    rotation %= 360;
+    vflip =
+        CAMERA_BASE_VFLIP != 0;
 
-    if (rotation < 0)
-        rotation += 360;
+    // A true 180-degree rotation is equivalent to toggling both axes.
+    // Config validation currently allows only 0 or 180 degrees.
+    if (cfg_rotation == 180) {
+        hmirror =
+            !hmirror;
 
-    return rotation;
+        vflip =
+            !vflip;
+    }
 }
 
 
@@ -5116,21 +5126,30 @@ bool cameraApplyCropRuntime(
     }
 
 
-    // Crop position is defined in DISPLAY coordinates. The board-specific
-    // camera mounting correction and the user-selected rotation are combined
-    // into one effective sensor rotation. If that effective rotation is 180
-    // degrees, both raw axes must be inverted so that e.g. "top-left" still
-    // means top-left in Live Preview and recordings.
+    // Crop position is defined in DISPLAY coordinates. Convert it back to raw
+    // sensor coordinates using the same effective mirror/flip orientation that
+    // is applied to Live Preview and recordings. This keeps e.g. "top-left"
+    // visually top-left even when the board needs a native mirror correction.
     int rawPositionX =
         positionX;
 
     int rawPositionY =
         positionY;
 
-    if (cameraEffectiveRotationDegrees() == 180) {
+    bool effectiveHMirror = false;
+    bool effectiveVFlip = false;
+
+    cameraEffectiveOrientation(
+        effectiveHMirror,
+        effectiveVFlip
+    );
+
+    if (effectiveHMirror) {
         rawPositionX =
             2 - rawPositionX;
+    }
 
+    if (effectiveVFlip) {
         rawPositionY =
             2 - rawPositionY;
     }
@@ -5378,36 +5397,33 @@ bool initCamera(
         }
 
 
-        const int effectiveRotation =
-            cameraEffectiveRotationDegrees();
+        bool effectiveHMirror = false;
+        bool effectiveVFlip = false;
 
-        switch (effectiveRotation) {
+        cameraEffectiveOrientation(
+            effectiveHMirror,
+            effectiveVFlip
+        );
 
-            case 0:
-                sensor->set_hmirror(sensor, 0);
-                sensor->set_vflip(sensor, 0);
-                break;
+        sensor->set_hmirror(
+            sensor,
+            effectiveHMirror ? 1 : 0
+        );
 
-            case 180:
-                sensor->set_hmirror(sensor, 1);
-                sensor->set_vflip(sensor, 1);
-                break;
+        sensor->set_vflip(
+            sensor,
+            effectiveVFlip ? 1 : 0
+        );
 
-            default:
-                // Config validation currently allows only 0/180 degrees and
-                // each board profile allows only a 0/180-degree base rotation.
-                // Keep a deterministic fallback if those invariants are ever
-                // changed without updating this camera path.
-                sensor->set_hmirror(sensor, 0);
-                sensor->set_vflip(sensor, 0);
-
-                Serial.printf(
-                    "Effective camera rotation %d unsupported | config=%d base=%d | using 0 degrees\n",
-                    effectiveRotation,
-                    cfg_rotation,
-                    CAMERA_BASE_ROTATION_DEGREES
-                );
-                break;
+        if (cfg_debug_enabled) {
+            Serial.printf(
+                "Camera orientation: config_rotation=%d base_hmirror=%d base_vflip=%d effective_hmirror=%d effective_vflip=%d\n",
+                cfg_rotation,
+                CAMERA_BASE_HMIRROR,
+                CAMERA_BASE_VFLIP,
+                effectiveHMirror ? 1 : 0,
+                effectiveVFlip ? 1 : 0
+            );
         }
     }
 
