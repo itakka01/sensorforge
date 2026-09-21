@@ -1,6 +1,6 @@
 SENSORFORGE / ESP32-S3 CAMERA (XIAO + FREENOVE)
 PROJEKTBESCHREIBUNG, RELEASESTAND UND WIEDEREINSTIEGSPROMPT
-Stand: 2026-09-21
+Stand: 2026-09-22
 Produktname: SensorForge
 Plattformname: Fabric Node
 Core-Version im Branding: 7.1.0
@@ -46,6 +46,8 @@ Der aktuelle Quellstand besteht im Kern aus:
 - recording_storage.cpp / recording_storage.h
 - config_secrets.cpp / config_secrets.h
 - log_storage.cpp / log_storage.h
+- mkv_writer.cpp / mkv_writer.h
+- webplayer.cpp / webplayer.h
 - sensorforge_sync.py fuer PC-seitigen Download/Sync
 - sensorforge_license.py fuer PC-seitige Lizenzcode-Erzeugung
 - den dazugehoerigen bestehenden Headern und Modulen fuer Recorder, Logger,
@@ -87,7 +89,7 @@ Auf echter Freenove-Hardware wurden mit SR602 mehrere aufeinanderfolgende
 Light-Sleep -> PIR-Wake -> Recording -> Light-Sleep-Zyklen erfolgreich
 beobachtet, darunter auch ein Wake nach mehr als 13 Minuten Sleep.
 
-Der aktuelle Sync-API-Stand ist Host API 1.10. Der aktuelle Python-Sync-Client
+Der aktuelle Sync-API-Stand ist Host API 1.11. Der aktuelle Python-Sync-Client
 ist 1.4. Die boardgebundene Offline-Lizenzierung ist als technisches Fundament
 implementiert und auf echter Hardware erstmals erfolgreich aktiviert worden.
 Die transparente Video-Verschluesselung fuer neue AVI/MKV-Aufnahmen ist
@@ -147,14 +149,10 @@ AKTUELLER AENDERUNGSSTAND 2026-09-21
 Seit dem vorherigen Dokumentstand wurden insbesondere folgende Punkte in den
 aktuellen Entwicklungsstand integriert:
 
-- periodische echte JPEG-Snapshots mit konfigurierbarem Minutenintervall,
-  Timer-Wake und festem Wall-Clock-Raster
-- Snapshots werden als /YYYYMMDD/HHMMSS.jpg abgelegt; Alarm/Presence hat immer
-  Vorrang vor einer faelligen Snapshot-Aufnahme
-- JPG-Dateien sind in Storage-Cleanup, Media/WebPlayer, Sync-API und optionaler
-  RecordingStorage-Verschluesselung integriert
-- Snapshot-Anzeige im WebPlayer mit Navigation/Filter und sichtbarem
-  Aufnahmezeitpunkt
+- der fruehere Minuten-Snapshot wurde spaeter im selben Entwicklungszyklus zum
+  universellen Dauershooter weiterentwickelt; siehe Aenderungsstand 2026-09-22
+- JPG-Dateien bleiben in Storage-Cleanup, Media/WebPlayer, Sync-API und
+  RecordingStorage integriert
 - WiFi-Firmware-Update schreibt jetzt DIREKT in die inaktive interne
   OTA-Partition; die SD-Karte ist fuer den WiFi-Updatepfad nicht mehr noetig
 - ein einmaliger NVS-Guard verhindert nach Direct-WiFi-OTA, dass beim ersten
@@ -216,6 +214,163 @@ wurden NICHT umgesetzt. Trigger/Hold und die interne Presence-Nachhaltefunktion
 des LD2410S bleiben Aufgabe des Sensors. Der ESP verwendet seine schnelle
 UART-Gate-Auswertung nur als schnellen Voralarm/Aufnahmestart und OT2 fuer die
 bestaetigte Presence-Haltephase.
+
+
+======================================================================
+AKTUELLER AENDERUNGSSTAND 2026-09-22 - DAUERSHOOTER / SPARSE MKV / PLAYER
+======================================================================
+
+Der fruehere periodische Minuten-Snapshot wurde durch EINEN universellen
+Dauershooter ersetzt. Es gibt keine zweite zeitbasierte Snapshot-Engine mehr.
+
+Aktuelle Dauershooter-Konfiguration:
+
+- shooter_enabled=0|1
+- shooter_interval_ms; Minimum 250 ms, damit maximal 4 fps
+- shooter_dark_mean_min; Firmware-Standard 20, aktueller Feldtest 15
+- shooter_min_change_pct als Mindestveraenderung gegenueber dem letzten
+  akzeptierten Bild
+- alter Key shooter_similarity_threshold wird fuer bestehende Configs noch
+  kompatibel auf Mindestveraenderung abgebildet
+- shooter_force_save_seconds
+- shooter_flush_seconds
+- shooter_storage_format=jpg|mkv; Standard im aktuellen Stand: mkv
+- kein Benutzerparameter fuer die PSRAM-Puffergroesse
+- motion_recording_enabled=0|1 ist unabhaengig von
+  motion_recording_decision=direct|image_verify|image_only
+
+Der Dauershooter ist auf Wall-Clock-Zeiten ausgerichtet und unterstuetzt auch
+Subsekunden-Slots. Bei 2 fps entstehen beispielsweise Zeitpunkte .000 und .500.
+Bei fehlender gueltiger Uhrzeit existiert weiterhin ein monotones Fallback.
+
+PSRAM-Puffer:
+
+- wird erst beim ersten tatsaechlichen Shooterbild automatisch dimensioniert
+- 1 MiB Laufzeitreserve
+- etwa 80 Prozent des danach sicher nutzbaren PSRAM
+- groesster zusammenhaengender Block/Fragmentierung wird beruecksichtigt
+- bei fehlendem oder zu kleinem PSRAM existiert ein sicherer direkter Fallback
+- der Puffer enthaelt vollstaendige akzeptierte JPEG-Frames plus Metadaten
+- Light Sleep behaelt den PSRAM-Inhalt
+- vor Deep Sleep, Reboot und Shutdown ist deshalb ein Flush erforderlich
+
+Filter:
+
+- zuerst Dunkelpruefung
+- danach Mindestveraenderung gegenueber dem LETZTEN AKZEPTIERTEN Bild
+- dadurch koennen kleine Veraenderungen ueber mehrere verworfene Frames
+  akkumulieren
+- Force-Save umgeht die Aehnlichkeitspruefung, aber NICHT die Dunkelpruefung
+- Dunkelentscheidung verwendet nicht nur den globalen Mittelwert, sondern
+  zusaetzlich die hellste lokale Zone des 20x15-Rasters
+- ein dunkles Gesamtbild kann deshalb erhalten bleiben, wenn z.B. eine Person
+  mit Taschenlampe lokal einen klar hellen Bereich erzeugt
+- bei sehr dunklen Szenen bleibt Bildrauschen ein wichtiger Feldtestpunkt fuer
+  sehr kleine shooter_min_change_pct-Werte; nicht auf Verdacht weiter
+  optimieren, sondern reale Nachtstatistik messen
+
+Bei hoher Frequenz wird nicht vor jedem Shooterbild erneut eine
+3-Frame-Warmup-Sequenz gefahren. Das waere bei 2 fps unbrauchbar und
+energieineffizient. Bei grossen Zeitabstaenden bleibt der Warmup-Pfad erhalten.
+
+Light Sleep / Dauershooter:
+
+- reine Shooter-Timer-Wakes setzen den normalen Idle-Countdown nicht permanent
+  zurueck
+- der Code versucht Light Sleep auch bei 2 fps zwischen den Slots, sofern keine
+  andere Sperre aktiv ist
+- WLAN blockiert den normalen Light-Sleep-Pfad
+- WebConfig kann bei web_recording_auto_pause=1 die Aufnahmeautomatik und damit
+  auch den Dauershooter temporaer pausieren
+- im reinen Shooterbetrieb mit motion_recording_enabled=0 werden Presence/PIR/
+  OT2 nicht als notwendige Shooter-Wakequelle behandelt
+
+Sparse MKV:
+
+- akzeptierte JPEGs werden ohne Re-Encoding in einen sparsamen MKV-Container
+  geschrieben
+- echte Aufnahmezeitpunkte bleiben als variable MKV-Block-Timestamps erhalten
+- DateUTC wird aus dem ersten akzeptierten Frame abgeleitet
+- lange Zeitluecken werden NICHT aus der MKV-Datei entfernt
+- eine Sparse-MKV-Datei pro Flush statt tausender einzelner JPG-Dateien
+- .mkv.part wird erst nach erfolgreicher Finalisierung in .mkv umbenannt
+- unvollstaendige .mkv.part-Dateien sind in der Boot-Recovery enthalten
+- Sparse MKV besitzt absichtlich keine sekundenweisen Subtitle-Blocks, weil diese
+  die Sparse-Eigenschaft wieder zerstoeren wuerden
+
+WebPlayer fuer Sparse MKV, aktueller Stand v15:
+
+- Browser liest echte variable Frame-Timestamps aus dem MKV
+- normale zusammenhaengende Sequenzen spielen mit Quellzeit
+- Luecken groesser als 3 s werden nur in der WEB-WIEDERGABE auf 500 ms
+  komprimiert; die MKV-Datei selbst bleibt zeitlich unveraendert
+- Speed 1x / 2x / 4x
+- Speed wird ueber Clip Previous/Next und Browser-Navigation als URL-Zustand
+  mitgenommen
+- Frame zurueck / Frame vor pausiert eine laufende Wiedergabe und zeigt exakt
+  den Nachbarframe
+- Download laedt weiterhin die komplette MKV-Datei
+- Download image exportiert nur den aktuell sichtbaren JPEG-Frame
+- der echte Aufnahmezeitpunkt wird als Browser-Overlay angezeigt
+- Overlay rechts unten, transparente Darstellung ohne schwarze Flaeche,
+  weisse Schrift mit Kontur/Schatten
+- Anzeige mit Zehntelsekunde, z.B. 2026-09-22 00:14:05.5
+- Download image rendert diesen Zeitstempel ebenfalls rechts unten direkt in
+  die heruntergeladene JPG-Kopie
+- Original-JPEG im MKV und die MKV-Datei selbst bleiben unveraendert
+
+WebPlayer-Hinweis:
+
+Die angezeigte MKV-Quellzeit und die komprimierte Wiedergabedauer sind bewusst
+zwei verschiedene Dinge. Nach einer langen komprimierten Luecke kann die
+Aufnahmezeit im Player sichtbar springen. Das ist korrekt und bewahrt die echte
+Zeitinformation.
+
+Logger / Stromoptimierung fuer den Dauershooter:
+
+- normale logWrite()-Aufrufe werden im aktuellen Stand in einem 16-KiB-
+  PSRAM-Puffer gesammelt statt jede Zeile sofort auf SD zu flushen
+- Flush bei vollem Puffer bzw. an sinnvollen Persistenzpunkten
+- Flush zusammen mit Shooter-SD-Flush, beim Logviewer, vor Reboot/Shutdown und
+  vor Deep Sleep
+- ohne PSRAM existiert ein sicherer direkter SD-Fallback
+- reine Shooter-Timer-Wakes erzeugen nicht mehr einzeln SD-Logwrites
+- Sleep-Zyklen werden im RAM gezaehlt und spaeter zusammengefasst
+- bei hartem Stromverlust koennen noch nicht persistierte Logzeilen verloren
+  gehen; kontrollierte Systemuebergaenge flushen den Puffer
+
+Reboot / Shutdown:
+
+- neue Aufnahmestarts werden waehrend des kontrollierten Uebergangs blockiert
+- Dauershooter-Puffer wird vor Restart/Shutdown mit erhoehter Prioritaet
+  geflusht
+- Shutdown besitzt vor dem finalen Deep Sleep nochmals einen defensiven Flush
+- bei hartem Stromverlust bleibt das eingestellte shooter_flush_seconds-Fenster
+  ein bewusst akzeptiertes Verlustfenster fuer nur im PSRAM liegende Bilder
+
+Messstand Dauershooter:
+
+- reale Tests zeigten bei shooter_interval_ms=500 exakt etwa 2 fps
+- PSRAM-Autopuffer lag im beobachteten XIAO-Aufbau bei rund 5.4 MiB
+- JPEG-Groessen lagen grob bei 44 bis 49 KiB
+- alte Einzel-JPG-Batch-Flushes waren vergleichsweise langsam und waren ein
+  wesentlicher Grund fuer den Sparse-MKV-Pfad
+- aktueller Strom-Messhinweis im Dauershooter-Aufbau: ohne WLAN aktiv grob
+  etwa 110 mA, mit WLAN grob etwa 180 mA, Light-Sleep-Anzeige am Multimeter
+  grob um 10 mA; bei 2 fps ist ein normales Multimeter fuer kurze Aktivspitzen
+  nur eingeschraenkt aussagekraeftig
+
+Produktionsstatus:
+
+- Funktionsumfang jetzt moeglichst einfrieren
+- aktueller Stand ist ein fortgeschrittener RELEASE CANDIDATE
+- vor endgueltiger Produktionsqualifikation mindestens 24-48 h Dauertest,
+  Sparse-MKV-Stichprobe, Encryption-Test, Reboot/Shutdown mit gefuelltem
+  Puffer, absichtlicher Power-Cut waehrend MKV-Flush und Rollover/volle-SD-Test
+- die letzten v10-v16-Deltas wurden strukturell/JavaScript-/ZIP-seitig geprueft,
+  aber in dieser Entwicklungsumgebung NICHT als kompletter Arduino/ESP32-Build
+  kompiliert; niemals einen nicht ausgefuehrten Build als bestanden markieren
+
 
 ======================================================================
 PROJEKTZIEL
@@ -521,7 +676,7 @@ Fuer einen XIAO-Build sollten die XIAO-Marker sichtbar sein.
 AKTUELLER KONFIGURATIONSSTAND
 ======================================================================
 
-Der zuletzt bekannte Feld-/Test-Config-Stand verwendet unter anderem:
+Der zuletzt bekannte XIAO-Dauershooter-Feld-/Teststand verwendet unter anderem:
 
 Kamera:
 
@@ -530,65 +685,54 @@ Kamera:
 - rotation=0
 - fps=5
 - quality=12
+- camera_xclk_mhz=16 im zuletzt hochgeladenen XIAO-Testconfig
 - camera_auto_exposure=1
 - camera_ae_level=-2
-- camera_crop_zoom=1.0
+- camera_crop_zoom=1.5
 - camera_crop_x=1
 - camera_crop_y=1
 
-Im aktuellen Freenove-Teststand ist explizit gesetzt:
-
-camera_xclk_mhz=10
-
-Fuer aeltere XIAO-Configs kann camera_xclk_mhz weiterhin fehlen; dort greift
-der board-/firmwareseitige Default. 10/16/20 MHz bleiben als unterstuetzte
-Werte erhalten.
-
-Der Code akzeptiert:
-
-- 10 MHz
-- 16 MHz
-- 20 MHz
-
-und WebConfig besitzt dafuer eine Auswahl. Eine Aenderung wird nach Neustart
-wirksam.
+Der Code akzeptiert weiterhin camera_xclk_mhz 10 / 16 / 20 MHz.
+Eine Aenderung wird nach Neustart wirksam.
 
 Bildbasierte Bewegungsentscheidung / Image Motion:
 
-- motion_recording_decision=direct
-  Gueltige Modi: direct / image_verify / image_only
+- motion_recording_enabled=0 im zuletzt bekannten Dauershooter-Testconfig
+- motion_recording_decision=image_only im zuletzt bekannten Dauershooter-Testconfig
+- gueltige Decision-Modi: direct / image_verify / image_only
+- motion_recording_enabled ist davon unabhaengig und kann die
+  bewegungsbasierte Videoaufnahme komplett abschalten
 - ein separates image_motion_enabled gibt es nicht mehr
 - image_motion_sensitivity=5
-- image_motion_min_area_pct=6
+- image_motion_min_area_pct=6 im zuletzt bekannten Config
 - image_motion_confirm_frames=2
 - image_motion_release_frames=2
 - image_motion_background_learning=4
 - image_motion_global_mean_delta=24
 - image_motion_global_change_pct=70
-- image_motion_roi_mask=volle Ueberwachungsmaske als Firmware-Default
+- image_motion_roi_mask konfigurierbar
 
-Der sichere Rueckwaertskompatibilitaets-Default ist:
+Das Image-Motion-Raster bleibt 20x15 = 300 Zellen. Bei voller ROI entspricht
+eine Zelle rund 0.33 Prozent. Deshalb koennen extrem kleine konfigurierte
+Flaechenwerte unterhalb dieser realen Rastergranularitaet nicht beliebig fein
+aufgeloest werden.
 
-- Recording Decision = direct
+Dauershooter:
 
-Aktueller Image-Motion-Teststand:
+- shooter_enabled=0|1
+- shooter_interval_ms; 500 ms = 2 fps; Minimum 250 ms
+- shooter_dark_mean_min; Firmware-Standard 20, aktueller Feldtest 15
+- shooter_min_change_pct als aktuelle Benutzereinstellung
+- Legacy shooter_similarity_threshold wird fuer bestehende Configs kompatibel
+  gelesen; 99 Prozent Aehnlichkeit entspricht 1.0 Prozent Mindestveraenderung
+- shooter_force_save_seconds
+- shooter_flush_seconds
+- shooter_storage_format=jpg|mkv; Standard mkv
+- kein shooter_buffer_kb mehr; Puffergroesse wird automatisch ermittelt
 
-- Sensitivity 5
-- Confirm 2
-- Release 2
-- Background Learning 4
-- Mindestflaeche derzeit 6 Prozent; als naechster Test sind etwa 2 Prozent
-  vorgesehen, um Bewegungen in groesserer Entfernung besser zu erfassen
+Aufnahme / Alarmvideo:
 
-Fehlen spaeter hinzugefuegte optionale Image-Motion-Keys in einer alten
-config.txt, bleibt die Config gueltig und die Firmware verwendet die eingebauten
-Defaults im RAM. Der Bootvorgang schreibt fehlende Image-Motion-Keys NICHT
-ungefragt in die bestehende config.txt. Erst bewusstes Speichern auf der
-Bildbewegungsseite persistiert die Einstellungen ueber den bestehenden Config-Pfad.
-
-Aufnahme:
-
-- recording_format=avi
+- recording_format=avi im zuletzt bekannten Alarmvideo-Testconfig
 - timestamp_enabled=1
 - recording_not_before=off
 - post_record_ms=3000
@@ -597,27 +741,22 @@ Aufnahme:
 - recording_event_max_seconds=65
 - recording_event_cooldown_seconds=30
 - recording_encryption=1 im aktuellen Encryption-Teststand
-- periodic_snapshot_minutes=1 im zuletzt bekannten XIAO-Testconfig
 
-recording_encryption akzeptiert 0 oder 1. Der Key ist fuer alte Configs
-optional; fehlt er, ist der Firmware-Default 0. Eine Aenderung gilt nur fuer
-NEUE Aufnahmen. Bereits vorhandene verschluesselte und unverschluesselte
-Dateien bleiben unabhaengig vom aktuellen Schalter lesbar.
+Der Dauershooter ist ein eigener zeitbasierter Aufnahmeweg. Das normale
+Alarmvideo-/Motion-System bleibt separat bestehen.
+
+recording_encryption akzeptiert 0 oder 1. Eine Aenderung gilt nur fuer NEUE
+Aufnahmen. Bereits vorhandene verschluesselte und unverschluesselte Dateien
+bleiben unabhaengig vom aktuellen Schalter lesbar.
 
 Sleep:
 
 - sleep_mode=light_sleep
 - sleep_delay_ms=2000
 - bootloop_protection=1
-
-Bootloop-/Unterspannungsschutz:
-
-- NVS-basiert, kein Spannungs-/Stromsensor erforderlich
-- Schutz wird nach 60 s stabiler Laufzeit intern als erfolgreich markiert
-- mehrere kurze instabile Cold-/Brownout-Starts fuehren zu gestaffeltem
-  Timer-Deep-Sleep-Backoff
-- normale Light-/Deep-Sleep-Wakes zaehlen nicht als instabile Boots
-- die 60-s-Stabilitaetszeit ist absichtlich kein Config-Key
+- reine Shooter-Timer-Wakes duerfen den Idle-Countdown nicht permanent
+  zuruecksetzen
+- WLAN aktiv verhindert den normalen Light-Sleep-Pfad
 
 Transport:
 
@@ -625,35 +764,46 @@ Transport:
 - transport_check_seconds=120
 - transport_light_confirm_seconds=10
 - transport_install_delay_seconds=300
-- transport_black_mean_max=25
-- transport_black_p95_max=45
+- transport_max_duration_seconds vorhanden
+- ab v16 nur noch EIN Benutzerparameter:
+  transport_black_threshold
+- interne zweite Schutzgrenze fuer helle Bildbereiche:
+  p95_limit = transport_black_threshold + 10
+- bestehende Configs mit transport_black_mean_max und
+  transport_black_p95_max bleiben als Migrationsquelle lesbar; beim naechsten
+  Speichern der Transportwerte werden die alten Keys entfernt
 
 Speicher:
 
 - min_free_space_mb=100
 - disk_full_action=rollover
+- .mkv.part ist in der Recovery unvollstaendiger Aufnahmen enthalten
 
-WLAN / Web:
+WLAN / Web im zuletzt hochgeladenen Testconfig:
 
 - wifi_on_system_start=on
-- wifi_timeout_sec=60
+- wifi_timeout_sec=0
+- damit bleibt WLAN dauerhaft aktiv, bis es bewusst abgeschaltet wird; fuer
+  Batterietests ist dieser Zustand ungeeignet, weil Light Sleep blockiert wird
 - Hotspot ist aktiviert
 - Web-Authentifizierung ist aktiviert
 - web_recording_auto_pause=1
 - web_language=de
 
-web_language akzeptiert aktuell de oder en. Der Key ist fuer alte Configs
-optional; fehlt er, wird Deutsch verwendet. Die Sprache betrifft nur sichtbare
-UI-Texte. API-, Config- und Log-Bezeichner bleiben technisch stabil und
-englisch/sprachneutral.
+web_recording_auto_pause=1 kann den Dauershooter pausieren, solange WebConfig
+aktiv gehalten wird. Strom-/Dauertests deshalb nicht mit offener WebConfig-Seite
+bewerten.
 
-Aus Sicherheitsgruenden werden Zugangsdaten und Passwoerter in diesem
-Wiedereinstiegsdokument nicht wiederholt.
+Aus Sicherheitsgruenden werden Zugangsdaten, Passwoerter, Hardware-IDs,
+Lizenz-/Private-Key-Daten und andere Secrets in diesem Dokument nicht wiederholt.
 
 Logging:
 
 - log_file=/log.txt
 - debug_enabled=0
+- normaler Logger besitzt fuer den Dauershooter einen 16-KiB-PSRAM-Puffer
+- normale Logzeilen werden nicht mehr einzeln sofort auf SD geflusht
+- kontrollierte Persistenz bei sinnvollen System-/Shooter-Uebergaengen
 - bei recording_encryption=1 wird die physische Loggeneration als SFLOG1
   verschluesselt gespeichert
 - bei recording_encryption=0 bleibt der neue Logpfad plaintext; bereits
@@ -1007,9 +1157,24 @@ Mit OV3660 Software Power Down:
 
 Light Sleep etwa 3.4 mA
 
-Das ist die aktuelle bewaehrte Produktionsgroessenordnung.
+Das ist eine fruehere bewaehrte Produktionsgroessenordnung aus dem
+dedizierten Light-Sleep-Test.
 
-Aktiver Strom wurde je nach Aufbau/Kamera grob um etwa 180 mA beobachtet.
+Neuere Dauershooter-Messungen am aktuellen Aufbau zeigten mit einfachem
+Multimeter grob:
+
+- WLAN aktiv etwa 180 mA
+- ohne WLAN im aktiven Kamera-/Shooterzustand etwa 110 mA
+- Light-Sleep-Anzeige grob um 10 mA
+
+Bei 2 fps wechselt der Strom schnell zwischen Sleep und Aktivphase. Ein normales
+Multimeter mittelt bzw. folgt diesen kurzen Pulsen nur begrenzt. Fuer belastbare
+Laufzeitwerte besser Energie/Wh oder gemittelten Strom ueber 30-60 Minuten
+messen. Die frueheren 3.4 mA und die neu beobachteten rund 10 mA stammen aus
+unterschiedlichen Teststaenden und duerfen nicht unkritisch gleichgesetzt werden.
+
+Aktiver Strom wurde je nach Aufbau/Kamera/WLAN grob um etwa 110 bis 180 mA
+beobachtet.
 Ein ungeeignetes bzw. auffaellig heisses Aftermarket-OV3660-Modul lag deutlich
 hoeher und zeigte zudem Bildprobleme.
 
@@ -1186,8 +1351,11 @@ Aktueller Produktions-/Testbetrieb:
 - JPEG quality 12
 - Timestamp/SRT aktiviert
 
-MKV-Infrastruktur ist ebenfalls vorhanden, der aktuelle Feldstand verwendet
-aber AVI. AVI ist daher derzeit der besser bewaehrte Produktionspfad.
+Fuer das normale bewegungsgetriggerte Alarmvideo bleibt AVI der besser
+bewaehrte Feldpfad. Zusaetzlich verwendet der Dauershooter im aktuellen Stand
+bevorzugt Sparse MKV mit direkt eingebetteten JPEG-Frames und variablen echten
+Zeitstempeln. Diese zwei Anwendungsfaelle nicht vermischen: AVI ist hier die
+Aussage zum Alarmvideo, Sparse MKV die Aussage zum Dauershooter.
 
 Recording-Funktionen:
 
@@ -1785,6 +1953,37 @@ weitgehend getestet, aber noch nicht als vollstaendig abgeschlossen markieren.
 
 
 ======================================================================
+LOGGER-PUFFERUNG FUER DAUERSHOOTER / STROMVERBRAUCH
+======================================================================
+
+Im Dauershooter-Test wurde festgestellt, dass der alte Logger jede normale
+Logzeile unmittelbar auf SD schrieb und flushte. Bei 2 fps konnte dadurch selbst
+ein reiner Shooter-Timer-Wake unnoetige SD-Aktivitaet verursachen.
+
+Aktueller Stand:
+
+- 16 KiB Log-Puffer bevorzugt in PSRAM
+- normale logWrite()-Aufrufe schreiben zuerst in RAM
+- kein sofortiges SD-flush() fuer jede normale Zeile
+- Flush bei vollem Puffer und an gezielten Persistenzpunkten
+- Shooter-SD-Flush zieht den Log-Puffer mit
+- Logviewer-/Downloadpfade duerfen vorher flushen
+- kontrollierter Reboot, Shutdown und Deep Sleep flushen Logs
+- ohne PSRAM sicherer direkter SD-Fallback
+- reine Shooter-Timer-Wakezyklen werden nicht einzeln persistent geloggt
+- Sleep-Zyklen/Zeiten koennen im RAM gesammelt und spaeter als Summary
+  geschrieben werden
+- repetitive POWER-/Shooter-Serial-Ausgaben sind bei debug_enabled=0 reduziert
+
+Tradeoff:
+
+Bei hartem Power-Off koennen die letzten noch nicht geflushten normalen
+Logzeilen verloren gehen. Dieser Tradeoff ist fuer niedrigere SD-Aktivitaet und
+Stromverbrauch bewusst akzeptiert. Aufnahmedaten besitzen ihren eigenen
+separaten Flush-/Finalisierungspfad.
+
+
+======================================================================
 ZEITGESTEUERTE SCHARFSCHALTUNG
 ======================================================================
 
@@ -1855,6 +2054,19 @@ Wichtig:
 - Erst danach wird transport_mode persistent auf 0 gesetzt und der Normalbetrieb
   fortgesetzt.
 
+Beziehung zum Dauershooter:
+
+- Transportmodus ist ein eigener frueher Bootpfad
+- solange transport_mode=1 ist, wird der normale Dauershooter NICHT gestartet
+- es gibt keinen parallelen 2-fps-Shooter-Timer und keinen normalen
+  Shooter-PSRAM-Puffer
+- beim kontrollierten Aktivieren des Transportmodus wird ein vorhandener
+  Dauershooter-Puffer ueber den normalen Before-Restart-Flush persistiert
+- nach erfolgreichem Ende des Transportmodus folgt wieder der komplette
+  Normalbetrieb; nur dann startet ein aktivierter Dauershooter wieder
+- shooter_dark_mean_min und transport_black_threshold sind zwei getrennte
+  Schwellen fuer unterschiedliche Aufgaben und duerfen nicht gekoppelt werden
+
 
 ======================================================================
 TRANSPORTSICHERUNG - WEBCONFIG WORKFLOW
@@ -1917,20 +2129,27 @@ Messmethode:
 - 6 Warmup-Frames vor der Messung
 - danach 10 Messframes fuer die Web-Kalibrierung
 
-Als Referenz werden die konservativen Hoechstwerte ueber die Messserie
-verwendet.
+Intern werden weiterhin zwei Messgroessen ausgewertet:
 
-Angezeigt werden:
+- durchschnittliche Bildhelligkeit / Mean
+- P95 als robuste Kontrolle auf hellere Teilbereiche bzw. Lichtspalte
 
-- durchschnittliche Helligkeit
-- P95 fuer helle Bildbereiche
-- Sicherheitsreserve
+Ab v16 sieht und speichert der Benutzer dafuer aber nur noch EINEN Wert:
 
-Automatische Vorschlaege:
+transport_black_threshold
 
-- Mean-Grenze = ceil(Referenz-Mean) + 10
-- P95-Grenze = Referenz-P95 + 15
-- P95 wird nie unter die Mean-Grenze gesetzt
+Die interne Black-Entscheidung bleibt zweistufig:
+
+mean <= transport_black_threshold
+
+UND
+
+p95 <= transport_black_threshold + 10
+
+Die automatische Kalibrierung misst weiterhin Mean und P95, berechnet daraus
+aber einen einzigen konservativen Vorschlagswert. Dadurch bleibt der Schutz
+gegen kleine helle Bereiche erhalten, ohne zwei schwer verstaendliche
+Benutzerparameter zu exponieren.
 
 Wenn die abgedeckte Kamera ungewoehnlich hell ist, wird gewarnt, die Aktivierung
 aber nicht hart blockiert.
@@ -1942,34 +2161,34 @@ Neu messen
 Dieser startet die Messung erneut, ohne die ganze Seite neu laden zu muessen.
 
 Die Messung speichert noch nichts automatisch. Erst der Speichern-Button
-schreibt die Werte persistent.
+schreibt den einen Transport-Schwarzgrenzwert persistent.
+
+Rueckwaertskompatibilitaet:
+
+- alte Configs mit transport_black_mean_max und transport_black_p95_max bleiben
+  ladbar
+- beim naechsten Speichern der Transportwerte werden beide alten Keys entfernt
+  und durch transport_black_threshold ersetzt
 
 
 ======================================================================
 TRANSPORTSICHERUNG - BENUTZERFREUNDLICHE FELDBEZEICHNUNGEN
 ======================================================================
 
-Die internen Variablennamen bleiben technisch unveraendert, die Weboberflaeche
-verwendet jedoch verstaendlichere Bezeichnungen.
+Aktuell sichtbarer Schwarzwert:
 
-transport_black_mean_max:
+transport_black_threshold:
 
-"Schwarzgrenze - durchschnittliche Bildhelligkeit"
-
-Erklaerung:
-
-Wie hell das vollstaendig abgedeckte Bild im Durchschnitt noch sein darf.
-Ein kleinerer Wert bedeutet eine strengere Schwarzerkennung.
-
-transport_black_p95_max:
-
-"Schwarzgrenze - helle Bereiche im Bild"
+"Schwarzgrenze Transport"
 
 Erklaerung:
 
-Zusaetzliche Grenze fuer hellere Bildbereiche. Sie hilft zu erkennen, wenn
-Teile der Abdeckung Licht durchlassen, obwohl der Gesamtdurchschnitt noch
-dunkel ist.
+Wie dunkel die vollstaendig abgedeckte Transportkamera sein muss.
+0 bedeutet schwarz, 255 hell. Ein kleinerer Wert ist strenger.
+
+Die zusaetzliche Kontrolle heller Teilbereiche bleibt intern aktiv und wird
+automatisch als transport_black_threshold + 10 abgeleitet. Der Benutzer muss
+den Begriff P95 nicht mehr konfigurieren.
 
 transport_check_seconds:
 
@@ -2057,13 +2276,16 @@ Nach dem Aufwachen:
 8. nur wenn alle erforderlichen Messungen OPEN bleiben, gilt die Abdeckung als
    entfernt
 
-BLACK gilt nur wenn gleichzeitig:
+BLACK gilt ab v16 nur dann, wenn intern BEIDE Bedingungen gelten:
 
-mean <= transport_black_mean_max
+mean <= transport_black_threshold
 
 und
 
-p95 <= transport_black_p95_max
+p95 <= transport_black_threshold + 10
+
+Nach aussen existiert dafuer nur noch der eine Benutzerparameter
+transport_black_threshold.
 
 Bei nicht bestaetigtem Licht geht das Geraet wieder in die normalen
 Abdeckungschecks zurueck.
@@ -2936,64 +3158,98 @@ Lange SD-Wartungsoperationen muessen Watchdog und Webserver weiter bedienen.
 
 
 ======================================================================
-PERIODISCHE SNAPSHOTS
+DAUERSHOOTER / ZEITBASIERTE JPEG-ERFASSUNG
 ======================================================================
 
-Config-Key:
+Der fruehere Key periodic_snapshot_minutes ist im aktuellen Produktpfad
+abgeloest. Es gibt nur noch EINEN universellen Dauershooter.
 
-periodic_snapshot_minutes=0..1440
+Wesentliche Config-Keys:
 
-- 0 deaktiviert periodische Snapshots
-- im zuletzt bekannten Testconfig ist 1 Minute gesetzt
+shooter_enabled=0|1
+shooter_interval_ms
+shooter_dark_mean_min
+shooter_min_change_pct
+shooter_force_save_seconds
+shooter_flush_seconds
+shooter_storage_format=jpg|mkv
 
-Verhalten:
+Legacy-Kompatibilitaet:
 
-- es werden echte JPEG-Dateien erzeugt, keine Video-Frames mit umbenannter Endung
-- bei gueltiger Uhrzeit wird auf feste Wall-Clock-Slots ausgerichtet; ein langes
-  Alarmereignis verschiebt damit nicht dauerhaft alle spaeteren Snapshot-Zeiten
-- bei fehlender gueltiger Wall-Clock existiert ein monotones Fallback-Scheduling
-- Light Sleep und der vorhandene Deep-Sleep-Pfad koennen einen Timer-Wake fuer
-  den naechsten Snapshot erhalten
-- Alarm/Presence hat immer Vorrang: erscheint waehrend Warmup/Capture/Write eine
-  Bewegung, wird der Snapshotpfad abgebrochen bzw. nicht gestartet
-- fuer Snapshots duerfen im Gegensatz zum schnellen Alarm-Wake bewusst drei
-  Warmup-Frames verworfen werden, damit Auto-Exposure/Gain Zeit zum Einregeln hat
-- der schnelle Alarm-Recordingpfad selbst wurde dadurch nicht verlangsamt
+- shooter_similarity_threshold kann in einer bestehenden Config noch gelesen
+  und auf shooter_min_change_pct abgebildet werden
+- periodic_snapshot_minutes soll nicht als zweites paralleles Shooter-System
+  wieder eingefuehrt werden
 
-Dateistruktur bei gueltiger Uhrzeit:
+Scheduling:
 
-/YYYYMMDD/HHMMSS.jpg
+- Wall-Clock-ausgerichtet, inklusive Subsekunden
+- 500 ms = 2 fps mit Slots .000 / .500
+- Minimum 250 ms = maximal 4 fps im aktuellen Stand
+- monotones Fallback bei ungueltiger Systemzeit
+- bei hoher Frequenz kein 3-Frame-Warmup pro Bild
+- bei sehr langen Intervallen kann weiterhin Warmup sinnvoll verwendet werden
 
-Der Zeitstempel im Namen entspricht dem geplanten Wall-Clock-Slot. Doppelte
-Dateien desselben Slots werden nicht ueberschrieben. Ohne gueltige Uhrzeit wird
-ein /fallback/snapshot_<millis>.jpg-Pfad verwendet.
+Dunkel-/Aehnlichkeitsfilter:
 
-Storage/Encryption:
+- Helligkeit als 0..255-Mittelwert
+- zusaetzlich hellste lokale Zone im 20x15-Raster
+- wegen eines hellen lokalen Motivs wird ein ansonsten dunkles Bild nicht
+  automatisch verworfen
+- Aehnlichkeitsvergleich gegen das letzte AKZEPTIERTE Bild
+- shooter_min_change_pct ist unabhaengig von image_motion_min_area_pct
+- Force-Save umgeht nur Aehnlichkeit, nicht die Dunkelpruefung
 
-- Snapshots respektieren die konfigurierte Storage-Mindestreserve
-- .jpg und .jpg.part sind in Cleanup-/Recovery-Logik integriert
-- geschrieben wird ueber RecordingStorageFile
-- bei recording_encryption=1 wird damit auch der Snapshot physisch ueber die
-  bestehende transparente Storage-Verschluesselung geschuetzt
-- Leser/Web/Sync arbeiten weiterhin mit dem logischen JPEG-Datenstrom
+PSRAM-Puffer:
+
+- automatisch, kein Benutzerwert
+- 1 MiB Reserve
+- ca. 80 Prozent des danach sicher nutzbaren PSRAM
+- Fragmentierung/groesster zusammenhaengender Block wird beruecksichtigt
+- gespeicherte Eintraege sind komplette JPEGs plus Zeitmetadaten
+- Light Sleep erhaelt den Puffer
+- Deep Sleep/Reboot/Shutdown verlangen vorheriges Flushen
+
+Storage-Format:
+
+JPG:
+- weiterhin moeglich
+- Namen bei gueltiger Zeit koennen Subsekunden enthalten, z.B.
+  HHMMSS_000.jpg / HHMMSS_500.jpg
+
+MKV, aktueller bevorzugter Dauershooter-Pfad:
+- Sparse MKV
+- JPEGs werden ohne Re-Encoding als Frames eingelagert
+- variable echte Frame-Zeitstempel
+- eine Datei pro Flush
+- .mkv.part -> Finalisierung -> .mkv
+- bei PSRAM-Fallback kann auch ein einzelner Sparse-MKV-Frame direkt geschrieben
+  werden
+- keine kuenstlichen sekundenweisen Subtitle-Frames im Sparse-MKV
+
+Dauershooter und Alarmvideo bleiben getrennte Funktionen. Alarm-/Motionvideo
+wird ueber motion_recording_enabled und motion_recording_decision gesteuert.
 
 Web/Sync:
 
-- JPG ist in Medienlisten und Tagesnavigation integriert
-- Filter erlauben eine sinnvolle Trennung von Video und Snapshot
-- WebPlayer kann Snapshots anzeigen und zwischen Medien navigieren
-- Snapshot-Anzeige besitzt einen sichtbaren Aufnahmezeitpunkt
-- Sync API listet und uebertraegt JPG-Dateien zusammen mit den bisherigen Medien
+- JPG und MKV sind in Medienlisten/Tagesnavigation integriert
+- Sparse MKV wird vom WebPlayer mit echten Framezeiten gelesen
+- Sync/Download arbeiten weiterhin mit RecordingStorage und damit transparent
+  auch bei SFENC1
 
-Periodische Snapshots sind eine Hintergrundfunktion und duerfen die Alarmkamera
-niemals gegenueber einem realen Bewegungsereignis priorisieren.
+Wichtig fuer Feldtests:
+
+Bei sehr dunklen Bildern kann Sensor-/JPEG-Rauschen den Differenzwert anheben.
+Der Shooter mittelt zwar im 20x15-Raster und ist daher robuster als ein
+Pixelvergleich, sehr kleine shooter_min_change_pct-Werte muessen nachts aber
+real gemessen werden. Erst messen, dann optimieren.
 
 ======================================================================
 SYNC API / PC-DOWNLOAD
 ======================================================================
 
 Fuer schnellen PC-seitigen Download existiert eine eigene stateless Sync API.
-Der aktuelle Host-Stand ist API 1.10. Der aktuelle Python-Client
+Der aktuelle Host-Stand ist API 1.11. Der aktuelle Python-Client
 sensorforge_sync.py ist 1.4.
 
 Wesentliche bestehende Endpunkte:
@@ -3036,7 +3292,7 @@ Sicherheits-/Zugriffsmodell:
 
 Dateitransfer:
 
-- nur abgeschlossene AVI/MKV/SRT-Dateien, keine .part-Dateien
+- nur abgeschlossene Medien-/Begleitdateien (u.a. AVI/MKV/JPG/SRT), keine .part-Dateien
 - direkter SD->TCP-Transfer ohne ZIP oder Kompression
 - HTTP Range/Resume wird unterstuetzt
 - der Python-Client behaelt lokale .part-Dateien und setzt unterbrochene Downloads
@@ -3075,8 +3331,9 @@ Getestete Alternativen:
 - 64-KB-Buffer brachten keinen messbaren Vorteil gegenueber 32 KB
 
 Der Transferpfad mit 32 KB / Core 0 bleibt daher der bewaehrte Sweet Spot.
-API 1.10 erweitert diesen Stand um read-only Status-/Sensor-/Snapshot-Funktionen,
-ohne den bewaehrten Downloadpfad neu zu designen.
+API 1.10 fuehrte die read-only Status-/Sensor-/Snapshot-Funktionen ein. Der
+aktuelle Host-Stand ist inzwischen API 1.11; der bewaehrte Downloadpfad wurde
+dadurch nicht grundsaetzlich neu designt.
 
 
 ======================================================================
@@ -3205,6 +3462,15 @@ Aufnahmen:
 - Tag loeschen
 - WebPlayer
 - Viewer-Zoom
+- Sparse-MKV-Wiedergabe mit echter variabler Framezeit
+- Wiedergabegeschwindigkeit 1x / 2x / 4x; Auswahl bleibt beim Clipwechsel erhalten
+- lange Sparse-Luecken >3 s werden nur in der Browserwiedergabe auf 500 ms
+  komprimiert
+- Frame vor / Frame zurueck
+- Download image fuer den aktuell sichtbaren JPEG-Frame
+- echter Aufnahmezeitstempel rechts unten als transparentes Overlay mit
+  Zehntelsekunde
+- Download image rendert denselben Zeitstempel in die exportierte JPG-Kopie
 
 System:
 
@@ -3824,7 +4090,7 @@ FUNKTIONAL GETESTET
 Der bewaehrte Transferpfad mit Exclusive-Lease, 20-MHz-SD, Range/Resume und
 Double-Buffer-Transfer wurde auf echter XIAO-Hardware verifiziert. Da NORMAL
 und MAX inzwischen beide 20 MHz sind, wird kein unnoetiger 20->20-MHz-Remount
-mehr ausgefuehrt. Host API ist inzwischen 1.10; die neuen Storage-/Sensor-/Snapshot-
+mehr ausgefuehrt. Host API ist inzwischen 1.11; die neuen Storage-/Sensor-/Snapshot-
 Endpunkte sind read-only. Reale Transferleistung des Downloadpfads liegt
 typischerweise bei etwa 0.80 bis 0.81 MB/s.
 
@@ -4075,7 +4341,7 @@ WICHTIGE ENTWICKLUNGSREGELN
 
 - Die bewaehrte Sync-API-Semantik mit Auth, Exclusive-Lease und Range/Resume
   bei spaeteren Client-/App-Implementierungen kompatibel halten. Aktueller Host
-  ist API 1.10; neue Funktionen bevorzugt read-only und additiv einfuehren.
+  ist API 1.11; neue Funktionen bevorzugt read-only und additiv einfuehren.
 
 - Debug-Zeitstempel im kritischen Pfad sammeln, Console-Ausgabe danach.
 
@@ -4376,7 +4642,7 @@ aktuell Vorrang, aber jeder neue sichtbare UI-Text muss sofort DE+EN erhalten.
 
 SYNC API:
 
-Aktueller Host API 1.10, Python-Client sensorforge_sync.py 1.4.
+Aktueller Host API 1.11, Python-Client sensorforge_sync.py 1.4.
 Bewaehrte Endpunkte fuer status/days/files/file/exclusive und Diagnose bleiben.
 Neu read-only:
 
@@ -4543,6 +4809,7 @@ keine bereits geloesten Themen neu designen, keine APIs/Funktionen erfinden und
 Codeaenderungen nur auf dem zuletzt wirklich gesehenen Quellstand vornehmen.
 Bei Rueckgabe von Code standardmaessig nur geaenderte/neue Dateien unter ihren
 Originalnamen mitsenden; keine unveraenderten Dateien in Update-ZIPs aufnehmen.
+
 
 
 

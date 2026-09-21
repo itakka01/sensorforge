@@ -50,6 +50,9 @@ static time_t recordingStartEpoch = 0;
 static bool recordingStartTimeValid = false;
 static bool subtitleTrackEnabled    = false;
 static uint64_t nextSubtitleMs      = 0;
+static bool mkvSparseMode           = false;
+static uint64_t mkvLastFrameTimeMs  = 0;
+static uint32_t mkvSparseTailMs     = 1;
 
 
 // Keep files below 4 GiB for broad FAT32/storage compatibility.
@@ -1441,6 +1444,9 @@ void mkvStart(
     durationPayloadPosition = 0;
 
     nextSubtitleMs = 0;
+    mkvSparseMode = false;
+    mkvLastFrameTimeMs = 0;
+    mkvSparseTailMs = 1;
 
 
     recordingStartEpoch =
@@ -1625,6 +1631,7 @@ void mkvAddFrame()
 
 
     frameCount++;
+    mkvLastFrameTimeMs = frameTimeMs;
 
     // Same image_only frame tap as AVI. The first written frame is deliberately
     // left untouched so wake/start latency is not inflated by image analysis.
@@ -1645,6 +1652,117 @@ void mkvAddFrame()
 
 
     esp_camera_fb_return(fb);
+}
+
+
+// =============================================================
+// SPARSE JPEG INPUT (CONTINUOUS SHOOTER)
+// =============================================================
+
+bool mkvStartSparseJpeg(
+    const String &path,
+    uint16_t width,
+    uint16_t height,
+    time_t startEpoch,
+    uint32_t nominalFrameDurationMs
+)
+{
+    if (mkvFile)
+        mkvEnd();
+
+    if (width == 0 || height == 0)
+        return false;
+
+    mkvPath = path;
+    mkvFps = 1;
+    frameCount = 0;
+    maxFrameSize = 0;
+    mkvWidth = 0;
+    mkvHeight = 0;
+    headerWritten = false;
+    writeFailed = false;
+    sizeLimitHit = false;
+    clusterOpen = false;
+    clusterTimestampMs = 0;
+    durationPayloadPosition = 0;
+    nextSubtitleMs = 0;
+    mkvSparseMode = true;
+    mkvLastFrameTimeMs = 0;
+    mkvSparseTailMs = nominalFrameDurationMs > 0 ? nominalFrameDurationMs : 1U;
+
+    recordingStartEpoch = startEpoch;
+    recordingStartTimeValid = startEpoch >= (time_t)1609459200;
+
+    // Sparse shooter timing already lives in the video block timestamps. A
+    // per-second subtitle track would defeat sparsity across long rejected gaps.
+    subtitleTrackEnabled = false;
+
+    if (STORAGE.exists(path.c_str()))
+        STORAGE.remove(path.c_str());
+
+    if (!mkvFile.openWrite(path, cfg_recording_encryption != 0))
+        return false;
+
+    if (!writeMatroskaHeader(width, height)) {
+        writeFailed = true;
+        mkvEnd();
+        return false;
+    }
+
+    return true;
+}
+
+bool mkvAddSparseJpeg(
+    const uint8_t *jpegData,
+    size_t jpegSize,
+    uint16_t width,
+    uint16_t height,
+    uint64_t relativeTimestampMs
+)
+{
+    if (
+        !mkvFile ||
+        !mkvSparseMode ||
+        writeFailed ||
+        sizeLimitHit ||
+        !jpegData ||
+        jpegSize < 4 ||
+        width != mkvWidth ||
+        height != mkvHeight
+    ) {
+        return false;
+    }
+
+    if (
+        jpegData[0] != 0xFF || jpegData[1] != 0xD8 ||
+        jpegData[jpegSize - 2] != 0xFF || jpegData[jpegSize - 1] != 0xD9
+    ) {
+        return false;
+    }
+
+    if (frameCount > 0 && relativeTimestampMs < mkvLastFrameTimeMs)
+        return false;
+
+    if (!ensureClusterForTime(relativeTimestampMs)) {
+        writeFailed = true;
+        return false;
+    }
+
+    if (!writeVideoFrame(
+            jpegData,
+            (uint32_t)jpegSize,
+            relativeTimestampMs
+        )) {
+        return false;
+    }
+
+    frameCount++;
+    mkvLastFrameTimeMs = relativeTimestampMs;
+
+    if (jpegSize > maxFrameSize)
+        maxFrameSize = (uint32_t)jpegSize;
+
+    return true;
 }
 
 
@@ -1700,11 +1818,13 @@ bool mkvEnd()
     // Duration is in Segment Ticks; with our TimestampScale
     // one tick equals one millisecond.
     double durationMs =
-        (
+        mkvSparseMode
+        ? (double)(mkvLastFrameTimeMs + (uint64_t)mkvSparseTailMs)
+        : (
             (double)frameCount *
             1000.0
-        ) /
-        (double)mkvFps;
+          ) /
+          (double)mkvFps;
 
 
     ok &= patchFloat64(
@@ -1730,32 +1850,22 @@ bool mkvEnd()
 
     if (ok) {
 
-        char summary[192];
+        if (!mkvSparseMode) {
+            char summary[192];
 
-        snprintf(
-            summary,
-            sizeof(summary),
-            "STOP | MKV | frames=%lu | duration=%.1f s | maxJPEG=%.1f KB%s",
-            (unsigned long)frameCount,
-            (double)(
-                durationMs /
-                1000.0
-            ),
-            (double)maxFrameSize / 1024.0,
-            subtitleTrackEnabled
-                ? " | subtitles=yes"
-                : ""
-        );
+            snprintf(
+                summary,
+                sizeof(summary),
+                "STOP | MKV | frames=%lu | duration=%.1f s | maxJPEG=%.1f KB%s",
+                (unsigned long)frameCount,
+                (double)(durationMs / 1000.0),
+                (double)maxFrameSize / 1024.0,
+                subtitleTrackEnabled ? " | subtitles=yes" : ""
+            );
 
-        consoleWrite(
-            "REC",
-            String(summary)
-        );
-
-        logWrite(
-            "Recording " +
-            String(summary)
-        );
+            consoleWrite("REC", String(summary));
+            logWrite("Recording " + String(summary));
+        }
 
     } else {
 

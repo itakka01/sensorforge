@@ -45,6 +45,7 @@ String cfg_recording_format = "avi";
 int cfg_timestamp_enabled   = 1;
 int cfg_recording_encryption = 0;
 int cfg_shooter_enabled = 0;
+String cfg_shooter_storage_format = "mkv";
 int cfg_shooter_interval_ms = 60000;
 int cfg_shooter_dark_mean_min = 20;
 float cfg_shooter_min_change_pct = 1.0f;
@@ -76,8 +77,7 @@ int cfg_transport_check_seconds = 120;
 int cfg_transport_light_confirm_seconds = 10;
 int cfg_transport_install_delay_seconds = 300;
 int cfg_transport_max_duration_seconds = 86400;
-int cfg_transport_black_mean_max = 25;
-int cfg_transport_black_p95_max = 45;
+int cfg_transport_black_threshold = 25;
 
 int cfg_min_free_space_mb = 100;
 String cfg_disk_full_action = "rollover";
@@ -103,6 +103,18 @@ String cfg_log_file = "/log.txt";
 
 int cfg_debug_enabled = 0;
 int cfg_rotation = 0;
+
+
+int configTransportBlackP95Limit()
+{
+    int limit =
+        cfg_transport_black_threshold + 10;
+
+    return
+        limit > 255
+        ? 255
+        : limit;
+}
 
 
 // =============================================================
@@ -375,6 +387,7 @@ struct ConfigValues {
     int timestampEnabled;
     int recordingEncryption;
     int shooterEnabled;
+    String shooterStorageFormat;
     int shooterIntervalMs;
     int shooterDarkMeanMin;
     float shooterMinChangePct;
@@ -407,8 +420,9 @@ struct ConfigValues {
     int transportLightConfirmSeconds;
     int transportInstallDelaySeconds;
     int transportMaxDurationSeconds;
-    int transportBlackMeanMax;
-    int transportBlackP95Max;
+    int transportBlackThreshold;
+    int transportBlackLegacyMeanMax;
+    int transportBlackLegacyP95Max;
 
     int minFreeSpaceMb;
     String diskFullAction;
@@ -452,6 +466,7 @@ struct ConfigSeen {
     bool timestampEnabled;
     bool recordingEncryption;
     bool shooterEnabled;
+    bool shooterStorageFormat;
     bool shooterIntervalMs;
     bool shooterDarkMeanMin;
     bool shooterMinChangePct;
@@ -486,8 +501,9 @@ struct ConfigSeen {
     bool transportLightConfirmSeconds;
     bool transportInstallDelaySeconds;
     bool transportMaxDurationSeconds;
-    bool transportBlackMeanMax;
-    bool transportBlackP95Max;
+    bool transportBlackThreshold;
+    bool transportBlackMeanMax; // legacy alias
+    bool transportBlackP95Max;  // legacy alias
 
     bool minFreeSpaceMb;
     bool diskFullAction;
@@ -575,6 +591,9 @@ static ConfigValues makeDefaultValues()
 
     values.shooterEnabled =
         0;
+
+    values.shooterStorageFormat =
+        "mkv";
 
     values.shooterIntervalMs =
         60000;
@@ -666,11 +685,14 @@ static ConfigValues makeDefaultValues()
     values.transportMaxDurationSeconds =
         86400;
 
-    values.transportBlackMeanMax =
+    values.transportBlackThreshold =
         25;
 
-    values.transportBlackP95Max =
-        45;
+    values.transportBlackLegacyMeanMax =
+        25;
+
+    values.transportBlackLegacyP95Max =
+        35;
 
     values.minFreeSpaceMb =
         100;
@@ -1223,6 +1245,9 @@ static bool validateValues(
 
     values.recordingNotBefore.trim();
 
+    values.shooterStorageFormat.trim();
+    values.shooterStorageFormat.toLowerCase();
+
     String recordingNotBeforeLower =
         values.recordingNotBefore;
 
@@ -1457,6 +1482,14 @@ static bool validateValues(
         values.shooterEnabled != 1
     ) {
         error = "shooter_enabled must be 0 or 1";
+        return false;
+    }
+
+    if (
+        values.shooterStorageFormat != "mkv" &&
+        values.shooterStorageFormat != "jpg"
+    ) {
+        error = "shooter_storage_format must be mkv or jpg";
         return false;
     }
 
@@ -1761,15 +1794,12 @@ static bool validateValues(
 
 
     if (
-        values.transportBlackMeanMax < 0 ||
-        values.transportBlackMeanMax > 255 ||
-        values.transportBlackP95Max < 0 ||
-        values.transportBlackP95Max > 255 ||
-        values.transportBlackP95Max < values.transportBlackMeanMax
+        values.transportBlackThreshold < 0 ||
+        values.transportBlackThreshold > 255
     ) {
 
         error =
-            "transport black thresholds invalid (0..255, p95 >= mean)";
+            "transport_black_threshold out of range (0..255)";
 
         return false;
     }
@@ -2415,6 +2445,10 @@ static bool parseConfigText(
                 if (!markOnce(seen.shooterEnabled, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid shooter_enabled"; return false; }
                 values.shooterEnabled = (int)numericValue;
 
+            } else if (key == "shooter_storage_format") {
+                if (!markOnce(seen.shooterStorageFormat, key, error)) return false;
+                values.shooterStorageFormat = value;
+
             } else if (key == "shooter_interval_ms") {
                 if (!markOnce(seen.shooterIntervalMs, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid shooter_interval_ms"; return false; }
                 values.shooterIntervalMs = (int)numericValue;
@@ -2867,9 +2901,35 @@ static bool parseConfigText(
                     (int)numericValue;
 
             } else if (
+                key == "transport_black_threshold"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.transportBlackThreshold,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid transport_black_threshold";
+
+                    return false;
+                }
+
+                values.transportBlackThreshold =
+                    (int)numericValue;
+
+            } else if (
                 key == "transport_black_mean_max"
             ) {
 
+                // Legacy two-threshold transport config. The mean value maps
+                // directly to the new single user-facing threshold.
                 if (
                     !markOnce(
                         seen.transportBlackMeanMax,
@@ -2882,18 +2942,20 @@ static bool parseConfigText(
                     )
                 ) {
                     if (!error.length())
-                        error = "invalid transport_black_mean_max";
+                        error = "invalid legacy transport_black_mean_max";
 
                     return false;
                 }
 
-                values.transportBlackMeanMax =
+                values.transportBlackLegacyMeanMax =
                     (int)numericValue;
 
             } else if (
                 key == "transport_black_p95_max"
             ) {
 
+                // Retained only so existing config.txt files remain loadable.
+                // New saves remove this key and derive the P95 guard internally.
                 if (
                     !markOnce(
                         seen.transportBlackP95Max,
@@ -2906,12 +2968,12 @@ static bool parseConfigText(
                     )
                 ) {
                     if (!error.length())
-                        error = "invalid transport_black_p95_max";
+                        error = "invalid legacy transport_black_p95_max";
 
                     return false;
                 }
 
-                values.transportBlackP95Max =
+                values.transportBlackLegacyP95Max =
                     (int)numericValue;
 
             } else if (
@@ -3329,6 +3391,28 @@ static bool parseConfigText(
     if (!values.shooterEnabled && values.shooterIntervalMs == 0)
         values.shooterIntervalMs = 60000;
 
+    // Transport threshold migration:
+    // - new config: transport_black_threshold is canonical.
+    // - old config: transport_black_mean_max maps directly to the new value.
+    // - very old/partial config with only P95 maps to P95-10.
+    // The old P95 key is otherwise ignored; the runtime guard is always
+    // derived as threshold+10 (clamped to 255).
+    if (!seen.transportBlackThreshold) {
+        if (seen.transportBlackMeanMax) {
+            values.transportBlackThreshold =
+                values.transportBlackLegacyMeanMax;
+        } else if (seen.transportBlackP95Max) {
+            int migrated =
+                values.transportBlackLegacyP95Max - 10;
+
+            if (migrated < 0)
+                migrated = 0;
+
+            values.transportBlackThreshold =
+                migrated;
+        }
+    }
+
 
     if (!allRequiredKeysSeen(
             seen,
@@ -3416,6 +3500,7 @@ static void applyValues(
         values.recordingEncryption;
 
     cfg_shooter_enabled = values.shooterEnabled;
+    cfg_shooter_storage_format = values.shooterStorageFormat;
     cfg_shooter_interval_ms = values.shooterIntervalMs;
     cfg_shooter_dark_mean_min = values.shooterDarkMeanMin;
     cfg_shooter_min_change_pct = values.shooterMinChangePct;
@@ -3478,11 +3563,8 @@ static void applyValues(
     cfg_transport_max_duration_seconds =
         values.transportMaxDurationSeconds;
 
-    cfg_transport_black_mean_max =
-        values.transportBlackMeanMax;
-
-    cfg_transport_black_p95_max =
-        values.transportBlackP95Max;
+    cfg_transport_black_threshold =
+        values.transportBlackThreshold;
 
     cfg_min_free_space_mb =
         values.minFreeSpaceMb;
@@ -4430,10 +4512,10 @@ config_loaded:
         String(cfg_transport_install_delay_seconds) +
         " max_duration_s=" +
         String(cfg_transport_max_duration_seconds) +
-        " black_mean_max=" +
-        String(cfg_transport_black_mean_max) +
-        " black_p95_max=" +
-        String(cfg_transport_black_p95_max)
+        " black_threshold=" +
+        String(cfg_transport_black_threshold) +
+        " p95_limit_auto=" +
+        String(configTransportBlackP95Limit())
     );
 
 
@@ -4457,6 +4539,8 @@ config_loaded:
     Serial.println(
         "Config Shooter: enabled=" +
         String(cfg_shooter_enabled) +
+        " storage_format=" +
+        cfg_shooter_storage_format +
         " interval_ms=" +
         String(cfg_shooter_interval_ms) +
         " dark_mean_min=" +
@@ -5760,8 +5844,7 @@ ConfigSaveResult configSaveTransportSettings(
     int lightConfirmSeconds,
     int installDelaySeconds,
     int maxDurationSeconds,
-    int blackMeanMax,
-    int blackP95Max,
+    int blackThreshold,
     bool writeToSd,
     String &error
 )
@@ -5788,18 +5871,8 @@ ConfigSaveResult configSaveTransportSettings(
         return CONFIG_SAVE_INTERNAL_FAILED;
     }
 
-    if (blackMeanMax < 0 || blackMeanMax > 255) {
-        error = "transport_black_mean_max out of range (0..255)";
-        return CONFIG_SAVE_INTERNAL_FAILED;
-    }
-
-    if (blackP95Max < 0 || blackP95Max > 255) {
-        error = "transport_black_p95_max out of range (0..255)";
-        return CONFIG_SAVE_INTERNAL_FAILED;
-    }
-
-    if (blackP95Max < blackMeanMax) {
-        error = "transport_black_p95_max must be >= transport_black_mean_max";
+    if (blackThreshold < 0 || blackThreshold > 255) {
+        error = "transport_black_threshold out of range (0..255)";
         return CONFIG_SAVE_INTERNAL_FAILED;
     }
 
@@ -5837,13 +5910,17 @@ ConfigSaveResult configSaveTransportSettings(
         return CONFIG_SAVE_INTERNAL_FAILED;
     }
 
+    // New transport config has one user-facing darkness parameter. Remove
+    // legacy two-threshold keys when this dedicated page is saved.
+    removeConfigKey(text, "transport_black_mean_max");
+    removeConfigKey(text, "transport_black_p95_max");
+
     if (
         !replaceOrAppendConfigKey(text, "transport_check_seconds", String(checkSeconds)) ||
         !replaceOrAppendConfigKey(text, "transport_light_confirm_seconds", String(lightConfirmSeconds)) ||
         !replaceOrAppendConfigKey(text, "transport_install_delay_seconds", String(installDelaySeconds)) ||
         !replaceOrAppendConfigKey(text, "transport_max_duration_seconds", String(maxDurationSeconds)) ||
-        !replaceOrAppendConfigKey(text, "transport_black_mean_max", String(blackMeanMax)) ||
-        !replaceOrAppendConfigKey(text, "transport_black_p95_max", String(blackP95Max))
+        !replaceOrAppendConfigKey(text, "transport_black_threshold", String(blackThreshold))
     ) {
         error = "could not patch transport settings";
         return CONFIG_SAVE_INTERNAL_FAILED;
@@ -5871,8 +5948,7 @@ ConfigSaveResult configSaveTransportSettings(
         cfg_transport_light_confirm_seconds = lightConfirmSeconds;
         cfg_transport_install_delay_seconds = installDelaySeconds;
         cfg_transport_max_duration_seconds = maxDurationSeconds;
-        cfg_transport_black_mean_max = blackMeanMax;
-        cfg_transport_black_p95_max = blackP95Max;
+        cfg_transport_black_threshold = blackThreshold;
     }
 
     return result;

@@ -44,6 +44,7 @@
 #include "license.h"
 #include "recording_crypto.h"
 #include "recording_storage.h"
+#include "mkv_writer.h"
 #include "log_storage.h"
 #include "image_motion.h"
 #include "motion_diagnostics.h"
@@ -6461,9 +6462,9 @@ static bool transportImageIsBlack(
 {
     return
         metrics.mean <=
-            (float)cfg_transport_black_mean_max &&
+            (float)cfg_transport_black_threshold &&
         metrics.p95 <=
-            (uint8_t)cfg_transport_black_p95_max;
+            (uint8_t)configTransportBlackP95Limit();
 }
 
 
@@ -6487,23 +6488,26 @@ static bool transportMeasureAndReport(
             metrics
         );
 
+    int p95Limit =
+        configTransportBlackP95Limit();
+
     Serial.printf(
-        "TRANSPORT image %s | mean=%.1f | p95=%u | limits mean<=%d p95<=%d | %s\n",
+        "TRANSPORT image %s | mean=%.1f | p95=%u | black_threshold=%d | p95_limit_auto=%d | %s\n",
         label ? label : "check",
         metrics.mean,
         (unsigned)metrics.p95,
-        cfg_transport_black_mean_max,
-        cfg_transport_black_p95_max,
+        cfg_transport_black_threshold,
+        p95Limit,
         isBlack ? "BLACK" : "OPEN"
     );
 
     transportJournalPrintf(
-        "TRANSPORT image %s | mean=%.1f | p95=%u | limits mean<=%d p95<=%d | %s",
+        "TRANSPORT image %s | mean=%.1f | p95=%u | black_threshold=%d | p95_limit_auto=%d | %s",
         label ? label : "check",
         metrics.mean,
         (unsigned)metrics.p95,
-        cfg_transport_black_mean_max,
-        cfg_transport_black_p95_max,
+        cfg_transport_black_threshold,
+        p95Limit,
         isBlack ? "BLACK" : "OPEN"
     );
 
@@ -6913,7 +6917,7 @@ static bool handleTransportModeBoot(
     );
 
     transportJournalPrintf(
-        "TRANSPORT mode ACTIVE | session=%s | wake=%s(%d) | cycle=%lu | check=%d s | confirm=%d s | install_delay=%d s | max_duration=%d s | elapsed=%lu s | remaining=%lu s | mean<=%d | p95<=%d",
+        "TRANSPORT mode ACTIVE | session=%s | wake=%s(%d) | cycle=%lu | check=%d s | confirm=%d s | install_delay=%d s | max_duration=%d s | elapsed=%lu s | remaining=%lu s | black_threshold=%d | p95_limit_auto=%d",
         newTransportSession ? "NEW" : "CONTINUE",
         sleepWakeCauseName(wakeCause),
         (int)wakeCause,
@@ -6924,8 +6928,8 @@ static bool handleTransportModeBoot(
         cfg_transport_max_duration_seconds,
         (unsigned long)transportElapsedSeconds,
         (unsigned long)transportRemaining,
-        cfg_transport_black_mean_max,
-        cfg_transport_black_p95_max
+        cfg_transport_black_threshold,
+        configTransportBlackP95Limit()
     );
 
 
@@ -8426,7 +8430,9 @@ static void triggerRecordingEventSafetyLimit()
 //
 // Single timed JPEG scheduler for the SensorForge continuous shooter.
 // It supports intervals down to 250 ms, optional dark/similarity rejection,
-// a forced-keep interval, and a PSRAM queue that batches SD writes.
+// a forced-keep interval, and a PSRAM queue that batches SD writes. Accepted
+// JPEGs can be persisted either individually or as a sparse MKV with their real
+// capture timing. No JPEG re-encoding is performed.
 //
 // Alarm video always has priority. The shooter never starts an SD write while
 // recording, WebConfig preview/maintenance, Sync Exclusive or thermal emergency
@@ -8710,7 +8716,7 @@ static void continuousShooterLogFailure(const String &message)
 }
 
 
-static bool continuousShooterBuildPath(
+static bool continuousShooterBuildJpegPath(
     int64_t scheduledWallUs,
     uint64_t captureMonotonicUs,
     String &finalPath,
@@ -8794,11 +8800,76 @@ static bool continuousShooterBuildPath(
 }
 
 
+static bool continuousShooterBuildMkvPath(
+    int64_t firstScheduledWallUs,
+    uint64_t firstCaptureMonotonicUs,
+    String &finalPath,
+    String &tempPath
+)
+{
+    finalPath = "";
+    tempPath = "";
+
+    String folder;
+    String filename;
+
+    if (firstScheduledWallUs >= (int64_t)1609459200 * 1000000LL) {
+        time_t slotSeconds = (time_t)(firstScheduledWallUs / 1000000LL);
+        uint16_t slotMs = (uint16_t)((firstScheduledWallUs % 1000000LL) / 1000LL);
+        struct tm localTime;
+
+        if (!localtime_r(&slotSeconds, &localTime))
+            return false;
+
+        char folderBuffer[24];
+        char timeBuffer[16];
+        char fileBuffer[48];
+
+        if (
+            strftime(folderBuffer, sizeof(folderBuffer), "/%Y%m%d", &localTime) == 0 ||
+            strftime(timeBuffer, sizeof(timeBuffer), "%H%M%S", &localTime) == 0
+        ) {
+            return false;
+        }
+
+        snprintf(
+            fileBuffer,
+            sizeof(fileBuffer),
+            "%s_%03u_shooter.mkv",
+            timeBuffer,
+            (unsigned)slotMs
+        );
+        folder = String(folderBuffer);
+        filename = String(fileBuffer);
+    } else {
+        folder = "/fallback";
+        char fileBuffer[56];
+        snprintf(
+            fileBuffer,
+            sizeof(fileBuffer),
+            "shooter_%llu.mkv",
+            (unsigned long long)(firstCaptureMonotonicUs / 1000ULL)
+        );
+        filename = String(fileBuffer);
+    }
+
+    if (!STORAGE.exists(folder.c_str())) {
+        if (!STORAGE.mkdir(folder.c_str()))
+            return false;
+    }
+
+    finalPath = folder + "/" + filename;
+    tempPath = finalPath + ".part";
+    return true;
+}
+
+
 static bool continuousShooterWriteJpeg(
     int64_t scheduledWallUs,
     uint64_t captureMonotonicUs,
     const uint8_t *jpeg,
-    size_t jpegBytes
+    size_t jpegBytes,
+    bool ignoreAlarmPriority = false
 )
 {
     if (!jpeg || jpegBytes == 0)
@@ -8818,7 +8889,7 @@ static bool continuousShooterWriteJpeg(
     // Persisting an already accepted PSRAM frame is allowed while WebConfig is
     // open. Capture itself remains blocked by preview/maintenance, but delaying a
     // due flush would violate the user's configured persistence window.
-    if (continuousShooterAlarmHasPriority())
+    if (!ignoreAlarmPriority && continuousShooterAlarmHasPriority())
         return false;
 
     if (!storagePrepareForRecording())
@@ -8827,7 +8898,7 @@ static bool continuousShooterWriteJpeg(
     String finalPath;
     String tempPath;
 
-    if (!continuousShooterBuildPath(
+    if (!continuousShooterBuildJpegPath(
             scheduledWallUs,
             captureMonotonicUs,
             finalPath,
@@ -8855,7 +8926,7 @@ static bool continuousShooterWriteJpeg(
     size_t offset = 0;
 
     while (offset < jpegBytes) {
-        if (continuousShooterAlarmHasPriority()) {
+        if (!ignoreAlarmPriority && continuousShooterAlarmHasPriority()) {
             ok = false;
             break;
         }
@@ -8898,6 +8969,246 @@ static bool continuousShooterWriteJpeg(
         return false;
     }
 
+    return true;
+}
+
+
+static bool continuousShooterWriteSparseMkvSingle(
+    int64_t scheduledWallUs,
+    uint64_t captureMonotonicUs,
+    const uint8_t *jpeg,
+    size_t jpegBytes,
+    uint16_t width,
+    uint16_t height
+)
+{
+    if (!jpeg || jpegBytes == 0 || width == 0 || height == 0)
+        return false;
+
+    if (
+        recording || recorderIsOpen() || !sdReady || g_storageLocked ||
+        syncApiExclusiveActive() || thermalEmergencyState ||
+        continuousShooterAlarmHasPriority()
+    ) {
+        return false;
+    }
+
+    if (!storagePrepareForRecording())
+        return false;
+
+    String finalPath;
+    String tempPath;
+    if (!continuousShooterBuildMkvPath(
+            scheduledWallUs,
+            captureMonotonicUs,
+            finalPath,
+            tempPath
+        )) {
+        return false;
+    }
+
+    if (STORAGE.exists(finalPath.c_str()))
+        return true;
+
+    if (STORAGE.exists(tempPath.c_str()))
+        STORAGE.remove(tempPath.c_str());
+
+    time_t startEpoch = 0;
+    if (scheduledWallUs >= (int64_t)1609459200 * 1000000LL)
+        startEpoch = (time_t)(scheduledWallUs / 1000000LL);
+
+    bool ok =
+        mkvStartSparseJpeg(
+            tempPath,
+            width,
+            height,
+            startEpoch,
+            (uint32_t)cfg_shooter_interval_ms
+        ) &&
+        mkvAddSparseJpeg(
+            jpeg,
+            jpegBytes,
+            width,
+            height,
+            0
+        ) &&
+        mkvEnd();
+
+    if (!ok) {
+        if (mkvIsOpen())
+            mkvEnd();
+        STORAGE.remove(tempPath.c_str());
+        return false;
+    }
+
+    if (!STORAGE.rename(tempPath.c_str(), finalPath.c_str())) {
+        STORAGE.remove(tempPath.c_str());
+        return false;
+    }
+
+    return true;
+}
+
+
+static bool continuousShooterWriteSparseMkvFromBuffer(
+    size_t &consumedBytes,
+    uint32_t &flushedFrames,
+    uint64_t &flushedJpegBytes,
+    bool ignoreAlarmPriority
+)
+{
+    consumedBytes = 0;
+    flushedFrames = 0;
+    flushedJpegBytes = 0;
+
+    if (shooterBufferUsed < sizeof(ShooterBufferedFrameHeader))
+        return false;
+
+    if (!storagePrepareForRecording())
+        return false;
+
+    ShooterBufferedFrameHeader firstHeader = {};
+    memcpy(&firstHeader, shooterBuffer, sizeof(firstHeader));
+
+    if (
+        firstHeader.jpegBytes == 0 ||
+        sizeof(firstHeader) + (size_t)firstHeader.jpegBytes > shooterBufferUsed ||
+        firstHeader.width == 0 ||
+        firstHeader.height == 0
+    ) {
+        return false;
+    }
+
+    String finalPath;
+    String tempPath;
+
+    if (!continuousShooterBuildMkvPath(
+            firstHeader.scheduledWallUs,
+            firstHeader.captureMonotonicUs,
+            finalPath,
+            tempPath
+        )) {
+        return false;
+    }
+
+    // A successful previous retry may already have committed exactly this
+    // segment. Treat it as persisted so reboot/shutdown retry loops can drain.
+    if (STORAGE.exists(finalPath.c_str())) {
+        size_t offset = 0;
+        while (offset + sizeof(ShooterBufferedFrameHeader) <= shooterBufferUsed) {
+            ShooterBufferedFrameHeader h = {};
+            memcpy(&h, shooterBuffer + offset, sizeof(h));
+            size_t recordBytes = sizeof(h) + (size_t)h.jpegBytes;
+            if (h.jpegBytes == 0 || recordBytes > shooterBufferUsed - offset)
+                return false;
+            offset += recordBytes;
+            ++flushedFrames;
+            flushedJpegBytes += h.jpegBytes;
+        }
+        consumedBytes = offset;
+        return consumedBytes > 0;
+    }
+
+    if (STORAGE.exists(tempPath.c_str()))
+        STORAGE.remove(tempPath.c_str());
+
+    time_t startEpoch = 0;
+    if (firstHeader.scheduledWallUs >= (int64_t)1609459200 * 1000000LL)
+        startEpoch = (time_t)(firstHeader.scheduledWallUs / 1000000LL);
+
+    if (!mkvStartSparseJpeg(
+            tempPath,
+            firstHeader.width,
+            firstHeader.height,
+            startEpoch,
+            (uint32_t)cfg_shooter_interval_ms
+        )) {
+        STORAGE.remove(tempPath.c_str());
+        return false;
+    }
+
+    const int64_t firstWallUs = firstHeader.scheduledWallUs;
+    const uint64_t firstMonoUs = firstHeader.captureMonotonicUs;
+    size_t offset = 0;
+    bool ok = true;
+
+    while (offset + sizeof(ShooterBufferedFrameHeader) <= shooterBufferUsed) {
+        if (!ignoreAlarmPriority && continuousShooterAlarmHasPriority()) {
+            ok = false;
+            break;
+        }
+
+        ShooterBufferedFrameHeader header = {};
+        memcpy(&header, shooterBuffer + offset, sizeof(header));
+
+        size_t recordBytes = sizeof(header) + (size_t)header.jpegBytes;
+        if (
+            header.jpegBytes == 0 ||
+            recordBytes > shooterBufferUsed - offset ||
+            header.width != firstHeader.width ||
+            header.height != firstHeader.height
+        ) {
+            ok = false;
+            break;
+        }
+
+        uint64_t relativeMs = 0;
+        if (
+            firstWallUs > 0 &&
+            header.scheduledWallUs >= firstWallUs
+        ) {
+            relativeMs = (uint64_t)(header.scheduledWallUs - firstWallUs) / 1000ULL;
+        } else if (header.captureMonotonicUs >= firstMonoUs) {
+            relativeMs = (header.captureMonotonicUs - firstMonoUs) / 1000ULL;
+        } else {
+            ok = false;
+            break;
+        }
+
+        const uint8_t *jpeg =
+            shooterBuffer + offset + sizeof(header);
+
+        if (!mkvAddSparseJpeg(
+                jpeg,
+                header.jpegBytes,
+                header.width,
+                header.height,
+                relativeMs
+            )) {
+            ok = false;
+            break;
+        }
+
+        offset += recordBytes;
+        ++flushedFrames;
+        flushedJpegBytes += header.jpegBytes;
+        feedWatchdog();
+        yield();
+    }
+
+    // A sparse MKV is committed only if the entire current RAM batch made it
+    // into the container. If alarm priority interrupts a normal flush, discard
+    // the .part and keep every frame in PSRAM for the next attempt. This avoids
+    // duplicate/ambiguous partial segments.
+    if (!ok || offset != shooterBufferUsed || !mkvEnd()) {
+        if (mkvIsOpen())
+            mkvEnd();
+        STORAGE.remove(tempPath.c_str());
+        consumedBytes = 0;
+        flushedFrames = 0;
+        flushedJpegBytes = 0;
+        return false;
+    }
+
+    if (!STORAGE.rename(tempPath.c_str(), finalPath.c_str())) {
+        STORAGE.remove(tempPath.c_str());
+        consumedBytes = 0;
+        flushedFrames = 0;
+        flushedJpegBytes = 0;
+        return false;
+    }
+
+    consumedBytes = offset;
     return true;
 }
 
@@ -9084,7 +9395,17 @@ static bool continuousShooterFlushBuffer(
     uint32_t startedMs = millis();
     uint32_t originalFirstQueuedMs = shooterBufferFirstQueuedMs;
 
-    while (
+    if (cfg_shooter_storage_format == "mkv") {
+        if (!continuousShooterWriteSparseMkvFromBuffer(
+                offset,
+                flushedFrames,
+                flushedJpegBytes,
+                ignoreAlarmPriority
+            )) {
+            shooterBufferFlushDue = true;
+            return false;
+        }
+    } else while (
         offset + sizeof(ShooterBufferedFrameHeader) <=
         shooterBufferUsed
     ) {
@@ -9124,7 +9445,8 @@ static bool continuousShooterFlushBuffer(
                 header.scheduledWallUs,
                 header.captureMonotonicUs,
                 jpeg,
-                header.jpegBytes
+                header.jpegBytes,
+                ignoreAlarmPriority
             )) {
             break;
         }
@@ -9180,8 +9502,9 @@ static bool continuousShooterFlushBuffer(
         snprintf(
             flushSummary,
             sizeof(flushSummary),
-            "Shooter flush | reason=%s | frames=%lu | jpeg_bytes=%llu | remaining=%lu | elapsed_ms=%lu | accepted=%lu | rejected_dark=%lu | rejected_similar=%lu | sleep_cycles=%lu | sleep_avg_ms=%lu | sleep_min_ms=%lu | sleep_max_ms=%lu",
+            "Shooter flush | reason=%s | format=%s | frames=%lu | jpeg_bytes=%llu | remaining=%lu | elapsed_ms=%lu | accepted=%lu | rejected_dark=%lu | rejected_similar=%lu | sleep_cycles=%lu | sleep_avg_ms=%lu | sleep_min_ms=%lu | sleep_max_ms=%lu",
             reason ? reason : "unknown",
+            cfg_shooter_storage_format.c_str(),
             (unsigned long)flushedFrames,
             (unsigned long long)flushedJpegBytes,
             (unsigned long)shooterBufferUsed,
@@ -9309,6 +9632,16 @@ static bool continuousShooterQueueJpeg(
 )
 {
     if (cfg_shooter_flush_seconds <= 0) {
+        if (cfg_shooter_storage_format == "mkv") {
+            return continuousShooterWriteSparseMkvSingle(
+                scheduledWallUs,
+                captureMonotonicUs,
+                jpeg,
+                jpegBytes,
+                width,
+                height
+            );
+        }
         return continuousShooterWriteJpeg(
             scheduledWallUs,
             captureMonotonicUs,
@@ -9318,6 +9651,16 @@ static bool continuousShooterQueueJpeg(
     }
 
     if (!continuousShooterEnsureBuffer()) {
+        if (cfg_shooter_storage_format == "mkv") {
+            return continuousShooterWriteSparseMkvSingle(
+                scheduledWallUs,
+                captureMonotonicUs,
+                jpeg,
+                jpegBytes,
+                width,
+                height
+            );
+        }
         return continuousShooterWriteJpeg(
             scheduledWallUs,
             captureMonotonicUs,
@@ -9339,6 +9682,16 @@ static bool continuousShooterQueueJpeg(
 
     if (recordBytes > shooterBufferCapacity) {
         continuousShooterFlushBuffer("oversize_frame");
+        if (cfg_shooter_storage_format == "mkv") {
+            return continuousShooterWriteSparseMkvSingle(
+                scheduledWallUs,
+                captureMonotonicUs,
+                jpeg,
+                jpegBytes,
+                width,
+                height
+            );
+        }
         return continuousShooterWriteJpeg(
             scheduledWallUs,
             captureMonotonicUs,

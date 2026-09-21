@@ -4093,6 +4093,12 @@ static void handleConfig()
                 ? "Zu dunkle und nahezu identische Bilder können vor dem Speichern verworfen werden. Bei gleichzeitig aktiver Bewegungsaufnahme behalten Alarmvideos Vorrang."
                 : "Dark and nearly identical images can be rejected before storage. When motion recording is enabled too, alarm video keeps priority.") +
             "</span><br><br>"
+            "shooter_storage_format: <select id='shooterStorageFormatInput' name='shooter_storage_format'>"
+            "<option value='mkv'" + String(cfg_shooter_storage_format == "mkv" ? " selected" : "") + ">MKV (sparse, " + String(de ? "empfohlen" : "recommended") + ")</option>"
+            "<option value='jpg'" + String(cfg_shooter_storage_format == "jpg" ? " selected" : "") + ">JPG (" + String(de ? "Einzeldateien" : "individual files") + ")</option>"
+            "</select> <small>" +
+            String(de ? "MKV erhält die realen Zeitabstände der akzeptierten Bilder ohne JPEG-Neukompression." : "MKV preserves the real timing gaps between accepted images without JPEG recompression.") +
+            "</small><br>"
             "shooter_interval_ms: <input id='shooterIntervalInput' name='shooter_interval_ms' type='number' min='250' max='86400000' step='1' value='" +
             String(cfg_shooter_interval_ms) +
             "' style='width:110px'> <small>" +
@@ -4151,6 +4157,7 @@ static void handleConfig()
             "var value=document.getElementById('shooterDarkThresholdValue');"
             "var swatch=document.getElementById('shooterDarkThresholdSwatch');"
             "var defaultsButton=document.getElementById('shooterDefaultsButton');"
+            "var storageFormatInput=document.getElementById('shooterStorageFormatInput');"
             "var intervalInput=document.getElementById('shooterIntervalInput');"
             "var minChangeInput=document.getElementById('shooterMinChangeInput');"
             "var forceSaveInput=document.getElementById('shooterForceSaveInput');"
@@ -4172,6 +4179,7 @@ static void handleConfig()
                 ".catch(function(){});}"
             "input.addEventListener('input',render);"
             "if(defaultsButton)defaultsButton.addEventListener('click',function(){"
+                "if(storageFormatInput)storageFormatInput.value='mkv';"
                 "if(intervalInput)intervalInput.value='60000';"
                 "input.value='20';"
                 "if(minChangeInput)minChangeInput.value='1.0';"
@@ -4411,15 +4419,10 @@ static void handleConfig()
             String(cfg_transport_max_duration_seconds) +
             "'> <small>(harte Sicherheitsgrenze; Standard 86400 s = 24 h)</small><br>";
 
-    html += "transport_black_mean_max: <input name='transport_black_mean_max' type='number' "
+    html += "transport_black_threshold: <input name='transport_black_threshold' type='number' "
             "min='0' max='255' value='" +
-            String(cfg_transport_black_mean_max) +
-            "'> <small>(Graustufen-Mittelwert; kleiner = strenger schwarz)</small><br>";
-
-    html += "transport_black_p95_max: <input name='transport_black_p95_max' type='number' "
-            "min='0' max='255' value='" +
-            String(cfg_transport_black_p95_max) +
-            "'> <small>(95%-Perzentil; muss >= Mittelwert-Grenze sein)</small><br>";
+            String(cfg_transport_black_threshold) +
+            "'> <small>(einziger Schwarzgrenzwert; Schutz für helle Bereiche wird intern automatisch abgeleitet)</small><br>";
 
     html +=
         "<p class='muted'><b>Wichtig:</b> Für die normale Vorbereitung bitte die eigene "
@@ -4814,6 +4817,10 @@ static void handleSave()
         ? 1
         : 0;
 
+    String shooterStorageFormat = server.arg("shooter_storage_format");
+    shooterStorageFormat.trim();
+    shooterStorageFormat.toLowerCase();
+
     int shooterIntervalMs = server.arg("shooter_interval_ms").toInt();
     int shooterDarkMeanMin = server.arg("shooter_dark_mean_min").toInt();
     float shooterMinChangePct = server.arg("shooter_min_change_pct").toFloat();
@@ -4976,28 +4983,12 @@ static void handleSave()
             604800
         );
 
-    int transportBlackMeanMax =
+    int transportBlackThreshold =
         constrain(
-            server.arg("transport_black_mean_max").toInt(),
+            server.arg("transport_black_threshold").toInt(),
             0,
             255
         );
-
-    int transportBlackP95Max =
-        constrain(
-            server.arg("transport_black_p95_max").toInt(),
-            0,
-            255
-        );
-
-    if (transportBlackP95Max < transportBlackMeanMax) {
-        server.send(
-            400,
-            "text/plain; charset=utf-8",
-            "transport_black_p95_max muss groesser/gleich transport_black_mean_max sein"
-        );
-        return;
-    }
 
 
     int minFreeSpaceMb =
@@ -5289,6 +5280,10 @@ static void handleSave()
     text += String(shooterEnabled);
     text += '\n';
 
+    text += "shooter_storage_format=";
+    text += shooterStorageFormat;
+    text += '\n';
+
     text += "shooter_interval_ms=";
     text += String(shooterIntervalMs);
     text += '\n';
@@ -5410,12 +5405,8 @@ static void handleSave()
     text += String(transportMaxDurationSeconds);
     text += '\n';
 
-    text += "transport_black_mean_max=";
-    text += String(transportBlackMeanMax);
-    text += '\n';
-
-    text += "transport_black_p95_max=";
-    text += String(transportBlackP95Max);
+    text += "transport_black_threshold=";
+    text += String(transportBlackThreshold);
     text += '\n';
 
     text += "led_enabled=";
@@ -5612,11 +5603,8 @@ static void handleSave()
             cfg_transport_max_duration_seconds =
                 transportMaxDurationSeconds;
 
-            cfg_transport_black_mean_max =
-                transportBlackMeanMax;
-
-            cfg_transport_black_p95_max =
-                transportBlackP95Max;
+            cfg_transport_black_threshold =
+                transportBlackThreshold;
 
             cfg_recording_not_before =
                 recordingNotBefore;
@@ -5634,6 +5622,7 @@ static void handleSave()
                 recordingEncryption;
 
             cfg_shooter_enabled = shooterEnabled;
+            cfg_shooter_storage_format = shooterStorageFormat;
             cfg_shooter_interval_ms = shooterIntervalMs;
             cfg_shooter_dark_mean_min = shooterDarkMeanMin;
             cfg_shooter_min_change_pct = shooterMinChangePct;
@@ -5717,11 +5706,8 @@ static void handleSave()
             cfg_transport_max_duration_seconds =
                 transportMaxDurationSeconds;
 
-            cfg_transport_black_mean_max =
-                transportBlackMeanMax;
-
-            cfg_transport_black_p95_max =
-                transportBlackP95Max;
+            cfg_transport_black_threshold =
+                transportBlackThreshold;
 
             cfg_recording_not_before =
                 recordingNotBefore;
@@ -5739,6 +5725,7 @@ static void handleSave()
                 recordingEncryption;
 
             cfg_shooter_enabled = shooterEnabled;
+            cfg_shooter_storage_format = shooterStorageFormat;
             cfg_shooter_interval_ms = shooterIntervalMs;
             cfg_shooter_dark_mean_min = shooterDarkMeanMin;
             cfg_shooter_min_change_pct = shooterMinChangePct;
@@ -5934,18 +5921,28 @@ static void handleTransportMeasure()
         return;
     }
 
-    int suggestedMean =
+    // One user-facing transport threshold:
+    // - keep +10 reserve over the measured global mean
+    // - keep +15 reserve over measured P95 via the internally derived
+    //   p95_limit = threshold + 10, therefore threshold >= p95 + 5
+    int suggestedFromMean =
+        (int)ceilf(referenceMean) + 10;
+
+    int suggestedFromP95 =
+        (int)referenceP95 + 5;
+
+    int suggestedThreshold =
         transportClampByte(
-            (int)ceilf(referenceMean) + 10
+            suggestedFromMean > suggestedFromP95
+            ? suggestedFromMean
+            : suggestedFromP95
         );
 
-    int suggestedP95 =
-        transportClampByte(
-            (int)referenceP95 + 15
-        );
+    int suggestedP95Limit =
+        suggestedThreshold + 10;
 
-    if (suggestedP95 < suggestedMean)
-        suggestedP95 = suggestedMean;
+    if (suggestedP95Limit > 255)
+        suggestedP95Limit = 255;
 
     bool suspiciouslyBright =
         referenceMean > 40.0f ||
@@ -5960,10 +5957,10 @@ static void handleTransportMeasure()
         String(referenceMean, 1) +
         " | p95=" +
         String((unsigned)referenceP95) +
-        " | suggested_mean=" +
-        String(suggestedMean) +
-        " | suggested_p95=" +
-        String(suggestedP95) +
+        " | suggested_threshold=" +
+        String(suggestedThreshold) +
+        " | p95_limit_auto=" +
+        String(suggestedP95Limit) +
         " | dark_check=" +
         String(suspiciouslyBright ? "WARN_BRIGHT" : "OK");
 
@@ -5982,10 +5979,10 @@ static void handleTransportMeasure()
     json += String(referenceMean, 1);
     json += ",\"reference_p95\":";
     json += String((unsigned)referenceP95);
-    json += ",\"suggested_mean\":";
-    json += String(suggestedMean);
-    json += ",\"suggested_p95\":";
-    json += String(suggestedP95);
+    json += ",\"suggested_threshold\":";
+    json += String(suggestedThreshold);
+    json += ",\"suggested_p95_limit\":";
+    json += String(suggestedP95Limit);
     json += ",\"suspiciously_bright\":";
     json += suspiciouslyBright ? "true" : "false";
     json += ",\"sample_count\":";
@@ -6012,7 +6009,7 @@ static void handleTransportPage()
     html +=
         "<div class='page-title'><div>"
         "<h2>Transportsicherung</h2>"
-        "<p>Kamera abkleben, Grenzwerte prüfen, speichern und Transportmodus aktivieren.</p>"
+        "<p>Kamera abkleben, Schwarzgrenze prüfen, speichern und Transportmodus aktivieren.</p>"
         "</div></div>";
 
     if (justSaved) {
@@ -6032,40 +6029,30 @@ static void handleTransportPage()
         "<div class='dash-card'><div class='card-label'>Durchschnittliche Helligkeit</div>"
         "<div id='transportReferenceMean' class='card-value'>--</div>"
         "<div class='card-note'>höchster Durchschnittswert aus 10 Messbildern</div></div>"
-        "<div class='dash-card'><div class='card-label'>Helle Bildbereiche (P95)</div>"
+        "<div class='dash-card'><div class='card-label'>Helle Bildbereiche</div>"
         "<div id='transportReferenceP95' class='card-value'>--</div>"
-        "<div class='card-note'>erkennt hellere Bereiche, die im Durchschnitt untergehen können</div></div>"
-        "<div class='dash-card'><div class='card-label'>Sicherheitsreserve</div><div class='card-value'>+10 / +15</div>"
-        "<div class='card-note'>Reserve über den gemessenen Referenzwerten</div></div>"
+        "<div class='card-note'>interne Zusatzprüfung gegen Lichtspalten und helle Teilbereiche</div></div>"
+        "<div class='dash-card'><div class='card-label'>Automatischer Zusatzschutz</div><div class='card-value'>+10</div>"
+        "<div class='card-note'>die interne Grenze für helle Bereiche liegt automatisch 10 Punkte über der Schwarzgrenze</div></div>"
         "</div>"
         "<p><span id='transportMeasureState' class='status-pill warn'>Messung wird vorbereitet ...</span></p>"
         "<p id='transportMeasureErrorText' class='muted' hidden></p>"
         "</section>"
         "<form method='POST' action='/transport_save'>"
         "<section class='settings-section'>"
-        "<h3>Grenzwerte und Zeiten</h3>"
-        "<p class='muted'>Die vorgeschlagenen Grenzwerte enthalten bereits Reserve für etwas Streulicht. "
-        "Du kannst beide Werte vor dem Speichern manuell ändern.</p>";
+        "<h3>Grenzwert und Zeiten</h3>"
+        "<p class='muted'>Für die Schwarzerkennung gibt es nur noch einen Wert. "
+        "Die zusätzliche Prüfung heller Bildbereiche wird intern automatisch daraus abgeleitet.</p>";
 
     html +=
         "<div style='margin-bottom:16px'>"
-        "<label for='transportBlackMeanMax'><b>Schwarzgrenze – durchschnittliche Bildhelligkeit</b></label><br>"
-        "<input id='transportBlackMeanMax' name='transport_black_mean_max' "
+        "<label for='transportBlackThreshold'><b>Schwarzgrenze Transport</b></label><br>"
+        "<input id='transportBlackThreshold' name='transport_black_threshold' "
         "type='number' min='0' max='255' value='" +
-        String(cfg_transport_black_mean_max) +
-        "'> <small id='transportMeanSuggestion'>Automatischer Vorschlag wird gemessen ...</small>"
-        "<div class='muted'>Wie hell das vollständig abgedeckte Bild im Durchschnitt noch sein darf. "
-        "Ein kleinerer Wert bedeutet eine strengere Schwarzerkennung.</div></div>";
-
-    html +=
-        "<div style='margin-bottom:16px'>"
-        "<label for='transportBlackP95Max'><b>Schwarzgrenze – helle Bereiche im Bild</b></label><br>"
-        "<input id='transportBlackP95Max' name='transport_black_p95_max' "
-        "type='number' min='0' max='255' value='" +
-        String(cfg_transport_black_p95_max) +
-        "'> <small id='transportP95Suggestion'>Automatischer Vorschlag wird gemessen ...</small>"
-        "<div class='muted'>Zusätzliche Grenze für hellere Bildbereiche (P95). Sie hilft zu erkennen, "
-        "wenn Teile der Abdeckung Licht durchlassen, obwohl der Gesamtdurchschnitt noch dunkel ist.</div></div>";
+        String(cfg_transport_black_threshold) +
+        "'> <small id='transportThresholdSuggestion'>Automatischer Vorschlag wird gemessen ...</small>"
+        "<div class='muted'>0 = schwarz, 255 = hell. Ein kleinerer Wert bedeutet eine strengere Schwarzerkennung. "
+        "Zusätzlich prüft SensorForge intern helle Bildbereiche mit einer automatisch um 10 Punkte höheren Grenze.</div></div>";
 
     html +=
         "<div style='margin-bottom:16px'>"
@@ -6120,7 +6107,7 @@ static void handleTransportPage()
             "<p class='muted'>Nach dem Aktivieren wird transport_mode=1 persistent gespeichert und SensorForge neu gestartet. "
             "Beim Boot springt die Firmware direkt in den Timer-only Transportpfad.</p>"
             "<form method='POST' action='/transport_activate' "
-            "onsubmit=\"return confirm('Grenzwerte gespeichert und Kamera vollständig schwarz abgeklebt? Transportmodus jetzt aktivieren?');\">"
+            "onsubmit=\"return confirm('Schwarzgrenze gespeichert und Kamera vollständig schwarz abgeklebt? Transportmodus jetzt aktivieren?');\">"
             "<button id='transportActivateButton' class='primary' type='submit'>Transportmodus aktivieren</button>"
             "</form>";
     } else {
@@ -6168,10 +6155,8 @@ static void handleTransportPage()
         "var p95El=document.getElementById('transportReferenceP95');"
         "var stateEl=document.getElementById('transportMeasureState');"
         "var errorEl=document.getElementById('transportMeasureErrorText');"
-        "var meanInput=document.getElementById('transportBlackMeanMax');"
-        "var p95Input=document.getElementById('transportBlackP95Max');"
-        "var meanSuggestion=document.getElementById('transportMeanSuggestion');"
-        "var p95Suggestion=document.getElementById('transportP95Suggestion');"
+        "var thresholdInput=document.getElementById('transportBlackThreshold');"
+        "var thresholdSuggestion=document.getElementById('transportThresholdSuggestion');"
         "var preserveSavedValues=" + String(justSaved ? "true" : "false") + ";"
         "var measuring=false;"
         "function setControlsDisabled(v){"
@@ -6190,12 +6175,11 @@ static void handleTransportPage()
         "function finishControls(){measuring=false;setControlsDisabled(false);}"
         "function hideModal(){if(modal)modal.hidden=true;}"
         "function applyMeasurement(d,applySuggestions){"
-        "var m=Number(d.reference_mean),p=Number(d.reference_p95),sm=Number(d.suggested_mean),sp=Number(d.suggested_p95);"
+        "var m=Number(d.reference_mean),p=Number(d.reference_p95),st=Number(d.suggested_threshold),pl=Number(d.suggested_p95_limit);"
         "if(meanEl)meanEl.textContent=isFinite(m)?m.toFixed(1):'--';"
         "if(p95El)p95El.textContent=isFinite(p)?String(p):'--';"
-        "if(meanSuggestion)meanSuggestion.textContent='Automatischer Vorschlag: '+sm+' (gemessene Durchschnittshelligkeit + 10 Reserve)';"
-        "if(p95Suggestion)p95Suggestion.textContent='Automatischer Vorschlag: '+sp+' (P95-Messwert + 15 Reserve)';"
-        "if(applySuggestions){if(meanInput)meanInput.value=sm;if(p95Input)p95Input.value=sp;}"
+        "if(thresholdSuggestion)thresholdSuggestion.textContent='Automatischer Vorschlag: '+st+' (interner Schutz heller Bereiche bis '+pl+')';"
+        "if(applySuggestions&&thresholdInput)thresholdInput.value=st;"
         "if(stateEl){stateEl.className='status-pill '+(d.suspiciously_bright?'warn':'ok');"
         "stateEl.textContent=d.suspiciously_bright?'Abgedecktes Bild ungewöhnlich hell - Tape/Sitz prüfen':'Messung plausibel dunkel';}"
         "}"
@@ -6204,7 +6188,7 @@ static void handleTransportPage()
         "if(errorEl){errorEl.hidden=false;errorEl.textContent=message||'Unbekannter Fehler';}"
         "if(spinner)spinner.hidden=true;if(closeBtn)closeBtn.hidden=false;"
         "if(title)title.textContent='Messung fehlgeschlagen';"
-        "if(text)text.textContent=message||'Die Schwarzmessung konnte nicht durchgeführt werden. Die gespeicherten Grenzwerte bleiben unverändert.';"
+        "if(text)text.textContent=message||'Die Schwarzmessung konnte nicht durchgeführt werden. Der gespeicherte Grenzwert bleibt unverändert.';"
         "}"
         "function runMeasurement(applySuggestions,source){"
         "if(measuring)return;showBusy();"
@@ -6264,11 +6248,8 @@ static void handleTransportSave()
     int maxDurationSeconds =
         server.arg("transport_max_duration_seconds").toInt();
 
-    int blackMeanMax =
-        server.arg("transport_black_mean_max").toInt();
-
-    int blackP95Max =
-        server.arg("transport_black_p95_max").toInt();
+    int blackThreshold =
+        server.arg("transport_black_threshold").toInt();
 
     configRefreshSdStatus();
 
@@ -6280,8 +6261,7 @@ static void handleTransportSave()
             lightConfirmSeconds,
             installDelaySeconds,
             maxDurationSeconds,
-            blackMeanMax,
-            blackP95Max,
+            blackThreshold,
             transportConfigWriteToSd(),
             error
         );
@@ -6300,11 +6280,17 @@ static void handleTransportSave()
         return;
     }
 
+    int p95Limit =
+        blackThreshold + 10;
+
+    if (p95Limit > 255)
+        p95Limit = 255;
+
     String savedSummary =
-        "Transport settings saved | mean<=" +
-        String(blackMeanMax) +
-        " | p95<=" +
-        String(blackP95Max) +
+        "Transport settings saved | black_threshold=" +
+        String(blackThreshold) +
+        " | p95_limit_auto=" +
+        String(p95Limit) +
         " | check=" +
         String(checkSeconds) +
         " s | light_confirm=" +
@@ -6461,10 +6447,10 @@ static void handleTransportActivate()
         String(cfg_transport_install_delay_seconds) +
         " s | max_duration=" +
         String(cfg_transport_max_duration_seconds) +
-        " s | mean<=" +
-        String(cfg_transport_black_mean_max) +
-        " | p95<=" +
-        String(cfg_transport_black_p95_max)
+        " s | black_threshold=" +
+        String(cfg_transport_black_threshold) +
+        " | p95_limit_auto=" +
+        String(configTransportBlackP95Limit())
     );
 
     sendTransportTransitionPage(

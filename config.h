@@ -32,6 +32,7 @@ extern int cfg_recording_encryption;  // 0/1, encrypt newly created video/snapsh
 // before entering an automatically sized PSRAM queue. The queue is persisted
 // when its timeout or automatically calculated capacity is reached.
 extern int cfg_shooter_enabled;                // 0/1
+extern String cfg_shooter_storage_format;         // "mkv" (default sparse container) or "jpg"
 extern int cfg_shooter_interval_ms;            // 250..86400000
 extern int cfg_shooter_dark_mean_min;          // 0 disables dark filter, otherwise 1..255
 extern float cfg_shooter_min_change_pct;       // 0 disables, otherwise 0.1..100.0 percent
@@ -76,8 +77,8 @@ extern int cfg_transport_check_seconds;           // 10..3600
 extern int cfg_transport_light_confirm_seconds;   // 0..120
 extern int cfg_transport_install_delay_seconds;   // 0..86400
 extern int cfg_transport_max_duration_seconds;      // 3600..604800, hard fallback to normal mode
-extern int cfg_transport_black_mean_max;          // 0..255
-extern int cfg_transport_black_p95_max;           // 0..255
+extern int cfg_transport_black_threshold;         // 0..255; P95 guard is derived internally as threshold + 10
+int configTransportBlackP95Limit();
 
 // Storage safety
 extern int cfg_min_free_space_mb;     // default: 100 MB
@@ -289,8 +290,7 @@ ConfigSaveResult configSaveTransportSettings(
     int lightConfirmSeconds,
     int installDelaySeconds,
     int maxDurationSeconds,
-    int blackMeanMax,
-    int blackP95Max,
+    int blackThreshold,
     bool writeToSd,
     String &error
 );

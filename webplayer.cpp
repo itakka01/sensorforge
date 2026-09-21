@@ -104,6 +104,8 @@ struct BatchFrameRef {
     uint32_t jpegPosition;
     uint32_t jpegSize;
     uint32_t resumePosition;
+    uint32_t timestampMs;
+    uint32_t holdMs;
 };
 
 
@@ -117,11 +119,12 @@ struct PlayerMeta {
     uint32_t width;
     uint32_t height;
     uint64_t durationMs;
+    bool variableTiming;
 };
 
 
 static PlayerMeta currentMeta = {
-    0, 0, 0, 0, 0
+    0, 0, 0, 0, 0, false
 };
 
 
@@ -535,6 +538,9 @@ static bool parseAviMeta(
             1000ULL
         ) /
         fps;
+
+
+    meta.variableTiming = false;
 
 
     containerMeta.moviDataStart =
@@ -1012,6 +1018,7 @@ static const uint32_t MKV_ID_SEGMENT        = 0x18538067;
 static const uint32_t MKV_ID_INFO           = 0x1549A966;
 static const uint32_t MKV_ID_TIMESTAMP_SCALE = 0x2AD7B1;
 static const uint32_t MKV_ID_DURATION       = 0x4489;
+static const uint32_t MKV_ID_DATE_UTC       = 0x4461;
 
 static const uint32_t MKV_ID_TRACKS         = 0x1654AE6B;
 static const uint32_t MKV_ID_TRACK_ENTRY    = 0xAE;
@@ -1043,6 +1050,8 @@ struct MkvMeta {
     uint64_t videoTrackNumber;
     uint64_t subtitleTrackNumber;
     bool hasSubtitleTrack;
+    bool hasDateUtc;
+    uint32_t startEpochSec;
     uint32_t segmentDataStart;
     uint32_t segmentEnd;
     uint32_t firstClusterPos;
@@ -1054,6 +1063,8 @@ static MkvMeta mkvMeta = {
     1,
     0,
     false,
+    false,
+    0,
     0,
     0,
     0
@@ -1399,6 +1410,42 @@ static bool readEbmlUnsigned(
 }
 
 
+static bool readEbmlSigned(
+    RecordingStorageFile &file,
+    const EbmlElement &element,
+    int64_t &value
+)
+{
+    uint64_t raw = 0;
+
+    if (!readEbmlUnsigned(
+            file,
+            element,
+            raw
+        )) {
+        return false;
+    }
+
+    const uint8_t bits =
+        (uint8_t)element.size * 8U;
+
+    if (bits < 64U) {
+        const uint64_t signBit =
+            1ULL << (bits - 1U);
+
+        if (raw & signBit) {
+            raw |=
+                (~0ULL) << bits;
+        }
+    }
+
+    value =
+        (int64_t)raw;
+
+    return true;
+}
+
+
 static bool readEbmlFloat(
     RecordingStorageFile &file,
     const EbmlElement &element,
@@ -1616,6 +1663,42 @@ static bool parseMkvInfo(
 
                 durationTicks =
                     duration;
+            }
+
+        } else if (
+            child.id ==
+            MKV_ID_DATE_UTC
+        ) {
+
+            int64_t dateUtcNs = 0;
+
+            if (readEbmlSigned(
+                    file,
+                    child,
+                    dateUtcNs
+                )) {
+
+                // Matroska DateUTC is signed nanoseconds since
+                // 2001-01-01T00:00:00Z. SensorForge writes it at the
+                // wall-clock time of the first frame. The frame-relative
+                // timestamps then reconstruct each exact capture time.
+                const int64_t unixToMatroskaEpoch =
+                    978307200LL;
+
+                int64_t unixSeconds =
+                    unixToMatroskaEpoch +
+                    dateUtcNs / 1000000000LL;
+
+                if (
+                    unixSeconds > 0 &&
+                    unixSeconds <= 0xFFFFFFFFLL
+                ) {
+                    containerMeta.hasDateUtc =
+                        true;
+
+                    containerMeta.startEpochSec =
+                        (uint32_t)unixSeconds;
+                }
             }
         }
 
@@ -2834,6 +2917,12 @@ static bool parseMkvMeta(
     containerMeta.hasSubtitleTrack =
         false;
 
+    containerMeta.hasDateUtc =
+        false;
+
+    containerMeta.startEpochSec =
+        0;
+
     containerMeta.segmentDataStart =
         0;
 
@@ -3047,92 +3136,71 @@ static bool parseMkvMeta(
     }
 
 
-    uint32_t fps =
-        5;
+    uint32_t fps = 5;
 
-
-    if (nextMkvVideoFrame(
-            file,
-            containerMeta,
-            probe,
-            secondFrame
-        )) {
-
-        uint64_t deltaMs =
-            secondFrame.timestampMs -
-            firstFrame.timestampMs;
-
-
+    if (nextMkvVideoFrame(file, containerMeta, probe, secondFrame)) {
+        uint64_t deltaMs = secondFrame.timestampMs - firstFrame.timestampMs;
         if (deltaMs > 0) {
-
             uint32_t estimatedFps =
-                (uint32_t)(
-                    (
-                        1000ULL +
-                        deltaMs / 2ULL
-                    ) /
-                    deltaMs
-                );
-
-
-            if (
-                estimatedFps >= 1 &&
-                estimatedFps <= 60
-            ) {
-                fps =
-                    estimatedFps;
-            }
+                (uint32_t)((1000ULL + deltaMs / 2ULL) / deltaMs);
+            if (estimatedFps >= 1 && estimatedFps <= 60)
+                fps = estimatedFps;
         }
     }
 
-
     double durationNs =
-        durationTicks *
-        (double)
-            containerMeta.timestampScaleNs;
-
-
+        durationTicks * (double)containerMeta.timestampScaleNs;
     uint64_t durationMs =
-        (uint64_t)(
-            durationNs /
-            1000000.0 +
-            0.5
-        );
+        (uint64_t)(durationNs / 1000000.0 + 0.5);
 
+    // Sparse shooter MKVs intentionally use irregular timestamps. Count the
+    // actual video blocks rather than inferring frame count from Duration*FPS.
+    MkvScanState countScan;
+    initMkvScan(countScan, containerMeta.firstClusterPos);
+    MkvFrameInfo countedFrame;
+    uint32_t actualFrameCount = 0;
+    bool variableTiming = false;
+    uint64_t previousTimestampMs = 0;
+    bool havePreviousTimestamp = false;
+    uint64_t nominalStepMs =
+        fps > 0
+        ? max(1ULL, 1000ULL / (uint64_t)fps)
+        : 1ULL;
 
-    uint64_t frameCount64 =
-        (
-            durationMs *
-            fps +
-            500ULL
-        ) /
-        1000ULL;
+    while (nextMkvVideoFrame(file, containerMeta, countScan, countedFrame)) {
+        if (actualFrameCount == 0xFFFFFFFFUL)
+            return false;
 
+        if (havePreviousTimestamp) {
+            uint64_t deltaMs =
+                countedFrame.timestampMs >= previousTimestampMs
+                ? countedFrame.timestampMs - previousTimestampMs
+                : 0;
+            uint64_t difference =
+                deltaMs > nominalStepMs
+                ? deltaMs - nominalStepMs
+                : nominalStepMs - deltaMs;
+            if (difference > 2ULL)
+                variableTiming = true;
+        }
 
-    if (
-        frameCount64 == 0 ||
-        frameCount64 >
-        0xFFFFFFFFULL
-    ) {
-        return false;
+        previousTimestampMs = countedFrame.timestampMs;
+        havePreviousTimestamp = true;
+        actualFrameCount++;
+
+        if ((actualFrameCount & 0x3FU) == 0U)
+            yield();
     }
 
+    if (actualFrameCount == 0)
+        return false;
 
-    meta.fps =
-        fps;
-
-    meta.frameCount =
-        (uint32_t)frameCount64;
-
-    meta.width =
-        width;
-
-    meta.height =
-        height;
-
-    meta.durationMs =
-        durationMs;
-
+    meta.fps = fps;
+    meta.frameCount = actualFrameCount;
+    meta.width = width;
+    meta.height = height;
+    meta.durationMs = durationMs;
+    meta.variableTiming = variableTiming;
 
     return true;
 }
@@ -3165,7 +3233,8 @@ static bool locateMkvFrame(
     uint32_t requestedFrame,
     uint32_t &jpegPosition,
     uint32_t &jpegSize,
-    uint32_t &resumePosition
+    uint32_t &resumePosition,
+    uint64_t *timestampMs = nullptr
 )
 {
     if (!playerFile)
@@ -3215,6 +3284,9 @@ static bool locateMkvFrame(
 
             resumePosition =
                 frame.resumePosition;
+
+            if (timestampMs)
+                *timestampMs = frame.timestampMs;
 
 
             return true;
@@ -3276,7 +3348,7 @@ static void closePlayerFile()
         PLAYER_NONE;
 
     currentMeta = {
-        0, 0, 0, 0, 0
+        0, 0, 0, 0, 0, false
     };
 
     aviMeta = {
@@ -3294,6 +3366,8 @@ static void closePlayerFile()
         1,
         0,
         false,
+        false,
+        0,
         0,
         0,
         0
@@ -3733,12 +3807,36 @@ static void handlePlayerMeta()
         );
 
     json +=
+        ",\"variable_timing\":";
+
+    json +=
+        currentMeta.variableTiming
+        ? "true"
+        : "false";
+
+    json +=
         ",\"subtitles\":";
 
     json +=
         playerHasSubtitles
         ? "true"
         : "false";
+
+    json +=
+        ",\"start_epoch_sec\":";
+
+    if (
+        playerFormat == PLAYER_MKV &&
+        mkvMeta.hasDateUtc
+    ) {
+        json +=
+            String(
+                (unsigned long)mkvMeta.startEpochSec
+            );
+    } else {
+        json +=
+            "0";
+    }
 
     json +=
         "}";
@@ -3762,13 +3860,15 @@ static void handlePlayerMeta()
 //
 // Binary wire format, little endian:
 //
-//   4 bytes  ITB1
+//   4 bytes  ITB2
 //   u16      frame count
 //   u16      reserved
 //
 //   repeated:
 //     u32    frame number
 //     u32    JPEG byte length
+//     u32    frame timestamp in milliseconds
+//     u32    display/hold duration in milliseconds
 //     bytes  JPEG payload
 //
 // Only frame positions/sizes are kept in RAM. JPEG data is read
@@ -3855,31 +3955,29 @@ static void handlePlayerBatch()
         uint32_t jpegPosition = 0;
         uint32_t jpegSize = 0;
         uint32_t resumePosition = 0;
+        uint64_t timestampMs64 = 0;
         bool located = false;
 
-        if (
-            playerFormat ==
-            PLAYER_AVI
-        ) {
-            located =
-                locateAviFrame(
-                    frameNumber,
-                    jpegPosition,
-                    jpegSize,
-                    resumePosition
-                );
-
-        } else if (
-            playerFormat ==
-            PLAYER_MKV
-        ) {
-            located =
-                locateMkvFrame(
-                    frameNumber,
-                    jpegPosition,
-                    jpegSize,
-                    resumePosition
-                );
+        if (playerFormat == PLAYER_AVI) {
+            located = locateAviFrame(
+                frameNumber,
+                jpegPosition,
+                jpegSize,
+                resumePosition
+            );
+            if (located && currentMeta.fps > 0) {
+                timestampMs64 =
+                    ((uint64_t)frameNumber * 1000ULL) /
+                    currentMeta.fps;
+            }
+        } else if (playerFormat == PLAYER_MKV) {
+            located = locateMkvFrame(
+                frameNumber,
+                jpegPosition,
+                jpegSize,
+                resumePosition,
+                &timestampMs64
+            );
         }
 
         if (!located)
@@ -3897,6 +3995,16 @@ static void handlePlayerBatch()
         refs[count].resumePosition =
             resumePosition;
 
+        refs[count].timestampMs =
+            timestampMs64 > 0xFFFFFFFFULL
+            ? 0xFFFFFFFFUL
+            : (uint32_t)timestampMs64;
+
+        refs[count].holdMs =
+            currentMeta.fps > 0
+            ? max(1UL, 1000UL / currentMeta.fps)
+            : 1UL;
+
         count++;
     }
 
@@ -3909,6 +4017,37 @@ static void handlePlayerBatch()
         return;
     }
 
+    for (uint8_t i = 0; i + 1 < count; ++i) {
+        if (refs[i + 1].timestampMs > refs[i].timestampMs)
+            refs[i].holdMs = refs[i + 1].timestampMs - refs[i].timestampMs;
+    }
+
+    if (currentMeta.variableTiming) {
+        uint32_t lastIndex = refs[count - 1].frameNumber;
+        if (lastIndex + 1U < currentMeta.frameCount) {
+            uint32_t p = 0, z = 0, r = 0;
+            uint64_t nextTimestampMs = 0;
+            if (
+                locateMkvFrame(lastIndex + 1U, p, z, r, &nextTimestampMs) &&
+                nextTimestampMs > refs[count - 1].timestampMs
+            ) {
+                uint64_t delta =
+                    nextTimestampMs - refs[count - 1].timestampMs;
+                refs[count - 1].holdMs =
+                    delta > 0xFFFFFFFFULL
+                    ? 0xFFFFFFFFUL
+                    : (uint32_t)delta;
+            }
+        } else if (currentMeta.durationMs > refs[count - 1].timestampMs) {
+            uint64_t delta =
+                currentMeta.durationMs - refs[count - 1].timestampMs;
+            refs[count - 1].holdMs =
+                delta > 0xFFFFFFFFULL
+                ? 0xFFFFFFFFUL
+                : (uint32_t)delta;
+        }
+    }
+
     uint64_t totalLength64 = 8ULL;
 
     for (
@@ -3917,7 +4056,7 @@ static void handlePlayerBatch()
         ++i
     ) {
         totalLength64 +=
-            8ULL +
+            16ULL +
             refs[i].jpegSize;
     }
 
@@ -3963,7 +4102,7 @@ static void handlePlayerBatch()
         playerServer->client();
 
     uint8_t batchHeader[8] = {
-        'I', 'T', 'B', '1',
+        'I', 'T', 'B', '2',
         0, 0, 0, 0
     };
 
@@ -3988,7 +4127,7 @@ static void handlePlayerBatch()
         i < count;
         ++i
     ) {
-        uint8_t frameHeader[8];
+        uint8_t frameHeader[16];
 
         putU32LE(
             &frameHeader[0],
@@ -3998,6 +4137,16 @@ static void handlePlayerBatch()
         putU32LE(
             &frameHeader[4],
             refs[i].jpegSize
+        );
+
+        putU32LE(
+            &frameHeader[8],
+            refs[i].timestampMs
+        );
+
+        putU32LE(
+            &frameHeader[12],
+            refs[i].holdMs
         );
 
         if (!clientWriteAll(
@@ -4283,13 +4432,25 @@ static void handlePlayerFrame()
         PLAYER_MKV
     ) {
 
+        uint64_t frameTimestampMs = 0;
         located =
             locateMkvFrame(
                 requestedFrame,
                 jpegPosition,
                 jpegSize,
-                resumePosition
+                resumePosition,
+                &frameTimestampMs
             );
+
+        if (located) {
+            playerServer->sendHeader(
+                "X-Frame-Time-Ms",
+                String((unsigned long)min(
+                    frameTimestampMs,
+                    (uint64_t)0xFFFFFFFFULL
+                ))
+            );
+        }
     }
 
 
@@ -5279,18 +5440,41 @@ h2{
 }
 #timestamp{
     position:absolute;
-    left:12px;
+    right:12px;
+    top:auto;
+    left:auto;
     bottom:12px;
-    padding:5px 8px;
+    padding:0;
     color:white;
-    background:rgba(0,0,0,.55);
+    background:transparent;
     font-family:monospace;
     font-size:18px;
+    font-weight:700;
+    line-height:1.2;
+    text-align:right;
     white-space:pre-line;
+    text-shadow:0 1px 2px rgba(0,0,0,.95),0 0 3px rgba(0,0,0,.85);
+    pointer-events:none;
     display:none;
 }
 .controls{
     margin:10px 0 12px;
+}
+.speed-control{
+    display:inline-flex;
+    align-items:center;
+    gap:6px;
+    margin:5px 10px 5px 0;
+    color:var(--muted);
+    font-weight:600;
+}
+.speed-control select{
+    padding:8px 10px;
+    border:1px solid #cbd5e1;
+    border-radius:6px;
+    background:white;
+    color:#1f2933;
+    font-weight:700;
 }
 button{
     padding:9px 15px;
@@ -5378,6 +5562,16 @@ R"HTML(</span></a>
 <div class="controls">
     <button class="playBtn videoOnly">Play</button>
     <button class="restartBtn videoOnly">Restart</button>
+    <button class="prevFrameBtn videoOnly" type="button" title="Previous frame">&#9664; Frame</button>
+    <button class="nextFrameBtn videoOnly" type="button" title="Next frame">Frame &#9654;</button>
+    <button class="downloadFrameBtn videoOnly" type="button" title="Download currently displayed frame">Download image</button>
+    <label class="speed-control videoOnly">Speed
+        <select class="speedSelect" aria-label="Playback speed">
+            <option value="1">1x</option>
+            <option value="2">2x</option>
+            <option value="4">4x</option>
+        </select>
+    </label>
     <button class="downloadBtn">Download</button>
     <button class="deleteBtn">Delete</button>
     <a href="/files"><button type="button">Back</button></a>
@@ -5408,6 +5602,16 @@ R"HTML(</span></a>
 <div class="controls">
     <button class="playBtn videoOnly">Play</button>
     <button class="restartBtn videoOnly">Restart</button>
+    <button class="prevFrameBtn videoOnly" type="button" title="Previous frame">&#9664; Frame</button>
+    <button class="nextFrameBtn videoOnly" type="button" title="Next frame">Frame &#9654;</button>
+    <button class="downloadFrameBtn videoOnly" type="button" title="Download currently displayed frame">Download image</button>
+    <label class="speed-control videoOnly">Speed
+        <select class="speedSelect" aria-label="Playback speed">
+            <option value="1">1x</option>
+            <option value="2">2x</option>
+            <option value="4">4x</option>
+        </select>
+    </label>
     <button class="downloadBtn">Download</button>
     <button class="deleteBtn">Delete</button>
     <a href="/files"><button type="button">Back</button></a>
@@ -5443,6 +5647,10 @@ document.addEventListener('click', function(e) {
 const frameImg = document.getElementById('frame');
 const playBtns = document.querySelectorAll('.playBtn');
 const restartBtns = document.querySelectorAll('.restartBtn');
+const prevFrameBtns = document.querySelectorAll('.prevFrameBtn');
+const nextFrameBtns = document.querySelectorAll('.nextFrameBtn');
+const downloadFrameBtns = document.querySelectorAll('.downloadFrameBtn');
+const speedSelects = document.querySelectorAll('.speedSelect');
 const downloadBtns = document.querySelectorAll('.downloadBtn');
 const deleteBtns = document.querySelectorAll('.deleteBtn');
 const seek = document.getElementById('seek');
@@ -5466,6 +5674,14 @@ let zoomMode = 'fit';
 
 let meta = null;
 let currentFrame = 0;
+let currentFrameTimeMs = 0;
+const requestedPlaybackSpeed = Number(params.get('speed'));
+let playbackSpeed =
+    requestedPlaybackSpeed === 2 || requestedPlaybackSpeed === 4
+        ? requestedPlaybackSpeed
+        : 1;
+const sparseGapThresholdMs = 3000;
+const sparseGapDisplayMs = 500;
 let playing = false;
 let loading = false;
 let currentObjectUrl = null;
@@ -5480,7 +5696,9 @@ function viewerUrl(targetPath) {
     return '/play?path=' +
         encodeURIComponent(targetPath) +
         '&mode=' +
-        encodeURIComponent(mediaMode);
+        encodeURIComponent(mediaMode) +
+        '&speed=' +
+        encodeURIComponent(String(playbackSpeed));
 }
 
 function snapshotTimestampTextFromPath(targetPath) {
@@ -5488,7 +5706,7 @@ function snapshotTimestampTextFromPath(targetPath) {
         return '';
 
     const match = String(targetPath).match(
-        /\/(\d{8})\/(\d{6})(?:_(\d{3}))?\.(?:jpe?g)$/i
+        /\/(\d{8})\/(\d{6})\.(?:jpe?g)$/i
     );
 
     if (!match)
@@ -5496,7 +5714,6 @@ function snapshotTimestampTextFromPath(targetPath) {
 
     const day = match[1];
     const time = match[2];
-    const milliseconds = match[3] || '';
 
     return (
         day.substring(0, 4) + '-' +
@@ -5504,8 +5721,7 @@ function snapshotTimestampTextFromPath(targetPath) {
         day.substring(6, 8) + ' ' +
         time.substring(0, 2) + ':' +
         time.substring(2, 4) + ':' +
-        time.substring(4, 6) +
-        (milliseconds.length ? '.' + milliseconds : '')
+        time.substring(4, 6)
     );
 }
 
@@ -5513,15 +5729,37 @@ function setNeighborLink(link, targetPath) {
     if (!link) return;
 
     if (!targetPath) {
+        link.dataset.targetPath = '';
         link.classList.add('disabled');
         link.setAttribute('aria-disabled','true');
         link.href = '#';
         return;
     }
 
+    link.dataset.targetPath = targetPath;
     link.href = viewerUrl(targetPath);
     link.classList.remove('disabled');
     link.removeAttribute('aria-disabled');
+}
+
+function refreshMediaNavigationHrefs() {
+    [prevMediaLink, nextMediaLink].forEach(function(link) {
+        if (!link) return;
+
+        const targetPath =
+            String(link.dataset.targetPath || '');
+
+        if (targetPath.length)
+            link.href = viewerUrl(targetPath);
+    });
+}
+
+function updatePlaybackSpeedUrl() {
+    try {
+        const current = new URL(location.href);
+        current.searchParams.set('speed', String(playbackSpeed));
+        history.replaceState(null, '', current.pathname + current.search);
+    } catch (e) {}
 }
 
 async function initMediaNavigation() {
@@ -5750,13 +5988,41 @@ function formatTime(ms) {
            String(s).padStart(2,'0');
 }
 
+function formatCaptureTimestamp(epochMs) {
+    const date =
+        new Date(epochMs);
+
+    if (Number.isNaN(date.getTime()))
+        return '';
+
+    const pad2 = function(value) {
+        return String(value).padStart(2,'0');
+    };
+
+    const tenth =
+        Math.floor(date.getMilliseconds() / 100);
+
+    return (
+        date.getFullYear() + '-' +
+        pad2(date.getMonth() + 1) + '-' +
+        pad2(date.getDate()) + ' ' +
+        pad2(date.getHours()) + ':' +
+        pad2(date.getMinutes()) + ':' +
+        pad2(date.getSeconds()) + '.' +
+        String(tenth)
+    );
+}
+
+
 function updateUi() {
     if (!meta) return;
 
     const currentMs =
         Math.min(
             meta.duration_ms,
-            Math.round(currentFrame * 1000 / meta.fps)
+            meta.variable_timing
+                ? Math.max(0, currentFrameTimeMs)
+                : Math.round(currentFrame * 1000 / meta.fps)
         );
 
     seek.value =
@@ -5774,6 +6040,21 @@ function updateUi() {
         button.textContent =
             playing ? 'Pause' : 'Play';
     });
+
+    prevFrameBtns.forEach(function(button) {
+        button.disabled =
+            currentFrame <= 0;
+    });
+
+    nextFrameBtns.forEach(function(button) {
+        button.disabled =
+            currentFrame >= meta.frames - 1;
+    });
+
+    downloadFrameBtns.forEach(function(button) {
+        button.disabled =
+            !currentObjectUrl;
+    });
 }
 
 function updateStatus() {
@@ -5783,8 +6064,11 @@ function updateStatus() {
     statusEl.textContent =
         meta.width + 'x' +
         meta.height + ' | ' +
-        meta.fps + ' fps | ' +
-        meta.format.toUpperCase() +
+        (meta.variable_timing
+            ? ('sparse timing | gaps > ' + (sparseGapThresholdMs / 1000) + ' s compressed')
+            : (meta.fps + ' fps')) +
+        ' | ' + playbackSpeed + 'x' +
+        ' | ' + meta.format.toUpperCase() +
         (
             meta.subtitles
             ? ' | Timestamp'
@@ -5793,6 +6077,36 @@ function updateStatus() {
 }
 
 async function updateSubtitle(frameNumber, force=false) {
+    // Sparse shooter MKVs deliberately omit subtitle tracks. Reconstruct the
+    // real wall-clock capture time from Matroska DateUTC plus this frame's
+    // original relative timestamp. This is display-only; playback gap
+    // compression never changes the recorded time.
+    if (
+        meta &&
+        !meta.subtitles &&
+        Number(meta.start_epoch_sec || 0) > 0
+    ) {
+        const captureText =
+            formatCaptureTimestamp(
+                Number(meta.start_epoch_sec) * 1000 +
+                Math.max(0, Number(currentFrameTimeMs || 0))
+            );
+
+        if (captureText.length) {
+            timestampEl.textContent =
+                captureText;
+            timestampEl.style.display =
+                'block';
+        } else {
+            timestampEl.style.display =
+                'none';
+            timestampEl.textContent =
+                '';
+        }
+
+        return;
+    }
+
     if (!meta || !meta.subtitles) {
         timestampEl.style.display = 'none';
         timestampEl.textContent = '';
@@ -5926,7 +6240,7 @@ function parseBatch(buffer) {
         view.getUint8(0) !== 73 ||
         view.getUint8(1) !== 84 ||
         view.getUint8(2) !== 66 ||
-        view.getUint8(3) !== 49
+        view.getUint8(3) !== 50
     ) {
         throw new Error(
             'Invalid batch'
@@ -5957,7 +6271,7 @@ function parseBatch(buffer) {
         ++i
     ) {
         if (
-            offset + 8 >
+            offset + 16 >
             view.byteLength
         ) {
             throw new Error(
@@ -5977,7 +6291,19 @@ function parseBatch(buffer) {
                 true
             );
 
-        offset += 8;
+        const timestampMs =
+            view.getUint32(
+                offset + 8,
+                true
+            );
+
+        const holdMs =
+            view.getUint32(
+                offset + 12,
+                true
+            );
+
+        offset += 16;
 
         if (
             jpegSize < 4 ||
@@ -6005,6 +6331,8 @@ function parseBatch(buffer) {
 
         frames.push({
             frame: frameNumber,
+            timestamp_ms: timestampMs,
+            hold_ms: Math.max(1, holdMs),
             url: url
         });
 
@@ -6115,6 +6443,9 @@ function showBatchFrame(item) {
     currentFrame =
         item.frame;
 
+    currentFrameTimeMs =
+        Number(item.timestamp_ms || 0);
+
     updateUi();
 
     updateSubtitle(
@@ -6126,6 +6457,15 @@ function showBatchFrame(item) {
 async function runSingleFramePlayback(
     generation
 ) {
+    // Variable-timing MKV requires the timing metadata carried by ITB2 batches.
+    // Never silently replay a sparse file at a fabricated constant FPS.
+    if (meta && meta.variable_timing) {
+        playing = false;
+        statusEl.textContent = 'Variable-timing playback requires batch transfer';
+        updateUi();
+        return;
+    }
+
     // Compatibility fallback for a broken/interrupted batch transfer.
     // /player_frame uses the same proven single-JPEG path that is also
     // used for the initial preview frame.
@@ -6157,8 +6497,7 @@ async function runSingleFramePlayback(
         }
 
         const frameMs =
-            1000 /
-            meta.fps;
+            (1000 / meta.fps) / playbackSpeed;
 
         const elapsed =
             performance.now() -
@@ -6181,6 +6520,27 @@ async function runSingleFramePlayback(
         playing = false;
         updateUi();
     }
+}
+
+
+function effectivePlaybackHoldMs(item) {
+    let sourceHoldMs =
+        Math.max(1, Number(item && item.hold_ms || 1));
+
+    // Sparse shooter MKVs preserve the original capture timeline in the file,
+    // but the viewer must not force the operator to wait through long periods
+    // in which no frame was accepted. Keep short runs temporally faithful and
+    // collapse larger gaps to a brief, visible jump. Playback speed applies to
+    // both normal frame spacing and the compressed transition.
+    if (
+        meta &&
+        meta.variable_timing &&
+        sourceHoldMs > sparseGapThresholdMs
+    ) {
+        sourceHoldMs = sparseGapDisplayMs;
+    }
+
+    return Math.max(1, sourceHoldMs / playbackSpeed);
 }
 
 
@@ -6246,8 +6606,9 @@ async function runBatchPlayback(
                 );
 
                 const frameMs =
-                    1000 /
-                    meta.fps;
+                    meta.variable_timing
+                    ? effectivePlaybackHoldMs(batch[i])
+                    : (1000 / meta.fps) / playbackSpeed;
 
                 const elapsed =
                     performance.now() -
@@ -6350,6 +6711,9 @@ async function loadFrame(frameNumber) {
                 response.status
             );
 
+        const frameTimeHeader =
+            response.headers.get('X-Frame-Time-Ms');
+
         const blob =
             await response.blob();
 
@@ -6368,6 +6732,11 @@ async function loadFrame(frameNumber) {
 
         currentFrame =
             frameNumber;
+
+        currentFrameTimeMs =
+            frameTimeHeader !== null
+            ? Math.max(0, Number(frameTimeHeader) || 0)
+            : Math.round(frameNumber * 1000 / Math.max(1, meta.fps));
 
         updateUi();
 
@@ -6418,6 +6787,7 @@ function togglePlayback() {
         meta.frames - 1
     ) {
         currentFrame = 0;
+        currentFrameTimeMs = 0;
         subtitleSecond = -1;
     }
 
@@ -6467,6 +6837,239 @@ restartBtns.forEach(function(button) {
         'click',
         restartPlayback
     );
+});
+
+
+function stopPlaybackForFrameStep() {
+    playing = false;
+    playbackGeneration++;
+
+    if (batchController) {
+        batchController.abort();
+        batchController = null;
+    }
+
+    updateUi();
+}
+
+
+async function stepFrame(delta) {
+    if (!meta || loading)
+        return;
+
+    const targetFrame =
+        Math.max(
+            0,
+            Math.min(
+                meta.frames - 1,
+                currentFrame + delta
+            )
+        );
+
+    if (targetFrame === currentFrame)
+        return;
+
+    stopPlaybackForFrameStep();
+    subtitleSecond = -1;
+
+    statusEl.textContent =
+        'Loading frame...';
+
+    const loaded =
+        await loadFrame(targetFrame);
+
+    if (loaded)
+        updateStatus();
+}
+
+
+prevFrameBtns.forEach(function(button) {
+    button.addEventListener(
+        'click',
+        function() {
+            stepFrame(-1);
+        }
+    );
+});
+
+
+nextFrameBtns.forEach(function(button) {
+    button.addEventListener(
+        'click',
+        function() {
+            stepFrame(1);
+        }
+    );
+});
+
+
+function currentFrameDownloadName() {
+    let baseName =
+        String(path || 'sensorforge')
+            .split('/')
+            .pop()
+            .replace(/\.[^.]+$/, '');
+
+    if (!baseName.length)
+        baseName = 'sensorforge';
+
+    let timestampSuffix = '';
+
+    if (
+        meta &&
+        Number(meta.start_epoch_sec || 0) > 0
+    ) {
+        const captureText =
+            formatCaptureTimestamp(
+                Number(meta.start_epoch_sec) * 1000 +
+                Math.max(0, Number(currentFrameTimeMs || 0))
+            );
+
+        if (captureText.length) {
+            timestampSuffix =
+                '_' + captureText
+                    .replace(/[-:. ]/g, '')
+                    .replace(/[^0-9]/g, '');
+        }
+    }
+
+    return (
+        baseName +
+        '_frame_' +
+        String(currentFrame + 1).padStart(6, '0') +
+        timestampSuffix +
+        '.jpg'
+    );
+}
+
+
+async function downloadCurrentFrame() {
+    if (!meta || !currentObjectUrl)
+        return;
+
+    // The displayed JPEG is already resident in the browser. Render that frame
+    // to a canvas and burn in the currently visible timestamp overlay. This
+    // keeps the node/SD completely out of the download path while preserving
+    // the pristine JPEG inside the MKV.
+    if (!frameImg.complete || !frameImg.naturalWidth || !frameImg.naturalHeight)
+        return;
+
+    const canvas =
+        document.createElement('canvas');
+
+    canvas.width = frameImg.naturalWidth;
+    canvas.height = frameImg.naturalHeight;
+
+    const ctx =
+        canvas.getContext('2d');
+
+    if (!ctx)
+        return;
+
+    ctx.drawImage(
+        frameImg,
+        0,
+        0,
+        canvas.width,
+        canvas.height
+    );
+
+    const overlayText =
+        timestampEl &&
+        timestampEl.style.display !== 'none'
+            ? String(timestampEl.textContent || '').trim()
+            : '';
+
+    if (overlayText.length) {
+        const fontSize =
+            Math.max(18, Math.round(canvas.width * 0.018));
+        const padding =
+            Math.max(12, Math.round(fontSize * 0.7));
+        const lineHeight =
+            Math.round(fontSize * 1.22);
+        const lines =
+            overlayText.split(/\r?\n/);
+
+        ctx.save();
+        ctx.font =
+            '700 ' + fontSize + 'px monospace';
+        ctx.textAlign = 'right';
+        ctx.textBaseline = 'bottom';
+        ctx.lineJoin = 'round';
+        ctx.strokeStyle = 'rgba(0,0,0,0.9)';
+        ctx.lineWidth =
+            Math.max(2, Math.round(fontSize * 0.14));
+        ctx.fillStyle = 'white';
+
+        for (let i = 0; i < lines.length; i++) {
+            const x =
+                canvas.width - padding;
+            const y =
+                canvas.height - padding -
+                (lines.length - 1 - i) * lineHeight;
+
+            ctx.strokeText(lines[i], x, y);
+            ctx.fillText(lines[i], x, y);
+        }
+
+        ctx.restore();
+    }
+
+    const blob =
+        await new Promise(function(resolve) {
+            canvas.toBlob(resolve, 'image/jpeg', 0.95);
+        });
+
+    if (!blob)
+        return;
+
+    const downloadUrl =
+        URL.createObjectURL(blob);
+    const link =
+        document.createElement('a');
+
+    link.href = downloadUrl;
+    link.download = currentFrameDownloadName();
+    link.style.display = 'none';
+
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+
+    setTimeout(function() {
+        URL.revokeObjectURL(downloadUrl);
+    }, 1000);
+}
+
+
+downloadFrameBtns.forEach(function(button) {
+    button.addEventListener(
+        'click',
+        downloadCurrentFrame
+    );
+});
+
+
+speedSelects.forEach(function(select) {
+    select.addEventListener('change', function() {
+        const requested = Number(select.value);
+        playbackSpeed =
+            requested === 2 || requested === 4
+            ? requested
+            : 1;
+
+        speedSelects.forEach(function(other) {
+            other.value = String(playbackSpeed);
+        });
+
+        updatePlaybackSpeedUrl();
+        refreshMediaNavigationHrefs();
+        updateStatus();
+    });
+});
+
+speedSelects.forEach(function(select) {
+    select.value = String(playbackSpeed);
 });
 
 
