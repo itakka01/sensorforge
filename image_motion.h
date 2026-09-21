@@ -158,6 +158,35 @@ struct ImageMotionDiagnosticSample {
     uint8_t frameChangedMask[IMAGE_MOTION_ROI_BYTES] = {};
 };
 
+
+// Lightweight metrics for the continuous JPEG shooter. This analyzer shares the
+// existing 1/8-scale JPEG decoder but maintains a completely separate reference
+// image, so shooter filtering cannot alter the operational image-motion state.
+struct ShooterImageMetrics {
+    uint32_t analyzeFrameMs = 0;
+    uint32_t decodeMs = 0;
+    float globalMean = 0.0f;
+    uint8_t brightestBlockMean = 0;
+    float similarityPct = 0.0f;
+    uint16_t changedBlocksGe5 = 0;
+    uint16_t meanAbsDiffX10 = 0;
+    uint16_t maxAbsDiff = 0;
+    bool referenceReady = false;
+};
+
+bool imageMotionAnalyzeShooterJpeg(
+    const uint8_t *jpeg,
+    size_t jpegLength,
+    uint16_t sourceWidth,
+    uint16_t sourceHeight,
+    ShooterImageMetrics &metrics
+);
+
+// Commit the most recently measured shooter frame as the similarity reference.
+// Call only after that frame has been accepted for persistence.
+bool imageMotionCommitShooterReference();
+void imageMotionResetShooterReference();
+
 String imageMotionDefaultRoiMask();
 bool imageMotionValidateRoiMask(const String &text);
 bool imageMotionDecodeRoiMask(const String &text, uint8_t mask[IMAGE_MOTION_ROI_BYTES]);

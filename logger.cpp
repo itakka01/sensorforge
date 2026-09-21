@@ -10,11 +10,22 @@
 #include <time.h>
 #include <sys/time.h>
 #include <stdarg.h>
+#include <esp_heap_caps.h>
 
 
 static LogStorageWriter logWriter;
 static String logCurrentPath;
 static uint64_t logBytesWritten = 0;
+
+// Low-power log batching. Normal log lines are accumulated in PSRAM and only
+// persisted in batches. This avoids waking the SD card for every informational
+// event during continuous-shooter operation. Light sleep retains PSRAM; all
+// deliberate deep-sleep/reboot/shutdown paths already call logFlush()/logClose().
+static uint8_t *logRamBuffer = nullptr;
+static size_t logRamBufferCapacity = 0;
+static size_t logRamBufferUsed = 0;
+static const size_t LOG_RAM_BUFFER_TARGET_BYTES = 16U * 1024U;
+static const size_t LOG_RAM_BUFFER_MIN_BYTES = 4U * 1024U;
 
 // Keep at most two log generations: current + .1 backup.
 // 5 MiB each gives a hard long-term budget of about 10 MiB.
@@ -760,6 +771,196 @@ static bool rotateActiveLogForNextWrite(
 }
 
 
+static bool ensureLogRamBuffer()
+{
+    if (logRamBuffer && logRamBufferCapacity > 0)
+        return true;
+
+    size_t attempt = LOG_RAM_BUFFER_TARGET_BYTES;
+
+    while (attempt >= LOG_RAM_BUFFER_MIN_BYTES) {
+        logRamBuffer =
+            (uint8_t *)heap_caps_malloc(
+                attempt,
+                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+            );
+
+        if (logRamBuffer) {
+            logRamBufferCapacity = attempt;
+            logRamBufferUsed = 0;
+
+            Serial.printf(
+                "Logger RAM buffer: %u bytes PSRAM\n",
+                (unsigned)attempt
+            );
+
+            return true;
+        }
+
+        attempt /= 2U;
+    }
+
+    logRamBuffer = nullptr;
+    logRamBufferCapacity = 0;
+    logRamBufferUsed = 0;
+
+    Serial.println(
+        "Logger RAM buffer unavailable - direct SD logging fallback"
+    );
+
+    return false;
+}
+
+
+static bool flushPendingLogBuffer()
+{
+    if (logRamBufferUsed == 0)
+        return true;
+
+    if (!logWriter.file)
+        return false;
+
+    size_t offset = 0;
+
+    // Keep each storage append at or below the native SFLOG1 plaintext-record
+    // size. This makes retries deterministic and avoids one large append hiding
+    // several authenticated record writes.
+    while (offset < logRamBufferUsed) {
+        size_t chunk =
+            logRamBufferUsed - offset;
+
+        if (chunk > 1024U)
+            chunk = 1024U;
+
+        if (!rotateActiveLogForNextWrite(chunk))
+            break;
+
+        uint64_t written = 0;
+        String error;
+
+        if (!logStorageAppend(
+                logWriter,
+                logRamBuffer + offset,
+                chunk,
+                written,
+                error
+            )) {
+            Serial.println(
+                "Logger: buffered write failed | " + error
+            );
+            break;
+        }
+
+        logBytesWritten += written;
+        offset += chunk;
+    }
+
+    if (offset > 0) {
+        size_t remaining =
+            logRamBufferUsed - offset;
+
+        if (remaining > 0) {
+            memmove(
+                logRamBuffer,
+                logRamBuffer + offset,
+                remaining
+            );
+        }
+
+        logRamBufferUsed = remaining;
+    }
+
+    if (logWriter.file)
+        logStorageFlushWriter(logWriter);
+
+    return logRamBufferUsed == 0;
+}
+
+
+static bool appendBufferedLogBytes(
+    const uint8_t *data,
+    size_t length
+)
+{
+    if (!data || length == 0)
+        return true;
+
+    if (!logWriter.file)
+        return false;
+
+    // PSRAM is expected on production boards. If it is unexpectedly unavailable,
+    // preserve the historical durability behavior instead of dropping logs.
+    if (!ensureLogRamBuffer()) {
+        if (!rotateActiveLogForNextWrite(length))
+            return false;
+
+        uint64_t written = 0;
+        String error;
+
+        if (!logStorageAppend(
+                logWriter,
+                data,
+                length,
+                written,
+                error
+            )) {
+            Serial.println(
+                "Logger: direct fallback write failed | " + error
+            );
+            return false;
+        }
+
+        logBytesWritten += written;
+        logStorageFlushWriter(logWriter);
+        return true;
+    }
+
+    // A single unusually long line should not force an oversized RAM buffer.
+    // Flush the normal queue first, then persist that line directly.
+    if (length > logRamBufferCapacity) {
+        if (!flushPendingLogBuffer())
+            return false;
+
+        if (!rotateActiveLogForNextWrite(length))
+            return false;
+
+        uint64_t written = 0;
+        String error;
+
+        if (!logStorageAppend(
+                logWriter,
+                data,
+                length,
+                written,
+                error
+            )) {
+            Serial.println(
+                "Logger: oversized direct write failed | " + error
+            );
+            return false;
+        }
+
+        logBytesWritten += written;
+        logStorageFlushWriter(logWriter);
+        return true;
+    }
+
+    if (logRamBufferUsed + length > logRamBufferCapacity) {
+        if (!flushPendingLogBuffer())
+            return false;
+    }
+
+    memcpy(
+        logRamBuffer + logRamBufferUsed,
+        data,
+        length
+    );
+
+    logRamBufferUsed += length;
+    return true;
+}
+
+
 void logInit()
 {
     logClose();
@@ -811,6 +1012,8 @@ void logInit()
         logWriter.encrypted ? "SFLOG1" : "plaintext",
         logCurrentPath.c_str()
     );
+
+    ensureLogRamBuffer();
 }
 
 
@@ -819,6 +1022,7 @@ void logClose()
     if (!logWriter.file)
         return;
 
+    flushPendingLogBuffer();
     logStorageFlushWriter(logWriter);
     logStorageCloseWriter(logWriter);
     logBytesWritten = 0;
@@ -827,6 +1031,7 @@ void logClose()
 
 void logFlush()
 {
+    flushPendingLogBuffer();
     logStorageFlushWriter(logWriter);
 }
 
@@ -841,31 +1046,14 @@ void logBlankLine()
 
     static const uint8_t blankLine[] = {'\r', '\n'};
 
-    rotateActiveLogForNextWrite(
-        sizeof(blankLine)
-    );
-
-    if (!logWriter.file)
-        return;
-
-    uint64_t written = 0;
-    String error;
-
-    if (!logStorageAppend(
-            logWriter,
+    if (!appendBufferedLogBytes(
             blankLine,
-            sizeof(blankLine),
-            written,
-            error
+            sizeof(blankLine)
         )) {
         Serial.println(
-            "Logger: blank-line write failed | " + error
+            "Logger: blank-line queue failed"
         );
-        return;
     }
-
-    logBytesWritten += written;
-    logStorageFlushWriter(logWriter);
 }
 
 
@@ -1059,33 +1247,14 @@ static void writeFormattedLogLine(
     line += msg;
     line += "\r\n";
 
-    rotateActiveLogForNextWrite(
-        line.length()
-    );
-
-    if (!logWriter.file)
-        return;
-
-    uint64_t written = 0;
-    String error;
-
-    if (!logStorageAppend(
-            logWriter,
+    if (!appendBufferedLogBytes(
             reinterpret_cast<const uint8_t *>(line.c_str()),
-            line.length(),
-            written,
-            error
+            line.length()
         )) {
         Serial.println(
-            "Logger: write failed | " + error
+            "Logger: queue failed"
         );
-        return;
     }
-
-    logBytesWritten += written;
-
-    // Low event rate; durability is more important than buffering.
-    logStorageFlushWriter(logWriter);
 }
 
 

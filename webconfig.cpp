@@ -41,6 +41,17 @@
 // This is the same state used by the periodic STATUS line.
 extern bool recording;
 extern bool sdReady;
+extern uint32_t continuousShooterBufferedFrameCount();
+extern uint32_t continuousShooterBufferUsedBytes();
+extern uint32_t continuousShooterBufferCapacityBytes();
+extern uint32_t continuousShooterAcceptedFrameCount();
+extern uint32_t continuousShooterRejectedDarkCount();
+extern uint32_t continuousShooterRejectedSimilarCount();
+extern uint64_t continuousShooterAcceptedJpegByteCount();
+extern bool continuousShooterLastBrightnessValid();
+extern float continuousShooterLastBrightnessMean();
+extern uint8_t continuousShooterLastBrightnessPeak();
+extern uint32_t continuousShooterLastBrightnessAgeMs();
 
 #if defined(STORAGE_SPI)
 extern bool sdManualReadOnlyRecovery(
@@ -54,6 +65,11 @@ extern bool sdManualReadOnlyRecovery(
 // Gracefully finalizes an active recording when the operator explicitly
 // pauses the recording automation from WebConfig.
 extern void stopRecording();
+
+// Persist accepted Dauershooter frames that are still RAM-only before an
+// intentional reboot/shutdown. Returns false if storage cannot be made safe.
+extern bool continuousShooterFlushBeforeRestart();
+extern bool continuousShooterFlushNow();
 
 // Camera-backed image-motion test supplied by the main firmware. Test mode
 // analyzes frames only and never starts a recording.
@@ -101,6 +117,48 @@ extern uint32_t recordingSafetyCooldownRemainingSeconds();
 
 static WebServer server(80);
 static bool webActive = false;
+
+// Dashboard SD-space cache. The browser polls /ui_status every two seconds,
+// but filesystem capacity does not need that cadence. Refreshing it only every
+// 30 seconds keeps the continuous-shooter dashboard essentially RAM-only.
+static uint64_t dashboardSdFreeBytesCache = 0;
+static uint64_t dashboardSdReserveBytesCache = 0;
+static uint32_t dashboardSdSpaceCacheMs = 0;
+static bool dashboardSdSpaceCacheValid = false;
+static const uint32_t DASHBOARD_SD_SPACE_REFRESH_MS = 30000UL;
+
+static String dashboardUint64Text(uint64_t value)
+{
+    char buffer[32];
+    snprintf(
+        buffer,
+        sizeof(buffer),
+        "%llu",
+        (unsigned long long)value
+    );
+    return String(buffer);
+}
+
+static void refreshDashboardSdSpaceCache()
+{
+    if (!sdReady || g_storageLocked)
+        return;
+
+    uint32_t nowMs = millis();
+
+    if (
+        dashboardSdSpaceCacheValid &&
+        (uint32_t)(nowMs - dashboardSdSpaceCacheMs) <
+            DASHBOARD_SD_SPACE_REFRESH_MS
+    ) {
+        return;
+    }
+
+    dashboardSdFreeBytesCache = storageFreeBytes();
+    dashboardSdReserveBytesCache = storageReserveBytes();
+    dashboardSdSpaceCacheMs = nowMs;
+    dashboardSdSpaceCacheValid = true;
+}
 
 // HTTP handlers persist in the WebServer object after server.stop().
 // Register them only once so repeated magnet WiFi toggles do not
@@ -396,6 +454,16 @@ static const uint32_t CAMERA_PREVIEW_TIMEOUT_MS = 2500UL;
 static uint32_t imageMotionPreviewLastAnalysisMs = 0;
 static const uint32_t IMAGE_MOTION_PREVIEW_ANALYSIS_INTERVAL_MS = 500UL;
 
+// Live Preview brightness is only a human reference for tuning the continuous
+// shooter's dark threshold. Analyze at 1 Hz, not at the ~5 Hz preview cadence.
+// The preview already owns the camera while this runs, so no recording/shooter
+// capture can race the shared image-analysis scratch buffers.
+static bool cameraPreviewBrightnessValid = false;
+static float cameraPreviewBrightnessMean = 0.0f;
+static uint8_t cameraPreviewBrightnessPeak = 0;
+static uint32_t cameraPreviewBrightnessLastAnalysisMs = 0;
+static const uint32_t CAMERA_PREVIEW_BRIGHTNESS_INTERVAL_MS = 1000UL;
+
 // Live Preview may temporarily test a crop before SAVE. That temporary sensor
 // state must never leak into later recordings. Leaving/losing the preview
 // restores the persisted cfg_camera_crop_* values automatically.
@@ -456,6 +524,9 @@ bool webConfigCameraPreviewActive()
 
         cameraPreviewActive = false;
         cameraPreviewLastActivityMs = 0;
+        cameraPreviewBrightnessValid = false;
+        cameraPreviewBrightnessPeak = 0;
+        cameraPreviewBrightnessLastAnalysisMs = 0;
         return false;
     }
 
@@ -483,6 +554,9 @@ static void stopCameraPreview()
 
     cameraPreviewActive = false;
     cameraPreviewLastActivityMs = 0;
+    cameraPreviewBrightnessValid = false;
+    cameraPreviewBrightnessPeak = 0;
+    cameraPreviewBrightnessLastAnalysisMs = 0;
 }
 
 
@@ -889,6 +963,13 @@ static String htmlHeader()
         ".module-recording-switch.on{background:#dcfce7;color:#166534;}"
         ".module-recording-switch.off{background:#f59e0b;color:#241500;}"
         ".module-recording-switch:disabled{opacity:.65;cursor:wait;}"
+        ".config-toggle{display:inline-flex;align-items:center;gap:9px;margin:6px 0 10px;cursor:pointer;user-select:none;}"
+        ".config-toggle input{position:absolute;opacity:0;pointer-events:none;}"
+        ".config-toggle-track{position:relative;width:46px;height:25px;border-radius:999px;background:#98a2b3;transition:.18s;}"
+        ".config-toggle-track:after{content:'';position:absolute;top:3px;left:3px;width:19px;height:19px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.28);transition:.18s;}"
+        ".config-toggle input:checked + .config-toggle-track{background:#16a34a;}"
+        ".config-toggle input:checked + .config-toggle-track:after{transform:translateX(21px);}"
+        ".config-toggle-label{font-weight:700;}"
         ".navitem,.navdrop>summary{display:block;color:#e5e7eb;text-decoration:none;"
         "padding:10px 11px;border-radius:6px;cursor:pointer;user-select:none;"
         "font-size:.95rem;white-space:nowrap;}"
@@ -1428,6 +1509,20 @@ static void handleUiStatus()
             rtcTempC
         );
 
+    refreshDashboardSdSpaceCache();
+
+    uint32_t shooterAccepted =
+        continuousShooterAcceptedFrameCount();
+
+    uint32_t shooterRejectedDark =
+        continuousShooterRejectedDarkCount();
+
+    uint32_t shooterRejectedSimilar =
+        continuousShooterRejectedSimilarCount();
+
+    uint64_t shooterAcceptedJpegBytes =
+        continuousShooterAcceptedJpegByteCount();
+
     String json =
         String("{\"recording\":") +
         (recording ? "true" : "false") +
@@ -1483,7 +1578,67 @@ static void handleUiStatus()
         String(SENSORFORGE_THERMAL_RTC_EMERGENCY_C, 1) +
         ",\"thermal_rtc_recovery_c\":" +
         String(SENSORFORGE_THERMAL_RTC_RECOVERY_C, 1) +
-        "}";
+        ",\"shooter_enabled\":" +
+        (cfg_shooter_enabled ? "true" : "false") +
+        ",\"shooter_buffer_frames\":" +
+        String(continuousShooterBufferedFrameCount()) +
+        ",\"shooter_buffer_used_bytes\":" +
+        String(continuousShooterBufferUsedBytes()) +
+        ",\"shooter_buffer_capacity_bytes\":" +
+        String(continuousShooterBufferCapacityBytes()) +
+        ",\"shooter_accepted_frames\":" +
+        String(shooterAccepted) +
+        ",\"shooter_rejected_dark\":" +
+        String(shooterRejectedDark) +
+        ",\"shooter_rejected_similar\":" +
+        String(shooterRejectedSimilar) +
+        ",\"shooter_accepted_jpeg_bytes\":" +
+        dashboardUint64Text(shooterAcceptedJpegBytes) +
+        ",\"shooter_interval_ms\":" +
+        String(cfg_shooter_interval_ms) +
+        ",\"shooter_dark_mean_min\":" +
+        String(cfg_shooter_dark_mean_min) +
+        ",\"shooter_brightness_valid\":" +
+        (continuousShooterLastBrightnessValid() ? "true" : "false") +
+        ",\"shooter_brightness_mean\":" +
+        String(
+            continuousShooterLastBrightnessValid()
+            ? continuousShooterLastBrightnessMean()
+            : 0.0f,
+            1
+        ) +
+        ",\"shooter_brightness_peak\":" +
+        String(
+            continuousShooterLastBrightnessValid()
+            ? continuousShooterLastBrightnessPeak()
+            : 0
+        ) +
+        ",\"shooter_brightness_age_ms\":" +
+        String(continuousShooterLastBrightnessAgeMs()) +
+        ",\"preview_brightness_valid\":" +
+        (cameraPreviewBrightnessValid ? "true" : "false") +
+        ",\"preview_brightness_mean\":" +
+        String(
+            cameraPreviewBrightnessValid
+            ? cameraPreviewBrightnessMean
+            : 0.0f,
+            1
+        ) +
+        ",\"preview_brightness_peak\":" +
+        String(
+            cameraPreviewBrightnessValid
+            ? cameraPreviewBrightnessPeak
+            : 0
+        ) +
+        ",\"sd_space_valid\":" +
+        (dashboardSdSpaceCacheValid ? "true" : "false") +
+        ",\"sd_free_bytes\":" +
+        dashboardUint64Text(dashboardSdFreeBytesCache) +
+        ",\"sd_reserve_bytes\":" +
+        dashboardUint64Text(dashboardSdReserveBytesCache) +
+        ",\"disk_full_action\":\"" +
+        cfg_disk_full_action +
+        "\"}";
 
     server.sendHeader(
         "Cache-Control",
@@ -2038,6 +2193,56 @@ static void handleRoot()
     if (usedPercent > 100)
         usedPercent = 100;
 
+    uint32_t shooterBufferFrames =
+        continuousShooterBufferedFrameCount();
+
+    uint32_t shooterBufferUsedBytes =
+        continuousShooterBufferUsedBytes();
+
+    uint32_t shooterBufferCapacityBytes =
+        continuousShooterBufferCapacityBytes();
+
+    uint32_t shooterBufferPercent =
+        shooterBufferCapacityBytes > 0
+        ? (uint32_t)(
+            ((uint64_t)shooterBufferUsedBytes * 100ULL) /
+            shooterBufferCapacityBytes
+        )
+        : 0;
+
+    if (shooterBufferPercent > 100)
+        shooterBufferPercent = 100;
+
+    uint32_t shooterAcceptedFrames =
+        continuousShooterAcceptedFrameCount();
+
+    uint32_t shooterRejectedDark =
+        continuousShooterRejectedDarkCount();
+
+    uint32_t shooterRejectedSimilar =
+        continuousShooterRejectedSimilarCount();
+
+    uint32_t shooterRejectedFrames =
+        shooterRejectedDark +
+        shooterRejectedSimilar;
+
+    uint64_t shooterAcceptedJpegBytes =
+        continuousShooterAcceptedJpegByteCount();
+
+    double shooterAverageKb =
+        shooterAcceptedFrames > 0
+        ? (double)shooterAcceptedJpegBytes /
+            (double)shooterAcceptedFrames /
+            1024.0
+        : 0.0;
+
+    // handleRoot already queried total/used bytes above, so initialize the SD
+    // cache from those values without another filesystem capacity call.
+    dashboardSdFreeBytesCache = freeBytes;
+    dashboardSdReserveBytesCache = storageReserveBytes();
+    dashboardSdSpaceCacheMs = millis();
+    dashboardSdSpaceCacheValid = sdReady;
+
     String networkText;
 
     if (WiFi.status() == WL_CONNECTED) {
@@ -2474,6 +2679,63 @@ static void handleRoot()
 
     html +=
         "<section class='dash-card'><div class='card-label'>" +
+        htmlText(UI_CARD_SHOOTER_BUFFER) +
+        "</div><div class='card-value'><span id='shooterBufferImages'>" +
+        String(shooterBufferFrames) +
+        "</span> " +
+        htmlText(UI_IMAGES) +
+        "</div><div class='card-note'><span id='shooterBufferUsed'>" +
+        String((double)shooterBufferUsedBytes / 1024.0, 1) +
+        " KB</span> / <span id='shooterBufferCapacity'>" +
+        String((double)shooterBufferCapacityBytes / 1024.0, 1) +
+        " KB</span><br>" +
+        htmlText(UI_SHOOTER_REJECTED) +
+        ": <span id='shooterRejected'>" +
+        String(shooterRejectedFrames) +
+        "</span> (<span id='shooterRejectedDark'>" +
+        String(shooterRejectedDark) +
+        "</span> " +
+        htmlText(UI_SHOOTER_DARK) +
+        ", <span id='shooterRejectedSimilar'>" +
+        String(shooterRejectedSimilar) +
+        "</span> " +
+        htmlText(UI_SHOOTER_SIMILAR) +
+        ")<br>" +
+        htmlText(UI_SHOOTER_AVG_IMAGE) +
+        ": <span id='shooterAvgImage'>" +
+        String(shooterAverageKb, 1) +
+        " KB</span><br>" +
+        htmlText(UI_SHOOTER_SD_FREE) +
+        ": <span id='shooterSdFree'>" +
+        String((double)freeBytes / 1024.0 / 1024.0 / 1024.0, 2) +
+        " GB</span><br><span id='shooterEstimateLabel'>" +
+        htmlText(
+            cfg_disk_full_action == "rollover"
+            ? UI_SHOOTER_EST_UNTIL_ROLLOVER
+            : UI_SHOOTER_EST_UNTIL_STOP
+        ) +
+        "</span>: <span id='shooterEstimate'>" +
+        htmlText(UI_SHOOTER_EST_WAITING) +
+        "</span><br><small>" +
+        htmlText(UI_SHOOTER_EST_NOTE) +
+        "</small><div style='margin-top:12px'>"
+        "<button id='shooterFlushButton' class='button' type='button'" +
+        String(shooterBufferFrames == 0 ? " disabled" : "") +
+        " data-idle='" +
+        String(cfg_web_language == "de" ? "Puffer auf SD schreiben" : "Write buffer to SD") +
+        "' data-writing='" +
+        String(cfg_web_language == "de" ? "Schreibe ..." : "Writing ...") +
+        "' data-failed='" +
+        String(cfg_web_language == "de" ? "Puffer konnte nicht vollständig geschrieben werden" : "Buffer could not be written completely") +
+        "'>" +
+        String(cfg_web_language == "de" ? "Puffer auf SD schreiben" : "Write buffer to SD") +
+        "</button> <span id='shooterFlushState' class='muted'></span>"
+        "</div></div><div class='progress'><span id='shooterBufferProgress' style='width:" +
+        String(shooterBufferPercent) +
+        "%'></span></div></section>";
+
+    html +=
+        "<section class='dash-card'><div class='card-label'>" +
         htmlText(UI_CARD_NETWORK) +
         "</div><div class='card-value'>" +
         htmlEscape(networkText) +
@@ -2751,6 +3013,9 @@ static void handleRoot()
         " data-thermal-ok='" + htmlText(UI_THERMAL_STATE_OK) + "'"
         " data-thermal-warning='" + htmlText(UI_THERMAL_STATE_WARNING) + "'"
         " data-thermal-emergency='" + htmlText(UI_THERMAL_STATE_EMERGENCY) + "'"
+        " data-shooter-est-rollover='" + htmlText(UI_SHOOTER_EST_UNTIL_ROLLOVER) + "'"
+        " data-shooter-est-stop='" + htmlText(UI_SHOOTER_EST_UNTIL_STOP) + "'"
+        " data-shooter-est-waiting='" + htmlText(UI_SHOOTER_EST_WAITING) + "'"
         "></div>";
 
     html +=
@@ -2767,6 +3032,20 @@ static void handleRoot()
         "var cpuCard=document.getElementById('cpuTempCard');"
         "var rtcCard=document.getElementById('rtcTempCard');"
         "var thermalCard=document.getElementById('thermalStateCard');"
+        "var shooterBufferImages=document.getElementById('shooterBufferImages');"
+        "var shooterBufferUsed=document.getElementById('shooterBufferUsed');"
+        "var shooterBufferCapacity=document.getElementById('shooterBufferCapacity');"
+        "var shooterBufferProgress=document.getElementById('shooterBufferProgress');"
+        "var shooterRejected=document.getElementById('shooterRejected');"
+        "var shooterRejectedDark=document.getElementById('shooterRejectedDark');"
+        "var shooterRejectedSimilar=document.getElementById('shooterRejectedSimilar');"
+        "var shooterAvgImage=document.getElementById('shooterAvgImage');"
+        "var shooterSdFree=document.getElementById('shooterSdFree');"
+        "var shooterEstimateLabel=document.getElementById('shooterEstimateLabel');"
+        "var shooterEstimate=document.getElementById('shooterEstimate');"
+        "var shooterFlushButton=document.getElementById('shooterFlushButton');"
+        "var shooterFlushState=document.getElementById('shooterFlushState');"
+        "var shooterFlushBusy=false;"
         "var armBanner=document.getElementById('armingBanner');"
         "var armTitleEl=document.getElementById('armingTitle');"
         "var armDeadlineEl=document.getElementById('armingDeadline');"
@@ -2782,6 +3061,8 @@ static void handleRoot()
             "var p=function(v){return v<10?'0'+v:String(v);};"
             "return (d>0?(d+' '+(d===1?i.dayOne:i.dayMany)+' '):'')+p(h)+' '+i.hours+' '+p(m)+' '+i.minutes+' '+p(s)+' '+i.seconds;"
         "}"
+        "function byteSize(v){v=Math.max(0,Number(v)||0);if(v>=1073741824)return (v/1073741824).toFixed(2)+' GB';"
+            "if(v>=1048576)return (v/1048576).toFixed(1)+' MB';return (v/1024).toFixed(1)+' KB';}"
         "function renderArm(){"
             "if(!armBanner)return;"
             "if(armState==='waiting'){"
@@ -2841,6 +3122,24 @@ static void handleRoot()
                 "(s.rtc_temp_valid&&rt>=Number(s.thermal_rtc_warning_c)?'#9a5a00':'');}"
             "if(thermalCard){var label=s.thermal_state==='WARNING'?i.thermalWarning:(s.thermal_state==='EMERGENCY'?i.thermalEmergency:i.thermalOk);"
                 "var src=(s.thermal_source&&s.thermal_source!=='NONE')?(' ('+s.thermal_source+')'):'';thermalCard.textContent=label+src;}"
+            "var bf=Math.max(0,Number(s.shooter_buffer_frames)||0),bu=Math.max(0,Number(s.shooter_buffer_used_bytes)||0),bc=Math.max(0,Number(s.shooter_buffer_capacity_bytes)||0);"
+            "var sa=Math.max(0,Number(s.shooter_accepted_frames)||0),srd=Math.max(0,Number(s.shooter_rejected_dark)||0),srs=Math.max(0,Number(s.shooter_rejected_similar)||0);"
+            "var sbytes=Math.max(0,Number(s.shooter_accepted_jpeg_bytes)||0),sint=Math.max(0,Number(s.shooter_interval_ms)||0);"
+            "var sdf=Math.max(0,Number(s.sd_free_bytes)||0),sdr=Math.max(0,Number(s.sd_reserve_bytes)||0);"
+            "if(shooterBufferImages)shooterBufferImages.textContent=String(Math.floor(bf));"
+            "if(shooterBufferUsed)shooterBufferUsed.textContent=(bu/1024).toFixed(1)+' KB';"
+            "if(shooterBufferCapacity)shooterBufferCapacity.textContent=(bc/1024).toFixed(1)+' KB';"
+            "if(shooterBufferProgress)shooterBufferProgress.style.width=(bc>0?Math.min(100,(bu*100/bc)):0).toFixed(0)+'%';"
+            "if(shooterRejected)shooterRejected.textContent=String(Math.floor(srd+srs));"
+            "if(shooterRejectedDark)shooterRejectedDark.textContent=String(Math.floor(srd));"
+            "if(shooterRejectedSimilar)shooterRejectedSimilar.textContent=String(Math.floor(srs));"
+            "if(shooterAvgImage)shooterAvgImage.textContent=(sa>0?(sbytes/sa/1024).toFixed(1):'0.0')+' KB';"
+            "if(shooterSdFree&&s.sd_space_valid)shooterSdFree.textContent=byteSize(sdf);"
+            "if(shooterEstimateLabel)shooterEstimateLabel.textContent=(s.disk_full_action==='rollover'?i.shooterEstRollover:i.shooterEstStop);"
+            "if(shooterEstimate){var processed=sa+srd+srs,usable=Math.max(0,sdf-sdr-bu);"
+                "var rate=(s.shooter_enabled&&processed>=10&&sa>=3&&sint>0)?((sbytes/processed)*1000/sint):0;"
+                "shooterEstimate.textContent=(rate>0&&s.sd_space_valid)?('~ '+armDuration(Math.floor(usable/rate))):i.shooterEstWaiting;}"
+            "if(shooterFlushButton&&!shooterFlushBusy)shooterFlushButton.disabled=bf<=0;"
         "}"
         "function poll(){fetch('/ui_status?t='+Date.now(),{cache:'no-store',credentials:'same-origin'})"
             ".then(function(r){if(!r.ok)throw new Error();return r.json();}).then(apply).catch(function(){});}"
@@ -2849,6 +3148,16 @@ static void handleRoot()
             "headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'action='+(paused?'resume':'pause')})"
             ".then(function(r){if(!r.ok)return r.text().then(function(t){throw new Error(t||('HTTP '+r.status));});return r.json();})"
             ".then(apply).catch(function(e){alert(i.changeFailed+': '+e.message);poll();});});"
+        "if(shooterFlushButton)shooterFlushButton.addEventListener('click',function(){"
+            "if(shooterFlushBusy)return;shooterFlushBusy=true;shooterFlushButton.disabled=true;"
+            "shooterFlushButton.textContent=shooterFlushButton.dataset.writing||'Writing ...';"
+            "if(shooterFlushState)shooterFlushState.textContent='';"
+            "fetch('/shooter_flush',{method:'POST',cache:'no-store',credentials:'same-origin'})"
+            ".then(function(r){if(!r.ok)return r.text().then(function(t){throw new Error(t||('HTTP '+r.status));});return r.json();})"
+            ".then(function(d){if(shooterFlushState)shooterFlushState.textContent=(d.flushed_frames||0)+' -> SD';return poll();})"
+            ".catch(function(e){if(shooterFlushState)shooterFlushState.textContent=(shooterFlushButton.dataset.failed||'Flush failed')+': '+e.message;})"
+            ".finally(function(){shooterFlushBusy=false;shooterFlushButton.textContent=shooterFlushButton.dataset.idle||'Write buffer to SD';poll();});"
+        "});"
         "poll();setInterval(poll,2000);"
         "setInterval(function(){if(armState==='waiting'&&armRemaining>0){armRemaining--;if(armRemaining<=0)armState='reached';renderArm();}"
             "if(safetyCooldown&&safetyRemaining>0){safetyRemaining--;if(safetyRemaining<=0)safetyCooldown=false;renderSafety();}},1000);"
@@ -3649,15 +3958,41 @@ static void handleConfig()
 
     html += "</div><div class='settings-section'><h3>Aufnahme</h3>";
 
-    html +=
-        "<div style='margin:0 0 18px 0;padding:14px;border:1px solid #d8dee6;border-radius:8px;background:#f8fbff'>"
-        "<b>" + htmlText(UI_RECORDING_TRIGGER_MODE) + "</b><br>"
-        "<select name='motion_recording_decision' style='min-width:320px;max-width:100%'>"
-        "<option value='direct'" + String(cfg_motion_recording_decision == "direct" ? " selected" : "") + ">" + htmlText(UI_RECORDING_TRIGGER_DIRECT) + "</option>"
-        "<option value='image_verify'" + String(cfg_motion_recording_decision == "image_verify" ? " selected" : "") + ">" + htmlText(UI_RECORDING_TRIGGER_VERIFY) + "</option>"
-        "<option value='image_only'" + String(cfg_motion_recording_decision == "image_only" ? " selected" : "") + ">" + htmlText(UI_RECORDING_TRIGGER_IMAGE_ONLY) + "</option>"
-        "</select><br>"
-        "<small class='muted'>" + htmlText(UI_RECORDING_TRIGGER_HELP) + "</small>";
+    {
+        const bool de = cfg_web_language == "de";
+        html +=
+            "<div style='margin:0 0 18px 0;padding:14px;border:1px solid #d8dee6;border-radius:8px;background:#f8fbff'>"
+            "<b>" + String(de ? "Aufnahmeauslösung" : "Recording triggers") + "</b><br>"
+            "<label class='config-toggle'>"
+            "<input type='checkbox' name='motion_recording_enabled' value='1'" +
+            String(cfg_motion_recording_enabled ? " checked" : "") +
+            "><span class='config-toggle-track'></span><span class='config-toggle-label'>" +
+            String(de ? "Bewegungsaufnahme" : "Motion recording") +
+            "</span></label><br>"
+            "<small class='muted'>" +
+            String(de
+                ? "Aus = Radar/PIR/Bildbewegung starten keine Aufnahme und werden im Sleep nicht als Presence-Wakequelle verwendet."
+                : "Off = radar/PIR/image motion cannot start recordings and is not armed as the presence wake source during sleep.") +
+            "</small><br>"
+            "<label class='config-toggle'>"
+            "<input type='checkbox' name='shooter_enabled' value='1'" +
+            String(cfg_shooter_enabled ? " checked" : "") +
+            "><span class='config-toggle-track'></span><span class='config-toggle-label'>" +
+            String(de ? "Dauershooter" : "Continuous shooter") +
+            "</span></label><br>"
+            "<small class='muted'>" +
+            String(de
+                ? "Unabhängig von der Bewegungsaufnahme. Für 'nur Dauershooter': Bewegungsaufnahme aus, Dauershooter an."
+                : "Independent of motion recording. For shooter-only operation: motion recording off, continuous shooter on.") +
+            "</small><br><br>"
+            "<b>" + htmlText(UI_RECORDING_TRIGGER_MODE) + "</b><br>"
+            "<select name='motion_recording_decision' style='min-width:320px;max-width:100%'>"
+            "<option value='direct'" + String(cfg_motion_recording_decision == "direct" ? " selected" : "") + ">" + htmlText(UI_RECORDING_TRIGGER_DIRECT) + "</option>"
+            "<option value='image_verify'" + String(cfg_motion_recording_decision == "image_verify" ? " selected" : "") + ">" + htmlText(UI_RECORDING_TRIGGER_VERIFY) + "</option>"
+            "<option value='image_only'" + String(cfg_motion_recording_decision == "image_only" ? " selected" : "") + ">" + htmlText(UI_RECORDING_TRIGGER_IMAGE_ONLY) + "</option>"
+            "</select><br>"
+            "<small class='muted'>" + htmlText(UI_RECORDING_TRIGGER_HELP) + "</small>";
+    }
 
     html +=
         "<div style='margin-top:8px'><a href='/image_motion'>" +
@@ -3748,17 +4083,106 @@ static void handleConfig()
         }
     }
 
-    html +=
-        "<div style='margin-top:18px;padding:14px;border:1px solid #d8dee6;border-radius:8px;background:#f8fbff'>"
-        "<b>Periodische Snapshots</b><br>"
-        "<span class='muted'>Zusätzlich zu Alarmvideos kann SensorForge in einem festen Zeitraster einzelne JPEG-Bilder speichern. "
-        "Alarmaufnahmen haben immer Vorrang. Für einen sauber belichteten Snapshot werden drei Kamerabilder verworfen und erst das vierte gespeichert. "
-        "Bei aktivierter Aufnahmeverschlüsselung werden auch Snapshots verschlüsselt gespeichert.</span><br><br>"
-        "Intervall: <input name='periodic_snapshot_minutes' type='number' min='0' max='1440' step='1' value='" +
-        String(cfg_periodic_snapshot_minutes) +
-        "' style='width:90px'> Minuten "
-        "<small>(0 = aus; z. B. 10 = 00, 10, 20, 30 ... Minuten)</small>"
-        "</div>";
+    {
+        const bool de = cfg_web_language == "de";
+        html +=
+            "<div style='margin-top:18px;padding:14px;border:1px solid #d8dee6;border-radius:8px;background:#f8fbff'>"
+            "<b>" + String(de ? "Dauershooter-Einstellungen" : "Continuous-shooter settings") + "</b><br>"
+            "<span class='muted'>" +
+            String(de
+                ? "Zu dunkle und nahezu identische Bilder können vor dem Speichern verworfen werden. Bei gleichzeitig aktiver Bewegungsaufnahme behalten Alarmvideos Vorrang."
+                : "Dark and nearly identical images can be rejected before storage. When motion recording is enabled too, alarm video keeps priority.") +
+            "</span><br><br>"
+            "shooter_interval_ms: <input id='shooterIntervalInput' name='shooter_interval_ms' type='number' min='250' max='86400000' step='1' value='" +
+            String(cfg_shooter_interval_ms) +
+            "' style='width:110px'> <small>" +
+            String(de ? "500 = 2 fps; 1000 = 1 fps; 60000 = 1 Bild/Minute" : "500 = 2 fps; 1000 = 1 fps; 60000 = 1 image/minute") +
+            "</small><br>"
+            "shooter_dark_mean_min: <input id='shooterDarkMeanInput' name='shooter_dark_mean_min' type='range' min='0' max='255' step='1' value='" +
+            String(cfg_shooter_dark_mean_min) +
+            "' style='width:230px;vertical-align:middle'> "
+            "<span id='shooterDarkThresholdValue' style='display:inline-block;min-width:34px;text-align:right;font-weight:600'>" +
+            String(cfg_shooter_dark_mean_min) +
+            "</span> "
+            "<span id='shooterDarkThresholdSwatch' title='" +
+            String(de ? "Schwellwert als Grauwert" : "Threshold as gray value") +
+            "' style='display:inline-block;width:22px;height:22px;border:1px solid #7b8794;border-radius:4px;vertical-align:middle'></span> "
+            "<small>" +
+            String(de ? "0 = Filter aus; dunkle Bilder werden nur verworfen, wenn zusätzlich keine lokal helle Zone erkannt wird" : "0 = filter off; dark frames are rejected only when no locally bright zone is present") +
+            "</small> <span id='shooterDarkCurrent' class='status-pill' style='margin-left:6px'>" +
+            String(de ? "Aktuell/zuletzt: --" : "Current/latest: --") +
+            "</span><br>"
+            "shooter_min_change_pct: <input id='shooterMinChangeInput' name='shooter_min_change_pct' type='number' min='0' max='100' step='0.1' value='" +
+            String(cfg_shooter_min_change_pct, 1) +
+            "' style='width:90px'> % <small>" +
+            String(de ? "0 = Filter aus; kleinere Änderungen werden als nahezu identisch verworfen (z. B. 0,2 für sehr kleine Änderungen)" : "0 = filter off; smaller changes are rejected as nearly identical (for example 0.2 for very small changes)") +
+            "</small><br>"
+            "shooter_force_save_seconds: <input id='shooterForceSaveInput' name='shooter_force_save_seconds' type='number' min='0' max='86400' value='" +
+            String(cfg_shooter_force_save_seconds) +
+            "' style='width:90px'> s <small>" +
+            String(de ? "erzwingt spätestens ein Bild trotz Ähnlichkeit; Dunkelfilter bleibt aktiv" : "forces a frame despite similarity; dark filtering remains active") +
+            "</small><br>"
+            "shooter_flush_seconds: <input id='shooterFlushInput' name='shooter_flush_seconds' type='number' min='0' max='3600' value='" +
+            String(cfg_shooter_flush_seconds) +
+            "' style='width:90px'> s <small>" +
+            String(de ? "maximale RAM-Persistenzlatenz; 0 = direkt auf SD" : "maximum RAM persistence latency; 0 = direct SD write") +
+            "</small><br>"
+            "<small class='muted'><b>" +
+            String(de ? "PSRAM-Puffer:" : "PSRAM buffer:") +
+            "</b> " +
+            String(de
+                ? "automatisch. SensorForge reserviert Laufzeitreserve und verwendet 80 % des danach sicher nutzbaren freien PSRAM. Ist der Puffer vorher voll, wird sofort auf SD geschrieben."
+                : "automatic. SensorForge keeps runtime headroom and uses 80% of the remaining safely usable free PSRAM. If the buffer fills first, it is written to SD immediately.") +
+            "</small><br><br>"
+            "<button type='button' id='shooterDefaultsButton'>" +
+            String(de ? "Dauershooter-Standardwerte einsetzen" : "Set continuous-shooter defaults") +
+            "</button> "
+            "<small id='shooterDefaultsNotice' class='muted'>" +
+            String(de
+                ? "Setzt nur die Felder im Formular zurück; gespeichert wird erst mit Einstellungen speichern."
+                : "Only resets the fields in this form; changes are stored only when you save settings.") +
+            "</small>"
+            "</div>";
+
+        html +=
+            "<script>(function(){"
+            "var out=document.getElementById('shooterDarkCurrent');"
+            "var input=document.getElementById('shooterDarkMeanInput');"
+            "var value=document.getElementById('shooterDarkThresholdValue');"
+            "var swatch=document.getElementById('shooterDarkThresholdSwatch');"
+            "var defaultsButton=document.getElementById('shooterDefaultsButton');"
+            "var intervalInput=document.getElementById('shooterIntervalInput');"
+            "var minChangeInput=document.getElementById('shooterMinChangeInput');"
+            "var forceSaveInput=document.getElementById('shooterForceSaveInput');"
+            "var flushInput=document.getElementById('shooterFlushInput');"
+            "if(!out||!input)return;"
+            "var mean=null,peak=null;"
+            "function gray(v){v=Math.max(0,Math.min(255,Math.round(Number(v)||0)));return 'rgb('+v+','+v+','+v+')';}"
+            "function render(){"
+                "var t=Number(input.value);"
+                "if(value)value.textContent=String(Math.round(t));"
+                "if(swatch)swatch.style.background=gray(t);"
+                "if(mean===null){out.textContent='" + String(de ? "Aktuell/zuletzt: --" : "Current/latest: --") + "';return;}"
+                "out.textContent='" + String(de ? "Aktuell Ø: " : "Current avg: ") + "'+mean.toFixed(1)+' / 255'+"
+                    "(peak!==null?(' · " + String(de ? "hellste Zone: " : "brightest zone: ") + "'+Math.round(peak)):'');"
+            "}"
+            "function poll(){if(document.hidden)return;fetch('/ui_status?t='+Date.now(),{cache:'no-store',credentials:'same-origin'})"
+                ".then(function(r){if(!r.ok)throw new Error();return r.json();})"
+                ".then(function(s){mean=s.shooter_brightness_valid?Number(s.shooter_brightness_mean):null;peak=s.shooter_brightness_valid?Number(s.shooter_brightness_peak):null;render();})"
+                ".catch(function(){});}"
+            "input.addEventListener('input',render);"
+            "if(defaultsButton)defaultsButton.addEventListener('click',function(){"
+                "if(intervalInput)intervalInput.value='60000';"
+                "input.value='20';"
+                "if(minChangeInput)minChangeInput.value='1.0';"
+                "if(forceSaveInput)forceSaveInput.value='60';"
+                "if(flushInput)flushInput.value='300';"
+                "render();"
+            "});"
+            "render();poll();setInterval(poll,2000);"
+            "document.addEventListener('visibilitychange',function(){if(!document.hidden)poll();});"
+            "})();</script>";
+    }
 
     html += "post_record_ms: <input name='post_record_ms' type='number' min='0' value='" +
             String(cfg_post_ms) + "'><br>";
@@ -4344,6 +4768,11 @@ static void handleSave()
     }
 
 
+    int motionRecordingEnabled =
+        server.hasArg("motion_recording_enabled")
+        ? 1
+        : 0;
+
     String motionRecordingDecision =
         server.arg("motion_recording_decision");
 
@@ -4366,6 +4795,9 @@ static void handleSave()
     const bool motionRecordingDecisionChanged =
         motionRecordingDecision != cfg_motion_recording_decision;
 
+    const bool motionRecordingEnabledChanged =
+        motionRecordingEnabled != cfg_motion_recording_enabled;
+
 
     int timestampEnabled =
         server.arg("timestamp_enabled").toInt()
@@ -4377,12 +4809,16 @@ static void handleSave()
         ? 1
         : 0;
 
-    int periodicSnapshotMinutes =
-        constrain(
-            server.arg("periodic_snapshot_minutes").toInt(),
-            0,
-            1440
-        );
+    int shooterEnabled =
+        server.hasArg("shooter_enabled")
+        ? 1
+        : 0;
+
+    int shooterIntervalMs = server.arg("shooter_interval_ms").toInt();
+    int shooterDarkMeanMin = server.arg("shooter_dark_mean_min").toInt();
+    float shooterMinChangePct = server.arg("shooter_min_change_pct").toFloat();
+    int shooterForceSaveSeconds = server.arg("shooter_force_save_seconds").toInt();
+    int shooterFlushSeconds = server.arg("shooter_flush_seconds").toInt();
 
 
     String recordingNotBefore = "off";
@@ -4849,8 +5285,28 @@ static void handleSave()
     text += String(recordingEncryption);
     text += '\n';
 
-    text += "periodic_snapshot_minutes=";
-    text += String(periodicSnapshotMinutes);
+    text += "shooter_enabled=";
+    text += String(shooterEnabled);
+    text += '\n';
+
+    text += "shooter_interval_ms=";
+    text += String(shooterIntervalMs);
+    text += '\n';
+
+    text += "shooter_dark_mean_min=";
+    text += String(shooterDarkMeanMin);
+    text += '\n';
+
+    text += "shooter_min_change_pct=";
+    text += String(shooterMinChangePct, 1);
+    text += '\n';
+
+    text += "shooter_force_save_seconds=";
+    text += String(shooterForceSaveSeconds);
+    text += '\n';
+
+    text += "shooter_flush_seconds=";
+    text += String(shooterFlushSeconds);
     text += '\n';
 
     text += "recording_not_before=";
@@ -4860,6 +5316,10 @@ static void handleSave()
     // Recording-decision and image-motion settings are part of the canonical
     // config.txt. General Config saves must preserve the tuning values managed
     // on /image_motion instead of accidentally dropping them back to defaults.
+    text += "motion_recording_enabled=";
+    text += String(motionRecordingEnabled);
+    text += '\n';
+
     text += "motion_recording_decision=";
     text += motionRecordingDecision;
     text += '\n';
@@ -4869,7 +5329,7 @@ static void handleSave()
     text += '\n';
 
     text += "image_motion_min_area_pct=";
-    text += String(cfg_image_motion_min_area_pct);
+    text += String(cfg_image_motion_min_area_pct, 1);
     text += '\n';
 
     text += "image_motion_confirm_frames=";
@@ -5114,10 +5574,16 @@ static void handleSave()
             cfg_fps =
                 fps;
 
+            cfg_motion_recording_enabled =
+                motionRecordingEnabled;
+
             cfg_motion_recording_decision =
                 motionRecordingDecision;
 
-            if (motionRecordingDecisionChanged) {
+            if (
+                motionRecordingEnabledChanged ||
+                motionRecordingDecisionChanged
+            ) {
                 imageMotionResetBackground();
             }
 
@@ -5167,8 +5633,12 @@ static void handleSave()
             cfg_recording_encryption =
                 recordingEncryption;
 
-            cfg_periodic_snapshot_minutes =
-                periodicSnapshotMinutes;
+            cfg_shooter_enabled = shooterEnabled;
+            cfg_shooter_interval_ms = shooterIntervalMs;
+            cfg_shooter_dark_mean_min = shooterDarkMeanMin;
+            cfg_shooter_min_change_pct = shooterMinChangePct;
+            cfg_shooter_force_save_seconds = shooterForceSaveSeconds;
+            cfg_shooter_flush_seconds = shooterFlushSeconds;
 
             cfg_timezone =
                 timezone;
@@ -5209,10 +5679,16 @@ static void handleSave()
             cfg_fps =
                 fps;
 
+            cfg_motion_recording_enabled =
+                motionRecordingEnabled;
+
             cfg_motion_recording_decision =
                 motionRecordingDecision;
 
-            if (motionRecordingDecisionChanged) {
+            if (
+                motionRecordingEnabledChanged ||
+                motionRecordingDecisionChanged
+            ) {
                 imageMotionResetBackground();
             }
 
@@ -5262,8 +5738,12 @@ static void handleSave()
             cfg_recording_encryption =
                 recordingEncryption;
 
-            cfg_periodic_snapshot_minutes =
-                periodicSnapshotMinutes;
+            cfg_shooter_enabled = shooterEnabled;
+            cfg_shooter_interval_ms = shooterIntervalMs;
+            cfg_shooter_dark_mean_min = shooterDarkMeanMin;
+            cfg_shooter_min_change_pct = shooterMinChangePct;
+            cfg_shooter_force_save_seconds = shooterForceSaveSeconds;
+            cfg_shooter_flush_seconds = shooterFlushSeconds;
 
             cfg_timezone =
                 timezone;
@@ -8976,6 +9456,21 @@ static int imageMotionArgInt(const char *name, int fallback)
 }
 
 
+static float imageMotionArgFloat(const char *name, float fallback)
+{
+    if (!server.hasArg(name))
+        return fallback;
+
+    String value = server.arg(name);
+    value.trim();
+
+    if (!value.length())
+        return fallback;
+
+    return value.toFloat();
+}
+
+
 static void handleImageMotionSave()
 {
     String roiMask = server.arg("roi");
@@ -8985,7 +9480,7 @@ static void handleImageMotionSave()
     String error;
     ConfigSaveResult result = configSaveImageMotion(
         imageMotionArgInt("sensitivity", cfg_image_motion_sensitivity),
-        imageMotionArgInt("min_area", cfg_image_motion_min_area_pct),
+        imageMotionArgFloat("min_area", cfg_image_motion_min_area_pct),
         imageMotionArgInt("confirm", cfg_image_motion_confirm_frames),
         imageMotionArgInt("release", cfg_image_motion_release_frames),
         imageMotionArgInt("learning", cfg_image_motion_background_learning),
@@ -9083,7 +9578,7 @@ static void handleImageMotionStatus()
         ",\"release_required\":" +
         String(cfg_image_motion_release_frames) +
         ",\"area_limit_pct\":" +
-        String(cfg_image_motion_min_area_pct) +
+        String(cfg_image_motion_min_area_pct, 1) +
         ",\"diag_count\":" +
         String(imageMotionDiagnosticCount()) +
         ",\"diag_capacity\":" +
@@ -9195,7 +9690,7 @@ static void handleImageMotionDiagnosticDownload()
         " crop_x=" + String(cfg_camera_crop_x) +
         " crop_y=" + String(cfg_camera_crop_y) +
         " sensitivity=" + String(cfg_image_motion_sensitivity) +
-        " min_area_pct=" + String(cfg_image_motion_min_area_pct) +
+        " min_area_pct=" + String(cfg_image_motion_min_area_pct, 1) +
         " confirm_frames=" + String(cfg_image_motion_confirm_frames) +
         " release_frames=" + String(cfg_image_motion_release_frames) +
         " background_learning=" + String(cfg_image_motion_background_learning) +
@@ -9361,7 +9856,7 @@ static void handleImageMotionPage()
             "<div class='im-live-label'>" + htmlText(UI_IMAGE_MOTION_LIVE_BACKGROUND_DIFFERENCE) + "</div>" +
             "<div id='imLiveBackground' class='im-live-value'>0.0 %</div>" +
             "<div class='im-live-label'>" + htmlText(UI_IMAGE_MOTION_RESULT_LIMIT) + "</div>" +
-            "<div id='imLiveLimit' class='im-live-value'>" + String(cfg_image_motion_min_area_pct) + " %</div>" +
+            "<div id='imLiveLimit' class='im-live-value'>" + String(cfg_image_motion_min_area_pct, 1) + " %</div>" +
             "<div class='im-live-label'>" + htmlText(UI_IMAGE_MOTION_LIVE_LAST_DETECTION) + "</div>" +
             "<div id='imLiveLast' class='im-live-value'>" + htmlText(UI_IMAGE_MOTION_LIVE_NEVER) + "</div>" +
             "</div></div>";
@@ -9391,7 +9886,7 @@ static void handleImageMotionPage()
 
         html += "<div class='im-field'><div class='im-label-row'><label for='imMinArea'>" + htmlText(UI_IMAGE_MOTION_MIN_AREA) + "</label>" +
             imageMotionInfoButton(UI_IMAGE_MOTION_MIN_AREA, UI_IMAGE_MOTION_MIN_AREA_HELP) +
-            "</div><input id='imMinArea' type='number' min='1' max='100' value='" + String(cfg_image_motion_min_area_pct) +
+            "</div><input id='imMinArea' type='number' min='0.1' max='100' step='0.1' value='" + String(cfg_image_motion_min_area_pct, 1) +
             "'><div class='im-help'>" + htmlText(UI_IMAGE_MOTION_MIN_AREA_HELP) + "</div></div>";
 
         html += "<div class='im-field'><div class='im-label-row'><label for='imConfirm'>" + htmlText(UI_IMAGE_MOTION_CONFIRM) + "</label>" +
@@ -9439,8 +9934,8 @@ static void handleImageMotionPage()
             htmlText(UI_IMAGE_MOTION_INFO_CLOSE) + "</button></div></div></div>";
 
         String defaultRoi = imageMotionDefaultRoiMask();
-        html += "<script>const IM_W=20,IM_H=15;let imMask='" + cfg_image_motion_roi_mask + "';let imSavedMinArea=" + String(cfg_image_motion_min_area_pct) + ";";
-        html += "const IM_DEFAULTS={sensitivity:'5',minArea:'6',confirm:'2',release:'2',learning:'4',globalMean:'24',globalChange:'70',roi:'" + defaultRoi + "'};";
+        html += "<script>const IM_W=20,IM_H=15;let imMask='" + cfg_image_motion_roi_mask + "';let imSavedMinArea=" + String(cfg_image_motion_min_area_pct, 1) + ";";
+        html += "const IM_DEFAULTS={sensitivity:'5',minArea:'6.0',confirm:'2',release:'2',learning:'4',globalMean:'24',globalChange:'70',roi:'" + defaultRoi + "'};";
         html += "const IM_TEXT={saved:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_SAVED))) +
             "\",saveFailed:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_SAVE_FAILED))) +
             "\",testFailed:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_TEST_FAILED))) +
@@ -9504,7 +9999,7 @@ document.querySelectorAll('.im-info').forEach(b=>b.addEventListener('click',()=>
 document.getElementById('imInfoClose').onclick=closeInfo;imInfoBackdrop.addEventListener('click',e=>{if(e.target===imInfoBackdrop)closeInfo()});document.addEventListener('keydown',e=>{if(e.key==='Escape')closeInfo()});
 function setDefaults(){document.getElementById('imSensitivity').value=IM_DEFAULTS.sensitivity;document.getElementById('imMinArea').value=IM_DEFAULTS.minArea;document.getElementById('imConfirm').value=IM_DEFAULTS.confirm;document.getElementById('imRelease').value=IM_DEFAULTS.release;document.getElementById('imLearning').value=IM_DEFAULTS.learning;document.getElementById('imGlobalMean').value=IM_DEFAULTS.globalMean;document.getElementById('imGlobalChange').value=IM_DEFAULTS.globalChange;imMask=IM_DEFAULTS.roi;drawGrid();imStatus.textContent=IM_TEXT.defaultsDone}
 document.getElementById('imDefaults').onclick=setDefaults;
-document.getElementById('imSave').onclick=async()=>{imStatus.textContent='...';try{const r=await fetch('/image_motion_save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:params()});const j=await r.json();if(!r.ok||!j.ok)throw new Error(IM_TEXT.saveFailed+(j.error?': '+j.error:''));imSavedMinArea=parseInt(document.getElementById('imMinArea').value,10)||imSavedMinArea;imStatus.textContent=IM_TEXT.saved}catch(e){imStatus.textContent=e.message}};
+document.getElementById('imSave').onclick=async()=>{imStatus.textContent='...';try{const r=await fetch('/image_motion_save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:params()});const j=await r.json();if(!r.ok||!j.ok)throw new Error(IM_TEXT.saveFailed+(j.error?': '+j.error:''));imSavedMinArea=parseFloat(document.getElementById('imMinArea').value)||imSavedMinArea;imStatus.textContent=IM_TEXT.saved}catch(e){imStatus.textContent=e.message}};
 function friendlyResult(d){if(d.motion_active||d.image_motion_state==='confirmed')return IM_TEXT.resultMotion;switch(d.reject_reason){case'disabled':return IM_TEXT.resultDisabled;case'background_init':return IM_TEXT.resultLearning;case'confirming':return IM_TEXT.resultConfirming;case'global_light':return IM_TEXT.resultGlobalLight;case'no_roi':return IM_TEXT.resultNoRoi;case'decode':case'invalid_frame':return IM_TEXT.resultError;default:return IM_TEXT.resultNone}}
 function renderDiagnostics(d){imResultText.textContent=friendlyResult(d);const active=Math.max(0,Number(d.active_roi_blocks)||0),changed=Math.max(0,Number(d.changed_blocks)||0),cluster=Math.max(0,Number(d.largest_cluster_blocks)||0),frameChanged=Math.max(0,Number(d.frame_changed_blocks)||0),frameCluster=Math.max(0,Number(d.frame_largest_cluster_blocks)||0);const total=Number(d.global_change_pct||0).toFixed(1)+' %'+(active?' ('+changed+' / '+active+')':'');const area=Number(d.changed_area_pct||0).toFixed(1)+' %'+(cluster?' ('+cluster+')':'');const frameTotal=d.frame_delta_ready?(Number(d.frame_changed_pct||0).toFixed(1)+' %'+(active?' ('+frameChanged+' / '+active+')':'')):'-';const frameArea=d.frame_delta_ready?(Number(d.frame_cluster_pct||0).toFixed(1)+' %'+(frameCluster?' ('+frameCluster+')':'')):'-';const limit=imSavedMinArea+' %';imResultMeta.innerHTML='';[[IM_TEXT.resultTime,(d.analyze_frame_ms!==undefined?d.analyze_frame_ms:'-')+' ms'],[IM_TEXT.liveCurrentMotion,frameTotal+' / '+frameArea+' '+IM_TEXT.liveConnectedShort],[IM_TEXT.liveBackgroundDifference,total+' / '+area+' '+IM_TEXT.liveConnectedShort],[IM_TEXT.resultLimit,limit]].forEach(([k,v])=>{const span=document.createElement('span');span.textContent=k+': '+v;imResultMeta.appendChild(span)});imDiag.textContent=JSON.stringify(d,null,2)}
 document.getElementById('imTest').onclick=async()=>{imStatus.textContent='...';try{const r=await fetch('/image_motion_test',{method:'POST'}),j=await r.json();if(!r.ok||!j.ok)throw new Error(IM_TEXT.testFailed+(j.error?': '+j.error:''));renderDiagnostics(j.diagnostics||{});imStatus.textContent='OK'}catch(e){imResultText.textContent=IM_TEXT.resultError;imStatus.textContent=e.message}};
@@ -9548,6 +10043,9 @@ static void handlePreview()
 
         // Raise the preview gate before the first snapshot request so there is
         // no race where motion could start a recording while the page loads.
+        cameraPreviewBrightnessValid = false;
+        cameraPreviewBrightnessPeak = 0;
+        cameraPreviewBrightnessLastAnalysisMs = 0;
         noteCameraPreviewActivity();
 
         sensor_t *previewSensor =
@@ -9824,6 +10322,12 @@ static void handlePreview()
     <span class='camera-zoom-hint'>Tastatur: - / + / F / 0</span>
 </div>
 
+<div style='margin:8px 0 12px 0'>
+    <span id='previewBrightness' class='status-pill'>Helligkeit Ø: -- / 255</span>
+    <span id='previewBrightnessPeak' class='status-pill' style='margin-left:6px'>Hellste Zone: -- / 255</span>
+    <span id='previewDarkThreshold' class='muted' style='margin-left:8px'>Dunkelgrenze Dauershooter: --</span>
+</div>
+
 <div id='camViewer' class='camera-viewer fit'>
     <div class='camera-stage-holder'>
         <div id='camStage' class='camera-stage'>
@@ -9841,6 +10345,10 @@ const camZoomInBtn=document.getElementById('camZoomInBtn');
 const camZoomFitBtn=document.getElementById('camZoomFitBtn');
 const camZoom100Btn=document.getElementById('camZoom100Btn');
 const camZoomLabel=document.getElementById('camZoomLabel');
+const previewBrightness=document.getElementById('previewBrightness');
+const previewBrightnessPeak=document.getElementById('previewBrightnessPeak');
+const previewDarkThreshold=document.getElementById('previewDarkThreshold');
+let previewBrightnessPollMs=0;
 
 const sensorCropPanel=document.getElementById('sensorCropPanel');
 const sensorCropZoomSelect=document.getElementById('sensorCropZoom');
@@ -10127,12 +10635,39 @@ function stopPreview(){
     releasePreview();
 }
 
+function refreshPreviewBrightness(){
+    if(previewStopped||previewPaused||!previewBrightness)return;
+    const now=Date.now();
+    if(now-previewBrightnessPollMs<900)return;
+    previewBrightnessPollMs=now;
+    fetch('/ui_status?t='+now,{cache:'no-store',credentials:'same-origin'})
+    .then(function(r){if(!r.ok)throw new Error();return r.json();})
+    .then(function(s){
+        previewBrightness.textContent=s.preview_brightness_valid
+            ?('Helligkeit Ø: '+Number(s.preview_brightness_mean).toFixed(1)+' / 255')
+            :'Helligkeit Ø: -- / 255';
+        if(previewBrightnessPeak){
+            previewBrightnessPeak.textContent=s.preview_brightness_valid
+                ?('Hellste Zone: '+Math.round(Number(s.preview_brightness_peak)||0)+' / 255')
+                :'Hellste Zone: -- / 255';
+        }
+        if(previewDarkThreshold){
+            const t=Math.max(0,Number(s.shooter_dark_mean_min)||0);
+            previewDarkThreshold.textContent=t>0
+                ?('Dunkelgrenze Dauershooter: Ø '+t+' (lokal helle Zone schützt)')
+                :'Dunkelgrenze Dauershooter: aus';
+        }
+    })
+    .catch(function(){});
+}
+
 function nextFrame(){
     if(previewStopped||previewPaused)return;
     img.src='/snapshot?t='+Date.now();
 }
 
 img.onload=function(){
+    refreshPreviewBrightness();
     applyCamZoom();
     setTimeout(nextFrame,200);
 };
@@ -10242,6 +10777,40 @@ static void handleSnapshot()
                 fb->height,
                 diagnostics
             );
+        }
+    }
+
+    // The normal Live Preview exposes the same 0..255 mean-brightness scale
+    // used by shooter_dark_mean_min. One 1/8-scale decode per second is enough
+    // for a visual reference and avoids analyzing every ~200 ms preview frame.
+    if (
+        !server.hasArg("im") &&
+        fb->format == PIXFORMAT_JPEG &&
+        fb->buf &&
+        fb->len > 0
+    ) {
+        uint32_t nowMs = millis();
+        if (
+            cameraPreviewBrightnessLastAnalysisMs == 0 ||
+            (uint32_t)(
+                nowMs -
+                cameraPreviewBrightnessLastAnalysisMs
+            ) >= CAMERA_PREVIEW_BRIGHTNESS_INTERVAL_MS
+        ) {
+            cameraPreviewBrightnessLastAnalysisMs = nowMs;
+
+            ShooterImageMetrics metrics;
+            if (imageMotionAnalyzeShooterJpeg(
+                    fb->buf,
+                    fb->len,
+                    (uint16_t)fb->width,
+                    (uint16_t)fb->height,
+                    metrics
+                )) {
+                cameraPreviewBrightnessMean = metrics.globalMean;
+                cameraPreviewBrightnessPeak = metrics.brightestBlockMean;
+                cameraPreviewBrightnessValid = true;
+            }
         }
     }
 
@@ -13550,6 +14119,47 @@ static void handleRebooting()
 }
 
 
+static void handleShooterFlush()
+{
+    uint32_t beforeFrames =
+        continuousShooterBufferedFrameCount();
+
+    if (!continuousShooterFlushNow()) {
+        server.send(
+            409,
+            "text/plain; charset=utf-8",
+            cfg_web_language == "de"
+                ? "Dauershooter-Puffer kann momentan nicht vollständig auf SD geschrieben werden."
+                : "Continuous-shooter buffer cannot be written completely to SD right now."
+        );
+        return;
+    }
+
+    // A manual flush changes both the RAM queue and SD occupancy. Force the
+    // next status request to refresh the otherwise 30-second SD-space cache.
+    dashboardSdSpaceCacheValid = false;
+    refreshDashboardSdSpaceCache();
+
+    String json =
+        "{\"ok\":true,\"flushed_frames\":" +
+        String(beforeFrames) +
+        ",\"remaining_frames\":" +
+        String(continuousShooterBufferedFrameCount()) +
+        "}";
+
+    server.sendHeader(
+        "Cache-Control",
+        "no-store"
+    );
+
+    server.send(
+        200,
+        "application/json; charset=utf-8",
+        json
+    );
+}
+
+
 static void handleRebootDo()
 {
     // Keep the server-side guard even though /reboot already shows the
@@ -13561,6 +14171,11 @@ static void handleRebootDo()
         );
         return;
     }
+
+    // Once reboot has been requested, do not allow a fresh alarm recording to
+    // start during the HTTP grace period. The final reboot path flushes the
+    // Dauershooter queue and retries instead of discarding RAM-only frames.
+    g_recordingStartBlocked = true;
 
     // POST/Redirect/GET prevents browser refresh from repeating the reboot POST.
     // Three seconds are intentionally left before restart so the browser can
@@ -13661,8 +14276,8 @@ static void sendShutdownPage(
         "</h3><p class='muted'>" +
         String(
             de
-            ? "SensorForge beendet die Web-Sitzung, deaktiviert alle Wakequellen und geht in Deep Sleep. Radar, Magnetkontakt und der Snapshot-Timer können das Board danach nicht mehr aufwecken."
-            : "SensorForge ends the web session, disables all wake sources and enters deep sleep. Radar, magnet switch and the snapshot timer cannot wake the board afterwards."
+            ? "SensorForge beendet die Web-Sitzung, deaktiviert alle Wakequellen und geht in Deep Sleep. Radar, Magnetkontakt und der Dauershooter-Timer können das Board danach nicht mehr aufwecken."
+            : "SensorForge ends the web session, disables all wake sources and enters deep sleep. Radar, magnet switch and the continuous-shooter timer cannot wake the board afterwards."
         ) +
         "</p><p class='muted'><b>" +
         String(de ? "Wieder einschalten:" : "Power on again:") +
@@ -13767,9 +14382,27 @@ static void handleShutdownDo()
         return;
     }
 
-    // Prevent a new recording from starting during the short HTTP grace period
-    // before the actual power-down sequence.
+    // Prevent a new recording from starting while the accepted RAM-only shooter
+    // frames are persisted. If persistence fails, restore the previous block
+    // state and cancel shutdown instead of discarding data.
+    bool previousRecordingStartBlocked =
+        g_recordingStartBlocked;
+
     g_recordingStartBlocked = true;
+
+    if (!continuousShooterFlushBeforeRestart()) {
+        g_recordingStartBlocked =
+            previousRecordingStartBlocked;
+
+        server.send(
+            409,
+            "text/plain; charset=utf-8",
+            cfg_web_language == "de"
+                ? "Dauershooter-Puffer konnte nicht auf SD geschrieben werden. Herunterfahren abgebrochen."
+                : "Continuous-shooter buffer could not be written to SD. Shutdown cancelled."
+        );
+        return;
+    }
 
     shutdownScheduled = true;
     shutdownAtMs =
@@ -13796,6 +14429,14 @@ static void performManualShutdown()
 
     if (recorderIsOpen())
         stopRecording();
+
+    // Defensive second pass in case a frame was queued during the HTTP grace
+    // period. Never enter Deep Sleep while accepted frames remain RAM-only.
+    if (!continuousShooterFlushBeforeRestart()) {
+        shutdownScheduled = true;
+        shutdownAtMs = millis() + 1000UL;
+        return;
+    }
 
     consoleWrite(
         "POWER",
@@ -17965,6 +18606,7 @@ void webConfigStart()
         });
 
         server.on("/ui_status", HTTP_GET, handleUiStatus);
+        server.on("/shooter_flush", HTTP_POST, handleShooterFlush);
         server.on("/motion_status", HTTP_GET, handleMotionStatus);
         server.on("/language", HTTP_POST, handleLanguageChange);
         server.on("/recording_pause", HTTP_POST, handleRecordingPause);
@@ -18220,6 +18862,13 @@ void webConfigLoop()
             rebootAtMs
         ) >= 0
     ) {
+        if (!continuousShooterFlushBeforeRestart()) {
+            // Keep the reboot scheduled and retry shortly. Losing an accepted
+            // RAM-only frame on an operator/OTA reboot is avoidable.
+            rebootAtMs = millis() + 1000UL;
+            return;
+        }
+
         rebootScheduled =
             false;
 

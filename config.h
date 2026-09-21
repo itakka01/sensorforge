@@ -27,7 +27,16 @@ extern int cfg_led_enabled;
 extern String cfg_recording_format;   // "avi" or "mkv"
 extern int cfg_timestamp_enabled;     // 0/1
 extern int cfg_recording_encryption;  // 0/1, encrypt newly created video/snapshot media on SD
-extern int cfg_periodic_snapshot_minutes; // 0 = off, fixed periodic JPEG schedule in minutes
+// Continuous JPEG shooter. It is independent of motion-triggered recording
+// and can run alone or in parallel with it. Accepted frames can be filtered
+// before entering an automatically sized PSRAM queue. The queue is persisted
+// when its timeout or automatically calculated capacity is reached.
+extern int cfg_shooter_enabled;                // 0/1
+extern int cfg_shooter_interval_ms;            // 250..86400000
+extern int cfg_shooter_dark_mean_min;          // 0 disables dark filter, otherwise 1..255
+extern float cfg_shooter_min_change_pct;       // 0 disables, otherwise 0.1..100.0 percent
+extern int cfg_shooter_force_save_seconds;     // 0 disables forced keep, otherwise 1..86400
+extern int cfg_shooter_flush_seconds;          // 0 = direct write, otherwise 1..3600
 extern int cfg_recording_segment_seconds; // 0 = unlimited
 extern int cfg_recording_segment_max_mb;  // 0 = unlimited
 // Maximum duration of one complete motion event across segment rotations.
@@ -38,13 +47,13 @@ extern int cfg_recording_event_cooldown_seconds;
 // "off" = no time gate; otherwise strict local ISO format YYYY-MM-DDTHH:MM:SS.
 extern String cfg_recording_not_before;
 
-// Motion recording decision. The physical presence sensor remains the hardware
-// wake source in low-power modes. direct starts from the sensor immediately;
-// image_verify requires sensor + image confirmation; image_only lets image
-// motion decide recording while the physical sensor is wake-only during sleep.
+// Motion-triggered recording is independently switchable. When disabled,
+// presence/radar/PIR no longer starts recordings and is not armed as a low-power
+// wake source. The decision mode is retained so it is ready when re-enabled.
+extern int cfg_motion_recording_enabled;      // 0/1
 extern String cfg_motion_recording_decision; // "direct", "image_verify" or "image_only"
 extern int cfg_image_motion_sensitivity;
-extern int cfg_image_motion_min_area_pct;
+extern float cfg_image_motion_min_area_pct;
 extern int cfg_image_motion_confirm_frames;
 extern int cfg_image_motion_release_frames;
 extern int cfg_image_motion_background_learning;
@@ -254,7 +263,7 @@ ConfigSaveResult configSaveWebLanguage(
 // derived solely from motion_recording_decision.
 ConfigSaveResult configSaveImageMotion(
     int sensitivity,
-    int minAreaPct,
+    float minAreaPct,
     int confirmFrames,
     int releaseFrames,
     int backgroundLearning,

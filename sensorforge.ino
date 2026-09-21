@@ -24,6 +24,7 @@
 #include "esp_camera.h"
 #include "esp_system.h"
 #include "esp_task_wdt.h"
+#include "esp_heap_caps.h"
 #include "esp_idf_version.h"
 #include "esp_ota_ops.h"
 #include "driver/rtc_io.h"
@@ -315,25 +316,49 @@ static const uint32_t NORMAL_DEEP_SLEEP_RTC_MAGIC = 0x53464453UL; // "SFDS"
 RTC_DATA_ATTR uint32_t normalDeepSleepRtcMagic = 0;
 RTC_DATA_ATTR int64_t normalDeepSleepStartedEpoch = 0;
 
-// Periodic snapshot deep-sleep marker. It distinguishes the normal periodic
-// photo timer from transport/thermal/storage-fault timer wakes and preserves
-// the exact scheduled wall-clock slot across the deep-sleep reboot.
-static const uint32_t SNAPSHOT_DEEP_SLEEP_RTC_MAGIC = 0x53465048UL; // "SFPH"
-RTC_DATA_ATTR uint32_t snapshotDeepSleepRtcMagic = 0;
-RTC_DATA_ATTR int64_t snapshotDeepSleepScheduledEpoch = 0;
+// Continuous-shooter deep-sleep marker. It preserves the exact scheduled
+// wall-clock slot across a deep-sleep reboot. PSRAM itself does not survive
+// deep sleep, therefore queued JPEGs are flushed before this path is entered.
+static const uint32_t SHOOTER_DEEP_SLEEP_RTC_MAGIC = 0x53465348UL; // "SFSH"
+RTC_DATA_ATTR uint32_t shooterDeepSleepRtcMagic = 0;
+RTC_DATA_ATTR int64_t shooterDeepSleepScheduledWallUs = 0;
 
-// Runtime periodic-snapshot scheduler. Wall-clock mode is aligned to fixed
-// epoch/minute slots, so capture/processing time never accumulates as drift.
-// If no valid clock is available, awake/light-sleep operation falls back to a
-// monotonic deadline that is also incremented from the previous deadline rather
-// than from capture completion.
-static const uint8_t SNAPSHOT_WARMUP_FRAMES = 3;
-static const uint32_t SNAPSHOT_DUE_TOLERANCE_SECONDS = 2UL;
-static int snapshotScheduleCachedMinutes = -1;
-static bool snapshotScheduleWallClockMode = false;
-static int64_t snapshotLastHandledWallSlotEpoch = -1;
-static uint64_t snapshotFallbackNextDueUs = 0;
-static int64_t snapshotLightSleepScheduledEpoch = 0;
+// Runtime continuous-shooter scheduler and PSRAM queue.
+static int shooterScheduleCachedIntervalMs = -1;
+static int shooterScheduleCachedEnabled = -1;
+static bool shooterScheduleWallClockMode = false;
+static int64_t shooterLastHandledWallSlotUs = -1;
+static uint64_t shooterFallbackNextDueUs = 0;
+static int64_t shooterLightSleepScheduledWallUs = 0;
+static uint8_t shooterLightSleepWakeKind = 0;
+
+static uint8_t *shooterBuffer = nullptr;
+static size_t shooterBufferCapacity = 0;
+static size_t shooterBufferUsed = 0;
+static uint32_t shooterBufferFrames = 0;
+static uint32_t shooterBufferFirstQueuedMs = 0;
+static bool shooterBufferFlushDue = false;
+static uint64_t shooterLastAcceptedMonoUs = 0;
+static uint32_t shooterAcceptedFrames = 0;
+static uint64_t shooterAcceptedJpegBytes = 0;
+static uint32_t shooterRejectedDark = 0;
+static uint32_t shooterRejectedSimilar = 0;
+static bool shooterLastBrightnessValid = false;
+static float shooterLastBrightnessMean = 0.0f;
+static uint8_t shooterLastBrightnessPeak = 0;
+static uint32_t shooterLastBrightnessMs = 0;
+static uint32_t shooterLastAnalyzerErrorLogMs = 0;
+static uint32_t shooterLastBufferAllocErrorLogMs = 0;
+static uint32_t shooterLastFailureLogMs = 0;
+static bool shooterInitialWarmupDone = false;
+
+// Pure continuous-shooter timer wakes can happen multiple times per second.
+// Keep their light-sleep diagnostics in RAM and fold them into the next
+// shooter flush summary instead of generating one SD-backed log line per wake.
+static uint32_t shooterSleepCyclesPending = 0;
+static uint64_t shooterSleepTotalMsPending = 0;
+static uint32_t shooterSleepMinMsPending = 0;
+static uint32_t shooterSleepMaxMsPending = 0;
 
 // Dedicated storage-fault sleep marker. This is deliberately independent of
 // normal deep sleep and transport mode so a timer wake can retry only the SD
@@ -1791,11 +1816,20 @@ bool motionDetected()
     if (!recordingAutomationAllowed())
         return false;
 
+    const bool simulated =
+        simulatedMotionActive();
+
+    // The persistent motion switch controls automatic physical/image triggers.
+    // Manual WebConfig simulation remains available as a deterministic recorder
+    // diagnostic even when automatic motion recording is disabled.
+    if (!cfg_motion_recording_enabled)
+        return simulated;
+
     return
         (recording
             ? physicalMotionActive()
             : physicalRecordingStartTriggerActive()) ||
-        simulatedMotionActive();
+        simulated;
 }
 
 
@@ -2059,6 +2093,7 @@ static bool imageOnlyIdleMotionTrigger()
     if (
         recording ||
         wakeCriticalPathActive ||
+        !cfg_motion_recording_enabled ||
         !imageOnlyModeActive() ||
         !recordingAutomationAllowed()
     ) {
@@ -8386,40 +8421,68 @@ static void triggerRecordingEventSafetyLimit()
 
 
 // =============================================================
-// PERIODIC JPEG SNAPSHOTS
+// CONTINUOUS JPEG SHOOTER
 // =============================================================
 //
-// Alarm video and periodic snapshots deliberately use different camera
-// priorities:
-//   - alarm recording keeps the existing fastest-possible first-frame path;
-//   - a periodic snapshot discards three frames so auto exposure/gain can settle.
+// Single timed JPEG scheduler for the SensorForge continuous shooter.
+// It supports intervals down to 250 ms, optional dark/similarity rejection,
+// a forced-keep interval, and a PSRAM queue that batches SD writes.
 //
-// Scheduling is anchored to fixed time slots. A 10-minute interval therefore
-// remains :00/:10/:20/... even though waking, warm-up and SD writing take time.
-// A missed slot is skipped rather than captured late, so there is no cumulative
-// drift and an alarm always wins over a snapshot.
+// Alarm video always has priority. The shooter never starts an SD write while
+// recording, WebConfig preview/maintenance, Sync Exclusive or thermal emergency
+// owns the device.
 
-static void periodicSnapshotRefreshScheduleState()
+enum ContinuousShooterWakeKind : uint8_t {
+    SHOOTER_WAKE_NONE = 0,
+    SHOOTER_WAKE_SAMPLE = 1,
+    SHOOTER_WAKE_FLUSH = 2
+};
+
+struct ShooterBufferedFrameHeader {
+    int64_t scheduledWallUs;
+    uint64_t captureMonotonicUs;
+    uint32_t jpegBytes;
+    uint16_t width;
+    uint16_t height;
+};
+
+static const uint8_t SHOOTER_LONG_INTERVAL_WARMUP_FRAMES = 3;
+static const uint32_t SHOOTER_LONG_INTERVAL_MS = 5000UL;
+static const size_t SHOOTER_WRITE_CHUNK = 8U * 1024U;
+static const uint8_t SHOOTER_PSRAM_USE_PERCENT = 80U;
+static const size_t SHOOTER_PSRAM_RESERVE_BYTES = 1024U * 1024U;
+static const size_t SHOOTER_PSRAM_CONTIGUOUS_RESERVE_BYTES = 256U * 1024U;
+static const size_t SHOOTER_PSRAM_MIN_BUFFER_BYTES = 64U * 1024U;
+static const size_t SHOOTER_PSRAM_ALIGNMENT_BYTES = 4U * 1024U;
+
+static void continuousShooterRefreshScheduleState()
 {
-    int minutes =
-        constrain(
-            cfg_periodic_snapshot_minutes,
-            0,
-            1440
-        );
+    int enabled = cfg_shooter_enabled ? 1 : 0;
+    int intervalMs = cfg_shooter_interval_ms;
 
-    if (snapshotScheduleCachedMinutes == minutes)
+    if (
+        shooterScheduleCachedEnabled == enabled &&
+        shooterScheduleCachedIntervalMs == intervalMs
+    ) {
         return;
+    }
 
-    snapshotScheduleCachedMinutes = minutes;
-    snapshotScheduleWallClockMode = false;
-    snapshotLastHandledWallSlotEpoch = -1;
-    snapshotFallbackNextDueUs = 0;
-    snapshotLightSleepScheduledEpoch = 0;
+    shooterScheduleCachedEnabled = enabled;
+    shooterScheduleCachedIntervalMs = intervalMs;
+    shooterScheduleWallClockMode = false;
+    shooterLastHandledWallSlotUs = -1;
+    shooterFallbackNextDueUs = 0;
+    shooterLightSleepScheduledWallUs = 0;
+    shooterLightSleepWakeKind = SHOOTER_WAKE_NONE;
+
+    if (!enabled && shooterBufferUsed > 0)
+        shooterBufferFlushDue = true;
+
+    imageMotionResetShooterReference();
 }
 
 
-static bool periodicSnapshotWallClockNowUs(
+static bool continuousShooterWallClockNowUs(
     int64_t &nowUs
 )
 {
@@ -8434,170 +8497,222 @@ static bool periodicSnapshotWallClockNowUs(
         return false;
 
     nowUs =
-        (int64_t)tv.tv_sec *
-        1000000LL +
+        (int64_t)tv.tv_sec * 1000000LL +
         (int64_t)tv.tv_usec;
 
     return true;
 }
 
 
-static bool periodicSnapshotNextWakeDelayUs(
-    uint64_t &delayUs,
-    int64_t &scheduledEpoch
-)
+static uint64_t continuousShooterIntervalUs()
 {
-    delayUs = 0;
-    scheduledEpoch = 0;
-
-    periodicSnapshotRefreshScheduleState();
-
-    if (snapshotScheduleCachedMinutes <= 0)
-        return false;
-
-    uint64_t intervalUs =
-        (uint64_t)snapshotScheduleCachedMinutes *
-        60ULL *
-        1000000ULL;
-
-    int64_t wallNowUs = 0;
-
-    if (periodicSnapshotWallClockNowUs(wallNowUs)) {
-        snapshotScheduleWallClockMode = true;
-        snapshotFallbackNextDueUs = 0;
-
-        int64_t intervalSeconds =
-            (int64_t)snapshotScheduleCachedMinutes *
-            60LL;
-
-        int64_t nowSeconds =
-            wallNowUs /
-            1000000LL;
-
-        int64_t targetSeconds =
-            (
-                nowSeconds /
-                intervalSeconds +
-                1LL
-            ) *
-            intervalSeconds;
-
-        int64_t targetUs =
-            targetSeconds *
-            1000000LL;
-
-        int64_t remainingUs =
-            targetUs -
-            wallNowUs;
-
-        if (remainingUs < 1000LL)
-            remainingUs = 1000LL;
-
-        delayUs =
-            (uint64_t)remainingUs;
-
-        scheduledEpoch =
-            targetSeconds;
-
-        return true;
-    }
-
-    // No valid RTC/NTP time: keep a monotonic fixed-deadline schedule for
-    // awake/light-sleep operation. Deep sleep can still wake periodically, but
-    // wall-clock alignment is naturally available only once a valid clock exists.
-    snapshotScheduleWallClockMode = false;
-    snapshotLastHandledWallSlotEpoch = -1;
-
-    uint64_t nowMonoUs =
-        (uint64_t)esp_timer_get_time();
-
-    if (snapshotFallbackNextDueUs == 0) {
-        snapshotFallbackNextDueUs =
-            nowMonoUs +
-            intervalUs;
-    }
-
-    while (
-        snapshotFallbackNextDueUs <=
-        nowMonoUs
+    if (
+        !cfg_shooter_enabled ||
+        cfg_shooter_interval_ms < 250
     ) {
-        snapshotFallbackNextDueUs +=
-            intervalUs;
+        return 0;
     }
 
-    delayUs =
-        snapshotFallbackNextDueUs -
-        nowMonoUs;
-
-    scheduledEpoch = 0;
-
-    return true;
+    return
+        (uint64_t)cfg_shooter_interval_ms *
+        1000ULL;
 }
 
 
-static void periodicSnapshotMarkScheduledHandled(
-    int64_t scheduledEpoch
+static uint64_t continuousShooterDueToleranceUs()
+{
+    uint64_t intervalUs = continuousShooterIntervalUs();
+    if (intervalUs == 0)
+        return 0;
+
+    uint64_t toleranceUs = intervalUs / 2ULL;
+
+    if (toleranceUs < 50000ULL)
+        toleranceUs = 50000ULL;
+    if (toleranceUs > 2000000ULL)
+        toleranceUs = 2000000ULL;
+
+    return toleranceUs;
+}
+
+
+static uint64_t continuousShooterFlushRemainingUs()
+{
+    if (shooterBufferUsed == 0)
+        return UINT64_MAX;
+
+    if (shooterBufferFlushDue)
+        return 1000ULL;
+
+    if (cfg_shooter_flush_seconds <= 0)
+        return 1000ULL;
+
+    if (shooterBufferFirstQueuedMs == 0)
+        return 1000ULL;
+
+    uint64_t timeoutMs =
+        (uint64_t)cfg_shooter_flush_seconds *
+        1000ULL;
+
+    uint32_t elapsedMs =
+        (uint32_t)(millis() - shooterBufferFirstQueuedMs);
+
+    if ((uint64_t)elapsedMs >= timeoutMs)
+        return 1000ULL;
+
+    return
+        (timeoutMs - (uint64_t)elapsedMs) *
+        1000ULL;
+}
+
+
+static bool continuousShooterNextWakeDelayUs(
+    uint64_t &delayUs,
+    int64_t &scheduledWallUs,
+    uint8_t &wakeKind
 )
 {
-    periodicSnapshotRefreshScheduleState();
+    delayUs = 0;
+    scheduledWallUs = 0;
+    wakeKind = SHOOTER_WAKE_NONE;
 
-    if (scheduledEpoch > 0) {
-        snapshotScheduleWallClockMode = true;
+    continuousShooterRefreshScheduleState();
 
-        if (
-            scheduledEpoch >
-            snapshotLastHandledWallSlotEpoch
-        ) {
-            snapshotLastHandledWallSlotEpoch =
-                scheduledEpoch;
+    uint64_t sampleDelayUs = UINT64_MAX;
+    int64_t sampleScheduledWallUs = 0;
+    uint64_t intervalUs = continuousShooterIntervalUs();
+
+    if (intervalUs > 0) {
+        int64_t wallNowUs = 0;
+
+        if (continuousShooterWallClockNowUs(wallNowUs)) {
+            shooterScheduleWallClockMode = true;
+            shooterFallbackNextDueUs = 0;
+
+            int64_t targetUs =
+                (
+                    wallNowUs /
+                    (int64_t)intervalUs +
+                    1LL
+                ) *
+                (int64_t)intervalUs;
+
+            int64_t remainingUs =
+                targetUs - wallNowUs;
+
+            if (remainingUs < 1000LL)
+                remainingUs = 1000LL;
+
+            sampleDelayUs =
+                (uint64_t)remainingUs;
+
+            sampleScheduledWallUs =
+                targetUs;
+        } else {
+            shooterScheduleWallClockMode = false;
+            shooterLastHandledWallSlotUs = -1;
+
+            uint64_t nowMonoUs =
+                (uint64_t)esp_timer_get_time();
+
+            if (shooterFallbackNextDueUs == 0) {
+                shooterFallbackNextDueUs =
+                    nowMonoUs + intervalUs;
+            }
+
+            while (shooterFallbackNextDueUs <= nowMonoUs) {
+                shooterFallbackNextDueUs += intervalUs;
+            }
+
+            sampleDelayUs =
+                shooterFallbackNextDueUs - nowMonoUs;
+        }
+    }
+
+    uint64_t flushDelayUs =
+        continuousShooterFlushRemainingUs();
+
+    if (flushDelayUs < sampleDelayUs) {
+        delayUs = flushDelayUs;
+        wakeKind = SHOOTER_WAKE_FLUSH;
+        return true;
+    }
+
+    if (sampleDelayUs != UINT64_MAX) {
+        delayUs = sampleDelayUs;
+        scheduledWallUs = sampleScheduledWallUs;
+        wakeKind = SHOOTER_WAKE_SAMPLE;
+        return true;
+    }
+
+    return false;
+}
+
+
+static void continuousShooterMarkScheduledHandled(
+    int64_t scheduledWallUs
+)
+{
+    continuousShooterRefreshScheduleState();
+
+    if (scheduledWallUs > 0) {
+        shooterScheduleWallClockMode = true;
+
+        if (scheduledWallUs > shooterLastHandledWallSlotUs) {
+            shooterLastHandledWallSlotUs =
+                scheduledWallUs;
         }
 
         return;
     }
 
-    if (snapshotScheduleCachedMinutes <= 0)
+    uint64_t intervalUs = continuousShooterIntervalUs();
+    if (intervalUs == 0)
         return;
-
-    uint64_t intervalUs =
-        (uint64_t)snapshotScheduleCachedMinutes *
-        60ULL *
-        1000000ULL;
 
     uint64_t nowMonoUs =
         (uint64_t)esp_timer_get_time();
 
-    if (snapshotFallbackNextDueUs == 0) {
-        snapshotFallbackNextDueUs =
-            nowMonoUs +
-            intervalUs;
+    if (shooterFallbackNextDueUs == 0) {
+        shooterFallbackNextDueUs =
+            nowMonoUs + intervalUs;
         return;
     }
 
-    while (
-        snapshotFallbackNextDueUs <=
-        nowMonoUs
-    ) {
-        snapshotFallbackNextDueUs +=
-            intervalUs;
+    while (shooterFallbackNextDueUs <= nowMonoUs) {
+        shooterFallbackNextDueUs += intervalUs;
     }
 }
 
 
-static bool periodicSnapshotAlarmHasPriority()
+static bool continuousShooterAlarmHasPriority()
 {
-    // Keep the ordinary sensor parsers fresh during snapshot warm-up/write.
-    // No logging is done here: if motion appears, the normal alarm path should
-    // get control with as little extra latency as possible.
     radarLoop();
     motionDiagnosticsLoop();
 
-    return
-        motionDetected();
+    return motionDetected();
 }
 
 
-static bool periodicSnapshotBuildPath(
-    int64_t scheduledEpoch,
+static void continuousShooterLogFailure(const String &message)
+{
+    uint32_t nowMs = millis();
+
+    if (
+        shooterLastFailureLogMs != 0 &&
+        (uint32_t)(nowMs - shooterLastFailureLogMs) < 10000UL
+    ) {
+        return;
+    }
+
+    shooterLastFailureLogMs = nowMs;
+    logWrite("Shooter failed | " + message);
+}
+
+
+static bool continuousShooterBuildPath(
+    int64_t scheduledWallUs,
+    uint64_t captureMonotonicUs,
     String &finalPath,
     String &tempPath
 )
@@ -8608,21 +8723,21 @@ static bool periodicSnapshotBuildPath(
     String folder;
     String filename;
 
-    if (scheduledEpoch >= (int64_t)1609459200) {
-        time_t slot =
-            (time_t)scheduledEpoch;
+    if (scheduledWallUs >= (int64_t)1609459200 * 1000000LL) {
+        time_t slotSeconds =
+            (time_t)(scheduledWallUs / 1000000LL);
+
+        uint16_t slotMs =
+            (uint16_t)((scheduledWallUs % 1000000LL) / 1000LL);
 
         struct tm localTime;
 
-        if (!localtime_r(
-                &slot,
-                &localTime
-            )) {
+        if (!localtime_r(&slotSeconds, &localTime))
             return false;
-        }
 
         char folderBuffer[24];
-        char fileBuffer[24];
+        char timeBuffer[16];
+        char fileBuffer[32];
 
         if (
             strftime(
@@ -8632,29 +8747,40 @@ static bool periodicSnapshotBuildPath(
                 &localTime
             ) == 0 ||
             strftime(
-                fileBuffer,
-                sizeof(fileBuffer),
-                "%H%M%S.jpg",
+                timeBuffer,
+                sizeof(timeBuffer),
+                "%H%M%S",
                 &localTime
             ) == 0
         ) {
             return false;
         }
 
-        folder =
-            String(folderBuffer);
+        snprintf(
+            fileBuffer,
+            sizeof(fileBuffer),
+            "%s_%03u.jpg",
+            timeBuffer,
+            (unsigned)slotMs
+        );
 
-        filename =
-            String(fileBuffer);
-
+        folder = String(folderBuffer);
+        filename = String(fileBuffer);
     } else {
-        folder =
-            "/fallback";
+        folder = "/fallback";
 
-        filename =
-            "snapshot_" +
-            String((unsigned long)millis()) +
-            ".jpg";
+        uint64_t captureMs =
+            captureMonotonicUs /
+            1000ULL;
+
+        char fileBuffer[48];
+        snprintf(
+            fileBuffer,
+            sizeof(fileBuffer),
+            "shooter_%llu.jpg",
+            (unsigned long long)captureMs
+        );
+        filename = String(fileBuffer);
     }
 
     if (!STORAGE.exists(folder.c_str())) {
@@ -8662,25 +8788,639 @@ static bool periodicSnapshotBuildPath(
             return false;
     }
 
-    finalPath =
-        folder +
-        "/" +
-        filename;
+    finalPath = folder + "/" + filename;
+    tempPath = finalPath + ".part";
+    return true;
+}
 
-    tempPath =
-        finalPath +
-        ".part";
+
+static bool continuousShooterWriteJpeg(
+    int64_t scheduledWallUs,
+    uint64_t captureMonotonicUs,
+    const uint8_t *jpeg,
+    size_t jpegBytes
+)
+{
+    if (!jpeg || jpegBytes == 0)
+        return false;
+
+    if (
+        recording ||
+        recorderIsOpen() ||
+        !sdReady ||
+        g_storageLocked ||
+        syncApiExclusiveActive() ||
+        thermalEmergencyState
+    ) {
+        return false;
+    }
+
+    // Persisting an already accepted PSRAM frame is allowed while WebConfig is
+    // open. Capture itself remains blocked by preview/maintenance, but delaying a
+    // due flush would violate the user's configured persistence window.
+    if (continuousShooterAlarmHasPriority())
+        return false;
+
+    if (!storagePrepareForRecording())
+        return false;
+
+    String finalPath;
+    String tempPath;
+
+    if (!continuousShooterBuildPath(
+            scheduledWallUs,
+            captureMonotonicUs,
+            finalPath,
+            tempPath
+        )) {
+        return false;
+    }
+
+    if (STORAGE.exists(finalPath.c_str()))
+        return true;
+
+    if (STORAGE.exists(tempPath.c_str()))
+        STORAGE.remove(tempPath.c_str());
+
+    RecordingStorageFile output;
+
+    if (!output.openWrite(
+            tempPath,
+            cfg_recording_encryption != 0
+        )) {
+        return false;
+    }
+
+    bool ok = true;
+    size_t offset = 0;
+
+    while (offset < jpegBytes) {
+        if (continuousShooterAlarmHasPriority()) {
+            ok = false;
+            break;
+        }
+
+        size_t remaining = jpegBytes - offset;
+        size_t chunk =
+            remaining < SHOOTER_WRITE_CHUNK
+            ? remaining
+            : SHOOTER_WRITE_CHUNK;
+
+        size_t written =
+            output.write(
+                jpeg + offset,
+                chunk
+            );
+
+        if (written != chunk) {
+            ok = false;
+            break;
+        }
+
+        offset += written;
+        feedWatchdog();
+        yield();
+    }
+
+    bool closeOk = output.closeChecked();
+    ok = ok && closeOk;
+
+    if (!ok) {
+        STORAGE.remove(tempPath.c_str());
+        return false;
+    }
+
+    if (!STORAGE.rename(
+            tempPath.c_str(),
+            finalPath.c_str()
+        )) {
+        STORAGE.remove(tempPath.c_str());
+        return false;
+    }
 
     return true;
 }
 
 
-static bool periodicSnapshotCapture(
-    int64_t scheduledEpoch
+static void continuousShooterReleaseBuffer()
+{
+    if (shooterBuffer) {
+        heap_caps_free(shooterBuffer);
+        shooterBuffer = nullptr;
+    }
+
+    shooterBufferCapacity = 0;
+    shooterBufferUsed = 0;
+    shooterBufferFrames = 0;
+    shooterBufferFirstQueuedMs = 0;
+    shooterBufferFlushDue = false;
+}
+
+
+static size_t continuousShooterAlignDown(
+    size_t value,
+    size_t alignment
+)
+{
+    if (alignment == 0)
+        return value;
+
+    return value - (value % alignment);
+}
+
+
+static bool continuousShooterEnsureBuffer()
+{
+    if (cfg_shooter_flush_seconds <= 0)
+        return false;
+
+    if (shooterBuffer)
+        return true;
+
+    const uint32_t caps =
+        MALLOC_CAP_SPIRAM |
+        MALLOC_CAP_8BIT;
+
+    size_t freeBefore =
+        heap_caps_get_free_size(caps);
+
+    size_t largestBefore =
+        heap_caps_get_largest_free_block(caps);
+
+    if (
+        freeBefore <=
+            SHOOTER_PSRAM_RESERVE_BYTES +
+            SHOOTER_PSRAM_MIN_BUFFER_BYTES ||
+        largestBefore <=
+            SHOOTER_PSRAM_CONTIGUOUS_RESERVE_BYTES +
+            SHOOTER_PSRAM_MIN_BUFFER_BYTES
+    ) {
+        uint32_t nowMs = millis();
+        if (
+            shooterLastBufferAllocErrorLogMs == 0 ||
+            (uint32_t)(nowMs - shooterLastBufferAllocErrorLogMs) >= 60000UL
+        ) {
+            shooterLastBufferAllocErrorLogMs = nowMs;
+            logWrite(
+                "Shooter PSRAM buffer unavailable | free_kb=" +
+                String((unsigned long)(freeBefore / 1024U)) +
+                " | largest_kb=" +
+                String((unsigned long)(largestBefore / 1024U)) +
+                " | direct SD fallback"
+            );
+        }
+        return false;
+    }
+
+    size_t usableAfterReserve =
+        freeBefore -
+        SHOOTER_PSRAM_RESERVE_BYTES;
+
+    size_t target =
+        (usableAfterReserve *
+         (size_t)SHOOTER_PSRAM_USE_PERCENT) /
+        100U;
+
+    size_t largestSafe =
+        largestBefore -
+        SHOOTER_PSRAM_CONTIGUOUS_RESERVE_BYTES;
+
+    if (target > largestSafe)
+        target = largestSafe;
+
+    target = continuousShooterAlignDown(
+        target,
+        SHOOTER_PSRAM_ALIGNMENT_BYTES
+    );
+
+    // Fragmentation may change between the size query and allocation. Retry
+    // with smaller blocks instead of abandoning batching after one failure.
+    size_t attempt = target;
+
+    while (attempt >= SHOOTER_PSRAM_MIN_BUFFER_BYTES) {
+        shooterBuffer =
+            (uint8_t *)heap_caps_malloc(
+                attempt,
+                caps
+            );
+
+        if (shooterBuffer) {
+            shooterBufferCapacity = attempt;
+
+            logWrite(
+                "Shooter PSRAM buffer auto | capacity_kb=" +
+                String((unsigned long)(attempt / 1024U)) +
+                " | free_before_kb=" +
+                String((unsigned long)(freeBefore / 1024U)) +
+                " | largest_before_kb=" +
+                String((unsigned long)(largestBefore / 1024U)) +
+                " | reserve_kb=" +
+                String((unsigned long)(SHOOTER_PSRAM_RESERVE_BYTES / 1024U)) +
+                " | use_pct=" +
+                String((unsigned)SHOOTER_PSRAM_USE_PERCENT)
+            );
+
+            return true;
+        }
+
+        attempt = continuousShooterAlignDown(
+            (attempt * 3U) / 4U,
+            SHOOTER_PSRAM_ALIGNMENT_BYTES
+        );
+    }
+
+    shooterBufferCapacity = 0;
+
+    uint32_t nowMs = millis();
+    if (
+        shooterLastBufferAllocErrorLogMs == 0 ||
+        (uint32_t)(nowMs - shooterLastBufferAllocErrorLogMs) >= 60000UL
+    ) {
+        shooterLastBufferAllocErrorLogMs = nowMs;
+        logWrite(
+            "Shooter PSRAM buffer allocation failed | free_kb=" +
+            String((unsigned long)(freeBefore / 1024U)) +
+            " | target_kb=" +
+            String((unsigned long)(target / 1024U)) +
+            " | direct SD fallback"
+        );
+    }
+
+    return false;
+}
+
+
+static bool continuousShooterFlushBuffer(
+    const char *reason,
+    bool ignoreAlarmPriority = false
+)
+{
+    if (shooterBufferUsed == 0) {
+        shooterBufferFrames = 0;
+        shooterBufferFirstQueuedMs = 0;
+        shooterBufferFlushDue = false;
+        return true;
+    }
+
+    if (
+        recording ||
+        recorderIsOpen() ||
+        !sdReady ||
+        g_storageLocked ||
+        syncApiExclusiveActive() ||
+        thermalEmergencyState ||
+        (
+            !ignoreAlarmPriority &&
+            continuousShooterAlarmHasPriority()
+        )
+    ) {
+        shooterBufferFlushDue = true;
+        return false;
+    }
+
+    size_t offset = 0;
+    uint32_t flushedFrames = 0;
+    uint64_t flushedJpegBytes = 0;
+    uint32_t startedMs = millis();
+    uint32_t originalFirstQueuedMs = shooterBufferFirstQueuedMs;
+
+    while (
+        offset + sizeof(ShooterBufferedFrameHeader) <=
+        shooterBufferUsed
+    ) {
+        ShooterBufferedFrameHeader header;
+        memcpy(
+            &header,
+            shooterBuffer + offset,
+            sizeof(header)
+        );
+
+        size_t recordBytes =
+            sizeof(header) +
+            (size_t)header.jpegBytes;
+
+        if (
+            header.jpegBytes == 0 ||
+            recordBytes > shooterBufferUsed - offset
+        ) {
+            logWrite("Shooter buffer corrupted | dropping queue");
+            continuousShooterReleaseBuffer();
+            return false;
+        }
+
+        if (
+            !ignoreAlarmPriority &&
+            continuousShooterAlarmHasPriority()
+        ) {
+            break;
+        }
+
+        const uint8_t *jpeg =
+            shooterBuffer +
+            offset +
+            sizeof(header);
+
+        if (!continuousShooterWriteJpeg(
+                header.scheduledWallUs,
+                header.captureMonotonicUs,
+                jpeg,
+                header.jpegBytes
+            )) {
+            break;
+        }
+
+        offset += recordBytes;
+        ++flushedFrames;
+        flushedJpegBytes += header.jpegBytes;
+
+        feedWatchdog();
+        yield();
+    }
+
+    if (offset > 0) {
+        size_t remaining =
+            shooterBufferUsed - offset;
+
+        if (remaining > 0) {
+            memmove(
+                shooterBuffer,
+                shooterBuffer + offset,
+                remaining
+            );
+        }
+
+        shooterBufferUsed = remaining;
+
+        if (flushedFrames >= shooterBufferFrames)
+            shooterBufferFrames = 0;
+        else
+            shooterBufferFrames -= flushedFrames;
+
+        if (remaining == 0) {
+            shooterBufferFirstQueuedMs = 0;
+            shooterBufferFlushDue = false;
+        } else {
+            // Preserve the age of the oldest still-unflushed frame. The user's
+            // configured persistence timeout is a maximum loss window, not a
+            // timer that restarts after a partial flush/preemption.
+            shooterBufferFirstQueuedMs = originalFirstQueuedMs;
+            shooterBufferFlushDue = true;
+        }
+
+        char flushSummary[448];
+
+        uint32_t sleepAverageMs =
+            shooterSleepCyclesPending > 0
+            ? (uint32_t)(
+                shooterSleepTotalMsPending /
+                (uint64_t)shooterSleepCyclesPending
+            )
+            : 0;
+
+        snprintf(
+            flushSummary,
+            sizeof(flushSummary),
+            "Shooter flush | reason=%s | frames=%lu | jpeg_bytes=%llu | remaining=%lu | elapsed_ms=%lu | accepted=%lu | rejected_dark=%lu | rejected_similar=%lu | sleep_cycles=%lu | sleep_avg_ms=%lu | sleep_min_ms=%lu | sleep_max_ms=%lu",
+            reason ? reason : "unknown",
+            (unsigned long)flushedFrames,
+            (unsigned long long)flushedJpegBytes,
+            (unsigned long)shooterBufferUsed,
+            (unsigned long)(millis() - startedMs),
+            (unsigned long)shooterAcceptedFrames,
+            (unsigned long)shooterRejectedDark,
+            (unsigned long)shooterRejectedSimilar,
+            (unsigned long)shooterSleepCyclesPending,
+            (unsigned long)sleepAverageMs,
+            (unsigned long)shooterSleepMinMsPending,
+            (unsigned long)shooterSleepMaxMsPending
+        );
+        logWrite(String(flushSummary));
+
+        // The SD is already active for the image batch. Persist the accumulated
+        // low-power log queue now so logging does not create a separate card wake.
+        logFlush();
+
+        shooterSleepCyclesPending = 0;
+        shooterSleepTotalMsPending = 0;
+        shooterSleepMinMsPending = 0;
+        shooterSleepMaxMsPending = 0;
+    }
+
+    return shooterBufferUsed == 0;
+}
+
+
+// WebConfig uses this before deliberate reboot/shutdown so accepted RAM-only
+// frames are not discarded by an operator action.
+bool continuousShooterFlushBeforeRestart()
+{
+    if (shooterBufferUsed == 0)
+        return true;
+
+    // A deliberate reboot/shutdown has already decided to stop normal
+    // operation. Physical motion must therefore not strand RAM-only frames
+    // forever; active recording/storage/thermal guards still remain enforced.
+    return continuousShooterFlushBuffer(
+        "before_restart",
+        true
+    );
+}
+
+bool continuousShooterFlushNow()
+{
+    if (shooterBufferUsed == 0)
+        return true;
+
+    return continuousShooterFlushBuffer(
+        "manual_web",
+        false
+    );
+}
+
+uint32_t continuousShooterBufferedFrameCount()
+{
+    return shooterBufferFrames;
+}
+
+uint32_t continuousShooterBufferUsedBytes()
+{
+    return (uint32_t)shooterBufferUsed;
+}
+
+uint32_t continuousShooterBufferCapacityBytes()
+{
+    return (uint32_t)shooterBufferCapacity;
+}
+
+uint32_t continuousShooterAcceptedFrameCount()
+{
+    return shooterAcceptedFrames;
+}
+
+uint32_t continuousShooterRejectedDarkCount()
+{
+    return shooterRejectedDark;
+}
+
+uint32_t continuousShooterRejectedSimilarCount()
+{
+    return shooterRejectedSimilar;
+}
+
+uint64_t continuousShooterAcceptedJpegByteCount()
+{
+    return shooterAcceptedJpegBytes;
+}
+
+bool continuousShooterLastBrightnessValid()
+{
+    return shooterLastBrightnessValid;
+}
+
+float continuousShooterLastBrightnessMean()
+{
+    return shooterLastBrightnessMean;
+}
+
+uint8_t continuousShooterLastBrightnessPeak()
+{
+    return shooterLastBrightnessPeak;
+}
+
+uint32_t continuousShooterLastBrightnessAgeMs()
+{
+    if (!shooterLastBrightnessValid)
+        return 0;
+
+    return (uint32_t)(
+        millis() -
+        shooterLastBrightnessMs
+    );
+}
+
+
+static bool continuousShooterQueueJpeg(
+    int64_t scheduledWallUs,
+    uint64_t captureMonotonicUs,
+    const uint8_t *jpeg,
+    size_t jpegBytes,
+    uint16_t width,
+    uint16_t height
+)
+{
+    if (cfg_shooter_flush_seconds <= 0) {
+        return continuousShooterWriteJpeg(
+            scheduledWallUs,
+            captureMonotonicUs,
+            jpeg,
+            jpegBytes
+        );
+    }
+
+    if (!continuousShooterEnsureBuffer()) {
+        return continuousShooterWriteJpeg(
+            scheduledWallUs,
+            captureMonotonicUs,
+            jpeg,
+            jpegBytes
+        );
+    }
+
+    ShooterBufferedFrameHeader header = {};
+    header.scheduledWallUs = scheduledWallUs;
+    header.captureMonotonicUs = captureMonotonicUs;
+    header.jpegBytes = (uint32_t)jpegBytes;
+    header.width = width;
+    header.height = height;
+
+    size_t recordBytes =
+        sizeof(header) +
+        jpegBytes;
+
+    if (recordBytes > shooterBufferCapacity) {
+        continuousShooterFlushBuffer("oversize_frame");
+        return continuousShooterWriteJpeg(
+            scheduledWallUs,
+            captureMonotonicUs,
+            jpeg,
+            jpegBytes
+        );
+    }
+
+    if (
+        shooterBufferUsed + recordBytes >
+        shooterBufferCapacity
+    ) {
+        if (!continuousShooterFlushBuffer("buffer_full")) {
+            return false;
+        }
+    }
+
+    if (
+        shooterBufferUsed + recordBytes >
+        shooterBufferCapacity
+    ) {
+        return false;
+    }
+
+    if (shooterBufferUsed == 0) {
+        shooterBufferFirstQueuedMs = millis();
+    }
+
+    memcpy(
+        shooterBuffer + shooterBufferUsed,
+        &header,
+        sizeof(header)
+    );
+    shooterBufferUsed += sizeof(header);
+
+    memcpy(
+        shooterBuffer + shooterBufferUsed,
+        jpeg,
+        jpegBytes
+    );
+    shooterBufferUsed += jpegBytes;
+    shooterBufferFrames++;
+
+    if (
+        shooterBufferUsed >=
+        shooterBufferCapacity
+    ) {
+        shooterBufferFlushDue = true;
+    }
+
+    return true;
+}
+
+
+static bool continuousShooterForceSaveDue(
+    uint64_t nowMonoUs
 )
 {
     if (
-        cfg_periodic_snapshot_minutes <= 0 ||
+        cfg_shooter_force_save_seconds <= 0 ||
+        shooterLastAcceptedMonoUs == 0
+    ) {
+        return false;
+    }
+
+    uint64_t forceUs =
+        (uint64_t)cfg_shooter_force_save_seconds *
+        1000000ULL;
+
+    return
+        nowMonoUs - shooterLastAcceptedMonoUs >=
+        forceUs;
+}
+
+
+static bool continuousShooterCapture(
+    int64_t scheduledWallUs
+)
+{
+    if (
+        !cfg_shooter_enabled ||
+        cfg_shooter_interval_ms < 250 ||
         recording ||
         recorderIsOpen() ||
         !sdReady ||
@@ -8701,73 +9441,70 @@ static bool periodicSnapshotCapture(
         return false;
     }
 
-    // Never consume the configured recording reserve for a housekeeping image.
-    // Alarm recording retains priority over periodic photography when storage
-    // becomes tight.
-    if (!storageHasRequiredFreeSpace())
+    if (continuousShooterAlarmHasPriority())
         return false;
 
-    if (periodicSnapshotAlarmHasPriority())
-        return false;
+    bool cameraWasInitialized =
+        cameraInitialized;
 
     if (!initCamera(
             cfg_camera,
             cfg_resolution,
             cfg_quality
         )) {
-        logWrite(
-            "Snapshot failed | camera init"
-        );
+        continuousShooterLogFailure("camera init");
         return false;
     }
 
+    bool wasSoftPoweredDown =
+        cameraSoftPowerDownActive;
+
     if (!cameraExitSoftPowerDown()) {
         if (!recoverCamera()) {
-            logWrite(
-                "Snapshot failed | camera wake/recovery"
-            );
+            continuousShooterLogFailure("camera wake/recovery");
             return false;
         }
     }
 
-    // Allow auto exposure/gain to settle independently from the alarm-video
-    // fast path. The three discarded frames are intentional product behavior.
-    for (
-        uint8_t i = 0;
-        i < SNAPSHOT_WARMUP_FRAMES;
-        ++i
-    ) {
-        if (periodicSnapshotAlarmHasPriority())
+    uint8_t warmupFrames =
+        (
+            cfg_shooter_interval_ms >=
+                (int)SHOOTER_LONG_INTERVAL_MS ||
+            !shooterInitialWarmupDone ||
+            !cameraWasInitialized ||
+            (
+                wasSoftPoweredDown &&
+                cfg_shooter_interval_ms >=
+                    (int)SHOOTER_LONG_INTERVAL_MS
+            )
+        )
+        ? SHOOTER_LONG_INTERVAL_WARMUP_FRAMES
+        : 0U;
+
+    for (uint8_t i = 0; i < warmupFrames; ++i) {
+        if (continuousShooterAlarmHasPriority())
             return false;
 
-        camera_fb_t *warmup =
-            esp_camera_fb_get();
-
+        camera_fb_t *warmup = esp_camera_fb_get();
         if (!warmup) {
-            logWrite(
-                "Snapshot failed | warmup frame unavailable"
-            );
+            continuousShooterLogFailure("warmup frame unavailable");
             return false;
         }
 
-        esp_camera_fb_return(
-            warmup
-        );
-
+        esp_camera_fb_return(warmup);
         feedWatchdog();
         yield();
     }
 
-    if (periodicSnapshotAlarmHasPriority())
+    shooterInitialWarmupDone = true;
+
+    if (continuousShooterAlarmHasPriority())
         return false;
 
-    camera_fb_t *frame =
-        esp_camera_fb_get();
+    camera_fb_t *frame = esp_camera_fb_get();
 
     if (!frame) {
-        logWrite(
-            "Snapshot failed | capture frame unavailable"
-        );
+        continuousShooterLogFailure("capture frame unavailable");
         return false;
     }
 
@@ -8777,308 +9514,265 @@ static bool periodicSnapshotCapture(
         frame->len == 0
     ) {
         esp_camera_fb_return(frame);
-        logWrite(
-            "Snapshot failed | camera frame is not JPEG"
+        continuousShooterLogFailure("camera frame is not JPEG");
+        return false;
+    }
+
+    ShooterImageMetrics metrics;
+    bool analyzed = imageMotionAnalyzeShooterJpeg(
+        frame->buf,
+        frame->len,
+        (uint16_t)frame->width,
+        (uint16_t)frame->height,
+        metrics
+    );
+
+    uint64_t captureMonoUs =
+        (uint64_t)esp_timer_get_time();
+
+    if (analyzed) {
+        shooterLastBrightnessMean = metrics.globalMean;
+        shooterLastBrightnessPeak = metrics.brightestBlockMean;
+        shooterLastBrightnessMs = millis();
+        shooterLastBrightnessValid = true;
+    }
+
+    // A whole-frame mean alone can misclassify a valuable night scene: a
+    // person with a flashlight may occupy only a small part of an otherwise
+    // dark image. The shooter analyzer already has 20x15 block means, so use
+    // the brightest local block as a virtually free fail-open guard. Static
+    // bright spots are still suppressed by the independent similarity filter.
+    float localBrightnessProtectThreshold =
+        (float)cfg_shooter_dark_mean_min + 20.0f;
+
+    if (localBrightnessProtectThreshold < 40.0f)
+        localBrightnessProtectThreshold = 40.0f;
+    if (localBrightnessProtectThreshold > 255.0f)
+        localBrightnessProtectThreshold = 255.0f;
+
+    bool dark =
+        analyzed &&
+        cfg_shooter_dark_mean_min > 0 &&
+        metrics.globalMean <
+            (float)cfg_shooter_dark_mean_min &&
+        (float)metrics.brightestBlockMean <
+            localBrightnessProtectThreshold;
+
+    bool forceSave =
+        continuousShooterForceSaveDue(
+            captureMonoUs
         );
+
+    float changedPct =
+        metrics.referenceReady
+        ? 100.0f - metrics.similarityPct
+        : 100.0f;
+
+    if (changedPct < 0.0f)
+        changedPct = 0.0f;
+
+    bool tooSimilar =
+        analyzed &&
+        !forceSave &&
+        cfg_shooter_min_change_pct > 0.0f &&
+        metrics.referenceReady &&
+        changedPct < cfg_shooter_min_change_pct;
+
+    if (dark || tooSimilar) {
+        esp_camera_fb_return(frame);
+
+        if (dark)
+            ++shooterRejectedDark;
+        else
+            ++shooterRejectedSimilar;
+
         return false;
     }
 
-    // Motion that starts while the final JPEG is waiting in the camera queue
-    // still wins before any SD write begins.
-    if (periodicSnapshotAlarmHasPriority()) {
-        esp_camera_fb_return(frame);
-        return false;
-    }
-
-    String finalPath;
-    String tempPath;
-
-    if (!periodicSnapshotBuildPath(
-            scheduledEpoch,
-            finalPath,
-            tempPath
-        )) {
-        esp_camera_fb_return(frame);
-        logWrite(
-            "Snapshot failed | path creation"
-        );
-        return false;
-    }
-
-    // A duplicate means this exact wall-clock slot already produced a valid
-    // image (for example after an unusual UI/retry sequence). Never overwrite.
-    if (STORAGE.exists(finalPath.c_str())) {
-        esp_camera_fb_return(frame);
-        return true;
-    }
-
-    if (STORAGE.exists(tempPath.c_str()))
-        STORAGE.remove(tempPath.c_str());
-
-    RecordingStorageFile output;
-
-    if (!output.openWrite(
-            tempPath,
-            cfg_recording_encryption != 0
-        )) {
-        esp_camera_fb_return(frame);
-        logWrite(
-            "Snapshot failed | storage open"
-        );
-        return false;
-    }
-
-    bool writeOk = true;
-    bool alarmPreempted = false;
-    size_t offset = 0;
-    static const size_t SNAPSHOT_WRITE_CHUNK = 8U * 1024U;
-
-    while (offset < frame->len) {
-        if (periodicSnapshotAlarmHasPriority()) {
-            alarmPreempted = true;
-            writeOk = false;
-            break;
+    // Analyzer failure is fail-open: a filtering fault must not silently erase
+    // the source material. It is rate-limited to avoid a log storm at 2 fps.
+    if (!analyzed) {
+        uint32_t nowMs = millis();
+        if (
+            shooterLastAnalyzerErrorLogMs == 0 ||
+            (uint32_t)(nowMs - shooterLastAnalyzerErrorLogMs) >= 60000UL
+        ) {
+            shooterLastAnalyzerErrorLogMs = nowMs;
+            logWrite("Shooter analyzer failed | frame accepted fail-open");
         }
-
-        size_t remaining =
-            frame->len -
-            offset;
-
-        size_t chunk =
-            remaining < SNAPSHOT_WRITE_CHUNK
-            ? remaining
-            : SNAPSHOT_WRITE_CHUNK;
-
-        size_t written =
-            output.write(
-                frame->buf + offset,
-                chunk
-            );
-
-        if (written != chunk) {
-            writeOk = false;
-            break;
-        }
-
-        offset +=
-            written;
-
-        feedWatchdog();
-        yield();
     }
 
-    size_t jpegBytes =
-        frame->len;
+    if (continuousShooterAlarmHasPriority()) {
+        esp_camera_fb_return(frame);
+        return false;
+    }
 
+    bool queued = continuousShooterQueueJpeg(
+        scheduledWallUs,
+        captureMonoUs,
+        frame->buf,
+        frame->len,
+        (uint16_t)frame->width,
+        (uint16_t)frame->height
+    );
+
+    size_t acceptedBytes = frame->len;
     esp_camera_fb_return(frame);
 
-    bool closeOk =
-        output.closeChecked();
-
-    writeOk =
-        writeOk &&
-        closeOk;
-
-    if (!writeOk) {
-        STORAGE.remove(
-            tempPath.c_str()
-        );
-
-        if (!alarmPreempted) {
-            logWrite(
-                "Snapshot failed | SD/encryption write"
-            );
-        }
-
+    if (!queued) {
+        continuousShooterLogFailure("queue/SD persistence");
         return false;
     }
 
-    if (!STORAGE.rename(
-            tempPath.c_str(),
-            finalPath.c_str()
-        )) {
-        STORAGE.remove(
-            tempPath.c_str()
-        );
+    if (analyzed)
+        imageMotionCommitShooterReference();
 
-        logWrite(
-            "Snapshot failed | final rename"
-        );
-
-        return false;
-    }
-
-    logWrite(
-        "Snapshot saved | " +
-        finalPath +
-        " | bytes=" +
-        String((unsigned long)jpegBytes) +
-        " | warmup=" +
-        String((unsigned)SNAPSHOT_WARMUP_FRAMES) +
-        " | encrypted=" +
-        String(cfg_recording_encryption ? 1 : 0)
-    );
+    shooterLastAcceptedMonoUs = captureMonoUs;
+    ++shooterAcceptedFrames;
+    shooterAcceptedJpegBytes += acceptedBytes;
 
     return true;
 }
 
 
-static bool periodicSnapshotServiceDue()
+static void continuousShooterServiceFlush()
 {
-    periodicSnapshotRefreshScheduleState();
+    if (shooterBufferUsed == 0) {
+        if (
+            shooterBuffer &&
+            (
+                !cfg_shooter_enabled ||
+                cfg_shooter_flush_seconds <= 0
+            )
+        ) {
+            continuousShooterReleaseBuffer();
+        }
+        return;
+    }
 
-    if (snapshotScheduleCachedMinutes <= 0)
+    if (
+        shooterBufferFlushDue ||
+        continuousShooterFlushRemainingUs() <= 1000ULL
+    ) {
+        continuousShooterFlushBuffer(
+            shooterBufferFlushDue
+            ? "buffer_due"
+            : "timeout"
+        );
+    }
+}
+
+
+static bool continuousShooterServiceDue()
+{
+    continuousShooterRefreshScheduleState();
+
+    uint64_t intervalUs = continuousShooterIntervalUs();
+    if (intervalUs == 0)
         return false;
 
     int64_t wallNowUs = 0;
 
-    if (periodicSnapshotWallClockNowUs(wallNowUs)) {
-        if (!snapshotScheduleWallClockMode) {
-            snapshotScheduleWallClockMode = true;
-            snapshotFallbackNextDueUs = 0;
-            snapshotLastHandledWallSlotEpoch = -1;
+    if (continuousShooterWallClockNowUs(wallNowUs)) {
+        if (!shooterScheduleWallClockMode) {
+            shooterScheduleWallClockMode = true;
+            shooterFallbackNextDueUs = 0;
+            shooterLastHandledWallSlotUs = -1;
         }
 
-        int64_t intervalSeconds =
-            (int64_t)snapshotScheduleCachedMinutes *
-            60LL;
-
-        int64_t nowSeconds =
-            wallNowUs /
-            1000000LL;
-
-        int64_t slotEpoch =
+        int64_t slotUs =
             (
-                nowSeconds /
-                intervalSeconds
+                wallNowUs /
+                (int64_t)intervalUs
             ) *
-            intervalSeconds;
+            (int64_t)intervalUs;
 
-        if (
-            slotEpoch <=
-            snapshotLastHandledWallSlotEpoch
-        ) {
+        if (slotUs <= shooterLastHandledWallSlotUs)
             return false;
-        }
 
         int64_t slotAgeUs =
-            wallNowUs -
-            slotEpoch *
-            1000000LL;
+            wallNowUs - slotUs;
 
-        // Consume a missed slot instead of taking a late photo. This is what
-        // keeps a long alarm recording from shifting every later snapshot.
-        snapshotLastHandledWallSlotEpoch =
-            slotEpoch;
+        shooterLastHandledWallSlotUs = slotUs;
 
         if (
             slotAgeUs >
-            (int64_t)SNAPSHOT_DUE_TOLERANCE_SECONDS *
-            1000000LL
+            (int64_t)continuousShooterDueToleranceUs()
         ) {
             return false;
         }
 
-        if (periodicSnapshotAlarmHasPriority())
+        if (continuousShooterAlarmHasPriority())
             return false;
 
-        return
-            periodicSnapshotCapture(
-                slotEpoch
-            );
+        return continuousShooterCapture(slotUs);
     }
 
-    // Monotonic fallback for systems that do not yet have valid wall-clock time.
-    snapshotScheduleWallClockMode = false;
-    snapshotLastHandledWallSlotEpoch = -1;
-
-    uint64_t intervalUs =
-        (uint64_t)snapshotScheduleCachedMinutes *
-        60ULL *
-        1000000ULL;
+    shooterScheduleWallClockMode = false;
+    shooterLastHandledWallSlotUs = -1;
 
     uint64_t nowMonoUs =
         (uint64_t)esp_timer_get_time();
 
-    if (snapshotFallbackNextDueUs == 0) {
-        snapshotFallbackNextDueUs =
-            nowMonoUs +
-            intervalUs;
+    if (shooterFallbackNextDueUs == 0) {
+        shooterFallbackNextDueUs =
+            nowMonoUs + intervalUs;
         return false;
     }
 
-    if (nowMonoUs < snapshotFallbackNextDueUs)
+    if (nowMonoUs < shooterFallbackNextDueUs)
         return false;
 
-    uint64_t dueUs =
-        snapshotFallbackNextDueUs;
+    uint64_t dueUs = shooterFallbackNextDueUs;
 
     do {
-        snapshotFallbackNextDueUs +=
-            intervalUs;
-    } while (
-        snapshotFallbackNextDueUs <=
-        nowMonoUs
-    );
+        shooterFallbackNextDueUs += intervalUs;
+    } while (shooterFallbackNextDueUs <= nowMonoUs);
 
     if (
-        nowMonoUs -
-        dueUs >
-        (uint64_t)SNAPSHOT_DUE_TOLERANCE_SECONDS *
-        1000000ULL
+        nowMonoUs - dueUs >
+        continuousShooterDueToleranceUs()
     ) {
         return false;
     }
 
-    if (periodicSnapshotAlarmHasPriority())
+    if (continuousShooterAlarmHasPriority())
         return false;
 
-    return
-        periodicSnapshotCapture(
-            0
-        );
+    return continuousShooterCapture(0);
 }
 
 
-static bool periodicSnapshotHandleScheduledWake(
-    int64_t scheduledEpoch
+static bool continuousShooterHandleScheduledWake(
+    int64_t scheduledWallUs
 )
 {
-    periodicSnapshotRefreshScheduleState();
+    continuousShooterRefreshScheduleState();
 
-    if (snapshotScheduleCachedMinutes <= 0)
+    uint64_t intervalUs = continuousShooterIntervalUs();
+    if (intervalUs == 0)
         return false;
 
-    if (scheduledEpoch > 0) {
-        int64_t intervalSeconds =
-            (int64_t)snapshotScheduleCachedMinutes *
-            60LL;
-
-        // If config.txt changed while the device was asleep, do not create an
-        // image for a slot that no longer belongs to the active interval.
-        if (
-            intervalSeconds <= 0 ||
-            scheduledEpoch %
-                intervalSeconds != 0
-        ) {
-            periodicSnapshotMarkScheduledHandled(
-                scheduledEpoch
-            );
-            return false;
-        }
+    if (
+        scheduledWallUs > 0 &&
+        scheduledWallUs % (int64_t)intervalUs != 0
+    ) {
+        continuousShooterMarkScheduledHandled(
+            scheduledWallUs
+        );
+        return false;
     }
 
-    periodicSnapshotMarkScheduledHandled(
-        scheduledEpoch
+    continuousShooterMarkScheduledHandled(
+        scheduledWallUs
     );
 
-    if (periodicSnapshotAlarmHasPriority())
+    if (continuousShooterAlarmHasPriority())
         return false;
 
-    return
-        periodicSnapshotCapture(
-            scheduledEpoch
-        );
+    return continuousShooterCapture(
+        scheduledWallUs
+    );
 }
 
 
@@ -9173,23 +9867,16 @@ static bool configureSleepWakeSources()
     );
 
 
-    // Presence / PIR / LD2410S OT2: active HIGH.
-    rtc_gpio_init(
-        PIR_PIN
-    );
+    const bool presenceWakeEnabled =
+        cfg_motion_recording_enabled != 0;
 
-    rtc_gpio_set_direction(
-        PIR_PIN,
-        RTC_GPIO_MODE_INPUT_ONLY
-    );
-
-    rtc_gpio_pullup_dis(
-        PIR_PIN
-    );
-
-    rtc_gpio_pulldown_en(
-        PIR_PIN
-    );
+    if (presenceWakeEnabled) {
+        // Presence / PIR / LD2410S OT2: active HIGH.
+        rtc_gpio_init(PIR_PIN);
+        rtc_gpio_set_direction(PIR_PIN, RTC_GPIO_MODE_INPUT_ONLY);
+        rtc_gpio_pullup_dis(PIR_PIN);
+        rtc_gpio_pulldown_en(PIR_PIN);
+    }
 
 
     esp_err_t magnetErr =
@@ -9199,15 +9886,19 @@ static bool configureSleepWakeSources()
         );
 
 
-    uint64_t presenceMask =
-        1ULL <<
-        (uint32_t)PIR_PIN;
+    esp_err_t presenceErr = ESP_OK;
 
-    esp_err_t presenceErr =
-        esp_sleep_enable_ext1_wakeup(
-            presenceMask,
-            ESP_EXT1_WAKEUP_ANY_HIGH
-        );
+    if (presenceWakeEnabled) {
+        uint64_t presenceMask =
+            1ULL <<
+            (uint32_t)PIR_PIN;
+
+        presenceErr =
+            esp_sleep_enable_ext1_wakeup(
+                presenceMask,
+                ESP_EXT1_WAKEUP_ANY_HIGH
+            );
+    }
 
 
     if (
@@ -9233,18 +9924,14 @@ static bool configureSleepWakeSources()
             MAGNET_SWITCH_PIN
         );
 
-        rtc_gpio_deinit(
-            PIR_PIN
-        );
+        if (presenceWakeEnabled) {
+            rtc_gpio_deinit(PIR_PIN);
+            pinMode(PIR_PIN, INPUT_PULLDOWN);
+        }
 
         pinMode(
             MAGNET_SWITCH_PIN,
             INPUT_PULLUP
-        );
-
-        pinMode(
-            PIR_PIN,
-            INPUT_PULLDOWN
         );
 
         motionDiagnosticsResumePresenceInterrupt();
@@ -9252,30 +9939,34 @@ static bool configureSleepWakeSources()
         return false;
     }
 
-    snapshotDeepSleepRtcMagic = 0;
-    snapshotDeepSleepScheduledEpoch = 0;
+    shooterDeepSleepRtcMagic = 0;
+    shooterDeepSleepScheduledWallUs = 0;
 
-    uint64_t snapshotDelayUs = 0;
-    int64_t snapshotScheduledEpoch = 0;
+    uint64_t shooterDelayUs = 0;
+    int64_t shooterScheduledWallUs = 0;
+    uint8_t shooterWakeKind = SHOOTER_WAKE_NONE;
 
-    if (periodicSnapshotNextWakeDelayUs(
-            snapshotDelayUs,
-            snapshotScheduledEpoch
-        )) {
+    if (continuousShooterNextWakeDelayUs(
+            shooterDelayUs,
+            shooterScheduledWallUs,
+            shooterWakeKind
+        ) &&
+        shooterWakeKind == SHOOTER_WAKE_SAMPLE
+    ) {
         esp_err_t timerErr =
             esp_sleep_enable_timer_wakeup(
-                snapshotDelayUs
+                shooterDelayUs
             );
 
         if (timerErr == ESP_OK) {
-            snapshotDeepSleepRtcMagic =
-                SNAPSHOT_DEEP_SLEEP_RTC_MAGIC;
+            shooterDeepSleepRtcMagic =
+                SHOOTER_DEEP_SLEEP_RTC_MAGIC;
 
-            snapshotDeepSleepScheduledEpoch =
-                snapshotScheduledEpoch;
+            shooterDeepSleepScheduledWallUs =
+                shooterScheduledWallUs;
         } else if (cfg_debug_enabled) {
             powerConsole(
-                "Snapshot deep-sleep timer setup failed | error=0x%x",
+                "Shooter deep-sleep timer setup failed | error=0x%x",
                 timerErr
             );
         }
@@ -9312,21 +10003,28 @@ static bool configureLightSleepWakeSources()
     rtc_gpio_hold_dis(PIR_PIN);
     rtc_gpio_hold_dis(MAGNET_SWITCH_PIN);
 
-    // Presence / PIR / OT2: active HIGH.
-    esp_err_t presenceRtcErr =
-        rtc_gpio_init(PIR_PIN);
+    const bool presenceWakeEnabled =
+        cfg_motion_recording_enabled != 0;
 
-    if (presenceRtcErr == ESP_OK) {
-        presenceRtcErr =
-            rtc_gpio_set_direction(
-                PIR_PIN,
-                RTC_GPIO_MODE_INPUT_ONLY
-            );
-    }
+    // Presence / PIR / OT2: active HIGH only while automatic motion recording
+    // is enabled. Shooter-only mode therefore ignores presence wake events.
+    esp_err_t presenceRtcErr = ESP_OK;
 
-    if (presenceRtcErr == ESP_OK) {
-        rtc_gpio_pullup_dis(PIR_PIN);
-        rtc_gpio_pulldown_en(PIR_PIN);
+    if (presenceWakeEnabled) {
+        presenceRtcErr = rtc_gpio_init(PIR_PIN);
+
+        if (presenceRtcErr == ESP_OK) {
+            presenceRtcErr =
+                rtc_gpio_set_direction(
+                    PIR_PIN,
+                    RTC_GPIO_MODE_INPUT_ONLY
+                );
+        }
+
+        if (presenceRtcErr == ESP_OK) {
+            rtc_gpio_pullup_dis(PIR_PIN);
+            rtc_gpio_pulldown_en(PIR_PIN);
+        }
     }
 
     // Magnet / reed: active LOW.
@@ -9346,19 +10044,18 @@ static bool configureLightSleepWakeSources()
         rtc_gpio_pulldown_dis(MAGNET_SWITCH_PIN);
     }
 
-    esp_err_t presenceErr = ESP_FAIL;
+    esp_err_t presenceErr = ESP_OK;
     esp_err_t magnetErr = ESP_FAIL;
 
-    if (
-        presenceRtcErr == ESP_OK &&
-        magnetRtcErr == ESP_OK
-    ) {
-        // Dedicated RTC_IO wake: PIR/OT2 HIGH.
-        presenceErr =
-            esp_sleep_enable_ext0_wakeup(
-                PIR_PIN,
-                1
-            );
+    if (magnetRtcErr == ESP_OK) {
+        if (presenceWakeEnabled && presenceRtcErr == ESP_OK) {
+            // Dedicated RTC_IO wake: PIR/OT2 HIGH.
+            presenceErr =
+                esp_sleep_enable_ext0_wakeup(
+                    PIR_PIN,
+                    1
+                );
+        }
 
         // Dedicated RTC controller wake: magnet LOW.
         const uint64_t magnetMask =
@@ -9394,36 +10091,43 @@ static bool configureLightSleepWakeSources()
             ESP_SLEEP_WAKEUP_EXT1
         );
 
-        rtc_gpio_deinit(PIR_PIN);
+        if (presenceWakeEnabled) {
+            rtc_gpio_deinit(PIR_PIN);
+            pinMode(PIR_PIN, INPUT_PULLDOWN);
+        }
         rtc_gpio_deinit(MAGNET_SWITCH_PIN);
 
-        pinMode(PIR_PIN, INPUT_PULLDOWN);
         pinMode(MAGNET_SWITCH_PIN, INPUT_PULLUP);
 
         motionDiagnosticsResumePresenceInterrupt();
         return false;
     }
 
-    snapshotLightSleepScheduledEpoch = 0;
+    shooterLightSleepScheduledWallUs = 0;
+    shooterLightSleepWakeKind = SHOOTER_WAKE_NONE;
 
-    uint64_t snapshotDelayUs = 0;
-    int64_t snapshotScheduledEpoch = 0;
+    uint64_t shooterDelayUs = 0;
+    int64_t shooterScheduledWallUs = 0;
+    uint8_t shooterWakeKind = SHOOTER_WAKE_NONE;
 
-    if (periodicSnapshotNextWakeDelayUs(
-            snapshotDelayUs,
-            snapshotScheduledEpoch
+    if (continuousShooterNextWakeDelayUs(
+            shooterDelayUs,
+            shooterScheduledWallUs,
+            shooterWakeKind
         )) {
         esp_err_t timerErr =
             esp_sleep_enable_timer_wakeup(
-                snapshotDelayUs
+                shooterDelayUs
             );
 
         if (timerErr == ESP_OK) {
-            snapshotLightSleepScheduledEpoch =
-                snapshotScheduledEpoch;
+            shooterLightSleepScheduledWallUs =
+                shooterScheduledWallUs;
+            shooterLightSleepWakeKind =
+                shooterWakeKind;
         } else if (cfg_debug_enabled) {
             powerConsole(
-                "Snapshot light-sleep timer setup failed | error=0x%x",
+                "Shooter light-sleep timer setup failed | error=0x%x",
                 timerErr
             );
         }
@@ -10161,18 +10865,34 @@ static bool tryEnterStorageFaultLowPower()
 
 static void enterDeepSleep()
 {
+    // PSRAM does not survive deep sleep. Preserve every accepted shooter frame
+    // before the reboot-style sleep transition. If persistence cannot complete,
+    // stay awake rather than knowingly discarding queued images.
+    if (
+        shooterBufferUsed > 0 &&
+        !continuousShooterFlushBuffer("before_deep_sleep")
+    ) {
+        return;
+    }
+
     if (!configureSleepWakeSources())
         return;
 
 
-    powerConsole(
-        "Entering deep sleep | wake=presence GPIO%d HIGH OR magnet GPIO%d LOW%s",
-        PIR_PIN,
-        MAGNET_SWITCH_PIN,
-        cfg_periodic_snapshot_minutes > 0
-            ? " OR periodic snapshot timer"
-            : ""
-    );
+    if (cfg_motion_recording_enabled) {
+        powerConsole(
+            "Entering deep sleep | wake=presence GPIO%d HIGH OR magnet GPIO%d LOW%s",
+            PIR_PIN,
+            MAGNET_SWITCH_PIN,
+            cfg_shooter_enabled ? " OR shooter timer" : ""
+        );
+    } else {
+        powerConsole(
+            "Entering deep sleep | wake=magnet GPIO%d LOW%s",
+            MAGNET_SWITCH_PIN,
+            cfg_shooter_enabled ? " OR shooter timer" : ""
+        );
+    }
 
     sleepDiagState =
         SLEEP_DIAG_UNKNOWN;
@@ -10260,14 +10980,27 @@ static bool enterLightSleep()
         return false;
 
 
-    powerConsole(
-        "Entering light sleep | RTC wake=presence EXT0 GPIO%d HIGH OR magnet EXT1 GPIO%d LOW%s",
-        PIR_PIN,
-        MAGNET_SWITCH_PIN,
-        cfg_periodic_snapshot_minutes > 0
-            ? " OR periodic snapshot timer"
-            : ""
-    );
+    const bool repetitiveShooterSleep =
+        cfg_shooter_enabled &&
+        shooterLightSleepWakeKind != SHOOTER_WAKE_NONE &&
+        !cfg_debug_enabled;
+
+    if (!repetitiveShooterSleep) {
+        if (cfg_motion_recording_enabled) {
+            powerConsole(
+                "Entering light sleep | RTC wake=presence EXT0 GPIO%d HIGH OR magnet EXT1 GPIO%d LOW%s",
+                PIR_PIN,
+                MAGNET_SWITCH_PIN,
+                cfg_shooter_enabled ? " OR shooter timer" : ""
+            );
+        } else {
+            powerConsole(
+                "Entering light sleep | RTC wake=magnet EXT1 GPIO%d LOW%s",
+                MAGNET_SWITCH_PIN,
+                cfg_shooter_enabled ? " OR shooter timer" : ""
+            );
+        }
+    }
 
     sleepDiagState =
         SLEEP_DIAG_UNKNOWN;
@@ -10462,7 +11195,7 @@ static bool enterLightSleep()
         wakeCause ==
         ESP_SLEEP_WAKEUP_EXT1;
 
-    const bool wokeBySnapshotTimer =
+    const bool wokeByShooterTimer =
         wakeCause ==
         ESP_SLEEP_WAKEUP_TIMER;
 
@@ -10511,18 +11244,18 @@ static bool enterLightSleep()
 
     // Preserve a real PIR/OT2 EXT0 wake immediately. A timer wake may coincide
     // with a rising presence signal; sample that physical input before doing any
-    // snapshot work so alarm recording still gets the same priority.
+    // shooter work so alarm recording still gets the same priority.
     if (
         wokeByPresence ||
         (
-            wokeBySnapshotTimer &&
+            wokeByShooterTimer &&
             digitalRead(PIR_PIN) == HIGH
         )
     ) {
         motionDiagnosticsNotePresenceTrigger();
     }
 
-    if (wokeBySnapshotTimer) {
+    if (wokeByShooterTimer) {
         // Drain the live radar/diagnostics once before classifying a simultaneous
         // TIMER + motion condition. This is RAM/UART work only; no SD/log delay.
         radarLoop();
@@ -10530,7 +11263,7 @@ static bool enterLightSleep()
     }
 
     const bool timerWakeMotionActive =
-        wokeBySnapshotTimer &&
+        wokeByShooterTimer &&
         motionDetected();
 
     const bool recordingWakeFromSleep =
@@ -10543,7 +11276,7 @@ static bool enterLightSleep()
 
     // Arm the end-to-end timing sample for every sleep wake that can immediately
     // lead to recording. A coincident TIMER + motion event is treated exactly
-    // like a presence wake so snapshot scheduling cannot add console latency.
+    // like a presence wake so shooter scheduling cannot add console latency.
     if (
         cfg_debug_enabled &&
         recordingWakeFromSleep &&
@@ -10569,7 +11302,7 @@ static bool enterLightSleep()
     // here: some hosts stall the first Serial.printf() for hundreds of
     // milliseconds after light sleep. This also covers a timer wake that lands
     // at the same moment as motion; the alarm path must remain faster than the
-    // periodic snapshot path.
+    // continuous shooter path.
     if (
         recordingWakeFromSleep &&
         wakeCanStartRecording
@@ -10583,50 +11316,94 @@ static bool enterLightSleep()
         deferredWakeCameraWakeOk = cameraWakeOk;
         deferredSleepLogPending = true;
     } else {
-        powerConsole(
-            "Wake from light sleep | cause=%s(%d) | slept=%llu ms | camera_wake=%llu us%s",
-            sleepWakeCauseName(
-                wakeCause
-            ),
-            (int)wakeCause,
-            (unsigned long long)(
-                sleptUs /
-                1000ULL
-            ),
-            (unsigned long long)(
-                cameraWakeDoneUs -
-                wakeStartUs
-            ),
-            fastCameraSleep
-                ? (cameraWakeOk ? "" : " FAILED")
-                : " (normal-init fallback)"
-        );
+        const bool pureShooterTimerWake =
+            wokeByShooterTimer &&
+            !timerWakeMotionActive &&
+            !wokeByMagnet;
 
-        logSleepCycle(
-            "light",
-            wakeCause,
-            sleptUs / 1000ULL
-        );
+        if (pureShooterTimerWake) {
+            uint32_t sleptMs =
+                (uint32_t)(sleptUs / 1000ULL);
+
+            shooterSleepCyclesPending++;
+            shooterSleepTotalMsPending += sleptMs;
+
+            if (
+                shooterSleepMinMsPending == 0 ||
+                sleptMs < shooterSleepMinMsPending
+            ) {
+                shooterSleepMinMsPending = sleptMs;
+            }
+
+            if (sleptMs > shooterSleepMaxMsPending)
+                shooterSleepMaxMsPending = sleptMs;
+
+            // Keep per-cycle console diagnostics available only in debug mode.
+            // Normal low-power operation avoids formatting/USB traffic twice a
+            // second solely for repetitive shooter timer wakes.
+            if (cfg_debug_enabled) {
+                powerConsole(
+                    "Wake from light sleep | cause=%s(%d) | slept=%llu ms | camera_wake=%llu us%s",
+                    sleepWakeCauseName(wakeCause),
+                    (int)wakeCause,
+                    (unsigned long long)(sleptUs / 1000ULL),
+                    (unsigned long long)(cameraWakeDoneUs - wakeStartUs),
+                    fastCameraSleep
+                        ? (cameraWakeOk ? "" : " FAILED")
+                        : " (normal-init fallback)"
+                );
+            }
+        } else {
+            powerConsole(
+                "Wake from light sleep | cause=%s(%d) | slept=%llu ms | camera_wake=%llu us%s",
+                sleepWakeCauseName(
+                    wakeCause
+                ),
+                (int)wakeCause,
+                (unsigned long long)(
+                    sleptUs /
+                    1000ULL
+                ),
+                (unsigned long long)(
+                    cameraWakeDoneUs -
+                    wakeStartUs
+                ),
+                fastCameraSleep
+                    ? (cameraWakeOk ? "" : " FAILED")
+                    : " (normal-init fallback)"
+            );
+
+            logSleepCycle(
+                "light",
+                wakeCause,
+                sleptUs / 1000ULL
+            );
+        }
     }
 
 
-    if (wokeBySnapshotTimer) {
-        // Consume this exact schedule slot once. A simultaneous alarm or magnet
-        // deliberately skips the photo rather than taking it late afterwards.
+    if (wokeByShooterTimer) {
+        // A timer wake may be either a sample slot or a persistence deadline.
+        // Motion/magnet always wins over shooter work.
         if (
             timerWakeMotionActive ||
             digitalRead(MAGNET_SWITCH_PIN) == LOW
         ) {
-            periodicSnapshotMarkScheduledHandled(
-                snapshotLightSleepScheduledEpoch
-            );
-        } else {
-            periodicSnapshotHandleScheduledWake(
-                snapshotLightSleepScheduledEpoch
+            if (shooterLightSleepWakeKind == SHOOTER_WAKE_SAMPLE) {
+                continuousShooterMarkScheduledHandled(
+                    shooterLightSleepScheduledWallUs
+                );
+            }
+        } else if (shooterLightSleepWakeKind == SHOOTER_WAKE_FLUSH) {
+            continuousShooterFlushBuffer("light_sleep_timeout");
+        } else if (shooterLightSleepWakeKind == SHOOTER_WAKE_SAMPLE) {
+            continuousShooterHandleScheduledWake(
+                shooterLightSleepScheduledWallUs
             );
         }
 
-        snapshotLightSleepScheduledEpoch = 0;
+        shooterLightSleepScheduledWallUs = 0;
+        shooterLightSleepWakeKind = SHOOTER_WAKE_NONE;
     }
 
 
@@ -10666,9 +11443,19 @@ static bool enterLightSleep()
         SLEEP_DIAG_UNKNOWN;
 
 
-    // Give the next idle period a fresh delay. If presence caused the EXT0
-    // wake, the next loop iteration starts recording immediately.
-    resetSleepDelayTimer();
+    // A pure shooter timer wake should return to light sleep immediately after
+    // capture/flush. Presence or magnet wakes retain the ordinary idle delay.
+    if (
+        wokeByShooterTimer &&
+        !timerWakeMotionActive &&
+        !wokeByMagnet
+    ) {
+        sleepIdleSinceMs =
+            millis() -
+            (uint32_t)max(cfg_sleep_delay_ms, 0);
+    } else {
+        resetSleepDelayTimer();
+    }
 
     return true;
 }
@@ -10737,7 +11524,10 @@ static bool tryEnterConfiguredSleep()
     }
 
 
-    if (!presenceWakeIsClear()) {
+    if (
+        cfg_motion_recording_enabled &&
+        !presenceWakeIsClear()
+    ) {
 
         if (
             sleepDiagState !=
@@ -11461,21 +12251,20 @@ void setup() {
         wakeCause == ESP_SLEEP_WAKEUP_TIMER &&
         storageFaultRtcMagic == STORAGE_FAULT_RTC_MAGIC;
 
-    const bool periodicSnapshotTimerWake =
+    const bool shooterTimerWake =
         resetReason == ESP_RST_DEEPSLEEP &&
         wakeCause == ESP_SLEEP_WAKEUP_TIMER &&
-        snapshotDeepSleepRtcMagic == SNAPSHOT_DEEP_SLEEP_RTC_MAGIC;
+        shooterDeepSleepRtcMagic == SHOOTER_DEEP_SLEEP_RTC_MAGIC;
 
-    const int64_t periodicSnapshotWakeEpoch =
-        periodicSnapshotTimerWake
-        ? snapshotDeepSleepScheduledEpoch
+    const int64_t shooterWakeWallUs =
+        shooterTimerWake
+        ? shooterDeepSleepScheduledWallUs
         : 0;
 
-    // Consume the snapshot sleep marker exactly once. Presence/magnet wakes from
-    // the same deep-sleep cycle must never leave a stale TIMER classification for
-    // a later reboot.
-    snapshotDeepSleepRtcMagic = 0;
-    snapshotDeepSleepScheduledEpoch = 0;
+    // Consume the shooter sleep marker exactly once. Presence/magnet wakes from
+    // the same deep-sleep cycle must never leave a stale TIMER classification.
+    shooterDeepSleepRtcMagic = 0;
+    shooterDeepSleepScheduledWallUs = 0;
 
     if (resetReason != ESP_RST_DEEPSLEEP) {
         normalDeepSleepRtcMagic = 0;
@@ -11524,7 +12313,7 @@ void setup() {
         );
     }
 
-    if (periodicSnapshotTimerWake) {
+    if (shooterTimerWake) {
         // Normal deep sleep configured BOTH service inputs as RTC wake pads.
         // A timer wake leaves neither one as the reported wake cause, so restore
         // both explicitly before ordinary GPIO/diagnostic initialization.
@@ -12313,16 +13102,18 @@ void setup() {
 
     }
 
-    else if (periodicSnapshotTimerWake) {
+    else if (shooterTimerWake) {
 
         Serial.println(
-            "Wake reason: PERIODIC SNAPSHOT"
+            "Wake reason: CONTINUOUS SHOOTER"
         );
 
-        periodicSnapshotHandleScheduledWake(
-            periodicSnapshotWakeEpoch
+        continuousShooterHandleScheduledWake(
+            shooterWakeWallUs
         );
 
+        // Deep sleep reboots the device, so there is no retained PSRAM queue
+        // from the previous cycle. Start the normal idle delay after capture.
         resetSleepDelayTimer();
 
     }
@@ -12583,13 +13374,16 @@ void loop() {
     }
 
 
-    // Keep the snapshot clock serviced even while an alarm video is running.
-    // periodicSnapshotServiceDue() consumes the current fixed slot before it
-    // attempts a capture; because capture is blocked during recording, an
-    // overlapping snapshot is therefore skipped instead of being taken late.
-    if (periodicSnapshotServiceDue()) {
-        resetSleepDelayTimer();
-    }
+    // Service persistence before sampling. A due flush is harmless while the
+    // recorder owns storage: it simply remains queued until the recorder stops.
+    continuousShooterServiceFlush();
+
+    // Keep the shooter clock serviced even while an alarm video is running.
+    // The fixed slot is consumed before capture, so an overlapping alarm skips
+    // that sample instead of shifting every later slot. Shooter work deliberately
+    // does NOT reset the idle-sleep timer; at high sample rates this allows the
+    // device to return to light sleep between timer wakes.
+    continuousShooterServiceDue();
 
 
     // ---------------------------------------------------------

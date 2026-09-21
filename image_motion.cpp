@@ -49,6 +49,14 @@ static bool workFrameChanged[IMAGE_MOTION_GRID_CELLS] = {};
 static bool workVisited[IMAGE_MOTION_GRID_CELLS] = {};
 static uint16_t workStack[IMAGE_MOTION_GRID_CELLS] = {};
 
+// Continuous-shooter similarity state. It is deliberately independent from the
+// adaptive motion background and from previousBlockMeans. The reference changes
+// only when the shooter accepts an image for persistence.
+static uint8_t shooterMeasuredBlockMeans[IMAGE_MOTION_GRID_CELLS] = {};
+static uint8_t shooterReferenceBlockMeans[IMAGE_MOTION_GRID_CELLS] = {};
+static bool shooterMeasuredReady = false;
+static bool shooterReferenceReady = false;
+
 // Separate RAM-only diagnostic ring buffer. The preferred 400 samples live in
 // PSRAM so normal internal heap pressure stays low. A smaller internal-RAM
 // fallback keeps diagnostics available on unusual builds without PSRAM.
@@ -564,11 +572,13 @@ static uint16_t minimumMotionBlocks(uint16_t activeBlocks)
     if (activeBlocks == 0)
         return 0;
 
+    float requestedBlocks =
+        ((float)activeBlocks *
+         cfg_image_motion_min_area_pct) /
+        100.0f;
+
     uint32_t blocks =
-        ((uint32_t)activeBlocks *
-         (uint32_t)cfg_image_motion_min_area_pct +
-         99U) /
-        100U;
+        (uint32_t)ceilf(requestedBlocks);
 
     if (blocks < 1)
         blocks = 1;
@@ -1175,7 +1185,7 @@ bool imageMotionAnalyzeJpeg(
     diagnostics.motionScore =
         diagnostics.minimumMotionBlocks > 0
         ? diagnostics.changedAreaPct /
-            max(1.0f, (float)cfg_image_motion_min_area_pct)
+            max(0.1f, cfg_image_motion_min_area_pct)
         : 0.0f;
 
     bool positive =
@@ -1255,6 +1265,194 @@ bool imageMotionAnalyzeJpeg(
     lastAnalysisCompletedMs = completedMs;
     captureDiagnosticSample(diagnostics, sourceWidth, sourceHeight);
     return true;
+}
+
+
+
+bool imageMotionAnalyzeShooterJpeg(
+    const uint8_t *jpeg,
+    size_t jpegLength,
+    uint16_t sourceWidth,
+    uint16_t sourceHeight,
+    ShooterImageMetrics &metrics
+)
+{
+    metrics = {};
+    shooterMeasuredReady = false;
+
+    if (
+        !jpeg || jpegLength == 0 ||
+        sourceWidth < IMAGE_MOTION_GRID_WIDTH ||
+        sourceHeight < IMAGE_MOTION_GRID_HEIGHT
+    ) {
+        return false;
+    }
+
+    const uint16_t scaledWidth = (uint16_t)(sourceWidth / 8U);
+    const uint16_t scaledHeight = (uint16_t)(sourceHeight / 8U);
+
+    if (
+        scaledWidth < IMAGE_MOTION_GRID_WIDTH ||
+        scaledHeight < IMAGE_MOTION_GRID_HEIGHT
+    ) {
+        return false;
+    }
+
+    size_t needed =
+        (size_t)scaledWidth *
+        (size_t)scaledHeight *
+        2U + 512U;
+
+    if (!ensureDecodeBuffer(needed))
+        return false;
+
+    uint32_t startedMs = millis();
+    uint32_t decodeStartedMs = millis();
+
+    if (!jpg2rgb565(
+            jpeg,
+            jpegLength,
+            rgb565Buffer,
+            JPG_SCALE_8X
+        )) {
+        metrics.decodeMs = millis() - decodeStartedMs;
+        metrics.analyzeFrameMs = millis() - startedMs;
+        return false;
+    }
+
+    metrics.decodeMs = millis() - decodeStartedMs;
+
+    memset(workBlockSums, 0, sizeof(workBlockSums));
+    memset(workBlockCounts, 0, sizeof(workBlockCounts));
+    memset(workBlockMeans, 0, sizeof(workBlockMeans));
+
+    for (uint16_t y = 0; y < scaledHeight; ++y) {
+        uint8_t by = (uint8_t)(
+            ((uint32_t)y * IMAGE_MOTION_GRID_HEIGHT) /
+            scaledHeight
+        );
+        if (by >= IMAGE_MOTION_GRID_HEIGHT)
+            by = IMAGE_MOTION_GRID_HEIGHT - 1U;
+
+        for (uint16_t x = 0; x < scaledWidth; ++x) {
+            uint8_t bx = (uint8_t)(
+                ((uint32_t)x * IMAGE_MOTION_GRID_WIDTH) /
+                scaledWidth
+            );
+        if (bx >= IMAGE_MOTION_GRID_WIDTH)
+                bx = IMAGE_MOTION_GRID_WIDTH - 1U;
+
+            uint16_t block =
+                (uint16_t)by * IMAGE_MOTION_GRID_WIDTH + bx;
+
+            const uint8_t *pixel =
+                rgb565Buffer +
+                (((size_t)y * scaledWidth + x) * 2U);
+
+            workBlockSums[block] += grayFromRgb565(pixel);
+            workBlockCounts[block]++;
+        }
+    }
+
+    uint32_t globalSum = 0;
+    uint16_t validBlocks = 0;
+    uint8_t brightestBlockMean = 0;
+
+    for (uint16_t i = 0; i < IMAGE_MOTION_GRID_CELLS; ++i) {
+        if (workBlockCounts[i] == 0)
+            continue;
+
+        workBlockMeans[i] = (uint8_t)(
+            workBlockSums[i] /
+            workBlockCounts[i]
+        );
+
+        globalSum += workBlockMeans[i];
+        if (workBlockMeans[i] > brightestBlockMean)
+            brightestBlockMean = workBlockMeans[i];
+        ++validBlocks;
+    }
+
+    if (validBlocks == 0)
+        return false;
+
+    metrics.globalMean =
+        (float)globalSum /
+        (float)validBlocks;
+    metrics.brightestBlockMean =
+        brightestBlockMean;
+
+    metrics.referenceReady =
+        shooterReferenceReady;
+
+    if (shooterReferenceReady) {
+        uint32_t absDiffSum = 0;
+        uint16_t changedGe5 = 0;
+        uint16_t maxAbsDiff = 0;
+
+        for (uint16_t i = 0; i < IMAGE_MOTION_GRID_CELLS; ++i) {
+            uint16_t difference = (uint16_t)abs(
+                (int)workBlockMeans[i] -
+                (int)shooterReferenceBlockMeans[i]
+            );
+
+            absDiffSum += difference;
+            if (difference >= 5U)
+                ++changedGe5;
+            if (difference > maxAbsDiff)
+                maxAbsDiff = difference;
+        }
+
+        metrics.changedBlocksGe5 = changedGe5;
+        metrics.meanAbsDiffX10 = (uint16_t)(
+            (absDiffSum * 10UL + IMAGE_MOTION_GRID_CELLS / 2U) /
+            IMAGE_MOTION_GRID_CELLS
+        );
+        metrics.maxAbsDiff = maxAbsDiff;
+        metrics.similarityPct =
+            100.0f -
+            ((float)changedGe5 * 100.0f /
+             (float)IMAGE_MOTION_GRID_CELLS);
+
+        if (metrics.similarityPct < 0.0f)
+            metrics.similarityPct = 0.0f;
+    } else {
+        metrics.similarityPct = 0.0f;
+    }
+
+    memcpy(
+        shooterMeasuredBlockMeans,
+        workBlockMeans,
+        sizeof(shooterMeasuredBlockMeans)
+    );
+    shooterMeasuredReady = true;
+    metrics.analyzeFrameMs = millis() - startedMs;
+    return true;
+}
+
+
+bool imageMotionCommitShooterReference()
+{
+    if (!shooterMeasuredReady)
+        return false;
+
+    memcpy(
+        shooterReferenceBlockMeans,
+        shooterMeasuredBlockMeans,
+        sizeof(shooterReferenceBlockMeans)
+    );
+
+    shooterReferenceReady = true;
+    return true;
+}
+
+
+void imageMotionResetShooterReference()
+{
+    shooterMeasuredReady = false;
+    shooterReferenceReady = false;
+    memset(shooterMeasuredBlockMeans, 0, sizeof(shooterMeasuredBlockMeans));
+    memset(shooterReferenceBlockMeans, 0, sizeof(shooterReferenceBlockMeans));
 }
 
 

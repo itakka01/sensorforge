@@ -9,6 +9,7 @@
 #include <time.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 
 // =============================================================
@@ -43,16 +44,22 @@ int cfg_led_enabled = 1;
 String cfg_recording_format = "avi";
 int cfg_timestamp_enabled   = 1;
 int cfg_recording_encryption = 0;
-int cfg_periodic_snapshot_minutes = 0;
+int cfg_shooter_enabled = 0;
+int cfg_shooter_interval_ms = 60000;
+int cfg_shooter_dark_mean_min = 20;
+float cfg_shooter_min_change_pct = 1.0f;
+int cfg_shooter_force_save_seconds = 60;
+int cfg_shooter_flush_seconds = 300;
 int cfg_recording_segment_seconds = 30;
 int cfg_recording_segment_max_mb  = 20;
 int cfg_recording_event_max_seconds = 60;
 int cfg_recording_event_cooldown_seconds = 120;
 String cfg_recording_not_before = "off";
 
+int cfg_motion_recording_enabled = 1;
 String cfg_motion_recording_decision = "direct";
 int cfg_image_motion_sensitivity = 5;
-int cfg_image_motion_min_area_pct = 6;
+float cfg_image_motion_min_area_pct = 6.0f;
 int cfg_image_motion_confirm_frames = 2;
 int cfg_image_motion_release_frames = 2;
 int cfg_image_motion_background_learning = 4;
@@ -367,15 +374,21 @@ struct ConfigValues {
     String recordingFormat;
     int timestampEnabled;
     int recordingEncryption;
-    int periodicSnapshotMinutes;
+    int shooterEnabled;
+    int shooterIntervalMs;
+    int shooterDarkMeanMin;
+    float shooterMinChangePct;
+    int shooterForceSaveSeconds;
+    int shooterFlushSeconds;
     int recordingSegmentSeconds;
     int recordingSegmentMaxMb;
     int recordingEventMaxSeconds;
     int recordingEventCooldownSeconds;
     String recordingNotBefore;
+    int motionRecordingEnabled;
     String motionRecordingDecision;
     int imageMotionSensitivity;
-    int imageMotionMinAreaPct;
+    float imageMotionMinAreaPct;
     int imageMotionConfirmFrames;
     int imageMotionReleaseFrames;
     int imageMotionBackgroundLearning;
@@ -438,12 +451,19 @@ struct ConfigSeen {
     bool recordingFormat;
     bool timestampEnabled;
     bool recordingEncryption;
-    bool periodicSnapshotMinutes;
+    bool shooterEnabled;
+    bool shooterIntervalMs;
+    bool shooterDarkMeanMin;
+    bool shooterMinChangePct;
+    bool shooterSimilarityThreshold; // legacy alias
+    bool shooterForceSaveSeconds;
+    bool shooterFlushSeconds;
     bool recordingSegmentSeconds;
     bool recordingSegmentMaxMb;
     bool recordingEventMaxSeconds;
     bool recordingEventCooldownSeconds;
     bool recordingNotBefore;
+    bool motionRecordingEnabled;
     bool motionRecordingDecision;
     bool imageMotionEnabled;
     bool imageMotionSensitivity;
@@ -553,8 +573,23 @@ static ConfigValues makeDefaultValues()
     values.recordingEncryption =
         0;
 
-    values.periodicSnapshotMinutes =
+    values.shooterEnabled =
         0;
+
+    values.shooterIntervalMs =
+        60000;
+
+    values.shooterDarkMeanMin =
+        20;
+
+    values.shooterMinChangePct =
+        1.0f;
+
+    values.shooterForceSaveSeconds =
+        60;
+
+    values.shooterFlushSeconds =
+        300;
 
     values.recordingSegmentSeconds =
         30;
@@ -571,6 +606,9 @@ static ConfigValues makeDefaultValues()
     values.recordingNotBefore =
         "off";
 
+    values.motionRecordingEnabled =
+        1;
+
     values.motionRecordingDecision =
         "direct";
 
@@ -578,7 +616,7 @@ static ConfigValues makeDefaultValues()
         5;
 
     values.imageMotionMinAreaPct =
-        6;
+        6.0f;
 
     values.imageMotionConfirmFrames =
         2;
@@ -741,6 +779,42 @@ static bool parseIntegerStrict(
 
     value =
         text.toInt();
+
+    return true;
+}
+
+
+static bool parseFloatStrict(
+    const String &text,
+    float &value
+)
+{
+    if (!text.length())
+        return false;
+
+    const char *start =
+        text.c_str();
+
+    char *end =
+        nullptr;
+
+    double parsed =
+        strtod(
+            start,
+            &end
+        );
+
+    if (
+        end == start ||
+        !end ||
+        *end != '\0' ||
+        !isfinite(parsed)
+    ) {
+        return false;
+    }
+
+    value =
+        (float)parsed;
 
     return true;
 }
@@ -1379,12 +1453,79 @@ static bool validateValues(
     }
 
     if (
-        values.periodicSnapshotMinutes < 0 ||
-        values.periodicSnapshotMinutes > 1440
+        values.shooterEnabled != 0 &&
+        values.shooterEnabled != 1
+    ) {
+        error = "shooter_enabled must be 0 or 1";
+        return false;
+    }
+
+    if (
+        values.shooterIntervalMs != 0 &&
+        (
+            values.shooterIntervalMs < 250 ||
+            values.shooterIntervalMs > 86400000
+        )
     ) {
         error =
-            "periodic_snapshot_minutes out of range (0..1440)";
+            "shooter_interval_ms must be 0 or 250..86400000";
+        return false;
+    }
 
+    if (
+        values.shooterEnabled &&
+        values.shooterIntervalMs == 0
+    ) {
+        error =
+            "shooter_enabled requires shooter_interval_ms >= 250";
+        return false;
+    }
+
+    if (
+        values.shooterDarkMeanMin < 0 ||
+        values.shooterDarkMeanMin > 255
+    ) {
+        error =
+            "shooter_dark_mean_min out of range (0..255)";
+        return false;
+    }
+
+    if (
+        values.shooterMinChangePct < 0.0f ||
+        values.shooterMinChangePct > 100.0f ||
+        (
+            values.shooterMinChangePct > 0.0f &&
+            values.shooterMinChangePct < 0.1f
+        )
+    ) {
+        error =
+            "shooter_min_change_pct must be 0 or 0.1..100.0";
+        return false;
+    }
+
+    if (
+        values.shooterForceSaveSeconds < 0 ||
+        values.shooterForceSaveSeconds > 86400
+    ) {
+        error =
+            "shooter_force_save_seconds out of range (0..86400)";
+        return false;
+    }
+
+    if (
+        values.shooterFlushSeconds < 0 ||
+        values.shooterFlushSeconds > 3600
+    ) {
+        error =
+            "shooter_flush_seconds out of range (0..3600)";
+        return false;
+    }
+
+    if (
+        values.motionRecordingEnabled != 0 &&
+        values.motionRecordingEnabled != 1
+    ) {
+        error = "motion_recording_enabled must be 0 or 1";
         return false;
     }
 
@@ -1402,8 +1543,8 @@ static bool validateValues(
         return false;
     }
 
-    if (values.imageMotionMinAreaPct < 1 || values.imageMotionMinAreaPct > 100) {
-        error = "image_motion_min_area_pct out of range (1..100)";
+    if (values.imageMotionMinAreaPct < 0.1f || values.imageMotionMinAreaPct > 100.0f) {
+        error = "image_motion_min_area_pct out of range (0.1..100.0)";
         return false;
     }
 
@@ -2270,29 +2411,65 @@ static bool parseConfigText(
                 values.recordingEncryption =
                     (int)numericValue;
 
-            } else if (
-                key == "periodic_snapshot_minutes"
-            ) {
+            } else if (key == "shooter_enabled") {
+                if (!markOnce(seen.shooterEnabled, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid shooter_enabled"; return false; }
+                values.shooterEnabled = (int)numericValue;
 
-                if (
-                    !markOnce(
-                        seen.periodicSnapshotMinutes,
-                        key,
-                        error
-                    ) ||
-                    !parseIntegerStrict(
-                        value,
-                        numericValue
-                    )
-                ) {
-                    if (!error.length())
-                        error = "invalid periodic_snapshot_minutes";
+            } else if (key == "shooter_interval_ms") {
+                if (!markOnce(seen.shooterIntervalMs, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid shooter_interval_ms"; return false; }
+                values.shooterIntervalMs = (int)numericValue;
 
+            } else if (key == "shooter_dark_mean_min") {
+                if (!markOnce(seen.shooterDarkMeanMin, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid shooter_dark_mean_min"; return false; }
+                values.shooterDarkMeanMin = (int)numericValue;
+
+            } else if (key == "shooter_min_change_pct") {
+                if (seen.shooterSimilarityThreshold) {
+                    error = "duplicate shooter filter key";
                     return false;
                 }
 
-                values.periodicSnapshotMinutes =
-                    (int)numericValue;
+                float decimalValue = 0.0f;
+                if (!markOnce(seen.shooterMinChangePct, key, error) || !parseFloatStrict(value, decimalValue)) { if (!error.length()) error = "invalid shooter_min_change_pct"; return false; }
+                values.shooterMinChangePct = decimalValue;
+
+            } else if (key == "shooter_similarity_threshold") {
+                // Legacy compatibility with the first continuous-shooter build.
+                // Canonical configuration now stores the more intuitive minimum
+                // changed-area percentage instead of the inverse similarity.
+                if (seen.shooterMinChangePct) {
+                    error = "duplicate shooter filter key";
+                    return false;
+                }
+
+                float legacySimilarity = 0.0f;
+                if (!markOnce(seen.shooterSimilarityThreshold, key, error) || !parseFloatStrict(value, legacySimilarity)) { if (!error.length()) error = "invalid shooter_similarity_threshold"; return false; }
+
+                if (legacySimilarity < 0.0f || legacySimilarity > 100.0f) {
+                    error = "shooter_similarity_threshold out of range (0..100.0)";
+                    return false;
+                }
+
+                if (legacySimilarity <= 0.0f) {
+                    values.shooterMinChangePct = 0.0f;
+                } else {
+                    values.shooterMinChangePct =
+                        100.0f - legacySimilarity;
+
+                    // Legacy 100% meant "reject only a perfectly identical
+                    // frame". With the new direct change threshold, 0 means
+                    // filter disabled, so retain that old behavior as 0.1%.
+                    if (values.shooterMinChangePct < 0.1f)
+                        values.shooterMinChangePct = 0.1f;
+                }
+
+            } else if (key == "shooter_force_save_seconds") {
+                if (!markOnce(seen.shooterForceSaveSeconds, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid shooter_force_save_seconds"; return false; }
+                values.shooterForceSaveSeconds = (int)numericValue;
+
+            } else if (key == "shooter_flush_seconds") {
+                if (!markOnce(seen.shooterFlushSeconds, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid shooter_flush_seconds"; return false; }
+                values.shooterFlushSeconds = (int)numericValue;
 
             } else if (
                 key == "recording_not_before"
@@ -2308,6 +2485,10 @@ static bool parseConfigText(
 
                 values.recordingNotBefore =
                     value;
+
+            } else if (key == "motion_recording_enabled") {
+                if (!markOnce(seen.motionRecordingEnabled, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid motion_recording_enabled"; return false; }
+                values.motionRecordingEnabled = (int)numericValue;
 
             } else if (key == "motion_recording_decision") {
                 if (!markOnce(seen.motionRecordingDecision, key, error)) return false;
@@ -2330,8 +2511,9 @@ static bool parseConfigText(
                 values.imageMotionSensitivity = (int)numericValue;
 
             } else if (key == "image_motion_min_area_pct") {
-                if (!markOnce(seen.imageMotionMinAreaPct, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid image_motion_min_area_pct"; return false; }
-                values.imageMotionMinAreaPct = (int)numericValue;
+                float decimalValue = 0.0f;
+                if (!markOnce(seen.imageMotionMinAreaPct, key, error) || !parseFloatStrict(value, decimalValue)) { if (!error.length()) error = "invalid image_motion_min_area_pct"; return false; }
+                values.imageMotionMinAreaPct = decimalValue;
 
             } else if (key == "image_motion_confirm_frames") {
                 if (!markOnce(seen.imageMotionConfirmFrames, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid image_motion_confirm_frames"; return false; }
@@ -3132,6 +3314,22 @@ static bool parseConfigText(
     }
 
 
+    // Compatibility with the immediately preceding continuous-shooter test
+    // build, where interval_ms itself acted as the on/off switch. Once saved by
+    // this firmware, the explicit shooter_enabled key becomes canonical.
+    if (!seen.shooterEnabled && seen.shooterIntervalMs) {
+        values.shooterEnabled =
+            values.shooterIntervalMs > 0
+            ? 1
+            : 0;
+    }
+
+    // Normalize the legacy "interval 0 = off" representation to the explicit
+    // switch model so WebConfig always has a valid retained interval to show.
+    if (!values.shooterEnabled && values.shooterIntervalMs == 0)
+        values.shooterIntervalMs = 60000;
+
+
     if (!allRequiredKeysSeen(
             seen,
             error
@@ -3217,8 +3415,12 @@ static void applyValues(
     cfg_recording_encryption =
         values.recordingEncryption;
 
-    cfg_periodic_snapshot_minutes =
-        values.periodicSnapshotMinutes;
+    cfg_shooter_enabled = values.shooterEnabled;
+    cfg_shooter_interval_ms = values.shooterIntervalMs;
+    cfg_shooter_dark_mean_min = values.shooterDarkMeanMin;
+    cfg_shooter_min_change_pct = values.shooterMinChangePct;
+    cfg_shooter_force_save_seconds = values.shooterForceSaveSeconds;
+    cfg_shooter_flush_seconds = values.shooterFlushSeconds;
 
     cfg_recording_segment_seconds =
         values.recordingSegmentSeconds;
@@ -3235,6 +3437,7 @@ static void applyValues(
     cfg_recording_not_before =
         values.recordingNotBefore;
 
+    cfg_motion_recording_enabled = values.motionRecordingEnabled;
     cfg_motion_recording_decision = values.motionRecordingDecision;
     cfg_image_motion_sensitivity = values.imageMotionSensitivity;
     cfg_image_motion_min_area_pct = values.imageMotionMinAreaPct;
@@ -4252,12 +4455,25 @@ config_loaded:
     );
 
     Serial.println(
-        "Config Periodic snapshot: minutes=" +
-        String(cfg_periodic_snapshot_minutes)
+        "Config Shooter: enabled=" +
+        String(cfg_shooter_enabled) +
+        " interval_ms=" +
+        String(cfg_shooter_interval_ms) +
+        " dark_mean_min=" +
+        String(cfg_shooter_dark_mean_min) +
+        " min_change_pct=" +
+        String(cfg_shooter_min_change_pct, 1) +
+        " force_save_s=" +
+        String(cfg_shooter_force_save_seconds) +
+        " flush_s=" +
+        String(cfg_shooter_flush_seconds) +
+        " buffer=auto"
     );
 
     Serial.println(
-        "Config Motion decision: mode=" +
+        "Config Motion recording: enabled=" +
+        String(cfg_motion_recording_enabled) +
+        " mode=" +
         cfg_motion_recording_decision
     );
 
@@ -5299,7 +5515,7 @@ ConfigSaveResult configSaveWebLanguage(
 
 ConfigSaveResult configSaveImageMotion(
     int sensitivity,
-    int minAreaPct,
+    float minAreaPct,
     int confirmFrames,
     int releaseFrames,
     int backgroundLearning,
@@ -5313,7 +5529,7 @@ ConfigSaveResult configSaveImageMotion(
     error = "";
 
     if (sensitivity < 1 || sensitivity > 10 ||
-        minAreaPct < 1 || minAreaPct > 100 ||
+        minAreaPct < 0.1f || minAreaPct > 100.0f ||
         confirmFrames < 1 || confirmFrames > 6 ||
         releaseFrames < 1 || releaseFrames > 10 ||
         backgroundLearning < 1 || backgroundLearning > 64 ||
@@ -5344,7 +5560,7 @@ ConfigSaveResult configSaveImageMotion(
     removeConfigKey(text, "image_motion_enabled");
 
     if (!replaceOrAppendConfigKey(text, "image_motion_sensitivity", String(sensitivity)) ||
-        !replaceOrAppendConfigKey(text, "image_motion_min_area_pct", String(minAreaPct)) ||
+        !replaceOrAppendConfigKey(text, "image_motion_min_area_pct", String(minAreaPct, 1)) ||
         !replaceOrAppendConfigKey(text, "image_motion_confirm_frames", String(confirmFrames)) ||
         !replaceOrAppendConfigKey(text, "image_motion_release_frames", String(releaseFrames)) ||
         !replaceOrAppendConfigKey(text, "image_motion_background_learning", String(backgroundLearning)) ||

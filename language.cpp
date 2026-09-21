@@ -266,7 +266,7 @@ static const UiTextEntry UI_TEXTS[] = {
     {"Schaltet die Bildbewegung ein oder aus. Standard: deaktiviert (0). Die Art der Aufnahmeauslösung wird separat unter Konfiguration > Aufnahme gewählt.", "Turns image motion on or off. Default: disabled (0). The recording trigger mode is selected separately under Configuration > Recording."}, // UI_IMAGE_MOTION_ACTIVE_HELP
     {"Standard: Direkt. 'Direkt' entspricht dem bisherigen Verhalten: Radar/OT2 kann sofort eine Aufnahme starten. 'Mit Bildbestätigung' startet erst, wenn der Sensor auslöst und die Bildanalyse Bewegung bestätigt. Dafür muss die Bildanalyse aktiviert sein.", "Default: Direct. Direct matches the previous behavior: radar/OT2 can start recording immediately. With image verification, recording starts only when the sensor triggers and image analysis confirms motion. Image analysis must be enabled for this."}, // UI_IMAGE_MOTION_DECISION_HELP
     {"1 = unempfindlich, 10 = maximale Empfindlichkeit. Ein höherer Wert reagiert auf kleinere Bildänderungen, kann aber eher Fehlalarme auslösen. Standard: 5.", "1 = low sensitivity, 10 = maximum sensitivity. A higher value reacts to smaller image changes but may cause more false triggers. Default: 5."}, // UI_IMAGE_MOTION_SENSITIVITY_HELP
-    {"Wie groß die zusammenhängende veränderte Fläche mindestens sein muss. Kleine Werte erkennen kleinere Objekte, größere Werte ignorieren kleine lokale Änderungen. Bezogen wird der Wert nur auf die nicht rot markierten Überwachungsbereiche. Standard: 6 %.", "Minimum size of one connected changed area. Small values detect smaller objects; larger values ignore small local changes. The percentage refers only to monitored areas that are not shaded red. Default: 6%."}, // UI_IMAGE_MOTION_MIN_AREA_HELP
+    {"Wie groß die zusammenhängende veränderte Fläche mindestens sein muss. Bereich 0,1–100,0 %. Kleine Werte erkennen sehr kleine Objekte. Das aktuelle 20×15-Analyseraster hat 300 Zellen; bei vollständig aktivem ROI entspricht eine Zelle etwa 0,33 % des Bildes. Werte darunter sind erlaubt und wählen damit die kleinste mögliche Schwelle von einer Zelle. Standard: 6,0 %.", "Minimum size of one connected changed area. Range 0.1–100.0%. Small values detect very small objects. The current 20×15 analysis grid has 300 cells; with the full ROI enabled, one cell represents about 0.33% of the image. Smaller configured values are allowed and therefore select the smallest possible threshold of one cell. Default: 6.0%."}, // UI_IMAGE_MOTION_MIN_AREA_HELP
     {"Wie viele aufeinanderfolgende Analysebilder Bewegung zeigen müssen, bevor sie bestätigt wird. Weniger Bilder reagieren schneller, mehr Bilder sind robuster gegen einzelne Störungen. Standard: 2.", "How many consecutive analysis images must show motion before it is confirmed. Fewer images react faster; more images are more robust against single disturbances. Default: 2."}, // UI_IMAGE_MOTION_CONFIRM_HELP
     {"Wie viele ruhige Analysebilder nötig sind, bis eine bereits bestätigte Bildbewegung wieder als beendet gilt. Höhere Werte halten den Bewegungszustand länger. Standard: 2.", "How many quiet analysis images are required before already confirmed image motion is considered finished. Higher values keep the motion state active longer. Default: 2."}, // UI_IMAGE_MOTION_RELEASE_HELP
     {"Bestimmt, wie schnell sich das gelernte Referenzbild an langsame, dauerhafte Änderungen anpasst, z. B. wandernde Schatten. Höher = schnellere Anpassung, niedriger = stabilere Referenz. Bereich 1–64, Standard: 4.", "Controls how quickly the learned reference image adapts to slow, lasting changes such as moving shadows. Higher = faster adaptation, lower = more stable reference. Range 1–64, default: 4."}, // UI_IMAGE_MOTION_BG_LEARNING_HELP
@@ -329,6 +329,17 @@ static const UiTextEntry UI_TEXTS[] = {
     {"Nicht aktiv", "Inactive"}, // UI_IMAGE_MOTION_LIVE_INACTIVE
     {"Diagnose herunterladen", "Download diagnostics"}, // UI_IMAGE_MOTION_DIAG_DOWNLOAD
     {"RAM-Puffer; keine SD-/Hauptlog-Einträge", "RAM buffer; no SD/main-log writes"}, // UI_IMAGE_MOTION_DIAG_BUFFER
+    {"Dauershooter-Puffer", "Continuous shooter buffer"}, // UI_CARD_SHOOTER_BUFFER
+    {"Bilder", "images"}, // UI_IMAGES
+    {"Verworfen", "Discarded"}, // UI_SHOOTER_REJECTED
+    {"dunkel", "dark"}, // UI_SHOOTER_DARK
+    {"ähnlich", "similar"}, // UI_SHOOTER_SIMILAR
+    {"Ø JPEG-Größe", "Avg JPEG size"}, // UI_SHOOTER_AVG_IMAGE
+    {"SD frei", "SD free"}, // UI_SHOOTER_SD_FREE
+    {"Geschätzt bis Rollover", "Estimated until rollover"}, // UI_SHOOTER_EST_UNTIL_ROLLOVER
+    {"Geschätzt bis Aufnahmestopp", "Estimated until recording stop"}, // UI_SHOOTER_EST_UNTIL_STOP
+    {"noch zu wenig Daten", "not enough data yet"}, // UI_SHOOTER_EST_WAITING
+    {"Grobe Schätzung aus bisheriger Filterquote und JPEG-Größe; Dateisystem-/Verschlüsselungs-Overhead ist nicht eingerechnet.", "Rough estimate from the observed filter ratio and JPEG size; filesystem/encryption overhead is not included."}, // UI_SHOOTER_EST_NOTE
 };
 
 static_assert(

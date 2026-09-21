@@ -5488,7 +5488,7 @@ function snapshotTimestampTextFromPath(targetPath) {
         return '';
 
     const match = String(targetPath).match(
-        /\/(\d{8})\/(\d{6})\.(?:jpe?g)$/i
+        /\/(\d{8})\/(\d{6})(?:_(\d{3}))?\.(?:jpe?g)$/i
     );
 
     if (!match)
@@ -5496,6 +5496,7 @@ function snapshotTimestampTextFromPath(targetPath) {
 
     const day = match[1];
     const time = match[2];
+    const milliseconds = match[3] || '';
 
     return (
         day.substring(0, 4) + '-' +
@@ -5503,7 +5504,8 @@ function snapshotTimestampTextFromPath(targetPath) {
         day.substring(6, 8) + ' ' +
         time.substring(0, 2) + ':' +
         time.substring(2, 4) + ':' +
-        time.substring(4, 6)
+        time.substring(4, 6) +
+        (milliseconds.length ? '.' + milliseconds : '')
     );
 }
 

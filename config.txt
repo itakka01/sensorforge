@@ -107,8 +107,8 @@ recording_format=avi
 timestamp_enabled=1
 
 # SD encryption policy:
-#   0 = new AVI/MKV recordings and system logs are stored normally
-#   1 = new AVI/MKV recordings use SFENC1 and system logs use SFLOG1; SensorForge
+#   0 = new AVI/MKV recordings, shooter JPEGs and system logs are stored normally
+#   1 = new AVI/MKV recordings and shooter JPEGs use SFENC1; system logs use SFLOG1; SensorForge
 #       decrypts both transparently for WebPlayer, downloads and the Log Viewer
 # Existing encrypted and unencrypted recordings remain readable independent of this setting.
 # When encryption is enabled, existing plaintext log generations are migrated once to SFLOG1.
@@ -118,6 +118,35 @@ timestamp_enabled=1
 # provisioning is permanent. Existing foreign/used key blocks are never overwritten.
 recording_encryption=0
 
+# Dauershooter: einziger zeitgesteuerter JPEG-Pfad. Unabhaengig von der
+# bewegungsgesteuerten Aufnahme und daher auch als alleiniger Modus nutzbar.
+shooter_enabled=1
+
+# 500 = 2 fps; 1000 = 1 fps; 60000 = 1 Bild/Minute.
+shooter_interval_ms=500
+
+# Zu dunkle Bilder verwerfen. Gemessen wird der mittlere Grauwert 0..255.
+# 0 deaktiviert den Dunkelfilter.
+shooter_dark_mean_min=20
+
+# Nahezu identische Bilder verwerfen. 99 bedeutet: wenn mindestens 99 Prozent
+# des 20x15-Rasters gegenueber dem letzten akzeptierten Bild praktisch gleich
+# bleiben, wird das neue Bild nicht gespeichert. 0 deaktiviert den Filter.
+shooter_similarity_threshold=99
+
+# Spaetestens nach dieser Zeit wieder ein Bild akzeptieren, auch wenn die Szene
+# nahezu identisch ist. Der Dunkelfilter bleibt trotzdem aktiv. 0 = aus.
+shooter_force_save_seconds=60
+
+# Akzeptierte JPEGs werden zuerst im PSRAM gesammelt. Nach diesem Timeout wird
+# der Puffer auf SD geschrieben. 0 = sofort schreiben. Bei Stromausfall koennen
+# hoechstens noch nicht geflushte Bilder verloren gehen.
+shooter_flush_seconds=300
+
+# Die PSRAM-Queue wird automatisch dimensioniert. SensorForge reserviert
+# Laufzeitreserve und verwendet 80 Prozent des danach sicher nutzbaren freien
+# PSRAM. Ist die Queue vor dem Timeout voll, wird sofort auf SD geflusht.
+
 # Zeitgesteuerte Scharfschaltung fuer automatische Aufnahmen.
 # off = keine Zeitsperre, Aufnahme sofort erlaubt
 # sonst lokale Zeit gemaess timezone im Format YYYY-MM-DDTHH:MM:SS
@@ -125,7 +154,12 @@ recording_encryption=0
 # Im Webinterface wird dieser Wert ueber Auswahlmenues gesetzt.
 recording_not_before=off
 
-# Motion recording decision:
+# Bewegungsgesteuerte Aufnahme. 0 deaktiviert Radar/PIR/Bildbewegung als
+# Aufnahmeausloeser und als Presence-Wakequelle. Der Dauershooter bleibt davon
+# unabhaengig aktiv, wenn shooter_enabled=1.
+motion_recording_enabled=1
+
+# Motion recording decision (nur bei motion_recording_enabled=1):
 # direct       = existing behavior; sensor trigger starts recording immediately
 # image_verify = radar/OT2 trigger wakes the camera, image analysis must confirm
 #                local motion before a new recording starts
