@@ -4,6 +4,7 @@
 #include <HardwareSerial.h>
 #include <Preferences.h>
 #include <math.h>
+#include <sys/time.h>
 
 
 // =============================================================
@@ -568,6 +569,140 @@ static void resetGateTriggerHistory()
         lastGateTriggerMs[gate] = 0;
         lastGateTriggerSeen[gate] = false;
     }
+}
+
+
+// RAM-only diagnostic ring buffer. It deliberately stores compact numeric
+// snapshots instead of Arduino String objects to avoid heap fragmentation.
+// Quiet periods are sampled once per second; meaningful state/threshold-zone
+// changes are captured immediately from the next standard radar report.
+static RadarDiagnosticSample radarDiagnosticBuffer[RADAR_DIAGNOSTIC_CAPACITY];
+static uint16_t radarDiagnosticHead = 0;
+static uint16_t radarDiagnosticStored = 0;
+static uint32_t radarDiagnosticSequence = 0;
+static uint32_t radarDiagnosticLastCaptureMs = 0;
+static bool radarDiagnosticSignatureValid = false;
+static uint8_t radarDiagnosticLastTargetState = 0;
+static bool radarDiagnosticLastOt2High = false;
+static bool radarDiagnosticLastEspMotionActive = false;
+static uint8_t radarDiagnosticLastCalibrationMode = 0;
+static uint8_t radarDiagnosticLastGateZone[16] = {};
+
+
+static uint8_t radarDiagnosticGateZone(
+    uint8_t gate,
+    uint16_t energyDeciDb
+)
+{
+    if (
+        gate >= 16 ||
+        energyDeciDb == RADAR_DIAGNOSTIC_INVALID_ENERGY ||
+        !motionTrackingConfigured
+    ) {
+        return 0; // no usable data / settings not ready
+    }
+
+    uint32_t energy = energyDeciDb;
+    uint32_t trigger = motionSettings.triggerThreshold[gate] * 10UL;
+    uint32_t hold = motionSettings.holdThreshold[gate] * 10UL;
+
+    if (energy >= trigger)
+        return 3; // trigger
+
+    if (energy >= hold)
+        return 2; // hold only
+
+    return 1; // clear
+}
+
+
+static void radarDiagnosticCapture(
+    const uint32_t rawGateEnergy[16],
+    uint32_t now
+)
+{
+    RadarDiagnosticSample sample = {};
+
+    sample.sequence = ++radarDiagnosticSequence;
+    sample.uptimeMs = now;
+    sample.targetDistanceCm = lastTargetDistanceCm;
+    sample.targetState = lastTargetState;
+    sample.ot2High = digitalRead(PIR_PIN) == HIGH ? 1U : 0U;
+    sample.espMotionActive = radarMotionActive() ? 1U : 0U;
+    sample.calibrationMode = (uint8_t)radarCalibrationActiveMode();
+
+    uint8_t gateZone[16];
+
+    for (uint8_t gate = 0; gate < 16; ++gate) {
+        if (rawGateEnergy[gate] == 0) {
+            sample.gateEnergyDeciDb[gate] =
+                RADAR_DIAGNOSTIC_INVALID_ENERGY;
+        } else {
+            long deciDb = lroundf(latestGateEnergyDb[gate] * 10.0f);
+
+            if (deciDb < 0)
+                deciDb = 0;
+
+            if (deciDb >= (long)RADAR_DIAGNOSTIC_INVALID_ENERGY)
+                deciDb = (long)RADAR_DIAGNOSTIC_INVALID_ENERGY - 1L;
+
+            sample.gateEnergyDeciDb[gate] = (uint16_t)deciDb;
+        }
+
+        gateZone[gate] = radarDiagnosticGateZone(
+            gate,
+            sample.gateEnergyDeciDb[gate]
+        );
+    }
+
+    bool changed = !radarDiagnosticSignatureValid;
+
+    if (!changed) {
+        changed =
+            sample.targetState != radarDiagnosticLastTargetState ||
+            (sample.ot2High != 0) != radarDiagnosticLastOt2High ||
+            (sample.espMotionActive != 0) != radarDiagnosticLastEspMotionActive ||
+            sample.calibrationMode != radarDiagnosticLastCalibrationMode;
+    }
+
+    if (!changed) {
+        for (uint8_t gate = 0; gate < 16; ++gate) {
+            if (gateZone[gate] != radarDiagnosticLastGateZone[gate]) {
+                changed = true;
+                break;
+            }
+        }
+    }
+
+    bool periodic =
+        !radarDiagnosticSignatureValid ||
+        (uint32_t)(now - radarDiagnosticLastCaptureMs) >= 1000UL;
+
+    if (!changed && !periodic)
+        return;
+
+    struct timeval tv;
+    if (gettimeofday(&tv, nullptr) == 0 && tv.tv_sec >= 1577836800L) {
+        sample.epochSec = (uint32_t)tv.tv_sec;
+        sample.epochMs = (uint16_t)(tv.tv_usec / 1000L);
+    }
+
+    radarDiagnosticBuffer[radarDiagnosticHead] = sample;
+    radarDiagnosticHead =
+        (uint16_t)((radarDiagnosticHead + 1U) % RADAR_DIAGNOSTIC_CAPACITY);
+
+    if (radarDiagnosticStored < RADAR_DIAGNOSTIC_CAPACITY)
+        ++radarDiagnosticStored;
+
+    radarDiagnosticLastCaptureMs = now;
+    radarDiagnosticSignatureValid = true;
+    radarDiagnosticLastTargetState = sample.targetState;
+    radarDiagnosticLastOt2High = sample.ot2High != 0;
+    radarDiagnosticLastEspMotionActive = sample.espMotionActive != 0;
+    radarDiagnosticLastCalibrationMode = sample.calibrationMode;
+
+    for (uint8_t gate = 0; gate < 16; ++gate)
+        radarDiagnosticLastGateZone[gate] = gateZone[gate];
 }
 
 
@@ -1613,26 +1748,52 @@ static void cacheMotionSettings(
     bool triggerThresholdChanged =
         motionTrackingConfigured;
 
-    if (triggerThresholdChanged) {
+    bool diagnosticSettingsChanged =
+        motionTrackingConfigured &&
+        (
+            motionSettings.maxGate != settings.maxGate ||
+            motionSettings.minGate != settings.minGate ||
+            motionSettings.absenceSec != settings.absenceSec ||
+            motionSettings.statusRateX10 != settings.statusRateX10 ||
+            motionSettings.distanceRateX10 != settings.distanceRateX10 ||
+            motionSettings.responseSpeed != settings.responseSpeed
+        );
+
+    if (triggerThresholdChanged)
         triggerThresholdChanged = false;
 
-        for (uint8_t gate = 0; gate < 16; ++gate) {
-            if (
+    for (uint8_t gate = 0; gate < 16; ++gate) {
+        if (
+            motionTrackingConfigured &&
+            motionSettings.triggerThreshold[gate] !=
+            settings.triggerThreshold[gate]
+        ) {
+            triggerThresholdChanged = true;
+        }
+
+        if (
+            motionTrackingConfigured &&
+            (
                 motionSettings.triggerThreshold[gate] !=
-                settings.triggerThreshold[gate]
-            ) {
-                triggerThresholdChanged = true;
-                break;
-            }
+                    settings.triggerThreshold[gate] ||
+                motionSettings.holdThreshold[gate] !=
+                    settings.holdThreshold[gate]
+            )
+        ) {
+            diagnosticSettingsChanged = true;
         }
     }
 
     motionSettings =
         settings;
 
-    if (triggerThresholdChanged) {
+    if (triggerThresholdChanged)
         resetGateTriggerHistory();
-    }
+
+    // The download annotates retained samples with the currently cached
+    // thresholds. Do not mix snapshots from two different configurations.
+    if (diagnosticSettingsChanged)
+        radarDiagnosticClear();
 }
 
 
@@ -2147,8 +2308,13 @@ static void processStandardPayload(
     );
 
 
-    if (!motionTrackingConfigured)
+    if (!motionTrackingConfigured) {
+        radarDiagnosticCapture(
+            rawGateEnergy,
+            now
+        );
         return;
+    }
 
 
     // Record every valid gate-level threshold crossing directly from the UART
@@ -2195,8 +2361,13 @@ static void processStandardPayload(
         (uint8_t)finalGateValue;
 
 
-    if (firstGate > finalGate)
+    if (firstGate > finalGate) {
+        radarDiagnosticCapture(
+            rawGateEnergy,
+            now
+        );
         return;
+    }
 
 
     bool motionNow =
@@ -2269,6 +2440,12 @@ static void processStandardPayload(
         lastMotionEnergyDb =
             strongestEnergyDb;
     }
+
+
+    radarDiagnosticCapture(
+        rawGateEnergy,
+        now
+    );
 }
 
 
@@ -3691,6 +3868,64 @@ bool radarGateLastTriggerAgeMs(
             lastGateTriggerMs[gate]
         );
 
+    return true;
+}
+
+
+uint16_t radarDiagnosticCount()
+{
+    return radarDiagnosticStored;
+}
+
+
+uint16_t radarDiagnosticCapacity()
+{
+    return RADAR_DIAGNOSTIC_CAPACITY;
+}
+
+
+void radarDiagnosticClear()
+{
+    radarDiagnosticHead = 0;
+    radarDiagnosticStored = 0;
+    radarDiagnosticSequence = 0;
+    radarDiagnosticLastCaptureMs = 0;
+    radarDiagnosticSignatureValid = false;
+    radarDiagnosticLastTargetState = 0;
+    radarDiagnosticLastOt2High = false;
+    radarDiagnosticLastEspMotionActive = false;
+    radarDiagnosticLastCalibrationMode = 0;
+
+    for (uint8_t gate = 0; gate < 16; ++gate)
+        radarDiagnosticLastGateZone[gate] = 0;
+}
+
+
+bool radarDiagnosticGet(
+    uint16_t index,
+    RadarDiagnosticSample &sample
+)
+{
+    if (index >= radarDiagnosticStored)
+        return false;
+
+    uint16_t oldest =
+        (uint16_t)(
+            (
+                radarDiagnosticHead +
+                RADAR_DIAGNOSTIC_CAPACITY -
+                radarDiagnosticStored
+            ) %
+            RADAR_DIAGNOSTIC_CAPACITY
+        );
+
+    uint16_t position =
+        (uint16_t)(
+            (oldest + index) %
+            RADAR_DIAGNOSTIC_CAPACITY
+        );
+
+    sample = radarDiagnosticBuffer[position];
     return true;
 }
 

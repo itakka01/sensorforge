@@ -1,6 +1,6 @@
 SENSORFORGE / ESP32-S3 CAMERA (XIAO + FREENOVE)
 PROJEKTBESCHREIBUNG, RELEASESTAND UND WIEDEREINSTIEGSPROMPT
-Stand: 2026-09-19
+Stand: 2026-09-21
 Produktname: SensorForge
 Plattformname: Fabric Node
 Core-Version im Branding: 7.1.0
@@ -135,6 +135,65 @@ Die konkrete Funktionseinschraenkung fuer UNLICENSED ist bewusst noch nicht
 definiert und bleibt ein eigener naechster Entwicklungsschritt.
 
 
+
+======================================================================
+AKTUELLER AENDERUNGSSTAND 2026-09-21
+======================================================================
+
+Seit dem vorherigen Dokumentstand wurden insbesondere folgende Punkte in den
+aktuellen Entwicklungsstand integriert:
+
+- periodische echte JPEG-Snapshots mit konfigurierbarem Minutenintervall,
+  Timer-Wake und festem Wall-Clock-Raster
+- Snapshots werden als /YYYYMMDD/HHMMSS.jpg abgelegt; Alarm/Presence hat immer
+  Vorrang vor einer faelligen Snapshot-Aufnahme
+- JPG-Dateien sind in Storage-Cleanup, Media/WebPlayer, Sync-API und optionaler
+  RecordingStorage-Verschluesselung integriert
+- Snapshot-Anzeige im WebPlayer mit Navigation/Filter und sichtbarem
+  Aufnahmezeitpunkt
+- WiFi-Firmware-Update schreibt jetzt DIREKT in die inaktive interne
+  OTA-Partition; die SD-Karte ist fuer den WiFi-Updatepfad nicht mehr noetig
+- ein einmaliger NVS-Guard verhindert nach Direct-WiFi-OTA, dass beim ersten
+  Boot sofort ein alter SD-Firmwarekandidat die neue Firmware wieder ersetzt
+- Systemmenue besitzt neben Reboot jetzt einen kontrollierten Shutdown-Pfad
+  (Deep Sleep ohne Wakequelle; Neustart danach nur per Reset/Power-Cycle)
+- Radar-Kalibrierung misst automatisch alle 16 Gates, unabhaengig vom normalen
+  Betriebsbereich, und stellt den vorherigen Radarbereich danach wieder her
+- Radar-Kalibrierung verwendet nur noch die beiden Benutzeraktionen
+  "Ruhemessung starten" und "Bewegungsmessung starten", jeweils mit
+  10-s-Countdown, automatischem Messende und Fortschritts-Popup
+- unmessbare Gates koennen fuer Vorschlaege konservativ aus dem naechsten
+  verlaesslichen Gate abgeleitet werden; echte Teilmessungen werden nicht durch
+  erfundene Werte ersetzt
+- vorgeschlagene Radarwerte koennen nach der Messung direkt in die Eingabefelder
+  uebernommen und mit Write+Verify auf den LD2410S geschrieben werden
+- Radar-Konfigurationszugriffe lesen Trigger UND Hold vor dem Caching; damit ist
+  der fruehere Randfall mit scheinbar auf 0 fallenden Hold-Werten behoben
+- pro Gate wird der letzte Triggerzeitpunkt im ESP gespeichert und im
+  Webinterface angezeigt
+- die Radar-Liveanzeige wurde fuer normale Benutzer vereinfacht und layoutfest
+  gemacht; wechselnde Texte verschieben die Seite nicht mehr
+- zusaetzlicher separater Radar-RAM-Diagnosepuffer mit 400 Eintraegen und
+  Download-Button; kein SD-/Hauptlog-Spam
+- die RAM-Diagnose zeichnet etwa 1-s-Basissamples sowie relevante
+  Zustandswechsel sofort auf und enthaelt Target-State, OT2, ESP-Motion,
+  Gate-Energien und Trigger/Hold-Zonen
+- reale Diagnosetests zeigten: einzelne schnelle UART-Gate-Trigger koennen vom
+  LD2410S intern verworfen werden, waehrend OT2/Target-Presence die bestaetigte
+  Sensorentscheidung deutlich stabiler abbilden
+- daraus wurde die aktuelle HYBRID-Aufnahmelogik abgeleitet: schneller
+  Aufnahmebeginn bleibt erhalten, OT2 uebernimmt danach die verlaessliche
+  Presence-/Haltefunktion
+
+WICHTIGE RADAR-ENTSCHEIDUNG:
+
+Die zwischenzeitlich diskutierte eigene ESP-Hold-State-Machine mit eigener
+2-s-Below-Hold-Freigabe sowie eine automatische Regel "Hold = Trigger - 1 dB"
+wurden NICHT umgesetzt. Trigger/Hold und die interne Presence-Nachhaltefunktion
+des LD2410S bleiben Aufgabe des Sensors. Der ESP verwendet seine schnelle
+UART-Gate-Auswertung nur als schnellen Voralarm/Aufnahmestart und OT2 fuer die
+bestaetigte Presence-Haltephase.
+
 ======================================================================
 PROJEKTZIEL
 ======================================================================
@@ -152,7 +211,8 @@ Hauptziele:
 - RTC-gestuetzte Zeitbasis
 - WebConfig fuer Bedienung, Diagnose und Konfiguration
 - Live Preview und Sensor-Crop
-- Remote-Firmware-Update ueber einen sicheren SD-Staging-Ablauf
+- Remote-Firmware-Update direkt in die inaktive interne OTA-Partition;
+  der separate SD-Boot-Updater bleibt zusaetzlich erhalten
 - Transportmodus fuer Versand/Montage ohne Fehlaufnahmen
 - stabile Feldfunktion ohne regelmaessige manuelle Eingriffe
 - boardgebundener Schutz sensibler SD-/Config-/Log-Daten bei entnommenem Medium
@@ -505,6 +565,7 @@ Aufnahme:
 - recording_event_max_seconds=65
 - recording_event_cooldown_seconds=30
 - recording_encryption=1 im aktuellen Encryption-Teststand
+- periodic_snapshot_minutes=1 im zuletzt bekannten XIAO-Testconfig
 
 recording_encryption akzeptiert 0 oder 1. Der Key ist fuer alte Configs
 optional; fehlt er, ist der Firmware-Default 0. Eine Aenderung gilt nur fuer
@@ -2193,10 +2254,10 @@ Die Diagnose ist RAM-only und erzeugt keine zusaetzliche permanente
 SD-Ereignisprotokollierung im schnellen Triggerpfad.
 
 ======================================================================
-RADAR WEBCONFIG UND KALIBRIERUNG
+RADAR WEBCONFIG, KALIBRIERUNG UND LIVE-DIAGNOSE
 ======================================================================
 
-Die Radar-Seite bietet:
+Die Radar-Seite bietet weiterhin:
 
 - Read Settings
 - Write + Verify
@@ -2206,16 +2267,41 @@ Die Radar-Seite bietet:
 - Radar-Defaultwerte
 - Kalibrierung
 
-Kalibrierung:
+Wichtiger Startup-/Cache-Fix:
 
-- getrennte Ruhemessung
-- getrennte Bewegungsmessung
-- Daten nur im RAM
-- Start einer Messung loescht nur den jeweiligen Datensatz
-- die andere Messung bleibt fuer Vergleich erhalten
-- unguelige rohe 0-Werte werden pro Gate verworfen
+Beim Start des Motion-Trackings werden Trigger UND Hold aus dem LD2410S gelesen,
+bevor RadarSettings gecacht werden. Damit kann ein zuvor genullter RAM-Cache die
+realen Hold-Werte nicht mehr als 0 erscheinen lassen oder spaeter versehentlich
+zurueckschreiben.
 
-Statistiken pro Gate:
+Automatische Kalibrierung:
+
+Fuer den Benutzer gibt es bewusst nur noch zwei Startaktionen:
+
+- Ruhemessung starten
+- Bewegungsmessung starten
+
+Ablauf je Messung:
+
+1. 10-s-Countdown im Geraet; bei Ruhemessung wird der Benutzer aufgefordert,
+   den Messbereich zu verlassen.
+2. Danach startet die Messung automatisch.
+3. Ziel sind 100 gueltige Werte pro Gate.
+4. Ein Gate mit dauerhaft ungueltigen/0-Rohwerten darf die Messung nicht
+   endlos blockieren; spaetestens nach der internen Sicherheitsgrenze wird es
+   als nicht verlaesslich behandelt.
+5. Gesamt-Sicherheitsgrenze: 150 Radar-Reports pro Messlauf.
+6. Wenn alle Gates fertig oder als nicht verlaesslich klassifiziert sind,
+   beendet sich die Messung automatisch.
+
+Die Kalibrierung misst IMMER alle 16 Gates. Dafuer wird der Hardware-Messbereich
+des LD2410S temporaer auf 0..16 gestellt. Der normale konfigurierte
+Betriebsbereich bleibt im ESP gespeichert und wird nach Abschluss/Abbruch wieder
+auf den Radar geschrieben. Ein kleiner NVS-Recovery-Marker erlaubt auch nach
+einem unterbrochenen Kalibrierungslauf die Wiederherstellung des vorherigen
+Bereichs.
+
+Statistiken pro Gate umfassen weiterhin u.a.:
 
 - gueltige Samples
 - verworfene Samples
@@ -2225,17 +2311,142 @@ Statistiken pro Gate:
 - P99
 - Peak
 
-Vorschlagslogik verwendet robust P99 statt einzelne Peaks.
+0-Rohwerte gelten als ungueltig und werden nicht als reale 0-dB-Messung in die
+Statistik aufgenommen.
 
-Voraussetzungen fuer einen Vorschlag umfassen ausreichende Samplezahl und
-genuegend Abstand zwischen Ruhe und Bewegung.
+Fehlende Gates / Fallback:
 
-"Vorgeschlagene Trigger-Werte uebernehmen" aendert nur die Eingabefelder.
-In den LD2410S geschrieben wird weiterhin erst mit Write + Verify.
+- besitzt ein Gate echte, aber zu wenige gueltige Samples, wird KEIN kuenstlicher
+  Ersatzwert erzeugt; das Gate bleibt als unzureichend gemessen sichtbar
+- besitzt ein Gate nach einem ausreichend langen Lauf GAR KEINEN gueltigen Wert,
+  darf der Vorschlag konservativ aus dem naechsten verlaesslichen Gate abgeleitet
+  werden
+- solche Werte werden im UI als abgeleitet gekennzeichnet
 
-Die Hold-Werte werden durch die automatische Vorschlagsfunktion nicht
-ungefragt veraendert.
+Ergebnis-/Apply-Flow:
 
+- nach Messende werden Vorschlaege sofort in die unteren Trigger-/Hold-Felder
+  eingetragen
+- im Ergebnis-Popup kann der Benutzer die Werte direkt uebernehmen und mit dem
+  bestehenden Radar-Write+Verify-Pfad auf den LD2410S schreiben
+- alternativ koennen nur die Ergebnisse angezeigt werden
+- nach erfolgreichem Write+Verify zeigt ein Reload die tatsaechlich vom Radar
+  zurueckgelesenen Werte
+
+WiFi-Hardening waehrend Radarwartung:
+
+- aktive Kalibrierung schuetzt die WebConfig/WiFi-Sitzung fuer bis zu ca. 10 min
+  vor dem normalen Inaktivitaetsabschalten
+- nach Radar-Konfiguration/Write besteht eine zusaetzliche kurze WiFi-Grace-Phase
+- wird WebConfig beendet, wird eine laufende Kalibrierung sauber gestoppt und
+  der temporaere Messbereich wiederhergestellt
+
+Live-Status fuer normale Benutzer:
+
+Der obere Radar-Status ist bewusst laienverstaendlich und layoutstabil. Er zeigt
+nur sinngemaess:
+
+- Radar erkennt: BEWEGUNG / Keine Bewegung
+- OT2-Ausgang: HIGH / LOW
+- Warum: z.B. "Gate 2 hat ausgeloest", "Gate 2 haelt die erkannte Bewegung noch
+  aktiv" oder "Der Sensor haelt die letzte Erkennung noch nach"
+
+Technische Detailwerte bleiben in der Gate-Tabelle darunter. Die festen
+Statusspalten und reservierte Hoehe verhindern, dass wechselnde Live-Texte die
+Webseite horizontal oder vertikal hin- und herschieben.
+
+Pro Gate speichert der ESP ausserdem den letzten Triggerzeitpunkt. Die Anzeige
+kann damit auch kurze Schwellenueberschreitungen sichtbar machen, die zwischen
+zwei Browser-Polls lagen.
+
+Separater Radar-RAM-Diagnosepuffer:
+
+- Ringpuffer mit maximal 400 kompakten Samples im RAM
+- KEINE Eintraege in /log.txt und keine SD-Schreiblast
+- etwa 1-s-Basissampling in ruhigen Phasen
+- relevante Aenderungen bei Target-State, OT2, ESP-Motion oder Gate-Zonen werden
+  sofort erfasst
+- gespeichert werden u.a. Zeit/Uptime, LD2410S Target-State, OT2, Distanz,
+  ESP-Motion, Kalibrierungsstatus, alle 16 Gate-Energien sowie die zugehoerigen
+  Trigger-/Hold-Zonen und aktuellen Schwellen
+- Download ueber einen kleinen Button auf der Radar-Seite als Textdatei
+- Ringpuffer ueberschreibt bei Vollstand die aeltesten Samples
+- normaler WiFi-Off und Light Sleep loeschen den Puffer nicht
+- Reboot, Deep Sleep/Shutdown oder Stromverlust loeschen ihn absichtlich
+
+Die Diagnose ist nur beobachtend. Sie veraendert weder Radar-Thresholds noch die
+Aufnahmelogik.
+
+Reale Diagnosetests vom 2026-09-21 zeigten wiederholt:
+
+- einzelne UART-Gate-Reports koennen die schnelle ESP-Auswertung ausloesen,
+  waehrend der LD2410S Target-Presence=nein und OT2 LOW beibehaelt
+- der LD2410S filtert damit kurze Einzelspitzen intern strenger als die bisherige
+  Ein-Report-ESP-Auswertung
+- bei einer echten bestaetigten Bewegung gehen Target-Presence und OT2 zusammen
+  aktiv und bleiben waehrend der internen Sensor-Halte-/Abwesenheitsphase aktiv
+- OT2 fiel in den Tests sauber wieder LOW; ein dauerhaft klemmender OT2-Pin wurde
+  durch diese Messungen nicht bestaetigt
+
+Diese Erkenntnis fuehrte zur unten beschriebenen Hybrid-Aufnahmelogik.
+
+
+======================================================================
+RADAR HYBRID-AUFNAHMELOGIK - AKTUELLER STAND 2026-09-21
+======================================================================
+
+Produktziel bleibt unveraendert: moeglichst fruehe Bilder nach einem Ereignis.
+Darum wird NICHT auf eine spaetere OT2-Bestaetigung gewartet, wenn ein schneller
+Start bereits moeglich ist.
+
+Fall A - Geraet ist in Light Sleep:
+
+- UART wird im Sleep nicht fuer einen schnellen Gate-Start ausgewertet
+- OT2 HIGH weckt den ESP ueber den bewaehrten Presence-EXT0-Pfad
+- nach dem Wake startet die Aufnahme sofort ueber den bestehenden optimierten
+  Kamera-/Recording-Wake-Pfad
+- es wurde KEINE zusaetzliche OT2-Bestaetigungswartezeit eingefuehrt
+
+Fall B - ESP ist bereits wach und filmt noch nicht:
+
+- die schnelle UART-Gate-Auswertung bleibt aktiv
+- sobald ein Gate im konfigurierten Betriebsbereich die Trigger-Schwelle
+  erreicht, darf der schnelle ESP-Radartrigger die Aufnahme sofort starten
+- bei 4-Hz-Statusrate liegt die reine Report-Latenz zwischen realer
+  Schwellenueberschreitung und UART-Sichtbarkeit typischerweise zwischen 0 und
+  ca. 250 ms; danach wird nicht auf OT2 gewartet
+
+Fortfuehrung einer bereits gestarteten Aufnahme:
+
+- solange der schnelle ESP-Radarstatus aktiv ist ODER OT2 HIGH ist, gilt das
+  physische Radarereignis als aktiv
+- bestaetigt der LD2410S die Bewegung ueber OT2 HIGH, uebernimmt damit seine
+  interne Trigger/Hold/Presence-Nachhaltefunktion das Halten der Aufnahme
+- faellt OT2 LOW und ist auch der schnelle ESP-Radarstatus bereits abgelaufen,
+  beginnt der normale post_record_ms-Nachlauf
+- im aktuellen Testconfig ist post_record_ms=3000
+
+Unbestaetigter schneller UART-Trigger:
+
+Ein einzelner schneller Gate-Peak darf weiterhin sofort einen kurzen Clip
+starten. Wenn der LD2410S ihn jedoch nie ueber OT2 bestaetigt, bekommt dieser
+Voralarm keine lange Sensor-Presence-Verlaengerung; er endet nach dem bestehenden
+kurzen Fast-Radar-Hold plus normalem post_record_ms-Nachlauf.
+
+Damit gilt konzeptionell:
+
+  schneller UART-Trigger = schneller Voralarm / frueher Aufnahmebeginn
+  OT2 HIGH                = vom LD2410S bestaetigte Presence / Haltephase
+  OT2 LOW                 = Presence beendet; danach SensorForge-Nachlauf
+
+NICHT implementiert:
+
+- keine eigene zweite Trigger/Hold-State-Machine im ESP
+- keine eigene 2-s-"unter Hold"-Freigabelogik
+- keine automatische globale Regel Hold=Trigger-1 dB
+
+Die bestehende LD2410S-Trigger/Hold-Logik soll nicht unnoetig im ESP doppelt
+nachprogrammiert werden.
 
 ======================================================================
 BILDBASIERTE MOTION DETECTION / IMAGE VERIFY
@@ -2644,6 +2855,59 @@ Lange SD-Wartungsoperationen muessen Watchdog und Webserver weiter bedienen.
 
 
 ======================================================================
+PERIODISCHE SNAPSHOTS
+======================================================================
+
+Config-Key:
+
+periodic_snapshot_minutes=0..1440
+
+- 0 deaktiviert periodische Snapshots
+- im zuletzt bekannten Testconfig ist 1 Minute gesetzt
+
+Verhalten:
+
+- es werden echte JPEG-Dateien erzeugt, keine Video-Frames mit umbenannter Endung
+- bei gueltiger Uhrzeit wird auf feste Wall-Clock-Slots ausgerichtet; ein langes
+  Alarmereignis verschiebt damit nicht dauerhaft alle spaeteren Snapshot-Zeiten
+- bei fehlender gueltiger Wall-Clock existiert ein monotones Fallback-Scheduling
+- Light Sleep und der vorhandene Deep-Sleep-Pfad koennen einen Timer-Wake fuer
+  den naechsten Snapshot erhalten
+- Alarm/Presence hat immer Vorrang: erscheint waehrend Warmup/Capture/Write eine
+  Bewegung, wird der Snapshotpfad abgebrochen bzw. nicht gestartet
+- fuer Snapshots duerfen im Gegensatz zum schnellen Alarm-Wake bewusst drei
+  Warmup-Frames verworfen werden, damit Auto-Exposure/Gain Zeit zum Einregeln hat
+- der schnelle Alarm-Recordingpfad selbst wurde dadurch nicht verlangsamt
+
+Dateistruktur bei gueltiger Uhrzeit:
+
+/YYYYMMDD/HHMMSS.jpg
+
+Der Zeitstempel im Namen entspricht dem geplanten Wall-Clock-Slot. Doppelte
+Dateien desselben Slots werden nicht ueberschrieben. Ohne gueltige Uhrzeit wird
+ein /fallback/snapshot_<millis>.jpg-Pfad verwendet.
+
+Storage/Encryption:
+
+- Snapshots respektieren die konfigurierte Storage-Mindestreserve
+- .jpg und .jpg.part sind in Cleanup-/Recovery-Logik integriert
+- geschrieben wird ueber RecordingStorageFile
+- bei recording_encryption=1 wird damit auch der Snapshot physisch ueber die
+  bestehende transparente Storage-Verschluesselung geschuetzt
+- Leser/Web/Sync arbeiten weiterhin mit dem logischen JPEG-Datenstrom
+
+Web/Sync:
+
+- JPG ist in Medienlisten und Tagesnavigation integriert
+- Filter erlauben eine sinnvolle Trennung von Video und Snapshot
+- WebPlayer kann Snapshots anzeigen und zwischen Medien navigieren
+- Snapshot-Anzeige besitzt einen sichtbaren Aufnahmezeitpunkt
+- Sync API listet und uebertraegt JPG-Dateien zusammen mit den bisherigen Medien
+
+Periodische Snapshots sind eine Hintergrundfunktion und duerfen die Alarmkamera
+niemals gegenueber einem realen Bewegungsereignis priorisieren.
+
+======================================================================
 SYNC API / PC-DOWNLOAD
 ======================================================================
 
@@ -2824,10 +3088,12 @@ Kamera:
 
 Radar:
 
-- Config
-- Live Gate Energy
-- Kalibrierung
-- Trigger-Vorschlaege
+- Config mit Read / Write + Verify
+- Live Gate Energy + feste laienverstaendliche Statusanzeige
+- pro Gate letzter Trigger
+- automatische Ruhe-/Bewegungskalibrierung ueber alle 16 Gates
+- Trigger-/Hold-Vorschlaege mit Apply + Write/Verify
+- separater 400-Sample-RAM-Diagnosepuffer mit Download
 - bei automatisch erkanntem PIR-Modus sind Radar-spezifische Seiten/Funktionen
   deaktiviert bzw. gesperrt
 
@@ -2863,6 +3129,8 @@ System:
 - PSRAM Test
 - SD Benchmark
 - Reboot
+- Shutdown / Ausschalten
+- Radar-Diagnose als separaten RAM-Textlog herunterladen
 
 Hardware-Hinweis / UI-Regel fuer Freenove:
 
@@ -3060,6 +3328,30 @@ irreversibel sind.
 
 
 ======================================================================
+SYSTEM SHUTDOWN / AUSSCHALTEN
+======================================================================
+
+WebConfig besitzt neben Reboot einen eigenen Shutdown-/Ausschalten-Befehl.
+
+Ablauf:
+
+- Shutdown wird abgelehnt, solange eine Aufnahme aktiv ist
+- waehrend der Bestaetigungs-/Shutdownphase werden neue Recording-Starts
+  blockiert
+- laufende Radar-Kalibrierung wird sauber beendet und ein temporaerer
+  Kalibrierungs-Messbereich wird wiederhergestellt
+- WebConfig/WebPlayer/Kamera werden geordnet beendet
+- WiFi wird abgeschaltet
+- normale Presence-/Magnet-/Timer-Wakequellen werden deaktiviert
+- anschliessend geht der ESP in Deep Sleep OHNE konfigurierte Wakequelle
+
+Dieser Zustand ist als Software-Off gedacht. Das Geraet startet danach nur durch
+Hardware-Reset bzw. Power-Cycle erneut.
+
+Wichtig: Deep Sleep ohne Wakequelle bedeutet nicht physikalisch 0 mA. Direkt
+versorgte Peripherie kann weiterhin Eigenstrom aufnehmen.
+
+======================================================================
 WIFI UND WEBCONFIG LIFECYCLE
 ======================================================================
 
@@ -3068,10 +3360,17 @@ Aktuell ist im Test-Config:
 wifi_on_system_start=on
 wifi_timeout_sec=60
 
-Nach WebConfig-Inaktivitaet kann WiFi wieder abgeschaltet werden.
+Nach WebConfig-Inaktivitaet kann WiFi wieder abgeschaltet werden. Eine offene
+Webseite sendet Heartbeats, Browser/OS koennen Hintergrund-Tabs jedoch drosseln;
+ein sichtbarer Tab ist daher keine harte Garantie gegen den Timeout.
+
+Radarwartung besitzt zusaetzliche Schutzfenster: eine aktive Radar-Kalibrierung
+hindert den normalen WiFi-Inaktivitaets-Timeout fuer den Kalibrierungszeitraum,
+und nach Radar-Write/Verify besteht eine kurze Grace-Phase.
 
 Bei deaktiviertem WiFi und ohne weitere Blocker kann das System nach dem
-konfigurierten sleep_delay_ms in Light Sleep gehen.
+konfigurierten sleep_delay_ms in Light Sleep gehen. Solange WiFi/WebConfig aktiv
+ist, wird dieser normale Light-Sleep-Bereitschaftspfad nicht betreten.
 
 WebConfig-Handler werden nur einmal registriert. Wiederholtes Start/Stop von
 WiFi soll dadurch keine doppelten Handler und keinen schleichenden Heap-Verlust
@@ -3111,46 +3410,61 @@ Die eigentliche OTA-Schreiboperation verwendet die inaktive OTA-Partition.
 
 
 ======================================================================
-FIRMWARE UPDATE - WEBCONFIG / WIFI
+FIRMWARE UPDATE - WEBCONFIG / DIRECT WIFI OTA
 ======================================================================
 
-Der Browser flasht niemals direkt die laufende Applikation.
+Der aktuelle WiFi-Updatepfad verwendet die SD-Karte NICHT mehr als Staging-
+Medium. Der Browser streamt das Image direkt in die inaktive interne
+OTA-Applikationspartition.
 
-Ablauf:
+Sicherheitsablauf:
 
 1. Benutzer waehlt eine kompilierte .bin-Datei.
-2. Upload geht auf SD nach:
+2. Upload wird nur nach erfolgreicher Web-Authentifizierung angenommen.
+3. Recording muss frei sein; neue Recording-Starts werden fuer den kritischen
+   Updatevorgang blockiert.
+4. Der Stream wird ausschliesslich in die INAKTIVE OTA-Partition geschrieben.
+5. Bereits waehrend des Streams werden u.a. ESP32-Image-Magic, Partitionsgroesse
+   und SensorForge-Board-Kompatibilitaetsmarker geprueft.
+6. esp_ota_end() validiert das vollstaendige Application-Image.
+7. Nach erfolgreichem Upload bleibt die laufende/aktive Bootpartition weiterhin
+   unveraendert. Ein Upload allein installiert also noch nichts.
+8. Erst die explizite Aktion INSTALLIEREN setzt die validierte inaktive
+   Partition als naechste Bootpartition.
+9. Danach erfolgt ein kontrollierter Neustart in die neue Firmware.
 
-   /firmware/.wifi_upload.part
+Wichtige Eigenschaft:
 
-3. Datei wird vollstaendig validiert.
-4. Bei Erfolg wird sie als nicht-.bin Staging-Datei bereitgestellt:
+Ein abgebrochener oder fehlerhafter Upload veraendert die ausgewaehlte
+Bootpartition nicht. Die bisherige Firmware bleibt startbar. Ein neuer Upload
+kann die inaktive OTA-Partition erneut ueberschreiben.
 
-   /firmware/.wifi_upload.ready
+Die erfolgreich hochgeladenen Image-Bytes liegen in der inaktiven OTA-Partition;
+der zugehoerige "ready"-Zustand ist nur Laufzeitstatus. Ein normaler Reboot ohne
+explizite Installation soll das Image nicht unbeabsichtigt aktivieren.
 
-5. Erst nach explizitem JETZT INSTALLIEREN wird sie umbenannt zu:
+SD-Unabhaengigkeit:
 
-   /firmware/wifi_update.bin
+- fehlende, defekte oder instabile SD blockiert den Direct-WiFi-OTA-Pfad nicht
+- der separate SD-Boot-Updater bleibt als eigener Firmwareweg bestehen
 
-6. SensorForge startet kontrolliert neu.
-7. Beim Boot uebernimmt der bereits bewaehrte SD-Auto-Updater.
-8. Der SD-Updater validiert das Image nochmals.
-9. Danach wird die inaktive OTA-Partition beschrieben.
-10. Neustart in die neue Firmware.
+First-Boot-Schutz gegen alten SD-Kandidaten:
 
-Sicherheitsprinzip:
+Vor dem Umschalten der Bootpartition wird ein one-shot NVS-Flag
+skip_sd_once gesetzt. Beim ersten Boot der neuen Direct-OTA-Firmware wird dieser
+Guard konsumiert, bevor der SD-Auto-Updater betrachtet wird. Dadurch kann eine
+zufaellig noch auf SD liegende alte .bin-Datei die frisch installierte
+WiFi-Firmware nicht sofort wieder ersetzen.
 
-Ein abgebrochener Browser-Upload ist keine .bin-Datei und kann beim naechsten
-Boot nicht versehentlich als Firmware installiert werden.
+WebConfig bietet nach erfolgreichem Upload explizit Installieren oder Verwerfen.
 
-Eine .ready-Datei wird bei einem normalen Reboot ebenfalls nicht automatisch
-installiert. Erst die explizite Install-Aktion macht daraus wifi_update.bin.
+Der Updater besitzt weiterhin keinen vollstaendigen Health-Confirmation-/
+automatischen Rollback-Mechanismus nach erfolgreichem Boot. Remote deshalb nur
+Images installieren, die zuvor auf einem passenden Zweitgeraet getestet wurden.
 
-Firmware-Upload und Installation werden blockiert, wenn Recording oder andere
-Storage-Operationen die SD belegen.
-
-Der Updater verwendet fuer WiFi- und SD-Updates denselben Validator.
-
+HTTP Basic Auth schuetzt den Zugriff bei aktivierter Web-Authentifizierung,
+der Transport selbst ist weiterhin unverschluesseltes HTTP. Firmware-Upload nur
+in einem vertrauenswuerdigen/isolierten Netz verwenden.
 
 ======================================================================
 FIRMWARE UPDATE - WICHTIGE GRENZEN
@@ -3559,13 +3873,14 @@ OFFENE PUNKTE NACH PRIORITAET
    - Journal-Rotation bei grosser Logdatei
    - Power-Unterbrechung waehrend INSTALL_DELAY
 
-9. FIRMWARE-UPDATE DES NEUEN BUILDS AUF EINEM ZWEITGERAET TESTEN
+9. DIRECT-WIFI-OTA DES NEUEN BUILDS AUF EINEM ZWEITGERAET TESTEN
 
    - Marker pruefen
    - Image-Groesse pruefen
-   - WiFi Upload
+   - direkter WiFi-Upload in die inaktive OTA-Partition
    - explizite Installation
-   - Boot-SD-Updater
+   - kontrollierter Reboot in die neue Partition
+   - skip_sd_once / alter SD-Kandidat beim ersten Boot pruefen
    - neue Firmware startet mit WebConfig
 
 10. VOLLSTAENDIGE UI-UEBERSETZUNG SPAETER ABSCHLIESSEN
@@ -3597,7 +3912,10 @@ OFFENE PUNKTE NACH PRIORITAET
 
 17. SD COLD-BOOT-VERHALTEN WEITER BEOBACHTEN
 
-18. OT2 PRESENCE-HALTEZEIT HINSICHTLICH BATTERIE BEWERTEN
+18. RADAR-HYBRIDLOGIK IM FELD WEITER BEOBACHTEN
+
+    Schneller UART-Start, OT2-Haltephase, Fehltriggerdauer und Batterieeffekt
+    anhand des separaten Radar-RAM-Diagnoselogs weiter bewerten.
 
 19. OPTIONAL OTA HEALTH-CONFIRMATION / ROLLBACK KONZIPIEREN
 
@@ -4054,9 +4372,10 @@ Transportmodus ist explizit manuell, timer-only und besitzt Auto-
 Schwarzmessung, Recording-Pause, Cover-Removal-Bestaetigung, Installationsdelay
 und persistentes Journal. End-to-end-/Power-Cycle-Tests sind weiterhin offen.
 
-Firmware Update ueber WiFi staged zuerst auf SD, validiert vor und nach Reboot
-und flasht erst ueber den bestehenden Boot-Updater in die inaktive OTA-
-Partition. Kein vollstaendiger Health-Rollback vorhanden.
+Firmware Update ueber WiFi streamt direkt in die inaktive interne OTA-
+Partition, validiert das Image dort und aktiviert es erst nach explizitem
+Installieren. Die SD ist fuer Direct-WiFi-OTA nicht erforderlich; der separate
+SD-Boot-Updater bleibt bestehen. Kein vollstaendiger Health-Rollback vorhanden.
 
 Aktueller XIAO-Kompatibilitaetsmarker:
 
@@ -4081,7 +4400,8 @@ WEITERE PRIORITAETEN:
   alternativer Metadata-Fallback aktuell NICHT implementiert; nur bei realem
   Produktbedarf separat designen und testen
 - Transport-UI + Journal end-to-end testen
-- neuen Build auf Zweitgeraet per WiFi-OTA testen
+- neuen Build auf Zweitgeraet per Direct-WiFi-OTA testen; dabei one-shot
+  skip_sd_once gegen alte SD-Firmwarekandidaten mitpruefen
 - vollstaendige historische UI-Uebersetzung spaeter systematisch abschliessen
 - Camera Settings Tool mit Live Exposure/Gain entwickeln
 - Motion Blur mit ae_level=-2 weiter bewerten
@@ -4096,6 +4416,9 @@ WEITERE PRIORITAETEN:
   und nur bei reproduzierbarem Fehler veraendern
 - bei XIAO-Produktionsgeraeten mit LD2410S spaeter gezielt einen mehrzyklischen
   Sleep->OT2-Wake->Recording->Sleep-Dauertest als Canary durchfuehren
+- Radar-Hybridlogik mit dem separaten 400-Sample-RAM-Diagnoselog weiter im Feld
+  beobachten; schnelle UART-Voralarme und bestaetigte OT2-Haltephase getrennt
+  bewerten
 - Watchdog/Radar/SD-Randfaelle weiter beobachten
 - XIAO camera default OV2640 vs reale OV3660-Hardware bewusst spaeter entscheiden
 
@@ -4104,6 +4427,7 @@ keine bereits geloesten Themen neu designen, keine APIs/Funktionen erfinden und
 Codeaenderungen nur auf dem zuletzt wirklich gesehenen Quellstand vornehmen.
 Bei Rueckgabe von Code standardmaessig nur geaenderte/neue Dateien unter ihren
 Originalnamen mitsenden; keine unveraenderten Dateien in Update-ZIPs aufnehmen.
+
 
 
 

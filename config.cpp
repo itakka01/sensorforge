@@ -51,7 +51,6 @@ int cfg_recording_event_cooldown_seconds = 120;
 String cfg_recording_not_before = "off";
 
 String cfg_motion_recording_decision = "direct";
-int cfg_image_motion_enabled = 0;
 int cfg_image_motion_sensitivity = 5;
 int cfg_image_motion_min_area_pct = 6;
 int cfg_image_motion_confirm_frames = 2;
@@ -375,7 +374,6 @@ struct ConfigValues {
     int recordingEventCooldownSeconds;
     String recordingNotBefore;
     String motionRecordingDecision;
-    int imageMotionEnabled;
     int imageMotionSensitivity;
     int imageMotionMinAreaPct;
     int imageMotionConfirmFrames;
@@ -575,9 +573,6 @@ static ConfigValues makeDefaultValues()
 
     values.motionRecordingDecision =
         "direct";
-
-    values.imageMotionEnabled =
-        0;
 
     values.imageMotionSensitivity =
         5;
@@ -1395,14 +1390,10 @@ static bool validateValues(
 
     if (
         values.motionRecordingDecision != "direct" &&
-        values.motionRecordingDecision != "image_verify"
+        values.motionRecordingDecision != "image_verify" &&
+        values.motionRecordingDecision != "image_only"
     ) {
-        error = "motion_recording_decision must be direct or image_verify";
-        return false;
-    }
-
-    if (values.imageMotionEnabled != 0 && values.imageMotionEnabled != 1) {
-        error = "image_motion_enabled must be 0 or 1";
+        error = "motion_recording_decision must be direct, image_verify or image_only";
         return false;
     }
 
@@ -2323,8 +2314,16 @@ static bool parseConfigText(
                 values.motionRecordingDecision = value;
 
             } else if (key == "image_motion_enabled") {
-                if (!markOnce(seen.imageMotionEnabled, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid image_motion_enabled"; return false; }
-                values.imageMotionEnabled = (int)numericValue;
+                // Legacy compatibility only. The old separate enable flag is no
+                // longer used; automatic image motion is selected exclusively by
+                // motion_recording_decision. Keep accepting 0/1 so existing SD
+                // cards remain valid until the next config save removes the key.
+                if (!markOnce(seen.imageMotionEnabled, key, error) ||
+                    !parseIntegerStrict(value, numericValue) ||
+                    (numericValue != 0 && numericValue != 1)) {
+                    if (!error.length()) error = "invalid legacy image_motion_enabled";
+                    return false;
+                }
 
             } else if (key == "image_motion_sensitivity") {
                 if (!markOnce(seen.imageMotionSensitivity, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid image_motion_sensitivity"; return false; }
@@ -3237,7 +3236,6 @@ static void applyValues(
         values.recordingNotBefore;
 
     cfg_motion_recording_decision = values.motionRecordingDecision;
-    cfg_image_motion_enabled = values.imageMotionEnabled;
     cfg_image_motion_sensitivity = values.imageMotionSensitivity;
     cfg_image_motion_min_area_pct = values.imageMotionMinAreaPct;
     cfg_image_motion_confirm_frames = values.imageMotionConfirmFrames;
@@ -4258,6 +4256,11 @@ config_loaded:
         String(cfg_periodic_snapshot_minutes)
     );
 
+    Serial.println(
+        "Config Motion decision: mode=" +
+        cfg_motion_recording_decision
+    );
+
     {
         uint32_t performanceLoad =
             configRecordingPerformanceLoad(
@@ -4932,6 +4935,49 @@ static bool replaceOrAppendConfigKey(
 }
 
 
+// Remove one active config key while preserving comments, unknown keys and the
+// surrounding text. Used to retire legacy keys without making old config.txt
+// files invalid on read.
+static bool removeConfigKey(
+    String &text,
+    const String &key
+)
+{
+    String output;
+    output.reserve(text.length());
+
+    size_t start = 0;
+    while (start < text.length()) {
+        int newlinePos = text.indexOf('\n', start);
+        size_t end = newlinePos < 0 ? text.length() : (size_t)newlinePos;
+        String line = text.substring(start, end);
+        String probe = line;
+        probe.trim();
+
+        bool remove = false;
+        if (!probe.startsWith("#") && !probe.startsWith(";")) {
+            int equalsPos = probe.indexOf('=');
+            if (equalsPos >= 0) {
+                String foundKey = probe.substring(0, equalsPos);
+                foundKey.trim();
+                remove = foundKey == key;
+            }
+        }
+
+        if (!remove) {
+            output += line;
+            if (newlinePos >= 0) output += '\n';
+        }
+
+        if (newlinePos >= 0) start = end + 1U;
+        else start = text.length();
+    }
+
+    text = output;
+    return true;
+}
+
+
 ConfigSaveResult configSaveCameraCrop(
     const String &zoom,
     int positionX,
@@ -5252,8 +5298,6 @@ ConfigSaveResult configSaveWebLanguage(
 
 
 ConfigSaveResult configSaveImageMotion(
-    const String &recordingDecision,
-    int enabled,
     int sensitivity,
     int minAreaPct,
     int confirmFrames,
@@ -5268,17 +5312,7 @@ ConfigSaveResult configSaveImageMotion(
 {
     error = "";
 
-    String decision = recordingDecision;
-    decision.trim();
-    decision.toLowerCase();
-
-    if (decision != "direct" && decision != "image_verify") {
-        error = "motion_recording_decision must be direct or image_verify";
-        return CONFIG_SAVE_INTERNAL_FAILED;
-    }
-
-    if ((enabled != 0 && enabled != 1) ||
-        sensitivity < 1 || sensitivity > 10 ||
+    if (sensitivity < 1 || sensitivity > 10 ||
         minAreaPct < 1 || minAreaPct > 100 ||
         confirmFrames < 1 || confirmFrames > 6 ||
         releaseFrames < 1 || releaseFrames > 10 ||
@@ -5305,9 +5339,11 @@ ConfigSaveResult configSaveImageMotion(
         return CONFIG_SAVE_INTERNAL_FAILED;
     }
 
-    if (!replaceOrAppendConfigKey(text, "motion_recording_decision", decision) ||
-        !replaceOrAppendConfigKey(text, "image_motion_enabled", String(enabled)) ||
-        !replaceOrAppendConfigKey(text, "image_motion_sensitivity", String(sensitivity)) ||
+    // Retire the old separate enable flag on the next image-motion save.
+    // motion_recording_decision is the sole source of truth.
+    removeConfigKey(text, "image_motion_enabled");
+
+    if (!replaceOrAppendConfigKey(text, "image_motion_sensitivity", String(sensitivity)) ||
         !replaceOrAppendConfigKey(text, "image_motion_min_area_pct", String(minAreaPct)) ||
         !replaceOrAppendConfigKey(text, "image_motion_confirm_frames", String(confirmFrames)) ||
         !replaceOrAppendConfigKey(text, "image_motion_release_frames", String(releaseFrames)) ||
@@ -5328,8 +5364,6 @@ ConfigSaveResult configSaveImageMotion(
     ConfigSaveResult result = configSaveText(text, writeToSd, error);
 
     if (result == CONFIG_SAVE_BOTH || result == CONFIG_SAVE_INTERNAL_ONLY) {
-        cfg_motion_recording_decision = decision;
-        cfg_image_motion_enabled = enabled;
         cfg_image_motion_sensitivity = sensitivity;
         cfg_image_motion_min_area_pct = minAreaPct;
         cfg_image_motion_confirm_frames = confirmFrames;

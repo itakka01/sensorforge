@@ -141,6 +141,45 @@ bool radarGateLastTriggerAgeMs(
 
 
 // =============================================================
+// RADAR RAM DIAGNOSTIC RING BUFFER
+// =============================================================
+//
+// Compact RAM-only snapshots captured inside radarLoop(), independently from
+// browser polling. The buffer keeps the newest 400 diagnostic entries and
+// overwrites the oldest entries when full. A 1-second baseline is retained,
+// while target/OT2/threshold-zone changes are captured immediately.
+//
+// gateEnergyDeciDb uses 0.1-dB units. 0xFFFF means the LD2410S reported a
+// raw energy value of zero / no usable value for that gate.
+
+static const uint16_t RADAR_DIAGNOSTIC_CAPACITY = 400U;
+static const uint16_t RADAR_DIAGNOSTIC_INVALID_ENERGY = 0xFFFFU;
+
+struct RadarDiagnosticSample {
+    uint32_t sequence;
+    uint32_t uptimeMs;
+    uint32_t epochSec;
+    uint16_t epochMs;
+    uint16_t targetDistanceCm;
+    uint8_t targetState;
+    uint8_t ot2High;
+    uint8_t espMotionActive;
+    uint8_t calibrationMode;
+    uint16_t gateEnergyDeciDb[16];
+};
+
+uint16_t radarDiagnosticCount();
+uint16_t radarDiagnosticCapacity();
+void radarDiagnosticClear();
+
+// Read one entry in chronological order: index 0 is the oldest retained entry.
+bool radarDiagnosticGet(
+    uint16_t index,
+    RadarDiagnosticSample &sample
+);
+
+
+// =============================================================
 // RADAR CALIBRATION / DIAGNOSTIC STATISTICS
 // =============================================================
 //

@@ -11,6 +11,7 @@ static constexpr uint8_t IMAGE_MOTION_ROI_BYTES =
     (IMAGE_MOTION_GRID_CELLS + 7U) / 8U;
 static constexpr uint8_t IMAGE_MOTION_ROI_HEX_CHARS =
     IMAGE_MOTION_ROI_BYTES * 2U;
+static constexpr uint16_t IMAGE_MOTION_DIAGNOSTIC_TARGET_CAPACITY = 400;
 
 enum ImageMotionState : uint8_t {
     IMAGE_MOTION_STATE_DISABLED = 0,
@@ -46,6 +47,25 @@ struct ImageMotionDiagnostics {
     float globalMeanDelta = 0.0f;
     float motionScore = 0.0f;
     uint16_t blockThreshold = 0;
+    uint16_t dynamicThresholdMin = 0;
+    uint16_t dynamicThresholdAvgX10 = 0;
+    uint16_t dynamicThresholdMax = 0;
+    uint16_t meanAbsDiffX10 = 0;
+    uint16_t maxAbsDiff = 0;
+    uint16_t diffGe5 = 0;
+    uint16_t diffGe10 = 0;
+    uint16_t diffGe15 = 0;
+    uint16_t diffGe20 = 0;
+    uint16_t diffGe25 = 0;
+    uint16_t diffGe30 = 0;
+    uint16_t diffGe35 = 0;
+    uint16_t diffGe40 = 0;
+    uint16_t clusterGe10 = 0;
+    uint16_t clusterGe15 = 0;
+    uint16_t clusterGe20 = 0;
+    uint16_t clusterGe25 = 0;
+    uint16_t clusterGe30 = 0;
+    uint16_t clusterGe35 = 0;
     uint16_t minimumMotionBlocks = 0;
     uint8_t confirmCounter = 0;
     uint8_t releaseCounter = 0;
@@ -53,6 +73,52 @@ struct ImageMotionDiagnostics {
     bool motionActive = false;
     ImageMotionState state = IMAGE_MOTION_STATE_DISABLED;
     ImageMotionRejectReason rejectReason = IMAGE_MOTION_REJECT_DISABLED;
+};
+
+// Compact RAM-only snapshot used for post-test diagnostics. The changed mask
+// stores one bit per 20x15 grid cell after the real adaptive threshold has been
+// applied. The ring buffer is intentionally independent from SD/main logging.
+struct ImageMotionDiagnosticSample {
+    uint32_t sequence = 0;
+    uint32_t uptimeMs = 0;
+    uint32_t epochSec = 0;
+    uint16_t epochMs = 0;
+    uint16_t sourceWidth = 0;
+    uint16_t sourceHeight = 0;
+    uint16_t analyzeFrameMs = 0;
+    uint16_t decodeMs = 0;
+    uint16_t activeRoiBlocks = 0;
+    uint16_t changedBlocks = 0;
+    uint16_t largestClusterBlocks = 0;
+    uint16_t minimumMotionBlocks = 0;
+    uint16_t blockThreshold = 0;
+    uint16_t dynamicThresholdMin = 0;
+    uint16_t dynamicThresholdAvgX10 = 0;
+    uint16_t dynamicThresholdMax = 0;
+    uint16_t meanAbsDiffX10 = 0;
+    uint16_t maxAbsDiff = 0;
+    uint16_t diffGe5 = 0;
+    uint16_t diffGe10 = 0;
+    uint16_t diffGe15 = 0;
+    uint16_t diffGe20 = 0;
+    uint16_t diffGe25 = 0;
+    uint16_t diffGe30 = 0;
+    uint16_t diffGe35 = 0;
+    uint16_t diffGe40 = 0;
+    uint16_t clusterGe10 = 0;
+    uint16_t clusterGe15 = 0;
+    uint16_t clusterGe20 = 0;
+    uint16_t clusterGe25 = 0;
+    uint16_t clusterGe30 = 0;
+    uint16_t clusterGe35 = 0;
+    int16_t globalMeanX10 = 0;
+    int16_t globalMeanDeltaX10 = 0;
+    uint8_t confirmCounter = 0;
+    uint8_t releaseCounter = 0;
+    uint8_t state = 0;
+    uint8_t rejectReason = 0;
+    uint8_t flags = 0;
+    uint8_t changedMask[IMAGE_MOTION_ROI_BYTES] = {};
 };
 
 String imageMotionDefaultRoiMask();
@@ -71,7 +137,29 @@ bool imageMotionAnalyzeJpeg(
     ImageMotionDiagnostics &diagnostics
 );
 
+// Called by the recorder with the JPEG frame that was just written. The
+// function is a cheap no-op unless image_only is active; in that mode it keeps
+// the image-motion state alive during recording so release_frames and the
+// normal post_record_ms window can end/restart the event without radar/PIR
+// deciding recording duration.
+void imageMotionObserveRecordingJpeg(
+    const uint8_t *jpeg,
+    size_t jpegLength,
+    uint16_t sourceWidth,
+    uint16_t sourceHeight
+);
+
+bool imageMotionMotionActive();
+
 const ImageMotionDiagnostics &imageMotionLastDiagnostics();
 const char *imageMotionStateName(ImageMotionState state);
 const char *imageMotionRejectReasonName(ImageMotionRejectReason reason);
 String imageMotionDiagnosticsJson();
+
+uint16_t imageMotionDiagnosticCount();
+uint16_t imageMotionDiagnosticCapacity();
+void imageMotionDiagnosticClear();
+bool imageMotionDiagnosticGet(
+    uint16_t index,
+    ImageMotionDiagnosticSample &sample
+);

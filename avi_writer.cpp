@@ -2,6 +2,7 @@
 #include "board_config.h"
 #include "config.h"
 #include "logger.h"
+#include "image_motion.h"
 #include "recording_storage.h"
 
 #include <FS.h>
@@ -880,6 +881,18 @@ void aviAddFrame()
     // ---------------------------------------------------------
 
     frameCount++;
+
+    // image_only keeps its motion/release state from the same JPEGs that are
+    // already being recorded. Skip the very first frame so the optimized
+    // wake->first-frame path and its timing metric remain untouched.
+    if (frameCount > 1U) {
+        imageMotionObserveRecordingJpeg(
+            fb->buf,
+            fb->len,
+            (uint16_t)fb->width,
+            (uint16_t)fb->height
+        );
+    }
 
     totalFrameBytes +=
         jpegSize;

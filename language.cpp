@@ -236,7 +236,7 @@ static const UiTextEntry UI_TEXTS[] = {
     {"Gespeicherte WLAN-, Hotspot- und Web-Passwörter sind in dieser Datei gerätegebunden als SFSEC1 verschlüsselt und nicht im Klartext enthalten.", "Stored Wi-Fi, hotspot and web passwords are device-bound and encrypted as SFSEC1 in this file; they are not stored in plaintext."}, // UI_CONFIG_SECRETS_DOWNLOAD_NOTE
     {"Bildbewegung", "Image motion"}, // UI_NAV_IMAGE_MOTION
     {"Bewegungserkennung im Bild", "Motion detection in the image"}, // UI_IMAGE_MOTION_TITLE
-    {"Radar/OT2 bleibt die stromsparende Wake-Quelle. Auf Wunsch prüft die Kamera zusätzlich, ob sich im ausgewählten Bildbereich wirklich etwas bewegt, bevor eine neue Aufnahme startet.", "Radar/OT2 remains the low-power wake source. If desired, the camera additionally checks whether something is really moving in the selected image area before a new recording starts."}, // UI_IMAGE_MOTION_SUBTITLE
+    {"Hier stellst du die Bildbewegung ein und siehst live, ob sie anschlägt. Welche Quelle eine Aufnahme startet, wird separat unter Konfiguration > Aufnahme gewählt.", "Tune image motion here and see live whether it triggers. Which source starts a recording is selected separately under Configuration > Recording."}, // UI_IMAGE_MOTION_SUBTITLE
     {"Bildanalyse verwenden", "Use image analysis"}, // UI_IMAGE_MOTION_ACTIVE
     {"Wann soll eine Aufnahme starten?", "When should a recording start?"}, // UI_IMAGE_MOTION_DECISION
     {"Direkt – Sensor startet Aufnahme sofort", "Direct – sensor starts recording immediately"}, // UI_IMAGE_MOTION_DIRECT
@@ -257,13 +257,13 @@ static const UiTextEntry UI_TEXTS[] = {
     {"Bildanalyse jetzt testen", "Test image analysis now"}, // UI_IMAGE_MOTION_TEST
     {"Referenzbild neu lernen", "Relearn reference image"}, // UI_IMAGE_MOTION_RESET_BG
     {"Testergebnis", "Test result"}, // UI_IMAGE_MOTION_DIAGNOSTICS
-    {"Solange diese Seite geöffnet ist, sind neue automatische Aufnahmen gesperrt. Der Test prüft nur die Bildanalyse und startet niemals selbst eine Aufnahme.", "While this page is open, new automatic recordings are blocked. The test only checks image analysis and never starts a recording itself."}, // UI_IMAGE_MOTION_TEST_NOTE
+    {"Solange diese Seite geöffnet ist, sind neue automatische Aufnahmen gesperrt. Die Kameravorschau wird laufend analysiert, startet dabei aber keine Aufnahme.", "While this page is open, new automatic recordings are blocked. The camera preview is analyzed continuously but does not start a recording."}, // UI_IMAGE_MOTION_TEST_NOTE
     {"Bildbewegungs-Einstellungen gespeichert.", "Image-motion settings saved."}, // UI_IMAGE_MOTION_SAVED
     {"Bildbewegungs-Einstellungen konnten nicht gespeichert werden", "Image-motion settings could not be saved"}, // UI_IMAGE_MOTION_SAVE_FAILED
     {"Bildanalyse-Test fehlgeschlagen", "Image-analysis test failed"}, // UI_IMAGE_MOTION_TEST_FAILED
     {"0 – Deaktiviert", "0 – Disabled"}, // UI_IMAGE_MOTION_ENABLED_OFF
     {"1 – Aktiviert", "1 – Enabled"}, // UI_IMAGE_MOTION_ENABLED_ON
-    {"Aktiviert die Bildanalyse. Standard: deaktiviert (0). Im Modus 'Direkt' ändert die Bildanalyse das Aufnahmeverhalten nicht; bei 'Mit Bildbestätigung' muss zusätzlich Bewegung im Bild erkannt werden.", "Enables image analysis. Default: disabled (0). In Direct mode, image analysis does not change recording behavior; with image verification, motion must also be detected in the image."}, // UI_IMAGE_MOTION_ACTIVE_HELP
+    {"Schaltet die Bildbewegung ein oder aus. Standard: deaktiviert (0). Die Art der Aufnahmeauslösung wird separat unter Konfiguration > Aufnahme gewählt.", "Turns image motion on or off. Default: disabled (0). The recording trigger mode is selected separately under Configuration > Recording."}, // UI_IMAGE_MOTION_ACTIVE_HELP
     {"Standard: Direkt. 'Direkt' entspricht dem bisherigen Verhalten: Radar/OT2 kann sofort eine Aufnahme starten. 'Mit Bildbestätigung' startet erst, wenn der Sensor auslöst und die Bildanalyse Bewegung bestätigt. Dafür muss die Bildanalyse aktiviert sein.", "Default: Direct. Direct matches the previous behavior: radar/OT2 can start recording immediately. With image verification, recording starts only when the sensor triggers and image analysis confirms motion. Image analysis must be enabled for this."}, // UI_IMAGE_MOTION_DECISION_HELP
     {"1 = unempfindlich, 10 = maximale Empfindlichkeit. Ein höherer Wert reagiert auf kleinere Bildänderungen, kann aber eher Fehlalarme auslösen. Standard: 5.", "1 = low sensitivity, 10 = maximum sensitivity. A higher value reacts to smaller image changes but may cause more false triggers. Default: 5."}, // UI_IMAGE_MOTION_SENSITIVITY_HELP
     {"Wie groß die zusammenhängende veränderte Fläche mindestens sein muss. Kleine Werte erkennen kleinere Objekte, größere Werte ignorieren kleine lokale Änderungen. Bezogen wird der Wert nur auf die nicht rot markierten Überwachungsbereiche. Standard: 6 %.", "Minimum size of one connected changed area. Small values detect smaller objects; larger values ignore small local changes. The percentage refers only to monitored areas that are not shaded red. Default: 6%."}, // UI_IMAGE_MOTION_MIN_AREA_HELP
@@ -287,7 +287,7 @@ static const UiTextEntry UI_TEXTS[] = {
     {"Ergebnis", "Result"}, // UI_IMAGE_MOTION_RESULT_TITLE
     {"Bewegung erkannt – die Bildanalyse würde diesen Trigger bestätigen.", "Motion detected – image analysis would confirm this trigger."}, // UI_IMAGE_MOTION_RESULT_MOTION
     {"Keine ausreichende Bewegung erkannt.", "No sufficient motion detected."}, // UI_IMAGE_MOTION_RESULT_NONE
-    {"Bildanalyse ist deaktiviert. Aktiviere sie und speichere die Einstellung, bevor du testest.", "Image analysis is disabled. Enable it and save the setting before testing."}, // UI_IMAGE_MOTION_RESULT_DISABLED
+    {"Bildanalyse steht momentan nicht zur Verfügung.", "Image analysis is currently unavailable."}, // UI_IMAGE_MOTION_RESULT_DISABLED
     {"Das Referenzbild wurde neu gelernt. Führe den Test erneut aus, während sich etwas im überwachten Bereich bewegt.", "The reference image was relearned. Run the test again while something moves in the monitored area."}, // UI_IMAGE_MOTION_RESULT_LEARNING
     {"Eine Bildänderung wurde erkannt, aber noch nicht oft genug hintereinander bestätigt.", "An image change was detected but has not yet been confirmed in enough consecutive images."}, // UI_IMAGE_MOTION_RESULT_CONFIRMING
     {"Großflächiger Helligkeitswechsel erkannt. Er wurde bewusst nicht als Bewegung gewertet.", "Large-area brightness change detected. It was deliberately not treated as motion."}, // UI_IMAGE_MOTION_RESULT_GLOBAL_LIGHT
@@ -302,6 +302,29 @@ static const UiTextEntry UI_TEXTS[] = {
     {"Keine Bewegung", "No motion"}, // UI_MOTION_RADAR_EVALUATION_NONE
     {"Bewegung erkannt", "Motion detected"}, // UI_MOTION_RADAR_EVALUATION_ACTIVE
     {"Letzter Radar-Trigger", "Last radar trigger"}, // UI_MOTION_LAST_RADAR_TRIGGER
+    {"Aufnahmeauslösung", "Recording trigger mode"}, // UI_RECORDING_TRIGGER_MODE
+    {"Sensor direkt – Radar/PIR startet sofort", "Direct sensor – radar/PIR starts immediately"}, // UI_RECORDING_TRIGGER_DIRECT
+    {"Sensor + Bildbestätigung – Bildbewegung muss bestätigen", "Sensor + image verification – image motion must confirm"}, // UI_RECORDING_TRIGGER_VERIFY
+    {"Nur Bildbewegung – Sensor dient im Sleep nur zum Aufwecken", "Image motion only – sensor is wake-only during sleep"}, // UI_RECORDING_TRIGGER_IMAGE_ONLY
+    {"Legt fest, wodurch eine automatische Aufnahme startet. 'Sensor direkt' ist der bisherige schnelle Pfad. 'Sensor + Bildbestätigung' benötigt zuerst Radar/PIR und anschließend bestätigte Bildbewegung. 'Nur Bildbewegung' lässt die Kamera entscheiden; im Light Sleep bleibt Radar/PIR lediglich die Hardware-Wakequelle.", "Defines what starts an automatic recording. Direct sensor is the existing low-latency path. Sensor + image verification requires radar/PIR first and then confirmed image motion. Image motion only lets the camera decide; in light sleep radar/PIR remains only the hardware wake source."}, // UI_RECORDING_TRIGGER_HELP
+    {"Bildbewegung ist ausgeschaltet. Bildbasierte Aufnahmemodi sind damit momentan nicht aktiv; SensorForge verwendet bis zur Aktivierung den direkten Sensorpfad.", "Image motion is disabled. Image-based recording modes are currently inactive; SensorForge uses the direct sensor path until image motion is enabled."}, // UI_RECORDING_TRIGGER_IMAGE_DISABLED_WARNING
+    {"Bildbewegung einstellen", "Configure image motion"}, // UI_RECORDING_TRIGGER_IMAGE_SETTINGS
+    {"Live-Erkennung", "Live detection"}, // UI_IMAGE_MOTION_LIVE_TITLE
+    {"Bildbewegung", "Image motion"}, // UI_IMAGE_MOTION_LIVE_STATUS
+    {"Bestätigung", "Confirmation"}, // UI_IMAGE_MOTION_LIVE_CONFIRMATION
+    {"Bild insgesamt verändert", "Total image changed"}, // UI_IMAGE_MOTION_LIVE_CHANGED_AREA
+    {"Letzte Erkennung", "Last detection"}, // UI_IMAGE_MOTION_LIVE_LAST_DETECTION
+    {"BEWEGUNG", "MOTION"}, // UI_IMAGE_MOTION_LIVE_DETECTED
+    {"Keine Bewegung", "No motion"}, // UI_IMAGE_MOTION_LIVE_NONE
+    {"Referenz wird gelernt", "Learning reference"}, // UI_IMAGE_MOTION_LIVE_LEARNING
+    {"Helligkeitswechsel ignoriert", "Brightness change ignored"}, // UI_IMAGE_MOTION_LIVE_GLOBAL_LIGHT
+    {"Fehler", "Error"}, // UI_IMAGE_MOTION_LIVE_ERROR
+    {"Bestätigt", "Confirmed"}, // UI_IMAGE_MOTION_LIVE_CONFIRMED
+    {"noch keine", "none yet"}, // UI_IMAGE_MOTION_LIVE_NEVER
+    {"warte auf Daten", "waiting for data"}, // UI_IMAGE_MOTION_LIVE_WAITING
+    {"Nicht aktiv", "Inactive"}, // UI_IMAGE_MOTION_LIVE_INACTIVE
+    {"Bildanalyse-Diagnose herunterladen", "Download image-motion diagnostic"}, // UI_IMAGE_MOTION_DIAG_DOWNLOAD
+    {"RAM-Puffer; keine SD-/Hauptlog-Einträge", "RAM buffer; no SD/main-log writes"}, // UI_IMAGE_MOTION_DIAG_BUFFER
 };
 
 static_assert(

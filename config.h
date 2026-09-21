@@ -38,10 +38,11 @@ extern int cfg_recording_event_cooldown_seconds;
 // "off" = no time gate; otherwise strict local ISO format YYYY-MM-DDTHH:MM:SS.
 extern String cfg_recording_not_before;
 
-// Motion recording decision. Existing radar/OT2 wake remains authoritative;
-// image_verify adds a camera confirmation step before a NEW recording starts.
-extern String cfg_motion_recording_decision; // "direct" or "image_verify"
-extern int cfg_image_motion_enabled;
+// Motion recording decision. The physical presence sensor remains the hardware
+// wake source in low-power modes. direct starts from the sensor immediately;
+// image_verify requires sensor + image confirmation; image_only lets image
+// motion decide recording while the physical sensor is wake-only during sleep.
+extern String cfg_motion_recording_decision; // "direct", "image_verify" or "image_only"
 extern int cfg_image_motion_sensitivity;
 extern int cfg_image_motion_min_area_pct;
 extern int cfg_image_motion_confirm_frames;
@@ -248,11 +249,10 @@ ConfigSaveResult configSaveWebLanguage(
     String &error
 );
 
-// Persist the image-motion decision/settings/ROI mask while preserving the
-// complete active config text and all unrelated/future keys.
+// Persist image-motion tuning/ROI while preserving the complete active config
+// text and all unrelated/future keys. Whether automatic image motion is used is
+// derived solely from motion_recording_decision.
 ConfigSaveResult configSaveImageMotion(
-    const String &recordingDecision,
-    int enabled,
     int sensitivity,
     int minAreaPct,
     int confirmFrames,

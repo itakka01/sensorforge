@@ -388,6 +388,14 @@ static bool cameraPreviewActive = false;
 static uint32_t cameraPreviewLastActivityMs = 0;
 static const uint32_t CAMERA_PREVIEW_TIMEOUT_MS = 2500UL;
 
+// Image-Motion diagnostics are deliberately slower than the camera preview.
+// Decoding/analyzing every preview JPEG would serialize the HTTP server behind
+// the relatively expensive JPEG motion analysis and make the live picture feel
+// much more sluggish than the normal camera preview. Keep the picture at its
+// normal cadence and update the diagnostic state at ~2 Hz instead.
+static uint32_t imageMotionPreviewLastAnalysisMs = 0;
+static const uint32_t IMAGE_MOTION_PREVIEW_ANALYSIS_INTERVAL_MS = 500UL;
+
 // Live Preview may temporarily test a crop before SAVE. That temporary sensor
 // state must never leak into later recordings. Leaving/losing the preview
 // restores the persisted cfg_camera_crop_* values automatically.
@@ -1575,6 +1583,10 @@ static void handleMotionStatus()
         (simulatedMotion ? "true" : "false") +
         ",\"motion_active\":" +
         (operationalMotionActive ? "true" : "false") +
+        ",\"image_motion_mode\":\"" +
+        cfg_motion_recording_decision +
+        "\",\"image_motion\":" +
+        imageMotionDiagnosticsJson() +
         "}";
 
     server.sendHeader(
@@ -2375,6 +2387,17 @@ static void handleRoot()
         "</b></span>";
 
     html +=
+        "<br><b>" +
+        htmlText(UI_IMAGE_MOTION_LIVE_STATUS) +
+        ":</b> <span id='motionImageState' class='status-pill warn'>" +
+        htmlText(UI_IMAGE_MOTION_LIVE_WAITING) +
+        "</span><span id='motionImageLastRow'> &middot; <b>" +
+        htmlText(UI_IMAGE_MOTION_LIVE_LAST_DETECTION) +
+        ":</b> <span id='motionImageLast'>" +
+        htmlText(UI_IMAGE_MOTION_LIVE_NEVER) +
+        "</span></span>";
+
+    html +=
         "<br>Simulation=<span id='motionSimulationState'>" +
         String(simulatedMotion ? "1" : "0") +
         "</span><span id='motionPirLastTriggerRow' style='" +
@@ -2410,6 +2433,14 @@ static void handleRoot()
         " data-no-trigger='" + htmlText(UI_MOTION_NO_TRIGGER_YET) + "'"
         " data-ago='" + htmlText(UI_MOTION_AGO) + "'"
         " data-ago-suffix='" + htmlText(UI_MOTION_AGO_SUFFIX) + "'"
+        " data-image-detected='" + htmlText(UI_IMAGE_MOTION_LIVE_DETECTED) + "'"
+        " data-image-none='" + htmlText(UI_IMAGE_MOTION_LIVE_NONE) + "'"
+        " data-image-learning='" + htmlText(UI_IMAGE_MOTION_LIVE_LEARNING) + "'"
+        " data-image-light='" + htmlText(UI_IMAGE_MOTION_LIVE_GLOBAL_LIGHT) + "'"
+        " data-image-error='" + htmlText(UI_IMAGE_MOTION_LIVE_ERROR) + "'"
+        " data-image-waiting='" + htmlText(UI_IMAGE_MOTION_LIVE_WAITING) + "'"
+        " data-image-inactive='" + htmlText(UI_IMAGE_MOTION_LIVE_INACTIVE) + "'"
+        " data-image-never='" + htmlText(UI_IMAGE_MOTION_LIVE_NEVER) + "'"
         "></div>";
 
     html +=
@@ -2841,12 +2872,17 @@ static void handleRoot()
         "var simState=document.getElementById('motionSimulationState');"
         "var lastEl=document.getElementById('motionLastTrigger');"
         "var countEl=document.getElementById('motionTriggerCount');"
+        "var imageState=document.getElementById('motionImageState');"
+        "var imageLast=document.getElementById('motionImageLast');"
+        "var imageLastRow=document.getElementById('motionImageLastRow');"
         "var basePresence=Number(c.dataset.basePresence)||0;"
         "var baseRadar=Number(c.dataset.baseRadar)||0;"
         "function ageText(valid,ms){if(!valid)return c.dataset.noTrigger;ms=Math.max(0,Number(ms)||0);"
             "if(ms<10000)return c.dataset.ago+(c.dataset.ago?' ':'')+(ms/1000).toFixed(1)+' s'+c.dataset.agoSuffix;"
             "if(ms<60000)return c.dataset.ago+(c.dataset.ago?' ':'')+Math.floor(ms/1000)+' s'+c.dataset.agoSuffix;"
             "var sec=Math.floor(ms/1000);var min=Math.floor(sec/60);sec%=60;return c.dataset.ago+(c.dataset.ago?' ':'')+min+' min '+sec+' s'+c.dataset.agoSuffix;}"
+        "function imageAgeText(valid,ms){if(!valid)return c.dataset.imageNever;return ageText(true,ms);}"
+        "function imageStateText(mode,d){if(mode==='direct')return c.dataset.imageInactive;if(!d||!d.last_analysis_valid||Number(d.last_analysis_age_ms)>2500)return c.dataset.imageWaiting;if(d.motion_active||d.image_motion_state==='confirmed')return c.dataset.imageDetected;if(d.image_motion_state==='background_init')return c.dataset.imageLearning;if(d.image_motion_state==='global_change')return c.dataset.imageLight;if(d.image_motion_state==='error')return c.dataset.imageError;return c.dataset.imageNone;}"
         "function applyMotion(s){"
             "if(value)value.textContent=s.motion_active?c.dataset.detected:c.dataset.none;"
             "if(pState){pState.textContent=s.presence_active?'HIGH':'LOW';"
@@ -2864,6 +2900,10 @@ static void handleRoot()
             "if(radarLastAge)radarLastAge.textContent=ageText(!!s.radar_last_trigger_valid,s.radar_last_trigger_age_ms);"
             "if(lastEl)lastEl.textContent=ageText(!!s.primary_last_trigger_valid,s.primary_last_trigger_age_ms);"
             "if(countEl){var base=s.primary_source==='radar'?baseRadar:basePresence;countEl.textContent=String(Math.max(0,(Number(s.primary_trigger_count)||0)-base));}"
+            "var im=s.image_motion||{};var imMode=s.image_motion_mode||'direct';"
+            "if(imageState){imageState.textContent=imageStateText(imMode,im);imageState.classList.remove('danger','warn','ok');if(imMode==='direct')imageState.classList.add('ok');else if(im.motion_active||im.image_motion_state==='confirmed')imageState.classList.add('danger');else if(!im.last_analysis_valid||Number(im.last_analysis_age_ms)>2500||im.image_motion_state==='background_init'||im.image_motion_state==='global_change')imageState.classList.add('warn');else if(im.image_motion_state==='error')imageState.classList.add('danger');else imageState.classList.add('ok');}"
+            "if(imageLastRow)imageLastRow.style.display=imMode==='direct'?'none':'';"
+            "if(imageLast)imageLast.textContent=imageAgeText(!!im.last_detection_valid,im.last_detection_age_ms);"
         "}"
         "function pollMotion(){if(document.hidden)return;fetch('/motion_status?t='+Date.now(),{cache:'no-store',credentials:'same-origin'})"
             ".then(function(r){if(!r.ok)throw new Error();return r.json();}).then(applyMotion).catch(function(){});}"
@@ -3609,6 +3649,23 @@ static void handleConfig()
 
     html += "</div><div class='settings-section'><h3>Aufnahme</h3>";
 
+    html +=
+        "<div style='margin:0 0 18px 0;padding:14px;border:1px solid #d8dee6;border-radius:8px;background:#f8fbff'>"
+        "<b>" + htmlText(UI_RECORDING_TRIGGER_MODE) + "</b><br>"
+        "<select name='motion_recording_decision' style='min-width:320px;max-width:100%'>"
+        "<option value='direct'" + String(cfg_motion_recording_decision == "direct" ? " selected" : "") + ">" + htmlText(UI_RECORDING_TRIGGER_DIRECT) + "</option>"
+        "<option value='image_verify'" + String(cfg_motion_recording_decision == "image_verify" ? " selected" : "") + ">" + htmlText(UI_RECORDING_TRIGGER_VERIFY) + "</option>"
+        "<option value='image_only'" + String(cfg_motion_recording_decision == "image_only" ? " selected" : "") + ">" + htmlText(UI_RECORDING_TRIGGER_IMAGE_ONLY) + "</option>"
+        "</select><br>"
+        "<small class='muted'>" + htmlText(UI_RECORDING_TRIGGER_HELP) + "</small>";
+
+    html +=
+        "<div style='margin-top:8px'><a href='/image_motion'>" +
+        htmlText(UI_RECORDING_TRIGGER_IMAGE_SETTINGS) +
+        "</a></div>";
+
+    html += "</div>";
+
     html += "recording_format: <select name='recording_format'>";
 
     html += "<option value='avi'" +
@@ -4287,6 +4344,29 @@ static void handleSave()
     }
 
 
+    String motionRecordingDecision =
+        server.arg("motion_recording_decision");
+
+    motionRecordingDecision.trim();
+    motionRecordingDecision.toLowerCase();
+
+    if (
+        motionRecordingDecision != "direct" &&
+        motionRecordingDecision != "image_verify" &&
+        motionRecordingDecision != "image_only"
+    ) {
+        server.send(
+            400,
+            "text/plain; charset=utf-8",
+            "Ungueltiger motion_recording_decision Wert"
+        );
+        return;
+    }
+
+    const bool motionRecordingDecisionChanged =
+        motionRecordingDecision != cfg_motion_recording_decision;
+
+
     int timestampEnabled =
         server.arg("timestamp_enabled").toInt()
         ? 1
@@ -4709,7 +4789,7 @@ static void handleSave()
     String text;
 
     text.reserve(
-        1500
+        2200
     );
 
 
@@ -4775,6 +4855,45 @@ static void handleSave()
 
     text += "recording_not_before=";
     text += recordingNotBefore;
+    text += '\n';
+
+    // Recording-decision and image-motion settings are part of the canonical
+    // config.txt. General Config saves must preserve the tuning values managed
+    // on /image_motion instead of accidentally dropping them back to defaults.
+    text += "motion_recording_decision=";
+    text += motionRecordingDecision;
+    text += '\n';
+
+    text += "image_motion_sensitivity=";
+    text += String(cfg_image_motion_sensitivity);
+    text += '\n';
+
+    text += "image_motion_min_area_pct=";
+    text += String(cfg_image_motion_min_area_pct);
+    text += '\n';
+
+    text += "image_motion_confirm_frames=";
+    text += String(cfg_image_motion_confirm_frames);
+    text += '\n';
+
+    text += "image_motion_release_frames=";
+    text += String(cfg_image_motion_release_frames);
+    text += '\n';
+
+    text += "image_motion_background_learning=";
+    text += String(cfg_image_motion_background_learning);
+    text += '\n';
+
+    text += "image_motion_global_mean_delta=";
+    text += String(cfg_image_motion_global_mean_delta);
+    text += '\n';
+
+    text += "image_motion_global_change_pct=";
+    text += String(cfg_image_motion_global_change_pct);
+    text += '\n';
+
+    text += "image_motion_roi_mask=";
+    text += cfg_image_motion_roi_mask;
     text += '\n';
 
     text += "post_record_ms=";
@@ -4995,6 +5114,13 @@ static void handleSave()
             cfg_fps =
                 fps;
 
+            cfg_motion_recording_decision =
+                motionRecordingDecision;
+
+            if (motionRecordingDecisionChanged) {
+                imageMotionResetBackground();
+            }
+
             cfg_sleep_mode =
                 sleepMode;
 
@@ -5082,6 +5208,13 @@ static void handleSave()
             // so changing the recorder/pacing FPS here is safe.
             cfg_fps =
                 fps;
+
+            cfg_motion_recording_decision =
+                motionRecordingDecision;
+
+            if (motionRecordingDecisionChanged) {
+                imageMotionResetBackground();
+            }
 
             cfg_sleep_mode =
                 sleepMode;
@@ -8845,15 +8978,12 @@ static int imageMotionArgInt(const char *name, int fallback)
 
 static void handleImageMotionSave()
 {
-    String decision = server.arg("decision");
     String roiMask = server.arg("roi");
     roiMask.trim();
     roiMask.toLowerCase();
 
     String error;
     ConfigSaveResult result = configSaveImageMotion(
-        decision,
-        imageMotionArgInt("enabled", cfg_image_motion_enabled),
         imageMotionArgInt("sensitivity", cfg_image_motion_sensitivity),
         imageMotionArgInt("min_area", cfg_image_motion_min_area_pct),
         imageMotionArgInt("confirm", cfg_image_motion_confirm_frames),
@@ -8941,6 +9071,207 @@ static void handleImageMotionResetBackground()
 }
 
 
+static void handleImageMotionStatus()
+{
+    String json;
+    json.reserve(900);
+    json =
+        String("{\"ok\":true,\"mode\":\"") +
+        cfg_motion_recording_decision +
+        "\",\"confirm_required\":" +
+        String(cfg_image_motion_confirm_frames) +
+        ",\"release_required\":" +
+        String(cfg_image_motion_release_frames) +
+        ",\"area_limit_pct\":" +
+        String(cfg_image_motion_min_area_pct) +
+        ",\"diag_count\":" +
+        String(imageMotionDiagnosticCount()) +
+        ",\"diag_capacity\":" +
+        String(imageMotionDiagnosticCapacity()) +
+        ",\"diagnostics\":" +
+        imageMotionDiagnosticsJson() +
+        "}";
+
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(
+        200,
+        "application/json; charset=utf-8",
+        json
+    );
+}
+
+
+
+static String imageMotionDiagnosticTimestamp(
+    const ImageMotionDiagnosticSample &sample
+)
+{
+    if (sample.epochSec < 1577836800UL)
+        return "-";
+
+    time_t seconds = (time_t)sample.epochSec;
+    struct tm localTime;
+    localtime_r(&seconds, &localTime);
+
+    char buffer[32];
+    strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &localTime);
+
+    char millisPart[8];
+    snprintf(
+        millisPart,
+        sizeof(millisPart),
+        ".%03u",
+        (unsigned int)sample.epochMs
+    );
+
+    return String(buffer) + String(millisPart);
+}
+
+static String imageMotionDiagnosticMaskHex(
+    const uint8_t mask[IMAGE_MOTION_ROI_BYTES]
+)
+{
+    static const char hex[] = "0123456789abcdef";
+    String out;
+    out.reserve(IMAGE_MOTION_ROI_HEX_CHARS);
+
+    for (uint8_t i = 0; i < IMAGE_MOTION_ROI_BYTES; ++i) {
+        out += hex[(mask[i] >> 4) & 0x0FU];
+        out += hex[mask[i] & 0x0FU];
+    }
+
+    return out;
+}
+
+static String imageMotionDiagnosticDeci(int16_t value)
+{
+    bool negative = value < 0;
+    uint16_t magnitude = negative
+        ? (uint16_t)(-(int32_t)value)
+        : (uint16_t)value;
+
+    return
+        String(negative ? "-" : "") +
+        String(magnitude / 10U) +
+        "." +
+        String(magnitude % 10U);
+}
+
+static void handleImageMotionDiagnosticDownload()
+{
+    uint16_t count = imageMotionDiagnosticCount();
+    uint16_t capacity = imageMotionDiagnosticCapacity();
+
+    server.sendHeader("Cache-Control", "no-store");
+    server.sendHeader(
+        "Content-Disposition",
+        "attachment; filename=\"sensorforge_image_motion_diagnostic.txt\""
+    );
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, "text/plain; charset=utf-8", "");
+
+    String line;
+    line.reserve(1200);
+
+    line =
+        "# SensorForge Image Motion RAM Diagnostic\n"
+        "# RAM-only ring buffer; no SD/main-log writes.\n"
+        "# One row is one analyzed JPEG frame; oldest retained sample first.\n"
+        "# changed = blocks above the real adaptive per-block threshold.\n"
+        "# diff_ge_N = ROI blocks whose absolute gray difference from the learned background is >= N, before the adaptive threshold is applied.\n"
+        "# changed_mask_hex = one bit per 20x15 grid cell after the real adaptive threshold; bit 0 is cell 0.\n";
+    server.sendContent(line);
+
+    line =
+        "# samples=" + String(count) +
+        " capacity=" + String(capacity) +
+        " mode=" + cfg_motion_recording_decision +
+        " resolution=" + cfg_resolution +
+        " crop_zoom=" + cfg_camera_crop_zoom +
+        " crop_x=" + String(cfg_camera_crop_x) +
+        " crop_y=" + String(cfg_camera_crop_y) +
+        " sensitivity=" + String(cfg_image_motion_sensitivity) +
+        " min_area_pct=" + String(cfg_image_motion_min_area_pct) +
+        " confirm_frames=" + String(cfg_image_motion_confirm_frames) +
+        " release_frames=" + String(cfg_image_motion_release_frames) +
+        " background_learning=" + String(cfg_image_motion_background_learning) +
+        " global_mean_delta=" + String(cfg_image_motion_global_mean_delta) +
+        " global_change_pct=" + String(cfg_image_motion_global_change_pct) +
+        " roi_mask=" + cfg_image_motion_roi_mask +
+        "\n";
+    server.sendContent(line);
+
+    server.sendContent(
+        "seq\ttime\tuptime_ms\tsource_px\tstate\treject\tbackground_ready\tmotion_active\tconfirm\trelease\tactive_blocks\tchanged_blocks\ttotal_changed_pct\tlargest_cluster\tcluster_pct\tminimum_blocks\tbase_threshold\tdynamic_threshold_min\tdynamic_threshold_avg\tdynamic_threshold_max\tmean_abs_diff\tmax_abs_diff\tdiff_ge_5\tdiff_ge_10\tdiff_ge_15\tdiff_ge_20\tdiff_ge_25\tdiff_ge_30\tdiff_ge_35\tdiff_ge_40\tcluster_ge_10\tcluster_ge_15\tcluster_ge_20\tcluster_ge_25\tcluster_ge_30\tcluster_ge_35\tglobal_mean\tbackground_mean\tglobal_mean_delta\tanalyze_ms\tdecode_ms\tchanged_mask_hex\n"
+    );
+
+    for (uint16_t index = 0; index < count; ++index) {
+        ImageMotionDiagnosticSample sample;
+        if (!imageMotionDiagnosticGet(index, sample))
+            continue;
+
+        float totalPct = sample.activeRoiBlocks > 0
+            ? ((float)sample.changedBlocks * 100.0f) / (float)sample.activeRoiBlocks
+            : 0.0f;
+        float clusterPct = sample.activeRoiBlocks > 0
+            ? ((float)sample.largestClusterBlocks * 100.0f) / (float)sample.activeRoiBlocks
+            : 0.0f;
+        int16_t backgroundMeanX10 = (int16_t)(
+            (int32_t)sample.globalMeanX10 -
+            (int32_t)sample.globalMeanDeltaX10
+        );
+
+        line =
+            String(sample.sequence) + "\t" +
+            imageMotionDiagnosticTimestamp(sample) + "\t" +
+            String(sample.uptimeMs) + "\t" +
+            String(sample.sourceWidth) + "x" + String(sample.sourceHeight) + "\t" +
+            String(imageMotionStateName((ImageMotionState)sample.state)) + "\t" +
+            String(imageMotionRejectReasonName((ImageMotionRejectReason)sample.rejectReason)) + "\t" +
+            String((sample.flags & 0x01U) ? "1" : "0") + "\t" +
+            String((sample.flags & 0x02U) ? "1" : "0") + "\t" +
+            String(sample.confirmCounter) + "\t" +
+            String(sample.releaseCounter) + "\t" +
+            String(sample.activeRoiBlocks) + "\t" +
+            String(sample.changedBlocks) + "\t" +
+            String(totalPct, 1) + "\t" +
+            String(sample.largestClusterBlocks) + "\t" +
+            String(clusterPct, 1) + "\t" +
+            String(sample.minimumMotionBlocks) + "\t" +
+            String(sample.blockThreshold) + "\t" +
+            String(sample.dynamicThresholdMin) + "\t" +
+            String((float)sample.dynamicThresholdAvgX10 / 10.0f, 1) + "\t" +
+            String(sample.dynamicThresholdMax) + "\t" +
+            String((float)sample.meanAbsDiffX10 / 10.0f, 1) + "\t" +
+            String(sample.maxAbsDiff) + "\t" +
+            String(sample.diffGe5) + "\t" +
+            String(sample.diffGe10) + "\t" +
+            String(sample.diffGe15) + "\t" +
+            String(sample.diffGe20) + "\t" +
+            String(sample.diffGe25) + "\t" +
+            String(sample.diffGe30) + "\t" +
+            String(sample.diffGe35) + "\t" +
+            String(sample.diffGe40) + "\t" +
+            String(sample.clusterGe10) + "\t" +
+            String(sample.clusterGe15) + "\t" +
+            String(sample.clusterGe20) + "\t" +
+            String(sample.clusterGe25) + "\t" +
+            String(sample.clusterGe30) + "\t" +
+            String(sample.clusterGe35) + "\t" +
+            imageMotionDiagnosticDeci(sample.globalMeanX10) + "\t" +
+            imageMotionDiagnosticDeci(backgroundMeanX10) + "\t" +
+            imageMotionDiagnosticDeci(sample.globalMeanDeltaX10) + "\t" +
+            String(sample.analyzeFrameMs) + "\t" +
+            String(sample.decodeMs) + "\t" +
+            imageMotionDiagnosticMaskHex(sample.changedMask) +
+            "\n";
+
+        server.sendContent(line);
+        if ((index % 20U) == 19U)
+            serviceWebLongOperation();
+    }
+}
+
 static String imageMotionInfoButton(
     UiTextId titleId,
     UiTextId helpId
@@ -8975,14 +9306,40 @@ static void handleImageMotionPage()
     } else {
         noteCameraPreviewActivity();
 
+        // Diagnostic live analysis must start with a fresh temporal vote so a
+        // previous operational detection cannot make the page look active. The
+        // learned background is intentionally retained.
+        imageMotionBeginVerification();
+        imageMotionPreviewLastAnalysisMs = 0;
+
         html += R"HTML(
 <style>
-.im-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:14px 0}.im-card{border:1px solid #d7dde5;border-radius:10px;padding:14px;background:#fff}.im-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.im-field{border:1px solid #e5e7eb;border-radius:8px;padding:10px;background:#fafbfc}.im-label-row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}.im-label-row label{font-weight:600}.im-help{font-size:.86rem;line-height:1.35;color:#5f6b7a;margin-top:6px}.im-info{flex:0 0 auto;width:26px;height:26px;padding:0;border-radius:50%;font-weight:700;line-height:24px}.im-stage{position:relative;display:inline-block;max-width:100%;touch-action:none}.im-stage img{display:block;max-width:100%;height:auto}.im-stage canvas{position:absolute;inset:0;width:100%;height:100%;cursor:crosshair;touch-action:none}.im-actions{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0}.im-legend{display:flex;flex-wrap:wrap;gap:10px;margin:8px 0 12px}.im-legend span{display:inline-flex;align-items:center;gap:6px;font-size:.86rem}.im-swatch{width:18px;height:14px;border:1px solid #9ca3af;border-radius:3px;background:#fff}.im-swatch.excluded{background:rgba(220,38,38,.35)}.im-result{border:1px solid #d7dde5;border-radius:8px;padding:12px;background:#f8fafc;margin:10px 0}.im-result-title{font-weight:700;margin-bottom:6px}.im-result-text{font-size:1rem;margin-bottom:8px}.im-result-meta{display:flex;flex-wrap:wrap;gap:8px 16px;font-size:.88rem;color:#4b5563}.im-diag{white-space:pre-wrap;overflow-wrap:anywhere;background:#111827;color:#e5e7eb;padding:12px;border-radius:8px;min-height:100px;font-family:monospace;font-size:.82rem}.im-details{margin-top:10px}.im-details summary{cursor:pointer;font-weight:600}.im-modal-backdrop{position:fixed;inset:0;background:rgba(15,23,42,.5);display:none;align-items:center;justify-content:center;padding:18px;z-index:10000}.im-modal-backdrop.open{display:flex}.im-modal{width:min(560px,100%);max-height:80vh;overflow:auto;background:#fff;border-radius:12px;padding:18px;box-shadow:0 18px 50px rgba(0,0,0,.25)}.im-modal h3{margin-top:0}.im-modal-actions{display:flex;justify-content:flex-end;margin-top:14px}@media(max-width:760px){.im-grid,.im-fields{grid-template-columns:1fr}}
+.im-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:14px 0}.im-card{border:1px solid #d7dde5;border-radius:10px;padding:14px;background:#fff}.im-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.im-field{border:1px solid #e5e7eb;border-radius:8px;padding:10px;background:#fafbfc}.im-label-row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}.im-label-row label{font-weight:600}.im-help{font-size:.86rem;line-height:1.35;color:#5f6b7a;margin-top:6px}.im-info{flex:0 0 auto;width:26px;height:26px;padding:0;border-radius:50%;font-weight:700;line-height:24px}.im-stage{position:relative;display:inline-block;max-width:100%;touch-action:none}.im-stage img{display:block;max-width:100%;height:auto}.im-stage canvas{position:absolute;inset:0;width:100%;height:100%;cursor:crosshair;touch-action:none}.im-actions{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0}.im-legend{display:flex;flex-wrap:wrap;gap:10px;margin:8px 0 12px}.im-legend span{display:inline-flex;align-items:center;gap:6px;font-size:.86rem}.im-swatch{width:18px;height:14px;border:1px solid #9ca3af;border-radius:3px;background:#fff}.im-swatch.excluded{background:rgba(220,38,38,.35)}.im-result{border:1px solid #d7dde5;border-radius:8px;padding:12px;background:#f8fafc;margin:10px 0}.im-result-title{font-weight:700;margin-bottom:6px}.im-result-text{font-size:1rem;margin-bottom:8px}.im-result-meta{display:flex;flex-wrap:wrap;gap:8px 16px;font-size:.88rem;color:#4b5563}.im-live-grid{display:grid;grid-template-columns:minmax(230px,42%) minmax(0,1fr);gap:9px 18px;align-items:start}.im-live-label{font-weight:700;white-space:normal;overflow-wrap:anywhere}.im-live-value{min-width:0;min-height:1.45em;overflow-wrap:anywhere}.im-live-card{margin:14px 0}.im-diag{white-space:pre-wrap;overflow-wrap:anywhere;background:#111827;color:#e5e7eb;padding:12px;border-radius:8px;min-height:100px;font-family:monospace;font-size:.82rem}.im-details{margin-top:10px}.im-details summary{cursor:pointer;font-weight:600}.im-modal-backdrop{position:fixed;inset:0;background:rgba(15,23,42,.5);display:none;align-items:center;justify-content:center;padding:18px;z-index:10000}.im-modal-backdrop.open{display:flex}.im-modal{width:min(560px,100%);max-height:80vh;overflow:auto;background:#fff;border-radius:12px;padding:18px;box-shadow:0 18px 50px rgba(0,0,0,.25)}.im-modal h3{margin-top:0}.im-modal-actions{display:flex;justify-content:flex-end;margin-top:14px}@media(max-width:760px){.im-grid,.im-fields{grid-template-columns:1fr}.im-live-grid{grid-template-columns:1fr;gap:3px}.im-live-label{margin-top:7px}.im-live-value{padding-bottom:3px}}
 </style>
 )HTML";
 
         html += "<div class='flash-notice' style='border-left-color:var(--accent);background:#eef4ff'><strong>" +
             htmlText(UI_IMAGE_MOTION_TEST_NOTE) + "</strong></div>";
+
+        html += "<div class='im-card im-live-card'><h3>" +
+            htmlText(UI_IMAGE_MOTION_LIVE_TITLE) +
+            "</h3><p class='muted'>" + htmlText(UI_IMAGE_MOTION_TEST_USES_SAVED) + "</p><div class='im-live-grid'>" +
+            "<div class='im-live-label'>" + htmlText(UI_IMAGE_MOTION_LIVE_STATUS) + "</div>" +
+            "<div class='im-live-value'><span id='imLiveState' class='status-pill warn'>" + htmlText(UI_IMAGE_MOTION_LIVE_WAITING) + "</span></div>" +
+            "<div class='im-live-label'>" + htmlText(UI_IMAGE_MOTION_LIVE_CONFIRMATION) + "</div>" +
+            "<div id='imLiveConfirm' class='im-live-value'>0 / " + String(cfg_image_motion_confirm_frames) + "</div>" +
+            "<div class='im-live-label'>" + htmlText(UI_IMAGE_MOTION_LIVE_CHANGED_AREA) + "</div>" +
+            "<div id='imLiveTotalArea' class='im-live-value'>0.0 %</div>" +
+            "<div class='im-live-label'>" + htmlText(UI_IMAGE_MOTION_RESULT_AREA) + "</div>" +
+            "<div id='imLiveArea' class='im-live-value'>0.0 %</div>" +
+            "<div class='im-live-label'>" + htmlText(UI_IMAGE_MOTION_RESULT_LIMIT) + "</div>" +
+            "<div id='imLiveLimit' class='im-live-value'>" + String(cfg_image_motion_min_area_pct) + " %</div>" +
+            "<div class='im-live-label'>" + htmlText(UI_IMAGE_MOTION_LIVE_LAST_DETECTION) + "</div>" +
+            "<div id='imLiveLast' class='im-live-value'>" + htmlText(UI_IMAGE_MOTION_LIVE_NEVER) + "</div>" +
+            "</div><div class='im-actions' style='margin-top:14px'>" +
+            "<a href='/image_motion_diag_download'><button type='button'>" + htmlText(UI_IMAGE_MOTION_DIAG_DOWNLOAD) + "</button></a>" +
+            "<span class='muted'>" + htmlText(UI_IMAGE_MOTION_DIAG_BUFFER) + ": <b id='imDiagBufferStatus'>0 / " + String(imageMotionDiagnosticCapacity()) + "</b></span>" +
+            "</div></div>";
 
         html += "<div class='im-grid'><div class='im-card'><h3>" +
             htmlText(UI_IMAGE_MOTION_ROI) + "</h3><p class='muted'>" +
@@ -9002,18 +9359,6 @@ static void handleImageMotionPage()
             "</button><button type='button' id='imInvert'>" + htmlText(UI_IMAGE_MOTION_INVERT) + "</button></div></div>";
 
         html += "<div class='im-card'><h3>" + htmlText(UI_IMAGE_MOTION_TITLE) + "</h3><div class='im-fields'>";
-
-        html += "<div class='im-field'><div class='im-label-row'><label for='imEnabled'>" + htmlText(UI_IMAGE_MOTION_ACTIVE) + "</label>" +
-            imageMotionInfoButton(UI_IMAGE_MOTION_ACTIVE, UI_IMAGE_MOTION_ACTIVE_HELP) +
-            "</div><select id='imEnabled'><option value='0'" + String(cfg_image_motion_enabled ? "" : " selected") + ">" + htmlText(UI_IMAGE_MOTION_ENABLED_OFF) +
-            "</option><option value='1'" + String(cfg_image_motion_enabled ? " selected" : "") + ">" + htmlText(UI_IMAGE_MOTION_ENABLED_ON) +
-            "</option></select><div class='im-help'>" + htmlText(UI_IMAGE_MOTION_ACTIVE_HELP) + "</div></div>";
-
-        html += "<div class='im-field'><div class='im-label-row'><label for='imDecision'>" + htmlText(UI_IMAGE_MOTION_DECISION) + "</label>" +
-            imageMotionInfoButton(UI_IMAGE_MOTION_DECISION, UI_IMAGE_MOTION_DECISION_HELP) +
-            "</div><select id='imDecision'><option value='direct'" + String(cfg_motion_recording_decision == "direct" ? " selected" : "") + ">" + htmlText(UI_IMAGE_MOTION_DIRECT) +
-            "</option><option value='image_verify'" + String(cfg_motion_recording_decision == "image_verify" ? " selected" : "") + ">" + htmlText(UI_IMAGE_MOTION_VERIFY) +
-            "</option></select><div class='im-help'>" + htmlText(UI_IMAGE_MOTION_DECISION_HELP) + "</div></div>";
 
         html += "<div class='im-field'><div class='im-label-row'><label for='imSensitivity'>" + htmlText(UI_IMAGE_MOTION_SENSITIVITY) + "</label>" +
             imageMotionInfoButton(UI_IMAGE_MOTION_SENSITIVITY, UI_IMAGE_MOTION_SENSITIVITY_HELP) +
@@ -9071,7 +9416,7 @@ static void handleImageMotionPage()
 
         String defaultRoi = imageMotionDefaultRoiMask();
         html += "<script>const IM_W=20,IM_H=15;let imMask='" + cfg_image_motion_roi_mask + "';let imSavedMinArea=" + String(cfg_image_motion_min_area_pct) + ";";
-        html += "const IM_DEFAULTS={enabled:'0',decision:'direct',sensitivity:'5',minArea:'6',confirm:'2',release:'2',learning:'4',globalMean:'24',globalChange:'70',roi:'" + defaultRoi + "'};";
+        html += "const IM_DEFAULTS={sensitivity:'5',minArea:'6',confirm:'2',release:'2',learning:'4',globalMean:'24',globalChange:'70',roi:'" + defaultRoi + "'};";
         html += "const IM_TEXT={saved:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_SAVED))) +
             "\",saveFailed:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_SAVE_FAILED))) +
             "\",testFailed:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_TEST_FAILED))) +
@@ -9087,11 +9432,23 @@ static void handleImageMotionPage()
             "\",resultError:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESULT_ERROR))) +
             "\",resultTime:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESULT_TIME))) +
             "\",resultArea:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESULT_AREA))) +
-            "\",resultLimit:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESULT_LIMIT))) + "\"};";
+            "\",resultLimit:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESULT_LIMIT))) +
+            "\",liveTotalArea:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_CHANGED_AREA))) +
+            "\",liveDetected:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_DETECTED))) +
+            "\",liveNone:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_NONE))) +
+            "\",liveLearning:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_LEARNING))) +
+            "\",liveGlobalLight:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_GLOBAL_LIGHT))) +
+            "\",liveError:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_ERROR))) +
+            "\",liveConfirmed:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_CONFIRMED))) +
+            "\",liveNever:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_NEVER))) +
+            "\",liveWaiting:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_WAITING))) +
+            "\",ago:\"" + imageMotionJsonEscape(String(tr(UI_MOTION_AGO))) +
+            "\",agoSuffix:\"" + imageMotionJsonEscape(String(tr(UI_MOTION_AGO_SUFFIX))) + "\"};";
 
         html += R"JS(
 const imImage=document.getElementById('imImage'),imCanvas=document.getElementById('imCanvas'),imCtx=imCanvas.getContext('2d');
-const imStatus=document.getElementById('imStatus'),imDiag=document.getElementById('imDiag'),imResultText=document.getElementById('imResultText'),imResultMeta=document.getElementById('imResultMeta');
+const imStatus=document.getElementById('imStatus'),imDiag=document.getElementById('imDiag'),imResultText=document.getElementById('imResultText'),imResultMeta=document.getElementById('imResultMeta'),imDiagBufferStatus=document.getElementById('imDiagBufferStatus');
+const imLiveState=document.getElementById('imLiveState'),imLiveConfirm=document.getElementById('imLiveConfirm'),imLiveTotalArea=document.getElementById('imLiveTotalArea'),imLiveArea=document.getElementById('imLiveArea'),imLiveLimit=document.getElementById('imLiveLimit'),imLiveLast=document.getElementById('imLiveLast');
 const imInfoBackdrop=document.getElementById('imInfoBackdrop'),imInfoTitle=document.getElementById('imInfoTitle'),imInfoBody=document.getElementById('imInfoBody');
 function maskBytes(){const a=[];for(let i=0;i<imMask.length;i+=2)a.push(parseInt(imMask.slice(i,i+2),16)||0);return a}
 function setMaskBytes(a){imMask=a.map(v=>v.toString(16).padStart(2,'0')).join('')}
@@ -9105,20 +9462,24 @@ imCanvas.addEventListener('pointermove',e=>{if(!painting)return;const i=cellAt(e
 document.getElementById('imAll').onclick=()=>{const a=new Array(38).fill(255);a[37]&=15;setMaskBytes(a);drawGrid()};
 document.getElementById('imClear').onclick=()=>{setMaskBytes(new Array(38).fill(0));drawGrid()};
 document.getElementById('imInvert').onclick=()=>{const a=maskBytes().map(v=>(~v)&255);a[37]&=15;setMaskBytes(a);drawGrid()};
-function refresh(){imImage.src='/snapshot?t='+Date.now()}imImage.onload=()=>{drawGrid();setTimeout(refresh,700)};imImage.onerror=()=>setTimeout(refresh,1200);window.addEventListener('resize',drawGrid);refresh();
-function params(){const p=new URLSearchParams();p.set('enabled',document.getElementById('imEnabled').value);p.set('decision',document.getElementById('imDecision').value);p.set('sensitivity',document.getElementById('imSensitivity').value);p.set('min_area',document.getElementById('imMinArea').value);p.set('confirm',document.getElementById('imConfirm').value);p.set('release',document.getElementById('imRelease').value);p.set('learning',document.getElementById('imLearning').value);p.set('global_mean',document.getElementById('imGlobalMean').value);p.set('global_change',document.getElementById('imGlobalChange').value);p.set('roi',imMask);return p}
+function liveAgeText(valid,ms){if(!valid)return IM_TEXT.liveNever;ms=Math.max(0,Number(ms)||0);let v='';if(ms<1000)v='<1 s';else if(ms<60000)v=Math.floor(ms/1000)+' s';else{const sec=Math.floor(ms/1000),min=Math.floor(sec/60),rest=sec%60;v=min+' min '+rest+' s'}return IM_TEXT.ago+(IM_TEXT.ago?' ':'')+v+IM_TEXT.agoSuffix}
+function liveStateText(d){if(d.motion_active||d.image_motion_state==='confirmed')return IM_TEXT.liveDetected;if(d.image_motion_state==='background_init')return IM_TEXT.liveLearning;if(d.image_motion_state==='global_change')return IM_TEXT.liveGlobalLight;if(d.image_motion_state==='error')return IM_TEXT.liveError;return IM_TEXT.liveNone}
+function renderLive(payload){const d=(payload&&payload.diagnostics)||{};const required=Math.max(1,Number((payload&&payload.confirm_required)||0)||1);const current=Math.max(0,Number(d.confirm_counter)||0);const active=Math.max(0,Number(d.active_roi_blocks)||0);const changed=Math.max(0,Number(d.changed_blocks)||0);const cluster=Math.max(0,Number(d.largest_cluster_blocks)||0);const totalPct=Number(d.global_change_pct||0);const clusterPct=Number(d.changed_area_pct||0);if(imLiveState){imLiveState.textContent=liveStateText(d);imLiveState.classList.remove('danger','warn','ok');if(d.motion_active||d.image_motion_state==='confirmed')imLiveState.classList.add('danger');else if(d.image_motion_state==='candidate'||d.image_motion_state==='background_init'||d.image_motion_state==='global_change')imLiveState.classList.add('warn');else if(d.image_motion_state==='error')imLiveState.classList.add('danger');else imLiveState.classList.add('ok')}if(imLiveConfirm){imLiveConfirm.textContent=(d.motion_active||d.image_motion_state==='confirmed')?IM_TEXT.liveConfirmed+' ('+Math.min(required,Math.max(current,required))+' / '+required+')':Math.min(current,required)+' / '+required}if(imLiveTotalArea){imLiveTotalArea.textContent=totalPct.toFixed(1)+' %'+(active?' ('+changed+' / '+active+')':'')}if(imLiveArea){imLiveArea.textContent=clusterPct.toFixed(1)+' %'+(cluster?' ('+cluster+')':'')}if(imLiveLimit){imLiveLimit.textContent=Number((payload&&payload.area_limit_pct)||imSavedMinArea).toFixed(1)+' %'}if(imLiveLast)imLiveLast.textContent=liveAgeText(!!d.last_detection_valid,d.last_detection_age_ms);if(imDiagBufferStatus)imDiagBufferStatus.textContent=String(Number((payload&&payload.diag_count)||0))+' / '+String(Number((payload&&payload.diag_capacity)||0));imDiag.textContent=JSON.stringify(d,null,2)}
+async function pollLiveStatus(){try{const r=await fetch('/image_motion_status?t='+Date.now(),{cache:'no-store',credentials:'same-origin'});if(!r.ok)throw new Error();const j=await r.json();renderLive(j)}catch(e){if(imLiveState){imLiveState.textContent=IM_TEXT.liveWaiting;imLiveState.classList.remove('danger','ok');imLiveState.classList.add('warn')}}}
+let imRefreshTimer=0,imStatusTimer=0;function scheduleRefresh(ms){clearTimeout(imRefreshTimer);imRefreshTimer=setTimeout(refresh,ms)}function scheduleStatus(ms){clearTimeout(imStatusTimer);imStatusTimer=setTimeout(updateStatusLoop,ms)}function refresh(){if(document.hidden){scheduleRefresh(1000);return}imImage.src='/snapshot?im=1&t='+Date.now()}async function updateStatusLoop(){if(document.hidden){scheduleStatus(1000);return}await pollLiveStatus();scheduleStatus(500)}imImage.onload=()=>{drawGrid();scheduleRefresh(200)};imImage.onerror=()=>scheduleRefresh(500);window.addEventListener('resize',drawGrid);refresh();updateStatusLoop();
+function params(){const p=new URLSearchParams();p.set('sensitivity',document.getElementById('imSensitivity').value);p.set('min_area',document.getElementById('imMinArea').value);p.set('confirm',document.getElementById('imConfirm').value);p.set('release',document.getElementById('imRelease').value);p.set('learning',document.getElementById('imLearning').value);p.set('global_mean',document.getElementById('imGlobalMean').value);p.set('global_change',document.getElementById('imGlobalChange').value);p.set('roi',imMask);return p}
 function openInfo(title,body){imInfoTitle.textContent=title;imInfoBody.textContent=body;imInfoBackdrop.classList.add('open')}
 function closeInfo(){imInfoBackdrop.classList.remove('open')}
 document.querySelectorAll('.im-info').forEach(b=>b.addEventListener('click',()=>openInfo(b.dataset.title||'',b.dataset.info||'')));
 document.getElementById('imInfoClose').onclick=closeInfo;imInfoBackdrop.addEventListener('click',e=>{if(e.target===imInfoBackdrop)closeInfo()});document.addEventListener('keydown',e=>{if(e.key==='Escape')closeInfo()});
-function setDefaults(){document.getElementById('imEnabled').value=IM_DEFAULTS.enabled;document.getElementById('imDecision').value=IM_DEFAULTS.decision;document.getElementById('imSensitivity').value=IM_DEFAULTS.sensitivity;document.getElementById('imMinArea').value=IM_DEFAULTS.minArea;document.getElementById('imConfirm').value=IM_DEFAULTS.confirm;document.getElementById('imRelease').value=IM_DEFAULTS.release;document.getElementById('imLearning').value=IM_DEFAULTS.learning;document.getElementById('imGlobalMean').value=IM_DEFAULTS.globalMean;document.getElementById('imGlobalChange').value=IM_DEFAULTS.globalChange;imMask=IM_DEFAULTS.roi;drawGrid();imStatus.textContent=IM_TEXT.defaultsDone}
+function setDefaults(){document.getElementById('imSensitivity').value=IM_DEFAULTS.sensitivity;document.getElementById('imMinArea').value=IM_DEFAULTS.minArea;document.getElementById('imConfirm').value=IM_DEFAULTS.confirm;document.getElementById('imRelease').value=IM_DEFAULTS.release;document.getElementById('imLearning').value=IM_DEFAULTS.learning;document.getElementById('imGlobalMean').value=IM_DEFAULTS.globalMean;document.getElementById('imGlobalChange').value=IM_DEFAULTS.globalChange;imMask=IM_DEFAULTS.roi;drawGrid();imStatus.textContent=IM_TEXT.defaultsDone}
 document.getElementById('imDefaults').onclick=setDefaults;
 document.getElementById('imSave').onclick=async()=>{imStatus.textContent='...';try{const r=await fetch('/image_motion_save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:params()});const j=await r.json();if(!r.ok||!j.ok)throw new Error(IM_TEXT.saveFailed+(j.error?': '+j.error:''));imSavedMinArea=parseInt(document.getElementById('imMinArea').value,10)||imSavedMinArea;imStatus.textContent=IM_TEXT.saved}catch(e){imStatus.textContent=e.message}};
 function friendlyResult(d){if(d.motion_active||d.image_motion_state==='confirmed')return IM_TEXT.resultMotion;switch(d.reject_reason){case'disabled':return IM_TEXT.resultDisabled;case'background_init':return IM_TEXT.resultLearning;case'confirming':return IM_TEXT.resultConfirming;case'global_light':return IM_TEXT.resultGlobalLight;case'no_roi':return IM_TEXT.resultNoRoi;case'decode':case'invalid_frame':return IM_TEXT.resultError;default:return IM_TEXT.resultNone}}
-function renderDiagnostics(d){imResultText.textContent=friendlyResult(d);const area=Number(d.changed_area_pct||0).toFixed(1)+' %';const limit=imSavedMinArea+' %';imResultMeta.innerHTML='';[[IM_TEXT.resultTime,(d.analyze_frame_ms!==undefined?d.analyze_frame_ms:'-')+' ms'],[IM_TEXT.resultArea,area],[IM_TEXT.resultLimit,limit]].forEach(([k,v])=>{const span=document.createElement('span');span.textContent=k+': '+v;imResultMeta.appendChild(span)});imDiag.textContent=JSON.stringify(d,null,2)}
+function renderDiagnostics(d){imResultText.textContent=friendlyResult(d);const active=Math.max(0,Number(d.active_roi_blocks)||0),changed=Math.max(0,Number(d.changed_blocks)||0),cluster=Math.max(0,Number(d.largest_cluster_blocks)||0);const total=Number(d.global_change_pct||0).toFixed(1)+' %'+(active?' ('+changed+' / '+active+')':'');const area=Number(d.changed_area_pct||0).toFixed(1)+' %'+(cluster?' ('+cluster+')':'');const limit=imSavedMinArea+' %';imResultMeta.innerHTML='';[[IM_TEXT.resultTime,(d.analyze_frame_ms!==undefined?d.analyze_frame_ms:'-')+' ms'],[IM_TEXT.liveTotalArea,total],[IM_TEXT.resultArea,area],[IM_TEXT.resultLimit,limit]].forEach(([k,v])=>{const span=document.createElement('span');span.textContent=k+': '+v;imResultMeta.appendChild(span)});imDiag.textContent=JSON.stringify(d,null,2)}
 document.getElementById('imTest').onclick=async()=>{imStatus.textContent='...';try{const r=await fetch('/image_motion_test',{method:'POST'}),j=await r.json();if(!r.ok||!j.ok)throw new Error(IM_TEXT.testFailed+(j.error?': '+j.error:''));renderDiagnostics(j.diagnostics||{});imStatus.textContent='OK'}catch(e){imResultText.textContent=IM_TEXT.resultError;imStatus.textContent=e.message}};
 document.getElementById('imResetBg').onclick=async()=>{imStatus.textContent='...';try{const r=await fetch('/image_motion_reset',{method:'POST'}),j=await r.json();if(!r.ok||!j.ok)throw new Error(IM_TEXT.testFailed);imResultText.textContent=IM_TEXT.resetBgDone;imResultMeta.textContent='';imDiag.textContent='-';imStatus.textContent=IM_TEXT.resetBgDone}catch(e){imStatus.textContent=e.message}};
-function release(){fetch('/preview_stop',{method:'POST',keepalive:true}).catch(()=>{})}window.addEventListener('pagehide',release);document.addEventListener('visibilitychange',()=>{if(document.hidden)release();});
+function release(){fetch('/preview_stop?im=1',{method:'POST',keepalive:true}).catch(()=>{})}window.addEventListener('pagehide',release);document.addEventListener('visibilitychange',()=>{if(document.hidden){clearTimeout(imRefreshTimer);clearTimeout(imStatusTimer);release()}else{clearTimeout(imRefreshTimer);clearTimeout(imStatusTimer);refresh();updateStatusLoop()}});
 )JS";
         html += "</script>";
     }
@@ -9824,6 +10185,36 @@ static void handleSnapshot()
         fb->len
     );
 
+    // The Image Motion page asks for ?im=1. Analyze exactly the JPEG that was
+    // just shown in the browser, so the live status always describes the same
+    // frame and no second camera capture is required. This path is diagnostic
+    // only; WebConfig's preview gate still prevents it from starting a recording.
+    if (
+        server.hasArg("im") &&
+        server.arg("im") == "1" &&
+        fb->format == PIXFORMAT_JPEG &&
+        fb->buf &&
+        fb->len > 0
+    ) {
+        uint32_t nowMs = millis();
+        if (
+            imageMotionPreviewLastAnalysisMs == 0 ||
+            (uint32_t)(nowMs - imageMotionPreviewLastAnalysisMs) >=
+                IMAGE_MOTION_PREVIEW_ANALYSIS_INTERVAL_MS
+        ) {
+            imageMotionPreviewLastAnalysisMs = nowMs;
+
+            ImageMotionDiagnostics diagnostics;
+            (void)imageMotionAnalyzeJpeg(
+                fb->buf,
+                fb->len,
+                fb->width,
+                fb->height,
+                diagnostics
+            );
+        }
+    }
+
     esp_camera_fb_return(fb);
 }
 
@@ -9831,6 +10222,13 @@ static void handleSnapshot()
 static void handlePreviewStop()
 {
     stopCameraPreview();
+
+    if (server.hasArg("im") && server.arg("im") == "1") {
+        // Keep the learned background, but never let a diagnostic/live-preview
+        // confirmation leak into the operational image_only trigger state.
+        imageMotionBeginVerification();
+        imageMotionPreviewLastAnalysisMs = 0;
+    }
 
     server.send(
         204,
@@ -9916,10 +10314,43 @@ static void handleRadarLive()
         ? "true"
         : "false";
 
+    uint8_t targetState =
+        radarLastTargetState();
+
+    RadarSettings liveSettings;
+    bool liveSettingsValid =
+        radarGetCachedSettings(
+            liveSettings
+        );
+
     json +=
         ",\"state\":" +
         String(
-            radarLastTargetState()
+            targetState
+        );
+
+    json +=
+        ",\"sensor_present\":";
+
+    json +=
+        (targetState == 2 || targetState == 3)
+        ? "true"
+        : "false";
+
+    json +=
+        ",\"ot2\":";
+
+    json +=
+        digitalRead(PIR_PIN) == HIGH
+        ? "true"
+        : "false";
+
+    json +=
+        ",\"absence_sec\":" +
+        String(
+            liveSettingsValid
+            ? liveSettings.absenceSec
+            : 0
         );
 
     json +=
@@ -10001,7 +10432,11 @@ static void handleRadarLive()
 
 
     json +=
-        "]}";
+        "],\"diag_count\":" +
+        String(radarDiagnosticCount()) +
+        ",\"diag_capacity\":" +
+        String(radarDiagnosticCapacity()) +
+        "}";
 
 
     server.sendHeader(
@@ -10014,6 +10449,278 @@ static void handleRadarLive()
         "application/json",
         json
     );
+}
+
+
+static String radarDiagnosticCalibrationText(
+    uint8_t mode
+)
+{
+    if (mode == (uint8_t)RADAR_CALIBRATION_QUIET)
+        return "quiet";
+
+    if (mode == (uint8_t)RADAR_CALIBRATION_MOTION)
+        return "motion";
+
+    return "none";
+}
+
+
+static String radarDiagnosticEnergyText(
+    uint16_t deciDb
+)
+{
+    if (deciDb == RADAR_DIAGNOSTIC_INVALID_ENERGY)
+        return "-";
+
+    return
+        String(deciDb / 10U) +
+        "." +
+        String(deciDb % 10U);
+}
+
+
+static char radarDiagnosticZone(
+    uint16_t deciDb,
+    uint32_t triggerDb,
+    uint32_t holdDb
+)
+{
+    if (deciDb == RADAR_DIAGNOSTIC_INVALID_ENERGY)
+        return 'X';
+
+    uint32_t energy = deciDb;
+
+    if (energy >= triggerDb * 10UL)
+        return 'T';
+
+    if (energy >= holdDb * 10UL)
+        return 'H';
+
+    return 'C';
+}
+
+
+static String radarDiagnosticTimestamp(
+    const RadarDiagnosticSample &sample
+)
+{
+    if (sample.epochSec < 1577836800UL)
+        return "-";
+
+    time_t seconds =
+        (time_t)sample.epochSec;
+
+    struct tm localTime;
+    localtime_r(
+        &seconds,
+        &localTime
+    );
+
+    char buffer[32];
+    strftime(
+        buffer,
+        sizeof(buffer),
+        "%Y-%m-%d %H:%M:%S",
+        &localTime
+    );
+
+    char millisPart[8];
+    snprintf(
+        millisPart,
+        sizeof(millisPart),
+        ".%03u",
+        (unsigned int)sample.epochMs
+    );
+
+    return String(buffer) + String(millisPart);
+}
+
+
+static void handleRadarDiagnosticDownload()
+{
+    if (rejectRadarConfigurationUnavailable())
+        return;
+
+    RadarSettings settings;
+    bool settingsValid =
+        radarGetCachedSettings(
+            settings
+        );
+
+    uint16_t count =
+        radarDiagnosticCount();
+
+    server.sendHeader(
+        "Cache-Control",
+        "no-store"
+    );
+
+    server.sendHeader(
+        "Content-Disposition",
+        "attachment; filename=\"sensorforge_radar_diagnostic.txt\""
+    );
+
+    server.setContentLength(
+        CONTENT_LENGTH_UNKNOWN
+    );
+
+    server.send(
+        200,
+        "text/plain; charset=utf-8",
+        ""
+    );
+
+    String line;
+    line.reserve(768);
+
+    line =
+        "# SensorForge Radar RAM Diagnostic\n"
+        "# RAM-only ring buffer; no SD/main-log writes.\n"
+        "# Capture: 1 s baseline plus immediate target/OT2/ESP-motion/threshold-zone changes.\n"
+        "# Oldest retained sample first; oldest entries are overwritten when the buffer is full.\n"
+        "# Zone: T=at/above Trigger, H=below Trigger but at/above Hold, C=below Hold, X=invalid raw zero.\n";
+
+    server.sendContent(line);
+
+    line =
+        "# samples=" +
+        String(count) +
+        " capacity=" +
+        String(radarDiagnosticCapacity()) +
+        "\n";
+
+    server.sendContent(line);
+
+    if (settingsValid) {
+        line =
+            "# settings: min_gate=" +
+            String(settings.minGate) +
+            " max_gate=" +
+            String(settings.maxGate) +
+            " absence_sec=" +
+            String(settings.absenceSec) +
+            " status_rate_hz=" +
+            radarRateText(settings.statusRateX10) +
+            " distance_rate_hz=" +
+            radarRateText(settings.distanceRateX10) +
+            " response_speed=" +
+            String(settings.responseSpeed) +
+            "\n";
+
+        server.sendContent(line);
+
+        uint32_t firstGateValue =
+            settings.minGate == 0
+            ? 0UL
+            : settings.minGate + 1UL;
+
+        if (firstGateValue > 15UL)
+            firstGateValue = 15UL;
+
+        uint32_t finalGateValue =
+            settings.maxGate > 15UL
+            ? 15UL
+            : settings.maxGate;
+
+        for (uint8_t gate = 0; gate < 16; ++gate) {
+            bool operational =
+                gate >= firstGateValue &&
+                gate <= finalGateValue;
+
+            line =
+                "# G" +
+                String(gate) +
+                " trigger=" +
+                String(settings.triggerThreshold[gate]) +
+                " hold=" +
+                String(settings.holdThreshold[gate]) +
+                " operational=" +
+                String(operational ? "yes" : "no") +
+                "\n";
+
+            server.sendContent(line);
+        }
+    } else {
+        server.sendContent(
+            "# settings: unavailable\n"
+        );
+    }
+
+    line =
+        "seq\ttime\tuptime_ms\ttarget_state\ttarget_present\tot2\tdistance_cm\tesp_motion\tcalibration";
+
+    for (uint8_t gate = 0; gate < 16; ++gate) {
+        line +=
+            "\tG" +
+            String(gate) +
+            "_db\tG" +
+            String(gate) +
+            "_zone";
+    }
+
+    line += "\n";
+    server.sendContent(line);
+
+    for (uint16_t index = 0; index < count; ++index) {
+        RadarDiagnosticSample sample;
+
+        if (!radarDiagnosticGet(
+                index,
+                sample
+            )) {
+            continue;
+        }
+
+        bool targetPresent =
+            sample.targetState == 2 ||
+            sample.targetState == 3;
+
+        line =
+            String(sample.sequence) +
+            "\t" +
+            radarDiagnosticTimestamp(sample) +
+            "\t" +
+            String(sample.uptimeMs) +
+            "\t" +
+            String(sample.targetState) +
+            "\t" +
+            String(targetPresent ? "1" : "0") +
+            "\t" +
+            String(sample.ot2High ? "HIGH" : "LOW") +
+            "\t" +
+            String(sample.targetDistanceCm) +
+            "\t" +
+            String(sample.espMotionActive ? "1" : "0") +
+            "\t" +
+            radarDiagnosticCalibrationText(
+                sample.calibrationMode
+            );
+
+        for (uint8_t gate = 0; gate < 16; ++gate) {
+            line += "\t";
+            line += radarDiagnosticEnergyText(
+                sample.gateEnergyDeciDb[gate]
+            );
+            line += "\t";
+
+            if (settingsValid) {
+                line += radarDiagnosticZone(
+                    sample.gateEnergyDeciDb[gate],
+                    settings.triggerThreshold[gate],
+                    settings.holdThreshold[gate]
+                );
+            } else {
+                line += '?';
+            }
+        }
+
+        line += "\n";
+        server.sendContent(line);
+
+        if ((index % 25U) == 24U)
+            serviceWebLongOperation();
+    }
 }
 
 
@@ -10534,17 +11241,32 @@ static void handleRadarConfig()
 
 
     html +=
+        "<h3>Radar Live-Status</h3>"
+        "<div class='flash-notice' style='border-color:#8aa6bf'>"
+        "<strong>Aktueller Radarstatus</strong>"
+        "<div style='display:grid;grid-template-columns:minmax(120px,150px) minmax(0,1fr);column-gap:12px;row-gap:5px;margin-top:8px;align-items:start'>"
+        "<b style='white-space:nowrap'>Radar erkennt:</b><span id='radarSensorDecision' style='display:block;min-height:1.35em'>warte auf Daten...</span>"
+        "<b style='white-space:nowrap'>OT2-Ausgang:</b><span id='radarOt2Decision' style='display:block;min-height:1.35em'>-</span>"
+        "<b style='white-space:nowrap'>Warum:</b><span id='radarDerivedCause' style='display:block;min-height:2.7em;line-height:1.35'>-</span>"
+        "</div>"
+        "<div style='display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-top:10px'>"
+        "<a href='/radar_diag_download'><button type='button'>Radar-Diagnose herunterladen</button></a>"
+        "<span class='muted'>RAM-Puffer: <b id='radarDiagBufferStatus'>- / 400</b> Einträge · älteste werden automatisch überschrieben</span>"
+        "</div>"
+        "</div>";
+
+    html +=
         "<h3>Live Gate Energy</h3>"
         "<p>Aktualisierung ca. 4x pro Sekunde. "
-        "Energie und Trigger-Schwelle benutzen dieselbe dB-Skala. "
-        "Positiver Margin bedeutet: Gate liegt ueber der Trigger-Schwelle. "
+        "<b>TRIGGER</b> bedeutet: Energie liegt auf/über der Trigger-Schwelle. "
+        "<b>HOLD</b> bedeutet: unter Trigger, aber noch auf/über der Hold-Schwelle. "
         "<b>Letzter Trigger</b> wird direkt im ESP aus jedem Radarreport gespeichert; "
         "auch ein kurzer Trigger zwischen zwei Browser-Aktualisierungen bleibt daher sichtbar.</p>";
 
     html +=
-        "<p><b>Live status:</b> "
+        "<p><b>UART:</b> "
         "<span id='radarLiveStatus'>waiting...</span>"
-        " &nbsp; <b>Motion:</b> "
+        " &nbsp; <b>ESP-Schnelltrigger:</b> "
         "<span id='radarLiveMotion'>-</span>"
         " &nbsp; <b>Messstatistik:</b> "
         "<span id='radarCalLiveMode'>keine</span>"
@@ -10561,7 +11283,8 @@ static void handleRadarConfig()
         "<th style='padding:5px;border-bottom:1px solid #aaa'>Mess-P99</th>"
         "<th style='padding:5px;border-bottom:1px solid #aaa'>Mess-Peak</th>"
         "<th style='padding:5px;border-bottom:1px solid #aaa'>Trigger dB</th>"
-        "<th style='padding:5px;border-bottom:1px solid #aaa'>Margin</th>"
+        "<th style='padding:5px;border-bottom:1px solid #aaa'>Hold dB</th>"
+        "<th style='padding:5px;border-bottom:1px solid #aaa'>Trigger-Margin</th>"
         "<th style='padding:5px;border-bottom:1px solid #aaa'>Status</th>"
         "<th style='padding:5px;border-bottom:1px solid #aaa'>Letzter Trigger</th>"
         "</tr>";
@@ -10580,6 +11303,12 @@ static void handleRadarConfig()
         html +=
             "<tr id='liveRow" +
             String(gate) +
+            "' data-active='" +
+            String(
+                inConfiguredRange
+                ? "1"
+                : "0"
+            ) +
             "'" +
             String(
                 inConfiguredRange
@@ -10613,6 +11342,15 @@ static void handleRadarConfig()
             "' style='padding:4px;text-align:right'>" +
             String(
                 settings.triggerThreshold[
+                    gate
+                ]
+            ) +
+            "</td>"
+            "<td id='liveHoldThreshold" +
+            String(gate) +
+            "' style='padding:4px;text-align:right'>" +
+            String(
+                settings.holdThreshold[
                     gate
                 ]
             ) +
@@ -10659,31 +11397,58 @@ static void handleRadarConfig()
             ".then(function(d){"
                 "var s=document.getElementById('radarLiveStatus');"
                 "var m=document.getElementById('radarLiveMotion');"
+                "var sd=document.getElementById('radarSensorDecision');"
+                "var od=document.getElementById('radarOt2Decision');"
+                "var dc=document.getElementById('radarDerivedCause');"
+                "var db=document.getElementById('radarDiagBufferStatus');"
+                "if(db&&Number.isFinite(Number(d.diag_count))&&Number.isFinite(Number(d.diag_capacity)))db.textContent=Number(d.diag_count)+' / '+Number(d.diag_capacity);"
                 "if(!d.recent){"
-                    "s.textContent='no recent standard report';"
+                    "s.textContent='keine aktuellen Standarddaten';"
+                    "if(sd)sd.textContent='keine aktuellen Daten';"
+                    "if(od)od.textContent=d.ot2?'HIGH':'LOW';"
+                    "if(dc)dc.textContent='nicht bestimmbar';"
                 "}else{"
-                    "s.textContent='state='+d.state+', distance='+d.distance+' cm';"
+                    "s.textContent='Status '+d.state+' · Distanz '+d.distance+' cm';"
+                    "if(sd)sd.textContent=d.sensor_present?'BEWEGUNG':'Keine Bewegung';"
+                    "if(od){od.textContent=d.ot2?'HIGH':'LOW';od.style.fontWeight='bold';}"
                 "}"
-                "m.textContent=d.motion?'ACTIVE ('+d.remaining_ms+' ms)':'clear';"
+                "m.textContent=d.motion?'AKTIV ('+d.remaining_ms+' ms)':'keine Bewegung';"
+                "var bestTrigger=null,bestHold=null;"
                 "for(var i=0;i<16;i++){"
                     "var e=document.getElementById('liveEnergy'+i);"
                     "var t=document.getElementById('liveThreshold'+i);"
+                    "var h=document.getElementById('liveHoldThreshold'+i);"
                     "var g=document.getElementById('liveMargin'+i);"
                     "var q=document.getElementById('liveState'+i);"
                     "var a=document.getElementById('liveLastTrigger'+i);"
-                    "if(!e||!t||!g||!q||!a)continue;"
+                    "var row=document.getElementById('liveRow'+i);"
+                    "if(!e||!t||!h||!g||!q||!a)continue;"
                     "a.textContent=(d.last_trigger_age_ms&&i<d.last_trigger_age_ms.length)?formatTriggerAge(d.last_trigger_age_ms[i]):'-';"
                     "if(!d.recent){"
-                        "e.textContent='-';g.textContent='-';q.textContent='-';"
+                        "e.textContent='-';g.textContent='-';q.textContent='-';q.style.fontWeight='normal';"
                         "continue;"
                     "}"
                     "var energy=Number(d.energy[i]);"
                     "var threshold=Number(t.textContent);"
+                    "var hold=Number(h.textContent);"
                     "var margin=energy-threshold;"
                     "e.textContent=energy.toFixed(1);"
                     "g.textContent=(margin>=0?'+':'')+margin.toFixed(1);"
-                    "q.textContent=margin>=0?'TRIGGER':'clear';"
-                    "q.style.fontWeight=margin>=0?'bold':'normal';"
+                    "var valid=Number.isFinite(energy)&&energy>0;"
+                    "if(!valid){q.textContent='keine Daten';q.style.fontWeight='normal';continue;}"
+                    "if(energy>=threshold){q.textContent='TRIGGER';q.style.fontWeight='bold';}"
+                    "else if(energy>=hold){q.textContent='HOLD';q.style.fontWeight='bold';}"
+                    "else{q.textContent='clear';q.style.fontWeight='normal';}"
+                    "var active=!row||row.dataset.active!=='0';"
+                    "if(active&&energy>=threshold){var tm=energy-threshold;if(!bestTrigger||tm>bestTrigger.margin)bestTrigger={gate:i,energy:energy,threshold:threshold,margin:tm};}"
+                    "else if(active&&energy>=hold){var hm=energy-hold;if(!bestHold||hm>bestHold.margin)bestHold={gate:i,energy:energy,hold:hold,margin:hm};}"
+                "}"
+                "if(d.recent&&dc){"
+                    "if(bestTrigger){dc.textContent='Gate '+bestTrigger.gate+' hat ausgelöst.';if(!d.sensor_present&&!d.ot2)dc.textContent+=' Der Sensor hat die Bewegung noch nicht übernommen.';}"
+                    "else if(bestHold){if(d.sensor_present||d.ot2)dc.textContent='Gate '+bestHold.gate+' hält die erkannte Bewegung noch aktiv.';else dc.textContent='Gate '+bestHold.gate+' liegt noch im Haltebereich, aber der Sensor meldet keine Bewegung.';}"
+                    "else if(d.sensor_present||d.ot2){dc.textContent='Der Sensor hält die letzte Erkennung noch nach.';}"
+                    "else{dc.textContent='Kein Gate meldet Bewegung.';}"
+                    "if(Boolean(d.sensor_present)!==Boolean(d.ot2))dc.textContent+=' Hinweis: Radarstatus und OT2 passen gerade nicht zusammen.';"
                 "}"
             "})"
             ".catch(function(){"
@@ -17197,6 +17962,7 @@ void webConfigStart()
 
     server.on("/radar_config", HTTP_GET, handleRadarConfig);
     server.on("/radar_live", HTTP_GET, handleRadarLive);
+    server.on("/radar_diag_download", HTTP_GET, handleRadarDiagnosticDownload);
     server.on("/radar_calibration_status", HTTP_GET, handleRadarCalibrationStatus);
     server.on("/radar_calibration_action", HTTP_POST, handleRadarCalibrationAction);
     server.on("/radar_config_save", HTTP_POST, handleRadarConfigSave);
@@ -17206,6 +17972,8 @@ void webConfigStart()
     server.on("/image_motion_save", HTTP_POST, handleImageMotionSave);
     server.on("/image_motion_test", HTTP_POST, handleImageMotionTest);
     server.on("/image_motion_reset", HTTP_POST, handleImageMotionResetBackground);
+    server.on("/image_motion_status", HTTP_GET, handleImageMotionStatus);
+    server.on("/image_motion_diag_download", HTTP_GET, handleImageMotionDiagnosticDownload);
 
     server.on("/sdstatus", HTTP_GET, handleSDStatus);
 #if defined(STORAGE_SPI)

@@ -5,6 +5,7 @@
 #include <img_converters.h>
 #include <math.h>
 #include <string.h>
+#include <sys/time.h>
 
 namespace {
 
@@ -14,6 +15,7 @@ static bool backgroundReadyState = false;
 static uint8_t confirmCounterState = 0;
 static uint8_t releaseCounterState = 0;
 static bool motionActiveState = false;
+static uint32_t lastRecordingAnalyzeMs = 0;
 
 static uint8_t *rgb565Buffer = nullptr;
 static size_t rgb565Capacity = 0;
@@ -23,6 +25,8 @@ static uint8_t cachedRoiMask[IMAGE_MOTION_ROI_BYTES] = {};
 static bool cachedRoiValid = false;
 
 static ImageMotionDiagnostics lastDiagnostics;
+static uint32_t lastConfirmedDetectionMs = 0;
+static uint32_t lastAnalysisCompletedMs = 0;
 static uint32_t backgroundConfigHash = 0;
 static bool backgroundConfigHashValid = false;
 
@@ -32,9 +36,137 @@ static bool backgroundConfigHashValid = false;
 static uint32_t workBlockSums[IMAGE_MOTION_GRID_CELLS] = {};
 static uint16_t workBlockCounts[IMAGE_MOTION_GRID_CELLS] = {};
 static uint8_t workBlockMeans[IMAGE_MOTION_GRID_CELLS] = {};
+// Previous analyzed frame, used only to estimate short-term camera/JPEG jitter.
+// This is deliberately separate from the slowly adapting scene background so
+// exposure drift or a slow real object cannot inflate the noise threshold.
+static uint8_t previousBlockMeans[IMAGE_MOTION_GRID_CELLS] = {};
+static bool previousFrameReady = false;
+static uint8_t workAbsDiff[IMAGE_MOTION_GRID_CELLS] = {};
 static bool workChanged[IMAGE_MOTION_GRID_CELLS] = {};
 static bool workVisited[IMAGE_MOTION_GRID_CELLS] = {};
 static uint16_t workStack[IMAGE_MOTION_GRID_CELLS] = {};
+
+// Separate RAM-only diagnostic ring buffer. The preferred 400 samples live in
+// PSRAM so normal internal heap pressure stays low. A smaller internal-RAM
+// fallback keeps diagnostics available on unusual builds without PSRAM.
+static ImageMotionDiagnosticSample *diagnosticBuffer = nullptr;
+static uint16_t diagnosticCapacityState = 0;
+static uint16_t diagnosticHead = 0;
+static uint16_t diagnosticStored = 0;
+static uint32_t diagnosticSequence = 0;
+
+static bool ensureDiagnosticBuffer()
+{
+    if (diagnosticBuffer && diagnosticCapacityState > 0)
+        return true;
+
+    diagnosticCapacityState = IMAGE_MOTION_DIAGNOSTIC_TARGET_CAPACITY;
+    diagnosticBuffer = (ImageMotionDiagnosticSample *)heap_caps_calloc(
+        diagnosticCapacityState,
+        sizeof(ImageMotionDiagnosticSample),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+    );
+
+    if (!diagnosticBuffer) {
+        diagnosticCapacityState = 128;
+        diagnosticBuffer = (ImageMotionDiagnosticSample *)heap_caps_calloc(
+            diagnosticCapacityState,
+            sizeof(ImageMotionDiagnosticSample),
+            MALLOC_CAP_8BIT
+        );
+    }
+
+    if (!diagnosticBuffer) {
+        diagnosticCapacityState = 0;
+        return false;
+    }
+
+    return true;
+}
+
+static uint16_t clampU16(uint32_t value)
+{
+    return value > 65535UL ? 65535U : (uint16_t)value;
+}
+
+static int16_t floatToDeciSigned(float value)
+{
+    long scaled = lroundf(value * 10.0f);
+    if (scaled < -32768L)
+        scaled = -32768L;
+    if (scaled > 32767L)
+        scaled = 32767L;
+    return (int16_t)scaled;
+}
+
+static void captureDiagnosticSample(
+    const ImageMotionDiagnostics &diagnostics,
+    uint16_t sourceWidth,
+    uint16_t sourceHeight
+)
+{
+    if (!ensureDiagnosticBuffer())
+        return;
+
+    ImageMotionDiagnosticSample sample;
+    sample.sequence = ++diagnosticSequence;
+    sample.uptimeMs = millis();
+
+    struct timeval tv;
+    if (gettimeofday(&tv, nullptr) == 0 && tv.tv_sec >= 1577836800LL) {
+        sample.epochSec = (uint32_t)tv.tv_sec;
+        sample.epochMs = (uint16_t)(tv.tv_usec / 1000L);
+    }
+
+    sample.sourceWidth = sourceWidth;
+    sample.sourceHeight = sourceHeight;
+    sample.analyzeFrameMs = clampU16(diagnostics.analyzeFrameMs);
+    sample.decodeMs = clampU16(diagnostics.decodeMs);
+    sample.activeRoiBlocks = diagnostics.activeRoiBlocks;
+    sample.changedBlocks = diagnostics.changedBlocks;
+    sample.largestClusterBlocks = diagnostics.largestClusterBlocks;
+    sample.minimumMotionBlocks = diagnostics.minimumMotionBlocks;
+    sample.blockThreshold = diagnostics.blockThreshold;
+    sample.dynamicThresholdMin = diagnostics.dynamicThresholdMin;
+    sample.dynamicThresholdAvgX10 = diagnostics.dynamicThresholdAvgX10;
+    sample.dynamicThresholdMax = diagnostics.dynamicThresholdMax;
+    sample.meanAbsDiffX10 = diagnostics.meanAbsDiffX10;
+    sample.maxAbsDiff = diagnostics.maxAbsDiff;
+    sample.diffGe5 = diagnostics.diffGe5;
+    sample.diffGe10 = diagnostics.diffGe10;
+    sample.diffGe15 = diagnostics.diffGe15;
+    sample.diffGe20 = diagnostics.diffGe20;
+    sample.diffGe25 = diagnostics.diffGe25;
+    sample.diffGe30 = diagnostics.diffGe30;
+    sample.diffGe35 = diagnostics.diffGe35;
+    sample.diffGe40 = diagnostics.diffGe40;
+    sample.clusterGe10 = diagnostics.clusterGe10;
+    sample.clusterGe15 = diagnostics.clusterGe15;
+    sample.clusterGe20 = diagnostics.clusterGe20;
+    sample.clusterGe25 = diagnostics.clusterGe25;
+    sample.clusterGe30 = diagnostics.clusterGe30;
+    sample.clusterGe35 = diagnostics.clusterGe35;
+    sample.globalMeanX10 = floatToDeciSigned(diagnostics.globalMean);
+    sample.globalMeanDeltaX10 = floatToDeciSigned(diagnostics.globalMeanDelta);
+    sample.confirmCounter = diagnostics.confirmCounter;
+    sample.releaseCounter = diagnostics.releaseCounter;
+    sample.state = (uint8_t)diagnostics.state;
+    sample.rejectReason = (uint8_t)diagnostics.rejectReason;
+    sample.flags =
+        (diagnostics.backgroundReady ? 0x01U : 0U) |
+        (diagnostics.motionActive ? 0x02U : 0U);
+
+    memset(sample.changedMask, 0, sizeof(sample.changedMask));
+    for (uint16_t i = 0; i < IMAGE_MOTION_GRID_CELLS; ++i) {
+        if (workChanged[i])
+            sample.changedMask[i >> 3] |= (uint8_t)(1U << (i & 7U));
+    }
+
+    diagnosticBuffer[diagnosticHead] = sample;
+    diagnosticHead = (uint16_t)((diagnosticHead + 1U) % diagnosticCapacityState);
+    if (diagnosticStored < diagnosticCapacityState)
+        ++diagnosticStored;
+}
 
 static uint32_t hashByte(uint32_t hash, uint8_t value)
 {
@@ -86,6 +218,11 @@ static void resetLearnedState()
     confirmCounterState = 0;
     releaseCounterState = 0;
     motionActiveState = false;
+    previousFrameReady = false;
+    memset(previousBlockMeans, 0, sizeof(previousBlockMeans));
+    lastRecordingAnalyzeMs = 0;
+    lastConfirmedDetectionMs = 0;
+    lastAnalysisCompletedMs = 0;
 }
 
 static uint8_t hexValue(char c)
@@ -245,6 +382,71 @@ static uint16_t largestConnectedCluster(
     return largest;
 }
 
+static uint16_t largestConnectedClusterAtDifference(
+    uint8_t minimumDifference,
+    const uint8_t roiMask[IMAGE_MOTION_ROI_BYTES]
+)
+{
+    memset(workVisited, 0, sizeof(workVisited));
+    uint16_t largest = 0;
+
+    for (uint16_t start = 0; start < IMAGE_MOTION_GRID_CELLS; ++start) {
+        if (workVisited[start] || workAbsDiff[start] < minimumDifference)
+            continue;
+        if ((roiMask[start >> 3] & (1U << (start & 7U))) == 0)
+            continue;
+
+        uint16_t count = 0;
+        uint16_t top = 0;
+        workStack[top++] = start;
+        workVisited[start] = true;
+
+        while (top > 0) {
+            uint16_t index = workStack[--top];
+            ++count;
+
+            int x = index % IMAGE_MOTION_GRID_WIDTH;
+            int y = index / IMAGE_MOTION_GRID_WIDTH;
+
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0)
+                        continue;
+
+                    int nx = x + dx;
+                    int ny = y + dy;
+                    if (
+                        nx < 0 || nx >= IMAGE_MOTION_GRID_WIDTH ||
+                        ny < 0 || ny >= IMAGE_MOTION_GRID_HEIGHT
+                    ) {
+                        continue;
+                    }
+
+                    uint16_t next =
+                        (uint16_t)ny * IMAGE_MOTION_GRID_WIDTH +
+                        (uint16_t)nx;
+
+                    if (
+                        workVisited[next] ||
+                        workAbsDiff[next] < minimumDifference ||
+                        (roiMask[next >> 3] & (1U << (next & 7U))) == 0
+                    ) {
+                        continue;
+                    }
+
+                    workVisited[next] = true;
+                    workStack[top++] = next;
+                }
+            }
+        }
+
+        if (count > largest)
+            largest = count;
+    }
+
+    return largest;
+}
+
 static uint16_t sensitivityThreshold(uint8_t sensitivity, float globalMean)
 {
     if (sensitivity < 1)
@@ -252,18 +454,20 @@ static uint16_t sensitivityThreshold(uint8_t sensitivity, float globalMean)
     if (sensitivity > 10)
         sensitivity = 10;
 
-    // Initial field-tuning curve. Higher sensitivity means a lower block
-    // difference threshold. Diagnostics expose the effective value so it can
-    // be tuned from measured installations rather than hidden magic numbers.
-    int threshold = 44 - ((int)sensitivity * 3);
+    // Field-tuned curve from real OV3660 diagnostics. Sensitivity 5 should
+    // react around 25 gray levels instead of the previous ~29 before noise
+    // compensation. Higher sensitivity still means a lower threshold.
+    int threshold = 40 - ((int)sensitivity * 3);
 
+    // Dark scenes need a small extra reserve because JPEG/luma noise rises,
+    // but the previous +6 made normal movement too easy to suppress.
     if (globalMean < 45.0f)
-        threshold += 6;
+        threshold += 3;
 
     if (threshold < 8)
         threshold = 8;
-    if (threshold > 48)
-        threshold = 48;
+    if (threshold > 44)
+        threshold = 44;
 
     return (uint16_t)threshold;
 }
@@ -302,20 +506,30 @@ static void updateBackgroundCell(
         ((delta * (int32_t)alphaQ8) >> 8)
     );
 
-    if (updateNoise) {
-        uint16_t absDiff = (uint16_t)(
-            abs((int32_t)current -
-                (int32_t)(backgroundQ8[index] >> 8))
+    if (updateNoise && previousFrameReady) {
+        // Estimate only short-term frame-to-frame jitter. Do NOT use the
+        // distance from the slowly adapting background here: that caused
+        // exposure drift and slow real movement to be learned as "noise" and
+        // pushed the effective threshold into the high 30s.
+        uint16_t frameJitter = (uint16_t)abs(
+            (int32_t)current -
+            (int32_t)previousBlockMeans[index]
         );
-        uint16_t targetQ8 = absDiff << 8;
-        int32_t noiseDelta =
-            (int32_t)targetQ8 -
-            (int32_t)noiseQ8[index];
 
-        noiseQ8[index] = (uint16_t)(
-            (int32_t)noiseQ8[index] +
-            (noiseDelta >> 4)
-        );
+        // Large inter-frame jumps are likely real movement or a transition,
+        // not sensor/JPEG noise. Ignore them for the noise estimator.
+        if (frameJitter <= 12U) {
+            uint16_t cappedJitter = min((uint16_t)8U, frameJitter);
+            uint16_t targetQ8 = cappedJitter << 8;
+            int32_t noiseDelta =
+                (int32_t)targetQ8 -
+                (int32_t)noiseQ8[index];
+
+            noiseQ8[index] = (uint16_t)(
+                (int32_t)noiseQ8[index] +
+                (noiseDelta >> 4)
+            );
+        }
     }
 }
 
@@ -324,9 +538,11 @@ static void initializeBackground(
 )
 {
     for (uint16_t i = 0; i < IMAGE_MOTION_GRID_CELLS; ++i) {
-        backgroundQ8[i] = (uint16_t)workBlockMeans[i] << 8;
+        backgroundQ8[i] = (uint16_t)blockMeans[i] << 8;
+        previousBlockMeans[i] = blockMeans[i];
         noiseQ8[i] = 2U << 8;
     }
+    previousFrameReady = true;
 
     backgroundReadyState = true;
     confirmCounterState = 0;
@@ -344,6 +560,7 @@ static void setError(
     diagnostics.backgroundReady = backgroundReadyState;
     diagnostics.motionActive = motionActiveState;
     lastDiagnostics = diagnostics;
+    lastAnalysisCompletedMs = millis();
 }
 
 } // namespace
@@ -475,13 +692,6 @@ bool imageMotionAnalyzeJpeg(
 
     diagnostics.backgroundReady = backgroundReadyState;
 
-    if (!cfg_image_motion_enabled) {
-        diagnostics.state = IMAGE_MOTION_STATE_DISABLED;
-        diagnostics.rejectReason = IMAGE_MOTION_REJECT_DISABLED;
-        lastDiagnostics = diagnostics;
-        return true;
-    }
-
     if (
         !jpeg || jpegLength == 0 ||
         sourceWidth < IMAGE_MOTION_GRID_WIDTH ||
@@ -509,6 +719,7 @@ bool imageMotionAnalyzeJpeg(
         diagnostics.state = IMAGE_MOTION_STATE_IDLE;
         diagnostics.rejectReason = IMAGE_MOTION_REJECT_NO_ROI;
         lastDiagnostics = diagnostics;
+        lastAnalysisCompletedMs = millis();
         return true;
     }
 
@@ -557,6 +768,7 @@ bool imageMotionAnalyzeJpeg(
     memset(workBlockSums, 0, sizeof(workBlockSums));
     memset(workBlockCounts, 0, sizeof(workBlockCounts));
     memset(workBlockMeans, 0, sizeof(workBlockMeans));
+    memset(workAbsDiff, 0, sizeof(workAbsDiff));
     memset(workChanged, 0, sizeof(workChanged));
 
     for (uint16_t y = 0; y < scaledHeight; ++y) {
@@ -617,6 +829,8 @@ bool imageMotionAnalyzeJpeg(
         diagnostics.rejectReason = IMAGE_MOTION_REJECT_BACKGROUND_INIT;
         diagnostics.analyzeFrameMs = millis() - startedMs;
         lastDiagnostics = diagnostics;
+        lastAnalysisCompletedMs = millis();
+        captureDiagnosticSample(diagnostics, sourceWidth, sourceHeight);
         return true;
     }
 
@@ -632,6 +846,19 @@ bool imageMotionAnalyzeJpeg(
 
     uint16_t changedBlocks = 0;
     int64_t backgroundGlobalSum = 0;
+    uint32_t absDifferenceSum = 0;
+    uint32_t dynamicThresholdSum = 0;
+    uint16_t dynamicThresholdMin = 0xFFFFU;
+    uint16_t dynamicThresholdMax = 0;
+    uint16_t maxAbsDifference = 0;
+    uint16_t diffGe5 = 0;
+    uint16_t diffGe10 = 0;
+    uint16_t diffGe15 = 0;
+    uint16_t diffGe20 = 0;
+    uint16_t diffGe25 = 0;
+    uint16_t diffGe30 = 0;
+    uint16_t diffGe35 = 0;
+    uint16_t diffGe40 = 0;
 
     for (uint16_t i = 0; i < IMAGE_MOTION_GRID_CELLS; ++i) {
         if ((roiMask[i >> 3] & (1U << (i & 7U))) == 0)
@@ -639,16 +866,35 @@ bool imageMotionAnalyzeJpeg(
 
         uint8_t background = (uint8_t)(backgroundQ8[i] >> 8);
         uint8_t noise = (uint8_t)(noiseQ8[i] >> 8);
-        uint16_t dynamicThreshold =
-            baseThreshold +
-            (uint16_t)min((int)noise * 2, 12);
+        // Keep adaptive compensation intentionally small. The previous
+        // noise*2/+12 reserve dominated Sensitivity 5 in real diagnostics.
+        uint16_t noiseReserve = (uint16_t)min(((int)noise + 1) / 2, 4);
+        uint16_t dynamicThreshold = baseThreshold + noiseReserve;
 
         uint16_t difference = (uint16_t)abs(
             (int)workBlockMeans[i] -
             (int)background
         );
+        workAbsDiff[i] = (uint8_t)min((uint16_t)255U, difference);
 
         backgroundGlobalSum += background;
+        absDifferenceSum += difference;
+        dynamicThresholdSum += dynamicThreshold;
+        if (dynamicThreshold < dynamicThresholdMin)
+            dynamicThresholdMin = dynamicThreshold;
+        if (dynamicThreshold > dynamicThresholdMax)
+            dynamicThresholdMax = dynamicThreshold;
+        if (difference > maxAbsDifference)
+            maxAbsDifference = difference;
+
+        if (difference >= 5U) ++diffGe5;
+        if (difference >= 10U) ++diffGe10;
+        if (difference >= 15U) ++diffGe15;
+        if (difference >= 20U) ++diffGe20;
+        if (difference >= 25U) ++diffGe25;
+        if (difference >= 30U) ++diffGe30;
+        if (difference >= 35U) ++diffGe35;
+        if (difference >= 40U) ++diffGe40;
 
         if (difference >= dynamicThreshold) {
             workChanged[i] = true;
@@ -657,6 +903,28 @@ bool imageMotionAnalyzeJpeg(
     }
 
     diagnostics.changedBlocks = changedBlocks;
+    diagnostics.dynamicThresholdMin =
+        activeBlocks > 0 && dynamicThresholdMin != 0xFFFFU
+        ? dynamicThresholdMin
+        : 0;
+    diagnostics.dynamicThresholdAvgX10 =
+        activeBlocks > 0
+        ? (uint16_t)((dynamicThresholdSum * 10UL + activeBlocks / 2U) / activeBlocks)
+        : 0;
+    diagnostics.dynamicThresholdMax = dynamicThresholdMax;
+    diagnostics.meanAbsDiffX10 =
+        activeBlocks > 0
+        ? (uint16_t)((absDifferenceSum * 10UL + activeBlocks / 2U) / activeBlocks)
+        : 0;
+    diagnostics.maxAbsDiff = maxAbsDifference;
+    diagnostics.diffGe5 = diffGe5;
+    diagnostics.diffGe10 = diffGe10;
+    diagnostics.diffGe15 = diffGe15;
+    diagnostics.diffGe20 = diffGe20;
+    diagnostics.diffGe25 = diffGe25;
+    diagnostics.diffGe30 = diffGe30;
+    diagnostics.diffGe35 = diffGe35;
+    diagnostics.diffGe40 = diffGe40;
     diagnostics.globalChangePct =
         activeBlocks > 0
         ? ((float)changedBlocks * 100.0f) / (float)activeBlocks
@@ -711,7 +979,11 @@ bool imageMotionAnalyzeJpeg(
         diagnostics.releaseCounter = releaseCounterState;
         diagnostics.motionActive = false;
         diagnostics.analyzeFrameMs = millis() - startedMs;
+        memcpy(previousBlockMeans, workBlockMeans, sizeof(previousBlockMeans));
+        previousFrameReady = true;
         lastDiagnostics = diagnostics;
+        lastAnalysisCompletedMs = millis();
+        captureDiagnosticSample(diagnostics, sourceWidth, sourceHeight);
         return true;
     }
 
@@ -719,6 +991,13 @@ bool imageMotionAnalyzeJpeg(
         workChanged,
         roiMask
     );
+
+    diagnostics.clusterGe10 = largestConnectedClusterAtDifference(10U, roiMask);
+    diagnostics.clusterGe15 = largestConnectedClusterAtDifference(15U, roiMask);
+    diagnostics.clusterGe20 = largestConnectedClusterAtDifference(20U, roiMask);
+    diagnostics.clusterGe25 = largestConnectedClusterAtDifference(25U, roiMask);
+    diagnostics.clusterGe30 = largestConnectedClusterAtDifference(30U, roiMask);
+    diagnostics.clusterGe35 = largestConnectedClusterAtDifference(35U, roiMask);
 
     diagnostics.largestClusterBlocks = largestCluster;
     diagnostics.changedAreaPct =
@@ -792,13 +1071,63 @@ bool imageMotionAnalyzeJpeg(
         }
     }
 
+    memcpy(previousBlockMeans, workBlockMeans, sizeof(previousBlockMeans));
+    previousFrameReady = true;
+
     diagnostics.confirmCounter = confirmCounterState;
     diagnostics.releaseCounter = releaseCounterState;
     diagnostics.motionActive = motionActiveState;
     diagnostics.analyzeFrameMs = millis() - startedMs;
 
+    uint32_t completedMs = millis();
+    if (positive && motionActiveState)
+        lastConfirmedDetectionMs = completedMs;
+
     lastDiagnostics = diagnostics;
+    lastAnalysisCompletedMs = completedMs;
+    captureDiagnosticSample(diagnostics, sourceWidth, sourceHeight);
     return true;
+}
+
+
+void imageMotionObserveRecordingJpeg(
+    const uint8_t *jpeg,
+    size_t jpegLength,
+    uint16_t sourceWidth,
+    uint16_t sourceHeight
+)
+{
+    if (cfg_motion_recording_decision != "image_only") {
+        return;
+    }
+
+    // At high camera FPS there is no benefit in decoding every single JPEG for
+    // motion. Five analyses per second keep the configured confirm/release frame
+    // semantics responsive while bounding CPU/PSRAM pressure. At the current
+    // production 5 fps this still observes every video frame.
+    uint32_t now = millis();
+    if (
+        lastRecordingAnalyzeMs != 0 &&
+        (uint32_t)(now - lastRecordingAnalyzeMs) < 180U
+    ) {
+        return;
+    }
+
+    lastRecordingAnalyzeMs = now;
+
+    ImageMotionDiagnostics diagnostics;
+    (void)imageMotionAnalyzeJpeg(
+        jpeg,
+        jpegLength,
+        sourceWidth,
+        sourceHeight,
+        diagnostics
+    );
+}
+
+bool imageMotionMotionActive()
+{
+    return motionActiveState;
 }
 
 const ImageMotionDiagnostics &imageMotionLastDiagnostics()
@@ -854,6 +1183,25 @@ String imageMotionDiagnosticsJson()
     json += ",\"global_mean_delta\":" + String(d.globalMeanDelta, 2);
     json += ",\"motion_score\":" + String(d.motionScore, 2);
     json += ",\"block_threshold\":" + String(d.blockThreshold);
+    json += ",\"dynamic_threshold_min\":" + String(d.dynamicThresholdMin);
+    json += ",\"dynamic_threshold_avg\":" + String((float)d.dynamicThresholdAvgX10 / 10.0f, 1);
+    json += ",\"dynamic_threshold_max\":" + String(d.dynamicThresholdMax);
+    json += ",\"mean_abs_diff\":" + String((float)d.meanAbsDiffX10 / 10.0f, 1);
+    json += ",\"max_abs_diff\":" + String(d.maxAbsDiff);
+    json += ",\"diff_ge_5\":" + String(d.diffGe5);
+    json += ",\"diff_ge_10\":" + String(d.diffGe10);
+    json += ",\"diff_ge_15\":" + String(d.diffGe15);
+    json += ",\"diff_ge_20\":" + String(d.diffGe20);
+    json += ",\"diff_ge_25\":" + String(d.diffGe25);
+    json += ",\"diff_ge_30\":" + String(d.diffGe30);
+    json += ",\"diff_ge_35\":" + String(d.diffGe35);
+    json += ",\"diff_ge_40\":" + String(d.diffGe40);
+    json += ",\"cluster_ge_10\":" + String(d.clusterGe10);
+    json += ",\"cluster_ge_15\":" + String(d.clusterGe15);
+    json += ",\"cluster_ge_20\":" + String(d.clusterGe20);
+    json += ",\"cluster_ge_25\":" + String(d.clusterGe25);
+    json += ",\"cluster_ge_30\":" + String(d.clusterGe30);
+    json += ",\"cluster_ge_35\":" + String(d.clusterGe35);
     json += ",\"minimum_motion_blocks\":" + String(d.minimumMotionBlocks);
     json += ",\"image_motion_state\":\"" + String(imageMotionStateName(d.state)) + "\"";
     json += ",\"reject_reason\":\"" + String(imageMotionRejectReasonName(d.rejectReason)) + "\"";
@@ -861,6 +1209,67 @@ String imageMotionDiagnosticsJson()
     json += ",\"confirm_counter\":" + String(d.confirmCounter);
     json += ",\"release_counter\":" + String(d.releaseCounter);
     json += ",\"motion_active\":" + String(d.motionActive ? "true" : "false");
+    json += ",\"last_detection_valid\":" + String(lastConfirmedDetectionMs != 0 ? "true" : "false");
+    json += ",\"last_detection_age_ms\":" + String(
+        lastConfirmedDetectionMs != 0
+        ? (uint32_t)(millis() - lastConfirmedDetectionMs)
+        : 0UL
+    );
+    json += ",\"last_analysis_valid\":" + String(lastAnalysisCompletedMs != 0 ? "true" : "false");
+    json += ",\"last_analysis_age_ms\":" + String(
+        lastAnalysisCompletedMs != 0
+        ? (uint32_t)(millis() - lastAnalysisCompletedMs)
+        : 0UL
+    );
     json += "}";
     return json;
 }
+
+uint16_t imageMotionDiagnosticCount()
+{
+    return diagnosticStored;
+}
+
+uint16_t imageMotionDiagnosticCapacity()
+{
+    if (!diagnosticBuffer)
+        (void)ensureDiagnosticBuffer();
+    return diagnosticCapacityState;
+}
+
+void imageMotionDiagnosticClear()
+{
+    diagnosticHead = 0;
+    diagnosticStored = 0;
+    diagnosticSequence = 0;
+
+    if (diagnosticBuffer && diagnosticCapacityState > 0) {
+        memset(
+            diagnosticBuffer,
+            0,
+            (size_t)diagnosticCapacityState * sizeof(ImageMotionDiagnosticSample)
+        );
+    }
+}
+
+bool imageMotionDiagnosticGet(
+    uint16_t index,
+    ImageMotionDiagnosticSample &sample
+)
+{
+    if (!diagnosticBuffer || index >= diagnosticStored || diagnosticCapacityState == 0)
+        return false;
+
+    uint16_t oldest =
+        diagnosticStored < diagnosticCapacityState
+        ? 0U
+        : diagnosticHead;
+
+    uint16_t position = (uint16_t)(
+        (oldest + index) % diagnosticCapacityState
+    );
+
+    sample = diagnosticBuffer[position];
+    return true;
+}
+

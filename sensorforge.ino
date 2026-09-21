@@ -204,6 +204,12 @@ static unsigned long sleepIdleSinceMs = 0;
 // 2-second radar hold cannot repeatedly wake the camera analyzer in a tight loop.
 static bool imageVerifyRejectedUntilMotionClear = false;
 
+// image_only continuously observes the camera while the ESP is awake and idle.
+// The physical presence sensor remains the hardware wake source in sleep, but
+// it is not allowed to decide whether a recording starts in this mode.
+static const uint32_t IMAGE_ONLY_IDLE_SCAN_INTERVAL_MS = 250UL;
+static uint32_t imageOnlyLastIdleScanMs = 0;
+
 // WiFi-off motion diagnostics. The baseline is captured when WebConfig/WiFi
 // shuts down and summarized once when the magnet brings WiFi back. This adds
 // no SD writes to the motion-critical offline period itself.
@@ -1613,18 +1619,24 @@ bool simulatedMotionActive()
 
 bool physicalMotionActive()
 {
-    // Ongoing motion semantics while already recording:
-    // - LD2410S with healthy UART tracking: use the fast gate-energy detector.
-    // - standalone PIR, or degraded radar tracking: use the digital presence pin.
+    // Hybrid LD2410S motion semantics:
+    // - the fast UART gate-energy detector may assert first and therefore keeps
+    //   the low-latency recording start path unchanged;
+    // - OT2 HIGH is the LD2410S' confirmed presence output and keeps an already
+    //   running recording alive for the sensor's own trigger/hold/absence logic.
     //
-    // OT2 is intentionally not used as a continuous radar-motion level while
-    // fast tracking is healthy because its no-person hold is comparatively long.
+    // The two sources are deliberately ORed. A fast UART trigger that the
+    // LD2410S never confirms through OT2 therefore receives only the existing
+    // short ESP-side radar hold plus cfg_post_ms. Once OT2 becomes HIGH, its
+    // level is authoritative until the sensor releases it again.
     if (radarMotionTrackingAvailable()) {
-        return radarMotionActive();
+        return
+            radarMotionActive() ||
+            motionDiagnosticsPresenceActive();
     }
 
-    // Keep the operational PIR/OT2 hold path independent of diagnostics.
-    // A physical HIGH is authoritative and must never be filtered away.
+    // Standalone PIR, or detected radar with stale/unavailable UART tracking:
+    // the physical presence input remains authoritative.
     return motionDiagnosticsPresenceActive();
 }
 
@@ -1702,16 +1714,18 @@ static bool physicalRecordingStartTriggerActive()
             pendingPresenceEdge;
     }
 
-    // For a detected LD2410S, retain the fast UART gate-energy detector as the
-    // normal awake motion source. However, an OT2 rising edge is authoritative
-    // enough to START a recording, just as it is when the same pin wakes us from
-    // light sleep. Only the edge is latched here; the long OT2 presence level is
-    // not used to extend an already-running recording while fast UART tracking
-    // is healthy. This makes sleep=off and light-sleep trigger behavior
-    // consistent without reintroducing the long OT2 hold into post-record timing.
+    // For a detected LD2410S, whichever trustworthy signal arrives first may
+    // START the recording:
+    //   1) fast UART gate threshold -> lowest awake latency, or
+    //   2) OT2 HIGH / its latched rising edge -> sensor-confirmed presence.
+    //
+    // Including the current OT2 level (not only its edge) also makes a HIGH that
+    // was already present before this loop iteration authoritative. This does not
+    // delay the fast path; radarMotionActive() is still evaluated immediately.
     if (radarMotionTrackingAvailable()) {
         return
             radarMotionActive() ||
+            presenceLevel ||
             pendingPresenceEdge;
     }
 
@@ -1723,7 +1737,7 @@ static bool physicalRecordingStartTriggerActive()
 }
 
 
-bool motionDetected()
+static bool recordingAutomationAllowed()
 {
     // Thermal emergency has absolute priority over every motion source.
     if (thermalEmergencyState)
@@ -1768,6 +1782,15 @@ bool motionDetected()
         return false;
     }
 
+    return true;
+}
+
+
+bool motionDetected()
+{
+    if (!recordingAutomationAllowed())
+        return false;
+
     return
         (recording
             ? physicalMotionActive()
@@ -1778,9 +1801,13 @@ bool motionDetected()
 
 static bool imageVerificationRequired()
 {
-    return
-        cfg_image_motion_enabled &&
-        cfg_motion_recording_decision == "image_verify";
+    return cfg_motion_recording_decision == "image_verify";
+}
+
+
+static bool imageOnlyModeActive()
+{
+    return cfg_motion_recording_decision == "image_only";
 }
 
 
@@ -1823,29 +1850,12 @@ static void finishDeferredWakeWithoutRecording(
 static bool runImageMotionVerification(
     const char *context,
     String *diagnosticsJson = nullptr,
-    String *errorOut = nullptr
+    String *errorOut = nullptr,
+    bool failOpenOnAnalyzerError = true
 )
 {
     if (errorOut)
         *errorOut = "";
-
-    if (!cfg_image_motion_enabled) {
-        // Keep WebConfig diagnostics deterministic even if a previous test left
-        // a different last state behind. imageMotionAnalyzeJpeg() exits before
-        // touching the frame when analysis is disabled and records DISABLED.
-        ImageMotionDiagnostics disabledDiagnostics;
-        imageMotionAnalyzeJpeg(
-            nullptr,
-            0,
-            0,
-            0,
-            disabledDiagnostics
-        );
-
-        if (diagnosticsJson)
-            *diagnosticsJson = imageMotionDiagnosticsJson();
-        return true;
-    }
 
     if (!initCamera(
             cfg_camera,
@@ -1855,17 +1865,17 @@ static bool runImageMotionVerification(
         if (errorOut)
             *errorOut = "camera initialization failed";
 
-        // Fail open for an operational trigger: an analyzer fault must not make
-        // the surveillance path silently miss an event. Web test callers can
-        // distinguish this through errorOut.
-        return true;
+        // image_verify deliberately fails open so an analyzer fault cannot
+        // silently suppress a real sensor event. image_only fails closed because
+        // the image itself is the authoritative recording decision.
+        return failOpenOnAnalyzerError;
     }
 
     if (cameraSoftPowerDownActive) {
         if (!cameraExitSoftPowerDown()) {
             if (errorOut)
                 *errorOut = "camera wake failed";
-            return true;
+            return failOpenOnAnalyzerError;
         }
     }
 
@@ -1950,11 +1960,12 @@ static bool runImageMotionVerification(
         if (!wakeCriticalPathActive) {
             consoleWrite(
                 "IMAGE_MOTION",
-                "analyzer error | " + analyzerError + " | fail-open"
+                "analyzer error | " + analyzerError +
+                (failOpenOnAnalyzerError ? " | fail-open" : " | fail-closed")
             );
         }
 
-        return true;
+        return failOpenOnAnalyzerError;
     }
 
     const ImageMotionDiagnostics &diagnostics = imageMotionLastDiagnostics();
@@ -2011,9 +2022,24 @@ static bool recordingDecisionAllowsStart(
     const char *context
 )
 {
-    // Simulation remains a deterministic test of the recorder itself. Image
-    // verification applies only to a real low-power sensor trigger.
-    if (!physicalTrigger || !imageVerificationRequired())
+    // Simulation remains a deterministic test of the recorder itself. For real
+    // sensor triggers, motion_recording_decision is the sole source of truth.
+    if (!physicalTrigger)
+        return true;
+
+    if (cfg_motion_recording_decision == "direct")
+        return true;
+
+    if (cfg_motion_recording_decision == "image_only") {
+        return runImageMotionVerification(
+            context,
+            nullptr,
+            nullptr,
+            false
+        );
+    }
+
+    if (!imageVerificationRequired())
         return true;
 
     if (imageVerifyRejectedUntilMotionClear)
@@ -2025,6 +2051,86 @@ static bool recordingDecisionAllowsStart(
         imageVerifyRejectedUntilMotionClear = true;
 
     return accepted;
+}
+
+
+static bool imageOnlyIdleMotionTrigger()
+{
+    if (
+        recording ||
+        wakeCriticalPathActive ||
+        !imageOnlyModeActive() ||
+        !recordingAutomationAllowed()
+    ) {
+        return false;
+    }
+
+    uint32_t now = millis();
+    if (
+        imageOnlyLastIdleScanMs != 0 &&
+        (uint32_t)(now - imageOnlyLastIdleScanMs) <
+            IMAGE_ONLY_IDLE_SCAN_INTERVAL_MS
+    ) {
+        return false;
+    }
+
+    imageOnlyLastIdleScanMs = now;
+
+    if (!initCamera(
+            cfg_camera,
+            cfg_resolution,
+            cfg_quality
+        )) {
+        return false;
+    }
+
+    if (cameraSoftPowerDownActive) {
+        if (!cameraExitSoftPowerDown())
+            return false;
+    }
+
+    camera_fb_t *frame = esp_camera_fb_get();
+    if (!frame)
+        return false;
+
+    ImageMotionDiagnostics diagnostics;
+    bool analyzed = false;
+
+    if (
+        frame->format == PIXFORMAT_JPEG &&
+        frame->buf &&
+        frame->len > 0
+    ) {
+        analyzed = imageMotionAnalyzeJpeg(
+            frame->buf,
+            frame->len,
+            frame->width,
+            frame->height,
+            diagnostics
+        );
+    }
+
+    esp_camera_fb_return(frame);
+
+    return
+        analyzed &&
+        diagnostics.motionActive;
+}
+
+
+static bool recordingContinuationMotionActive()
+{
+    // In image_only, radar/PIR is not allowed to keep a recording alive. The
+    // recorder feeds its already-written JPEGs back into image_motion, so the
+    // configured release_frames determine when image motion ends. The normal
+    // cfg_post_ms window then runs exactly as in every other mode.
+    if (imageOnlyModeActive()) {
+        return
+            imageMotionMotionActive() ||
+            simulatedMotionActive();
+    }
+
+    return motionDetected();
 }
 
 
@@ -12561,22 +12667,55 @@ void loop() {
         }
 
 
-        if (motionDetected()) {
+        bool imageOnlyTrigger =
+            imageOnlyIdleMotionTrigger();
+
+        if (motionDetected() || imageOnlyTrigger) {
 
             bool physicalTrigger =
                 physicalRecordingStartTriggerActive();
             bool simulatedTrigger = simulatedMotionActive();
+            bool imageOnlyVerifiedPhysical = false;
 
             if (
                 physicalTrigger &&
-                !simulatedTrigger &&
-                !recordingDecisionAllowsStart(true, "awake_trigger")
+                !simulatedTrigger
             ) {
-                motionDiagnosticsConsumePresenceStartTrigger();
-                resetSleepDelayTimer();
-                finishDeferredWakeWithoutRecording("image-rejected");
-                delay(10);
-                return;
+                if (imageOnlyModeActive()) {
+                    // While already awake, the physical sensor is only a hint in
+                    // image_only. Continuous camera scans decide the start. On
+                    // the latency-sensitive post-sleep wake path, verify in one
+                    // immediate burst so we do not wait for the 250-ms poll.
+                    if (!imageOnlyTrigger) {
+                        if (wakeCriticalPathActive) {
+                            if (!recordingDecisionAllowsStart(
+                                    true,
+                                    "awake_trigger"
+                                )) {
+                                motionDiagnosticsConsumePresenceStartTrigger();
+                                resetSleepDelayTimer();
+                                finishDeferredWakeWithoutRecording("image-rejected");
+                                delay(10);
+                                return;
+                            }
+
+                            imageOnlyVerifiedPhysical = true;
+                        } else {
+                            resetSleepDelayTimer();
+                            delay(10);
+                            return;
+                        }
+                    }
+                } else if (!recordingDecisionAllowsStart(
+                               true,
+                               "awake_trigger"
+                           )) {
+                    motionDiagnosticsConsumePresenceStartTrigger();
+                    resetSleepDelayTimer();
+                    finishDeferredWakeWithoutRecording("image-rejected");
+                    delay(10);
+                    return;
+                }
             }
 
             if (
@@ -12604,6 +12743,11 @@ void loop() {
             String motionMessage;
 
             if (
+                imageOnlyTrigger ||
+                imageOnlyVerifiedPhysical
+            ) {
+                motionMessage = "image motion";
+            } else if (
                 simulatedTrigger &&
                 !physicalTrigger
             ) {
@@ -12644,6 +12788,7 @@ void loop() {
 
             const bool presenceStartSource =
                 !simulatedTrigger &&
+                !imageOnlyTrigger &&
                 (
                     motionDiagnosticsPresenceActive() ||
                     motionDiagnosticsPresenceStartPending(
@@ -12713,10 +12858,12 @@ void loop() {
     // Motion detected
     // ---------------------------------------------------------
 
-    if (motionDetected()) {
+    if (recordingContinuationMotionActive()) {
 
-        // While fast radar motion (2 s hold) or software simulation
-        // is active, reset the existing post-recording timer.
+        // direct/image_verify use the physical sensor state. image_only is fed
+        // from the JPEGs already written by the recorder, so its configured
+        // release_frames own the motion state before the normal post_record_ms
+        // timer begins.
 
         lastMotionMs =
             millis();

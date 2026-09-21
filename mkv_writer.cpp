@@ -3,6 +3,7 @@
 #include "board_config.h"
 #include "config.h"
 #include "logger.h"
+#include "image_motion.h"
 #include "recording_storage.h"
 
 #include <FS.h>
@@ -1624,6 +1625,17 @@ void mkvAddFrame()
 
 
     frameCount++;
+
+    // Same image_only frame tap as AVI. The first written frame is deliberately
+    // left untouched so wake/start latency is not inflated by image analysis.
+    if (frameCount > 1U) {
+        imageMotionObserveRecordingJpeg(
+            fb->buf,
+            fb->len,
+            (uint16_t)fb->width,
+            (uint16_t)fb->height
+        );
+    }
 
 
     if (jpegSize > maxFrameSize) {
