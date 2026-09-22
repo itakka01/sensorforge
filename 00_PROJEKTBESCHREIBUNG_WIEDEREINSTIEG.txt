@@ -1,6 +1,7 @@
 SENSORFORGE / ESP32-S3 CAMERA (XIAO + FREENOVE)
 PROJEKTBESCHREIBUNG, RELEASESTAND UND WIEDEREINSTIEGSPROMPT
 Stand: 2026-09-22
+Dokumentrevision: Sitzung bis v22 / WebLog-Modularisierung
 Produktname: SensorForge
 Plattformname: Fabric Node
 Core-Version im Branding: 7.1.0
@@ -36,12 +37,14 @@ Der aktuelle Quellstand besteht im Kern aus:
 - image_motion.cpp / image_motion.h
 - motion_diagnostics.cpp / motion_diagnostics.h
 - webconfig.cpp
+- web_log.cpp / web_log.h fuer den ausgelagerten Logviewer
 - language.cpp / language.h
 - license.cpp / license.h
 - license_policy.cpp / license_policy.h
 - license_public_key.h
 - board_config.h
 - sync_api.cpp / sync_api.h
+- SENSORFORGE_API_V1.md fuer den stabilen lokalen Integration-API-Vertrag
 - recording_crypto.cpp / recording_crypto.h
 - recording_storage.cpp / recording_storage.h
 - config_secrets.cpp / config_secrets.h
@@ -89,8 +92,8 @@ Auf echter Freenove-Hardware wurden mit SR602 mehrere aufeinanderfolgende
 Light-Sleep -> PIR-Wake -> Recording -> Light-Sleep-Zyklen erfolgreich
 beobachtet, darunter auch ein Wake nach mehr als 13 Minuten Sleep.
 
-Der aktuelle Sync-API-Stand ist Host API 1.11. Der aktuelle Python-Sync-Client
-ist 1.4. Die boardgebundene Offline-Lizenzierung ist als technisches Fundament
+Der aktuelle Sync-API-Stand ist Host-Protokoll 1.12 mit stabilem Integration-
+API-Profil 1.0. Der aktuelle Python-Sync-Client ist 1.4. Die boardgebundene Offline-Lizenzierung ist als technisches Fundament
 implementiert und auf echter Hardware erstmals erfolgreich aktiviert worden.
 Die transparente Video-Verschluesselung fuer neue AVI/MKV-Aufnahmen ist
 ebenfalls implementiert und auf echter XIAO-ESP32S3-Hardware inklusive
@@ -273,15 +276,27 @@ Bei hoher Frequenz wird nicht vor jedem Shooterbild erneut eine
 3-Frame-Warmup-Sequenz gefahren. Das waere bei 2 fps unbrauchbar und
 energieineffizient. Bei grossen Zeitabstaenden bleibt der Warmup-Pfad erhalten.
 
-Light Sleep / Dauershooter:
+Light Sleep / Dauershooter, aktueller Stand ab v20:
 
 - reine Shooter-Timer-Wakes setzen den normalen Idle-Countdown nicht permanent
   zurueck
-- der Code versucht Light Sleep auch bei 2 fps zwischen den Slots, sofern keine
-  andere Sperre aktiv ist
-- WLAN blockiert den normalen Light-Sleep-Pfad
-- WebConfig kann bei web_recording_auto_pause=1 die Aufnahmeautomatik und damit
-  auch den Dauershooter temporaer pausieren
+- WICHTIGE FELDKORREKTUR: bei aktiviertem Dauershooter und Intervallen von
+  250..1000 ms wird der normale Light-Sleep-Pfad bewusst NICHT mehr benutzt.
+  Der ESP bleibt fuer den Hochfrequenz-Shooter wach. Hintergrund ist ein realer
+  Langzeitausfall, bei dem der 500-ms-Shooter nach WLAN-Off/Light-Sleep praktisch
+  keine weiteren Aufnahmen mehr erzeugte
+- der aktuelle 500-ms-/2-fps-Feldstand laeuft deshalb mit awake fallback; reale
+  Logs zeigen sleep_cycles=0 und gleichzeitig stabile Shooteraktivitaet
+- langsamere Shooter-Intervalle duerfen Light Sleep weiter verwenden, aber nur
+  wenn der naechste Shooter-/Flush-Timer nachweislich erfolgreich als Wakequelle
+  programmiert wurde. Schlaegt das Timer-Arming fehl oder ist kein Shooter-Wake
+  verfuegbar, bleibt das Geraet fail-safe wach
+- WLAN blockiert den normalen Light-Sleep-Pfad weiterhin ohnehin
+- web_recording_auto_pause=1 pausiert weiterhin die normale Motion-/Alarm-
+  Recording-Automatik. Der unabhaengige Dauershooter wird seit v18 NICHT mehr
+  allein durch eine offene WebConfig-Sitzung pausiert. Nur eine aktive
+  Live-Preview blockiert einen Shooter-Capture, weil sie die Kamera-Pipeline
+  besitzt
 - im reinen Shooterbetrieb mit motion_recording_enabled=0 werden Presence/PIR/
   OT2 nicht als notwendige Shooter-Wakequelle behandelt
 
@@ -347,18 +362,45 @@ Reboot / Shutdown:
 - Shutdown besitzt vor dem finalen Deep Sleep nochmals einen defensiven Flush
 - bei hartem Stromverlust bleibt das eingestellte shooter_flush_seconds-Fenster
   ein bewusst akzeptiertes Verlustfenster fuer nur im PSRAM liegende Bilder
+- ab v19 beendet der Transportmodus den Sonderpfad nicht mehr mitten im selben
+  Boot. Nach sicher persistiertem transport_mode=0 und finalem Transport-Journal
+  erfolgt ein kontrollierter ESP.restart() in einen normalen SW-Boot. Das gilt
+  fuer Installationsdelay abgelaufen, Installationsdelay=0 und den
+  Max-Duration-Fallback
+- dieser Transport->Normalboot wurde im Feldlog mit restart=normal_boot und
+  anschliessendem reset=SW bestaetigt. Weil der Dauershooter danach trotzdem in
+  einem langen unbeaufsichtigten Test ausfiel, wurde der Transport-Handoff als
+  Hauptursache des Shooterproblems ausgeschlossen
+- die Logzeilen rund um den Restart koennen wegen gepuffertem Logger zeitlich
+  leicht ungeordnet erscheinen. Aus diesen Zeilen keine exakte Rebootdauer
+  ableiten; der aktuelle Handoff ist ein normaler kurzer Software-Restart ohne
+  absichtlichen Backoff/Deep-Sleep-Warteblock
 
-Messstand Dauershooter:
+Messstand Dauershooter, aktualisiert nach v20:
 
-- reale Tests zeigten bei shooter_interval_ms=500 exakt etwa 2 fps
-- PSRAM-Autopuffer lag im beobachteten XIAO-Aufbau bei rund 5.4 MiB
-- JPEG-Groessen lagen grob bei 44 bis 49 KiB
+- reale Tests zeigten bei shooter_interval_ms=500 weiterhin exakt etwa 2 fps
+- PSRAM-Autopuffer lag im beobachteten Aufbau bei rund 5.4 MiB
+- JPEG-Groessen im aktuellen v20-Feldlauf lagen grob um 30 bis 35 KiB; fruehere
+  Aufbauten lagen auch im Bereich etwa 44 bis 49 KiB. Bildinhalt/Qualitaet und
+  Szene beeinflussen die Groesse stark
+- ruhige erste Feldphase nach dem v20-Normalboot: 2407 bewertete Frames in rund
+  20 Minuten, davon 22 akzeptiert, 2385 wegen Aehnlichkeit verworfen, 0 wegen
+  Dunkelheit. Das entspricht sehr gut 2 fps und dem Force-Save von etwa einem
+  Bild pro Minute bei statischer heller Szene
+- vor dem anschliessenden Power-Cycle standen kumuliert 683 akzeptierte, 4116
+  als aehnlich verworfene und 0 dunkle Frames im Log; mehrere Buffer-full-Flushes
+  schrieben jeweils rund 5.5 MiB Sparse-MKV erfolgreich
+- in der spaeteren Phase mit real viel Bewegung stieg die Akzeptanzrate deutlich,
+  passend zur Beobachtung vor der Kamera. Der Aehnlichkeitsfilter reagiert damit
+  im aktuellen Feldlauf plausibel
+- nach einem weiteren Power-On wurden in kurzer Zeit 160 Frames akzeptiert und
+  145 als aehnlich verworfen; auch dieser Lauf erzeugte einen Buffer-full-MKV-
+  Flush
+- v20-Feldmessung des gesamten awake-fallback-Aufbaus lag grob um 120 mA. Das
+  ist bewusst hoeher als echter Light Sleep; Zuverlaessigkeit hat fuer den
+  500-ms-Shooter derzeit Vorrang vor dieser Energieeinsparung
 - alte Einzel-JPG-Batch-Flushes waren vergleichsweise langsam und waren ein
   wesentlicher Grund fuer den Sparse-MKV-Pfad
-- aktueller Strom-Messhinweis im Dauershooter-Aufbau: ohne WLAN aktiv grob
-  etwa 110 mA, mit WLAN grob etwa 180 mA, Light-Sleep-Anzeige am Multimeter
-  grob um 10 mA; bei 2 fps ist ein normales Multimeter fuer kurze Aktivspitzen
-  nur eingeschraenkt aussagekraeftig
 
 Produktionsstatus:
 
@@ -367,9 +409,387 @@ Produktionsstatus:
 - vor endgueltiger Produktionsqualifikation mindestens 24-48 h Dauertest,
   Sparse-MKV-Stichprobe, Encryption-Test, Reboot/Shutdown mit gefuelltem
   Puffer, absichtlicher Power-Cut waehrend MKV-Flush und Rollover/volle-SD-Test
-- die letzten v10-v16-Deltas wurden strukturell/JavaScript-/ZIP-seitig geprueft,
-  aber in dieser Entwicklungsumgebung NICHT als kompletter Arduino/ESP32-Build
-  kompiliert; niemals einen nicht ausgefuehrten Build als bestanden markieren
+- die Deltas v10-v17 wurden je nach Aenderung strukturell/JavaScript-/ZIP-seitig
+  geprueft; v17 selbst wurde statisch und auf ZIP-/Client-Kompatibilitaet geprueft
+- die spaeteren v18a/v19/v20-Staende wurden vom Benutzer mit Arduino-ESP32 3.3.12
+  gebaut bzw. als Firmware auf dem Feldgeraet ausgefuehrt; v20 besitzt einen
+  positiven kurzen Hardware-Feldlauf fuer den 500-ms-Dauershooter
+- v21/v22 wurden in der verwendeten Entwicklungsumgebung strukturell/JS-/ZIP-
+  seitig geprueft, aber hier NICHT als kompletter Arduino/ESP32-Build kompiliert.
+  Niemals einen nicht ausgefuehrten Build als bestanden markieren
+
+
+
+======================================================================
+AKTUELLER AENDERUNGSSTAND 2026-09-22 - V18A BIS V22 / FELDDEBUG
+======================================================================
+
+Dieser Block dokumentiert die spaetere Sitzung nach dem urspruenglichen v17-
+Integrationsstand. Besonders wichtig ist die Fehlergeschichte des Dauershooters,
+damit bei einem spaeteren Wiedereinstieg nicht erneut an bereits ausgeschlossenen
+Hypothesen gearbeitet wird.
+
+Versions-/Paketfolge dieser Sitzung:
+
+- SensorForge_Dauershooter_WebConfigPauseFix_20260922_v18.zip
+  - nur sensorforge.ino
+  - WebConfig-RAM-Pause gilt nur noch fuer Motion-/Alarm-Recording
+  - Dauershooter wird durch eine bloss offene WebConfig-Seite nicht mehr gestoppt
+  - aktive Live-Preview blockiert Shooter-Capture weiterhin korrekt, weil die
+    Kamera-Pipeline exklusiv benutzt wird
+  - dieser Fix ist konzeptionell richtig, wurde durch spaetere Logs aber NICHT als
+    Hauptursache des damaligen Langzeitausfalls bestaetigt
+
+- SensorForge_API_CompileFix_20260922_v18a.zip
+  - nur sync_api.cpp
+  - Arduino Print.h definiert HEX als Makro. In sync_api.cpp kollidierte deshalb
+    eine lokale Tabelle "HEX" beim Build mit Arduino-ESP32 3.3.12
+  - reine Compilekorrektur: lokales Symbol auf HEX_DIGITS umbenannt; keine API-
+    Semantik geaendert
+
+- SensorForge_TransportRestartFix_20260922_v19.zip
+  - nur sensorforge.ino
+  - Transportende persistiert zuerst transport_mode=0 und das finale Journal und
+    fuehrt danach ESP.restart() fuer einen sauberen Normalboot aus
+  - alle Transport-Freigabepfade benutzen denselben Restart: normaler 300-s-
+    Installationsdelay, delay=0 und Max-Duration-Fallback
+  - realer Log bestaetigte restart=normal_boot und danach reset=SW
+  - ein anschliessender Lauf von rund sieben Stunden produzierte trotzdem nach
+    einer kurzen Anfangssequenz keine brauchbaren weiteren Shooterdateien. Damit
+    war der Transport-Handoff als Hauptursache praktisch ausgeschlossen
+
+- SensorForge_Dauershooter_AwakeFallback_20260922_v20.zip
+  - nur sensorforge.ino
+  - Zuverlaessigkeitsfix fuer Hochfrequenz-Shooter: bei shooter_interval_ms
+    250..1000 bleibt der normale Betrieb wach und geht NICHT zwischen jedem
+    Capture in Light Sleep
+  - langsamere Shooter duerfen Light Sleep weiter verwenden, aber nur wenn der
+    naechste Sample-/Flush-Timer erfolgreich programmiert wurde. Ohne sicher
+    armed Timer wird Light Sleep fail-safe blockiert
+  - Transportmodus behaelt seinen eigenen Deep-Sleep-/Timer-Pfad
+  - Feldlauf mit 500 ms danach positiv; siehe Messstand oben
+
+- SensorForge_LogViewer_ChunkedAnalysis_20260922_v21.zip
+  - nur webconfig.cpp
+  - Logstatistik wird nicht mehr automatisch beim Oeffnen der Seite berechnet
+  - eigener Button "Statistik berechnen"
+  - Vollanzeige wird nicht mehr ueber einen einzigen langen /log_raw-Stream
+    geladen, sondern stueckweise ueber /log_chunk mit 16-KiB-Chunks
+  - Chunk-Requests besitzen Retry; die Viewer-Seite soll bei transientem
+    Log-Info-Fehler nicht sofort als HTTP-500-Seite sterben
+  - beim Voll-Load wird nur vor dem ersten Chunk ein Logger-Flush angefordert;
+    Live-Update fordert weiterhin explizit aktuelle Daten an
+  - neue Live-Daten markieren eine bereits berechnete Statistik nur als veraltet;
+    automatische Neuberechnung findet nicht statt
+
+- SensorForge_WebLog_Module_20260922_v22.zip
+  - webconfig.cpp geaendert
+  - web_log.cpp NEU
+  - web_log.h NEU
+  - kompletter Logviewer-Bereich aus webconfig.cpp ausgelagert: /log, /log_raw,
+    /log_chunk, /log_clear sowie Viewer-HTML/JavaScript und Route-Registrierung
+  - log_storage.cpp/.h bleiben unveraenderte Storage-/Crypto-Schicht
+  - webconfig.cpp sank dadurch von rund 18.3k auf rund 17.4k Zeilen; web_log.cpp
+    enthaelt knapp 1000 Zeilen
+  - v21-Verhalten wurde beim Auslagern absichtlich nicht funktional neu designt
+
+WICHTIGE VERWECHSLUNG VERMEIDEN:
+
+Ein frueher begonnener Home-Assistant-/Discovery-Zwischenstand verwendete
+zwischenzeitlich ebenfalls die Nummer v18. Dieser HA-Zwischenstand war NICHT
+freigegeben und ist weiterhin zu ignorieren. Bei der aktuellen Firmwarehistorie
+immer die vollstaendigen Paketnamen verwenden; der gueltige v18-Fix dieser
+Sitzung ist der Dauershooter_WebConfigPauseFix.
+
+DAUERSHOOTER-FEHLERGESCHICHTE / WAS BEREITS AUSGESCHLOSSEN WURDE:
+
+1. Zunaechst fiel auf, dass continuousShooterCapture() auch von
+   webConfigRecordingPaused() blockiert wurde. Das war architektonisch falsch und
+   wurde in v18 korrigiert. Der problematische Feldlauf hatte WebConfig jedoch
+   nachweislich nicht offen; dieser Punkt war daher nicht die Hauptursache.
+
+2. Ein harter Power-Off kann die letzten noch nicht geflushten Shooterbilder bis
+   zum konfigurierten Flushfenster verlieren. Das allein erklaerte den Fehler
+   ebenfalls nicht: In einem Lauf lagen nach Transportende mehr als 20 Minuten
+   Normalbetrieb ohne irgendeinen sichtbaren Shooter-Flush, obwohl
+   shooter_flush_seconds=600 war.
+
+3. Der Transportmodus selbst arbeitete korrekt (schwarz -> offen -> 10-s-
+   Bestaetigung -> 300-s-Installationsdelay). v19 erzwang danach zusaetzlich einen
+   sauberen Normalboot. Der folgende Langzeitausfall blieb bestehen. Transport
+   wurde damit als Hauptursache ausgeschlossen.
+
+4. Der entscheidende Unterschied zwischen erfolgreichen Kurztests und den
+   unbeaufsichtigten Ausfaellen war der Betriebszustand nach WLAN-Off: Mit
+   WebConfig/WLAN blieb das Geraet wach und der Shooter arbeitete; nach dem
+   WLAN-Timeout durfte der 500-ms-Shooter den schnellen Light-Sleep-Zyklus
+   verwenden. Genau in diesem Zustand verschwanden die Aufnahmen.
+
+5. v20 isoliert deshalb den schnellen 250..1000-ms-Shooter bewusst vom normalen
+   Light Sleep. Das ist derzeit die freigegebene Zuverlaessigkeitsloesung. Eine
+   spaetere Energieoptimierung dieses Pfads darf nur mit reproduzierbarem A/B-
+   Test und Langzeitlauf erfolgen; nicht erneut auf Verdacht den 500-ms-Shooter
+   in Light Sleep schicken.
+
+FLUSH-AUDIT DES DAUERSHOOTERS:
+
+Der komplette Flushpfad wurde in dieser Sitzung nochmals statisch durchgesehen.
+Kein zweiter offensichtlicher Flush-Logikfehler wurde gefunden:
+
+- Timeout-, Buffer-full-, manueller/API-, before-restart-, Shutdown- und
+  Deep-Sleep-Pfade fuehren auf den zentralen Shooter-Flush
+- Sparse MKV wird zuerst als .mkv.part geschrieben
+- erst nach erfolgreicher MKV-Finalisierung wird auf .mkv umbenannt
+- bei Fehler bleibt der noch nicht persistierte RAM-Batch erhalten; er wird nicht
+  absichtlich als erfolgreich verworfen
+- kontrollierter Reboot/Shutdown versucht den Puffer vor dem Uebergang zu
+  persistieren
+- real auf Hardware bestaetigt sind insbesondere Buffer-full- und Timeout-Flushes
+  im v20-Feldlauf
+- ein harter Stromverlust bleibt prinzipbedingt ein Verlustfenster fuer den noch
+  nicht geflushten PSRAM-Inhalt
+
+LOG-/SFLOG1-BEOBACHTUNGEN DER SITZUNG:
+
+- harte Power-Cuts koennen den letzten physischen SFLOG1-Record bzw. das sichtbare
+  Ende einer Klartextansicht zerreissen. In einem Feldlog waren abgeschnittene
+  CONFIG-Zeilen sichtbar, an die der naechste Boot angehaengt wurde
+- der vorhandene SFLOG1-Reader ist fuer einen torn final record bzw. eine
+  Resynchronisation auf spaetere gueltige Records ausgelegt. Es wurde beobachtet,
+  dass ein Log direkt nach dem Zugriff zunaechst nicht lesbar wirkte und bei einem
+  spaeteren erneuten Aufruf doch geladen werden konnte
+- das war ein wichtiger Anlass fuer v21: Viewer und Analyse nicht mehr als einen
+  schweren synchronen Vollvorgang behandeln
+
+AKTUELLER FELDSTATUS NACH V20:
+
+Der kurze v20-Feldlauf ist positiv und deutlich aussagekraeftiger als die
+vorherigen Kurztests:
+
+- 500-ms-Slots werden praktisch mit 2 fps abgearbeitet
+- in ruhiger heller Szene werden die meisten Frames korrekt als aehnlich verworfen
+- Force-Save erzeugt weiterhin regelmaessige akzeptierte Bilder
+- bei realer Bewegung steigt die Akzeptanzrate stark
+- rejected_dark blieb im Tageslicht-Lauf 0
+- mehrere Sparse-MKV-Flushes wurden real geschrieben
+- sleep_cycles blieb 0, wie beim awake fallback beabsichtigt
+- aktueller grober Stromwert dieses Zuverlaessigkeitsstands: etwa 120 mA
+
+Dieser Stand ist fuer die anstehende Installation derzeit dem frueheren
+500-ms-Light-Sleep-Versuch vorzuziehen.
+
+TESTSTATUS V21/V22:
+
+- v21/v22 wurden strukturell, per JavaScript-/Delimiter-Pruefung und ZIP-
+  Integritaet geprueft
+- in der verwendeten Assistenzumgebung wurde kein Arduino-Build ausgefuehrt
+- v22 sollte nach Build/Flash einmal Logseite, Chunk-Load, Button-Analyse, Live-
+  Update, Download und Log-Clear auf Hardware regressionsgeprueft werden
+
+======================================================================
+AKTUELLER AENDERUNGSSTAND 2026-09-22 - V17 INTEGRATION API 1.0
+======================================================================
+
+Gueltiger letzter gemeinsamer Entwicklungsstand fuer die Integrationsarbeit ist
+v17. Ein spaeter begonnener Home-Assistant-/Discovery-Zwischenstand wurde NICHT
+als neuer Projektstand uebernommen und ist fuer den Wiedereinstieg zu ignorieren,
+solange er nicht erneut bewusst geprueft und freigegeben wird.
+
+v17-Paket:
+
+SensorForge_Integration_API_Update_20260922_v17.zip
+
+v17 aendert im Firmwareprojekt nur:
+
+- sync_api.cpp
+
+und liefert zusaetzlich die technische Schnittstellendokumentation:
+
+- SENSORFORGE_API_V1.md
+
+Ziel von v17:
+
+Eine stabile lokale Integrationsschnittstelle fuer Home Assistant und andere
+lokale Automationsclients schaffen, OHNE bestehende SensorForge-Funktionalitaet,
+Config, WLAN-/Sleep-Verhalten, Recording, Dauershooter oder den bewaehrten
+PC-Sync-Pfad umzubauen.
+
+Versionsmodell:
+
+- bestehender HTTP-Namespace bleibt /api/v1
+- Host-/Protokollversion ist ab v17 1.12
+- darauf liegt das stabile Integration-API-Profil 1.0
+- bestehende dokumentierte API-v1-Routen/Felder duerfen innerhalb v1 nur additiv
+  erweitert und nicht stillschweigend entfernt oder umbenannt werden
+- der Python-Sync-Client bleibt Version 1.4 und verwendet weiterhin seine
+  bisherigen Endpunkte
+
+Neue v17-Routen:
+
+- GET /api/v1/device
+  relativ statische Geraeteidentitaet und Capabilities
+- GET /api/v1/state
+  leichter RAM-naher Betriebsstatus fuer regelmaessiges Polling; keine
+  SD-Verzeichnisscans und kein Kameracapture
+- GET /api/v1/shooter
+  Dauershooter-Konfiguration und Laufzeittelemetrie
+- POST /api/v1/shooter/flush
+  kontrollierter sofortiger Flush des bestehenden Shooter-RAM-Puffers ueber den
+  bereits vorhandenen sicheren Flushpfad; bei Busy kein stilles Verwerfen
+
+Bestehende Routen bleiben erhalten, insbesondere:
+
+- GET /api/v1/status
+- GET /api/v1/storage
+- GET /api/v1/sensors
+- GET /api/v1/camera/snapshot
+- GET /api/v1/days
+- GET /api/v1/files?day=YYYYMMDD
+- GET /api/v1/file?path=...
+- GET/POST /api/v1/exclusive
+- bestehende Diagnose-/Benchmark-Routen
+
+Identity / Datenschutz:
+
+- device_id bleibt aus Kompatibilitaetsgruenden cfg_hostname
+- fuer Automationsclients fuehrt v17 zusaetzlich integration_id ein
+- integration_id ist eine zufaellige stabile 128-Bit-ID in NVS
+- integration_id ist unabhaengig von Lizenz-Hardware-ID und MAC-Adresse
+- API-Antworten duerfen keine Lizenz-Hardware-ID, WLAN-/Web-/Hotspot-Passwoerter,
+  Verschluesselungskeys oder andere Secrets exponieren
+
+Neue Header ab v17:
+
+- X-SensorForge-API-Version
+- X-SensorForge-Device-ID
+- X-SensorForge-Integration-API-Version: 1.0
+
+Capabilities in /device kennzeichnen den real vorhandenen Funktionsumfang.
+RTSP und MQTT sind in v17 ausdruecklich noch NICHT implementiert und werden als
+nicht verfuegbar ausgewiesen.
+
+Wichtige Nicht-Aenderungen in v17:
+
+- keine Config-Migration
+- keine persistente Aenderung von shooter_enabled oder motion_recording_enabled
+  ueber die neue Integration API
+- keine Aenderung des bestehenden WLAN-/Hotspot-/Magnet-Lifecycles
+- keine Aenderung an Light Sleep / Wake
+- keine Aenderung an Recorder, Image Motion, Radar/PIR, Storage oder Encryption
+- keine Home-Assistant-Discovery
+- kein RTSP
+- kein MQTT
+
+Netzwerkgrenze von v17:
+
+Die Integration API ist die Schnittstellengrundlage. Sie veraendert bewusst
+nicht, wann und wie SensorForge WLAN startet oder beendet. Die Erreichbarkeit im
+Heimnetz/Home Assistant muss als naechster separater, optionaler Schritt
+hinzukommen.
+
+v17-Teststatus:
+
+- ZIP-Struktur/Integritaet geprueft
+- bestehende und neue API-Routen statisch gegengeprueft
+- Python-Sync-Client auf problematische exakte Minor-Versionsbindung geprueft;
+  der bestehende Client bleibt mit dem additiven Host-Minor kompatibel
+- kein kompletter Arduino/ESP32-Build in der verwendeten Entwicklungsumgebung
+  ausgefuehrt
+- v17 deshalb vor breitem Rollout zuerst auf mindestens einem Zweitgeraet bauen,
+  flashen und gegen bestehende Feldfunktion sowie alle wichtigen API-Routen
+  testen
+
+
+======================================================================
+HOME ASSISTANT - FESTGELEGTE PRODUKTARCHITEKTUR / NAECHSTE SCHRITTE
+======================================================================
+
+SensorForge soll KEIN reines Home-Assistant-Produkt werden. Die gesamte bisherige
+Funktionalitaet bleibt das Hauptprodukt. Home Assistant ist eine OPTIONALE
+zusaetzliche Integrationsschicht.
+
+Verbindliche Kompatibilitaetsregel:
+
+Eine bestehende Kamera, deren alte config.txt keinen Home-Assistant-Key kennt,
+muss nach einem Firmwareupdate funktional genauso arbeiten wie vorher.
+Insbesondere duerfen Recording, Dauershooter, Motion, Sleep, Magnet, Hotspot,
+WebConfig, Sync, OTA und Storage-Verhalten nicht allein durch das Firmwareupdate
+veraendert werden.
+
+Geplantes Konfigurationsmodell:
+
+home_assistant_enabled=0|1
+
+- neuer Key optional
+- fehlt er in einer alten Config, gilt 0
+- 0 = bisheriges SensorForge-Verhalten ohne HA-Discovery
+- 1 = zusaetzliche Home-Assistant-Unterstuetzung
+- KEIN separates "Connected-Profil" und keine zweite Produktvariante
+
+Wichtig: Vor Implementierung den Key so in den bestehenden aufwaertskompatiblen
+Configparser integrieren, dass alte Configs weiterhin ohne Migration gueltig
+bleiben.
+
+Geplantes Verhalten bei home_assistant_enabled=1:
+
+- bestehende WLAN-Optionen bleiben weiterhin autoritativ
+- wifi_on_system_start, wifi_timeout_sec, Hotspot und Magnet-Semantik werden
+  NICHT durch HA ersetzt
+- HA ist nur erreichbar, wenn WLAN nach den bestehenden SensorForge-Regeln aktiv
+  ist
+- wer dauerhafte HA-Erreichbarkeit moechte, kann den bereits vorhandenen
+  WLAN-Dauerbetrieb verwenden
+- wer Batteriebetrieb priorisiert, darf das bisherige temporare WLAN-/Magnet-
+  Verhalten weiterverwenden; HA ist dann nur waehrend aktiver WLAN-Phasen
+  erreichbar
+
+Der HA-Schalter soll zunaechst nur die zusaetzliche Discovery-/Integrationsschicht
+steuern. API-Verkehr darf niemals so behandelt werden, als haette ein Benutzer
+WebConfig im Browser geoeffnet. Insbesondere darf normales HA-Polling nicht die
+bestehende web_recording_auto_pause-Logik ausloesen.
+
+Naechster Firmwareblock fuer HA:
+
+1. optionalen Config-Key home_assistant_enabled=0|1 einfuehren; Default/Fallback 0
+2. WebConfig-Schalter "Home Assistant" mit DE/EN-Text einfuehren
+3. mDNS/Zeroconf nur bei aktiviertem HA und aktivem WLAN starten
+4. Discovery bei WLAN-Start/Verbindung sauber starten und bei WLAN-Off sauber
+   stoppen; bestehender WLAN-Lifecycle bleibt ansonsten unveraendert
+5. stabile v17-integration_id fuer Discovery/Unique-ID verwenden
+6. /api/v1/device bzw. /state um HA-/Discovery-Status nur additiv erweitern
+7. alte Kamera ohne neuen Key als expliziten Regressionstest verwenden
+8. erst danach Home-Assistant-Custom-Integration auf PC/HA-Seite erstellen
+
+Erste HA-Custom-Integration soll read-mostly auf v17 aufbauen:
+
+- /device fuer Setup, Capabilities und eindeutige integration_id
+- /state fuer schnelle Betriebsentities
+- /storage fuer SD-Kapazitaet/Reserve
+- /sensors fuer Presence/Radar/RTC/Temperaturen
+- /shooter fuer Dauershooter-Telemetrie
+- /camera/snapshot fuer camera-Entity
+- /shooter/flush fuer expliziten Flush-Button
+
+Persistente Schalter wie shooter_enabled oder motion_recording_enabled spaeter
+nur ueber eigene explizite, atomare API-Actions anbieten. Home Assistant soll
+nicht config.txt direkt editieren und keine WebConfig-HTML-Handler missbrauchen.
+
+RTSP:
+
+RTSP/MJPEG bleibt ein spaeterer eigener Funktionsblock. Fuer die erste
+Home-Assistant-Integration ist RTSP nicht Voraussetzung; Snapshot + Entities
+reichen fuer den MVP. Wenn RTSP spaeter kommt, muss der Stream on-demand gebaut
+werden und darf das bestehende autonome/Low-Power-Verhalten nicht unbemerkt
+ersetzen.
+
+Reihenfolge fuer den Wiedereinstieg:
+
+v17 auf echter Hardware regressionsfrei verifizieren
+-> optionalen HA-Schalter + mDNS/Zeroconf additiv implementieren
+-> HA-Custom-Integration bauen und mit mehreren SensorForge-Geraeten testen
+-> persistente Control-Actions gezielt ergaenzen
+-> danach RTSP/MJPEG on demand
+-> UI-Vereinfachung spaeter, nachdem echte Nutzer-/Integrationsdaten vorliegen
 
 
 ======================================================================
@@ -574,7 +994,15 @@ esp32:esp32:esp32s3
 
 Arduino-ESP32 Core:
 
-3.3.11
+- historisch bewaehrter/urspruenglich dokumentierter Stand: 3.3.11
+- aktueller Feld-/Buildstand dieser Sitzung: 3.3.12
+
+Beim ersten Build mit 3.3.12 trat in sync_api.cpp ein Arduino-Makrokonflikt auf:
+Print.h definiert HEX. Eine lokale Hex-Zeichentabelle mit dem Namen HEX wurde
+deshalb vom Praeprozessor zerstoert. v18a benennt nur dieses lokale Symbol in
+HEX_DIGITS um; keine API-Funktion wurde dadurch geaendert. Spaetere v19/v20-
+Firmwarestaende wurden im Benutzeraufbau gebaut und ausgefuehrt. 3.3.11 bleibt
+trotzdem die wichtige historische Referenz fuer fruehere Messergebnisse.
 
 Historisch bewaehrte FQBN-Optionen:
 
@@ -751,12 +1179,17 @@ bleiben unabhaengig vom aktuellen Schalter lesbar.
 
 Sleep:
 
-- sleep_mode=light_sleep
+- sleep_mode=light_sleep bleibt die allgemeine Configeinstellung
 - sleep_delay_ms=2000
 - bootloop_protection=1
 - reine Shooter-Timer-Wakes duerfen den Idle-Countdown nicht permanent
   zuruecksetzen
 - WLAN aktiv verhindert den normalen Light-Sleep-Pfad
+- ab v20 gilt zusaetzlich: wenn shooter_enabled=1 und shooter_interval_ms zwischen
+  250 und 1000 liegt, wird Light Sleep fuer den normalen Dauershooter bewusst
+  gebypasst und das Geraet bleibt wach
+- langsamere Shooter duerfen nur schlafen, wenn der naechste Shooter-/Flush-
+  Timer erfolgreich armed wurde
 
 Transport:
 
@@ -776,23 +1209,31 @@ Transport:
 Speicher:
 
 - min_free_space_mb=100
-- disk_full_action=rollover
+- der zuletzt real gelaufene Feldconfig verwendete disk_full_action=rollover
+- disk_full_action=stop ist im aktuellen Storage-Guard ebenfalls ein explizit
+  implementierter gueltiger Modus: unterhalb der Reserve keine neue Aufnahme /
+  kein automatisches Loeschen alter Aufnahmen. Dieser volle-SD-Grenzfall wurde in
+  dieser Sitzung nicht real mit fast voller Karte qualifiziert
+- fuer die aktuelle Installation wurde stop als konservative Alternative zu
+  rollover diskutiert; eine tatsaechlich geaenderte Feldconfig wurde noch nicht
+  als neuer autoritativer Upload bestaetigt
 - .mkv.part ist in der Recovery unvollstaendiger Aufnahmen enthalten
 
-WLAN / Web im zuletzt hochgeladenen Testconfig:
+WLAN / Web im zuletzt real verwendeten Dauershooter-Feldconfig:
 
 - wifi_on_system_start=on
-- wifi_timeout_sec=0
-- damit bleibt WLAN dauerhaft aktiv, bis es bewusst abgeschaltet wird; fuer
-  Batterietests ist dieser Zustand ungeeignet, weil Light Sleep blockiert wird
+- wifi_timeout_sec=60
 - Hotspot ist aktiviert
 - Web-Authentifizierung ist aktiviert
 - web_recording_auto_pause=1
 - web_language=de
 
-web_recording_auto_pause=1 kann den Dauershooter pausieren, solange WebConfig
-aktiv gehalten wird. Strom-/Dauertests deshalb nicht mit offener WebConfig-Seite
-bewerten.
+Seit v18 gilt die WebConfig-Pause nur fuer die normale Motion-/Alarm-Recording-
+Automatik. Der unabhaengige Dauershooter laeuft bei bloss geoeffneter WebConfig
+weiter. Eine aktive Live-Preview blockiert den Shooter weiterhin, weil sie die
+Kamera aktiv besitzt. Fuer Strom-/Dauertests WebConfig/WLAN trotzdem nicht
+unnoetig offen halten, weil aktives WLAN den Schlafpfad und den Stromverbrauch
+veraendert.
 
 Aus Sicherheitsgruenden werden Zugangsdaten, Passwoerter, Hardware-IDs,
 Lizenz-/Private-Key-Daten und andere Secrets in diesem Dokument nicht wiederholt.
@@ -808,6 +1249,10 @@ Logging:
   verschluesselt gespeichert
 - bei recording_encryption=0 bleibt der neue Logpfad plaintext; bereits
   vorhandene SFLOG1-Generationen werden nicht mit Plaintext vermischt
+- v21: Viewer laedt den Log stueckweise ueber 16-KiB-/log_chunk-Requests mit
+  Retry statt als einen langen /log_raw-Stream; Statistik nur noch per Button
+- v22: komplette Web-Log-UI/Routen aus webconfig.cpp in web_log.cpp/.h
+  ausgelagert; log_storage.cpp/.h bleibt davon getrennte Crypto-/Storage-Schicht
 
 
 ======================================================================
@@ -1164,14 +1609,18 @@ Neuere Dauershooter-Messungen am aktuellen Aufbau zeigten mit einfachem
 Multimeter grob:
 
 - WLAN aktiv etwa 180 mA
-- ohne WLAN im aktiven Kamera-/Shooterzustand etwa 110 mA
-- Light-Sleep-Anzeige grob um 10 mA
+- ohne WLAN im aktiven Kamera-/Shooterzustand frueher etwa 110 mA
+- Light-Sleep-Anzeige grob um 10 mA in den frueheren 2-fps-Sleep-Versuchen
+- aktueller v20-Zuverlaessigkeitsstand mit 500-ms-awake-fallback etwa 120 mA
 
-Bei 2 fps wechselt der Strom schnell zwischen Sleep und Aktivphase. Ein normales
-Multimeter mittelt bzw. folgt diesen kurzen Pulsen nur begrenzt. Fuer belastbare
+WICHTIG: Fuer den 500-ms-Shooter wird Light Sleep ab v20 bewusst nicht mehr
+verwendet. Der aktuelle Feldstrom liegt deshalb deutlich ueber echtem Sleep und
+ist der Preis fuer den stabilen unbeaufsichtigten 2-fps-Betrieb. Bei spaeterer
+Energieoptimierung zuerst Langzeit-A/B messen; den schnellen Light-Sleep-Pfad
+nicht ohne reproduzierbaren Nachweis wieder aktivieren. Fuer belastbare
 Laufzeitwerte besser Energie/Wh oder gemittelten Strom ueber 30-60 Minuten
-messen. Die frueheren 3.4 mA und die neu beobachteten rund 10 mA stammen aus
-unterschiedlichen Teststaenden und duerfen nicht unkritisch gleichgesetzt werden.
+messen. Die frueheren 3.4 mA, rund 10 mA und aktuellen rund 120 mA stammen aus
+unterschiedlichen Betriebsmodi und duerfen nicht gleichgesetzt werden.
 
 Aktiver Strom wurde je nach Aufbau/Kamera/WLAN grob um etwa 110 bis 180 mA
 beobachtet.
@@ -3249,7 +3698,8 @@ SYNC API / PC-DOWNLOAD
 ======================================================================
 
 Fuer schnellen PC-seitigen Download existiert eine eigene stateless Sync API.
-Der aktuelle Host-Stand ist API 1.11. Der aktuelle Python-Client
+Der aktuelle Host-Stand ist Protokoll API 1.12. Zusaetzlich definiert v17 das
+stabile lokale Integration-API-Profil 1.0. Der aktuelle Python-Client
 sensorforge_sync.py ist 1.4.
 
 Wesentliche bestehende Endpunkte:
@@ -3271,6 +3721,19 @@ Mit API 1.10 kamen zusaetzlich read-only hinzu:
 
 - X-SensorForge-API-Version
 - X-SensorForge-Device-ID
+- X-SensorForge-Integration-API-Version: 1.0
+
+Mit v17 kommen fuer lokale Integrationen additiv hinzu:
+
+- GET /api/v1/device
+- GET /api/v1/state
+- GET /api/v1/shooter
+- POST /api/v1/shooter/flush
+
+/device liefert neben Capabilities eine stabile zufaellige integration_id aus
+NVS. Diese ist fuer Automationsclients die bevorzugte Unique-ID und ist weder
+Lizenz-Hardware-ID noch MAC-Adresse. RTSP und MQTT sind in v17 noch nicht
+implementiert.
 
 device_id ist die bestehende, vom Benutzer konfigurierbare Netzwerk-/Geraete-ID
 aus cfg_hostname. Diese ID ist NICHT die Lizenz-Hardware-ID und darf niemals
@@ -3332,7 +3795,8 @@ Getestete Alternativen:
 
 Der Transferpfad mit 32 KB / Core 0 bleibt daher der bewaehrte Sweet Spot.
 API 1.10 fuehrte die read-only Status-/Sensor-/Snapshot-Funktionen ein. Der
-aktuelle Host-Stand ist inzwischen API 1.11; der bewaehrte Downloadpfad wurde
+aktuelle Host-Stand ist inzwischen Protokoll API 1.12; v17 ergaenzt darauf
+additiv das stabile Integration-API-Profil 1.0. Der bewaehrte Downloadpfad wurde
 dadurch nicht grundsaetzlich neu designt.
 
 
@@ -3993,8 +4457,9 @@ Solange kein konkretes Problem besteht, nicht wieder grundlos umbauen:
 - Recorder-Interface komplett neu designen
 - Camera Queue neu designen
 - extreme SD-Mikrooptimierungen
-- Sync API ohne konkreten Bedarf ueber den bewaehrten API-1.10-Stand hinaus
-  optimieren oder durch FTP ersetzen
+- Sync-/Integration-API ohne konkreten Bedarf ueber den bewaehrten aktuellen
+  API-1.12-/Integration-1.0-Vertrag hinaus grundsaetzlich neu designen oder
+  durch FTP ersetzen
 - bereits funktionierende Fast-Light-Sleep-Logik neu schreiben
 - Transportmodus automatisiert nur aufgrund von Dunkelheit aktivieren
 
@@ -4061,6 +4526,18 @@ beeinflusst die Aufnahmeentscheidung derzeit aber noch nicht. Vor produktiver
 Nutzung muessen Erkennungsqualitaet, Licht/Schatten, Tag/Nacht, Parameter,
 Wake-Latenz, Strom und Temperatur auf echter Hardware weiter getestet werden.
 
+Dauershooter / Sparse MKV:
+
+V20-KURZFELDLAUF POSITIV, LANGZEITQUALIFIKATION NOCH OFFEN
+Der fruehere 500-ms-Light-Sleep-Betrieb zeigte reale unbeaufsichtigte Ausfaelle
+mit stundenlang fehlenden Aufnahmen. WebConfig-Pause und Transport-Handoff
+wurden als Hauptursachen ausgeschlossen. v20 haelt 250..1000-ms-Shooter wach und
+blockiert langsameren Light Sleep fail-safe, falls der Shooter-Wake-Timer nicht
+sicher armed ist. Der danach gemessene 500-ms-Feldlauf zeigte praktisch 2 fps,
+plausible Similarity-/Force-Save-Entscheidungen sowie mehrere erfolgreiche
+Timeout-/Buffer-full-Sparse-MKV-Flushes. Fuer Produktion weiterhin Langzeitlauf
+und Power-Cut-/volle-SD-Tests einplanen.
+
 Config-Secrets / SFSEC1:
 
 FUNKTIONAL AUF ECHTER HARDWARE GETESTET
@@ -4070,19 +4547,22 @@ wurden positiv bestaetigt.
 
 Log-Verschluesselung / SFLOG1:
 
-IMPLEMENTIERT, LETZTER HARDWARE-REGRESSIONSTEST NOCH OFFEN
-Normaler Logger und Transport-Journal sind auf die gemeinsame SFLOG1-Schicht
-umgestellt. Der Arduino-HEX-Makrokonflikt und der WebConfig-Clear-Reopen-
-Randfall wurden im aktuellen Quellstand behoben. Der Clear-Fix sowie physischer
-SD-Ciphertext/Viewer/Transport-End-to-End muessen noch einmal auf echter
-Hardware bestaetigt werden.
+IMPLEMENTIERT, VIEWER/POWER-CUT-RANDFALL WEITER BEOBACHTEN
+Normaler Logger und Transport-Journal verwenden die gemeinsame SFLOG1-Schicht.
+Ein harter Power-Cut kann einen letzten Record abreissen; der Reader besitzt
+Torn-Record-Recovery/Resync. In dieser Sitzung wurde ein kurzzeitig schwer
+ladbarer Log mit abgeschnittenem Tail beobachtet, der spaeter wieder lesbar war.
+V21 entkoppelt Anzeige und Analyse und laedt chunkweise; v22 lagert die Weblog-
+Schicht aus webconfig.cpp aus. Der WebConfig-Clear-Reopen-Fix sowie v22 sollten
+noch einmal end-to-end auf Hardware regressionsgeprueft werden.
 
 Transportmodus:
 
-FUNKTIONAL IMPLEMENTIERT
-aktuelle UI, Autokalibrierung, Aufnahme-Pause und persistentes Journal muessen
-mit dem letzten Quellstand nochmals end-to-end auf echter Hardware verifiziert
-werden, falls das nach den letzten Aenderungen noch nicht erfolgt ist
+FUNKTIONAL AUF AKTUELLER HARDWARE BESTAETIGT
+Schwarzbild-Erkennung, Cover-Removal-Bestaetigung, 300-s-Installationsdelay und
+v19-Transport->Normalboot-Restart wurden in realen Logs bestaetigt. Der danach
+weiter bestehende Shooter-Langzeitausfall zeigte, dass Transport nicht die
+Hauptursache des Dauershooterproblems war.
 
 Sync API / PC-Download:
 
@@ -4090,8 +4570,9 @@ FUNKTIONAL GETESTET
 Der bewaehrte Transferpfad mit Exclusive-Lease, 20-MHz-SD, Range/Resume und
 Double-Buffer-Transfer wurde auf echter XIAO-Hardware verifiziert. Da NORMAL
 und MAX inzwischen beide 20 MHz sind, wird kein unnoetiger 20->20-MHz-Remount
-mehr ausgefuehrt. Host API ist inzwischen 1.11; die neuen Storage-/Sensor-/Snapshot-
-Endpunkte sind read-only. Reale Transferleistung des Downloadpfads liegt
+mehr ausgefuehrt. Host-Protokoll ist inzwischen 1.12; v17 definiert zusaetzlich Integration API
+1.0. Storage-/Sensor-/Snapshot-Endpunkte bleiben read-only. Reale
+Transferleistung des Downloadpfads liegt
 typischerweise bei etwa 0.80 bis 0.81 MB/s.
 
 Mehrsprachigkeit:
@@ -4341,7 +4822,9 @@ WICHTIGE ENTWICKLUNGSREGELN
 
 - Die bewaehrte Sync-API-Semantik mit Auth, Exclusive-Lease und Range/Resume
   bei spaeteren Client-/App-Implementierungen kompatibel halten. Aktueller Host
-  ist API 1.11; neue Funktionen bevorzugt read-only und additiv einfuehren.
+  ist Protokoll API 1.12 mit Integration API 1.0; neue Funktionen bevorzugt
+  read-only und additiv einfuehren. Bestehende dokumentierte API-v1-Felder und
+  Routen nicht ohne neue Major-Version entfernen oder umbenennen.
 
 - Debug-Zeitstempel im kritischen Pfad sammeln, Console-Ausgabe danach.
 
@@ -4440,13 +4923,19 @@ WICHTIGE ARBEITSREGELN:
 - Neue sichtbare UI-Texte immer sofort ueber language.h/.cpp in DE und EN
   einfuehren. API-, Config- und Log-Bezeichner bleiben stabil/englisch.
 - Keine .lic-Datei-Userflows fuer die Lizenzierung wieder einfuehren.
+- WebLog ist ab v22 eigenes Modul web_log.cpp/.h; log_storage.cpp/.h bleibt die
+  separate SFLOG1-/Storage-Schicht.
 
 BUILD / HARDWARE:
 
 Aktueller Entwicklungs-/Teststand hat BOARD_FREENOVE aktiv; XIAO bleibt
 unterstuetzt und produktiv im Feld. Vor jedem Build board_config.h pruefen.
-Der bewaehrte Arduino-Build verwendet ESP32S3 Dev Module mit Arduino-ESP32 3.3.11, 8 MB Flash, DIO, OPI PSRAM und der
-8-MB-OTA-Partitionierung. Nicht ohne Grund auf eine andere FQBN umstellen.
+Der historische bewaehrte Arduino-Build verwendet ESP32S3 Dev Module mit
+Arduino-ESP32 3.3.11, 8 MB Flash, DIO, OPI PSRAM und der 8-MB-OTA-
+Partitionierung. Die aktuelle Feldsitzung wurde mit Arduino-ESP32 3.3.12 gebaut.
+Dabei musste in sync_api.cpp der lokale Bezeichner HEX wegen Print.h-Makro-
+Kollision auf HEX_DIGITS umbenannt werden. Nicht ohne Grund FQBN/Partitionierung
+umstellen und 3.3.11-vs-3.3.12 bei Regressionen explizit mitdenken.
 
 Physischer Kamerasensor ist OV3660, PID 0x3660. Der aktuelle Freenove-Teststand
 verwendet typischerweise 1024x768, 5 fps, quality 12, Auto Exposure,
@@ -4496,9 +4985,12 @@ Event-Gesamtgrenze 65 s, danach 30 s Cooldown, post_record_ms=3000.
 recording_not_before ist vorhanden und aktuell off.
 
 WebConfig besitzt eine RAM-only Recording-Pause. web_recording_auto_pause=1
-pausiert die Aufnahmeautomatik beim Oeffnen normaler WebConfig-UI-Sessions.
-Normale Lease etwa 35 s; Transportvorbereitung besitzt einen laengeren
-Sicherheits-Hold. API-Verkehr allein zaehlt nicht als Web-UI-Session.
+pausiert die normale Motion-/Alarm-Recording-Automatik beim Oeffnen normaler
+WebConfig-UI-Sessions. Der unabhaengige Dauershooter wird seit v18 NICHT mehr
+durch diese Pause blockiert; nur eine aktive Live-Preview besitzt die Kamera und
+blockiert einen Shooter-Capture. Normale Lease etwa 35 s; Transportvorbereitung
+besitzt einen laengeren Sicherheits-Hold. API-Verkehr allein zaehlt nicht als
+Web-UI-Session.
 
 IMAGE MOTION:
 
@@ -4532,6 +5024,30 @@ Licht/Schatten, Tag/Nacht, Parameter, Wake-Latenz, Strom und Temperatur pruefen.
 Ein echter PIR ist im Freenove-Pfad implementiert. Freigegeben ist nur SR602
 auf GPIO21; AM312 ist nicht freigegeben. XIAO verwendet typischerweise
 LD2410S/OT2 auf GPIO4.
+
+DAUERSHOOTER / SPARSE MKV - AKTUELLER FELDSTAND:
+
+shooter_interval_ms=500 bedeutet 2 fps Pruefslots, nicht 2 gespeicherte Bilder
+pro Sekunde. Filter: Dunkelheit zuerst, dann Mindestveraenderung gegen das letzte
+akzeptierte Bild; Force-Save umgeht Similarity, aber nicht Darkness. Aktueller
+Feldwert shooter_min_change_pct=0.2, shooter_dark_mean_min=15, Force-Save 60 s,
+Flush 600 s, Storageformat MKV.
+
+WICHTIGER v20-FIX: Hochfrequenz-Shooter mit 250..1000 ms bleiben im normalen
+Betrieb wach. Den frueheren 500-ms-Light-Sleep-Zyklus NICHT wieder aktivieren,
+solange kein reproduzierbarer Langzeit-A/B-Nachweis vorliegt. Langsamere Shooter
+duerfen Light Sleep nur mit sicher armed Shooter-/Flush-Timer verwenden.
+
+Fehlergeschichte: WebConfig-Pause wurde in v18 korrekt vom Shooter entkoppelt,
+war aber nicht Hauptursache. v19 fuehrte nach Transportende einen sauberen
+ESP.restart()/SW-Normalboot ein; ein 7-h-Ausfall blieb bestehen. Erst v20 mit
+awake fallback zeigte im Feld wieder stabilen 2-fps-Betrieb und mehrere reale
+Sparse-MKV-Flushes. Der aktuelle grobe Stromwert liegt dabei etwa bei 120 mA.
+
+Flushpfad statisch geprueft: timeout, buffer_full, API/manuell, before_restart,
+Shutdown und Deep Sleep verwenden denselben zentralen Pfad; .mkv.part wird erst
+nach erfolgreicher Finalisierung umbenannt. Harter Power-Cut kann weiterhin den
+noch ungeflushten PSRAM-Inhalt verlieren.
 
 RECORDING ENCRYPTION / SFENC1:
 
@@ -4607,6 +5123,10 @@ SFLOG1 v1:
 - Plaintext /log.txt und .1 werden bei encryption=1 kontrolliert migriert
 - WebConfig Viewer/Live/Download lesen transparent Klartext
 - zerrissener letzter Record darf ignoriert/recovered werden, Auth-Fehler nicht
+- v21-Viewer laedt 16-KiB-Chunks mit Retry; Statistik wird nur per Button
+  berechnet und bei Live-Aenderung lediglich als veraltet markiert
+- v22 lagert /log, /log_raw, /log_chunk, /log_clear und die Viewer-UI in
+  web_log.cpp/.h aus; webconfig.cpp registriert nur noch das Modul
 
 Zwei aktuelle Integrationsfixes unbedingt beibehalten:
 1. Arduino Print.h definiert HEX als Makro; die Tabelle in log_storage.cpp muss
@@ -4618,6 +5138,22 @@ Zwei aktuelle Integrationsfixes unbedingt beibehalten:
 Der zweite Fix ist im aktuellen Quellstand enthalten, aber sein erneuter
 Hardwaretest steht noch aus. SFLOG1 daher noch nicht als vollstaendig
 abgeschlossen betrachten.
+
+Zusaetzliche Sitzungserkenntnisse 2026-09-22:
+
+- ein harter Power-Cut kann am Logende einen zerrissenen letzten Record bzw. in
+  der Klartextansicht abgeschnittene Zeilen hinterlassen; der Reader soll einen
+  torn final record ignorieren bzw. auf spaetere gueltige Records resynchronisieren
+- die fruehere Logseite kombinierte komplettes SFLOG1-Entschluesseln/Streaming
+  und sofortige Browser-Statistikanalyse. Das war auf dem ESP unnoetig schwer und
+  konnte als HTTP-Ladefehler sichtbar werden
+- v21 verwendet fuer den Viewer /log_chunk in 16-KiB-Schritten mit Retry; die
+  Statistik startet nur noch explizit per Button
+- v22 verschiebt den gesamten Weblog-Bereich in web_log.cpp/.h. log_storage bleibt
+  bewusst die darunterliegende unveraenderte Verschluesselungs-/Storage-Schicht
+- der spaetere 3.3.12-Makrokonflikt in sync_api.cpp (lokales HEX) ist ein separater
+  Compilefix v18a und darf nicht mit dem bereits frueher geloesten HEX_CHARS-Punkt
+  in log_storage.cpp verwechselt werden
 
 THERMAL:
 
@@ -4642,13 +5178,21 @@ aktuell Vorrang, aber jeder neue sichtbare UI-Text muss sofort DE+EN erhalten.
 
 SYNC API:
 
-Aktueller Host API 1.11, Python-Client sensorforge_sync.py 1.4.
-Bewaehrte Endpunkte fuer status/days/files/file/exclusive und Diagnose bleiben.
-Neu read-only:
+Aktuelles Host-Protokoll API 1.12, stabiles Integration-API-Profil 1.0,
+Python-Client sensorforge_sync.py 1.4. Bewaehrte Endpunkte fuer
+status/days/files/file/exclusive und Diagnose bleiben. Bereits seit API 1.10
+read-only vorhanden:
 
 - GET /api/v1/storage
 - GET /api/v1/sensors
 - GET /api/v1/camera/snapshot
+
+Mit v17 additiv hinzugekommen:
+
+- GET /api/v1/device
+- GET /api/v1/state
+- GET /api/v1/shooter
+- POST /api/v1/shooter/flush
 
 /status liefert device_id=cfg_hostname. Responses tragen API-Version und
 Device-ID Header. device_id ist nur Netzwerk-/Sync-Identitaet und NICHT die
@@ -4662,6 +5206,28 @@ Der bewaehrte Transferpfad nutzt Exclusive-Lease 60 s, XIAO-SD dauerhaft
 Core 0. Da NORMAL==MAX, wird bei Exclusive kein reiner 20->20-MHz-Remount mehr
 benoetigt.
 Realer Transfer liegt typischerweise bei etwa 0.80-0.81 MB/s.
+
+HOME ASSISTANT / INTEGRATION - WIEDEREINSTIEGSPUNKT:
+
+Gueltiger letzter Stand ist v17. Host-Protokoll API 1.12, Integration API 1.0.
+Neue Routen: /device, /state, /shooter und POST /shooter/flush. /device besitzt
+eine stabile zufaellige integration_id in NVS. Bestehende Sync-Routen bleiben
+unveraendert. RTSP, MQTT und Home-Assistant-Discovery sind NOCH NICHT
+implementiert. Ein spaeter begonnener v18-/Discovery-Zwischenstand gilt NICHT
+als freigegebener Projektstand und soll bei Wiederaufnahme ignoriert werden.
+
+Produktentscheidung fuer die naechste HA-Stufe: KEIN separates Connected-Profil.
+SensorForge bleibt vollstaendig hybrid. Geplant ist nur ein optionaler Config-Key
+home_assistant_enabled=0|1; bei alten Configs ohne diesen Key muss 0 gelten und
+das bisherige Verhalten exakt erhalten bleiben. Bei 1 kommen nur Discovery/HA-
+Funktionen additiv hinzu. Bestehende wifi_on_system_start-, wifi_timeout_sec-,
+Hotspot-, Magnet-, Sleep-, Recording- und Dauershooter-Semantik bleibt
+autoritativ. API-Polling darf web_recording_auto_pause nicht ausloesen.
+
+Naechste Reihenfolge: v17 auf echter Hardware regressionsfrei testen -> optionalen
+HA-Key + mDNS/Zeroconf additiv implementieren -> HA-Custom-Integration read-mostly
+auf /device,/state,/storage,/sensors,/shooter,/camera/snapshot bauen -> spaeter
+explizite Control-Actions -> danach RTSP/MJPEG on demand.
 
 LIZENZSYSTEM - AKTUELLER STAND:
 
@@ -4748,7 +5314,10 @@ WEITERE BESTEHENDE FUNKTIONSBEREICHE:
 
 Transportmodus ist explizit manuell, timer-only und besitzt Auto-
 Schwarzmessung, Recording-Pause, Cover-Removal-Bestaetigung, Installationsdelay
-und persistentes Journal. End-to-end-/Power-Cycle-Tests sind weiterhin offen.
+und persistentes Journal. v19 persistiert beim Freigeben transport_mode=0 und
+startet danach kontrolliert per ESP.restart() in einen normalen SW-Boot. Dieser
+Ablauf wurde im Feldlog bestaetigt. Keine exakte Rebootdauer aus gepufferten
+Logzeitstempeln ableiten.
 
 Firmware Update ueber WiFi streamt direkt in die inaktive interne OTA-
 Partition, validiert das Image dort und aktiviert es erst nach explizitem
@@ -4764,6 +5333,20 @@ neutraler Platzhalter.
 
 WEITERE PRIORITAETEN:
 
+- v20 fuer den 500-ms-Dauershooter als aktuellen Zuverlaessigkeitsstand halten;
+  High-Rate-Light-Sleep nicht ohne reproduzierbaren Langzeit-A/B-Test reaktivieren
+- v22 nach Build/Flash kurz auf Logseite regressionspruefen: Chunk-Load, Retry,
+  Button-Statistik, Live-Update, Download und Log-Clear
+- webconfig.cpp kuenftig nur schrittweise nach fachlich geschlossenen Modulen
+  verkleinern; web_log.cpp/.h ist der erste ausgelagerte Bereich. Keine grosse
+  gleichzeitige Komplettrefaktorierung vor Feldqualifikation
+- Integration-API-Vertrag von v17 (Host 1.12 / Integration API 1.0) als stabile
+  Basis einfrieren; bei Wiederaufnahme von HA den dann aktuellen Firmwarestand
+  gegen bestehende Kamera-/Sync-Funktion regressionsfrei pruefen
+- danach Home Assistant nur additiv ueber optionales home_assistant_enabled=0|1
+  einfuehren; alte Config ohne Key muss exakt bisherigen Betrieb behalten
+- mDNS/Zeroconf + HA-Custom-Integration vor RTSP umsetzen; RTSP/MJPEG erst danach
+  als separaten on-demand Streamingblock planen
 - zuerst SFLOG1 nach dem letzten WebConfig-Clear-Reopen-Fix erneut auf echter
   Hardware pruefen: Clear, weiterer Append, Viewer/Download, physische SD,
   Rotation/Power-Loss und Transport-Journal
@@ -4777,7 +5360,9 @@ WEITERE PRIORITAETEN:
 - fuer Altboards mit bereits fremd belegtem EFUSE_BLK_USER_DATA ist ein
   alternativer Metadata-Fallback aktuell NICHT implementiert; nur bei realem
   Produktbedarf separat designen und testen
-- Transport-UI + Journal end-to-end testen
+- Transport-UI/Journal sind im aktuellen Grundablauf hardwarebestaetigt; bei
+  spaeteren Aenderungen nur gezielt regressionspruefen, nicht erneut grundlos
+  redesignen
 - neuen Build auf Zweitgeraet per Direct-WiFi-OTA testen; dabei one-shot
   skip_sd_once gegen alte SD-Firmwarekandidaten mitpruefen
 - vollstaendige historische UI-Uebersetzung spaeter systematisch abschliessen
@@ -4809,6 +5394,8 @@ keine bereits geloesten Themen neu designen, keine APIs/Funktionen erfinden und
 Codeaenderungen nur auf dem zuletzt wirklich gesehenen Quellstand vornehmen.
 Bei Rueckgabe von Code standardmaessig nur geaenderte/neue Dateien unter ihren
 Originalnamen mitsenden; keine unveraenderten Dateien in Update-ZIPs aufnehmen.
+
+
 
 
 

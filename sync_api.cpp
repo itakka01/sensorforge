@@ -566,14 +566,14 @@ static const String &integrationId()
         esp_fill_random(bytes, sizeof(bytes));
     }
 
-    static const char HEX[] = "0123456789abcdef";
+    static const char HEX_DIGITS[] = "0123456789abcdef";
     char text[3 + 32 + 1];
     text[0] = 's';
     text[1] = 'f';
     text[2] = '-';
     for (size_t i = 0; i < sizeof(bytes); ++i) {
-        text[3 + i * 2] = HEX[(bytes[i] >> 4) & 0x0F];
-        text[4 + i * 2] = HEX[bytes[i] & 0x0F];
+        text[3 + i * 2] = HEX_DIGITS[(bytes[i] >> 4) & 0x0F];
+        text[4 + i * 2] = HEX_DIGITS[bytes[i] & 0x0F];
     }
     text[35] = '\0';
 

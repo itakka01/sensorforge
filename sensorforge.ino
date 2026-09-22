@@ -6757,6 +6757,67 @@ static bool persistTransportModeValue(
 }
 
 
+static void restartFromTransportIntoNormalBoot(
+    const char *reason
+)
+{
+    const char *restartReason =
+        (reason && reason[0])
+        ? reason
+        : "transport-release";
+
+    // transport_mode=0 has already been persisted before this helper is called.
+    // Write the final durable journal entry while the transport wake-cycle
+    // context still exists, then clear every RTC/persistent transport marker.
+    // A software restart guarantees that normal operation begins from the same
+    // clean setup() path as any ordinary SensorForge boot instead of continuing
+    // inside the special minimal transport boot.
+    Serial.printf(
+        "TRANSPORT mode OFF - restarting into normal boot | reason=%s\n",
+        restartReason
+    );
+
+    transportJournalWrite(
+        String("TRANSPORT mode OFF | reason=") +
+        restartReason +
+        " | restart=normal_boot"
+    );
+
+    transportRtcMagic =
+        0;
+
+    transportRtcPhase =
+        TRANSPORT_PHASE_NONE;
+
+    transportRtcWakeCount =
+        0;
+
+    transportRtcStartedEpoch =
+        0;
+
+    transportRtcElapsedFallbackSeconds =
+        0;
+
+    transportRtcLastSleepSeconds =
+        0;
+
+    transportClearPersistentStartEpoch();
+
+    // Config persistence and the transport journal both close/flush their files
+    // before returning. Flush the UART too so the restart reason remains visible
+    // during service diagnostics.
+    Serial.flush();
+    delay(50);
+
+    ESP.restart();
+
+    // Defensive only: ESP.restart() does not return on a healthy platform.
+    while (true) {
+        delay(1000);
+    }
+}
+
+
 static bool handleTransportModeBoot(
     esp_sleep_wakeup_cause_t wakeCause
 )
@@ -6966,35 +7027,11 @@ static bool handleTransportModeBoot(
             return true;
         }
 
-        transportRtcMagic =
-            0;
-
-        transportRtcPhase =
-            TRANSPORT_PHASE_NONE;
-
-        transportRtcWakeCount =
-            0;
-
-        transportRtcStartedEpoch =
-            0;
-
-        transportRtcElapsedFallbackSeconds =
-            0;
-
-        transportRtcLastSleepSeconds =
-            0;
-
-        transportClearPersistentStartEpoch();
-
-        Serial.println(
-            "TRANSPORT mode OFF - maximum duration fallback"
+        restartFromTransportIntoNormalBoot(
+            "max-duration"
         );
 
-        transportJournalWrite(
-            "TRANSPORT mode OFF | reason=max-duration | normal boot continues"
-        );
-
-        return false;
+        return true;
     }
 
 
@@ -7036,35 +7073,11 @@ static bool handleTransportModeBoot(
                 return true;
             }
 
-            transportRtcMagic =
-                0;
-
-            transportRtcPhase =
-                TRANSPORT_PHASE_NONE;
-
-            Serial.println(
-                "TRANSPORT mode OFF - normal boot continues"
+            restartFromTransportIntoNormalBoot(
+                "installation-delay-elapsed"
             );
 
-            transportJournalWrite(
-                "TRANSPORT mode OFF | normal boot continues"
-            );
-
-            transportRtcWakeCount =
-                0;
-
-            transportRtcStartedEpoch =
-                0;
-
-            transportRtcElapsedFallbackSeconds =
-                0;
-
-            transportRtcLastSleepSeconds =
-                0;
-
-            transportClearPersistentStartEpoch();
-
-            return false;
+            return true;
         }
 
 
@@ -7350,35 +7363,11 @@ static bool handleTransportModeBoot(
     }
 
 
-    transportRtcMagic =
-        0;
-
-    transportRtcPhase =
-        TRANSPORT_PHASE_NONE;
-
-    Serial.println(
-        "TRANSPORT mode OFF - normal boot continues"
+    restartFromTransportIntoNormalBoot(
+        "zero-install-delay"
     );
 
-    transportJournalWrite(
-        "TRANSPORT mode OFF | normal boot continues"
-    );
-
-    transportRtcWakeCount =
-        0;
-
-    transportRtcStartedEpoch =
-        0;
-
-    transportRtcElapsedFallbackSeconds =
-        0;
-
-    transportRtcLastSleepSeconds =
-        0;
-
-    transportClearPersistentStartEpoch();
-
-    return false;
+    return true;
 }
 
 
@@ -8454,6 +8443,11 @@ struct ShooterBufferedFrameHeader {
 
 static const uint8_t SHOOTER_LONG_INTERVAL_WARMUP_FRAMES = 3;
 static const uint32_t SHOOTER_LONG_INTERVAL_MS = 5000UL;
+// High-rate continuous capture is kept awake deliberately. Repeated 500/1000 ms
+// light-sleep camera standby/wake cycles are not allowed to become a single
+// point of failure for unattended capture. Slower shooter intervals may still
+// use light sleep, protected by the mandatory timer-arm check below.
+static const uint32_t SHOOTER_LIGHT_SLEEP_AWAKE_MAX_INTERVAL_MS = 1000UL;
 static const size_t SHOOTER_WRITE_CHUNK = 8U * 1024U;
 static const uint8_t SHOOTER_PSRAM_USE_PERCENT = 80U;
 static const size_t SHOOTER_PSRAM_RESERVE_BYTES = 1024U * 1024U;
@@ -9784,12 +9778,13 @@ static bool continuousShooterCapture(
         return false;
     }
 
+    // WebConfig's recording-automation pause is intentionally limited to the
+    // motion/alarm recording path. The independent time-based Dauershooter must
+    // keep running while an operator merely has WebConfig open. Only an active
+    // live preview owns the camera pipeline and therefore blocks a shooter frame.
     if (
         webConfigStarted &&
-        (
-            webConfigCameraPreviewActive() ||
-            webConfigRecordingPaused()
-        )
+        webConfigCameraPreviewActive()
     ) {
         return false;
     }
@@ -10463,11 +10458,20 @@ static bool configureLightSleepWakeSources()
     int64_t shooterScheduledWallUs = 0;
     uint8_t shooterWakeKind = SHOOTER_WAKE_NONE;
 
-    if (continuousShooterNextWakeDelayUs(
+    const bool shooterWakeRequired =
+        cfg_shooter_enabled != 0;
+
+    bool shooterWakeArmed =
+        !shooterWakeRequired;
+
+    bool shooterWakeAvailable =
+        continuousShooterNextWakeDelayUs(
             shooterDelayUs,
             shooterScheduledWallUs,
             shooterWakeKind
-        )) {
+        );
+
+    if (shooterWakeAvailable) {
         esp_err_t timerErr =
             esp_sleep_enable_timer_wakeup(
                 shooterDelayUs
@@ -10478,12 +10482,46 @@ static bool configureLightSleepWakeSources()
                 shooterScheduledWallUs;
             shooterLightSleepWakeKind =
                 shooterWakeKind;
-        } else if (cfg_debug_enabled) {
+            shooterWakeArmed = true;
+        } else {
             powerConsole(
-                "Shooter light-sleep timer setup failed | error=0x%x",
+                "Light sleep blocked | shooter timer setup failed | error=0x%x",
                 timerErr
             );
         }
+    } else if (shooterWakeRequired) {
+        powerConsole(
+            "Light sleep blocked | shooter timer unavailable"
+        );
+    }
+
+    // Fail safe: an enabled continuous shooter must never enter light sleep
+    // unless its next sample/flush wake is definitely armed. Otherwise a
+    // shooter-only installation without an active presence wake source could
+    // sleep indefinitely after WiFi shuts down.
+    if (!shooterWakeArmed) {
+        esp_sleep_disable_wakeup_source(
+            ESP_SLEEP_WAKEUP_EXT0
+        );
+        esp_sleep_disable_wakeup_source(
+            ESP_SLEEP_WAKEUP_EXT1
+        );
+        esp_sleep_disable_wakeup_source(
+            ESP_SLEEP_WAKEUP_TIMER
+        );
+
+        if (presenceWakeEnabled) {
+            rtc_gpio_deinit(PIR_PIN);
+            pinMode(PIR_PIN, INPUT_PULLDOWN);
+        }
+
+        rtc_gpio_deinit(MAGNET_SWITCH_PIN);
+        pinMode(MAGNET_SWITCH_PIN, INPUT_PULLUP);
+        motionDiagnosticsResumePresenceInterrupt();
+
+        shooterLightSleepScheduledWallUs = 0;
+        shooterLightSleepWakeKind = SHOOTER_WAKE_NONE;
+        return false;
     }
 
     return true;
@@ -11872,6 +11910,38 @@ static bool tryEnterConfiguredSleep()
             SLEEP_DIAG_WIFI,
             "Sleep blocked | WiFi/WebConfig active"
         );
+
+        return false;
+    }
+
+
+    // Reliability-first fallback for high-rate continuous capture. The
+    // 250..1000 ms shooter range remains fully operational after WiFi turns
+    // off, but stays awake instead of cycling the camera through light sleep
+    // for every frame. This isolates unattended capture from the rapid
+    // light-sleep wake path while preserving light sleep for slower shooters.
+    if (
+        cfg_sleep_mode == "light_sleep" &&
+        cfg_shooter_enabled &&
+        cfg_shooter_interval_ms >= 250 &&
+        (uint32_t)cfg_shooter_interval_ms <=
+            SHOOTER_LIGHT_SLEEP_AWAKE_MAX_INTERVAL_MS
+    ) {
+        static bool highRateShooterAwakeLogged = false;
+
+        if (!highRateShooterAwakeLogged) {
+            String message =
+                "Light sleep bypassed | high-rate shooter awake fallback | interval_ms=" +
+                String(cfg_shooter_interval_ms);
+
+            powerConsole(
+                "%s",
+                message.c_str()
+            );
+
+            logWrite(message);
+            highRateShooterAwakeLogged = true;
+        }
 
         return false;
     }
