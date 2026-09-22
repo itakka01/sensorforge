@@ -11,12 +11,15 @@
 #include "thermal.h"
 #include "webplayer.h"
 #include "recording_storage.h"
+#include "image_motion.h"
 
 #include <Arduino.h>
 #include <FS.h>
 #include <WiFi.h>
+#include <Preferences.h>
 #include <algorithm>
 #include <esp_camera.h>
+#include <esp_system.h>
 #include <esp_task_wdt.h>
 #include <math.h>
 #include <freertos/FreeRTOS.h>
@@ -27,7 +30,29 @@
 
 // High-level state / operational motion decision from the main firmware.
 extern bool recording;
+extern bool sdReady;
+extern bool webConfigStarted;
+extern bool cameraInitialized;
 extern bool motionDetected();
+extern bool recordingSafetyCooldownActive();
+extern uint32_t recordingSafetyCooldownRemainingSeconds();
+extern String firmwareBuildTimestamp();
+
+// Continuous-shooter runtime telemetry/actions exposed by the main firmware.
+// These are read-only except for the explicit flush action below; configuration
+// mutation remains in the established config/WebConfig path for API 1.0.
+extern bool continuousShooterFlushNow();
+extern uint32_t continuousShooterBufferedFrameCount();
+extern uint32_t continuousShooterBufferUsedBytes();
+extern uint32_t continuousShooterBufferCapacityBytes();
+extern uint32_t continuousShooterAcceptedFrameCount();
+extern uint32_t continuousShooterRejectedDarkCount();
+extern uint32_t continuousShooterRejectedSimilarCount();
+extern uint64_t continuousShooterAcceptedJpegByteCount();
+extern bool continuousShooterLastBrightnessValid();
+extern float continuousShooterLastBrightnessMean();
+extern uint8_t continuousShooterLastBrightnessPeak();
+extern uint32_t continuousShooterLastBrightnessAgeMs();
 
 namespace {
 
@@ -37,7 +62,13 @@ static WebServer *syncServer = nullptr;
 // firmware compile timestamp, so every newly compiled API identifies itself
 // with a fresh, chronologically increasing build version.
 static const uint16_t SYNC_API_VERSION_MAJOR = 1;
-static const uint16_t SYNC_API_VERSION_MINOR = 11;
+static const uint16_t SYNC_API_VERSION_MINOR = 12;
+
+// Stable integration contract intended for Home Assistant and other local
+// automation clients. The transport/protocol version above may grow additively,
+// while this profile changes only when the documented integration schema does.
+static const uint16_t INTEGRATION_API_VERSION_MAJOR = 1;
+static const uint16_t INTEGRATION_API_VERSION_MINOR = 0;
 
 static const size_t SYNC_TRANSFER_BUFFER_PREFERRED = 32U * 1024U;
 static const size_t SYNC_TRANSFER_BUFFER_MINIMUM = 4U * 1024U;
@@ -139,6 +170,11 @@ static void sendApiVersionHeader()
     server().sendHeader(
         "X-SensorForge-Device-ID",
         cfg_hostname
+    );
+    server().sendHeader(
+        "X-SensorForge-Integration-API-Version",
+        String(INTEGRATION_API_VERSION_MAJOR) + "." +
+        String(INTEGRATION_API_VERSION_MINOR)
     );
 }
 
@@ -452,6 +488,296 @@ static bool storageReadReady()
     }
 
     return true;
+}
+
+static const char *boardApiName()
+{
+#if defined(BOARD_XIAO)
+    return "xiao_esp32s3_sense";
+#elif defined(BOARD_FREENOVE)
+    return "freenove_fnk0085";
+#else
+    return "esp32s3_unknown";
+#endif
+}
+
+static const char *networkModeApiName()
+{
+    wifi_mode_t mode = WiFi.getMode();
+
+    switch (mode) {
+        case WIFI_MODE_STA:
+            return "sta";
+        case WIFI_MODE_AP:
+            return "ap";
+        case WIFI_MODE_APSTA:
+            return "ap_sta";
+        case WIFI_MODE_NULL:
+        default:
+            return "off";
+    }
+}
+
+static String activeIpAddress()
+{
+    wifi_mode_t mode = WiFi.getMode();
+
+    if (
+        (mode == WIFI_MODE_STA || mode == WIFI_MODE_APSTA) &&
+        WiFi.status() == WL_CONNECTED
+    ) {
+        return WiFi.localIP().toString();
+    }
+
+    if (mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA)
+        return WiFi.softAPIP().toString();
+
+    return String("0.0.0.0");
+}
+
+// Home Assistant needs a stable, non-secret identity that does not depend on
+// the user-editable hostname. Never expose the license hardware ID or MAC here.
+// A random 128-bit public integration ID is generated once and stored in NVS.
+static const String &integrationId()
+{
+    static String id;
+    if (id.length())
+        return id;
+
+    uint8_t bytes[16] = {};
+    bool persistent = false;
+
+    Preferences prefs;
+    if (prefs.begin("sfapi", false)) {
+        size_t read = prefs.getBytes("iid", bytes, sizeof(bytes));
+        if (read != sizeof(bytes)) {
+            esp_fill_random(bytes, sizeof(bytes));
+            persistent =
+                prefs.putBytes("iid", bytes, sizeof(bytes)) == sizeof(bytes);
+        } else {
+            persistent = true;
+        }
+        prefs.end();
+    }
+
+    // NVS should normally be available. If it is not, still return a valid
+    // per-boot identifier rather than leaking a hardware-derived identifier.
+    if (!persistent) {
+        esp_fill_random(bytes, sizeof(bytes));
+    }
+
+    static const char HEX[] = "0123456789abcdef";
+    char text[3 + 32 + 1];
+    text[0] = 's';
+    text[1] = 'f';
+    text[2] = '-';
+    for (size_t i = 0; i < sizeof(bytes); ++i) {
+        text[3 + i * 2] = HEX[(bytes[i] >> 4) & 0x0F];
+        text[4 + i * 2] = HEX[bytes[i] & 0x0F];
+    }
+    text[35] = '\0';
+
+    id = text;
+    return id;
+}
+
+static void handleDevice()
+{
+    if (!authenticate())
+        return;
+
+    touchExclusiveLease();
+
+    sensor_t *cameraSensor = esp_camera_sensor_get();
+    uint16_t detectedPid = cameraSensor ? cameraSensor->id.PID : 0U;
+
+    String json =
+        "{\"ok\":true,\"api_version\":\"" + jsonEscape(syncApiVersionText()) +
+        "\",\"api_protocol_major\":" + String(SYNC_API_VERSION_MAJOR) +
+        ",\"api_protocol_minor\":" + String(SYNC_API_VERSION_MINOR) +
+        ",\"integration_api_version\":\"" +
+            String(INTEGRATION_API_VERSION_MAJOR) + "." +
+            String(INTEGRATION_API_VERSION_MINOR) +
+        "\",\"integration_id\":\"" + jsonEscape(integrationId()) +
+        "\",\"device_id\":\"" + jsonEscape(cfg_hostname) +
+        "\",\"app\":\"" + jsonEscape(String(Branding::APP_NAME)) +
+        "\",\"platform\":\"" + jsonEscape(String(Branding::PLATFORM)) +
+        "\",\"core_version\":\"" + jsonEscape(String(Branding::CORE_VERSION)) +
+        "\",\"firmware_build\":\"" + jsonEscape(firmwareBuildTimestamp()) +
+        "\",\"board\":\"" + String(boardApiName()) +
+        "\",\"camera_config\":\"" + jsonEscape(cfg_camera) +
+        "\",\"camera_initialized\":" + String(cameraInitialized ? "true" : "false") +
+        ",\"camera_pid\":" + String((unsigned)detectedPid) +
+        ",\"config_source\":\"" + jsonEscape(String(configSourceName())) +
+        "\",\"network_mode\":\"" + String(networkModeApiName()) +
+        "\",\"capabilities\":{" +
+            "\"camera_snapshot\":true," +
+            "\"motion_state\":true," +
+            "\"image_motion_state\":true," +
+            "\"motion_recording\":true," +
+            "\"continuous_shooter\":true," +
+            "\"shooter_flush\":true," +
+            "\"storage_status\":true," +
+            "\"sensor_status\":true," +
+            "\"media_browser\":true," +
+            "\"rtsp\":false," +
+            "\"mqtt\":false" +
+        "}}";
+
+    sendApiVersionHeader();
+    server().sendHeader("Cache-Control", "no-store");
+    server().send(200, "application/json; charset=utf-8", json);
+}
+
+static void handleIntegrationState()
+{
+    if (!authenticate())
+        return;
+
+    touchExclusiveLease();
+
+    bool recorderOpen = recorderIsOpen();
+    bool cooldown = recordingSafetyCooldownActive();
+    bool imageMotionActive = imageMotionMotionActive();
+
+    String json =
+        "{\"ok\":true,\"api_version\":\"" + jsonEscape(syncApiVersionText()) +
+        "\",\"integration_api_version\":\"" +
+            String(INTEGRATION_API_VERSION_MAJOR) + "." +
+            String(INTEGRATION_API_VERSION_MINOR) +
+        "\",\"integration_id\":\"" + jsonEscape(integrationId()) +
+        "\",\"device_id\":\"" + jsonEscape(cfg_hostname) +
+        "\",\"uptime_ms\":" + String((unsigned long)millis()) +
+        ",\"network_mode\":\"" + String(networkModeApiName()) +
+        "\",\"ip\":\"" + jsonEscape(activeIpAddress()) +
+        "\",\"web_config_active\":" + String(webConfigStarted ? "true" : "false") +
+        ",\"camera_initialized\":" + String(cameraInitialized ? "true" : "false") +
+        ",\"storage_ready\":" + String(sdReady ? "true" : "false") +
+        ",\"storage_locked\":" + String(g_storageLocked ? "true" : "false") +
+        ",\"recording\":" + String(recording ? "true" : "false") +
+        ",\"recorder_open\":" + String(recorderOpen ? "true" : "false") +
+        ",\"recording_start_blocked\":" + String(g_recordingStartBlocked ? "true" : "false") +
+        ",\"motion_recording_enabled\":" + String(cfg_motion_recording_enabled ? "true" : "false") +
+        ",\"motion_recording_decision\":\"" + jsonEscape(cfg_motion_recording_decision) +
+        "\",\"automation_motion_detected\":" + String(motionDetected() ? "true" : "false") +
+        ",\"image_motion_active\":" + String(imageMotionActive ? "true" : "false") +
+        ",\"recording_cooldown_active\":" + String(cooldown ? "true" : "false") +
+        ",\"recording_cooldown_remaining_seconds\":" +
+            String(recordingSafetyCooldownRemainingSeconds()) +
+        ",\"shooter_enabled\":" + String(cfg_shooter_enabled ? "true" : "false") +
+        ",\"exclusive_active\":" + String(syncExclusiveActiveState ? "true" : "false") +
+        ",\"sleep_mode\":\"" + jsonEscape(cfg_sleep_mode) +
+        "\",\"sleep_delay_ms\":" + String(cfg_sleep_delay_ms) +
+        "}";
+
+    sendApiVersionHeader();
+    server().sendHeader("Cache-Control", "no-store");
+    server().send(200, "application/json; charset=utf-8", json);
+}
+
+static void handleShooterStatus()
+{
+    if (!authenticate())
+        return;
+
+    touchExclusiveLease();
+
+    uint32_t usedBytes = continuousShooterBufferUsedBytes();
+    uint32_t capacityBytes = continuousShooterBufferCapacityBytes();
+    uint32_t accepted = continuousShooterAcceptedFrameCount();
+    uint64_t acceptedBytes = continuousShooterAcceptedJpegByteCount();
+    bool brightnessValid = continuousShooterLastBrightnessValid();
+
+    uint32_t averageJpegBytes =
+        accepted > 0
+        ? (uint32_t)(acceptedBytes / (uint64_t)accepted)
+        : 0U;
+
+    String json =
+        "{\"ok\":true,\"api_version\":\"" + jsonEscape(syncApiVersionText()) +
+        "\",\"integration_id\":\"" + jsonEscape(integrationId()) +
+        "\",\"device_id\":\"" + jsonEscape(cfg_hostname) +
+        "\",\"enabled\":" + String(cfg_shooter_enabled ? "true" : "false") +
+        ",\"storage_format\":\"" + jsonEscape(cfg_shooter_storage_format) +
+        "\",\"interval_ms\":" + String(cfg_shooter_interval_ms) +
+        ",\"dark_mean_min\":" + String(cfg_shooter_dark_mean_min) +
+        ",\"min_change_pct\":" + String(cfg_shooter_min_change_pct, 1) +
+        ",\"force_save_seconds\":" + String(cfg_shooter_force_save_seconds) +
+        ",\"flush_seconds\":" + String(cfg_shooter_flush_seconds) +
+        ",\"buffered_frames\":" + String(continuousShooterBufferedFrameCount()) +
+        ",\"buffer_used_bytes\":" + String(usedBytes) +
+        ",\"buffer_capacity_bytes\":" + String(capacityBytes) +
+        ",\"buffer_fill_pct\":" + String(
+            capacityBytes > 0
+            ? ((float)usedBytes * 100.0f / (float)capacityBytes)
+            : 0.0f,
+            1
+        ) +
+        ",\"accepted_frames\":" + String(accepted) +
+        ",\"accepted_jpeg_bytes\":" + uint64Text(acceptedBytes) +
+        ",\"average_jpeg_bytes\":" + String(averageJpegBytes) +
+        ",\"rejected_dark\":" + String(continuousShooterRejectedDarkCount()) +
+        ",\"rejected_similar\":" + String(continuousShooterRejectedSimilarCount()) +
+        ",\"brightness_valid\":" + String(brightnessValid ? "true" : "false") +
+        ",\"brightness_mean\":" + String(
+            brightnessValid ? continuousShooterLastBrightnessMean() : 0.0f,
+            1
+        ) +
+        ",\"brightness_peak\":" + String(
+            brightnessValid ? (unsigned)continuousShooterLastBrightnessPeak() : 0U
+        ) +
+        ",\"brightness_age_ms\":" + String(
+            brightnessValid ? continuousShooterLastBrightnessAgeMs() : 0U
+        ) +
+        "}";
+
+    sendApiVersionHeader();
+    server().sendHeader("Cache-Control", "no-store");
+    server().send(200, "application/json; charset=utf-8", json);
+}
+
+static void handleShooterFlush()
+{
+    if (!authenticate())
+        return;
+
+    touchExclusiveLease();
+
+    if (recording || recorderIsOpen()) {
+        sendBusy("recording_active");
+        return;
+    }
+
+    if (!sdReady) {
+        sendJsonError(503, "storage_unavailable", "storage_is_not_ready");
+        return;
+    }
+
+    if (g_storageLocked) {
+        sendBusy("storage_locked");
+        return;
+    }
+
+    if (syncExclusiveActiveState) {
+        sendBusy("exclusive_active");
+        return;
+    }
+
+    if (!continuousShooterFlushNow()) {
+        sendBusy("shooter_flush_deferred");
+        return;
+    }
+
+    String json =
+        "{\"ok\":true,\"flushed\":true,\"buffered_frames\":" +
+        String(continuousShooterBufferedFrameCount()) +
+        ",\"buffer_used_bytes\":" +
+        String(continuousShooterBufferUsedBytes()) +
+        "}";
+
+    sendApiVersionHeader();
+    server().sendHeader("Cache-Control", "no-store");
+    server().send(200, "application/json; charset=utf-8", json);
 }
 
 static void handleStatus()
@@ -2137,6 +2463,13 @@ void syncApiRegisterRoutes(WebServer &webServer)
         "X-SensorForge-Client-Version"
     };
     webServer.collectHeaders(headerKeys, sizeof(headerKeys) / sizeof(headerKeys[0]));
+
+    // Stable Integration API 1.0 profile. Existing Sync API endpoints remain
+    // unchanged and continue to coexist with these additive automation routes.
+    webServer.on("/api/v1/device", HTTP_GET, handleDevice);
+    webServer.on("/api/v1/state", HTTP_GET, handleIntegrationState);
+    webServer.on("/api/v1/shooter", HTTP_GET, handleShooterStatus);
+    webServer.on("/api/v1/shooter/flush", HTTP_POST, handleShooterFlush);
 
     webServer.on("/api/v1/status", HTTP_GET, handleStatus);
     webServer.on("/api/v1/storage", HTTP_GET, handleStorageStatus);
