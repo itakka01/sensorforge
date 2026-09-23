@@ -1,6 +1,7 @@
 #include "webplayer.h"
 
 #include "board_config.h"
+#include "config.h"
 #include "recorder.h"
 #include "storage_guard.h"
 #include "branding.h"
@@ -80,7 +81,8 @@ static const uint32_t PLAYER_IDLE_CLOSE_MS =
 // executed only after recording has been continuously idle for a
 // short grace period. This avoids SD directory changes at segment
 // boundaries or while a new recording is starting.
-static const uint8_t PLAYER_DELETE_QUEUE_MAX = 8;
+static const uint8_t PLAYER_DELETE_QUEUE_MAX = 128;
+static const uint8_t PLAYER_DELETE_BATCH_MAX = 16;
 static const uint32_t PLAYER_DELETE_SAFE_IDLE_MS = 1500UL;
 
 static String pendingDeletePaths[PLAYER_DELETE_QUEUE_MAX];
@@ -90,13 +92,13 @@ static uint32_t pendingDeleteSafeSinceMs = 0;
 
 // Shared transfer buffer.
 // JPEGs are sent to the browser in small chunks.
-static uint8_t transferBuffer[2048];
+static uint8_t transferBuffer[8192];
 
 
 // Finite batches only. At the project's normal 5 fps this is
-// one second of video. Higher-fps recordings still cannot hold
-// the synchronous WebServer for an excessively long response.
-static const uint8_t PLAYER_BATCH_MAX_FRAMES = 5;
+// two seconds of video. This reduces HTTP/SD round-trips while keeping
+// the synchronous WebServer response bounded.
+static const uint8_t PLAYER_BATCH_MAX_FRAMES = 10;
 
 
 struct BatchFrameRef {
@@ -196,6 +198,82 @@ static bool isJpegPath(
     return
         lower.endsWith(".jpg") ||
         lower.endsWith(".jpeg");
+}
+
+
+static const size_t PLAYER_ANNOTATION_MAX_BYTES = 240U;
+
+
+static String annotationPathForMedia(
+    const String &path
+)
+{
+    return
+        path +
+        ".note";
+}
+
+
+static String normalizedAnnotationText(
+    String text
+)
+{
+    text.replace("\r", " ");
+    text.replace("\n", " ");
+    text.replace("\t", " ");
+    text.trim();
+
+    while (text.indexOf("  ") >= 0)
+        text.replace("  ", " ");
+
+    if (text.length() > PLAYER_ANNOTATION_MAX_BYTES)
+        text.remove(PLAYER_ANNOTATION_MAX_BYTES);
+
+    return text;
+}
+
+
+static bool loadMediaAnnotation(
+    const String &mediaPath,
+    String &text
+)
+{
+    text = "";
+
+    String notePath =
+        annotationPathForMedia(mediaPath);
+
+    RecordingStorageFile file;
+
+    if (!file.openRead(notePath))
+        return !STORAGE.exists(notePath.c_str());
+
+    if (file.isDirectory()) {
+        file.close();
+        return false;
+    }
+
+    while (
+        file.available() &&
+        text.length() < PLAYER_ANNOTATION_MAX_BYTES
+    ) {
+        int c = file.read();
+
+        if (c < 0)
+            break;
+
+        if (c == '\r' || c == '\n' || c == '\t')
+            c = ' ';
+
+        text += (char)c;
+    }
+
+    file.close();
+
+    text =
+        normalizedAnnotationText(text);
+
+    return true;
 }
 
 
@@ -3206,6 +3284,224 @@ static bool parseMkvMeta(
 }
 
 
+
+// -------------------------------------------------------------
+// Lightweight duration probe used by the recording list.
+//
+// Unlike parseMkvMeta(), the MKV path deliberately stops after the Info
+// element and does NOT count all sparse video blocks. This keeps the day list
+// responsive even when a sparse shooter MKV spans many minutes.
+// -------------------------------------------------------------
+
+static bool probeAviDurationMs(
+    RecordingStorageFile &file,
+    uint64_t &durationMs
+)
+{
+    durationMs = 0;
+
+    uint8_t header[72];
+
+    if (!readAt(
+            file,
+            0,
+            header,
+            sizeof(header)
+        )) {
+        return false;
+    }
+
+    if (
+        !fourCCEquals(&header[0], "RIFF") ||
+        !fourCCEquals(&header[8], "AVI ")
+    ) {
+        return false;
+    }
+
+    uint32_t microSecPerFrame =
+        readU32LE(&header[32]);
+
+    uint32_t totalFrames =
+        readU32LE(&header[48]);
+
+    if (
+        microSecPerFrame == 0 ||
+        totalFrames == 0
+    ) {
+        return false;
+    }
+
+    durationMs =
+        (
+            (uint64_t)microSecPerFrame *
+            (uint64_t)totalFrames +
+            999ULL
+        ) /
+        1000ULL;
+
+    return durationMs > 0;
+}
+
+
+static bool probeMkvDurationMs(
+    RecordingStorageFile &file,
+    uint64_t &durationMs
+)
+{
+    durationMs = 0;
+
+    uint32_t fileSize =
+        (uint32_t)file.size();
+
+    if (fileSize < 32U)
+        return false;
+
+    uint32_t pos = 0;
+    EbmlElement segment;
+    bool segmentFound = false;
+
+    while (pos < fileSize) {
+        EbmlElement element;
+
+        if (!readEbmlElementAt(
+                file,
+                pos,
+                element
+            )) {
+            return false;
+        }
+
+        if (element.end <= pos)
+            return false;
+
+        if (element.id == MKV_ID_SEGMENT) {
+            segment = element;
+            segmentFound = true;
+            break;
+        }
+
+        pos = element.end;
+    }
+
+    if (!segmentFound)
+        return false;
+
+    MkvMeta containerMeta;
+    containerMeta.timestampScaleNs = 1000000ULL;
+    containerMeta.videoTrackNumber = 1;
+    containerMeta.subtitleTrackNumber = 0;
+    containerMeta.hasSubtitleTrack = false;
+    containerMeta.hasDateUtc = false;
+    containerMeta.startEpochSec = 0;
+    containerMeta.segmentDataStart = segment.dataStart;
+    containerMeta.segmentEnd = segment.end;
+    containerMeta.firstClusterPos = 0;
+
+    double durationTicks = 0.0;
+
+    pos = segment.dataStart;
+
+    while (pos < segment.end) {
+        EbmlElement child;
+
+        if (!readEbmlElementAt(
+                file,
+                pos,
+                child
+            )) {
+            return false;
+        }
+
+        if (
+            child.end <= pos ||
+            child.end > segment.end
+        ) {
+            return false;
+        }
+
+        if (child.id == MKV_ID_INFO) {
+            if (!parseMkvInfo(
+                    file,
+                    child,
+                    containerMeta,
+                    durationTicks
+                )) {
+                return false;
+            }
+
+            if (durationTicks <= 0.0)
+                return false;
+
+            double durationNs =
+                durationTicks *
+                (double)containerMeta.timestampScaleNs;
+
+            durationMs =
+                (uint64_t)(
+                    durationNs /
+                    1000000.0 +
+                    0.5
+                );
+
+            return durationMs > 0;
+        }
+
+        // Info is written before the first Cluster by SensorForge. There is no
+        // reason to walk JPEG payloads when the metadata is absent/corrupt.
+        if (child.id == MKV_ID_CLUSTER)
+            break;
+
+        pos = child.end;
+    }
+
+    return false;
+}
+
+
+bool webPlayerProbeDurationMs(
+    const String &path,
+    uint64_t &durationMs
+)
+{
+    durationMs = 0;
+
+    if (
+        !validRecordingPath(path) ||
+        (
+            !isAviPath(path) &&
+            !isMkvPath(path)
+        )
+    ) {
+        return false;
+    }
+
+    RecordingStorageFile file;
+
+    if (
+        !file.openRead(path) ||
+        file.isDirectory()
+    ) {
+        file.close();
+        return false;
+    }
+
+    bool ok =
+        isAviPath(path)
+        ? probeAviDurationMs(
+            file,
+            durationMs
+        )
+        : probeMkvDurationMs(
+            file,
+            durationMs
+        );
+
+    file.close();
+
+    return ok;
+}
+
+
 static bool resetMkvScan()
 {
     if (!playerFile)
@@ -4716,6 +5012,18 @@ static bool deleteQueuedRecordingNow(
     }
 
 
+    String notePath =
+        annotationPathForMedia(path);
+
+    STORAGE.remove(
+        notePath.c_str()
+    );
+
+    STORAGE.remove(
+        (notePath + ".tmp").c_str()
+    );
+
+
     return true;
 }
 
@@ -4728,18 +5036,13 @@ static void processPendingDelete()
     }
 
 
-    String path =
-        pendingDeletePaths[0];
-
-
-    // Close the race between the idle check in webPlayerLoop() and the
-    // actual SD delete. Once this guard is active recorderStart() will
-    // refuse every new recording start until the delete has finished.
+    // Once the queue has reached its safe-idle window, keep NEW recordings
+    // blocked while draining a small batch. The previous implementation
+    // deleted only one file per 1.5 s grace period, so an old queue could stay
+    // full for a long time and reject a later multi-select delete request.
     RecordingStartBlockGuard recordingBlock;
 
 
-    // A recording that became active just before the lock was raised
-    // always wins. Keep the item queued and restart the safe-idle timer.
     if (recorderIsOpen()) {
         pendingDeleteSafeSinceMs =
             0;
@@ -4748,29 +5051,45 @@ static void processPendingDelete()
     }
 
 
-    bool ok =
-        deleteQueuedRecordingNow(
-            path
-        );
+    uint8_t processed =
+        0;
 
 
-    if (ok) {
-        Serial.println(
-            "WebPlayer: queued delete completed " +
-            path
-        );
-    } else {
-        Serial.println(
-            "WebPlayer: queued delete failed " +
-            path
-        );
+    while (
+        pendingDeleteCount > 0 &&
+        processed < PLAYER_DELETE_BATCH_MAX
+    ) {
+        String path =
+            pendingDeletePaths[0];
+
+
+        bool ok =
+            deleteQueuedRecordingNow(
+                path
+            );
+
+
+        if (ok) {
+            Serial.println(
+                "WebPlayer: queued delete completed " +
+                path
+            );
+        } else {
+            Serial.println(
+                "WebPlayer: queued delete failed " +
+                path
+            );
+        }
+
+
+        removeFirstPendingDelete();
+        processed++;
+
+        // Keep the loop cooperative during a larger queued cleanup.
+        yield();
     }
 
 
-    removeFirstPendingDelete();
-
-    // If more items are waiting, leave a small idle gap before the
-    // next SD directory modification as well.
     pendingDeleteSafeSinceMs =
         pendingDeleteCount > 0
         ? millis()
@@ -4959,6 +5278,18 @@ static void handlePlayerDelete()
     }
 
 
+    String notePath =
+        annotationPathForMedia(path);
+
+    STORAGE.remove(
+        notePath.c_str()
+    );
+
+    STORAGE.remove(
+        (notePath + ".tmp").c_str()
+    );
+
+
     Serial.println(
         "WebPlayer: deleted " +
         path
@@ -4970,6 +5301,150 @@ static void handlePlayerDelete()
         "text/plain; charset=utf-8",
         "Deleted"
     );
+}
+
+
+// =============================================================
+// MEDIA ANNOTATION SIDECAR
+// =============================================================
+
+static void handlePlayerAnnotationGet()
+{
+    if (rejectPlayerWhileRecording())
+        return;
+
+    if (!playerServer)
+        return;
+
+    String path =
+        playerServer->arg("path");
+
+    if (
+        !validRecordingPath(path) ||
+        (
+            !isAviPath(path) &&
+            !isMkvPath(path)
+        )
+    ) {
+        playerServer->send(400, "text/plain; charset=utf-8", "Invalid recording path");
+        return;
+    }
+
+    String text;
+
+    if (!loadMediaAnnotation(path, text)) {
+        playerServer->send(500, "text/plain; charset=utf-8", "Annotation read failed");
+        return;
+    }
+
+    playerServer->sendHeader("Cache-Control", "no-store");
+
+    if (!text.length()) {
+        playerServer->send(204, "text/plain; charset=utf-8", "");
+        return;
+    }
+
+    playerServer->send(200, "text/plain; charset=utf-8", text);
+}
+
+
+static void handlePlayerAnnotationPost()
+{
+    if (!playerServer)
+        return;
+
+    String path =
+        playerServer->arg("path");
+
+    if (
+        !validRecordingPath(path) ||
+        (
+            !isAviPath(path) &&
+            !isMkvPath(path)
+        )
+    ) {
+        playerServer->send(400, "text/plain; charset=utf-8", "Invalid recording path");
+        return;
+    }
+
+    if (g_storageLocked) {
+        playerServer->send(409, "text/plain; charset=utf-8", "Storage locked");
+        return;
+    }
+
+    if (recorderIsOpen()) {
+        playerServer->send(409, "text/plain; charset=utf-8", "Recording active");
+        return;
+    }
+
+    RecordingStartBlockGuard recordingBlock;
+
+    if (recorderIsOpen()) {
+        playerServer->send(409, "text/plain; charset=utf-8", "Recording active");
+        return;
+    }
+
+    // Release the current media read handle before changing the directory.
+    // The next frame/batch request reopens the session transparently.
+    closePlayerFile();
+
+    String text =
+        normalizedAnnotationText(
+            playerServer->arg("text")
+        );
+
+    String notePath =
+        annotationPathForMedia(path);
+
+    String tempPath =
+        notePath +
+        ".tmp";
+
+    STORAGE.remove(tempPath.c_str());
+
+    if (!text.length()) {
+        STORAGE.remove(notePath.c_str());
+        playerServer->send(200, "text/plain; charset=utf-8", "Cleared");
+        return;
+    }
+
+    RecordingStorageFile file;
+
+    if (!file.openWrite(
+            tempPath,
+            cfg_recording_encryption != 0
+        )) {
+        playerServer->send(500, "text/plain; charset=utf-8", "Annotation write failed");
+        return;
+    }
+
+    size_t written =
+        file.write(
+            (const uint8_t *)text.c_str(),
+            text.length()
+        );
+
+    bool finalized =
+        file.closeChecked();
+
+    if (
+        written != text.length() ||
+        !finalized
+    ) {
+        STORAGE.remove(tempPath.c_str());
+        playerServer->send(500, "text/plain; charset=utf-8", "Annotation write failed");
+        return;
+    }
+
+    STORAGE.remove(notePath.c_str());
+
+    if (!STORAGE.rename(tempPath.c_str(), notePath.c_str())) {
+        STORAGE.remove(tempPath.c_str());
+        playerServer->send(500, "text/plain; charset=utf-8", "Annotation finalize failed");
+        return;
+    }
+
+    playerServer->send(200, "text/plain; charset=utf-8", text);
 }
 
 
@@ -5119,20 +5594,23 @@ static void handlePlayerNeighbors()
     String previousPath;
     String nextPath;
 
-    if (currentIndex > 0) {
-        previousPath =
-            mediaPaths[
-                (size_t)currentIndex - 1U
-            ];
-    }
-
+    // mediaPaths is sorted newest -> oldest. Chronological navigation must
+    // therefore move "Previous" toward the older entry and "Next" toward the
+    // newer entry. The old mapping was exactly reversed.
     if (
         (size_t)currentIndex + 1U <
         mediaPaths.size()
     ) {
-        nextPath =
+        previousPath =
             mediaPaths[
                 (size_t)currentIndex + 1U
+            ];
+    }
+
+    if (currentIndex > 0) {
+        nextPath =
+            mediaPaths[
+                (size_t)currentIndex - 1U
             ];
     }
 
@@ -5438,6 +5916,37 @@ h2{
     color:var(--muted);
     font-size:.85rem;
 }
+#annotationOverlay{
+    position:absolute;
+    top:12px;
+    left:50%;
+    transform:translateX(-50%);
+    max-width:90%;
+    padding:6px 10px;
+    border-radius:6px;
+    color:white;
+    background:rgba(0,0,0,.48);
+    font-size:18px;
+    font-weight:700;
+    line-height:1.25;
+    text-align:center;
+    white-space:pre-wrap;
+    overflow-wrap:anywhere;
+    text-shadow:0 1px 2px rgba(0,0,0,.9);
+    pointer-events:none;
+    display:none;
+}
+.annotation-panel{
+    margin:12px 0;
+    padding:12px;
+    border:1px solid var(--line);
+    border-radius:8px;
+    background:#f8fafc;
+}
+.annotation-panel label{display:block;font-weight:700;margin-bottom:6px;}
+.annotation-panel textarea{width:100%;min-height:64px;resize:vertical;box-sizing:border-box;padding:8px 10px;border:1px solid #cbd5e1;border-radius:6px;font:inherit;color:#1f2933;background:#fff;}
+.annotation-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:6px;}
+.annotation-status{color:var(--muted);font-size:.85rem;}
 #timestamp{
     position:absolute;
     right:12px;
@@ -5577,6 +6086,16 @@ R"HTML(</span></a>
     <a href="/files"><button type="button">Back</button></a>
 </div>
 
+<div class="annotation-panel videoOnly">
+    <label for="annotationText">Annotation</label>
+    <textarea id="annotationText" maxlength="240" placeholder="Kurze Anmerkung zu dieser Aufnahme ..."></textarea>
+    <div class="annotation-actions">
+        <button id="saveAnnotationBtn" type="button">Speichern</button>
+        <button id="clearAnnotationBtn" type="button">Leeren</button>
+        <span id="annotationStatus" class="annotation-status"></span>
+    </div>
+</div>
+
 <div class="zoom-controls" aria-label="Bildzoom">
     <button id="zoomOutBtn" type="button" title="Zoom out (-)">-</button>
     <span id="zoomLabel" class="zoom-label">Fit</span>
@@ -5592,6 +6111,7 @@ R"HTML(</span></a>
         <div class="stage-holder">
             <div class="stage" id="stage">
                 <img id="frame" alt="Media">
+                <div id="annotationOverlay"></div>
                 <div id="timestamp"></div>
             </div>
         </div>
@@ -5657,6 +6177,11 @@ const seek = document.getElementById('seek');
 const timeLabel = document.getElementById('time');
 const statusEl = document.getElementById('status');
 const timestampEl = document.getElementById('timestamp');
+const annotationOverlayEl = document.getElementById('annotationOverlay');
+const annotationTextEl = document.getElementById('annotationText');
+const saveAnnotationBtn = document.getElementById('saveAnnotationBtn');
+const clearAnnotationBtn = document.getElementById('clearAnnotationBtn');
+const annotationStatusEl = document.getElementById('annotationStatus');
 const viewerEl = document.getElementById('viewer');
 const stageEl = document.getElementById('stage');
 const zoomOutBtn = document.getElementById('zoomOutBtn');
@@ -6057,6 +6582,81 @@ function updateUi() {
     });
 }
 
+function applyAnnotationOverlay(text) {
+    const value = String(text || '').trim();
+    if (annotationOverlayEl) {
+        annotationOverlayEl.textContent = value;
+        annotationOverlayEl.style.display = value.length ? 'block' : 'none';
+    }
+    if (annotationTextEl && annotationTextEl.value !== value)
+        annotationTextEl.value = value;
+}
+
+async function loadAnnotation() {
+    if (imageMode || !path) return;
+    try {
+        const response = await fetch('/player_annotation?path=' + encodeURIComponent(path) + '&t=' + Date.now(), {cache:'no-store'});
+        if (response.status === 204) {
+            applyAnnotationOverlay('');
+            if (annotationStatusEl) annotationStatusEl.textContent = '';
+            return;
+        }
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        const text = await response.text();
+        applyAnnotationOverlay(text);
+        if (annotationStatusEl) annotationStatusEl.textContent = '';
+    } catch (e) {
+        if (annotationStatusEl) annotationStatusEl.textContent = 'Annotation konnte nicht geladen werden.';
+    }
+}
+
+async function saveAnnotationText(text) {
+    if (imageMode || !path) return;
+    const value = String(text || '').replace(/[\r\n\t]+/g, ' ').trim().slice(0, 240);
+    if (saveAnnotationBtn) saveAnnotationBtn.disabled = true;
+    if (clearAnnotationBtn) clearAnnotationBtn.disabled = true;
+    if (annotationStatusEl) annotationStatusEl.textContent = 'Speichere ...';
+    try {
+        const response = await fetch('/player_annotation?path=' + encodeURIComponent(path), {
+            method:'POST', cache:'no-store', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'text=' + encodeURIComponent(value)
+        });
+        const body = await response.text();
+        if (!response.ok) throw new Error(body || ('HTTP ' + response.status));
+        applyAnnotationOverlay(value);
+
+        // The recordings overview caches one opened day in sessionStorage.
+        // Invalidate exactly that day so the annotation shown in the list is
+        // refreshed when the user returns from the player.
+        try {
+            const parts = path.split('/');
+            if (parts.length >= 3 && parts[1]) {
+                sessionStorage.removeItem('recordings.day.' + parts[1]);
+                sessionStorage.setItem('recordings.annotationDirtyDay', parts[1]);
+            }
+        } catch (e) {}
+
+        if (annotationStatusEl) annotationStatusEl.textContent = value.length ? 'Gespeichert.' : 'Annotation entfernt.';
+    } catch (e) {
+        if (annotationStatusEl) annotationStatusEl.textContent = 'Speichern fehlgeschlagen: ' + e.message;
+    } finally {
+        if (saveAnnotationBtn) saveAnnotationBtn.disabled = false;
+        if (clearAnnotationBtn) clearAnnotationBtn.disabled = false;
+    }
+}
+
+if (saveAnnotationBtn) {
+    saveAnnotationBtn.addEventListener('click', function() {
+        saveAnnotationText(annotationTextEl ? annotationTextEl.value : '');
+    });
+}
+
+if (clearAnnotationBtn) {
+    clearAnnotationBtn.addEventListener('click', function() {
+        if (annotationTextEl) annotationTextEl.value = '';
+        saveAnnotationText('');
+    });
+}
+
 function updateStatus() {
     if (!meta)
         return;
@@ -6255,7 +6855,7 @@ function parseBatch(buffer) {
 
     if (
         count < 1 ||
-        count > 5
+        count > 10
     ) {
         throw new Error(
             'Invalid frame count'
@@ -7419,6 +8019,9 @@ async function initPlayer() {
 
     initMediaNavigation();
 
+    if (!imageMode)
+        await loadAnnotation();
+
     if (imageMode) {
         if (viewerTitle)
             viewerTitle.textContent = 'Snapshot Viewer';
@@ -7626,6 +8229,20 @@ void webPlayerRegisterRoutes(
         "/player_subtitle",
         HTTP_GET,
         handlePlayerSubtitle
+    );
+
+
+    server.on(
+        "/player_annotation",
+        HTTP_GET,
+        handlePlayerAnnotationGet
+    );
+
+
+    server.on(
+        "/player_annotation",
+        HTTP_POST,
+        handlePlayerAnnotationPost
     );
 
 

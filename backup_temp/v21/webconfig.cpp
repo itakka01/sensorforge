@@ -1,5 +1,4 @@
 #include "webconfig.h"
-#include "web_log_reader.h"
 #include "config.h"
 #include "language.h"
 #include "board_config.h"
@@ -22,12 +21,12 @@
 #include <math.h>
 #include <string.h>
 #include "logger.h"
+#include "log_storage.h"
 #include "webplayer.h"
 #include "recorder.h"
 #include "storage_guard.h"
 #include "radar.h"
 #include "branding.h"
-#include "sensorforge_version.h"
 #include "rtc.h"
 #include "thermal.h"
 #include "sync_api.h"
@@ -215,13 +214,12 @@ static uint32_t simulationDurationSeconds = 5;
 // Temporary operator-controlled recording pause. This is deliberately RAM-only:
 // it must never survive a reboot and is never written to config.txt. While paused,
 // the physical sensors may still be read for diagnostics, but the main firmware
-// suppresses NEW motion-recording starts and the continuous shooter.
+// suppresses operational motion detection and NEW recording starts.
 //
 // The pause is a short lease rather than a sticky switch. Every visible WebConfig
-// page renews (or, when auto-pause is enabled, re-establishes) the lease.
-// Closing/hiding the UI therefore re-enables capture automation automatically
-// after a short grace period, so the system cannot be forgotten in maintenance
-// mode.
+// page renews the lease. Closing/hiding the UI therefore re-enables recording
+// automatically after a short grace period, so the system cannot be forgotten in
+// maintenance mode.
 static bool recordingAutomationPaused = false;
 static uint32_t recordingPauseLeaseMs = 0;
 static bool recordingPauseTransportHold = false;
@@ -262,19 +260,13 @@ static void setRecordingAutomationPaused(
         );
 
         logWrite(
-            "Capture automation paused from WebConfig"
+            "Recording automation paused from WebConfig"
         );
 
         // Finish the current file cleanly. Once the flag above is set, the
         // next main-loop iteration cannot immediately start a replacement.
-        if (recording) {
+        if (recording)
             stopRecording();
-        } else if (recorderIsOpen()) {
-            // Defensive recovery for a stale recorder handle whose high-level
-            // recording flag was already cleared. Maintenance operations must
-            // never remain blocked by such an orphaned open recorder.
-            recorderEnd();
-        }
 
     } else {
         recordingPauseLeaseMs = 0;
@@ -323,25 +315,14 @@ static void maybeAutoPauseRecordingForWebUi()
 
     recordingUiSessionLastSeenMs = now;
 
-    if (recordingAutomationPaused) {
-        // Any visible WebConfig/player heartbeat renews an existing manual or
-        // automatic pause. This also recovers cleanly after a long synchronous
-        // HTTP operation that consumed most of the previous lease.
-        recordingPauseLeaseMs = now;
-        return;
-    }
-
     if (
         cfg_web_recording_auto_pause &&
-        !recordingAutoPauseSuppressedForUiSession
+        !recordingAutoPauseSuppressedForUiSession &&
+        !recordingAutomationPaused
     ) {
-        // Important: this path is also reached from /activity and from the
-        // standalone player keepalive. Therefore an expired lease is
-        // re-established while the browser session is visibly active instead
-        // of leaving recording/shooter automation running behind the UI.
         setRecordingAutomationPaused(
             true,
-            "automatic WebConfig activity"
+            "automatic WebConfig open"
         );
     }
 }
@@ -660,7 +641,6 @@ static const char *configSdStatusUiName()
 
     return tr(UI_SD_INVALID);
 }
-
 
 
 static const char *thermalStateUiName(
@@ -1390,30 +1370,6 @@ static bool rejectWhileRecording(
 }
 
 
-// V22 module bridge for the external Web Log Reader. Keep these wrappers
-// intentionally small so the log-reader module can reuse the common WebConfig
-// shell without owning unrelated WebConfig state.
-String webConfigLogReaderHtmlHeader()
-{
-    return htmlHeader();
-}
-
-String webConfigLogReaderHtmlFooter()
-{
-    return htmlFooter();
-}
-
-String webConfigLogReaderHtmlEscape(const String &value)
-{
-    return htmlEscape(value);
-}
-
-bool webConfigLogReaderRejectWhileRecording(const char *operation)
-{
-    return rejectWhileRecording(operation);
-}
-
-
 // Lightweight dynamic UI state. The dashboard uses the high-level
 // `recording` flag (same source as the serial STATUS line), while
 // `recorder_open` remains available for SD/file-operation safety.
@@ -1689,10 +1645,6 @@ static void handleRecordingPauseKeepalive()
     bool transportHold =
         server.hasArg("transport") &&
         server.arg("transport") == "1";
-
-    // A keepalive must be able to re-establish auto-pause, not merely extend
-    // an already-active lease. This is essential for the standalone player.
-    maybeAutoPauseRecordingForWebUi();
 
     renewRecordingPauseLease(
         transportHold
@@ -3395,18 +3347,13 @@ static void handleConfig()
             "<p>Geräteeinstellungen, Aufnahme, WLAN und Speicher.</p></div></div>";
 
     html += "<p style='padding:10px;background:#f7f7f7;border-radius:6px;'>"
-            "<b>Release:</b> " +
-            htmlEscape(String(SENSORFORGE_RELEASE_TAG)) +
-            " (" + htmlEscape(String(SENSORFORGE_RELEASE_DATE)) + ")" +
-            "<br><b>Firmware Build:</b> " +
+            "<b>Firmware Build:</b> " +
             htmlEscape(firmwareBuildTimestamp()) +
             "<br><b>Installiert:</b> " +
             htmlEscape(firmwareInstallTimestamp()) +
             "<br><b>Quelle:</b> " +
             htmlEscape(firmwareInstallSource()) +
-            "<br><span class='muted'>Git-Tag für diesen Programstand: " +
-            htmlEscape(String(SENSORFORGE_RELEASE_TAG)) +
-            "</span></p>";
+            "</p>";
 
     if (configNotice.length()) {
         html +=
@@ -3704,14 +3651,6 @@ static void handleConfig()
 
     html +=
         "<div style='margin:0 0 18px 0;padding:14px;border:1px solid #d8dee6;border-radius:8px;background:#f8fbff'>"
-        "<b>Recording-Modus</b><br>"
-        "<select name='recording_mode' style='min-width:320px;max-width:100%'>"
-        "<option value='off'" + String(!cfg_motion_recording_enabled && !cfg_shooter_enabled ? " selected" : "") + ">Aus - keine automatische Aufnahme</option>"
-        "<option value='motion'" + String(cfg_motion_recording_enabled && !cfg_shooter_enabled ? " selected" : "") + ">Normal Recording - Motion/Alarm</option>"
-        "<option value='shooter'" + String(!cfg_motion_recording_enabled && cfg_shooter_enabled ? " selected" : "") + ">Power Shooter standalone</option>"
-        "<option value='motion_shooter'" + String(cfg_motion_recording_enabled && cfg_shooter_enabled ? " selected" : "") + ">Normal Recording + Power Shooter</option>"
-        "</select><br>"
-        "<small class='muted'>Der Modus steuert intern motion_recording_enabled und shooter_enabled. Im Kombimodus läuft der Power Shooter zusätzlich; ein Alarm-/Motionvideo hat weiterhin Vorrang.</small><br><br>"
         "<b>" + htmlText(UI_RECORDING_TRIGGER_MODE) + "</b><br>"
         "<select name='motion_recording_decision' style='min-width:320px;max-width:100%'>"
         "<option value='direct'" + String(cfg_motion_recording_decision == "direct" ? " selected" : "") + ">" + htmlText(UI_RECORDING_TRIGGER_DIRECT) + "</option>"
@@ -3810,48 +3749,15 @@ static void handleConfig()
     }
 
     html +=
-        "<div style='margin-top:18px;padding:14px;border:1px solid #9cc7ff;border-radius:8px;background:#f5f9ff'>"
-        "<b>Power Shooter / Dauershooter</b><br>"
-        "<span class='muted'>Aktivierung erfolgt oben über den Recording-Modus. Hier werden nur die Shooter-Parameter eingestellt. Alarm-/Motionvideo hat im Kombimodus Vorrang. "
-        "Bei geöffnetem Webinterface wird der Shooter durch die Web-Autopause vorübergehend pausiert und danach automatisch fortgesetzt.</span><br><br>"
-        "shooter_storage_format: <select name='shooter_storage_format'>"
-        "<option value='mkv'" + String(cfg_shooter_storage_format == "mkv" ? " selected" : "") + ">MKV - Sparse MKV, empfohlen</option>"
-        "<option value='jpg'" + String(cfg_shooter_storage_format == "jpg" ? " selected" : "") + ">JPG - einzelne JPEG-Dateien</option>"
-        "</select><br>"
-        "shooter_interval_ms: <input id='cfgShooterInterval' name='shooter_interval_ms' type='number' min='250' max='86400000' step='1' value='" +
-        String(cfg_shooter_interval_ms) +
-        "' style='width:120px'> ms "
-        "<small id='cfgShooterRateHint' class='muted'></small><br>"
-        "<small class='muted'>Beispiele: 250 ms = 4 fps · 500 ms = 2 fps · 1000 ms = 1 fps · 2000 ms = 0,5 fps. Es sind Prüfslots; Filter können weniger Bilder speichern.</small><br><br>"
-        "<label for='cfgShooterDark'><b>Dunkelgrenze / Mindesthelligkeit</b></label><br>"
-        "<div style='display:flex;align-items:center;gap:10px;flex-wrap:wrap'>"
-        "<input id='cfgShooterDark' name='shooter_dark_mean_min' type='range' min='0' max='255' step='1' value='" +
-        String(cfg_shooter_dark_mean_min) +
-        "' style='width:260px;max-width:70vw'>"
-        "<span id='cfgShooterDarkValue' style='display:inline-block;min-width:34px;font-weight:600'>" +
-        String(cfg_shooter_dark_mean_min) +
-        "</span>"
-        "<span id='cfgShooterDarkSwatch' title='Helligkeitswert' style='display:inline-block;width:28px;height:28px;border:1px solid #667085;border-radius:4px;vertical-align:middle'></span>"
-        "</div>"
-        "<small class='muted'>0 = Darkness-Filter praktisch aus. Bilder mit mittlerer Helligkeit unter diesem Wert werden verworfen; das Kästchen zeigt den gewählten Grauwert.</small><br>"
-        "shooter_min_change_pct: <input name='shooter_min_change_pct' type='number' min='0' max='100' step='0.1' value='" +
-        String(cfg_shooter_min_change_pct, 1) +
-        "' style='width:90px'> % <small>(0 = Similarity-Filter aus; Vergleich gegen letztes akzeptiertes Bild)</small><br>"
-        "shooter_force_save_seconds: <input name='shooter_force_save_seconds' type='number' min='0' max='86400' step='1' value='" +
-        String(cfg_shooter_force_save_seconds) +
-        "' style='width:100px'> s <small>(0 = kein Force-Save; umgeht Similarity, nicht Darkness)</small><br>"
-        "shooter_flush_seconds: <input name='shooter_flush_seconds' type='number' min='0' max='3600' step='1' value='" +
-        String(cfg_shooter_flush_seconds) +
-        "' style='width:100px'> s <small>(0 = kein zeitbasierter Flush; Buffer-full/Shutdown/Reboot flushen weiterhin)</small><br>"
-        "<small class='muted'>Die tatsächliche Zahl gespeicherter Bilder kann durch Darkness-/Change-Filter niedriger sein. PSRAM-Puffergröße wird automatisch gewählt.</small>"
-        "<script>(function(){"
-        "const i=document.getElementById('cfgShooterInterval');const h=document.getElementById('cfgShooterRateHint');"
-        "function u(){const ms=Number(i&&i.value);if(!h)return;if(!Number.isFinite(ms)||ms<=0){h.textContent='';return;}const fps=1000/ms;h.textContent='≈ '+fps.toLocaleString('de-DE',{maximumFractionDigits:2})+' fps';}"
-        "if(i){i.addEventListener('input',u);u();}"
-        "const d=document.getElementById('cfgShooterDark');const v=document.getElementById('cfgShooterDarkValue');const sw=document.getElementById('cfgShooterDarkSwatch');"
-        "function ud(){let n=Number(d&&d.value);if(!Number.isFinite(n))n=0;n=Math.max(0,Math.min(255,Math.round(n)));if(v)v.textContent=String(n);if(sw)sw.style.backgroundColor='rgb('+n+','+n+','+n+')';}"
-        "if(d){d.addEventListener('input',ud);ud();}"
-        "})();</script>"
+        "<div style='margin-top:18px;padding:14px;border:1px solid #d8dee6;border-radius:8px;background:#f8fbff'>"
+        "<b>Periodische Snapshots</b><br>"
+        "<span class='muted'>Zusätzlich zu Alarmvideos kann SensorForge in einem festen Zeitraster einzelne JPEG-Bilder speichern. "
+        "Alarmaufnahmen haben immer Vorrang. Für einen sauber belichteten Snapshot werden drei Kamerabilder verworfen und erst das vierte gespeichert. "
+        "Bei aktivierter Aufnahmeverschlüsselung werden auch Snapshots verschlüsselt gespeichert.</span><br><br>"
+        "Intervall: <input name='periodic_snapshot_minutes' type='number' min='0' max='1440' step='1' value='" +
+        String(cfg_periodic_snapshot_minutes) +
+        "' style='width:90px'> Minuten "
+        "<small>(0 = aus; z. B. 10 = 00, 10, 20, 30 ... Minuten)</small>"
         "</div>";
 
     html += "post_record_ms: <input name='post_record_ms' type='number' min='0' value='" +
@@ -4081,10 +3987,15 @@ static void handleConfig()
             String(cfg_transport_max_duration_seconds) +
             "'> <small>(harte Sicherheitsgrenze; Standard 86400 s = 24 h)</small><br>";
 
-    html += "transport_black_threshold: <input name='transport_black_threshold' type='number' "
+    html += "transport_black_mean_max: <input name='transport_black_mean_max' type='number' "
             "min='0' max='255' value='" +
-            String(cfg_transport_black_threshold) +
-            "'> <small>(Schwarzgrenze der aktuellen Transport-Config; kleiner = strenger schwarz)</small><br>";
+            String(cfg_transport_black_mean_max) +
+            "'> <small>(Graustufen-Mittelwert; kleiner = strenger schwarz)</small><br>";
+
+    html += "transport_black_p95_max: <input name='transport_black_p95_max' type='number' "
+            "min='0' max='255' value='" +
+            String(cfg_transport_black_p95_max) +
+            "'> <small>(95%-Perzentil; muss >= Mittelwert-Grenze sein)</small><br>";
 
     html +=
         "<p class='muted'><b>Wichtig:</b> Für die normale Vorbereitung bitte die eigene "
@@ -4466,126 +4377,11 @@ static void handleSave()
         ? 1
         : 0;
 
-    String recordingMode =
-        server.arg("recording_mode");
-
-    recordingMode.trim();
-    recordingMode.toLowerCase();
-
-    int motionRecordingEnabled = 0;
-    int shooterEnabled = 0;
-
-    if (recordingMode == "off") {
-        // Both remain disabled.
-    } else if (recordingMode == "motion") {
-        motionRecordingEnabled = 1;
-    } else if (recordingMode == "shooter") {
-        shooterEnabled = 1;
-    } else if (recordingMode == "motion_shooter") {
-        motionRecordingEnabled = 1;
-        shooterEnabled = 1;
-    } else if (!recordingMode.length()) {
-        // Backward-compatible fallback for an old browser page that may still
-        // submit the pre-v31 fields after the firmware has just been updated.
-        motionRecordingEnabled =
-            server.hasArg("motion_recording_enabled") &&
-            server.arg("motion_recording_enabled").toInt()
-            ? 1
-            : 0;
-        shooterEnabled =
-            server.hasArg("shooter_enabled") &&
-            server.arg("shooter_enabled").toInt()
-            ? 1
-            : 0;
-    } else {
-        server.send(
-            400,
-            "text/plain; charset=utf-8",
-            "Ungueltiger recording_mode Wert"
-        );
-        return;
-    }
-
-    String shooterStorageFormat =
-        server.arg("shooter_storage_format");
-
-    shooterStorageFormat.trim();
-    shooterStorageFormat.toLowerCase();
-
-    if (
-        shooterStorageFormat != "mkv" &&
-        shooterStorageFormat != "jpg"
-    ) {
-        server.send(
-            400,
-            "text/plain; charset=utf-8",
-            "Ungueltiger shooter_storage_format Wert"
-        );
-        return;
-    }
-
-    int shooterIntervalMs =
-        server.arg("shooter_interval_ms").toInt();
-
-    if (
-        shooterIntervalMs < 250 ||
-        shooterIntervalMs > 86400000
-    ) {
-        server.send(
-            400,
-            "text/plain; charset=utf-8",
-            "shooter_interval_ms muss zwischen 250 und 86400000 liegen"
-        );
-        return;
-    }
-
-    int shooterDarkMeanMin =
+    int periodicSnapshotMinutes =
         constrain(
-            server.arg("shooter_dark_mean_min").toInt(),
+            server.arg("periodic_snapshot_minutes").toInt(),
             0,
-            255
-        );
-
-    String shooterMinChangeText =
-        server.arg("shooter_min_change_pct");
-
-    shooterMinChangeText.trim();
-
-    char *shooterMinChangeEnd = nullptr;
-    float shooterMinChangePct =
-        strtof(
-            shooterMinChangeText.c_str(),
-            &shooterMinChangeEnd
-        );
-
-    if (
-        !shooterMinChangeText.length() ||
-        !shooterMinChangeEnd ||
-        *shooterMinChangeEnd != '\0' ||
-        shooterMinChangePct < 0.0f ||
-        shooterMinChangePct > 100.0f ||
-        (shooterMinChangePct > 0.0f && shooterMinChangePct < 0.1f)
-    ) {
-        server.send(
-            400,
-            "text/plain; charset=utf-8",
-            "shooter_min_change_pct muss 0 oder 0.1..100.0 sein"
-        );
-        return;
-    }
-
-    int shooterForceSaveSeconds =
-        constrain(
-            server.arg("shooter_force_save_seconds").toInt(),
-            0,
-            86400
-        );
-
-    int shooterFlushSeconds =
-        constrain(
-            server.arg("shooter_flush_seconds").toInt(),
-            0,
-            3600
+            1440
         );
 
 
@@ -4744,12 +4540,28 @@ static void handleSave()
             604800
         );
 
-    int transportBlackThreshold =
+    int transportBlackMeanMax =
         constrain(
-            server.arg("transport_black_threshold").toInt(),
+            server.arg("transport_black_mean_max").toInt(),
             0,
             255
         );
+
+    int transportBlackP95Max =
+        constrain(
+            server.arg("transport_black_p95_max").toInt(),
+            0,
+            255
+        );
+
+    if (transportBlackP95Max < transportBlackMeanMax) {
+        server.send(
+            400,
+            "text/plain; charset=utf-8",
+            "transport_black_p95_max muss groesser/gleich transport_black_mean_max sein"
+        );
+        return;
+    }
 
 
     int minFreeSpaceMb =
@@ -4977,7 +4789,7 @@ static void handleSave()
     String text;
 
     text.reserve(
-        2600
+        2200
     );
 
 
@@ -5037,45 +4849,17 @@ static void handleSave()
     text += String(recordingEncryption);
     text += '\n';
 
-    text += "shooter_enabled=";
-    text += String(shooterEnabled);
-    text += '\n';
-
-    text += "shooter_storage_format=";
-    text += shooterStorageFormat;
-    text += '\n';
-
-    text += "shooter_interval_ms=";
-    text += String(shooterIntervalMs);
-    text += '\n';
-
-    text += "shooter_dark_mean_min=";
-    text += String(shooterDarkMeanMin);
-    text += '\n';
-
-    text += "shooter_min_change_pct=";
-    text += String(shooterMinChangePct, 1);
-    text += '\n';
-
-    text += "shooter_force_save_seconds=";
-    text += String(shooterForceSaveSeconds);
-    text += '\n';
-
-    text += "shooter_flush_seconds=";
-    text += String(shooterFlushSeconds);
+    text += "periodic_snapshot_minutes=";
+    text += String(periodicSnapshotMinutes);
     text += '\n';
 
     text += "recording_not_before=";
     text += recordingNotBefore;
     text += '\n';
 
-    // Motion recording enable/decision and image-motion settings are part of
-    // the canonical config.txt. General Config saves must preserve them instead
-    // of accidentally dropping them back to defaults.
-    text += "motion_recording_enabled=";
-    text += String(motionRecordingEnabled);
-    text += '\n';
-
+    // Recording-decision and image-motion settings are part of the canonical
+    // config.txt. General Config saves must preserve the tuning values managed
+    // on /image_motion instead of accidentally dropping them back to defaults.
     text += "motion_recording_decision=";
     text += motionRecordingDecision;
     text += '\n';
@@ -5166,8 +4950,12 @@ static void handleSave()
     text += String(transportMaxDurationSeconds);
     text += '\n';
 
-    text += "transport_black_threshold=";
-    text += String(transportBlackThreshold);
+    text += "transport_black_mean_max=";
+    text += String(transportBlackMeanMax);
+    text += '\n';
+
+    text += "transport_black_p95_max=";
+    text += String(transportBlackP95Max);
     text += '\n';
 
     text += "led_enabled=";
@@ -5358,8 +5146,11 @@ static void handleSave()
             cfg_transport_max_duration_seconds =
                 transportMaxDurationSeconds;
 
-            cfg_transport_black_threshold =
-                transportBlackThreshold;
+            cfg_transport_black_mean_max =
+                transportBlackMeanMax;
+
+            cfg_transport_black_p95_max =
+                transportBlackP95Max;
 
             cfg_recording_not_before =
                 recordingNotBefore;
@@ -5376,34 +5167,8 @@ static void handleSave()
             cfg_recording_encryption =
                 recordingEncryption;
 
-            // Shooter and motion enable state are safe to apply immediately.
-            // WebConfig auto-pause still suppresses capture while this browser
-            // session is active; the shooter resumes with the new settings when
-            // the WebConfig pause is released. The shooter scheduler detects
-            // enabled/interval changes and resets its slot state itself.
-            cfg_shooter_enabled =
-                shooterEnabled;
-
-            cfg_shooter_storage_format =
-                shooterStorageFormat;
-
-            cfg_shooter_interval_ms =
-                shooterIntervalMs;
-
-            cfg_shooter_dark_mean_min =
-                shooterDarkMeanMin;
-
-            cfg_shooter_min_change_pct =
-                shooterMinChangePct;
-
-            cfg_shooter_force_save_seconds =
-                shooterForceSaveSeconds;
-
-            cfg_shooter_flush_seconds =
-                shooterFlushSeconds;
-
-            cfg_motion_recording_enabled =
-                motionRecordingEnabled;
+            cfg_periodic_snapshot_minutes =
+                periodicSnapshotMinutes;
 
             cfg_timezone =
                 timezone;
@@ -5476,8 +5241,11 @@ static void handleSave()
             cfg_transport_max_duration_seconds =
                 transportMaxDurationSeconds;
 
-            cfg_transport_black_threshold =
-                transportBlackThreshold;
+            cfg_transport_black_mean_max =
+                transportBlackMeanMax;
+
+            cfg_transport_black_p95_max =
+                transportBlackP95Max;
 
             cfg_recording_not_before =
                 recordingNotBefore;
@@ -5494,34 +5262,8 @@ static void handleSave()
             cfg_recording_encryption =
                 recordingEncryption;
 
-            // Shooter and motion enable state are safe to apply immediately.
-            // WebConfig auto-pause still suppresses capture while this browser
-            // session is active; the shooter resumes with the new settings when
-            // the WebConfig pause is released. The shooter scheduler detects
-            // enabled/interval changes and resets its slot state itself.
-            cfg_shooter_enabled =
-                shooterEnabled;
-
-            cfg_shooter_storage_format =
-                shooterStorageFormat;
-
-            cfg_shooter_interval_ms =
-                shooterIntervalMs;
-
-            cfg_shooter_dark_mean_min =
-                shooterDarkMeanMin;
-
-            cfg_shooter_min_change_pct =
-                shooterMinChangePct;
-
-            cfg_shooter_force_save_seconds =
-                shooterForceSaveSeconds;
-
-            cfg_shooter_flush_seconds =
-                shooterFlushSeconds;
-
-            cfg_motion_recording_enabled =
-                motionRecordingEnabled;
+            cfg_periodic_snapshot_minutes =
+                periodicSnapshotMinutes;
 
             cfg_timezone =
                 timezone;
@@ -5822,18 +5564,28 @@ static void handleTransportPage()
         "<form method='POST' action='/transport_save'>"
         "<section class='settings-section'>"
         "<h3>Grenzwerte und Zeiten</h3>"
-        "<p class='muted'>Die aktuelle Config-Version verwendet einen gemeinsamen Schwarzwert. "
-        "Der automatische Vorschlag basiert auf der gemessenen durchschnittlichen Bildhelligkeit plus Reserve.</p>";
+        "<p class='muted'>Die vorgeschlagenen Grenzwerte enthalten bereits Reserve für etwas Streulicht. "
+        "Du kannst beide Werte vor dem Speichern manuell ändern.</p>";
 
     html +=
         "<div style='margin-bottom:16px'>"
-        "<label for='transportBlackThreshold'><b>Schwarzgrenze</b></label><br>"
-        "<input id='transportBlackThreshold' name='transport_black_threshold' "
+        "<label for='transportBlackMeanMax'><b>Schwarzgrenze – durchschnittliche Bildhelligkeit</b></label><br>"
+        "<input id='transportBlackMeanMax' name='transport_black_mean_max' "
         "type='number' min='0' max='255' value='" +
-        String(cfg_transport_black_threshold) +
-        "'> <small id='transportThresholdSuggestion'>Automatischer Vorschlag wird gemessen ...</small>"
-        "<div class='muted'>Wie hell das vollständig abgedeckte Bild noch sein darf. "
+        String(cfg_transport_black_mean_max) +
+        "'> <small id='transportMeanSuggestion'>Automatischer Vorschlag wird gemessen ...</small>"
+        "<div class='muted'>Wie hell das vollständig abgedeckte Bild im Durchschnitt noch sein darf. "
         "Ein kleinerer Wert bedeutet eine strengere Schwarzerkennung.</div></div>";
+
+    html +=
+        "<div style='margin-bottom:16px'>"
+        "<label for='transportBlackP95Max'><b>Schwarzgrenze – helle Bereiche im Bild</b></label><br>"
+        "<input id='transportBlackP95Max' name='transport_black_p95_max' "
+        "type='number' min='0' max='255' value='" +
+        String(cfg_transport_black_p95_max) +
+        "'> <small id='transportP95Suggestion'>Automatischer Vorschlag wird gemessen ...</small>"
+        "<div class='muted'>Zusätzliche Grenze für hellere Bildbereiche (P95). Sie hilft zu erkennen, "
+        "wenn Teile der Abdeckung Licht durchlassen, obwohl der Gesamtdurchschnitt noch dunkel ist.</div></div>";
 
     html +=
         "<div style='margin-bottom:16px'>"
@@ -5936,8 +5688,10 @@ static void handleTransportPage()
         "var p95El=document.getElementById('transportReferenceP95');"
         "var stateEl=document.getElementById('transportMeasureState');"
         "var errorEl=document.getElementById('transportMeasureErrorText');"
-        "var thresholdInput=document.getElementById('transportBlackThreshold');"
-        "var thresholdSuggestion=document.getElementById('transportThresholdSuggestion');"
+        "var meanInput=document.getElementById('transportBlackMeanMax');"
+        "var p95Input=document.getElementById('transportBlackP95Max');"
+        "var meanSuggestion=document.getElementById('transportMeanSuggestion');"
+        "var p95Suggestion=document.getElementById('transportP95Suggestion');"
         "var preserveSavedValues=" + String(justSaved ? "true" : "false") + ";"
         "var measuring=false;"
         "function setControlsDisabled(v){"
@@ -5959,8 +5713,9 @@ static void handleTransportPage()
         "var m=Number(d.reference_mean),p=Number(d.reference_p95),sm=Number(d.suggested_mean),sp=Number(d.suggested_p95);"
         "if(meanEl)meanEl.textContent=isFinite(m)?m.toFixed(1):'--';"
         "if(p95El)p95El.textContent=isFinite(p)?String(p):'--';"
-        "if(thresholdSuggestion)thresholdSuggestion.textContent='Automatischer Vorschlag: '+sm+' (gemessene Durchschnittshelligkeit + 10 Reserve)';"
-        "if(applySuggestions&&thresholdInput)thresholdInput.value=sm;"
+        "if(meanSuggestion)meanSuggestion.textContent='Automatischer Vorschlag: '+sm+' (gemessene Durchschnittshelligkeit + 10 Reserve)';"
+        "if(p95Suggestion)p95Suggestion.textContent='Automatischer Vorschlag: '+sp+' (P95-Messwert + 15 Reserve)';"
+        "if(applySuggestions){if(meanInput)meanInput.value=sm;if(p95Input)p95Input.value=sp;}"
         "if(stateEl){stateEl.className='status-pill '+(d.suspiciously_bright?'warn':'ok');"
         "stateEl.textContent=d.suspiciously_bright?'Abgedecktes Bild ungewöhnlich hell - Tape/Sitz prüfen':'Messung plausibel dunkel';}"
         "}"
@@ -6029,8 +5784,11 @@ static void handleTransportSave()
     int maxDurationSeconds =
         server.arg("transport_max_duration_seconds").toInt();
 
-    int blackThreshold =
-        server.arg("transport_black_threshold").toInt();
+    int blackMeanMax =
+        server.arg("transport_black_mean_max").toInt();
+
+    int blackP95Max =
+        server.arg("transport_black_p95_max").toInt();
 
     configRefreshSdStatus();
 
@@ -6042,7 +5800,8 @@ static void handleTransportSave()
             lightConfirmSeconds,
             installDelaySeconds,
             maxDurationSeconds,
-            blackThreshold,
+            blackMeanMax,
+            blackP95Max,
             transportConfigWriteToSd(),
             error
         );
@@ -6062,8 +5821,10 @@ static void handleTransportSave()
     }
 
     String savedSummary =
-        "Transport settings saved | black<=" +
-        String(blackThreshold) +
+        "Transport settings saved | mean<=" +
+        String(blackMeanMax) +
+        " | p95<=" +
+        String(blackP95Max) +
         " | check=" +
         String(checkSeconds) +
         " s | light_confirm=" +
@@ -6220,8 +5981,10 @@ static void handleTransportActivate()
         String(cfg_transport_install_delay_seconds) +
         " s | max_duration=" +
         String(cfg_transport_max_duration_seconds) +
-        " s | black<=" +
-        String(cfg_transport_black_threshold)
+        " s | mean<=" +
+        String(cfg_transport_black_mean_max) +
+        " | p95<=" +
+        String(cfg_transport_black_p95_max)
     );
 
     sendTransportTransitionPage(
@@ -12919,11 +12682,6 @@ static void handleFirmwareUploadData()
         server.upload();
 
     if (upload.status == UPLOAD_FILE_START) {
-        // Multipart callbacks can begin before the browser has had a chance to
-        // send another keepalive. Re-establish the maintenance pause before
-        // checking recorder state so firmware upload cannot race a new capture.
-        maybeAutoPauseRecordingForWebUi();
-
         webFirmwareUploadAttempted = true;
         webFirmwareUploadSucceeded = false;
         webFirmwareUploadBytes = 0;
@@ -13454,11 +13212,6 @@ static void sendFirmwareUpdatePage(
 
 static void handleFirmwareUpdate()
 {
-    // Entering the firmware page is maintenance activity. Establish the
-    // configured automatic pause immediately instead of waiting for the first
-    // browser-side heartbeat after the page has rendered.
-    maybeAutoPauseRecordingForWebUi();
-
     sendFirmwareUpdatePage(
         200
     );
@@ -13467,8 +13220,6 @@ static void handleFirmwareUpdate()
 
 static void handleFirmwareDiscard()
 {
-    maybeAutoPauseRecordingForWebUi();
-
     if (!webFirmwareActionTokenValid()) {
         server.send(
             403,
@@ -13503,8 +13254,6 @@ static void handleFirmwareDiscard()
 
 static void handleFirmwareInstall()
 {
-    maybeAutoPauseRecordingForWebUi();
-
     if (!webFirmwareActionTokenValid()) {
         server.send(
             403,
@@ -14085,12 +13834,912 @@ static void performManualShutdown()
 
 
 // -------------------------------------------------------------
-// WEB LOG READER
+// LOG VIEWER
 // -------------------------------------------------------------
-// V22: Log Viewer / live log / download / clear are owned by the external
-// log-reader module. The common navigation, authentication middleware and
-// shared WebConfig HTML/CSS remain here. Routes are registered in
-// webConfigStart() via webLogReaderRegisterRoutes(server).
+static String activeWebLogPath()
+{
+    return
+        cfg_log_file.length()
+        ? cfg_log_file
+        : String("/log.txt");
+}
+
+
+static bool parseUnsignedLongLongArg(
+    const String &text,
+    uint64_t &value
+)
+{
+    if (!text.length()) {
+        value = 0;
+        return true;
+    }
+
+    uint64_t result = 0;
+
+    for (size_t i = 0; i < text.length(); ++i) {
+        char c = text[i];
+
+        if (c < '0' || c > '9')
+            return false;
+
+        uint8_t digit =
+            (uint8_t)(c - '0');
+
+        if (
+            result >
+            (UINT64_MAX - digit) / 10ULL
+        ) {
+            return false;
+        }
+
+        result =
+            result * 10ULL +
+            digit;
+    }
+
+    value = result;
+    return true;
+}
+
+
+static void handleLogRaw()
+{
+    if (rejectWhileRecording("log download"))
+        return;
+
+    logFlush();
+
+    String logPath =
+        activeWebLogPath();
+
+    String body;
+    uint64_t nextCursor = 0;
+    uint64_t physicalSize = 0;
+    bool more = false;
+    bool reset = false;
+    bool encrypted = false;
+    String generation;
+    bool recoveredTornRecord = false;
+    String error;
+
+    static const size_t MAX_LOG_STREAM_CHUNK =
+        16U * 1024U;
+
+    if (!logStorageReadChunk(
+            logPath,
+            0,
+            MAX_LOG_STREAM_CHUNK,
+            body,
+            nextCursor,
+            physicalSize,
+            more,
+            reset,
+            encrypted,
+            generation,
+            recoveredTornRecord,
+            error
+        )) {
+        server.send(
+            STORAGE.exists(logPath.c_str()) ? 500 : 404,
+            "text/plain; charset=utf-8",
+            "Log read failed: " + error
+        );
+        return;
+    }
+
+    server.sendHeader(
+        "Cache-Control",
+        "no-store"
+    );
+
+    server.sendHeader(
+        "X-Log-Size",
+        String((unsigned long)physicalSize)
+    );
+
+    server.sendHeader(
+        "X-Log-Generation",
+        generation
+    );
+
+    server.sendHeader(
+        "X-Log-Encrypted",
+        encrypted ? "1" : "0"
+    );
+
+    if (
+        server.hasArg("download") &&
+        server.arg("download") == "1"
+    ) {
+        int slashPos =
+            logPath.lastIndexOf('/');
+
+        String downloadName =
+            slashPos >= 0
+            ? logPath.substring(slashPos + 1)
+            : logPath;
+
+        if (!downloadName.length())
+            downloadName = "sensorforge.log";
+
+        downloadName.replace("\"", "_");
+        downloadName.replace("\r", "_");
+        downloadName.replace("\n", "_");
+
+        server.sendHeader(
+            "Content-Disposition",
+            "attachment; filename=\"" +
+            downloadName +
+            "\""
+        );
+    }
+
+    server.setContentLength(
+        CONTENT_LENGTH_UNKNOWN
+    );
+
+    server.send(
+        200,
+        "text/plain; charset=utf-8",
+        ""
+    );
+
+    if (body.length())
+        server.sendContent(body);
+
+    if (recoveredTornRecord) {
+        Serial.println(
+            "SFLOG1 reader: recovered after torn record"
+        );
+    }
+
+    uint64_t cursor = nextCursor;
+
+    while (more && server.client().connected()) {
+        body = "";
+        reset = false;
+        recoveredTornRecord = false;
+
+        if (!logStorageReadChunk(
+                logPath,
+                cursor,
+                MAX_LOG_STREAM_CHUNK,
+                body,
+                nextCursor,
+                physicalSize,
+                more,
+                reset,
+                encrypted,
+                generation,
+                recoveredTornRecord,
+                error
+            )) {
+            Serial.println(
+                "SFLOG1 raw stream failed | " +
+                error
+            );
+            server.client().stop();
+            return;
+        }
+
+        if (body.length())
+            server.sendContent(body);
+
+        if (recoveredTornRecord) {
+            Serial.println(
+                "SFLOG1 reader: recovered after torn record"
+            );
+        }
+
+        if (nextCursor <= cursor && more) {
+            Serial.println(
+                "SFLOG1 raw stream stalled"
+            );
+            server.client().stop();
+            return;
+        }
+
+        cursor = nextCursor;
+    }
+}
+
+
+static void handleLogChunk()
+{
+    if (rejectWhileRecording("log live update"))
+        return;
+
+    String logPath =
+        activeWebLogPath();
+
+    uint64_t offset = 0;
+
+    if (
+        server.hasArg("offset") &&
+        !parseUnsignedLongLongArg(
+            server.arg("offset"),
+            offset
+        )
+    ) {
+        server.send(
+            400,
+            "text/plain; charset=utf-8",
+            "Invalid log offset"
+        );
+        return;
+    }
+
+    // Full-page loading uses many small requests. Flushing the writer before
+    // every chunk would add unnecessary SD and SFLOG1 work. Flush once for the
+    // first chunk; live polling explicitly requests a fresh writer flush.
+    bool flushRequested =
+        offset == 0 ||
+        (
+            server.hasArg("flush") &&
+            server.arg("flush") == "1"
+        );
+
+    if (flushRequested)
+        logFlush();
+
+    uint64_t infoSize = 0;
+    bool infoEncrypted = false;
+    String infoGeneration;
+    String error;
+
+    if (!logStorageGetInfo(
+            logPath,
+            infoSize,
+            infoEncrypted,
+            infoGeneration,
+            error
+        )) {
+        server.send(
+            STORAGE.exists(logPath.c_str()) ? 500 : 404,
+            "text/plain; charset=utf-8",
+            "Log read failed: " + error
+        );
+        return;
+    }
+
+    bool generationReset = false;
+
+    if (
+        infoEncrypted &&
+        server.hasArg("generation") &&
+        server.arg("generation").length() &&
+        server.arg("generation") != infoGeneration
+    ) {
+        offset = 0;
+        generationReset = true;
+    }
+
+    static const size_t MAX_LOG_CHUNK_BYTES =
+        16U * 1024U;
+
+    String body;
+    uint64_t nextOffset = 0;
+    uint64_t fileSize = 0;
+    bool more = false;
+    bool reset = false;
+    bool encrypted = false;
+    String generation;
+    bool recoveredTornRecord = false;
+
+    if (!logStorageReadChunk(
+            logPath,
+            offset,
+            MAX_LOG_CHUNK_BYTES,
+            body,
+            nextOffset,
+            fileSize,
+            more,
+            reset,
+            encrypted,
+            generation,
+            recoveredTornRecord,
+            error
+        )) {
+        server.send(
+            500,
+            "text/plain; charset=utf-8",
+            "Log read failed: " + error
+        );
+        return;
+    }
+
+    reset = reset || generationReset;
+
+    if (recoveredTornRecord) {
+        Serial.println(
+            "SFLOG1 reader: recovered after torn record"
+        );
+    }
+
+    server.sendHeader(
+        "Cache-Control",
+        "no-store"
+    );
+
+    server.sendHeader(
+        "X-Log-Offset",
+        String((unsigned long)nextOffset)
+    );
+
+    server.sendHeader(
+        "X-Log-Size",
+        String((unsigned long)fileSize)
+    );
+
+    server.sendHeader(
+        "X-Log-Reset",
+        reset ? "1" : "0"
+    );
+
+    server.sendHeader(
+        "X-Log-More",
+        more ? "1" : "0"
+    );
+
+    server.sendHeader(
+        "X-Log-Generation",
+        generation
+    );
+
+    server.sendHeader(
+        "X-Log-Encrypted",
+        encrypted ? "1" : "0"
+    );
+
+    server.sendHeader(
+        "X-Log-Recovered",
+        recoveredTornRecord ? "1" : "0"
+    );
+
+    server.send(
+        200,
+        "text/plain; charset=utf-8",
+        body
+    );
+}
+
+
+static void handleLogClear()
+{
+    if (rejectWhileRecording("log clear"))
+        return;
+
+    if (g_storageLocked) {
+        server.send(
+            409,
+            "text/plain; charset=utf-8",
+            "Storage ist momentan gesperrt"
+        );
+        return;
+    }
+
+    String error;
+
+    if (!logClear(error)) {
+        server.send(
+            500,
+            "text/plain; charset=utf-8",
+            "Log konnte nicht geleert werden: " +
+            error
+        );
+        return;
+    }
+
+    consoleWrite(
+        "LOG",
+        "Log cleared from WebConfig"
+    );
+
+    // POST/Redirect/GET: browser refresh must never repeat a destructive action.
+    server.sendHeader(
+        "Location",
+        "/log?notice=cleared"
+    );
+
+    server.send(
+        303,
+        "text/plain; charset=utf-8",
+        ""
+    );
+}
+
+
+static void handleLog()
+{
+    if (rejectWhileRecording("log viewer"))
+        return;
+
+    // Keep the page request lightweight. The progressive log loader flushes
+    // once before its first chunk, rather than blocking page generation here.
+    String logPath =
+        activeWebLogPath();
+
+    uint64_t logSize = 0;
+    bool logEncrypted = false;
+    String logGeneration;
+    String logInfoError;
+
+    bool logInfoAvailable =
+        logStorageGetInfo(
+            logPath,
+            logSize,
+            logEncrypted,
+            logGeneration,
+            logInfoError
+        );
+
+    // A transient SD/SFLOG1 read error must not make the whole Log Viewer page
+    // fail. The browser loads the plaintext stream progressively via /log_chunk
+    // and retries individual chunks. Keep the page available and let that path
+    // surface a persistent error with more useful context.
+    if (!logInfoAvailable) {
+        logSize = 0;
+        logEncrypted = false;
+        logGeneration = "";
+    }
+
+    String sizeText;
+
+    if (!logInfoAvailable) {
+        sizeText = "--";
+    } else if (logSize >= 1024ULL * 1024ULL) {
+        sizeText =
+            String(
+                (double)logSize /
+                (1024.0 * 1024.0),
+                1
+            ) +
+            " MB";
+    } else if (logSize >= 1024ULL) {
+        sizeText =
+            String(
+                (double)logSize / 1024.0,
+                1
+            ) +
+            " KB";
+    } else {
+        sizeText =
+            String((unsigned long)logSize) +
+            " B";
+    }
+
+    bool justCleared =
+        server.hasArg("notice") &&
+        server.arg("notice") == "cleared";
+
+    const bool logUiEnglish =
+        cfg_web_language == "en";
+
+    const String logAnalyzeButtonText =
+        logUiEnglish
+        ? "Calculate statistics"
+        : "Statistik berechnen";
+
+    const String logAnalysisIdleText =
+        logUiEnglish
+        ? "Not calculated yet"
+        : "Noch nicht berechnet";
+
+    const String logAnalysisStaleText =
+        logUiEnglish
+        ? "Log changed - recalculate statistics"
+        : "Log geändert - Statistik neu berechnen";
+
+    const String logLoadingChunkText =
+        logUiEnglish
+        ? "Loading log in chunks..."
+        : "Log wird blockweise geladen...";
+
+    const String logRetryText =
+        logUiEnglish
+        ? "Read failed - retrying..."
+        : "Lesefehler - neuer Versuch...";
+
+    String html = htmlHeader();
+
+    html +=
+        "<div class='page-title'><div>"
+        "<h2>Log Viewer</h2>"
+        "<p>SensorForge System- und Ereignisprotokoll</p>"
+        "</div></div>";
+
+    if (justCleared) {
+        html +=
+            "<div class='flash-notice success'>"
+            "<strong>Log wurde geleert.</strong> "
+            "Aktive Logdatei und Rotationsarchiv wurden entfernt. "
+            "Eine neue Audit-Zeile markiert den manuellen Neustart des Logs."
+            "</div>";
+    }
+
+    html +=
+        "<div class='log-analysis'>"
+        "<div class='log-analysis-head'><div><h3>Log Analyse</h3>"
+        "<div class='muted'>Statistik aus der aktuell geladenen Logdatei. Der Suchfilter beeinflusst die Analyse nicht.</div></div>"
+        "<div style='display:flex;gap:10px;align-items:center;flex-wrap:wrap;justify-content:flex-end'>"
+        "<button id='logAnalyze' class='primary' type='button'>" +
+        htmlEscape(logAnalyzeButtonText) +
+        "</button>"
+        "<div id='logAnalysisStatus' class='log-analysis-status'>" +
+        htmlEscape(logAnalysisIdleText) +
+        "</div></div></div>"
+        "<div class='log-analysis-grid'>"
+        "<div class='log-stat'><div class='log-stat-label'>Log Start</div><div id='statLogStart' class='log-stat-value'>--</div><div class='log-stat-note'>frühester Zeitstempel</div></div>"
+        "<div class='log-stat'><div class='log-stat-label'>Log Ende</div><div id='statLogEnd' class='log-stat-value'>--</div><div class='log-stat-note'>spätester Zeitstempel</div></div>"
+        "<div class='log-stat'><div class='log-stat-label'>Zeitraum</div><div id='statPeriod' class='log-stat-value'>--</div><div class='log-stat-note'>zwischen Start und Ende</div></div>"
+        "<div class='log-stat'><div class='log-stat-label'>Sleep gesamt</div><div id='statSleep' class='log-stat-value'>--</div><div id='statSleepNote' class='log-stat-note'>--</div></div>"
+        "<div class='log-stat'><div class='log-stat-label'>Alarmereignisse</div><div id='statEvents' class='log-stat-value'>--</div><div class='log-stat-note'>Recording START, NEXT zählt nicht neu</div></div>"
+        "<div class='log-stat'><div class='log-stat-label'>Clips abgeschlossen</div><div id='statClips' class='log-stat-value'>--</div><div class='log-stat-note'>Clips mit STOP + duration</div></div>"
+        "<div class='log-stat'><div class='log-stat-label'>Aufnahmemodus gesamt</div><div id='statModeTime' class='log-stat-value'>--</div><div id='statModeNote' class='log-stat-note'>--</div></div>"
+        "<div class='log-stat'><div class='log-stat-label'>Clip-Länge gesamt</div><div id='statRecordTime' class='log-stat-value'>--</div><div id='statRecordNote' class='log-stat-note'>--</div></div>"
+        "<div class='log-stat'><div class='log-stat-label'>Cliplänge</div><div id='statClipAvg' class='log-stat-value'>--</div><div id='statClipNote' class='log-stat-note'>--</div></div>"
+        "<div class='log-stat'><div class='log-stat-label'>Frames gesamt</div><div id='statFrames' class='log-stat-value'>--</div><div class='log-stat-note'>aus abgeschlossenen Clips</div></div>"
+        "<div class='log-stat'><div class='log-stat-label'>Boots</div><div id='statBoots' class='log-stat-value'>--</div><div id='statBootNote' class='log-stat-note'>--</div></div>"
+        "<div class='log-stat'><div class='log-stat-label'>Warnungen / Fehler</div><div id='statHealth' class='log-stat-value'>--</div><div id='statHealthNote' class='log-stat-note'>--</div></div>"
+        "<div class='log-stat'><div class='log-stat-label'>Safety Limits</div><div id='statSafety' class='log-stat-value'>--</div><div id='statSafetyNote' class='log-stat-note'>--</div></div>"
+        "</div>"
+        "<div style='margin:18px 0 8px;font-weight:800;font-size:1.02rem'>Temperatur / Thermal Guard</div>"
+        "<div class='log-analysis-grid'>"
+        "<div class='log-stat'><div class='log-stat-label'>Thermal Warnings</div><div id='statThermalWarnings' class='log-stat-value'>--</div><div id='statThermalWarningsNote' class='log-stat-note'>--</div></div>"
+        "<div class='log-stat'><div class='log-stat-label'>Thermal Abschaltungen</div><div id='statThermalEmergency' class='log-stat-value'>--</div><div id='statThermalEmergencyNote' class='log-stat-note'>--</div></div>"
+        "<div class='log-stat'><div class='log-stat-label'>CPU Spitze</div><div id='statThermalCpuMax' class='log-stat-value'>--</div><div id='statThermalCpuMaxNote' class='log-stat-note'>--</div></div>"
+        "<div class='log-stat'><div class='log-stat-label'>RTC/Gehäuse Spitze</div><div id='statThermalRtcMax' class='log-stat-value'>--</div><div id='statThermalRtcMaxNote' class='log-stat-note'>--</div></div>"
+        "<div class='log-stat'><div class='log-stat-label'>Ø CPU bei Aufnahme</div><div id='statThermalCpuAvgRec' class='log-stat-value'>--</div><div id='statThermalCpuAvgRecNote' class='log-stat-note'>--</div></div>"
+        "<div class='log-stat'><div class='log-stat-label'>Ø RTC bei Aufnahme</div><div id='statThermalRtcAvgRec' class='log-stat-value'>--</div><div id='statThermalRtcAvgRecNote' class='log-stat-note'>--</div></div>"
+        "<div class='log-stat'><div class='log-stat-label'>Thermal Recoveries</div><div id='statThermalRecoveries' class='log-stat-value'>--</div><div id='statThermalRecoveriesNote' class='log-stat-note'>--</div></div>"
+        "<div class='log-stat'><div class='log-stat-label'>Aufnahme-Thermaldaten</div><div id='statThermalCoverage' class='log-stat-value'>--</div><div id='statThermalCoverageNote' class='log-stat-note'>--</div></div>"
+        "</div>"
+        "<div class='log-chart-card'>"
+        "<div class='log-chart-title'>Alarmereignisse nach Uhrzeit</div>"
+        "<div class='log-chart-note'>24 Stunden-Buckets über alle Tage im geladenen Log: 0–1, 1–2, ... 23–24 Uhr. Gezählt wird jedes <code>Recording START</code>; Segmentwechsel <code>NEXT</code> sind kein neuer Alarm.</div>"
+        "<div class='log-chart-scroll'><div class='log-chart-inner'><canvas id='logHourChart' class='log-hour-chart' width='1000' height='320' aria-label='Alarmereignisse pro Stunde'></canvas></div></div>"
+        "</div></div>"
+        ;
+
+    html +=
+        "<div class='log-toolbar'>"
+        "<button id='logReload' class='primary' type='button'>Neu laden</button>"
+        "<button id='logBottom' type='button'>Zum Ende</button>"
+        "<a class='button' href='/log_raw?download=1'>Download</a>"
+        "<form method='POST' action='/log_clear' style='display:inline;margin:0' "
+        "onsubmit=\"return confirm('Log wirklich leeren? Die aktuelle Logdatei und das .1-Rotationsarchiv werden gelöscht. Dieser Vorgang kann nicht rückgängig gemacht werden.');\">"
+        "<button class='danger' type='submit'>Log leeren</button>"
+        "</form>"
+        "<span id='logStatus' class='log-status'>Bereit</span>"
+        "</div>"
+        "<div class='log-filter-row'>"
+        "<input id='logSearch' class='log-search' type='search' autocomplete='off' "
+        "placeholder='Log durchsuchen / filtern...'>"
+        "<label class='log-live-label'><input id='logLive' type='checkbox'> "
+        "Live aktualisieren (5 s)</label>"
+        "</div>"
+        "<div class='log-meta'>"
+        "<span>Datei: <code>" +
+        htmlEscape(logPath) +
+        "</code></span>"
+        "<span>Größe: <span id='logSize'>" +
+        htmlEscape(sizeText) +
+        "</span></span>"
+        "<span id='logFilterMeta'></span>"
+        "</div>"
+        "<div id='logTerminal' class='log-terminal'>"
+        "<pre id='logOutput' class='log-view'>Log wird geladen...</pre>"
+        "</div>"
+        "<script>"
+        "(function(){"
+        "var out=document.getElementById('logOutput');"
+        "var term=document.getElementById('logTerminal');"
+        "var status=document.getElementById('logStatus');"
+        "var reload=document.getElementById('logReload');"
+        "var bottom=document.getElementById('logBottom');"
+        "var search=document.getElementById('logSearch');"
+        "var live=document.getElementById('logLive');"
+        "var sizeEl=document.getElementById('logSize');"
+        "var filterMeta=document.getElementById('logFilterMeta');"
+        "var analysisStatus=document.getElementById('logAnalysisStatus');"
+        "var analyzeButton=document.getElementById('logAnalyze');"
+        "var hourChart=document.getElementById('logHourChart');"
+        "var lastHourBuckets=new Array(24).fill(0);"
+        "var rawText='';"
+        "var logOffset=0;"
+        "var logGeneration='';"
+        "var loading=false;"
+        "var analysisCalculated=false;"
+        "var liveTimer=0;"
+        "var uiAnalysisIdle='" + logAnalysisIdleText + "';"
+        "var uiAnalysisStale='" + logAnalysisStaleText + "';"
+        "var uiLoadingChunks='" + logLoadingChunkText + "';"
+        "var uiRetry='" + logRetryText + "';"
+        "function scrollBottom(){term.scrollTop=term.scrollHeight;}"
+        "function byteSizeText(bytes){"
+            "if(bytes>=1048576)return (bytes/1048576).toFixed(1)+' MB';"
+            "if(bytes>=1024)return (bytes/1024).toFixed(1)+' KB';"
+            "return bytes+' B';"
+        "}"
+        "function statText(id,value){var e=document.getElementById(id);if(e)e.textContent=value;}"
+        "function parseTimestamp(line){"
+        "var m=/^\\[(\\d{4})-(\\d{2})-(\\d{2}) (\\d{2}):(\\d{2}):(\\d{2})(?:\\.(\\d{1,3}))?\\]/.exec(line);"
+        "if(!m)return null;"
+        "var ms=m[7]?Number((m[7]+'00').slice(0,3)):0;"
+        "var value=Date.UTC(+m[1],+m[2]-1,+m[3],+m[4],+m[5],+m[6],ms);"
+        "if(!Number.isFinite(value))return null;"
+        "return {ms:value,hour:+m[4],label:m[3]+'.'+m[2]+'.'+m[1]+' '+m[4]+':'+m[5]+':'+m[6]};"
+        "}"
+        "function durationText(ms){"
+        "if(!Number.isFinite(ms)||ms<0)return '--';"
+        "var total=Math.round(ms/1000),days=Math.floor(total/86400);total%=86400;"
+        "var hours=Math.floor(total/3600);total%=3600;"
+        "var mins=Math.floor(total/60),secs=total%60;"
+        "var parts=[];"
+        "if(days)parts.push(days+' d');"
+        "if(hours||days)parts.push(hours+' h');"
+        "if(mins||hours||days)parts.push(mins+' min');"
+        "if(!days&&!hours)parts.push(secs+' s');"
+        "return parts.join(' ');"
+        "}"
+        "function secondsText(seconds){return durationText(seconds*1000);}"
+        "function niceStep(maxValue){"
+        "if(maxValue<=4)return 1;"
+        "var rough=maxValue/4;"
+        "var p=Math.pow(10,Math.floor(Math.log10(rough)));"
+        "var n=rough/p;"
+        "if(n<=1)return p;if(n<=2)return 2*p;if(n<=5)return 5*p;return 10*p;"
+        "}"
+        "function drawHourChart(counts){"
+        "if(!hourChart||!hourChart.getContext)return;"
+        "var ctx=hourChart.getContext('2d'),w=hourChart.width,h=hourChart.height;"
+        "ctx.clearRect(0,0,w,h);"
+        "var root=getComputedStyle(document.documentElement);"
+        "var accent=(root.getPropertyValue('--accent')||'#2563eb').trim();"
+        "var muted=(root.getPropertyValue('--muted')||'#667085').trim();"
+        "var line=(root.getPropertyValue('--line')||'#d8dee6').trim();"
+        "var text=(root.getPropertyValue('--text')||'#1f2933').trim();"
+        "var left=52,right=18,top=26,bottom=48,pw=w-left-right,ph=h-top-bottom;"
+        "var maxValue=0;for(var i=0;i<24;i++)if(counts[i]>maxValue)maxValue=counts[i];"
+        "var step=niceStep(Math.max(1,maxValue));var yMax=Math.max(step,Math.ceil(maxValue/step)*step);"
+        "ctx.font='12px Arial';ctx.textBaseline='middle';"
+        "for(var yv=0;yv<=yMax;yv+=step){"
+        "var y=top+ph-(yv/yMax)*ph;ctx.strokeStyle=line;ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(left,y);ctx.lineTo(w-right,y);ctx.stroke();"
+        "ctx.fillStyle=muted;ctx.textAlign='right';ctx.fillText(String(yv),left-8,y);"
+        "}"
+        "var slot=pw/24,barW=Math.max(4,slot*0.68);"
+        "for(var hour=0;hour<24;hour++){"
+        "var value=counts[hour]||0;var bh=(value/yMax)*ph;var x=left+hour*slot+(slot-barW)/2;var yb=top+ph-bh;"
+        "ctx.fillStyle=accent;ctx.fillRect(x,yb,barW,bh);"
+        "if(value>0){ctx.fillStyle=text;ctx.textAlign='center';ctx.textBaseline='bottom';ctx.fillText(String(value),x+barW/2,Math.max(top+12,yb-3));ctx.textBaseline='middle';}"
+        "}"
+        "ctx.strokeStyle=text;ctx.lineWidth=1.2;ctx.beginPath();ctx.moveTo(left,top+ph);ctx.lineTo(w-right,top+ph);ctx.stroke();"
+        "ctx.fillStyle=muted;ctx.textAlign='center';ctx.textBaseline='top';"
+        "for(var tick=0;tick<=24;tick++){var x=left+(tick/24)*pw;ctx.beginPath();ctx.moveTo(x,top+ph);ctx.lineTo(x,top+ph+5);ctx.strokeStyle=text;ctx.stroke();ctx.fillText(String(tick),x,top+ph+9);}"
+        "ctx.save();ctx.translate(15,top+ph/2);ctx.rotate(-Math.PI/2);ctx.textAlign='center';ctx.textBaseline='top';ctx.fillStyle=muted;ctx.fillText('Anzahl Alarmereignisse',0,0);ctx.restore();"
+        "if(maxValue===0){ctx.fillStyle=muted;ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText('Keine Recording START Ereignisse im geladenen Log',left+pw/2,top+ph/2);}"
+        "}"
+        "function markAnalysisDirty(){"
+        "if(analysisStatus)analysisStatus.textContent=analysisCalculated?uiAnalysisStale:uiAnalysisIdle;"
+        "}"
+        "function analyzeLog(){"
+        "var lines=rawText?rawText.split(/\\r?\\n/):[];"
+        "var first=null,last=null,events=0,clips=0,recordSeconds=0,frames=0,clipMin=null,clipMax=0;"
+        "var modeMs=0,modeEvents=0,activeEventStart=null;"
+        "var sleepMs=0,sleepCycles=0,sleepUnknown=0,sleepMax=0;"
+        "var boots=0,brownouts=0,wdt=0,warnings=0,errors=0,safety=0,sdRecoveries=0;"
+        "var thermalWarnCpu=0,thermalWarnRtc=0,thermalEmergencyCpu=0,thermalEmergencyRtc=0,thermalEmergencyBoth=0,thermalRecoveries=0;"
+        "var thermalCpuMax=null,thermalRtcMax=null;"
+        "var recThermalEvents=0,recCpuSamples=0,recCpuWeighted=0,recCpuMax=null,recRtcSamples=0,recRtcWeighted=0,recRtcMax=null;"
+        "var buckets=new Array(24).fill(0);"
+        "for(var i=0;i<lines.length;i++){"
+        "var line=lines[i];if(!line)continue;"
+        "var ts=parseTimestamp(line);"
+        "if(ts){if(!first||ts.ms<first.ms)first=ts;if(!last||ts.ms>last.ms)last=ts;}"
+        "if(line.indexOf('Recording START |')>=0){"
+        "events++;"
+        "activeEventStart=ts?ts.ms:null;"
+        "var hm=/\\/\\d{8}\\/(\\d{2})\\d{4}\\.[A-Za-z0-9]+/.exec(line);"
+        "var hour=hm?Number(hm[1]):(ts?ts.hour:-1);"
+        "if(hour>=0&&hour<24)buckets[hour]++;"
+        "}"
+        "var stop=/Recording STOP \\|.*?duration=([0-9]+(?:\\.[0-9]+)?) s/i.exec(line);"
+        "if(stop){var sec=Number(stop[1]);if(Number.isFinite(sec)&&sec>=0){clips++;recordSeconds+=sec;if(clipMin===null||sec<clipMin)clipMin=sec;if(sec>clipMax)clipMax=sec;}var fm=/frames=(\\d+)/i.exec(line);if(fm)frames+=Number(fm[1])||0;}"
+        "var eventEnded=line.indexOf('Recording stop | finalized')>=0||line.indexOf('Recording finalization failed')>=0||line.indexOf('Recording segment finalization failed')>=0;"
+        "if(eventEnded&&activeEventStart!==null&&ts&&ts.ms>=activeEventStart){modeMs+=ts.ms-activeEventStart;modeEvents++;activeEventStart=null;}"
+        "var sm=/SLEEP \\| mode=(light|deep) \\| duration_ms=(\\d+)/i.exec(line);"
+        "if(sm){var d=Number(sm[2]);if(Number.isFinite(d)&&d>=0){sleepCycles++;sleepMs+=d;if(d>sleepMax)sleepMax=d;}}"
+        "else if(/SLEEP \\| mode=(light|deep) \\| duration_ms=unknown/i.test(line)){sleepCycles++;sleepUnknown++;}"
+        "if(line.indexOf('BOOT | reset=')>=0){boots++;if(line.indexOf('reset=BROWNOUT')>=0)brownouts++;if(/reset=(?:INT_WDT|TASK_WDT|WDT)/.test(line))wdt++;}"
+        "if(/\\bWARNING\\b/i.test(line))warnings++;"
+        "if(/\\bERROR\\b/i.test(line)||/\\bfailed\\b/i.test(line))errors++;"
+        "if(line.indexOf('Recording safety limit reached')>=0)safety++;"
+        "if(line.indexOf('SD recovery successful')>=0)sdRecoveries++;"
+        "if(line.indexOf('THERMAL |')>=0){"
+        "var ev=/THERMAL \\| ([A-Z0-9_]+)/.exec(line);var eventName=ev?ev[1]:'';"
+        "if(eventName==='WARNING_CPU')thermalWarnCpu++;else if(eventName==='WARNING_RTC')thermalWarnRtc++;"
+        "else if(eventName==='EMERGENCY_CPU')thermalEmergencyCpu++;else if(eventName==='EMERGENCY_RTC')thermalEmergencyRtc++;else if(eventName==='EMERGENCY_CPU_RTC')thermalEmergencyBoth++;"
+        "if(eventName.indexOf('RECOVERED_')===0)thermalRecoveries++;"
+        "var cpuEvent=/\\| CPU=([-+]?[0-9]+(?:\\.[0-9]+)?) C/i.exec(line);"
+        "if(cpuEvent){var cv=Number(cpuEvent[1]);if(Number.isFinite(cv)&&(thermalCpuMax===null||cv>thermalCpuMax))thermalCpuMax=cv;}"
+        "var rtcEvent=/\\| RTC=([-+]?[0-9]+(?:\\.[0-9]+)?) C/i.exec(line);"
+        "if(rtcEvent){var rv=Number(rtcEvent[1]);if(Number.isFinite(rv)&&(thermalRtcMax===null||rv>thermalRtcMax))thermalRtcMax=rv;}"
+        "if(eventName==='RECORDING_SUMMARY'){"
+        "recThermalEvents++;"
+        "var cs=/cpu_samples=(\\d+)/i.exec(line),ca=/cpu_avg=([-+]?[0-9]+(?:\\.[0-9]+)?) C/i.exec(line),cx=/cpu_max=([-+]?[0-9]+(?:\\.[0-9]+)?) C/i.exec(line);"
+        "var rs=/rtc_samples=(\\d+)/i.exec(line),ra=/rtc_avg=([-+]?[0-9]+(?:\\.[0-9]+)?) C/i.exec(line),rx=/rtc_max=([-+]?[0-9]+(?:\\.[0-9]+)?) C/i.exec(line);"
+        "var csn=cs?Number(cs[1]):0,cav=ca?Number(ca[1]):NaN,cxv=cx?Number(cx[1]):NaN;"
+        "if(csn>0&&Number.isFinite(cav)){recCpuSamples+=csn;recCpuWeighted+=cav*csn;}"
+        "if(Number.isFinite(cxv)){if(recCpuMax===null||cxv>recCpuMax)recCpuMax=cxv;if(thermalCpuMax===null||cxv>thermalCpuMax)thermalCpuMax=cxv;}"
+        "var rsn=rs?Number(rs[1]):0,rav=ra?Number(ra[1]):NaN,rxv=rx?Number(rx[1]):NaN;"
+        "if(rsn>0&&Number.isFinite(rav)){recRtcSamples+=rsn;recRtcWeighted+=rav*rsn;}"
+        "if(Number.isFinite(rxv)){if(recRtcMax===null||rxv>recRtcMax)recRtcMax=rxv;if(thermalRtcMax===null||rxv>thermalRtcMax)thermalRtcMax=rxv;}"
+        "}"
+        "}"
+        "}"
+        "var periodMs=(first&&last&&last.ms>=first.ms)?last.ms-first.ms:null;"
+        "var avgClip=clips?recordSeconds/clips:0;"
+        "var modePct=(periodMs&&periodMs>0)?(modeMs/periodMs)*100:null;"
+        "statText('statLogStart',first?first.label:'nicht verfügbar');"
+        "statText('statLogEnd',last?last.label:'nicht verfügbar');"
+        "statText('statPeriod',periodMs!==null?durationText(periodMs):'nicht verfügbar');"
+        "statText('statSleep',sleepCycles?durationText(sleepMs):'noch keine Messdaten');"
+        "var sleepNote=sleepCycles?(sleepCycles+' Zyklen · Ø '+durationText(sleepMs/Math.max(1,sleepCycles))+' · max '+durationText(sleepMax)):'SLEEP-Datensätze werden ab dieser Firmware exakt protokolliert';"
+        "if(sleepUnknown)sleepNote+=' · '+sleepUnknown+' ohne Zeitwert';"
+        "statText('statSleepNote',sleepNote);"
+        "statText('statEvents',String(events));"
+        "statText('statClips',String(clips));"
+        "statText('statModeTime',modeEvents?durationText(modeMs):'--');"
+        "statText('statModeNote',modeEvents?(modeEvents+' abgeschlossene Ereignisse'+(modePct!==null?' · '+modePct.toFixed(2)+' % des Log-Zeitraums':'')):'keine vollständig begrenzten Ereignisse');"
+        "statText('statRecordTime',secondsText(recordSeconds));"
+        "statText('statRecordNote','Summe der STOP-duration-Werte');"
+        "statText('statClipAvg',clips?secondsText(avgClip):'--');"
+        "statText('statClipNote',clips?('min '+secondsText(clipMin)+' · max '+secondsText(clipMax)):'keine abgeschlossenen Clips');"
+        "statText('statFrames',String(frames));"
+        "statText('statBoots',String(boots));"
+        "statText('statBootNote','Brownout '+brownouts+' · WDT '+wdt);"
+        "statText('statHealth',warnings+' / '+errors);"
+        "statText('statHealthNote','Warnungen / Fehlerhinweise');"
+        "statText('statSafety',String(safety));"
+        "statText('statSafetyNote','SD-Recoveries '+sdRecoveries);"
+        "var thermalWarnings=thermalWarnCpu+thermalWarnRtc;"
+        "var thermalShutdowns=thermalEmergencyCpu+thermalEmergencyRtc+thermalEmergencyBoth;"
+        "var recCpuAvg=recCpuSamples?recCpuWeighted/recCpuSamples:null;"
+        "var recRtcAvg=recRtcSamples?recRtcWeighted/recRtcSamples:null;"
+        "statText('statThermalWarnings',String(thermalWarnings));"
+        "statText('statThermalWarningsNote','CPU '+thermalWarnCpu+' · RTC '+thermalWarnRtc+' · gezählt werden Warn-Episoden');"
+        "statText('statThermalEmergency',String(thermalShutdowns));"
+        "statText('statThermalEmergencyNote','CPU '+thermalEmergencyCpu+' · RTC '+thermalEmergencyRtc+' · beide '+thermalEmergencyBoth);"
+        "statText('statThermalCpuMax',thermalCpuMax!==null?thermalCpuMax.toFixed(1)+' °C':'--');"
+        "statText('statThermalCpuMaxNote',thermalCpuMax!==null?'höchster protokollierter CPU-Wert':'keine Thermal-Temperaturdaten im Log');"
+        "statText('statThermalRtcMax',thermalRtcMax!==null?thermalRtcMax.toFixed(1)+' °C':'--');"
+        "statText('statThermalRtcMaxNote',thermalRtcMax!==null?'höchster protokollierter RTC/Gehäuse-Wert':'keine RTC-Thermaldaten im Log');"
+        "statText('statThermalCpuAvgRec',recCpuAvg!==null?recCpuAvg.toFixed(1)+' °C':'--');"
+        "statText('statThermalCpuAvgRecNote',recCpuSamples?(recCpuSamples+' Samples · max '+(recCpuMax!==null?recCpuMax.toFixed(1)+' °C':'--')):'mit neuen RECORDING_SUMMARY-Einträgen verfügbar');"
+        "statText('statThermalRtcAvgRec',recRtcAvg!==null?recRtcAvg.toFixed(1)+' °C':'--');"
+        "statText('statThermalRtcAvgRecNote',recRtcSamples?(recRtcSamples+' Samples · max '+(recRtcMax!==null?recRtcMax.toFixed(1)+' °C':'--')):'mit RTC und neuen RECORDING_SUMMARY-Einträgen verfügbar');"
+        "statText('statThermalRecoveries',String(thermalRecoveries));"
+        "statText('statThermalRecoveriesNote','Warning-Recovery und Recovery nach Cooldown');"
+        "statText('statThermalCoverage',String(recThermalEvents));"
+        "statText('statThermalCoverageNote',recThermalEvents?('Aufnahmeereignisse · CPU '+recCpuSamples+' / RTC '+recRtcSamples+' Samples'):'ältere Logs enthalten noch keine Aufnahme-Thermalsummaries');"
+        "lastHourBuckets=buckets;drawHourChart(buckets);"
+        "if(analysisStatus){"
+        "var msg=events+' Alarmereignisse · '+clips+' Clips';"
+        "if(sleepCycles)msg+=' · '+sleepCycles+' Sleep-Zyklen';else msg+=' · Sleep ab neuer Firmware messbar';"
+        "if(thermalWarnings||thermalShutdowns)msg+=' · Thermal '+thermalWarnings+' Warnungen / '+thermalShutdowns+' Abschaltungen';"
+        "analysisStatus.textContent=msg;"
+        "}"
+        "analysisCalculated=true;"
+        "}"
+        "function render(scroll){"
+            "var q=search.value.trim().toLowerCase();"
+            "var shown=rawText;"
+            "var matchCount=0,totalCount=0;"
+            "if(rawText.length){totalCount=rawText.split(/\\r?\\n/).filter(function(x){return x.length>0;}).length;}"
+            "if(q){"
+                "var lines=rawText.split(/\\r?\\n/);"
+                "var filtered=[];"
+                "for(var i=0;i<lines.length;i++){if(lines[i].toLowerCase().indexOf(q)>=0)filtered.push(lines[i]);}"
+                "matchCount=filtered.length;"
+                "shown=filtered.join('\\n');"
+                "filterMeta.textContent='Filter: '+matchCount+' von '+totalCount+' Zeilen';"
+            "}else{filterMeta.textContent=totalCount?totalCount+' Zeilen':'';}"
+            "out.textContent=shown.length?shown:(q?'(Keine Treffer)':'(Log ist leer)');"
+            "if(scroll)scrollBottom();"
+        "}"
+        "function loadLog(scroll){"
+            "if(loading)return;"
+            "loading=true;reload.disabled=true;if(analyzeButton)analyzeButton.disabled=true;"
+            "rawText='';logOffset=0;logGeneration='';analysisCalculated=false;markAnalysisDirty();"
+            "out.textContent='Log wird geladen...';status.textContent=uiLoadingChunks;"
+            "function loadNext(attempt){"
+                "fetch('/log_chunk?offset='+encodeURIComponent(logOffset)+'&generation='+encodeURIComponent(logGeneration)+'&t='+Date.now(),{cache:'no-store'})"
+                ".then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);"
+                    "var reset=r.headers.get('X-Log-Reset')==='1';"
+                    "var generation=r.headers.get('X-Log-Generation')||'';"
+                    "var next=Number(r.headers.get('X-Log-Offset')||String(logOffset));"
+                    "var size=Number(r.headers.get('X-Log-Size')||String(next));"
+                    "var more=r.headers.get('X-Log-More')==='1';"
+                    "return r.text().then(function(text){return {text:text,reset:reset,next:next,size:size,more:more,generation:generation};});})"
+                ".then(function(x){"
+                    "if(x.reset)rawText='';"
+                    "if(x.text.length)rawText+=x.text;"
+                    "logOffset=x.next;"
+                    "logGeneration=x.generation||logGeneration;"
+                    "if(Number.isFinite(x.size))sizeEl.textContent=byteSizeText(x.size);"
+                    "if(x.more){"
+                        "var pct=(Number.isFinite(x.size)&&x.size>0)?Math.min(100,Math.round((logOffset/x.size)*100)):0;"
+                        "status.textContent=uiLoadingChunks+(pct?' '+pct+' %':'');"
+                        "setTimeout(function(){loadNext(0);},25);"
+                        "return;"
+                    "}"
+                    "loading=false;reload.disabled=false;if(analyzeButton)analyzeButton.disabled=false;"
+                    "status.textContent='Aktualisiert';markAnalysisDirty();render(scroll);"
+                "})"
+                ".catch(function(err){"
+                    "if(attempt<2){status.textContent=uiRetry+' ('+(attempt+2)+'/3)';setTimeout(function(){loadNext(attempt+1);},250*(attempt+1));return;}"
+                    "loading=false;reload.disabled=false;if(analyzeButton)analyzeButton.disabled=true;"
+                    "status.textContent='Fehler: '+err.message;"
+                    "if(rawText.length){render(false);}else{out.textContent='Log konnte nicht geladen werden: '+err.message;}"
+                    "markAnalysisDirty();"
+                "});"
+            "}"
+            "loadNext(0);"
+        "}"
+        "function pollLog(){"
+            "if(!live.checked||loading)return;"
+            "loading=true;status.textContent='Prüfe neue Einträge...';"
+            "fetch('/log_chunk?offset='+encodeURIComponent(logOffset)+'&generation='+encodeURIComponent(logGeneration)+'&flush=1&t='+Date.now(),{cache:'no-store'})"
+            ".then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);"
+                "var reset=r.headers.get('X-Log-Reset')==='1';"
+                "var generation=r.headers.get('X-Log-Generation')||'';"
+                "var next=Number(r.headers.get('X-Log-Offset')||String(logOffset));"
+                "var size=Number(r.headers.get('X-Log-Size')||String(next));"
+                "var more=r.headers.get('X-Log-More')==='1';"
+                "return r.text().then(function(text){return {text:text,reset:reset,next:next,size:size,more:more,generation:generation};});})"
+            ".then(function(x){"
+                "if(x.reset)rawText='';"
+                "if(x.text.length)rawText+=x.text;"
+                "logOffset=x.next;"
+                "logGeneration=x.generation||logGeneration;"
+                "if(Number.isFinite(x.size))sizeEl.textContent=byteSizeText(x.size);"
+                "status.textContent=x.text.length?'Neue Einträge':'Keine neuen Einträge';"
+                "if(x.reset||x.text.length)markAnalysisDirty();"
+                "render(x.text.length>0&&!search.value.trim());"
+                "loading=false;"
+                "if(x.more&&live.checked)setTimeout(pollLog,80);"
+            "})"
+            ".catch(function(err){loading=false;status.textContent='Live-Update Fehler: '+err.message;});"
+        "}"
+        "function scheduleLive(){"
+            "if(liveTimer){clearInterval(liveTimer);liveTimer=0;}"
+            "if(live.checked){pollLog();liveTimer=setInterval(pollLog,5000);status.textContent='Live-Update aktiv';}"
+            "else status.textContent='Live-Update aus';"
+        "}"
+        "reload.addEventListener('click',function(){loadLog(true);});"
+        "bottom.addEventListener('click',scrollBottom);"
+        "search.addEventListener('input',function(){render(false);});"
+        "live.addEventListener('change',scheduleLive);"
+        "if(analyzeButton)analyzeButton.addEventListener('click',function(){if(loading)return;analyzeLog();});"
+        "window.addEventListener('resize',function(){if(analysisCalculated)drawHourChart(lastHourBuckets);});"
+        "loadLog(true);"
+        "})();"
+        "</script>";
+
+    html += htmlFooter();
+
+    server.sendHeader(
+        "Cache-Control",
+        "no-store"
+    );
+
+    server.send(
+        200,
+        "text/html; charset=utf-8",
+        html
+    );
+}
 
 
 // -------------------------------------------------------------
@@ -14104,14 +14753,10 @@ static void performManualShutdown()
 struct RecordingEntry {
     String name;
     String fullPath;
-    String annotation;
     uint64_t size;
-    uint64_t durationMs;
-    bool durationValid;
     bool isMkv;
     bool isJpeg;
     bool hasSrt;
-    bool corrupt;
 };
 
 
@@ -14151,13 +14796,7 @@ static String displayRecordingTime(const String &fileName)
         ? fileName.substring(0, dotPos)
         : fileName;
 
-    // Normal recordings use HHMMSS.ext. Continuous-shooter files append
-    // a sub-second/role suffix, e.g. HHMMSS_500_shooter.mkv. For list
-    // display both formats share the same HH:MM:SS start time.
-    if (
-        baseName.length() >= 6 &&
-        (baseName.length() == 6 || baseName[6] == '_')
-    ) {
+    if (baseName.length() == 6) {
 
         bool numeric = true;
 
@@ -14177,199 +14816,6 @@ static String displayRecordingTime(const String &fileName)
     }
 
     return baseName;
-}
-
-
-static bool recordingStartSecondOfDay(
-    const String &fileName,
-    uint32_t &secondOfDay
-)
-{
-    int dotPos =
-        fileName.lastIndexOf('.');
-
-    String baseName =
-        dotPos >= 0
-        ? fileName.substring(0, dotPos)
-        : fileName;
-
-    // Accept both normal HHMMSS names and shooter names such as
-    // HHMMSS_500_shooter. The first six digits remain the wall-clock start.
-    if (
-        baseName.length() < 6 ||
-        (baseName.length() > 6 && baseName[6] != '_')
-    ) {
-        return false;
-    }
-
-    for (size_t i = 0; i < 6; ++i) {
-        if (!isDigit(baseName[i]))
-            return false;
-    }
-
-    uint8_t hour =
-        (uint8_t)baseName.substring(0, 2).toInt();
-
-    uint8_t minute =
-        (uint8_t)baseName.substring(2, 4).toInt();
-
-    uint8_t second =
-        (uint8_t)baseName.substring(4, 6).toInt();
-
-    if (
-        hour > 23 ||
-        minute > 59 ||
-        second > 59
-    ) {
-        return false;
-    }
-
-    secondOfDay =
-        (uint32_t)hour * 3600UL +
-        (uint32_t)minute * 60UL +
-        (uint32_t)second;
-
-    return true;
-}
-
-
-static String formatSecondOfDay(uint32_t secondOfDay)
-{
-    secondOfDay %=
-        24UL * 60UL * 60UL;
-
-    uint8_t hour =
-        (uint8_t)(secondOfDay / 3600UL);
-
-    uint8_t minute =
-        (uint8_t)((secondOfDay / 60UL) % 60UL);
-
-    uint8_t second =
-        (uint8_t)(secondOfDay % 60UL);
-
-    char buffer[9];
-
-    snprintf(
-        buffer,
-        sizeof(buffer),
-        "%02u:%02u:%02u",
-        (unsigned)hour,
-        (unsigned)minute,
-        (unsigned)second
-    );
-
-    return String(buffer);
-}
-
-
-static String displayRecordingTimeRange(
-    const RecordingEntry &entry
-)
-{
-    uint32_t startSecond = 0;
-
-    if (!recordingStartSecondOfDay(
-            entry.name,
-            startSecond
-        )) {
-        return displayRecordingTime(
-            entry.name
-        );
-    }
-
-    String startText =
-        formatSecondOfDay(
-            startSecond
-        );
-
-    if (
-        entry.isJpeg ||
-        !entry.durationValid
-    ) {
-        return startText;
-    }
-
-    uint64_t roundedDurationSeconds =
-        (entry.durationMs + 500ULL) /
-        1000ULL;
-
-    uint32_t endSecond =
-        (uint32_t)(
-            (
-                (uint64_t)startSecond +
-                roundedDurationSeconds
-            ) %
-            (24ULL * 60ULL * 60ULL)
-        );
-
-    return
-        startText +
-        " - " +
-        formatSecondOfDay(
-            endSecond
-        );
-}
-
-
-static const size_t RECORDING_LIST_ANNOTATION_MAX_BYTES = 240U;
-
-
-static bool loadRecordingAnnotationForList(
-    const String &mediaPath,
-    String &text
-)
-{
-    text =
-        "";
-
-    String notePath =
-        mediaPath +
-        ".note";
-
-    RecordingStorageFile file;
-
-    if (!file.openRead(notePath)) {
-        // Missing annotation is a normal state. An existing but unreadable note
-        // is treated as a note-read error, not as media corruption.
-        return
-            !STORAGE.exists(
-                notePath.c_str()
-            );
-    }
-
-    if (file.isDirectory()) {
-        file.close();
-        return false;
-    }
-
-    while (
-        file.available() &&
-        text.length() < RECORDING_LIST_ANNOTATION_MAX_BYTES
-    ) {
-        int c =
-            file.read();
-
-        if (c < 0)
-            break;
-
-        if (c == '\r' || c == '\n' || c == '\t')
-            c = ' ';
-
-        text +=
-            (char)c;
-    }
-
-    file.close();
-
-    text.trim();
-
-    while (text.indexOf("  ") >= 0)
-        text.replace("  ", " ");
-
-    if (text.length() > RECORDING_LIST_ANNOTATION_MAX_BYTES)
-        text.remove(RECORDING_LIST_ANNOTATION_MAX_BYTES);
-
-    return true;
 }
 
 
@@ -14578,17 +15024,8 @@ static void handleFilesDay()
                         "/" +
                         name;
 
-                    entry.annotation =
-                        "";
-
                     entry.size =
                         file.size();
-
-                    entry.durationMs =
-                        0;
-
-                    entry.durationValid =
-                        false;
 
                     entry.isMkv =
                         isMkv;
@@ -14597,9 +15034,6 @@ static void handleFilesDay()
                         isJpeg;
 
                     entry.hasSrt =
-                        false;
-
-                    entry.corrupt =
                         false;
 
 
@@ -14628,11 +15062,40 @@ static void handleFilesDay()
     serviceWebLongOperation();
 
 
-    // Sort immediately after the single directory pass. Expensive per-file
-    // work (decryptability/size, AVI/MKV duration probe, annotation load) is
-    // intentionally deferred until AFTER the HTTP response has started. The
-    // browser can therefore render each completed row while the next file is
-    // being inspected instead of waiting for the entire day.
+    // Match SRT files without performing another SD open/exists()
+    // for every AVI file.
+    uint16_t matchedEntries =
+        0;
+
+    for (
+        RecordingEntry &entry :
+        recordings
+    ) {
+
+        matchedEntries++;
+
+        if ((matchedEntries & 0x1FU) == 0)
+            serviceWebLongOperation();
+
+        uint64_t logicalSize = 0;
+
+        if (recordingStorageLogicalSize(
+                entry.fullPath,
+                logicalSize
+            )) {
+            entry.size = logicalSize;
+        }
+
+        if (!entry.isMkv && !entry.isJpeg) {
+            entry.hasSrt =
+                hasMatchingSrt(
+                    entry.name,
+                    srtBaseNames
+                );
+        }
+    }
+
+
     std::sort(
         recordings.begin(),
         recordings.end(),
@@ -14640,14 +15103,12 @@ static void handleFilesDay()
     );
 
 
+    // Stream the response. This keeps heap use low even when
+    // a day contains many recordings. Never let the browser HTTP-cache
+    // this fragment; the optional session cache is managed explicitly.
     server.sendHeader(
         "Cache-Control",
         "no-store"
-    );
-
-    server.sendHeader(
-        "X-Media-Count",
-        String((unsigned long)recordings.size())
     );
 
     server.setContentLength(
@@ -14664,121 +15125,31 @@ static void handleFilesDay()
     if (recordings.empty()) {
 
         server.sendContent(
-            "<div class='recording emptyrecording'>"
+            "<div class='recording'>"
             "Keine Aufnahmen oder Snapshots an diesem Tag."
-            "</div><!--SFCHUNK-->"
+            "</div>"
         );
 
         return;
     }
 
 
-    // The explicit marker gives the browser a safe framing boundary. TCP /
-    // fetch stream chunks may split or combine arbitrary bytes, so client code
-    // must never assume one sendContent() call equals one ReadableStream chunk.
     server.sendContent(
         "<div class='dayMediaFilter'>"
-        "<button type='button' class='mediaFilterMode active' "
+        "<button type='button' class='active' "
         "onclick=\"filterDayMedia(this,'all')\">Show all</button>"
-        "<button type='button' class='mediaFilterMode' "
+        "<button type='button' "
         "onclick=\"filterDayMedia(this,'videos')\">Show videos</button>"
-        "<button type='button' class='mediaFilterMode' "
+        "<button type='button' "
         "onclick=\"filterDayMedia(this,'images')\">Show images/snapshots</button>"
-        "<span class='selectionHint'>Shift oder Ziehen = Bereich</span>"
-        "<span class='daySelectionSpacer'></span>"
-        "<button type='button' class='selectionAction' "
-        "onclick=\"setDaySelection(this,true)\">Select all</button>"
-        "<button type='button' class='selectionAction' "
-        "onclick=\"setDaySelection(this,false)\">Deselect all</button>"
-        "<button type='button' class='deleteSelectedBtn' disabled "
-        "onclick=\"deleteSelectedMedia(this)\">Delete selected</button>"
-        "</div><!--SFCHUNK-->"
+        "</div>"
     );
 
 
-    uint16_t matchedEntries =
-        0;
-
     for (
-        RecordingEntry &entry :
+        const RecordingEntry &entry :
         recordings
     ) {
-
-        matchedEntries++;
-
-        if ((matchedEntries & 0x1FU) == 0)
-            serviceWebLongOperation();
-
-        uint64_t logicalSize = 0;
-
-        bool logicalSizeOk =
-            recordingStorageLogicalSize(
-                entry.fullPath,
-                logicalSize
-            );
-
-        if (!logicalSizeOk) {
-            // Same defensive second chance as the day-ZIP path: a transient
-            // lightweight header probe must not create a false corruption flag.
-            RecordingStorageFile probe;
-
-            if (
-                probe.openRead(entry.fullPath) &&
-                !probe.isDirectory()
-            ) {
-                logicalSize =
-                    (uint64_t)probe.size();
-                logicalSizeOk =
-                    true;
-            }
-
-            probe.close();
-        }
-
-        if (logicalSizeOk) {
-            entry.size = logicalSize;
-        } else {
-            entry.corrupt = true;
-        }
-
-        if (!entry.isJpeg) {
-            uint64_t durationMs = 0;
-
-            if (webPlayerProbeDurationMs(
-                    entry.fullPath,
-                    durationMs
-                )) {
-                entry.durationMs =
-                    durationMs;
-
-                entry.durationValid =
-                    true;
-            } else {
-                // Lightweight AVI/MKV parsing failed: mark the file visibly
-                // instead of discovering the problem only after opening it.
-                entry.corrupt = true;
-            }
-        }
-
-        if (!entry.isJpeg) {
-            String annotation;
-
-            if (loadRecordingAnnotationForList(
-                    entry.fullPath,
-                    annotation
-                )) {
-                entry.annotation =
-                    annotation;
-            }
-        }
-
-        if (!entry.isMkv && !entry.isJpeg) {
-            entry.hasSrt =
-                hasMatchingSrt(
-                    entry.name,
-                    srtBaseNames
-                );
-        }
 
         String row;
         row.reserve(512);
@@ -14791,48 +15162,12 @@ static void handleFilesDay()
 
 
         row +=
-            "<label class='mediaSelectWrap' title='Auswählen – ziehen oder Shift für Bereich'>"
-            "<input class='mediaSelect' type='checkbox' data-path='" +
-            htmlEscape(entry.fullPath) +
-            "' onchange='updateDaySelection(this)'>"
-            "</label>";
-
-
-        if (entry.corrupt) {
-            row +=
-                "<span class='mediaCorruptIcon' "
-                "title='Datei beschädigt, unvollständig oder nicht entschlüsselbar' "
-                "aria-label='Datei beschädigt oder nicht lesbar'>"
-                "<svg viewBox='0 0 24 24' aria-hidden='true'>"
-                "<path d='M12 3L2.8 20h18.4L12 3z'></path>"
-                "<path d='M12 8v5'></path>"
-                "<circle cx='12' cy='16.5' r='.7'></circle>"
-                "</svg></span>";
-        }
-
-
-        row +=
-            entry.isJpeg
-            ? "<span class='mediaKindIcon' title='Bild' aria-label='Bild'>"
-              "<svg viewBox='0 0 24 24' aria-hidden='true'>"
-              "<rect x='3' y='4' width='18' height='16' rx='2'></rect>"
-              "<circle cx='8' cy='9' r='2'></circle>"
-              "<path d='M5 17l4-4 3 3 3-4 4 5'></path>"
-              "</svg></span>"
-            : "<span class='mediaKindIcon' title='Video' aria-label='Video'>"
-              "<svg viewBox='0 0 24 24' aria-hidden='true'>"
-              "<rect x='2.5' y='5' width='13.5' height='14' rx='2'></rect>"
-              "<path d='M16 9l5-3v12l-5-3z'></path>"
-              "</svg></span>";
-
-
-        row +=
             "<span class='recname'>";
 
         row +=
             htmlEscape(
-                displayRecordingTimeRange(
-                    entry
+                displayRecordingTime(
+                    entry.name
                 )
             );
 
@@ -14842,6 +15177,18 @@ static void handleFilesDay()
 
         row +=
             "<span class='recmeta'>";
+
+        row +=
+            entry.isJpeg
+            ? "JPG"
+            : (
+                entry.isMkv
+                ? "MKV"
+                : "AVI"
+            );
+
+        row +=
+            " &nbsp; ";
 
         row +=
             formatFileSize(
@@ -14915,39 +15262,9 @@ static void handleFilesDay()
         }
 
 
-        if (!entry.isJpeg && entry.annotation.length()) {
-            row +=
-                "<span class='recannotation' title='";
-
-            row +=
-                htmlEscape(
-                    entry.annotation
-                );
-
-            row +=
-                "'>"
-                "<svg viewBox='0 0 24 24' aria-hidden='true'>"
-                "<path d='M4 4h16v12H8l-4 4z'></path>"
-                "<path d='M8 8h8M8 12h6'></path>"
-                "</svg>"
-                "<span>";
-
-            row +=
-                htmlEscape(
-                    entry.annotation
-                );
-
-            row +=
-                "</span></span>";
-        }
-
-
         row +=
             "</div>";
 
-
-        row +=
-            "<!--SFCHUNK-->";
 
         server.sendContent(
             row
@@ -14975,85 +15292,7 @@ struct DayZipEntry {
     uint32_t size;
     uint32_t crc32;
     uint32_t localHeaderOffset;
-    bool synthetic;
-    String syntheticData;
 };
-
-
-// Day ZIP downloads are deliberately serialized. Arduino WebServer handlers run
-// synchronously, so a second browser request cannot truly stream in parallel,
-// but it can wait in the TCP queue and start immediately after the first one.
-// Keep a short post-download guard so such queued requests are rejected instead
-// of unexpectedly starting another large SD/crypto transfer.
-static bool dayZipDownloadActive = false;
-static uint32_t dayZipDownloadLastFinishedMs = 0;
-static const uint32_t DAY_ZIP_REQUEUE_GUARD_MS = 3000UL;
-
-
-static uint32_t dayZipDownloadCooldownRemainingMs()
-{
-    if (dayZipDownloadActive)
-        return DAY_ZIP_REQUEUE_GUARD_MS;
-
-    if (dayZipDownloadLastFinishedMs == 0)
-        return 0;
-
-    uint32_t elapsed =
-        (uint32_t)(
-            millis() -
-            dayZipDownloadLastFinishedMs
-        );
-
-    if (elapsed >= DAY_ZIP_REQUEUE_GUARD_MS)
-        return 0;
-
-    return
-        DAY_ZIP_REQUEUE_GUARD_MS -
-        elapsed;
-}
-
-
-class DayZipDownloadGuard {
-public:
-    DayZipDownloadGuard()
-    {
-        dayZipDownloadActive = true;
-    }
-
-    ~DayZipDownloadGuard()
-    {
-        dayZipDownloadActive = false;
-        dayZipDownloadLastFinishedMs = millis();
-    }
-
-    DayZipDownloadGuard(const DayZipDownloadGuard &) = delete;
-    DayZipDownloadGuard &operator=(const DayZipDownloadGuard &) = delete;
-};
-
-
-static void handleDownloadDayStatus()
-{
-    uint32_t cooldownMs =
-        dayZipDownloadCooldownRemainingMs();
-
-    String json =
-        String("{\"active\":") +
-        (dayZipDownloadActive ? "true" : "false") +
-        ",\"cooldown_ms\":" +
-        String(cooldownMs) +
-        "}";
-
-    server.sendHeader(
-        "Cache-Control",
-        "no-store"
-    );
-
-    server.send(
-        200,
-        "application/json; charset=utf-8",
-        json
-    );
-}
 
 
 static bool isRecordingFileForDayDownload(
@@ -15070,127 +15309,7 @@ static bool isRecordingFileForDayDownload(
         lower.endsWith(".mkv") ||
         lower.endsWith(".srt") ||
         lower.endsWith(".jpg") ||
-        lower.endsWith(".jpeg") ||
-        lower.endsWith(".note");
-}
-
-
-static bool dayZipResolveLogicalSize(
-    const String &fullPath,
-    uint64_t physicalSize,
-    uint64_t &logicalSize,
-    bool &encrypted
-)
-{
-    encrypted = false;
-
-    String lowerPath =
-        fullPath;
-
-    lowerPath.toLowerCase();
-
-    // SRT sidecars are always plain files. Annotation sidecars may follow the
-    // recording-encryption policy and therefore continue through SFENC1 probing.
-    if (lowerPath.endsWith(".srt")) {
-        logicalSize =
-            physicalSize;
-        return true;
-    }
-
-    // Fast path: validate the SFENC1 header without allocating the full
-    // encrypted-reader chunk buffers.
-    if (recordingStorageLogicalSize(
-            fullPath,
-            logicalSize,
-            &encrypted
-        )) {
-        return true;
-    }
-
-    // Defensive fallback: use exactly the same reader path as the working
-    // individual file download. This also gives transient crypto/storage state
-    // one clean second chance before a file is classified as unreadable.
-    RecordingStorageFile probe;
-
-    if (
-        probe.openRead(fullPath) &&
-        !probe.isDirectory()
-    ) {
-        logicalSize =
-            (uint64_t)probe.size();
-        encrypted =
-            probe.isEncrypted();
-
-        probe.close();
-        return true;
-    }
-
-    probe.close();
-    return false;
-}
-
-
-// Header validation alone is not sufficient for SFENC1: a damaged encrypted
-// chunk can fail authentication only when that part of the logical file is read.
-// Validate every encrypted file fully BEFORE HTTP ZIP headers are sent. Plain
-// files do not need the extra pass because they can be copied byte-for-byte even
-// when their AVI/MKV structure is imperfect.
-static bool dayZipValidateEncryptedReadable(
-    const String &fullPath,
-    uint64_t logicalSize,
-    uint8_t *buffer,
-    size_t bufferSize
-)
-{
-    if (!buffer || bufferSize == 0)
-        return false;
-
-    RecordingStorageFile probe;
-
-    if (
-        !probe.openRead(fullPath) ||
-        probe.isDirectory() ||
-        !probe.isEncrypted()
-    ) {
-        probe.close();
-        return false;
-    }
-
-    uint64_t totalRead = 0;
-
-    while (totalRead < logicalSize) {
-        uint64_t remaining =
-            logicalSize -
-            totalRead;
-
-        size_t wanted =
-            remaining < (uint64_t)bufferSize
-            ? (size_t)remaining
-            : bufferSize;
-
-        size_t got =
-            probe.read(
-                buffer,
-                wanted
-            );
-
-        if (got == 0) {
-            probe.close();
-            return false;
-        }
-
-        totalRead +=
-            (uint64_t)got;
-
-        serviceWebLongOperation();
-    }
-
-    bool ok =
-        totalRead == logicalSize &&
-        !probe.failed();
-
-    probe.close();
-    return ok;
+        lower.endsWith(".jpeg");
 }
 
 
@@ -15442,24 +15561,6 @@ static void handleDownloadDay()
     }
 
 
-    uint32_t dayZipCooldownMs =
-        dayZipDownloadCooldownRemainingMs();
-
-    if (
-        dayZipDownloadActive ||
-        dayZipCooldownMs > 0
-    ) {
-        server.send(
-            409,
-            "text/plain; charset=utf-8",
-            "Another day ZIP download is already active or has just finished."
-        );
-        return;
-    }
-
-    DayZipDownloadGuard dayZipGuard;
-
-
     // Release any old WebPlayer SD handles before starting a
     // potentially long sequential SD read.
     webPlayerStop();
@@ -15576,12 +15677,6 @@ static void handleDownloadDay()
                 entry.localHeaderOffset =
                     0;
 
-                entry.synthetic =
-                    false;
-
-                entry.syntheticData =
-                    "";
-
 
                 entries.push_back(
                     entry
@@ -15622,35 +15717,10 @@ static void handleDownloadDay()
 
 
     // ZIP sizes and CRCs must describe the logical plaintext files, not the
-    // physical SFENC1 bytes stored on SD. Unreadable/corrupt files are skipped
-    // instead of aborting the entire day archive. Encrypted files are read once
-    // completely during preflight so a damaged SFENC1 chunk cannot break the ZIP
-    // after HTTP headers have already been sent.
+    // physical SFENC1 bytes stored on SD. Resolve every entry before HTTP
+    // headers are sent so an unreadable encrypted file fails cleanly.
     localAreaBytes = 0;
     centralAreaBytes = 0;
-
-    static const size_t DAY_ZIP_VALIDATE_BUFFER_SIZE =
-        4U * 1024U;
-
-    uint8_t *validationBuffer =
-        (uint8_t *)malloc(
-            DAY_ZIP_VALIDATE_BUFFER_SIZE
-        );
-
-    if (!validationBuffer) {
-        server.send(
-            503,
-            "text/plain; charset=utf-8",
-            "ZIP validation buffer unavailable."
-        );
-        return;
-    }
-
-    std::vector<DayZipEntry> readableEntries;
-    readableEntries.reserve(entries.size() + 1U);
-
-    std::vector<String> skippedEntries;
-    skippedEntries.reserve(8);
 
     for (DayZipEntry &entry : entries) {
         String fullPath =
@@ -15659,78 +15729,24 @@ static void handleDownloadDay()
             entry.name;
 
         uint64_t logicalSize = 0;
-        bool encrypted = false;
 
-        bool readable =
-            dayZipResolveLogicalSize(
+        if (!recordingStorageLogicalSize(
                 fullPath,
-                (uint64_t)entry.size,
-                logicalSize,
-                encrypted
-            ) &&
-            logicalSize <= 0xFFFFFFFFULL;
+                logicalSize
+            ) ||
+            logicalSize > 0xFFFFFFFFULL) {
 
-        if (
-            readable &&
-            encrypted
-        ) {
-            readable =
-                dayZipValidateEncryptedReadable(
-                    fullPath,
-                    logicalSize,
-                    validationBuffer,
-                    DAY_ZIP_VALIDATE_BUFFER_SIZE
-                );
-        }
-
-        // Keep ZIP behavior consistent with the red corruption marker used by
-        // the recordings list. A video whose AVI/MKV metadata cannot be parsed
-        // is skipped even if its raw/plain bytes could still be copied.
-        if (readable) {
-            String lowerName =
-                entry.name;
-            lowerName.toLowerCase();
-
-            bool isVideo =
-                lowerName.endsWith(".avi") ||
-                lowerName.endsWith(".mkv");
-
-            if (isVideo) {
-                uint64_t ignoredDurationMs = 0;
-
-                if (!webPlayerProbeDurationMs(
-                        fullPath,
-                        ignoredDurationMs
-                    )) {
-                    readable = false;
-                }
-            }
-        }
-
-        if (!readable) {
-            skippedEntries.push_back(
-                entry.name
+            server.send(
+                500,
+                "text/plain; charset=utf-8",
+                "Recording cannot be opened or decrypted."
             );
 
-            Serial.println(
-                "ZIP download: skipping unreadable/corrupt file " +
-                fullPath
-            );
-
-            logWrite(
-                "ZIP download skipped unreadable/corrupt file: " +
-                fullPath
-            );
-
-            continue;
+            return;
         }
 
         entry.size =
             (uint32_t)logicalSize;
-
-        readableEntries.push_back(
-            entry
-        );
 
         localAreaBytes +=
             30ULL +
@@ -15741,67 +15757,6 @@ static void handleDownloadDay()
         centralAreaBytes +=
             46ULL +
             (uint64_t)entry.name.length();
-    }
-
-    free(validationBuffer);
-    validationBuffer = nullptr;
-
-    entries.swap(
-        readableEntries
-    );
-
-
-    // Make skipped files visible to the operator inside the otherwise valid
-    // archive. This synthetic text entry is generated in RAM and does not touch
-    // the SD card.
-    if (!skippedEntries.empty()) {
-        String report =
-            "SensorForge Tagesarchiv\r\n"
-            "Folgende Dateien wurden wegen Lese-/Entschluesselungsfehlern nicht in das ZIP aufgenommen:\r\n\r\n";
-
-        for (const String &name : skippedEntries) {
-            report +=
-                "- " +
-                name +
-                "\r\n";
-        }
-
-        report +=
-            "\r\nDie uebrigen lesbaren Dateien wurden normal archiviert.\r\n";
-
-        DayZipEntry reportEntry;
-        reportEntry.name =
-            "_SENSORFORGE_SKIPPED_CORRUPT.txt";
-        reportEntry.size =
-            (uint32_t)report.length();
-        reportEntry.crc32 = 0;
-        reportEntry.localHeaderOffset = 0;
-        reportEntry.synthetic = true;
-        reportEntry.syntheticData = report;
-
-        entries.push_back(
-            reportEntry
-        );
-
-        localAreaBytes +=
-            30ULL +
-            (uint64_t)reportEntry.name.length() +
-            (uint64_t)reportEntry.size +
-            16ULL;
-
-        centralAreaBytes +=
-            46ULL +
-            (uint64_t)reportEntry.name.length();
-    }
-
-
-    if (entries.empty()) {
-        server.send(
-            404,
-            "text/plain; charset=utf-8",
-            "No readable recordings found for this day."
-        );
-        return;
     }
 
 
@@ -15951,6 +15906,28 @@ static void handleDownloadDay()
             (uint32_t)entry.name.length();
 
 
+        String fullPath =
+            folderPath +
+            "/" +
+            entry.name;
+
+
+        RecordingStorageFile input;
+
+        if (!input.openRead(fullPath)) {
+
+            Serial.println(
+                "ZIP download: cannot open " +
+                fullPath
+            );
+
+            ok =
+                false;
+
+            break;
+        }
+
+
         uint32_t crc =
             0xFFFFFFFFUL;
 
@@ -15958,96 +15935,50 @@ static void handleDownloadDay()
             0;
 
 
-        if (entry.synthetic) {
-            size_t dataLength =
-                entry.syntheticData.length();
+        while (input.available()) {
 
-            if (dataLength > 0) {
-                const uint8_t *data =
-                    (const uint8_t *)entry.syntheticData.c_str();
-
-                crc =
-                    zipCrc32Update(
-                        crc,
-                        data,
-                        dataLength
-                    );
-
-                if (!zipClientWriteAll(
-                        data,
-                        dataLength
-                    )) {
-                    ok = false;
-                } else {
-                    sentForFile =
-                        (uint32_t)dataLength;
-                }
-            }
-
-        } else {
-            String fullPath =
-                folderPath +
-                "/" +
-                entry.name;
-
-            RecordingStorageFile input;
-
-            if (!input.openRead(fullPath)) {
-
-                Serial.println(
-                    "ZIP download: cannot open after successful preflight " +
-                    fullPath
+            size_t got =
+                input.read(
+                    buffer,
+                    ZIP_BUFFER_SIZE
                 );
+
+
+            if (got == 0) {
 
                 ok =
                     false;
 
-            } else {
-                while (input.available()) {
-
-                    size_t got =
-                        input.read(
-                            buffer,
-                            ZIP_BUFFER_SIZE
-                        );
-
-
-                    if (got == 0) {
-
-                        ok =
-                            false;
-
-                        break;
-                    }
-
-
-                    crc =
-                        zipCrc32Update(
-                            crc,
-                            buffer,
-                            got
-                        );
-
-
-                    if (!zipClientWriteAll(
-                            buffer,
-                            got
-                        )) {
-
-                        ok =
-                            false;
-
-                        break;
-                    }
-
-
-                    sentForFile +=
-                        (uint32_t)got;
-                }
+                break;
             }
 
-            input.close();
+
+            crc =
+                zipCrc32Update(
+                    crc,
+                    buffer,
+                    got
+                );
+
+
+            if (!zipClientWriteAll(
+                    buffer,
+                    got
+                )) {
+
+                ok =
+                    false;
+
+                break;
+            }
+
+
+            sentForFile +=
+                (uint32_t)got;
         }
+
+
+        input.close();
 
 
         if (
@@ -16180,9 +16111,7 @@ static void handleDownloadDay()
         archiveName +
         " (" +
         String(entries.size()) +
-        " archive entries, skipped=" +
-        String(skippedEntries.size()) +
-        ")"
+        " files)"
     );
 
     logWrite(
@@ -16190,9 +16119,7 @@ static void handleDownloadDay()
         archiveName +
         " (" +
         String(entries.size()) +
-        " archive entries, skipped=" +
-        String(skippedEntries.size()) +
-        ")"
+        " files)"
     );
 }
 
@@ -16224,8 +16151,6 @@ static bool isRecordingFileForDayDelete(
         lower.endsWith(".srt") ||
         lower.endsWith(".jpg") ||
         lower.endsWith(".jpeg") ||
-        lower.endsWith(".note") ||
-        lower.endsWith(".note.tmp") ||
         lower.endsWith(".avi.part") ||
         lower.endsWith(".mkv.part") ||
         lower.endsWith(".srt.part") ||
@@ -16795,7 +16720,6 @@ static void handleFiles()
         ".downloadDayBtn{"
             "border:1px solid #777;background:#f7f7f7;color:#222;"
         "}"
-        ".downloadDayBtn:disabled{opacity:.55;cursor:default;}"
         ".deleteDayBtn{"
             "background:#b00020;color:white;border:1px solid #b00020;"
         "}"
@@ -16812,31 +16736,6 @@ static void handleFiles()
         ".dayMediaFilter button.active{"
             "background:#344054;color:#fff;border-color:#344054;"
         "}"
-        ".selectionHint{font-size:11px;color:#667085;white-space:nowrap;}"
-        ".daySelectionSpacer{flex:1 1 18px;}"
-        ".dayMediaFilter .selectionAction{background:#fff;color:#344054;}"
-        ".dayMediaFilter .deleteSelectedBtn{background:#b42318;color:#fff;border-color:#b42318;}"
-        ".dayMediaFilter .deleteSelectedBtn:disabled{opacity:.45;cursor:default;}"
-        ".mediaSelectWrap{display:inline-flex;align-items:center;justify-content:center;width:32px;min-height:28px;margin-right:3px;vertical-align:middle;cursor:crosshair;user-select:none;}"
-        ".mediaSelect{width:17px;height:17px;margin:0;cursor:crosshair;}"
-        ".recording.mediaSelected{background:#eef4ff;box-shadow:inset 3px 0 0 #2563eb;}"
-        ".mediaRangeSelecting,.mediaRangeSelecting *{user-select:none!important;}"
-        ".mediaCorruptIcon{display:inline-flex;width:20px;height:20px;align-items:center;justify-content:center;margin-right:5px;vertical-align:middle;color:#b42318;}"
-        ".mediaCorruptIcon svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;}"
-        ".mediaKindIcon{"
-            "display:inline-flex;width:20px;height:20px;"
-            "align-items:center;justify-content:center;"
-            "margin-right:7px;vertical-align:middle;color:#475467;"
-        "}"
-        ".mediaKindIcon svg{"
-            "width:18px;height:18px;fill:none;stroke:currentColor;"
-            "stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;"
-        "}"
-        ".recname{display:inline-block;min-width:150px;}"
-        ".recmeta{display:inline-block;min-width:70px;color:#667085;}"
-        ".recannotation{display:inline-flex;align-items:center;gap:5px;max-width:min(440px,38vw);margin-left:10px;padding:3px 8px;border:1px solid #cbd5e1;border-radius:999px;background:#f8fafc;color:#475467;font-size:12px;line-height:1.3;vertical-align:middle;white-space:nowrap;overflow:hidden;}"
-        ".recannotation svg{flex:0 0 auto;width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;}"
-        ".recannotation span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}"
         ".daycontent{background:rgba(255,255,255,0.55);}"
         "@media(max-width:700px){"
             ".day summary{"
@@ -16844,7 +16743,6 @@ static void handleFiles()
                 "row-gap:7px;align-items:center;"
             "}"
             ".dayActions{grid-column:2;padding-left:0;}"
-            ".recannotation{max-width:calc(100vw - 92px);margin:6px 0 2px 47px;}"
         "}"
         "</style>"
         "<script>"
@@ -16857,8 +16755,6 @@ static void handleFiles()
 
         "let sameBoot=false;"
         "try{"
-            "const dirtyDay=sessionStorage.getItem('recordings.annotationDirtyDay');"
-            "if(dirtyDay){sessionStorage.removeItem(CACHE_PREFIX+dirtyDay);sessionStorage.removeItem('recordings.annotationDirtyDay');}"
             "const previousBoot=sessionStorage.getItem(BOOT_KEY);"
             "sameBoot=(previousBoot===BOOT_ID);"
             "if(!sameBoot){"
@@ -16910,67 +16806,10 @@ static void handleFiles()
 
         "setInterval(watchRecordingBlockedDialog,1500);"
 
-        "let dayDownloadUiBusy=false;"
-        "let dayDownloadPollTimer=0;"
-
-        "function setDayDownloadUiBusy(busy,sourceButton){"
-            "dayDownloadUiBusy=busy;"
-            "document.querySelectorAll('.downloadDayBtn').forEach(function(b){"
-                "if(!b.dataset.normalText)b.dataset.normalText=b.textContent;"
-                "b.disabled=busy;"
-                "b.textContent=(busy&&b===sourceButton)?'Download läuft...':b.dataset.normalText;"
-            "});"
-        "}"
-
-        "function pollDayDownloadStatus(){"
-            "if(!dayDownloadUiBusy)return;"
-            "fetch('/download_day_status?t='+Date.now(),{cache:'no-store'})"
-            ".then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();})"
-            ".then(function(s){"
-                "const cooldown=Number(s.cooldown_ms)||0;"
-                "if(s.active||cooldown>0){"
-                    "dayDownloadPollTimer=setTimeout(pollDayDownloadStatus,1000);"
-                    "return;"
-                "}"
-                "setDayDownloadUiBusy(false,null);"
-            "})"
-            ".catch(function(){dayDownloadPollTimer=setTimeout(pollDayDownloadStatus,1500);});"
-        "}"
-
-        "function startDayDownload(day,sourceButton){"
-            "let frame=document.getElementById('dayDownloadFrame');"
-            "if(!frame){"
-                "frame=document.createElement('iframe');"
-                "frame.id='dayDownloadFrame';"
-                "frame.name='dayDownloadFrame';"
-                "frame.hidden=true;"
-                "document.body.appendChild(frame);"
-            "}"
-            "frame.src='/download_day?day='+encodeURIComponent(day)+'&t='+Date.now();"
-            "dayDownloadPollTimer=setTimeout(pollDayDownloadStatus,1500);"
-        "}"
-
         "function downloadDay(ev,day){"
             "ev.preventDefault();"
             "ev.stopPropagation();"
-            "if(dayDownloadUiBusy)return;"
-            "const sourceButton=ev.currentTarget||ev.target;"
-            "setDayDownloadUiBusy(true,sourceButton);"
-            "fetch('/download_day_status?t='+Date.now(),{cache:'no-store'})"
-            ".then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();})"
-            ".then(function(s){"
-                "const cooldown=Number(s.cooldown_ms)||0;"
-                "if(s.active||cooldown>0){"
-                    "setDayDownloadUiBusy(false,null);"
-                    "alert('Ein Tagesdownload läuft bereits oder wurde gerade beendet. Bitte kurz warten.');"
-                    "return;"
-                "}"
-                "startDayDownload(day,sourceButton);"
-            "})"
-            ".catch(function(e){"
-                "setDayDownloadUiBusy(false,null);"
-                "alert('Download konnte nicht gestartet werden: '+e.message);"
-            "});"
+            "window.location='/download_day?day='+encodeURIComponent(day);"
         "}"
 
         "function deleteDay(ev,day){"
@@ -17019,150 +16858,11 @@ static void handleFiles()
             "if(!content)return;"
             "if(mode!=='videos'&&mode!=='images')mode='all';"
             "content.dataset.mediaMode=mode;"
-            "content._sfSelectionAnchor=null;"
             "content.querySelectorAll('.recording[data-media]').forEach(function(row){"
-                "const hidden=(mode==='videos'&&row.dataset.media!=='video')||(mode==='images'&&row.dataset.media!=='image');"
-                "row.hidden=hidden;"
-                "if(hidden){const cb=row.querySelector('.mediaSelect');if(cb)setMediaCheckboxState(cb,false);}"
+                "row.hidden=(mode==='videos'&&row.dataset.media!=='video')||(mode==='images'&&row.dataset.media!=='image');"
             "});"
-            "content.querySelectorAll('.dayMediaFilter .mediaFilterMode').forEach(function(b){b.classList.remove('active');});"
+            "content.querySelectorAll('.dayMediaFilter button').forEach(function(b){b.classList.remove('active');});"
             "button.classList.add('active');"
-            "updateDaySelection(content);"
-        "}"
-
-        "function setMediaCheckboxState(cb,selected){"
-        "    if(!cb)return;"
-        "    cb.checked=!!selected;"
-        "    const row=cb.closest('.recording[data-media]');"
-        "    if(row)row.classList.toggle('mediaSelected',cb.checked);"
-        "}"
-        ""
-        "function syncMediaSelectionRows(content){"
-        "    if(!content)return;"
-        "    content.querySelectorAll('.recording[data-media] .mediaSelect').forEach(function(cb){"
-        "        const row=cb.closest('.recording[data-media]');"
-        "        if(row)row.classList.toggle('mediaSelected',cb.checked);"
-        "    });"
-        "}"
-        ""
-        "function updateDaySelection(source){"
-        "    const content=source&&source.closest?source.closest('.daycontent'):source;"
-        "    if(!content)return;"
-        "    syncMediaSelectionRows(content);"
-        "    const selected=visibleSelectableRows(content).reduce(function(n,row){const cb=row.querySelector('.mediaSelect');return n+(cb&&cb.checked?1:0);},0);"
-        "    const btn=content.querySelector('.deleteSelectedBtn');"
-        "    if(btn){btn.disabled=selected===0;btn.textContent=selected?'Delete selected ('+selected+')':'Delete selected';}"
-        "}"
-        ""
-        "function setDaySelection(button,selected){"
-        "    const content=button.closest('.daycontent');"
-        "    if(!content)return;"
-        "    visibleSelectableRows(content).forEach(function(row){const cb=row.querySelector('.mediaSelect');if(cb)setMediaCheckboxState(cb,selected);});"
-        "    content._sfSelectionAnchor=null;"
-        "    updateDaySelection(content);"
-        "}"
-        ""
-        "function visibleSelectableRows(content){"
-        "    return Array.from(content.querySelectorAll('.recording[data-media]')).filter(function(row){return !row.hidden;});"
-        "}"
-        ""
-        "function selectMediaRange(content,anchorRow,targetRow,selected){"
-        "    const rows=visibleSelectableRows(content);"
-        "    const a=rows.indexOf(anchorRow),b=rows.indexOf(targetRow);"
-        "    if(a<0||b<0)return false;"
-        "    const from=Math.min(a,b),to=Math.max(a,b);"
-        "    for(let i=from;i<=to;i++){"
-        "        const cb=rows[i].querySelector('.mediaSelect');"
-        "        if(cb)setMediaCheckboxState(cb,selected);"
-        "    }"
-        "    return true;"
-        "}"
-        ""
-        "let mediaMouseDrag=null;"
-        "let suppressMediaSelectionClickUntil=0;"
-        ""
-        "function finishMediaMouseDrag(){"
-        "    if(!mediaMouseDrag)return;"
-        "    mediaMouseDrag=null;"
-        "    document.body.classList.remove('mediaRangeSelecting');"
-        "}"
-        ""
-        "document.addEventListener('mousedown',function(ev){"
-        "    if(ev.button!==0)return;"
-        "    const wrap=ev.target.closest?ev.target.closest('.mediaSelectWrap'):null;"
-        "    if(!wrap)return;"
-        "    const content=wrap.closest('.daycontent');"
-        "    const row=wrap.closest('.recording[data-media]');"
-        "    const cb=wrap.querySelector('.mediaSelect');"
-        "    if(!content||!row||!cb||row.hidden)return;"
-        "    ev.preventDefault();"
-        "    try{cb.focus({preventScroll:true});}catch(e){try{cb.focus();}catch(ignore){}}"
-        "    const selected=!cb.checked;"
-        "    const anchor=content._sfSelectionAnchor;"
-        "    if(ev.shiftKey&&anchor&&content.contains(anchor)){"
-        "        if(!selectMediaRange(content,anchor,row,selected))setMediaCheckboxState(cb,selected);"
-        "    }else{"
-        "        setMediaCheckboxState(cb,selected);"
-        "        content._sfSelectionAnchor=row;"
-        "    }"
-        "    mediaMouseDrag={content:content,selected:selected,lastRow:row};"
-        "    suppressMediaSelectionClickUntil=Date.now()+700;"
-        "    document.body.classList.add('mediaRangeSelecting');"
-        "    updateDaySelection(content);"
-        "},true);"
-        ""
-        "document.addEventListener('mouseover',function(ev){"
-        "    if(!mediaMouseDrag)return;"
-        "    const row=ev.target.closest?ev.target.closest('.recording[data-media]'):null;"
-        "    if(!row||row.hidden||row===mediaMouseDrag.lastRow)return;"
-        "    const content=row.closest('.daycontent');"
-        "    if(content!==mediaMouseDrag.content)return;"
-        "    const cb=row.querySelector('.mediaSelect');"
-        "    if(!cb)return;"
-        "    setMediaCheckboxState(cb,mediaMouseDrag.selected);"
-        "    mediaMouseDrag.lastRow=row;"
-        "    content._sfSelectionAnchor=row;"
-        "    updateDaySelection(content);"
-        "},true);"
-        ""
-        "document.addEventListener('mouseup',finishMediaMouseDrag,true);"
-        "window.addEventListener('blur',finishMediaMouseDrag);"
-        ""
-        "document.addEventListener('click',function(ev){"
-        "    const wrap=ev.target.closest?ev.target.closest('.mediaSelectWrap'):null;"
-        "    if(wrap&&Date.now()<suppressMediaSelectionClickUntil){"
-        "        ev.preventDefault();"
-        "        ev.stopPropagation();"
-        "    }"
-        "},true);"
-
-        "async function deleteSelectedMedia(button){"
-            "const content=button.closest('.daycontent');"
-            "const dayDetails=button.closest('details.day');"
-            "if(!content||!dayDetails)return;"
-            "const selected=visibleSelectableRows(content).map(function(row){return row.querySelector('.mediaSelect');}).filter(function(cb){return cb&&cb.checked;});"
-            "if(!selected.length)return;"
-            "if(!confirm(selected.length+' ausgewählte Datei(en) wirklich löschen?\\n\\nDiese Aktion kann nicht rückgängig gemacht werden.'))return;"
-            "button.disabled=true;button.textContent='Lösche 0 / '+selected.length+' ...';"
-            "let deleted=0;const failed=[];"
-            "for(let i=0;i<selected.length;i++){"
-                "const cb=selected[i];const path=cb.dataset.path||'';"
-                "try{"
-                    "const r=await fetch('/player_delete?path='+encodeURIComponent(path),{method:'POST',cache:'no-store'});"
-                    "const t=await r.text();"
-                    "if(!r.ok&&r.status!==202)throw new Error(t||('HTTP '+r.status));"
-                    "const row=cb.closest('.recording[data-media]');if(row)row.remove();"
-                    "deleted++;"
-                "}catch(e){failed.push(path+' – '+e.message);cb.checked=false;}"
-                "button.textContent='Lösche '+(i+1)+' / '+selected.length+' ...';"
-            "}"
-            "updateDayCount(dayDetails);"
-            "updateDaySelection(content);"
-            "if(content.querySelectorAll('.recording[data-media]').length===0){"
-                "const empty=document.createElement('div');empty.className='recording emptyrecording';empty.textContent='Keine Aufnahmen oder Snapshots an diesem Tag.';content.appendChild(empty);"
-            "}"
-            "try{sessionStorage.setItem(CACHE_PREFIX+dayDetails.dataset.day,content.innerHTML);}catch(e){}"
-            "if(failed.length){alert(deleted+' Datei(en) gelöscht. '+failed.length+' Datei(en) konnten nicht gelöscht werden.\\n\\n'+failed.join('\\n'));}"
         "}"
 
         "function openDayMedia(link){"
@@ -17196,82 +16896,41 @@ static void handleFiles()
             "c.innerHTML=cached;"
             "c.dataset.mediaMode='all';"
             "d.dataset.loaded='1';"
-            "syncMediaSelectionRows(c);"
             "updateDayCount(d);"
-            "updateDaySelection(c);"
             "return true;"
         "}"
 
-        "async function loadDay(d){"
-        "    if(d.dataset.loaded==='1')return;"
-        "    if(restoreDay(d))return;"
-        "    d.dataset.loaded='1';"
-        "    const c=d.querySelector('.daycontent');"
-        "    c.textContent='Verzeichnis wird gelesen ...';"
-        "    try{"
-        "        const r=await fetch('/files_day?day='+encodeURIComponent(d.dataset.day),{cache:'no-store'});"
-        "        if(r.status===409){"
-        "            showRecordingBlockedDialog();"
-        "            const blocked=new Error('recording_active');"
-        "            blocked.recordingBlocked=true;"
-        "            throw blocked;"
-        "        }"
-        "        if(!r.ok)throw new Error('HTTP '+r.status);"
-        "        const total=Math.max(0,Number(r.headers.get('X-Media-Count'))||0);"
-        "        const marker='<!--SFCHUNK-->';"
-        "        let loaded=0;"
-        "        c.innerHTML='';"
-        "        c.dataset.mediaMode='all';"
-        ""
-        "        function appendFragment(fragment){"
-        "            if(!fragment)return;"
-        "            c.insertAdjacentHTML('beforeend',fragment);"
-        "            const last=c.lastElementChild;"
-        "            if(last&&last.matches&&last.matches('.recording[data-media]')){"
-        "                loaded++;"
-        "                const mode=c.dataset.mediaMode||'all';"
-        "                last.hidden=(mode==='videos'&&last.dataset.media!=='video')||(mode==='images'&&last.dataset.media!=='image');"
-        "                const cb=last.querySelector('.mediaSelect');"
-        "                if(cb)setMediaCheckboxState(cb,cb.checked);"
-        "            }"
-        "            const count=d.querySelector('.count');"
-        "            if(count&&total>0)count.textContent=' ('+loaded+' / '+total+' geladen)';"
-        "        }"
-        ""
-        "        if(r.body&&r.body.getReader&&window.TextDecoder){"
-        "            const reader=r.body.getReader();"
-        "            const decoder=new TextDecoder();"
-        "            let pending='';"
-        "            while(true){"
-        "                const part=await reader.read();"
-        "                if(part.value)pending+=decoder.decode(part.value,{stream:!part.done});"
-        "                let split;"
-        "                while((split=pending.indexOf(marker))>=0){"
-        "                    appendFragment(pending.slice(0,split));"
-        "                    pending=pending.slice(split+marker.length);"
-        "                }"
-        "                if(part.done)break;"
-        "            }"
-        "            if(pending.length)appendFragment(pending);"
-        "        }else{"
-        "            const t=await r.text();"
-        "            t.split(marker).forEach(appendFragment);"
-        "        }"
-        ""
-        "        if(c.querySelectorAll('.recording[data-media]').length===0&&!c.querySelector('.emptyrecording')){"
-        "            c.innerHTML=\"<div class='recording emptyrecording'>Keine Aufnahmen oder Snapshots an diesem Tag.</div>\";"
-        "        }"
-        "        updateDayCount(d);"
-        "        updateDaySelection(c);"
-        "        try{sessionStorage.setItem(CACHE_PREFIX+d.dataset.day,c.innerHTML);}catch(e){}"
-        "    }catch(e){"
-        "        d.dataset.loaded='0';"
-        "        if(e&&e.recordingBlocked){"
-        "            c.textContent='Wird nach Aufnahmeende neu geladen ...';"
-        "            return;"
-        "        }"
-        "        c.textContent='Fehler beim Laden: '+e.message;"
-        "    }"
+        "function loadDay(d){"
+            "if(d.dataset.loaded==='1')return;"
+            "if(restoreDay(d))return;"
+            "d.dataset.loaded='1';"
+            "const c=d.querySelector('.daycontent');"
+            "c.textContent='Lade...';"
+            "fetch('/files_day?day='+encodeURIComponent(d.dataset.day),{cache:'no-store'})"
+            ".then(function(r){"
+                "if(r.status===409){"
+                    "showRecordingBlockedDialog();"
+                    "const blocked=new Error('recording_active');"
+                    "blocked.recordingBlocked=true;"
+                    "throw blocked;"
+                "}"
+                "if(!r.ok)throw new Error('HTTP '+r.status);"
+                "return r.text();"
+            "})"
+            ".then(function(t){"
+                "c.innerHTML=t;"
+                "c.dataset.mediaMode='all';"
+                "try{sessionStorage.setItem(CACHE_PREFIX+d.dataset.day,t);}catch(e){}"
+                "updateDayCount(d);"
+            "})"
+            ".catch(function(e){"
+                "d.dataset.loaded='0';"
+                "if(e&&e.recordingBlocked){"
+                    "c.textContent='Wird nach Aufnahmeende neu geladen ...';"
+                    "return;"
+                "}"
+                "c.textContent='Fehler beim Laden: '+e.message;"
+            "});"
         "}"
 
         "const dayElements=Array.from(document.querySelectorAll('details.day'));"
@@ -17309,19 +16968,6 @@ static void handleFiles()
                 "}"
             "}"
         "}"
-
-        "window.addEventListener('pageshow',function(){"
-            "let dirtyDay=null;"
-            "try{dirtyDay=sessionStorage.getItem('recordings.annotationDirtyDay');}catch(e){}"
-            "if(!dirtyDay)return;"
-            "try{sessionStorage.removeItem(CACHE_PREFIX+dirtyDay);sessionStorage.removeItem('recordings.annotationDirtyDay');}catch(e){}"
-            "const d=dayElements.find(function(x){return x.dataset.day===dirtyDay;});"
-            "if(!d)return;"
-            "d.dataset.loaded='0';"
-            "const c=d.querySelector('.daycontent');"
-            "if(c)c.innerHTML='';"
-            "if(d.open)loadDay(d);"
-        "});"
         "</script>";
 
 
@@ -18381,10 +18027,7 @@ void webConfigStart()
         });
 
         server.on("/activity", HTTP_GET, []() {
-            // /activity is the common visible-browser heartbeat used by both
-            // normal WebConfig pages and the standalone player. It therefore
-            // owns automatic maintenance-pause recovery as well as WiFi liveness.
-            maybeAutoPauseRecordingForWebUi();
+            noteRecordingUiSessionActivity();
 
             server.send(
                 204,
@@ -18474,12 +18117,13 @@ void webConfigStart()
     server.on("/shutting_down", HTTP_GET, handleShuttingDown);
     server.on("/shutdown_do", HTTP_POST, handleShutdownDo);
 
-    // V22: all /log* routes are registered by the dedicated log-reader module.
-    webLogReaderRegisterRoutes(server);
+    server.on("/log", HTTP_GET, handleLog);
+    server.on("/log_raw", HTTP_GET, handleLogRaw);
+    server.on("/log_chunk", HTTP_GET, handleLogChunk);
+    server.on("/log_clear", HTTP_POST, handleLogClear);
     server.on("/files", HTTP_GET, handleFiles);
     server.on("/files_day", HTTP_GET, handleFilesDay);
     server.on("/download_day", HTTP_GET, handleDownloadDay);
-    server.on("/download_day_status", HTTP_GET, handleDownloadDayStatus);
     server.on("/delete_day", HTTP_POST, handleDeleteDay);
     server.on("/file", HTTP_GET, handleFile);
 

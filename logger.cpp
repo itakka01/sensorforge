@@ -4,6 +4,7 @@
 #include "board_config.h"
 #include "storage_guard.h"
 #include "log_storage.h"
+#include "sensorforge_version.h"
 
 #include <FS.h>
 #include <Preferences.h>
@@ -24,8 +25,36 @@ static uint64_t logBytesWritten = 0;
 static uint8_t *logRamBuffer = nullptr;
 static size_t logRamBufferCapacity = 0;
 static size_t logRamBufferUsed = 0;
-static const size_t LOG_RAM_BUFFER_TARGET_BYTES = 16U * 1024U;
+static const size_t LOG_RAM_BUFFER_NORMAL_TARGET_BYTES = 16U * 1024U;
+static const size_t LOG_RAM_BUFFER_SHOOTER_TARGET_BYTES = 256U * 1024U;
 static const size_t LOG_RAM_BUFFER_MIN_BYTES = 4U * 1024U;
+
+// While the continuous shooter batches accepted JPEGs in PSRAM, normal log
+// traffic should follow the same persistence rhythm: keep it in PSRAM and let
+// the existing shooter flush path persist it immediately after the media batch.
+// 256 KiB is intentionally small compared with the shooter's reserved PSRAM
+// headroom, but large enough that ordinary status/error traffic cannot wake the
+// SD card during long (for example 30-minute) shooter batching windows.
+static bool logShooterBatchingPreferred()
+{
+    return
+        cfg_shooter_enabled != 0 &&
+        cfg_shooter_flush_seconds > 0;
+}
+
+static size_t logDesiredRamBufferBytes()
+{
+    return
+        logShooterBatchingPreferred()
+        ? LOG_RAM_BUFFER_SHOOTER_TARGET_BYTES
+        : LOG_RAM_BUFFER_NORMAL_TARGET_BYTES;
+}
+
+// Keep encrypted SFLOG1 record boundaries on complete text-line boundaries.
+// log_storage currently authenticates at most 1024 plaintext bytes per record.
+// If a physical record is later lost/torn and the reader resynchronizes, this
+// prevents the tail of one log line from being glued to the head of another.
+static const size_t LOG_STORAGE_RECORD_PLAINTEXT_MAX = 1024U;
 
 // Keep at most two log generations: current + .1 backup.
 // 5 MiB each gives a hard long-term budget of about 10 MiB.
@@ -471,7 +500,11 @@ bool firmwareInfoFinalizePendingInstallTime()
 void firmwareInfoLogStatus()
 {
     String line =
-        "Firmware: build=" +
+        "Firmware: release=" +
+        String(SENSORFORGE_RELEASE_TAG) +
+        " | release_date=" +
+        String(SENSORFORGE_RELEASE_DATE) +
+        " | build=" +
         firmwareBuildTimestamp() +
         " | installed=" +
         firmwareInstallTimestamp() +
@@ -773,31 +806,73 @@ static bool rotateActiveLogForNextWrite(
 
 static bool ensureLogRamBuffer()
 {
-    if (logRamBuffer && logRamBufferCapacity > 0)
-        return true;
+    size_t desired =
+        logDesiredRamBufferBytes();
 
-    size_t attempt = LOG_RAM_BUFFER_TARGET_BYTES;
+    if (
+        logRamBuffer &&
+        logRamBufferCapacity >= desired
+    ) {
+        return true;
+    }
+
+    // The logger normally starts with a small buffer. If the shooter is enabled
+    // later from WebConfig, grow lazily without discarding already queued log
+    // lines. Allocate the replacement first so an allocation failure leaves the
+    // existing queue intact.
+    size_t attempt = desired;
 
     while (attempt >= LOG_RAM_BUFFER_MIN_BYTES) {
-        logRamBuffer =
+        // Never replace a working buffer by a smaller one.
+        if (
+            logRamBuffer &&
+            attempt <= logRamBufferCapacity
+        ) {
+            return true;
+        }
+
+        uint8_t *replacement =
             (uint8_t *)heap_caps_malloc(
                 attempt,
                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
             );
 
-        if (logRamBuffer) {
+        if (replacement) {
+            if (
+                logRamBuffer &&
+                logRamBufferUsed > 0
+            ) {
+                memcpy(
+                    replacement,
+                    logRamBuffer,
+                    logRamBufferUsed
+                );
+            }
+
+            if (logRamBuffer)
+                heap_caps_free(logRamBuffer);
+
+            logRamBuffer = replacement;
             logRamBufferCapacity = attempt;
-            logRamBufferUsed = 0;
 
             Serial.printf(
-                "Logger RAM buffer: %u bytes PSRAM\n",
-                (unsigned)attempt
+                "Logger RAM buffer: %u bytes PSRAM | mode=%s\n",
+                (unsigned)attempt,
+                logShooterBatchingPreferred()
+                    ? "shooter-batched"
+                    : "normal"
             );
 
             return true;
         }
 
         attempt /= 2U;
+    }
+
+    if (logRamBuffer && logRamBufferCapacity > 0) {
+        // Keep the existing queue. If it eventually fills, the normal fail-safe
+        // path below will persist it rather than losing diagnostic data.
+        return true;
     }
 
     logRamBuffer = nullptr;
@@ -812,6 +887,33 @@ static bool ensureLogRamBuffer()
 }
 
 
+static size_t logBufferedFlushChunkLength(
+    const uint8_t *data,
+    size_t remaining
+)
+{
+    if (!data || remaining == 0)
+        return 0;
+
+    if (remaining <= LOG_STORAGE_RECORD_PLAINTEXT_MAX)
+        return remaining;
+
+    size_t limit = LOG_STORAGE_RECORD_PLAINTEXT_MAX;
+
+    // The RAM queue contains complete formatted lines. Prefer the last LF that
+    // fits in one authenticated SFLOG1 record so every persisted record ends
+    // cleanly between log lines.
+    for (size_t i = limit; i > 0; --i) {
+        if (data[i - 1U] == '\n')
+            return i;
+    }
+
+    // Defensive fallback for an unexpectedly huge single line. Normal
+    // SensorForge log lines are far below 1024 bytes, so this should not occur.
+    return limit;
+}
+
+
 static bool flushPendingLogBuffer()
 {
     if (logRamBufferUsed == 0)
@@ -823,14 +925,16 @@ static bool flushPendingLogBuffer()
     size_t offset = 0;
 
     // Keep each storage append at or below the native SFLOG1 plaintext-record
-    // size. This makes retries deterministic and avoids one large append hiding
-    // several authenticated record writes.
+    // size AND end it at a complete log-line boundary whenever possible.
     while (offset < logRamBufferUsed) {
         size_t chunk =
-            logRamBufferUsed - offset;
+            logBufferedFlushChunkLength(
+                logRamBuffer + offset,
+                logRamBufferUsed - offset
+            );
 
-        if (chunk > 1024U)
-            chunk = 1024U;
+        if (chunk == 0)
+            break;
 
         if (!rotateActiveLogForNextWrite(chunk))
             break;
@@ -946,6 +1050,11 @@ static bool appendBufferedLogBytes(
     }
 
     if (logRamBufferUsed + length > logRamBufferCapacity) {
+        // In shooter-batched mode ensureLogRamBuffer() has already attempted to
+        // expand the queue up to the dedicated 256-KiB target. Reaching this
+        // point is therefore an exceptional safety limit (or PSRAM pressure).
+        // Persist rather than dropping logs, even though that may cause one
+        // additional SD wake before the next media flush.
         if (!flushPendingLogBuffer())
             return false;
     }

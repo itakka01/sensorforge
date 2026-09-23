@@ -8508,7 +8508,11 @@ static uint64_t continuousShooterIntervalUs()
 {
     if (
         !cfg_shooter_enabled ||
-        cfg_shooter_interval_ms < 250
+        cfg_shooter_interval_ms < 250 ||
+        (
+            webConfigStarted &&
+            webConfigRecordingPaused()
+        )
     ) {
         return 0;
     }
@@ -9778,13 +9782,17 @@ static bool continuousShooterCapture(
         return false;
     }
 
-    // WebConfig's recording-automation pause is intentionally limited to the
-    // motion/alarm recording path. The independent time-based Dauershooter must
-    // keep running while an operator merely has WebConfig open. Only an active
-    // live preview owns the camera pipeline and therefore blocks a shooter frame.
+    // WebConfig maintenance pause now applies to all automatic camera capture:
+    // motion/alarm recording and the continuous shooter. Existing shooter RAM
+    // buffers are preserved; only NEW timed captures are suppressed while the
+    // visible WebConfig/player session keeps the pause lease alive. Live preview
+    // independently owns the camera pipeline and therefore also blocks capture.
     if (
         webConfigStarted &&
-        webConfigCameraPreviewActive()
+        (
+            webConfigRecordingPaused() ||
+            webConfigCameraPreviewActive()
+        )
     ) {
         return false;
     }
@@ -10459,7 +10467,7 @@ static bool configureLightSleepWakeSources()
     uint8_t shooterWakeKind = SHOOTER_WAKE_NONE;
 
     const bool shooterWakeRequired =
-        cfg_shooter_enabled != 0;
+        continuousShooterIntervalUs() > 0;
 
     bool shooterWakeArmed =
         !shooterWakeRequired;

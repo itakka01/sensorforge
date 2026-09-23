@@ -114,7 +114,8 @@ static bool isTemporaryRecordingName(
         lower.endsWith(".mkv.part") ||
         lower.endsWith(".srt.part") ||
         lower.endsWith(".jpg.part") ||
-        lower.endsWith(".jpeg.part");
+        lower.endsWith(".jpeg.part") ||
+        lower.endsWith(".note.tmp");
 }
 
 
@@ -511,6 +512,23 @@ static bool deleteRecordingPair(
             );
         }
     }
+
+    // Player annotations are stored as a sidecar using the complete media name
+    // (for example 123456.mkv.note). Delete it together with the recording so
+    // rollover cannot leave orphaned metadata behind.
+    String notePath =
+        videoPath +
+        ".note";
+
+    if (STORAGE.exists(notePath.c_str())) {
+        STORAGE.remove(
+            notePath.c_str()
+        );
+    }
+
+    STORAGE.remove(
+        (notePath + ".tmp").c_str()
+    );
 
     Serial.println(
         "Storage rollover deleted: " +

@@ -18,6 +18,6 @@ bool storageHasRequiredFreeSpace();
 // becomes available again.
 bool storagePrepareForRecording();
 
-// Removes only our interrupted temporary recording files:
-// *.avi.part, *.mkv.part, *.srt.part
+// Removes only SensorForge interrupted temporary media/metadata files:
+// *.avi.part, *.mkv.part, *.srt.part, *.jpg.part, *.jpeg.part, *.note.tmp
 int storageRecoverIncompleteRecordings();

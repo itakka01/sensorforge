@@ -1,4 +1,5 @@
 #include "webconfig.h"
+#include "web_log.h"
 #include "config.h"
 #include "language.h"
 #include "board_config.h"
@@ -9,13 +10,17 @@
 #include <WebServer.h>
 #include <esp_camera.h>
 #include <esp_system.h>
+#include <esp_sleep.h>
 #include <esp_task_wdt.h>
 #include <esp_arduino_version.h>
+#include <esp_ota_ops.h>
+#include <esp_err.h>
 #include <vector>
 #include <algorithm>
 #include <time.h>
 #include <stdlib.h>
 #include <math.h>
+#include <string.h>
 #include "logger.h"
 #include "webplayer.h"
 #include "recorder.h"
@@ -28,15 +33,31 @@
 #include "license.h"
 #include "recording_crypto.h"
 #include "recording_storage.h"
+#include "image_motion.h"
+#include "motion_diagnostics.h"
 
 
 // High-level recording state from the main firmware loop.
 // This is the same state used by the periodic STATUS line.
 extern bool recording;
+extern bool sdReady;
+
+#if defined(STORAGE_SPI)
+extern bool sdManualReadOnlyRecovery(
+    String &report,
+    uint32_t &mountedFrequencyHz,
+    bool &rawCardReady,
+    bool &sector0Readable
+);
+#endif
 
 // Gracefully finalizes an active recording when the operator explicitly
 // pauses the recording automation from WebConfig.
 extern void stopRecording();
+
+// Camera-backed image-motion test supplied by the main firmware. Test mode
+// analyzes frames only and never starts a recording.
+extern bool imageMotionWebTest(String &json, String &error);
 
 // OV3660 crop runtime control implemented by the main camera module.
 extern bool cameraApplyCropRuntime(
@@ -54,15 +75,9 @@ extern bool cameraMeasureTransportBlackReference(
     String &error
 );
 
-// Firmware-image validation helpers supplied by the existing SD auto-updater.
-// WebConfig stages the upload on SD and reuses these exact checks instead of
-// maintaining a second, potentially divergent OTA validator.
-extern bool firmwareValidateStagedImage(
-    const String &candidatePath,
-    size_t &firmwareSize,
-    String &error
-);
-extern size_t firmwareInactiveOtaCapacity();
+// Firmware compatibility information supplied by the main firmware.
+// The browser update streams directly into the inactive internal OTA partition
+// and uses the same board-specific marker as the SD auto-updater.
 extern const char *firmwareExpectedCompatibilityMarker();
 
 // Recording-event safety cooldown state supplied by the main firmware loop.
@@ -98,17 +113,85 @@ static bool webRoutesRegistered = false;
 // so an open browser session is not mistaken for inactivity.
 static uint32_t webLastActivityMs = 0;
 
+// Radar configuration is a synchronous UART maintenance operation. Keep WiFi
+// alive explicitly while it runs and for a short grace period afterwards so a
+// redirect/browser reconnect cannot race the normal WebConfig inactivity timer.
+static const uint32_t RADAR_WEB_MAINTENANCE_GRACE_MS = 120000UL;
+static const uint32_t RADAR_CALIBRATION_MAX_IDLE_HOLD_MS = 10UL * 60UL * 1000UL;
+static uint8_t radarWebMaintenanceDepth = 0;
+static uint32_t radarWebMaintenanceHoldUntilMs = 0;
+
 // Reboot is scheduled instead of executed directly inside the HTTP handler.
 // This gives the browser enough time to follow the POST/Redirect/GET flow and
 // render the reboot notice before the network connection disappears.
 static bool rebootScheduled = false;
 static uint32_t rebootAtMs = 0;
 
+// Manual software shutdown. Unlike the normal power-management sleep path,
+// this deliberately enables NO wake source. The ESP32-S3 therefore remains in
+// deep sleep until external reset or power is removed and applied again.
+static bool shutdownScheduled = false;
+static uint32_t shutdownAtMs = 0;
+
 static void noteWebActivity()
 {
     webLastActivityMs =
         millis();
 }
+
+static void radarWebMaintenanceBegin()
+{
+    if (radarWebMaintenanceDepth < 0xFFU)
+        radarWebMaintenanceDepth++;
+
+    noteWebActivity();
+}
+
+static void radarWebMaintenanceEnd()
+{
+    if (radarWebMaintenanceDepth > 0)
+        radarWebMaintenanceDepth--;
+
+    noteWebActivity();
+
+    if (radarWebMaintenanceDepth == 0) {
+        radarWebMaintenanceHoldUntilMs =
+            millis() + RADAR_WEB_MAINTENANCE_GRACE_MS;
+    }
+}
+
+static bool radarWebMaintenanceGraceActive()
+{
+    if (radarWebMaintenanceHoldUntilMs == 0)
+        return false;
+
+    if (
+        (int32_t)(
+            radarWebMaintenanceHoldUntilMs - millis()
+        ) > 0
+    ) {
+        return true;
+    }
+
+    radarWebMaintenanceHoldUntilMs = 0;
+    return false;
+}
+
+class RadarWebMaintenanceGuard {
+public:
+    RadarWebMaintenanceGuard()
+    {
+        radarWebMaintenanceBegin();
+    }
+
+    ~RadarWebMaintenanceGuard()
+    {
+        radarWebMaintenanceEnd();
+    }
+
+    RadarWebMaintenanceGuard(const RadarWebMaintenanceGuard &) = delete;
+    RadarWebMaintenanceGuard &operator=(const RadarWebMaintenanceGuard &) = delete;
+};
 
 static void serviceWebLongOperation()
 {
@@ -305,6 +388,14 @@ static bool cameraPreviewActive = false;
 static uint32_t cameraPreviewLastActivityMs = 0;
 static const uint32_t CAMERA_PREVIEW_TIMEOUT_MS = 2500UL;
 
+// Image-Motion diagnostics are deliberately slower than the camera preview.
+// Decoding/analyzing every preview JPEG would serialize the HTTP server behind
+// the relatively expensive JPEG motion analysis and make the live picture feel
+// much more sluggish than the normal camera preview. Keep the picture at its
+// normal cadence and update the diagnostic state at ~2 Hz instead.
+static uint32_t imageMotionPreviewLastAnalysisMs = 0;
+static const uint32_t IMAGE_MOTION_PREVIEW_ANALYSIS_INTERVAL_MS = 500UL;
+
 // Live Preview may temporarily test a crop before SAVE. That temporary sensor
 // state must never leak into later recordings. Leaving/losing the preview
 // restores the persisted cfg_camera_crop_* values automatically.
@@ -458,6 +549,68 @@ static String htmlText(
         htmlEscape(
             String(tr(id))
         );
+}
+
+
+static bool radarConfigAvailable()
+{
+    // This is the result of the robust four-attempt LD2410S startup check.
+    // It deliberately does not depend on current report freshness.
+    return radarSensorDetected();
+}
+
+
+static UiTextId motionSensorTypeUiId()
+{
+    if (radarConfigAvailable())
+        return UI_MOTION_SENSOR_RADAR;
+
+#if defined(BOARD_FREENOVE)
+    return UI_MOTION_SENSOR_SR602_PIR;
+#else
+    return UI_MOTION_SENSOR_PIR;
+#endif
+}
+
+
+static bool freenovePirCompatibilityNoteApplies()
+{
+#if defined(BOARD_FREENOVE)
+    return !radarConfigAvailable();
+#else
+    return false;
+#endif
+}
+
+
+static bool rejectRadarConfigurationUnavailable()
+{
+    if (radarConfigAvailable())
+        return false;
+
+    server.sendHeader(
+        "Cache-Control",
+        "no-store"
+    );
+
+    String message =
+        String(tr(UI_RADAR_CONFIG_UNAVAILABLE)) +
+        "\n\n" +
+        String(tr(UI_RADAR_CONFIG_PIR_NOTE));
+
+    if (freenovePirCompatibilityNoteApplies()) {
+        message +=
+            "\n\n" +
+            String(tr(UI_MOTION_PIR_FREENOVE_NOTE));
+    }
+
+    server.send(
+        409,
+        "text/plain; charset=utf-8",
+        message
+    );
+
+    return true;
 }
 
 
@@ -752,6 +905,9 @@ static String htmlHeader()
         ".dropdown a{display:block;text-decoration:none;color:var(--text);"
         "padding:9px 10px;border-radius:6px;margin:0;}"
         ".dropdown a:hover,.dropdown a.active{background:#eef4ff;color:#174ea6;}"
+        ".dropdown .nav-disabled{display:block;color:#98a2b3;padding:9px 10px;border-radius:6px;"
+        "margin:0;cursor:not-allowed;background:#f8fafc;}"
+        ".button.disabled{opacity:.5;cursor:not-allowed;pointer-events:none;}"
         ".dropdown .sep{height:1px;background:var(--line);margin:6px 4px;}"
         ".dropdown .danger-link{color:var(--danger);}"
         ".page{max-width:1200px;margin:20px auto;padding:0 14px 30px;}"
@@ -819,6 +975,20 @@ static String htmlHeader()
         ".modal-card p{margin:8px 0;color:var(--muted);line-height:1.5;}"
         ".modal-actions{display:flex;flex-wrap:wrap;gap:6px;margin-top:18px;}"
         ".modal-state{margin-top:12px;font-size:.88rem;color:var(--muted);}"
+        ".radar-cal-modal-card{width:min(600px,100%);text-align:center;padding:28px;}"
+        ".radar-cal-kicker{font-size:.78rem;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);}"
+        ".radar-cal-modal-card h3{font-size:1.45rem;margin:8px 0 4px;}"
+        ".radar-cal-big{font-size:4.4rem;line-height:1;font-weight:850;letter-spacing:-.04em;margin:24px 0 6px;color:var(--accent);}"
+        ".radar-cal-big-label{font-size:1rem;font-weight:700;color:#263445;margin-bottom:18px;}"
+        ".radar-cal-progress{height:12px;background:#e5e9ef;border-radius:999px;overflow:hidden;margin:18px 0 10px;}"
+        ".radar-cal-progress>span{display:block;width:0;height:100%;background:var(--accent);transition:width .3s ease;}"
+        ".radar-cal-hint{min-height:2.8em;margin:8px auto 18px;color:var(--muted);line-height:1.45;max-width:470px;}"
+        ".radar-cal-meta{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin:18px 0;}"
+        ".radar-cal-meta>div{border:1px solid var(--line);border-radius:9px;background:#f7f9fb;padding:12px 8px;}"
+        ".radar-cal-meta b{display:block;font-size:1.15rem;margin-bottom:3px;color:#1f2937;}"
+        ".radar-cal-meta span{display:block;font-size:.78rem;color:var(--muted);line-height:1.25;}"
+        ".radar-cal-modal-card .modal-actions{justify-content:center;}"
+        "@media(max-width:520px){.radar-cal-big{font-size:3.6rem}.radar-cal-meta{grid-template-columns:1fr}.radar-cal-modal-card{padding:22px 16px;}}"
         ".operation-card{max-width:620px;margin:26px auto;text-align:center;border:1px solid var(--line);"
         "border-radius:12px;padding:28px 22px;background:#fafbfc;}"
         ".operation-card .countdown{font-size:2.4rem;font-weight:700;margin:14px 0 4px;}"
@@ -927,8 +1097,36 @@ static String htmlHeader()
     html +=
         "<details class='navdrop' id='navSensor'><summary data-nav='sensor'>" +
         htmlText(UI_NAV_SENSOR) +
-        "</summary><div class='dropdown'><a href='/radar_config'>" +
-        htmlText(UI_NAV_RADAR_CONFIG) +
+        "</summary><div class='dropdown'>";
+
+    if (radarConfigAvailable()) {
+        html +=
+            "<a href='/radar_config'>" +
+            htmlText(UI_NAV_RADAR_CONFIG) +
+            "</a>";
+    } else {
+        String radarUnavailableTitle =
+            htmlText(UI_RADAR_CONFIG_PIR_NOTE);
+
+        if (freenovePirCompatibilityNoteApplies()) {
+            radarUnavailableTitle +=
+                " " +
+                htmlText(UI_MOTION_PIR_FREENOVE_NOTE);
+        }
+
+        html +=
+            "<span class='nav-disabled' title='" +
+            radarUnavailableTitle +
+            "'>" +
+            htmlText(UI_NAV_RADAR_CONFIG) +
+            " &middot; " +
+            htmlText(motionSensorTypeUiId()) +
+            "</span>";
+    }
+
+    html +=
+        "<a href='/image_motion'>" +
+        htmlText(UI_NAV_IMAGE_MOTION) +
         "</a><a href='/#simulation'>" +
         htmlText(UI_NAV_SIMULATE_MOTION) +
         "</a></div></details>";
@@ -940,6 +1138,9 @@ static String htmlHeader()
 
     html +=
         "<a href='/sdstatus'>" + htmlText(UI_NAV_SD_STATUS) + "</a>"
+#if defined(STORAGE_SPI)
+        "<a href='/sd_recovery'>" + htmlText(UI_NAV_SD_RECOVERY) + "</a>"
+#endif
         "<a href='/log'>" + htmlText(UI_NAV_LOG_VIEWER) + "</a>"
         "<a href='/sysinfo'>" + htmlText(UI_NAV_SYSTEM_INFO) + "</a>"
         "<a href='/board'>" + htmlText(UI_NAV_BOARD_INFO) + "</a>"
@@ -950,6 +1151,9 @@ static String htmlHeader()
         "<a href='/transport'>" + htmlText(UI_NAV_TRANSPORT) + "</a>"
         "<div class='sep'></div><a class='danger-link' href='/reboot'>" +
         htmlText(UI_NAV_REBOOT) +
+        "</a>"
+        "<a class='danger-link' href='/shutdown'>" +
+        htmlText(UI_NAV_SHUTDOWN) +
         "</a></div></details>";
 
     html +=
@@ -1128,7 +1332,7 @@ static String htmlFooter()
         "if(p==='/')group='home';"
         "else if(p==='/config'||p==='/save')group='config';"
         "else if(p.indexOf('/files')===0||p==='/file'||p==='/play')group='recordings';"
-        "else if(p==='/preview'||p==='/snapshot')group='camera';"
+        "else if(p==='/preview'||p==='/snapshot')group='camera';else if(p==='/image_motion')group='sensor';"
         "else if(p.indexOf('/radar_')===0)group='sensor';"
         "else group='system';"
         "var active=document.querySelector('[data-nav=\"'+group+'\"]');"
@@ -1279,6 +1483,110 @@ static void handleUiStatus()
         String(SENSORFORGE_THERMAL_RTC_EMERGENCY_C, 1) +
         ",\"thermal_rtc_recovery_c\":" +
         String(SENSORFORGE_THERMAL_RTC_RECOVERY_C, 1) +
+        "}";
+
+    server.sendHeader(
+        "Cache-Control",
+        "no-store"
+    );
+
+    server.send(
+        200,
+        "application/json",
+        json
+    );
+}
+
+
+static void handleMotionStatus()
+{
+    MotionDiagnosticsSnapshot diagnostics;
+    motionDiagnosticsGetSnapshot(diagnostics);
+
+    bool radarDetected =
+        radarConfigAvailable();
+
+    bool radarTrackingAvailable =
+        radarMotionTrackingAvailable();
+
+    bool useRadarTrigger =
+        radarDetected &&
+        radarTrackingAvailable;
+
+    bool physicalMotionActive =
+        useRadarTrigger
+        ? diagnostics.radarMotionActive
+        : diagnostics.presenceActive;
+
+    bool simulatedMotion =
+        webConfigMotionActive();
+
+    bool operationalMotionActive =
+        physicalMotionActive ||
+        simulatedMotion;
+
+    uint32_t primaryTriggerCount =
+        useRadarTrigger
+        ? diagnostics.radarTriggerCount
+        : diagnostics.presenceTriggerCount;
+
+    bool primaryLastTriggerValid =
+        useRadarTrigger
+        ? diagnostics.radarLastTriggerValid
+        : diagnostics.presenceLastTriggerValid;
+
+    uint32_t primaryLastTriggerAgeMs =
+        useRadarTrigger
+        ? diagnostics.radarLastTriggerAgeMs
+        : diagnostics.presenceLastTriggerAgeMs;
+
+    String json =
+        String("{\"sensor_type\":\"") +
+        (radarDetected ? "radar" : "pir") +
+        "\",\"presence_pin\":" +
+        String((int)PRESENCE_PIN) +
+        ",\"presence_active\":" +
+        (diagnostics.presenceActive ? "true" : "false") +
+        ",\"presence_trigger_count\":" +
+        String(diagnostics.presenceTriggerCount) +
+        ",\"presence_last_trigger_valid\":" +
+        (diagnostics.presenceLastTriggerValid ? "true" : "false") +
+        ",\"presence_last_trigger_age_ms\":" +
+        String(diagnostics.presenceLastTriggerAgeMs) +
+        ",\"radar_detected\":" +
+        (radarDetected ? "true" : "false") +
+        ",\"radar_tracking_available\":" +
+        (radarTrackingAvailable ? "true" : "false") +
+        ",\"radar_motion_active\":" +
+        (diagnostics.radarMotionActive ? "true" : "false") +
+        ",\"radar_trigger_count\":" +
+        String(diagnostics.radarTriggerCount) +
+        ",\"radar_last_trigger_valid\":" +
+        (diagnostics.radarLastTriggerValid ? "true" : "false") +
+        ",\"radar_last_trigger_age_ms\":" +
+        String(diagnostics.radarLastTriggerAgeMs) +
+        ",\"radar_last_gate\":" +
+        String(radarLastMotionGate()) +
+        ",\"radar_last_energy_db\":" +
+        String(radarLastMotionEnergyDb(), 1) +
+        ",\"primary_source\":\"" +
+        (useRadarTrigger ? "radar" : "presence") +
+        "\",\"primary_trigger_count\":" +
+        String(primaryTriggerCount) +
+        ",\"primary_last_trigger_valid\":" +
+        (primaryLastTriggerValid ? "true" : "false") +
+        ",\"primary_last_trigger_age_ms\":" +
+        String(primaryLastTriggerAgeMs) +
+        ",\"physical_motion_active\":" +
+        (physicalMotionActive ? "true" : "false") +
+        ",\"simulated_motion\":" +
+        (simulatedMotion ? "true" : "false") +
+        ",\"motion_active\":" +
+        (operationalMotionActive ? "true" : "false") +
+        ",\"image_motion_mode\":\"" +
+        cfg_motion_recording_decision +
+        "\",\"image_motion\":" +
+        imageMotionDiagnosticsJson() +
         "}";
 
     server.sendHeader(
@@ -1653,16 +1961,29 @@ static void handleRoot()
     bool simulatedMotion =
         webConfigMotionActive();
 
-    bool radarMotion =
-        radarMotionActive();
+    bool radarDetected =
+        radarConfigAvailable();
 
-    bool ot2Active =
-        digitalRead(PIR_PIN) == HIGH;
+    bool radarTrackingAvailable =
+        radarMotionTrackingAvailable();
+
+    MotionDiagnosticsSnapshot motionDiagnostics;
+    motionDiagnosticsGetSnapshot(motionDiagnostics);
+
+    bool radarMotion =
+        motionDiagnostics.radarMotionActive;
+
+    bool presenceInputActive =
+        motionDiagnostics.presenceActive;
+
+    bool physicalMotionActive =
+        radarDetected && radarTrackingAvailable
+        ? radarMotion
+        : presenceInputActive;
 
     bool motionActive =
         simulatedMotion ||
-        radarMotion ||
-        ot2Active;
+        physicalMotionActive;
 
     float cpuTempC =
         thermalCpuTemperatureC();
@@ -1989,22 +2310,138 @@ static void handleRoot()
         String(cfg_fps) +
         " fps</div></section>";
 
+    String presencePillClass;
+
+    if (!presenceInputActive) {
+        presencePillClass = "ok";
+    } else if (radarDetected && !radarMotion) {
+        // OT2 can remain HIGH for the sensor's own hold/absence time even
+        // after the fast UART gate evaluation has returned to idle. Do not
+        // present that raw hardware level as an active alarm.
+        presencePillClass = "warn";
+    } else {
+        presencePillClass = "danger";
+    }
+
     html +=
         "<section class='dash-card'><div class='card-label'>" +
         htmlText(UI_CARD_MOTION) +
-        "</div><div class='card-value'>" +
+        "</div><div id='motionCardValue' class='card-value'>" +
         htmlText(
             motionActive
             ? UI_MOTION_DETECTED
             : UI_MOTION_NONE
         ) +
-        "</div><div class='card-note'>OT2=" +
-        String(ot2Active ? "1" : "0") +
-        " &middot; Radar=" +
-        String(radarMotion ? "1" : "0") +
-        " &middot; Simulation=" +
+        "</div><div class='card-note'>" +
+        htmlText(UI_MOTION_SENSOR_TYPE) +
+        ": <b>" +
+        htmlText(motionSensorTypeUiId()) +
+        "</b><br><b>" +
+        htmlText(UI_MOTION_CURRENT_SENSOR_STATUS) +
+        ":</b> <span id='motionPresenceLabel'>" +
+        htmlText(
+            radarDetected
+            ? UI_MOTION_OT2_GPIO
+            : UI_MOTION_PIR_GPIO
+        ) +
+        " " +
+        String((int)PRESENCE_PIN) +
+        "</span>: <b id='motionPresenceState' class='status-pill " +
+        presencePillClass +
+        "'>" +
+        String(presenceInputActive ? "HIGH" : "LOW") +
+        "</b>";
+
+    html +=
+        "<span id='motionRadarRow' style='" +
+        String(radarDetected ? "" : "display:none") +
+        "'> &middot; <b>" +
+        htmlText(UI_MOTION_RADAR_EVALUATION) +
+        ":</b> <span id='motionRadarState'>" +
+        (
+            radarTrackingAvailable
+            ? htmlText(
+                radarMotion
+                ? UI_MOTION_RADAR_EVALUATION_ACTIVE
+                : UI_MOTION_RADAR_EVALUATION_NONE
+            )
+            : htmlText(UI_MOTION_RADAR_FALLBACK)
+        ) +
+        "</span></span>";
+
+    html +=
+        "<span id='motionRadarLastRow' style='" +
+        String(radarDetected ? "" : "display:none") +
+        "'><br><b>" +
+        htmlText(UI_MOTION_LAST_RADAR_TRIGGER) +
+        ":</b> " +
+        htmlText(UI_MOTION_GATE) +
+        " <span id='motionRadarGate'>" +
+        (radarLastMotionGate() >= 0 ? String(radarLastMotionGate()) : String("-")) +
+        "</span> &middot; " +
+        htmlText(UI_MOTION_ENERGY) +
+        " <span id='motionRadarEnergy'>" +
+        (radarLastMotionGate() >= 0 ? String(radarLastMotionEnergyDb(), 1) : String("-")) +
+        "</span> dB &middot; <b id='motionRadarLastTriggerAge'>" +
+        htmlText(UI_MOTION_NO_TRIGGER_YET) +
+        "</b></span>";
+
+    html +=
+        "<br><b>" +
+        htmlText(UI_IMAGE_MOTION_LIVE_STATUS) +
+        ":</b> <span id='motionImageState' class='status-pill warn'>" +
+        htmlText(UI_IMAGE_MOTION_LIVE_WAITING) +
+        "</span><span id='motionImageLastRow'> &middot; <b>" +
+        htmlText(UI_IMAGE_MOTION_LIVE_LAST_DETECTION) +
+        ":</b> <span id='motionImageLast'>" +
+        htmlText(UI_IMAGE_MOTION_LIVE_NEVER) +
+        "</span></span>";
+
+    html +=
+        "<br>Simulation=<span id='motionSimulationState'>" +
         String(simulatedMotion ? "1" : "0") +
+        "</span><span id='motionPirLastTriggerRow' style='" +
+        String(radarDetected ? "display:none" : "") +
+        "'> &middot; " +
+        htmlText(UI_MOTION_LAST_TRIGGER) +
+        ": <b id='motionLastTrigger'>" +
+        htmlText(UI_MOTION_NO_TRIGGER_YET) +
+        "</b></span> &middot; " +
+        htmlText(UI_MOTION_TRIGGERS_SINCE_OPEN) +
+        ": <b id='motionTriggerCount'>0</b>";
+
+    if (freenovePirCompatibilityNoteApplies()) {
+        html +=
+            "<br><span class='muted' style='display:inline-block;margin-top:8px'>" +
+            htmlText(UI_MOTION_PIR_FREENOVE_NOTE) +
+            "</span>";
+    }
+
+    html +=
         "</div></section>";
+
+    html +=
+        "<div id='motionLiveConfig' hidden"
+        " data-base-presence='" + String(motionDiagnostics.presenceTriggerCount) + "'"
+        " data-base-radar='" + String(motionDiagnostics.radarTriggerCount) + "'"
+        " data-detected='" + htmlText(UI_MOTION_DETECTED) + "'"
+        " data-none='" + htmlText(UI_MOTION_NONE) + "'"
+        " data-active='" + htmlText(UI_STATUS_ACTIVE) + "'"
+        " data-radar-active='" + htmlText(UI_MOTION_RADAR_EVALUATION_ACTIVE) + "'"
+        " data-radar-none='" + htmlText(UI_MOTION_RADAR_EVALUATION_NONE) + "'"
+        " data-fallback='" + htmlText(UI_MOTION_RADAR_FALLBACK) + "'"
+        " data-no-trigger='" + htmlText(UI_MOTION_NO_TRIGGER_YET) + "'"
+        " data-ago='" + htmlText(UI_MOTION_AGO) + "'"
+        " data-ago-suffix='" + htmlText(UI_MOTION_AGO_SUFFIX) + "'"
+        " data-image-detected='" + htmlText(UI_IMAGE_MOTION_LIVE_DETECTED) + "'"
+        " data-image-none='" + htmlText(UI_IMAGE_MOTION_LIVE_NONE) + "'"
+        " data-image-learning='" + htmlText(UI_IMAGE_MOTION_LIVE_LEARNING) + "'"
+        " data-image-light='" + htmlText(UI_IMAGE_MOTION_LIVE_GLOBAL_LIGHT) + "'"
+        " data-image-error='" + htmlText(UI_IMAGE_MOTION_LIVE_ERROR) + "'"
+        " data-image-waiting='" + htmlText(UI_IMAGE_MOTION_LIVE_WAITING) + "'"
+        " data-image-inactive='" + htmlText(UI_IMAGE_MOTION_LIVE_INACTIVE) + "'"
+        " data-image-never='" + htmlText(UI_IMAGE_MOTION_LIVE_NEVER) + "'"
+        "></div>";
 
     html +=
         "<section class='dash-card'><div class='card-label'>" +
@@ -2420,14 +2857,87 @@ static void handleRoot()
         "</script>";
 
     html +=
+        "<script>"
+        "(function(){"
+        "var c=document.getElementById('motionLiveConfig');if(!c)return;"
+        "var value=document.getElementById('motionCardValue');"
+        "var pState=document.getElementById('motionPresenceState');"
+        "var radarRow=document.getElementById('motionRadarRow');"
+        "var radarLastRow=document.getElementById('motionRadarLastRow');"
+        "var radarState=document.getElementById('motionRadarState');"
+        "var radarGate=document.getElementById('motionRadarGate');"
+        "var radarEnergy=document.getElementById('motionRadarEnergy');"
+        "var radarLastAge=document.getElementById('motionRadarLastTriggerAge');"
+        "var pirLastRow=document.getElementById('motionPirLastTriggerRow');"
+        "var simState=document.getElementById('motionSimulationState');"
+        "var lastEl=document.getElementById('motionLastTrigger');"
+        "var countEl=document.getElementById('motionTriggerCount');"
+        "var imageState=document.getElementById('motionImageState');"
+        "var imageLast=document.getElementById('motionImageLast');"
+        "var imageLastRow=document.getElementById('motionImageLastRow');"
+        "var basePresence=Number(c.dataset.basePresence)||0;"
+        "var baseRadar=Number(c.dataset.baseRadar)||0;"
+        "function ageText(valid,ms){if(!valid)return c.dataset.noTrigger;ms=Math.max(0,Number(ms)||0);"
+            "if(ms<10000)return c.dataset.ago+(c.dataset.ago?' ':'')+(ms/1000).toFixed(1)+' s'+c.dataset.agoSuffix;"
+            "if(ms<60000)return c.dataset.ago+(c.dataset.ago?' ':'')+Math.floor(ms/1000)+' s'+c.dataset.agoSuffix;"
+            "var sec=Math.floor(ms/1000);var min=Math.floor(sec/60);sec%=60;return c.dataset.ago+(c.dataset.ago?' ':'')+min+' min '+sec+' s'+c.dataset.agoSuffix;}"
+        "function imageAgeText(valid,ms){if(!valid)return c.dataset.imageNever;return ageText(true,ms);}"
+        "function imageStateText(mode,d){if(mode==='direct')return c.dataset.imageInactive;if(!d||!d.last_analysis_valid||Number(d.last_analysis_age_ms)>2500)return c.dataset.imageWaiting;if(d.motion_active||d.image_motion_state==='confirmed')return c.dataset.imageDetected;if(d.image_motion_state==='background_init')return c.dataset.imageLearning;if(d.image_motion_state==='global_change')return c.dataset.imageLight;if(d.image_motion_state==='error')return c.dataset.imageError;return c.dataset.imageNone;}"
+        "function applyMotion(s){"
+            "if(value)value.textContent=s.motion_active?c.dataset.detected:c.dataset.none;"
+            "if(pState){pState.textContent=s.presence_active?'HIGH':'LOW';"
+                "pState.classList.remove('danger','warn','ok');"
+                "if(!s.presence_active)pState.classList.add('ok');"
+                "else if(s.radar_detected&&!s.radar_motion_active)pState.classList.add('warn');"
+                "else pState.classList.add('danger');}"
+            "if(simState)simState.textContent=s.simulated_motion?'1':'0';"
+            "if(radarRow)radarRow.style.display=s.radar_detected?'':'none';"
+            "if(radarLastRow)radarLastRow.style.display=s.radar_detected?'':'none';"
+            "if(pirLastRow)pirLastRow.style.display=s.radar_detected?'none':'';"
+            "if(radarState)radarState.textContent=s.radar_tracking_available?(s.radar_motion_active?c.dataset.radarActive:c.dataset.radarNone):c.dataset.fallback;"
+            "if(radarGate)radarGate.textContent=Number(s.radar_last_gate)>=0?String(Number(s.radar_last_gate)):'-';"
+            "if(radarEnergy)radarEnergy.textContent=Number(s.radar_last_gate)>=0?Number(s.radar_last_energy_db).toFixed(1):'-';"
+            "if(radarLastAge)radarLastAge.textContent=ageText(!!s.radar_last_trigger_valid,s.radar_last_trigger_age_ms);"
+            "if(lastEl)lastEl.textContent=ageText(!!s.primary_last_trigger_valid,s.primary_last_trigger_age_ms);"
+            "if(countEl){var base=s.primary_source==='radar'?baseRadar:basePresence;countEl.textContent=String(Math.max(0,(Number(s.primary_trigger_count)||0)-base));}"
+            "var im=s.image_motion||{};var imMode=s.image_motion_mode||'direct';"
+            "if(imageState){imageState.textContent=imageStateText(imMode,im);imageState.classList.remove('danger','warn','ok');if(imMode==='direct')imageState.classList.add('ok');else if(im.motion_active||im.image_motion_state==='confirmed')imageState.classList.add('danger');else if(!im.last_analysis_valid||Number(im.last_analysis_age_ms)>2500||im.image_motion_state==='background_init'||im.image_motion_state==='global_change')imageState.classList.add('warn');else if(im.image_motion_state==='error')imageState.classList.add('danger');else imageState.classList.add('ok');}"
+            "if(imageLastRow)imageLastRow.style.display=imMode==='direct'?'none':'';"
+            "if(imageLast)imageLast.textContent=imageAgeText(!!im.last_detection_valid,im.last_detection_age_ms);"
+        "}"
+        "function pollMotion(){if(document.hidden)return;fetch('/motion_status?t='+Date.now(),{cache:'no-store',credentials:'same-origin'})"
+            ".then(function(r){if(!r.ok)throw new Error();return r.json();}).then(applyMotion).catch(function(){});}"
+        "pollMotion();setInterval(pollMotion,250);"
+        "document.addEventListener('visibilitychange',function(){if(!document.hidden)pollMotion();});"
+        "})();"
+        "</script>";
+
+    html +=
         "<div class='quick-actions'>"
         "<a class='button primary' href='/files'>" +
         htmlText(UI_NAV_RECORDINGS) +
         "</a><a class='button' href='/preview'>" +
         htmlText(UI_NAV_LIVE_PREVIEW) +
-        "</a><a class='button' href='/radar_config'>" +
-        htmlText(UI_RADAR) +
-        "</a><a class='button' href='/config'>" +
+        "</a>";
+
+    if (radarConfigAvailable()) {
+        html +=
+            "<a class='button' href='/radar_config'>" +
+            htmlText(UI_RADAR) +
+            "</a>";
+    } else {
+        html +=
+            "<span class='button disabled' title='" +
+            htmlText(UI_RADAR_CONFIG_PIR_NOTE) +
+            "'>" +
+            htmlText(UI_RADAR) +
+            " &middot; " +
+            htmlText(UI_MOTION_SENSOR_PIR) +
+            "</span>";
+    }
+
+    html +=
+        "<a class='button' href='/config'>" +
         htmlText(UI_NAV_CONFIGURATION) +
         "</a><a class='button' href='/transport'>" +
         htmlText(UI_NAV_TRANSPORT) +
@@ -2995,15 +3505,57 @@ static void handleConfig()
     html += "camera: <input name='camera' value='" +
             htmlEscape(cfg_camera) + "'><br>";
 
-    html += "resolution: <input name='resolution' value='" +
+    html += "resolution: <input id='cfgResolution' name='resolution' value='" +
             htmlEscape(cfg_resolution) + "'><br>";
 
-    html += "fps: <input name='fps' type='number' min='1' max='30' value='" +
+    int recordingPerformanceMaxFps =
+        configRecordingPerformanceMaxFps(
+            cfg_resolution,
+            cfg_quality
+        );
+
+    if (recordingPerformanceMaxFps < 1)
+        recordingPerformanceMaxFps = 30;
+
+    html += "fps: <input id='cfgFps' name='fps' type='number' min='1' max='" +
+            String(recordingPerformanceMaxFps) + "' value='" +
             String(cfg_fps) + "'><br>";
 
-    html += "quality: <input name='quality' type='number' min='0' max='63' value='" +
+    html += "quality: <input id='cfgQuality' name='quality' type='number' min='0' max='63' value='" +
             String(cfg_quality) + "'>"
-            " <small>(kleiner = bessere JPEG-Qualität, Testwert: 12)</small><br>";
+            " <small>(kleiner = bessere JPEG-Qualität und meist größere Dateien; Referenzwert: 12)</small><br>";
+
+    html +=
+        "<small id='recordingPerformanceHint' class='muted'></small><br>";
+
+    html += "<script>(function(){";
+    html += "const cap=" +
+            String((unsigned long)configRecordingPerformanceLimit()) +
+            ";";
+    html +=
+        "const px={'160x120':19200,'320x240':76800,'640x480':307200,"
+        "'800x600':480000,'1024x768':786432,'1280x1024':1310720,"
+        "'1600x1200':1920000,'2048x1536':3145728};"
+        "const r=document.getElementById('cfgResolution');"
+        "const f=document.getElementById('cfgFps');"
+        "const q=document.getElementById('cfgQuality');"
+        "const h=document.getElementById('recordingPerformanceHint');"
+        "function qw(v){v=Math.max(0,Math.min(63,Number(v)||0));"
+        "if(v>=12)return 100;return Math.min(160,100+(12-v)*5);}"
+        "function update(){"
+        "const p=px[(r.value||'').trim()];"
+        "if(!cap){f.max=30;h.textContent='Für dieses Board ist noch kein Performance-Oberdeckel qualifiziert.';return;}"
+        "if(!p){f.max=30;h.textContent='Performance-Limit wird nach Eingabe einer unterstützten Auflösung angezeigt.';return;}"
+        "const w=qw(q.value);"
+        "const m=Math.max(0,Math.min(30,Math.floor((cap*100)/(p*w))));"
+        "f.max=Math.max(1,m);"
+        "if(m<1){h.textContent='Diese Auflösung/JPEG-Qualität überschreitet bereits bei 1 fps das Board-Limit.';return;}"
+        "const load=Math.ceil((p*(Number(f.value)||0)*w)/100);"
+        "h.textContent='Board-Leistungsgrenze: max. '+m+' fps für diese Auflösung/Qualität. '+"
+        "'Aktueller Lastwert: '+load.toLocaleString('de-DE')+' / '+cap.toLocaleString('de-DE')+'.';"
+        "}"
+        "r.addEventListener('input',update);q.addEventListener('input',update);f.addEventListener('input',update);update();"
+        "})();</script>";
 
     html += "camera_xclk_mhz: <select name='camera_xclk_mhz'>";
     html += "<option value='10'" +
@@ -3097,6 +3649,23 @@ static void handleConfig()
 
     html += "</div><div class='settings-section'><h3>Aufnahme</h3>";
 
+    html +=
+        "<div style='margin:0 0 18px 0;padding:14px;border:1px solid #d8dee6;border-radius:8px;background:#f8fbff'>"
+        "<b>" + htmlText(UI_RECORDING_TRIGGER_MODE) + "</b><br>"
+        "<select name='motion_recording_decision' style='min-width:320px;max-width:100%'>"
+        "<option value='direct'" + String(cfg_motion_recording_decision == "direct" ? " selected" : "") + ">" + htmlText(UI_RECORDING_TRIGGER_DIRECT) + "</option>"
+        "<option value='image_verify'" + String(cfg_motion_recording_decision == "image_verify" ? " selected" : "") + ">" + htmlText(UI_RECORDING_TRIGGER_VERIFY) + "</option>"
+        "<option value='image_only'" + String(cfg_motion_recording_decision == "image_only" ? " selected" : "") + ">" + htmlText(UI_RECORDING_TRIGGER_IMAGE_ONLY) + "</option>"
+        "</select><br>"
+        "<small class='muted'>" + htmlText(UI_RECORDING_TRIGGER_HELP) + "</small>";
+
+    html +=
+        "<div style='margin-top:8px'><a href='/image_motion'>" +
+        htmlText(UI_RECORDING_TRIGGER_IMAGE_SETTINGS) +
+        "</a></div>";
+
+    html += "</div>";
+
     html += "recording_format: <select name='recording_format'>";
 
     html += "<option value='avi'" +
@@ -3178,6 +3747,18 @@ static void handleConfig()
                 "</small><br>";
         }
     }
+
+    html +=
+        "<div style='margin-top:18px;padding:14px;border:1px solid #d8dee6;border-radius:8px;background:#f8fbff'>"
+        "<b>Periodische Snapshots</b><br>"
+        "<span class='muted'>Zusätzlich zu Alarmvideos kann SensorForge in einem festen Zeitraster einzelne JPEG-Bilder speichern. "
+        "Alarmaufnahmen haben immer Vorrang. Für einen sauber belichteten Snapshot werden drei Kamerabilder verworfen und erst das vierte gespeichert. "
+        "Bei aktivierter Aufnahmeverschlüsselung werden auch Snapshots verschlüsselt gespeichert.</span><br><br>"
+        "Intervall: <input name='periodic_snapshot_minutes' type='number' min='0' max='1440' step='1' value='" +
+        String(cfg_periodic_snapshot_minutes) +
+        "' style='width:90px'> Minuten "
+        "<small>(0 = aus; z. B. 10 = 00, 10, 20, 30 ... Minuten)</small>"
+        "</div>";
 
     html += "post_record_ms: <input name='post_record_ms' type='number' min='0' value='" +
             String(cfg_post_ms) + "'><br>";
@@ -3354,7 +3935,23 @@ static void handleConfig()
     html += "sleep_delay_ms: <input name='sleep_delay_ms' type='number' "
             "min='0' max='60000' value='" +
             String(cfg_sleep_delay_ms) +
-            "'> <small>(0..60000 ms)</small><br>";
+            "'> <small>(0..60000 ms)</small><br><br>";
+
+    html +=
+        "<b>Bootloop-/Unterspannungsschutz</b><br>"
+        "<span class='muted'>Schützt SensorForge vor wiederholten kurzen Neustarts, "
+        "z. B. wenn ein fast leerer oder instabiler Akku beim Hochfahren immer wieder einbricht. "
+        "Nach mehreren unvollständigen Starts legt das Gerät automatisch eine längere Deep-Sleep-Pause ein. "
+        "Normales Ausschalten nach stabilem Betrieb wird nicht als Fehler gewertet.</span><br>";
+
+    html += "bootloop_protection: <select name='bootloop_protection'>";
+    html += "<option value='1'" +
+            String(cfg_bootloop_protection ? " selected" : "") +
+            ">1 - aktiviert (empfohlen)</option>";
+    html += "<option value='0'" +
+            String(!cfg_bootloop_protection ? " selected" : "") +
+            ">0 - deaktiviert</option>";
+    html += "</select> <small>(vollständige Wirkung ab dem nächsten Neustart)</small><br>";
 
 
     html += "</div><div class='settings-section'><h3>Transportmodus</h3>";
@@ -3747,6 +4344,29 @@ static void handleSave()
     }
 
 
+    String motionRecordingDecision =
+        server.arg("motion_recording_decision");
+
+    motionRecordingDecision.trim();
+    motionRecordingDecision.toLowerCase();
+
+    if (
+        motionRecordingDecision != "direct" &&
+        motionRecordingDecision != "image_verify" &&
+        motionRecordingDecision != "image_only"
+    ) {
+        server.send(
+            400,
+            "text/plain; charset=utf-8",
+            "Ungueltiger motion_recording_decision Wert"
+        );
+        return;
+    }
+
+    const bool motionRecordingDecisionChanged =
+        motionRecordingDecision != cfg_motion_recording_decision;
+
+
     int timestampEnabled =
         server.arg("timestamp_enabled").toInt()
         ? 1
@@ -3756,6 +4376,13 @@ static void handleSave()
         server.arg("recording_encryption").toInt()
         ? 1
         : 0;
+
+    int periodicSnapshotMinutes =
+        constrain(
+            server.arg("periodic_snapshot_minutes").toInt(),
+            0,
+            1440
+        );
 
 
     String recordingNotBefore = "off";
@@ -3877,6 +4504,12 @@ static void handleSave()
             0,
             60000
         );
+
+
+    int bootloopProtection =
+        server.hasArg("bootloop_protection")
+        ? (server.arg("bootloop_protection").toInt() ? 1 : 0)
+        : cfg_bootloop_protection;
 
 
     int transportCheckSeconds =
@@ -4068,6 +4701,53 @@ static void handleSave()
     resolution.trim();
 
 
+    {
+        int performanceMaxFps =
+            configRecordingPerformanceMaxFps(
+                resolution,
+                quality
+            );
+
+        if (
+            configRecordingPerformanceLimit() > 0 &&
+            performanceMaxFps > 0
+        ) {
+            uint32_t performanceLoad = 0;
+            uint32_t performanceLimit = 0;
+
+            if (!configRecordingPerformanceAllowed(
+                    resolution,
+                    fps,
+                    quality,
+                    performanceLoad,
+                    performanceLimit
+                )) {
+
+                String message =
+                    "Recording-Performance-Limit ueberschritten. "
+                    "Fuer " +
+                    resolution +
+                    " und quality=" +
+                    String(quality) +
+                    " sind auf diesem Board maximal " +
+                    String(performanceMaxFps) +
+                    " fps zugelassen. Last=" +
+                    String((unsigned long)performanceLoad) +
+                    ", Limit=" +
+                    String((unsigned long)performanceLimit) +
+                    ".";
+
+                server.send(
+                    400,
+                    "text/plain; charset=utf-8",
+                    message
+                );
+                return;
+            }
+        }
+    }
+
+
     String hostname =
         server.arg("hostname");
 
@@ -4109,7 +4789,7 @@ static void handleSave()
     String text;
 
     text.reserve(
-        1400
+        2200
     );
 
 
@@ -4169,8 +4849,51 @@ static void handleSave()
     text += String(recordingEncryption);
     text += '\n';
 
+    text += "periodic_snapshot_minutes=";
+    text += String(periodicSnapshotMinutes);
+    text += '\n';
+
     text += "recording_not_before=";
     text += recordingNotBefore;
+    text += '\n';
+
+    // Recording-decision and image-motion settings are part of the canonical
+    // config.txt. General Config saves must preserve the tuning values managed
+    // on /image_motion instead of accidentally dropping them back to defaults.
+    text += "motion_recording_decision=";
+    text += motionRecordingDecision;
+    text += '\n';
+
+    text += "image_motion_sensitivity=";
+    text += String(cfg_image_motion_sensitivity);
+    text += '\n';
+
+    text += "image_motion_min_area_pct=";
+    text += String(cfg_image_motion_min_area_pct);
+    text += '\n';
+
+    text += "image_motion_confirm_frames=";
+    text += String(cfg_image_motion_confirm_frames);
+    text += '\n';
+
+    text += "image_motion_release_frames=";
+    text += String(cfg_image_motion_release_frames);
+    text += '\n';
+
+    text += "image_motion_background_learning=";
+    text += String(cfg_image_motion_background_learning);
+    text += '\n';
+
+    text += "image_motion_global_mean_delta=";
+    text += String(cfg_image_motion_global_mean_delta);
+    text += '\n';
+
+    text += "image_motion_global_change_pct=";
+    text += String(cfg_image_motion_global_change_pct);
+    text += '\n';
+
+    text += "image_motion_roi_mask=";
+    text += cfg_image_motion_roi_mask;
     text += '\n';
 
     text += "post_record_ms=";
@@ -4199,6 +4922,10 @@ static void handleSave()
 
     text += "sleep_delay_ms=";
     text += String(sleepDelayMs);
+    text += '\n';
+
+    text += "bootloop_protection=";
+    text += String(bootloopProtection);
     text += '\n';
 
     // transport_mode is an operational flag controlled by the dedicated
@@ -4379,13 +5106,33 @@ static void handleSave()
 
         case CONFIG_SAVE_BOTH:
 
-            // Sleep policy is safe to apply immediately. Other settings
-            // may still require a reboot (camera, recording format, etc.).
+            // Sleep policy is safe to apply immediately. FPS is also a
+            // runtime recorder/pacing setting and can be applied safely here
+            // because config saves are rejected while recording is active.
+            // Camera sensor settings (resolution/quality/etc.) may still
+            // require a reboot/reinit before the hardware uses them.
+            cfg_fps =
+                fps;
+
+            cfg_motion_recording_decision =
+                motionRecordingDecision;
+
+            if (motionRecordingDecisionChanged) {
+                imageMotionResetBackground();
+            }
+
             cfg_sleep_mode =
                 sleepMode;
 
             cfg_sleep_delay_ms =
                 sleepDelayMs;
+
+            // Keep the rendered WebConfig state in sync with the just-saved
+            // value. Enabling is armed on the next cold boot; disabling stops
+            // the runtime stability timer immediately and clears persisted
+            // bootloop state on the next boot.
+            cfg_bootloop_protection =
+                bootloopProtection;
 
             cfg_transport_check_seconds =
                 transportCheckSeconds;
@@ -4419,6 +5166,9 @@ static void handleSave()
             // auto-detected independently when they are read.
             cfg_recording_encryption =
                 recordingEncryption;
+
+            cfg_periodic_snapshot_minutes =
+                periodicSnapshotMinutes;
 
             cfg_timezone =
                 timezone;
@@ -4452,13 +5202,32 @@ static void handleSave()
 
         case CONFIG_SAVE_INTERNAL_ONLY:
 
-            // The running system should honor the just-saved sleep policy
-            // immediately even when only the internal fallback was written.
+            // The running system should honor the just-saved FPS and sleep
+            // policy immediately even when only the internal fallback was
+            // written. Config saves are rejected while recording is active,
+            // so changing the recorder/pacing FPS here is safe.
+            cfg_fps =
+                fps;
+
+            cfg_motion_recording_decision =
+                motionRecordingDecision;
+
+            if (motionRecordingDecisionChanged) {
+                imageMotionResetBackground();
+            }
+
             cfg_sleep_mode =
                 sleepMode;
 
             cfg_sleep_delay_ms =
                 sleepDelayMs;
+
+            // Keep the rendered WebConfig state in sync with the just-saved
+            // value. Enabling is armed on the next cold boot; disabling stops
+            // the runtime stability timer immediately and clears persisted
+            // bootloop state on the next boot.
+            cfg_bootloop_protection =
+                bootloopProtection;
 
             cfg_transport_check_seconds =
                 transportCheckSeconds;
@@ -4492,6 +5261,9 @@ static void handleSave()
             // auto-detected independently when they are read.
             cfg_recording_encryption =
                 recordingEncryption;
+
+            cfg_periodic_snapshot_minutes =
+                periodicSnapshotMinutes;
 
             cfg_timezone =
                 timezone;
@@ -5375,6 +6147,9 @@ static void handleSDStatus()
     html +=
         " MB"
         "</section>"
+#if defined(STORAGE_SPI)
+        "<a class='button' href='/sd_recovery'>" + htmlText(UI_NAV_SD_RECOVERY) + "</a>"
+#endif
         "<a class='button danger' href='/sd_maintenance'>SD Maintenance</a>"
         "<a class='button' href='/'>Zur Übersicht</a>";
 
@@ -5382,6 +6157,292 @@ static void handleSDStatus()
 
     server.send(200, "text/html; charset=utf-8", html);
 }
+
+
+
+#if defined(STORAGE_SPI)
+
+static String sdRecoveryPage(
+    const String *report = nullptr,
+    bool success = false,
+    uint32_t mountedFrequencyHz = 0,
+    bool rawCardReady = false,
+    bool sector0Readable = false
+)
+{
+    bool de =
+        cfg_web_language !=
+        "en";
+
+    String html =
+        htmlHeader();
+
+    html +=
+        "<div class='page-title'><div>"
+        "<h2>" +
+        htmlText(UI_NAV_SD_RECOVERY) +
+        "</h2><p>" +
+        String(
+            de
+            ? "Nicht-destruktive Wiederbelebung und Diagnose der XIAO-SPI-SD"
+            : "Non-destructive recovery and diagnostics for the XIAO SPI SD"
+        ) +
+        "</p></div></div>";
+
+
+    html +=
+        "<div class='flash-notice' style='border-left-color:var(--accent);background:#eef4ff'>"
+        "<strong style='color:#174ea6'>" +
+        String(
+            de
+            ? "Sicherer Recovery-Modus"
+            : "Safe recovery mode"
+        ) +
+        "</strong><span class='muted'>" +
+        String(
+            de
+            ? "Dieser Vorgang formatiert oder löscht die SD-Karte nicht und führt keine RAW-Schreiboperation aus. "
+              "Er setzt den SPI-Kartencontroller bei 400 kHz zurück, prüft Sektor 0 lesend und versucht anschließend "
+              "Filesystem-Mounts mit mehreren SPI-Takten. Nach erfolgreichem Mount übernimmt SensorForge die Karte wieder "
+              "für den normalen Betrieb; ab diesem Zeitpunkt können normale Logger-/Aufnahmezugriffe wieder schreiben."
+            : "This operation does not format or erase the SD card and performs no raw-sector writes. "
+              "It resets the SPI card controller at 400 kHz, reads sector 0 for diagnostics and then tries "
+              "filesystem mounts at several SPI clocks. After a successful mount SensorForge adopts the card "
+              "for normal operation; normal logger/recording activity may write from that point onward."
+        ) +
+        "</span></div>";
+
+
+    html +=
+        "<section class='settings-section'><h3>" +
+        String(
+            de
+            ? "Aktueller Zustand"
+            : "Current state"
+        ) +
+        "</h3>";
+
+    if (sdReady) {
+        html +=
+            "<p><span class='status-pill ok'>" +
+            String(
+                de
+                ? "SD GEMOUNTET"
+                : "SD MOUNTED"
+            ) +
+            "</span></p><p class='muted'>" +
+            String(
+                de
+                ? "Die Firmware meldet die SD aktuell als betriebsbereit. Die Recovery wird deshalb nicht gestartet."
+                : "The firmware currently reports the SD as ready. Recovery is therefore not started."
+            ) +
+            "</p>";
+    } else {
+        html +=
+            "<p><span class='status-pill danger'>" +
+            String(
+                de
+                ? "SD NICHT VERFÜGBAR"
+                : "SD UNAVAILABLE"
+            ) +
+            "</span></p><p class='muted'>" +
+            String(
+                de
+                ? "Die Recovery darf jetzt exklusiv auf den SPI-Bus zugreifen."
+                : "Recovery may now take exclusive ownership of the SPI bus."
+            ) +
+            "</p>";
+    }
+
+    html +=
+        "</section>";
+
+
+    if (report) {
+        html +=
+            "<section class='settings-section'><h3>" +
+            String(
+                de
+                ? "Recovery-Ergebnis"
+                : "Recovery result"
+            ) +
+            "</h3>";
+
+        if (success) {
+            html +=
+                "<p><span class='status-pill ok'>" +
+                String(
+                    de
+                    ? "RECOVERY ERFOLGREICH"
+                    : "RECOVERY SUCCESSFUL"
+                ) +
+                "</span></p>";
+
+            if (mountedFrequencyHz > 0) {
+                html +=
+                    "<p class='muted'>" +
+                    String(
+                        de
+                        ? "Gemounteter SPI-Takt: "
+                        : "Mounted SPI clock: "
+                    ) +
+                    String(
+                        (double)mountedFrequencyHz /
+                        1000000.0,
+                        3
+                    ) +
+                    " MHz</p>";
+            }
+        } else {
+            html +=
+                "<p><span class='status-pill danger'>" +
+                String(
+                    de
+                    ? "RECOVERY NICHT ERFOLGREICH"
+                    : "RECOVERY NOT SUCCESSFUL"
+                ) +
+                "</span></p>";
+        }
+
+        html +=
+            "<p class='muted'>RAW controller: <b>" +
+            String(
+                rawCardReady
+                ? "READY"
+                : "NO READY"
+            ) +
+            "</b> &middot; Sector 0: <b>" +
+            String(
+                sector0Readable
+                ? "READABLE"
+                : "NOT READABLE"
+            ) +
+            "</b></p>"
+            "<pre style='white-space:pre-wrap;word-break:break-word;max-height:520px;overflow:auto;padding:12px;"
+            "border:1px solid var(--border);border-radius:10px;background:var(--surface-2)'>" +
+            htmlEscape(*report) +
+            "</pre></section>";
+    }
+
+
+    if (!sdReady) {
+        html +=
+            "<section class='settings-section'><h3>" +
+            String(
+                de
+                ? "Recovery starten"
+                : "Start recovery"
+            ) +
+            "</h3><p class='muted'>" +
+            String(
+                de
+                ? "Während des Tests werden neue Aufnahme-Starts und andere SD-Zugriffe gesperrt. "
+                  "Die Seite antwortet erst nach Abschluss der Diagnose; das kann einige Sekunden dauern."
+                : "New recording starts and other SD access are blocked while the test runs. "
+                  "The page responds after diagnostics finish; this can take several seconds."
+            ) +
+            "</p><form method='POST' action='/sd_recovery_run' "
+            "onsubmit=\"this.querySelector('button').disabled=true;this.querySelector('button').textContent='" +
+            String(
+                de
+                ? "Recovery läuft..."
+                : "Recovery running..."
+            ) +
+            "';\">"
+            "<button class='primary' type='submit'>" +
+            String(
+                de
+                ? "READ-ONLY SD RECOVERY STARTEN"
+                : "START READ-ONLY SD RECOVERY"
+            ) +
+            "</button></form></section>";
+    }
+
+
+    html +=
+        "<a class='button' href='/sdstatus'>" +
+        htmlText(UI_NAV_SD_STATUS) +
+        "</a>"
+        "<a class='button' href='/'>" +
+        String(
+            de
+            ? "Zur Übersicht"
+            : "Back to overview"
+        ) +
+        "</a>";
+
+    html +=
+        htmlFooter();
+
+    return html;
+}
+
+
+static void handleSDRecovery()
+{
+    String html =
+        sdRecoveryPage();
+
+    server.send(
+        200,
+        "text/html; charset=utf-8",
+        html
+    );
+}
+
+
+static void handleSDRecoveryRun()
+{
+    if (recording) {
+        server.send(
+            409,
+            "text/plain; charset=utf-8",
+            "Recording active"
+        );
+
+        return;
+    }
+
+
+    String report;
+
+    uint32_t mountedFrequencyHz =
+        0;
+
+    bool rawCardReady =
+        false;
+
+    bool sector0Readable =
+        false;
+
+
+    bool recovered =
+        sdManualReadOnlyRecovery(
+            report,
+            mountedFrequencyHz,
+            rawCardReady,
+            sector0Readable
+        );
+
+
+    String html =
+        sdRecoveryPage(
+            &report,
+            recovered,
+            mountedFrequencyHz,
+            rawCardReady,
+            sector0Readable
+        );
+
+
+    server.send(
+        200,
+        "text/html; charset=utf-8",
+        html
+    );
+}
+
+#endif // STORAGE_SPI
 
 
 enum SdMaintenanceMode : uint8_t {
@@ -7018,6 +8079,12 @@ static void redirectSdMaintenanceResult(
     // subsystems. Even though all known SD users are closed/reopened during
     // maintenance, reboot after a successful Format/Secure Erase gives every
     // module a completely fresh mount and avoids stale state in future code.
+    //
+    // Normal Format returns directly to the dashboard. The dashboard already
+    // renders the one-shot success notice and immediately replaces the browser
+    // history URL with "/", so a later reload cannot get stuck on a stale
+    // "format completed" subpage. Secure Erase keeps its dedicated reboot page
+    // because that path has its own asynchronous progress workflow.
     if (
         result == SD_MAINT_RESULT_OK &&
         (
@@ -7034,7 +8101,7 @@ static void redirectSdMaintenanceResult(
         server.sendHeader(
             "Location",
             mode == SD_MAINT_FORMAT
-            ? "/rebooting?reason=sd_format"
+            ? "/?notice=sd_format_done"
             : "/rebooting?reason=sd_secure"
         );
 
@@ -7871,6 +8938,588 @@ static void handleCameraCropSave()
 }
 
 
+static String imageMotionJsonEscape(const String &input)
+{
+    String out;
+    out.reserve(input.length() + 8);
+
+    for (size_t i = 0; i < input.length(); ++i) {
+        char c = input[i];
+        if (c == '\\' || c == '"') {
+            out += '\\';
+            out += c;
+        } else if (c == '\n') {
+            out += "\\n";
+        } else if (c == '\r') {
+            out += "\\r";
+        } else if ((uint8_t)c >= 0x20U) {
+            out += c;
+        }
+    }
+
+    return out;
+}
+
+
+static int imageMotionArgInt(const char *name, int fallback)
+{
+    if (!server.hasArg(name))
+        return fallback;
+
+    String value = server.arg(name);
+    value.trim();
+
+    if (!value.length())
+        return fallback;
+
+    return value.toInt();
+}
+
+
+static void handleImageMotionSave()
+{
+    String roiMask = server.arg("roi");
+    roiMask.trim();
+    roiMask.toLowerCase();
+
+    String error;
+    ConfigSaveResult result = configSaveImageMotion(
+        imageMotionArgInt("sensitivity", cfg_image_motion_sensitivity),
+        imageMotionArgInt("min_area", cfg_image_motion_min_area_pct),
+        imageMotionArgInt("confirm", cfg_image_motion_confirm_frames),
+        imageMotionArgInt("release", cfg_image_motion_release_frames),
+        imageMotionArgInt("learning", cfg_image_motion_background_learning),
+        imageMotionArgInt("global_mean", cfg_image_motion_global_mean_delta),
+        imageMotionArgInt("global_change", cfg_image_motion_global_change_pct),
+        roiMask,
+        true,
+        error
+    );
+
+    if (
+        result != CONFIG_SAVE_BOTH &&
+        result != CONFIG_SAVE_INTERNAL_ONLY
+    ) {
+        server.send(
+            400,
+            "application/json; charset=utf-8",
+            String("{\"ok\":false,\"error\":\"") +
+            imageMotionJsonEscape(error.length() ? error : String("save failed")) +
+            "\"}"
+        );
+        return;
+    }
+
+    // Settings/ROI changes invalidate the old scene model deliberately.
+    imageMotionResetBackground();
+
+    server.send(
+        200,
+        "application/json; charset=utf-8",
+        String("{\"ok\":true,\"storage\":\"") +
+        (result == CONFIG_SAVE_BOTH ? "sd+internal" : "internal") +
+        "\"}"
+    );
+}
+
+
+static void handleImageMotionTest()
+{
+    if (recorderIsOpen()) {
+        server.send(
+            409,
+            "application/json; charset=utf-8",
+            "{\"ok\":false,\"error\":\"recording active\"}"
+        );
+        return;
+    }
+
+    // Keep the same camera-ownership gate used by Live Preview. This guarantees
+    // that a diagnostic request can never race an automatic recording start.
+    noteCameraPreviewActivity();
+
+    String json;
+    String error;
+
+    if (!imageMotionWebTest(json, error)) {
+        server.send(
+            500,
+            "application/json; charset=utf-8",
+            String("{\"ok\":false,\"error\":\"") +
+            imageMotionJsonEscape(error) +
+            "\"}"
+        );
+        return;
+    }
+
+    server.send(
+        200,
+        "application/json; charset=utf-8",
+        String("{\"ok\":true,\"diagnostics\":") + json + "}"
+    );
+}
+
+
+static void handleImageMotionResetBackground()
+{
+    imageMotionResetBackground();
+    server.send(
+        200,
+        "application/json; charset=utf-8",
+        "{\"ok\":true}"
+    );
+}
+
+
+static void handleImageMotionStatus()
+{
+    String json;
+    json.reserve(900);
+    json =
+        String("{\"ok\":true,\"mode\":\"") +
+        cfg_motion_recording_decision +
+        "\",\"confirm_required\":" +
+        String(cfg_image_motion_confirm_frames) +
+        ",\"release_required\":" +
+        String(cfg_image_motion_release_frames) +
+        ",\"area_limit_pct\":" +
+        String(cfg_image_motion_min_area_pct) +
+        ",\"diag_count\":" +
+        String(imageMotionDiagnosticCount()) +
+        ",\"diag_capacity\":" +
+        String(imageMotionDiagnosticCapacity()) +
+        ",\"analysis_stamp_ms\":" +
+        String(imageMotionLastAnalysisCompletedMs()) +
+        ",\"diagnostics\":" +
+        imageMotionDiagnosticsJson() +
+        "}";
+
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(
+        200,
+        "application/json; charset=utf-8",
+        json
+    );
+}
+
+
+
+static String imageMotionDiagnosticTimestamp(
+    const ImageMotionDiagnosticSample &sample
+)
+{
+    if (sample.epochSec < 1577836800UL)
+        return "-";
+
+    time_t seconds = (time_t)sample.epochSec;
+    struct tm localTime;
+    localtime_r(&seconds, &localTime);
+
+    char buffer[32];
+    strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &localTime);
+
+    char millisPart[8];
+    snprintf(
+        millisPart,
+        sizeof(millisPart),
+        ".%03u",
+        (unsigned int)sample.epochMs
+    );
+
+    return String(buffer) + String(millisPart);
+}
+
+static String imageMotionDiagnosticMaskHex(
+    const uint8_t mask[IMAGE_MOTION_ROI_BYTES]
+)
+{
+    static const char hex[] = "0123456789abcdef";
+    String out;
+    out.reserve(IMAGE_MOTION_ROI_HEX_CHARS);
+
+    for (uint8_t i = 0; i < IMAGE_MOTION_ROI_BYTES; ++i) {
+        out += hex[(mask[i] >> 4) & 0x0FU];
+        out += hex[mask[i] & 0x0FU];
+    }
+
+    return out;
+}
+
+static String imageMotionDiagnosticDeci(int16_t value)
+{
+    bool negative = value < 0;
+    uint16_t magnitude = negative
+        ? (uint16_t)(-(int32_t)value)
+        : (uint16_t)value;
+
+    return
+        String(negative ? "-" : "") +
+        String(magnitude / 10U) +
+        "." +
+        String(magnitude % 10U);
+}
+
+static void handleImageMotionDiagnosticDownload()
+{
+    uint16_t count = imageMotionDiagnosticCount();
+    uint16_t capacity = imageMotionDiagnosticCapacity();
+
+    server.sendHeader("Cache-Control", "no-store");
+    server.sendHeader(
+        "Content-Disposition",
+        "attachment; filename=\"sensorforge_image_motion_diagnostic.txt\""
+    );
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, "text/plain; charset=utf-8", "");
+
+    String line;
+    line.reserve(1900);
+
+    line =
+        "# SensorForge Image Motion RAM Diagnostic\n"
+        "# RAM-only ring buffer; no SD/main-log writes.\n"
+        "# One row is one analyzed JPEG frame; oldest retained sample first.\n"
+        "# changed = blocks above the real adaptive per-block threshold against the learned background.\n"
+        "# frame_delta = diagnostic-only difference to the immediately previous analyzed frame; it does NOT yet influence motion_active/state.\n"
+        "# diff_ge_N = ROI blocks whose absolute gray difference from the learned background is >= N, before the adaptive threshold is applied.\n"
+        "# frame_diff_ge_N = ROI blocks whose frame-to-frame gray difference is >= N.\n"
+        "# changed_mask_hex/frame_changed_mask_hex = one bit per 20x15 grid cell; bit 0 is cell 0.\n";
+    server.sendContent(line);
+
+    line =
+        "# samples=" + String(count) +
+        " capacity=" + String(capacity) +
+        " mode=" + cfg_motion_recording_decision +
+        " resolution=" + cfg_resolution +
+        " crop_zoom=" + cfg_camera_crop_zoom +
+        " crop_x=" + String(cfg_camera_crop_x) +
+        " crop_y=" + String(cfg_camera_crop_y) +
+        " sensitivity=" + String(cfg_image_motion_sensitivity) +
+        " min_area_pct=" + String(cfg_image_motion_min_area_pct) +
+        " confirm_frames=" + String(cfg_image_motion_confirm_frames) +
+        " release_frames=" + String(cfg_image_motion_release_frames) +
+        " background_learning=" + String(cfg_image_motion_background_learning) +
+        " global_mean_delta=" + String(cfg_image_motion_global_mean_delta) +
+        " global_change_pct=" + String(cfg_image_motion_global_change_pct) +
+        " roi_mask=" + cfg_image_motion_roi_mask +
+        "\n";
+    server.sendContent(line);
+
+    server.sendContent(
+        "seq\ttime\tuptime_ms\tsource_px\tstate\treject\tbackground_ready\tmotion_active\tconfirm\trelease\tactive_blocks\tchanged_blocks\ttotal_changed_pct\tlargest_cluster\tcluster_pct\tminimum_blocks\tbase_threshold\tdynamic_threshold_min\tdynamic_threshold_avg\tdynamic_threshold_max\tmean_abs_diff\tmax_abs_diff\tframe_delta_ready\tframe_interval_ms\tframe_threshold\tframe_changed_blocks\tframe_changed_pct\tframe_largest_cluster\tframe_cluster_pct\tframe_mean_abs_diff\tframe_max_abs_diff\tframe_diff_ge_5\tframe_diff_ge_10\tframe_diff_ge_15\tframe_diff_ge_20\tframe_cluster_ge_10\tframe_cluster_ge_15\tframe_cluster_ge_20\tdiff_ge_5\tdiff_ge_10\tdiff_ge_15\tdiff_ge_20\tdiff_ge_25\tdiff_ge_30\tdiff_ge_35\tdiff_ge_40\tcluster_ge_10\tcluster_ge_15\tcluster_ge_20\tcluster_ge_25\tcluster_ge_30\tcluster_ge_35\tglobal_mean\tbackground_mean\tglobal_mean_delta\tanalyze_ms\tdecode_ms\tchanged_mask_hex\tframe_changed_mask_hex\n"
+    );
+
+    for (uint16_t index = 0; index < count; ++index) {
+        ImageMotionDiagnosticSample sample;
+        if (!imageMotionDiagnosticGet(index, sample))
+            continue;
+
+        float totalPct = sample.activeRoiBlocks > 0
+            ? ((float)sample.changedBlocks * 100.0f) / (float)sample.activeRoiBlocks
+            : 0.0f;
+        float clusterPct = sample.activeRoiBlocks > 0
+            ? ((float)sample.largestClusterBlocks * 100.0f) / (float)sample.activeRoiBlocks
+            : 0.0f;
+        float frameChangedPct = sample.activeRoiBlocks > 0
+            ? ((float)sample.frameChangedBlocks * 100.0f) / (float)sample.activeRoiBlocks
+            : 0.0f;
+        float frameClusterPct = sample.activeRoiBlocks > 0
+            ? ((float)sample.frameLargestClusterBlocks * 100.0f) / (float)sample.activeRoiBlocks
+            : 0.0f;
+        int16_t backgroundMeanX10 = (int16_t)(
+            (int32_t)sample.globalMeanX10 -
+            (int32_t)sample.globalMeanDeltaX10
+        );
+
+        line =
+            String(sample.sequence) + "\t" +
+            imageMotionDiagnosticTimestamp(sample) + "\t" +
+            String(sample.uptimeMs) + "\t" +
+            String(sample.sourceWidth) + "x" + String(sample.sourceHeight) + "\t" +
+            String(imageMotionStateName((ImageMotionState)sample.state)) + "\t" +
+            String(imageMotionRejectReasonName((ImageMotionRejectReason)sample.rejectReason)) + "\t" +
+            String((sample.flags & 0x01U) ? "1" : "0") + "\t" +
+            String((sample.flags & 0x02U) ? "1" : "0") + "\t" +
+            String(sample.confirmCounter) + "\t" +
+            String(sample.releaseCounter) + "\t" +
+            String(sample.activeRoiBlocks) + "\t" +
+            String(sample.changedBlocks) + "\t" +
+            String(totalPct, 1) + "\t" +
+            String(sample.largestClusterBlocks) + "\t" +
+            String(clusterPct, 1) + "\t" +
+            String(sample.minimumMotionBlocks) + "\t" +
+            String(sample.blockThreshold) + "\t" +
+            String(sample.dynamicThresholdMin) + "\t" +
+            String((float)sample.dynamicThresholdAvgX10 / 10.0f, 1) + "\t" +
+            String(sample.dynamicThresholdMax) + "\t" +
+            String((float)sample.meanAbsDiffX10 / 10.0f, 1) + "\t" +
+            String(sample.maxAbsDiff) + "\t" +
+            String((sample.flags & 0x04U) ? "1" : "0") + "\t" +
+            String(sample.frameDeltaIntervalMs) + "\t" +
+            String(sample.frameDeltaThreshold) + "\t" +
+            String(sample.frameChangedBlocks) + "\t" +
+            String(frameChangedPct, 1) + "\t" +
+            String(sample.frameLargestClusterBlocks) + "\t" +
+            String(frameClusterPct, 1) + "\t" +
+            String((float)sample.frameMeanAbsDiffX10 / 10.0f, 1) + "\t" +
+            String(sample.frameMaxAbsDiff) + "\t" +
+            String(sample.frameDiffGe5) + "\t" +
+            String(sample.frameDiffGe10) + "\t" +
+            String(sample.frameDiffGe15) + "\t" +
+            String(sample.frameDiffGe20) + "\t" +
+            String(sample.frameClusterGe10) + "\t" +
+            String(sample.frameClusterGe15) + "\t" +
+            String(sample.frameClusterGe20) + "\t" +
+            String(sample.diffGe5) + "\t" +
+            String(sample.diffGe10) + "\t" +
+            String(sample.diffGe15) + "\t" +
+            String(sample.diffGe20) + "\t" +
+            String(sample.diffGe25) + "\t" +
+            String(sample.diffGe30) + "\t" +
+            String(sample.diffGe35) + "\t" +
+            String(sample.diffGe40) + "\t" +
+            String(sample.clusterGe10) + "\t" +
+            String(sample.clusterGe15) + "\t" +
+            String(sample.clusterGe20) + "\t" +
+            String(sample.clusterGe25) + "\t" +
+            String(sample.clusterGe30) + "\t" +
+            String(sample.clusterGe35) + "\t" +
+            imageMotionDiagnosticDeci(sample.globalMeanX10) + "\t" +
+            imageMotionDiagnosticDeci(backgroundMeanX10) + "\t" +
+            imageMotionDiagnosticDeci(sample.globalMeanDeltaX10) + "\t" +
+            String(sample.analyzeFrameMs) + "\t" +
+            String(sample.decodeMs) + "\t" +
+            imageMotionDiagnosticMaskHex(sample.changedMask) + "\t" +
+            imageMotionDiagnosticMaskHex(sample.frameChangedMask) +
+            "\n";
+
+        server.sendContent(line);
+        if ((index % 20U) == 19U)
+            serviceWebLongOperation();
+    }
+}
+
+static String imageMotionInfoButton(
+    UiTextId titleId,
+    UiTextId helpId
+)
+{
+    return
+        "<button type='button' class='im-info' data-title='" +
+        htmlText(titleId) +
+        "' data-info='" +
+        htmlText(helpId) +
+        "' aria-label='" +
+        htmlText(UI_IMAGE_MOTION_INFO) +
+        "'>i</button>";
+}
+
+
+static void handleImageMotionPage()
+{
+    String html = htmlHeader();
+
+    html += "<h2>" + htmlText(UI_IMAGE_MOTION_TITLE) + "</h2>";
+    html += "<p class='muted'>" + htmlText(UI_IMAGE_MOTION_SUBTITLE) + "</p>";
+
+    if (recorderIsOpen()) {
+        stopCameraPreview();
+        html += "<div class='flash-notice error'><strong>" +
+            htmlText(UI_STATUS_RECORDING_RUNNING) +
+            "</strong></div>";
+    } else if (!esp_camera_sensor_get()) {
+        stopCameraPreview();
+        html += "<p>" + htmlText(UI_NOT_DETECTED) + "</p>";
+    } else {
+        noteCameraPreviewActivity();
+
+        // Diagnostic live analysis must start with a fresh temporal vote so a
+        // previous operational detection cannot make the page look active. The
+        // learned background is intentionally retained.
+        imageMotionBeginVerification();
+        imageMotionPreviewLastAnalysisMs = 0;
+
+        html += R"HTML(
+<style>
+.im-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:12px 0}.im-card{border:1px solid #d7dde5;border-radius:10px;padding:14px;background:#fff}.im-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.im-field{border:1px solid #e5e7eb;border-radius:8px;padding:10px;background:#fafbfc}.im-label-row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}.im-label-row label{font-weight:600}.im-help{font-size:.86rem;line-height:1.35;color:#5f6b7a;margin-top:6px}.im-info{flex:0 0 auto;width:26px;height:26px;padding:0;border-radius:50%;font-weight:700;line-height:24px}.im-stage{position:relative;display:inline-block;max-width:100%;touch-action:none}.im-stage img{display:block;max-width:100%;height:auto}.im-stage canvas{position:absolute;inset:0;width:100%;height:100%;cursor:crosshair;touch-action:none}.im-actions{display:flex;flex-wrap:wrap;gap:8px;margin:9px 0}.im-legend{display:flex;flex-wrap:wrap;gap:10px;margin:0 0 8px}.im-legend span{display:inline-flex;align-items:center;gap:6px;font-size:.86rem}.im-roi-hint{font-size:.84rem;line-height:1.25;margin:5px 0 8px}.im-swatch{width:18px;height:14px;border:1px solid #9ca3af;border-radius:3px;background:#fff}.im-swatch.excluded{background:rgba(220,38,38,.35)}.im-result{border:1px solid #d7dde5;border-radius:8px;padding:12px;background:#f8fafc;margin:10px 0}.im-result-title{font-weight:700;margin-bottom:6px}.im-result-text{font-size:1rem;margin-bottom:8px}.im-result-meta{display:flex;flex-wrap:wrap;gap:8px 16px;font-size:.88rem;color:#4b5563}.im-live-card{margin:10px 0;padding:10px 12px}.im-live-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:7px}.im-live-title{display:flex;align-items:center;gap:7px}.im-live-head h3{margin:0}.im-live-pulse{font-size:.72rem;line-height:1;opacity:.22;transition:opacity .08s}.im-live-pulse.tick{opacity:1}.im-live-tools{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;font-size:.84rem}.im-live-tools button{padding:6px 10px;margin:0}.im-live-grid{display:grid;grid-template-columns:minmax(205px,38%) minmax(0,1fr);gap:5px 14px;align-items:center;line-height:1.25}.im-live-label{font-weight:700;white-space:normal;overflow-wrap:anywhere}.im-live-value{min-width:0;min-height:1.25em;overflow-wrap:anywhere}.im-diag{white-space:pre-wrap;overflow-wrap:anywhere;background:#111827;color:#e5e7eb;padding:12px;border-radius:8px;min-height:100px;font-family:monospace;font-size:.82rem}.im-details{margin-top:10px}.im-details summary{cursor:pointer;font-weight:600}.im-modal-backdrop{position:fixed;inset:0;background:rgba(15,23,42,.5);display:none;align-items:center;justify-content:center;padding:18px;z-index:10000}.im-modal-backdrop.open{display:flex}.im-modal{width:min(560px,100%);max-height:80vh;overflow:auto;background:#fff;border-radius:12px;padding:18px;box-shadow:0 18px 50px rgba(0,0,0,.25)}.im-modal h3{margin-top:0}.im-modal-actions{display:flex;justify-content:flex-end;margin-top:14px}@media(max-width:760px){.im-grid,.im-fields{grid-template-columns:1fr}.im-live-head{align-items:flex-start;flex-direction:column}.im-live-tools{justify-content:flex-start}.im-live-grid{grid-template-columns:minmax(145px,42%) minmax(0,1fr);gap:5px 10px}.im-live-label{margin-top:0}.im-live-value{padding-bottom:0}}@media(max-width:480px){.im-live-grid{grid-template-columns:1fr;gap:2px}.im-live-label{margin-top:5px}}
+</style>
+)HTML";
+
+        html += "<div class='flash-notice' style='border-left-color:var(--accent);background:#eef4ff'><strong>" +
+            htmlText(UI_IMAGE_MOTION_TEST_NOTE) + "</strong></div>";
+
+        html += "<div class='im-card im-live-card'><div class='im-live-head'><div class='im-live-title'><h3>" +
+            htmlText(UI_IMAGE_MOTION_LIVE_TITLE) +
+            "</h3><span id='imLivePulse' class='im-live-pulse' aria-hidden='true'>●</span></div><div class='im-live-tools'><span class='muted'>RAM <b id='imDiagBufferStatus'>0 / " + String(imageMotionDiagnosticCapacity()) + "</b></span>" +
+            "<a href='/image_motion_diag_download'><button type='button'>" + htmlText(UI_IMAGE_MOTION_DIAG_DOWNLOAD) + "</button></a></div></div><div class='im-live-grid'>" +
+            "<div class='im-live-label'>" + htmlText(UI_IMAGE_MOTION_LIVE_STATUS) + "</div>" +
+            "<div class='im-live-value'><span id='imLiveState' class='status-pill warn'>" + htmlText(UI_IMAGE_MOTION_LIVE_WAITING) + "</span></div>" +
+            "<div class='im-live-label'>" + htmlText(UI_IMAGE_MOTION_LIVE_CONFIRMATION) + "</div>" +
+            "<div id='imLiveConfirm' class='im-live-value'>0 / " + String(cfg_image_motion_confirm_frames) + "</div>" +
+            "<div class='im-live-label'>" + htmlText(UI_IMAGE_MOTION_LIVE_CURRENT_MOTION) + "</div>" +
+            "<div id='imLiveFrameMotion' class='im-live-value'>-</div>" +
+            "<div class='im-live-label'>" + htmlText(UI_IMAGE_MOTION_LIVE_BACKGROUND_DIFFERENCE) + "</div>" +
+            "<div id='imLiveBackground' class='im-live-value'>0.0 %</div>" +
+            "<div class='im-live-label'>" + htmlText(UI_IMAGE_MOTION_RESULT_LIMIT) + "</div>" +
+            "<div id='imLiveLimit' class='im-live-value'>" + String(cfg_image_motion_min_area_pct) + " %</div>" +
+            "<div class='im-live-label'>" + htmlText(UI_IMAGE_MOTION_LIVE_LAST_DETECTION) + "</div>" +
+            "<div id='imLiveLast' class='im-live-value'>" + htmlText(UI_IMAGE_MOTION_LIVE_NEVER) + "</div>" +
+            "</div></div>";
+
+        html += "<div class='im-grid'><div class='im-card'>";
+
+        html += "<div class='im-legend'><span><i class='im-swatch'></i>" +
+            htmlText(UI_IMAGE_MOTION_ROI_ACTIVE_LEGEND) +
+            "</span><span><i class='im-swatch excluded'></i>" +
+            htmlText(UI_IMAGE_MOTION_ROI_EXCLUDED_LEGEND) +
+            "</span></div>";
+
+        html += "<div class='im-stage' id='imStage'><img id='imImage' alt='" +
+            htmlText(UI_IMAGE_MOTION_TITLE) +
+            "'><canvas id='imCanvas'></canvas></div>";
+        html += "<p class='im-roi-hint muted'>" + htmlText(UI_IMAGE_MOTION_ROI_HELP) + "</p>";
+        html += "<div class='im-actions'><button type='button' id='imAll'>" + htmlText(UI_IMAGE_MOTION_SELECT_ALL) +
+            "</button><button type='button' id='imClear'>" + htmlText(UI_IMAGE_MOTION_CLEAR) +
+            "</button><button type='button' id='imInvert'>" + htmlText(UI_IMAGE_MOTION_INVERT) + "</button></div></div>";
+
+        html += "<div class='im-card'><h3>" + htmlText(UI_IMAGE_MOTION_TITLE) + "</h3><div class='im-fields'>";
+
+        html += "<div class='im-field'><div class='im-label-row'><label for='imSensitivity'>" + htmlText(UI_IMAGE_MOTION_SENSITIVITY) + "</label>" +
+            imageMotionInfoButton(UI_IMAGE_MOTION_SENSITIVITY, UI_IMAGE_MOTION_SENSITIVITY_HELP) +
+            "</div><input id='imSensitivity' type='number' min='1' max='10' value='" + String(cfg_image_motion_sensitivity) +
+            "'><div class='im-help'>" + htmlText(UI_IMAGE_MOTION_SENSITIVITY_HELP) + "</div></div>";
+
+        html += "<div class='im-field'><div class='im-label-row'><label for='imMinArea'>" + htmlText(UI_IMAGE_MOTION_MIN_AREA) + "</label>" +
+            imageMotionInfoButton(UI_IMAGE_MOTION_MIN_AREA, UI_IMAGE_MOTION_MIN_AREA_HELP) +
+            "</div><input id='imMinArea' type='number' min='1' max='100' value='" + String(cfg_image_motion_min_area_pct) +
+            "'><div class='im-help'>" + htmlText(UI_IMAGE_MOTION_MIN_AREA_HELP) + "</div></div>";
+
+        html += "<div class='im-field'><div class='im-label-row'><label for='imConfirm'>" + htmlText(UI_IMAGE_MOTION_CONFIRM) + "</label>" +
+            imageMotionInfoButton(UI_IMAGE_MOTION_CONFIRM, UI_IMAGE_MOTION_CONFIRM_HELP) +
+            "</div><input id='imConfirm' type='number' min='1' max='6' value='" + String(cfg_image_motion_confirm_frames) +
+            "'><div class='im-help'>" + htmlText(UI_IMAGE_MOTION_CONFIRM_HELP) + "</div></div>";
+
+        html += "<div class='im-field'><div class='im-label-row'><label for='imRelease'>" + htmlText(UI_IMAGE_MOTION_RELEASE) + "</label>" +
+            imageMotionInfoButton(UI_IMAGE_MOTION_RELEASE, UI_IMAGE_MOTION_RELEASE_HELP) +
+            "</div><input id='imRelease' type='number' min='1' max='10' value='" + String(cfg_image_motion_release_frames) +
+            "'><div class='im-help'>" + htmlText(UI_IMAGE_MOTION_RELEASE_HELP) + "</div></div>";
+
+        html += "<div class='im-field'><div class='im-label-row'><label for='imLearning'>" + htmlText(UI_IMAGE_MOTION_BG_LEARNING) + "</label>" +
+            imageMotionInfoButton(UI_IMAGE_MOTION_BG_LEARNING, UI_IMAGE_MOTION_BG_LEARNING_HELP) +
+            "</div><input id='imLearning' type='number' min='1' max='64' value='" + String(cfg_image_motion_background_learning) +
+            "'><div class='im-help'>" + htmlText(UI_IMAGE_MOTION_BG_LEARNING_HELP) + "</div></div>";
+
+        html += "<div class='im-field'><div class='im-label-row'><label for='imGlobalMean'>" + htmlText(UI_IMAGE_MOTION_GLOBAL_MEAN) + "</label>" +
+            imageMotionInfoButton(UI_IMAGE_MOTION_GLOBAL_MEAN, UI_IMAGE_MOTION_GLOBAL_MEAN_HELP) +
+            "</div><input id='imGlobalMean' type='number' min='5' max='100' value='" + String(cfg_image_motion_global_mean_delta) +
+            "'><div class='im-help'>" + htmlText(UI_IMAGE_MOTION_GLOBAL_MEAN_HELP) + "</div></div>";
+
+        html += "<div class='im-field'><div class='im-label-row'><label for='imGlobalChange'>" + htmlText(UI_IMAGE_MOTION_GLOBAL_CHANGE) + "</label>" +
+            imageMotionInfoButton(UI_IMAGE_MOTION_GLOBAL_CHANGE, UI_IMAGE_MOTION_GLOBAL_CHANGE_HELP) +
+            "</div><input id='imGlobalChange' type='number' min='20' max='100' value='" + String(cfg_image_motion_global_change_pct) +
+            "'><div class='im-help'>" + htmlText(UI_IMAGE_MOTION_GLOBAL_CHANGE_HELP) + "</div></div>";
+
+        html += "</div><div class='im-actions'><button type='button' id='imSave'>" + htmlText(UI_IMAGE_MOTION_SAVE) +
+            "</button><button type='button' id='imDefaults'>" + htmlText(UI_IMAGE_MOTION_RESET_DEFAULTS) +
+            "</button>" + imageMotionInfoButton(UI_IMAGE_MOTION_RESET_DEFAULTS, UI_IMAGE_MOTION_RESET_DEFAULTS_HELP) + "</div>";
+
+        html += "<div class='im-card' style='margin-top:14px'><h3>" + htmlText(UI_IMAGE_MOTION_TEST) + "</h3><p class='muted'>" +
+            htmlText(UI_IMAGE_MOTION_TEST_HELP) + " <strong>" + htmlText(UI_IMAGE_MOTION_TEST_USES_SAVED) + "</strong></p>";
+        html += "<div class='im-actions'><button type='button' id='imTest'>" + htmlText(UI_IMAGE_MOTION_TEST) +
+            "</button>" + imageMotionInfoButton(UI_IMAGE_MOTION_TEST, UI_IMAGE_MOTION_TEST_HELP) +
+            "<button type='button' id='imResetBg'>" + htmlText(UI_IMAGE_MOTION_RESET_BG) +
+            "</button>" + imageMotionInfoButton(UI_IMAGE_MOTION_RESET_BG, UI_IMAGE_MOTION_RESET_BG_HELP) + "</div>";
+        html += "<div id='imStatus' class='muted'></div><h3>" + htmlText(UI_IMAGE_MOTION_DIAGNOSTICS) + "</h3><p class='muted'>" +
+            htmlText(UI_IMAGE_MOTION_DIAGNOSTICS_HELP) + "</p><div class='im-result'><div class='im-result-title'>" +
+            htmlText(UI_IMAGE_MOTION_RESULT_TITLE) + "</div><div id='imResultText' class='im-result-text'>-</div><div id='imResultMeta' class='im-result-meta'></div></div>";
+        html += "<details class='im-details'><summary>" + htmlText(UI_IMAGE_MOTION_TECH_DETAILS) +
+            "</summary><div id='imDiag' class='im-diag'>-</div></details></div></div></div>";
+
+        html += "<div id='imInfoBackdrop' class='im-modal-backdrop' role='dialog' aria-modal='true'><div class='im-modal'><h3 id='imInfoTitle'></h3><div id='imInfoBody'></div><div class='im-modal-actions'><button type='button' id='imInfoClose'>" +
+            htmlText(UI_IMAGE_MOTION_INFO_CLOSE) + "</button></div></div></div>";
+
+        String defaultRoi = imageMotionDefaultRoiMask();
+        html += "<script>const IM_W=20,IM_H=15;let imMask='" + cfg_image_motion_roi_mask + "';let imSavedMinArea=" + String(cfg_image_motion_min_area_pct) + ";";
+        html += "const IM_DEFAULTS={sensitivity:'5',minArea:'6',confirm:'2',release:'2',learning:'4',globalMean:'24',globalChange:'70',roi:'" + defaultRoi + "'};";
+        html += "const IM_TEXT={saved:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_SAVED))) +
+            "\",saveFailed:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_SAVE_FAILED))) +
+            "\",testFailed:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_TEST_FAILED))) +
+            "\",defaultsDone:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESET_DEFAULTS_DONE))) +
+            "\",resetBgDone:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESET_BG_DONE))) +
+            "\",resultMotion:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESULT_MOTION))) +
+            "\",resultNone:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESULT_NONE))) +
+            "\",resultDisabled:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESULT_DISABLED))) +
+            "\",resultLearning:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESULT_LEARNING))) +
+            "\",resultConfirming:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESULT_CONFIRMING))) +
+            "\",resultGlobalLight:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESULT_GLOBAL_LIGHT))) +
+            "\",resultNoRoi:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESULT_NO_ROI))) +
+            "\",resultError:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESULT_ERROR))) +
+            "\",resultTime:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESULT_TIME))) +
+            "\",resultArea:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESULT_AREA))) +
+            "\",resultLimit:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_RESULT_LIMIT))) +
+            "\",liveTotalArea:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_CHANGED_AREA))) +
+            "\",liveCurrentMotion:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_CURRENT_MOTION))) +
+            "\",liveBackgroundDifference:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_BACKGROUND_DIFFERENCE))) +
+            "\",liveTotalShort:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_TOTAL_SHORT))) +
+            "\",liveConnectedShort:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_CONNECTED_SHORT))) +
+            "\",liveDetected:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_DETECTED))) +
+            "\",liveNone:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_NONE))) +
+            "\",liveLearning:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_LEARNING))) +
+            "\",liveGlobalLight:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_GLOBAL_LIGHT))) +
+            "\",liveError:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_ERROR))) +
+            "\",liveConfirmed:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_CONFIRMED))) +
+            "\",liveNever:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_NEVER))) +
+            "\",liveWaiting:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_WAITING))) +
+            "\",ago:\"" + imageMotionJsonEscape(String(tr(UI_MOTION_AGO))) +
+            "\",agoSuffix:\"" + imageMotionJsonEscape(String(tr(UI_MOTION_AGO_SUFFIX))) + "\"};";
+
+        html += R"JS(
+const imImage=document.getElementById('imImage'),imCanvas=document.getElementById('imCanvas'),imCtx=imCanvas.getContext('2d');
+const imStatus=document.getElementById('imStatus'),imDiag=document.getElementById('imDiag'),imResultText=document.getElementById('imResultText'),imResultMeta=document.getElementById('imResultMeta'),imDiagBufferStatus=document.getElementById('imDiagBufferStatus');
+const imLiveState=document.getElementById('imLiveState'),imLiveConfirm=document.getElementById('imLiveConfirm'),imLiveFrameMotion=document.getElementById('imLiveFrameMotion'),imLiveBackground=document.getElementById('imLiveBackground'),imLiveLimit=document.getElementById('imLiveLimit'),imLiveLast=document.getElementById('imLiveLast'),imLivePulse=document.getElementById('imLivePulse');
+const imInfoBackdrop=document.getElementById('imInfoBackdrop'),imInfoTitle=document.getElementById('imInfoTitle'),imInfoBody=document.getElementById('imInfoBody');
+function maskBytes(){const a=[];for(let i=0;i<imMask.length;i+=2)a.push(parseInt(imMask.slice(i,i+2),16)||0);return a}
+function setMaskBytes(a){imMask=a.map(v=>v.toString(16).padStart(2,'0')).join('')}
+function bit(i){const a=maskBytes();return !!(a[i>>3]&(1<<(i&7)))}
+function setBit(i,on){const a=maskBytes();if(on)a[i>>3]|=1<<(i&7);else a[i>>3]&=~(1<<(i&7));setMaskBytes(a)}
+function drawGrid(){const r=imCanvas.getBoundingClientRect();imCanvas.width=Math.max(1,Math.round(r.width*devicePixelRatio));imCanvas.height=Math.max(1,Math.round(r.height*devicePixelRatio));imCtx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);const w=r.width,h=r.height,cw=w/IM_W,ch=h/IM_H;for(let y=0;y<IM_H;y++)for(let x=0;x<IM_W;x++){const i=y*IM_W+x;if(!bit(i)){imCtx.fillStyle='rgba(220,38,38,.35)';imCtx.fillRect(x*cw,y*ch,cw,ch)}imCtx.strokeStyle='rgba(255,255,255,.55)';imCtx.strokeRect(x*cw,y*ch,cw,ch)}}
+let painting=false,paintValue=true;
+function cellAt(e){const r=imCanvas.getBoundingClientRect(),x=Math.floor((e.clientX-r.left)/r.width*IM_W),y=Math.floor((e.clientY-r.top)/r.height*IM_H);if(x<0||x>=IM_W||y<0||y>=IM_H)return-1;return y*IM_W+x}
+imCanvas.addEventListener('pointerdown',e=>{const i=cellAt(e);if(i<0)return;painting=true;paintValue=!bit(i);setBit(i,paintValue);imCanvas.setPointerCapture(e.pointerId);drawGrid()});
+imCanvas.addEventListener('pointermove',e=>{if(!painting)return;const i=cellAt(e);if(i>=0){setBit(i,paintValue);drawGrid()}});imCanvas.addEventListener('pointerup',()=>painting=false);imCanvas.addEventListener('pointercancel',()=>painting=false);
+document.getElementById('imAll').onclick=()=>{const a=new Array(38).fill(255);a[37]&=15;setMaskBytes(a);drawGrid()};
+document.getElementById('imClear').onclick=()=>{setMaskBytes(new Array(38).fill(0));drawGrid()};
+document.getElementById('imInvert').onclick=()=>{const a=maskBytes().map(v=>(~v)&255);a[37]&=15;setMaskBytes(a);drawGrid()};
+function liveAgeText(valid,ms){if(!valid)return IM_TEXT.liveNever;ms=Math.max(0,Number(ms)||0);let v='';if(ms<1000)v='<1 s';else if(ms<60000)v=Math.floor(ms/1000)+' s';else{const sec=Math.floor(ms/1000),min=Math.floor(sec/60),rest=sec%60;v=min+' min '+rest+' s'}return IM_TEXT.ago+(IM_TEXT.ago?' ':'')+v+IM_TEXT.agoSuffix}
+function liveStateText(d){if(d.motion_active||d.image_motion_state==='confirmed')return IM_TEXT.liveDetected;if(d.image_motion_state==='background_init')return IM_TEXT.liveLearning;if(d.image_motion_state==='global_change')return IM_TEXT.liveGlobalLight;if(d.image_motion_state==='error')return IM_TEXT.liveError;return IM_TEXT.liveNone}
+let imLastAnalysisStamp=0,imLastAnalysisLocalMs=0,imStatusInFlight=false;
+function setLiveWaiting(clearValues){if(imLivePulse)imLivePulse.classList.remove('tick');if(imLiveState){imLiveState.textContent=IM_TEXT.liveWaiting;imLiveState.classList.remove('danger','ok');imLiveState.classList.add('warn')}if(clearValues){if(imLiveConfirm)imLiveConfirm.textContent='-';if(imLiveFrameMotion)imLiveFrameMotion.textContent='-';if(imLiveBackground)imLiveBackground.textContent='-'}}
+function motionPair(total,cluster){return Number(total||0).toFixed(1)+' % '+IM_TEXT.liveTotalShort+' · '+Number(cluster||0).toFixed(1)+' % '+IM_TEXT.liveConnectedShort}function renderLive(payload){const d=(payload&&payload.diagnostics)||{};const stamp=Math.max(0,Number((payload&&payload.analysis_stamp_ms)||0)||0);const age=Math.max(0,Number(d.last_analysis_age_ms)||0);if(imLiveLimit)imLiveLimit.textContent=Number((payload&&payload.area_limit_pct)||imSavedMinArea).toFixed(1)+' %';if(imLiveLast)imLiveLast.textContent=liveAgeText(!!d.last_detection_valid,d.last_detection_age_ms);if(imDiagBufferStatus)imDiagBufferStatus.textContent=String(Number((payload&&payload.diag_count)||0))+' / '+String(Number((payload&&payload.diag_capacity)||0));if(!stamp||!d.last_analysis_valid||age>1500){setLiveWaiting(true);return}if(stamp===imLastAnalysisStamp){return}imLastAnalysisStamp=stamp;imLastAnalysisLocalMs=Date.now();if(imLivePulse){imLivePulse.classList.add('tick');setTimeout(()=>imLivePulse.classList.remove('tick'),180)}const required=Math.max(1,Number((payload&&payload.confirm_required)||0)||1);const current=Math.max(0,Number(d.confirm_counter)||0);if(imLiveState){imLiveState.textContent=liveStateText(d);imLiveState.classList.remove('danger','warn','ok');if(d.motion_active||d.image_motion_state==='confirmed')imLiveState.classList.add('danger');else if(d.image_motion_state==='candidate'||d.image_motion_state==='background_init'||d.image_motion_state==='global_change')imLiveState.classList.add('warn');else if(d.image_motion_state==='error')imLiveState.classList.add('danger');else imLiveState.classList.add('ok')}if(imLiveConfirm){imLiveConfirm.textContent=(d.motion_active||d.image_motion_state==='confirmed')?IM_TEXT.liveConfirmed+' ('+Math.min(required,Math.max(current,required))+' / '+required+')':Math.min(current,required)+' / '+required}if(imLiveFrameMotion){imLiveFrameMotion.textContent=d.frame_delta_ready?motionPair(d.frame_changed_pct,d.frame_cluster_pct):'-'}if(imLiveBackground){imLiveBackground.textContent=motionPair(d.global_change_pct,d.changed_area_pct)}imDiag.textContent=JSON.stringify(d,null,2)}
+async function pollLiveStatus(){if(imStatusInFlight||document.hidden)return;imStatusInFlight=true;try{const r=await fetch('/image_motion_status?t='+Date.now(),{cache:'no-store',credentials:'same-origin'});if(!r.ok)throw new Error();const j=await r.json();renderLive(j)}catch(e){setLiveWaiting(true)}finally{imStatusInFlight=false}}
+let imRefreshTimer=0,imFreshnessTimer=0;function scheduleRefresh(ms){clearTimeout(imRefreshTimer);imRefreshTimer=setTimeout(refresh,ms)}function scheduleFreshness(ms){clearTimeout(imFreshnessTimer);imFreshnessTimer=setTimeout(checkFreshness,ms)}function refresh(){if(document.hidden){scheduleRefresh(1000);return}imImage.src='/snapshot?im=1&t='+Date.now()}function checkFreshness(){if(!document.hidden&&imLastAnalysisLocalMs&&Date.now()-imLastAnalysisLocalMs>1600)setLiveWaiting(true);scheduleFreshness(300)}imImage.onload=()=>{drawGrid();pollLiveStatus();scheduleRefresh(200)};imImage.onerror=()=>{setLiveWaiting(true);scheduleRefresh(500)};window.addEventListener('resize',drawGrid);refresh();pollLiveStatus();scheduleFreshness(300);
+function params(){const p=new URLSearchParams();p.set('sensitivity',document.getElementById('imSensitivity').value);p.set('min_area',document.getElementById('imMinArea').value);p.set('confirm',document.getElementById('imConfirm').value);p.set('release',document.getElementById('imRelease').value);p.set('learning',document.getElementById('imLearning').value);p.set('global_mean',document.getElementById('imGlobalMean').value);p.set('global_change',document.getElementById('imGlobalChange').value);p.set('roi',imMask);return p}
+function openInfo(title,body){imInfoTitle.textContent=title;imInfoBody.textContent=body;imInfoBackdrop.classList.add('open')}
+function closeInfo(){imInfoBackdrop.classList.remove('open')}
+document.querySelectorAll('.im-info').forEach(b=>b.addEventListener('click',()=>openInfo(b.dataset.title||'',b.dataset.info||'')));
+document.getElementById('imInfoClose').onclick=closeInfo;imInfoBackdrop.addEventListener('click',e=>{if(e.target===imInfoBackdrop)closeInfo()});document.addEventListener('keydown',e=>{if(e.key==='Escape')closeInfo()});
+function setDefaults(){document.getElementById('imSensitivity').value=IM_DEFAULTS.sensitivity;document.getElementById('imMinArea').value=IM_DEFAULTS.minArea;document.getElementById('imConfirm').value=IM_DEFAULTS.confirm;document.getElementById('imRelease').value=IM_DEFAULTS.release;document.getElementById('imLearning').value=IM_DEFAULTS.learning;document.getElementById('imGlobalMean').value=IM_DEFAULTS.globalMean;document.getElementById('imGlobalChange').value=IM_DEFAULTS.globalChange;imMask=IM_DEFAULTS.roi;drawGrid();imStatus.textContent=IM_TEXT.defaultsDone}
+document.getElementById('imDefaults').onclick=setDefaults;
+document.getElementById('imSave').onclick=async()=>{imStatus.textContent='...';try{const r=await fetch('/image_motion_save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:params()});const j=await r.json();if(!r.ok||!j.ok)throw new Error(IM_TEXT.saveFailed+(j.error?': '+j.error:''));imSavedMinArea=parseInt(document.getElementById('imMinArea').value,10)||imSavedMinArea;imStatus.textContent=IM_TEXT.saved}catch(e){imStatus.textContent=e.message}};
+function friendlyResult(d){if(d.motion_active||d.image_motion_state==='confirmed')return IM_TEXT.resultMotion;switch(d.reject_reason){case'disabled':return IM_TEXT.resultDisabled;case'background_init':return IM_TEXT.resultLearning;case'confirming':return IM_TEXT.resultConfirming;case'global_light':return IM_TEXT.resultGlobalLight;case'no_roi':return IM_TEXT.resultNoRoi;case'decode':case'invalid_frame':return IM_TEXT.resultError;default:return IM_TEXT.resultNone}}
+function renderDiagnostics(d){imResultText.textContent=friendlyResult(d);const active=Math.max(0,Number(d.active_roi_blocks)||0),changed=Math.max(0,Number(d.changed_blocks)||0),cluster=Math.max(0,Number(d.largest_cluster_blocks)||0),frameChanged=Math.max(0,Number(d.frame_changed_blocks)||0),frameCluster=Math.max(0,Number(d.frame_largest_cluster_blocks)||0);const total=Number(d.global_change_pct||0).toFixed(1)+' %'+(active?' ('+changed+' / '+active+')':'');const area=Number(d.changed_area_pct||0).toFixed(1)+' %'+(cluster?' ('+cluster+')':'');const frameTotal=d.frame_delta_ready?(Number(d.frame_changed_pct||0).toFixed(1)+' %'+(active?' ('+frameChanged+' / '+active+')':'')):'-';const frameArea=d.frame_delta_ready?(Number(d.frame_cluster_pct||0).toFixed(1)+' %'+(frameCluster?' ('+frameCluster+')':'')):'-';const limit=imSavedMinArea+' %';imResultMeta.innerHTML='';[[IM_TEXT.resultTime,(d.analyze_frame_ms!==undefined?d.analyze_frame_ms:'-')+' ms'],[IM_TEXT.liveCurrentMotion,frameTotal+' / '+frameArea+' '+IM_TEXT.liveConnectedShort],[IM_TEXT.liveBackgroundDifference,total+' / '+area+' '+IM_TEXT.liveConnectedShort],[IM_TEXT.resultLimit,limit]].forEach(([k,v])=>{const span=document.createElement('span');span.textContent=k+': '+v;imResultMeta.appendChild(span)});imDiag.textContent=JSON.stringify(d,null,2)}
+document.getElementById('imTest').onclick=async()=>{imStatus.textContent='...';try{const r=await fetch('/image_motion_test',{method:'POST'}),j=await r.json();if(!r.ok||!j.ok)throw new Error(IM_TEXT.testFailed+(j.error?': '+j.error:''));renderDiagnostics(j.diagnostics||{});imStatus.textContent='OK'}catch(e){imResultText.textContent=IM_TEXT.resultError;imStatus.textContent=e.message}};
+document.getElementById('imResetBg').onclick=async()=>{imStatus.textContent='...';try{const r=await fetch('/image_motion_reset',{method:'POST'}),j=await r.json();if(!r.ok||!j.ok)throw new Error(IM_TEXT.testFailed);imResultText.textContent=IM_TEXT.resetBgDone;imResultMeta.textContent='';imDiag.textContent='-';imStatus.textContent=IM_TEXT.resetBgDone}catch(e){imStatus.textContent=e.message}};
+function release(){fetch('/preview_stop?im=1',{method:'POST',keepalive:true}).catch(()=>{})}window.addEventListener('pagehide',release);document.addEventListener('visibilitychange',()=>{if(document.hidden){clearTimeout(imRefreshTimer);clearTimeout(imFreshnessTimer);release()}else{clearTimeout(imRefreshTimer);clearTimeout(imFreshnessTimer);imLastAnalysisStamp=0;imLastAnalysisLocalMs=0;refresh();pollLiveStatus();scheduleFreshness(300)}});
+)JS";
+        html += "</script>";
+    }
+
+    html += htmlFooter();
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "text/html; charset=utf-8", html);
+}
+
+
 static void handlePreview()
 {
     String html = htmlHeader();
@@ -8566,6 +10215,36 @@ static void handleSnapshot()
         fb->len
     );
 
+    // The Image Motion page asks for ?im=1. Analyze exactly the JPEG that was
+    // just shown in the browser, so the live status always describes the same
+    // frame and no second camera capture is required. This path is diagnostic
+    // only; WebConfig's preview gate still prevents it from starting a recording.
+    if (
+        server.hasArg("im") &&
+        server.arg("im") == "1" &&
+        fb->format == PIXFORMAT_JPEG &&
+        fb->buf &&
+        fb->len > 0
+    ) {
+        uint32_t nowMs = millis();
+        if (
+            imageMotionPreviewLastAnalysisMs == 0 ||
+            (uint32_t)(nowMs - imageMotionPreviewLastAnalysisMs) >=
+                IMAGE_MOTION_PREVIEW_ANALYSIS_INTERVAL_MS
+        ) {
+            imageMotionPreviewLastAnalysisMs = nowMs;
+
+            ImageMotionDiagnostics diagnostics;
+            (void)imageMotionAnalyzeJpeg(
+                fb->buf,
+                fb->len,
+                fb->width,
+                fb->height,
+                diagnostics
+            );
+        }
+    }
+
     esp_camera_fb_return(fb);
 }
 
@@ -8573,6 +10252,13 @@ static void handleSnapshot()
 static void handlePreviewStop()
 {
     stopCameraPreview();
+
+    if (server.hasArg("im") && server.arg("im") == "1") {
+        // Keep the learned background, but never let a diagnostic/live-preview
+        // confirmation leak into the operational image_only trigger state.
+        imageMotionBeginVerification();
+        imageMotionPreviewLastAnalysisMs = 0;
+    }
 
     server.send(
         204,
@@ -8626,6 +10312,9 @@ static void appendRadarRateOptions(
 
 static void handleRadarLive()
 {
+    if (rejectRadarConfigurationUnavailable())
+        return;
+
     // This endpoint only returns values already cached in RAM by radarLoop().
     // It does not enter configuration mode and does not touch the SD card.
     //
@@ -8644,7 +10333,7 @@ static void handleRadarLive()
     String json;
 
     json.reserve(
-        512
+        1024
     );
 
     json +=
@@ -8655,10 +10344,43 @@ static void handleRadarLive()
         ? "true"
         : "false";
 
+    uint8_t targetState =
+        radarLastTargetState();
+
+    RadarSettings liveSettings;
+    bool liveSettingsValid =
+        radarGetCachedSettings(
+            liveSettings
+        );
+
     json +=
         ",\"state\":" +
         String(
-            radarLastTargetState()
+            targetState
+        );
+
+    json +=
+        ",\"sensor_present\":";
+
+    json +=
+        (targetState == 2 || targetState == 3)
+        ? "true"
+        : "false";
+
+    json +=
+        ",\"ot2\":";
+
+    json +=
+        digitalRead(PIR_PIN) == HIGH
+        ? "true"
+        : "false";
+
+    json +=
+        ",\"absence_sec\":" +
+        String(
+            liveSettingsValid
+            ? liveSettings.absenceSec
+            : 0
         );
 
     json +=
@@ -8712,7 +10434,39 @@ static void handleRadarLive()
 
 
     json +=
-        "]}";
+        "],\"last_trigger_age_ms\":[";
+
+
+    for (
+        uint8_t gate = 0;
+        gate < 16;
+        ++gate
+    ) {
+        if (gate > 0) {
+            json += ',';
+        }
+
+        uint32_t ageMs = 0;
+
+        if (
+            radarGateLastTriggerAgeMs(
+                gate,
+                ageMs
+            )
+        ) {
+            json += String(ageMs);
+        } else {
+            json += "-1";
+        }
+    }
+
+
+    json +=
+        "],\"diag_count\":" +
+        String(radarDiagnosticCount()) +
+        ",\"diag_capacity\":" +
+        String(radarDiagnosticCapacity()) +
+        "}";
 
 
     server.sendHeader(
@@ -8725,6 +10479,278 @@ static void handleRadarLive()
         "application/json",
         json
     );
+}
+
+
+static String radarDiagnosticCalibrationText(
+    uint8_t mode
+)
+{
+    if (mode == (uint8_t)RADAR_CALIBRATION_QUIET)
+        return "quiet";
+
+    if (mode == (uint8_t)RADAR_CALIBRATION_MOTION)
+        return "motion";
+
+    return "none";
+}
+
+
+static String radarDiagnosticEnergyText(
+    uint16_t deciDb
+)
+{
+    if (deciDb == RADAR_DIAGNOSTIC_INVALID_ENERGY)
+        return "-";
+
+    return
+        String(deciDb / 10U) +
+        "." +
+        String(deciDb % 10U);
+}
+
+
+static char radarDiagnosticZone(
+    uint16_t deciDb,
+    uint32_t triggerDb,
+    uint32_t holdDb
+)
+{
+    if (deciDb == RADAR_DIAGNOSTIC_INVALID_ENERGY)
+        return 'X';
+
+    uint32_t energy = deciDb;
+
+    if (energy >= triggerDb * 10UL)
+        return 'T';
+
+    if (energy >= holdDb * 10UL)
+        return 'H';
+
+    return 'C';
+}
+
+
+static String radarDiagnosticTimestamp(
+    const RadarDiagnosticSample &sample
+)
+{
+    if (sample.epochSec < 1577836800UL)
+        return "-";
+
+    time_t seconds =
+        (time_t)sample.epochSec;
+
+    struct tm localTime;
+    localtime_r(
+        &seconds,
+        &localTime
+    );
+
+    char buffer[32];
+    strftime(
+        buffer,
+        sizeof(buffer),
+        "%Y-%m-%d %H:%M:%S",
+        &localTime
+    );
+
+    char millisPart[8];
+    snprintf(
+        millisPart,
+        sizeof(millisPart),
+        ".%03u",
+        (unsigned int)sample.epochMs
+    );
+
+    return String(buffer) + String(millisPart);
+}
+
+
+static void handleRadarDiagnosticDownload()
+{
+    if (rejectRadarConfigurationUnavailable())
+        return;
+
+    RadarSettings settings;
+    bool settingsValid =
+        radarGetCachedSettings(
+            settings
+        );
+
+    uint16_t count =
+        radarDiagnosticCount();
+
+    server.sendHeader(
+        "Cache-Control",
+        "no-store"
+    );
+
+    server.sendHeader(
+        "Content-Disposition",
+        "attachment; filename=\"sensorforge_radar_diagnostic.txt\""
+    );
+
+    server.setContentLength(
+        CONTENT_LENGTH_UNKNOWN
+    );
+
+    server.send(
+        200,
+        "text/plain; charset=utf-8",
+        ""
+    );
+
+    String line;
+    line.reserve(768);
+
+    line =
+        "# SensorForge Radar RAM Diagnostic\n"
+        "# RAM-only ring buffer; no SD/main-log writes.\n"
+        "# Capture: 1 s baseline plus immediate target/OT2/ESP-motion/threshold-zone changes.\n"
+        "# Oldest retained sample first; oldest entries are overwritten when the buffer is full.\n"
+        "# Zone: T=at/above Trigger, H=below Trigger but at/above Hold, C=below Hold, X=invalid raw zero.\n";
+
+    server.sendContent(line);
+
+    line =
+        "# samples=" +
+        String(count) +
+        " capacity=" +
+        String(radarDiagnosticCapacity()) +
+        "\n";
+
+    server.sendContent(line);
+
+    if (settingsValid) {
+        line =
+            "# settings: min_gate=" +
+            String(settings.minGate) +
+            " max_gate=" +
+            String(settings.maxGate) +
+            " absence_sec=" +
+            String(settings.absenceSec) +
+            " status_rate_hz=" +
+            radarRateText(settings.statusRateX10) +
+            " distance_rate_hz=" +
+            radarRateText(settings.distanceRateX10) +
+            " response_speed=" +
+            String(settings.responseSpeed) +
+            "\n";
+
+        server.sendContent(line);
+
+        uint32_t firstGateValue =
+            settings.minGate == 0
+            ? 0UL
+            : settings.minGate + 1UL;
+
+        if (firstGateValue > 15UL)
+            firstGateValue = 15UL;
+
+        uint32_t finalGateValue =
+            settings.maxGate > 15UL
+            ? 15UL
+            : settings.maxGate;
+
+        for (uint8_t gate = 0; gate < 16; ++gate) {
+            bool operational =
+                gate >= firstGateValue &&
+                gate <= finalGateValue;
+
+            line =
+                "# G" +
+                String(gate) +
+                " trigger=" +
+                String(settings.triggerThreshold[gate]) +
+                " hold=" +
+                String(settings.holdThreshold[gate]) +
+                " operational=" +
+                String(operational ? "yes" : "no") +
+                "\n";
+
+            server.sendContent(line);
+        }
+    } else {
+        server.sendContent(
+            "# settings: unavailable\n"
+        );
+    }
+
+    line =
+        "seq\ttime\tuptime_ms\ttarget_state\ttarget_present\tot2\tdistance_cm\tesp_motion\tcalibration";
+
+    for (uint8_t gate = 0; gate < 16; ++gate) {
+        line +=
+            "\tG" +
+            String(gate) +
+            "_db\tG" +
+            String(gate) +
+            "_zone";
+    }
+
+    line += "\n";
+    server.sendContent(line);
+
+    for (uint16_t index = 0; index < count; ++index) {
+        RadarDiagnosticSample sample;
+
+        if (!radarDiagnosticGet(
+                index,
+                sample
+            )) {
+            continue;
+        }
+
+        bool targetPresent =
+            sample.targetState == 2 ||
+            sample.targetState == 3;
+
+        line =
+            String(sample.sequence) +
+            "\t" +
+            radarDiagnosticTimestamp(sample) +
+            "\t" +
+            String(sample.uptimeMs) +
+            "\t" +
+            String(sample.targetState) +
+            "\t" +
+            String(targetPresent ? "1" : "0") +
+            "\t" +
+            String(sample.ot2High ? "HIGH" : "LOW") +
+            "\t" +
+            String(sample.targetDistanceCm) +
+            "\t" +
+            String(sample.espMotionActive ? "1" : "0") +
+            "\t" +
+            radarDiagnosticCalibrationText(
+                sample.calibrationMode
+            );
+
+        for (uint8_t gate = 0; gate < 16; ++gate) {
+            line += "\t";
+            line += radarDiagnosticEnergyText(
+                sample.gateEnergyDeciDb[gate]
+            );
+            line += "\t";
+
+            if (settingsValid) {
+                line += radarDiagnosticZone(
+                    sample.gateEnergyDeciDb[gate],
+                    settings.triggerThreshold[gate],
+                    settings.holdThreshold[gate]
+                );
+            } else {
+                line += '?';
+            }
+        }
+
+        line += "\n";
+        server.sendContent(line);
+
+        if ((index % 25U) == 24U)
+            serviceWebLongOperation();
+    }
 }
 
 
@@ -8759,6 +10785,36 @@ static void appendRadarCalibrationSessionJson(
             radarCalibrationSampleCount(
                 mode
             )
+        ) +
+        ",\"countdown_ms\":" +
+        String(
+            radarCalibrationCountdownRemainingMs(
+                mode
+            )
+        ) +
+        ",\"measurement_started\":" +
+        String(
+            radarCalibrationMeasurementStarted(mode)
+            ? "true"
+            : "false"
+        ) +
+        ",\"auto_completed\":" +
+        String(
+            radarCalibrationAutoCompleted(mode)
+            ? "true"
+            : "false"
+        ) +
+        ",\"quality_limited\":" +
+        String(
+            radarCalibrationQualityLimited(mode)
+            ? "true"
+            : "false"
+        ) +
+        ",\"aborted\":" +
+        String(
+            radarCalibrationAborted(mode)
+            ? "true"
+            : "false"
         ) +
         ",\"gates\":[";
 
@@ -8796,6 +10852,8 @@ static void appendRadarCalibrationSessionJson(
             String(stats.minimumDb, 1) +
             ",\"mean\":" +
             String(stats.meanDb, 1) +
+            ",\"p10\":" +
+            String(stats.p10Db, 1) +
             ",\"p50\":" +
             String(stats.p50Db, 1) +
             ",\"p95\":" +
@@ -8814,6 +10872,9 @@ static void appendRadarCalibrationSessionJson(
 
 static void handleRadarCalibrationStatus()
 {
+    if (rejectRadarConfigurationUnavailable())
+        return;
+
     String json;
 
     json.reserve(
@@ -8830,7 +10891,15 @@ static void handleRadarCalibrationStatus()
                 active
             )
         ) +
-        "\",\"quiet\":";
+        "\",\"target_samples\":" +
+        String(
+            radarCalibrationTargetValidSamples()
+        ) +
+        ",\"max_reports\":" +
+        String(
+            radarCalibrationMaxReports()
+        ) +
+        ",\"quiet\":";
 
     appendRadarCalibrationSessionJson(
         json,
@@ -8863,6 +10932,11 @@ static void handleRadarCalibrationStatus()
 
 static void handleRadarCalibrationAction()
 {
+    if (rejectRadarConfigurationUnavailable())
+        return;
+
+    RadarWebMaintenanceGuard maintenanceGuard;
+
     String action =
         server.arg("action");
 
@@ -8878,11 +10952,17 @@ static void handleRadarCalibrationAction()
             ? RADAR_CALIBRATION_QUIET
             : RADAR_CALIBRATION_MOTION;
 
-        if (!radarCalibrationStart(mode)) {
+        String calibrationError;
+
+        if (!radarCalibrationStart(
+                mode,
+                calibrationError
+            )) {
             server.send(
                 409,
                 "text/plain; charset=utf-8",
-                "Radar-Gate-Energien sind momentan nicht verfügbar."
+                "Radar-Kalibrierung konnte nicht gestartet werden: " +
+                calibrationError
             );
             return;
         }
@@ -8894,20 +10974,34 @@ static void handleRadarCalibrationAction()
 
         consoleWrite(
             "RADAR",
-            "Kalibrierung gestartet | " +
-            label
+            "Kalibrierung vorbereitet | " +
+            label +
+            " | Start in 10 s"
         );
 
         logWrite(
-            "Radar calibration started | " +
-            label
+            "Radar calibration armed | " +
+            label +
+            " | countdown=10s"
         );
 
     } else if (action == "stop") {
         RadarCalibrationMode previous =
             radarCalibrationActiveMode();
 
-        radarCalibrationStop();
+        String calibrationError;
+
+        if (!radarCalibrationStop(
+                calibrationError
+            )) {
+            server.send(
+                500,
+                "text/plain; charset=utf-8",
+                "Messung wurde gestoppt, aber der normale Gate-Bereich konnte nicht wiederhergestellt werden: " +
+                calibrationError
+            );
+            return;
+        }
 
         if (previous != RADAR_CALIBRATION_NONE) {
             consoleWrite(
@@ -8948,6 +11042,11 @@ static void handleRadarCalibrationAction()
 
 static void handleRadarConfig()
 {
+    if (rejectRadarConfigurationUnavailable())
+        return;
+
+    RadarWebMaintenanceGuard maintenanceGuard;
+
     // Opening/navigating to Radar Config is explicit operator activity. If the
     // recording automation is paused, refresh its lease immediately before the
     // synchronous UART settings read below.
@@ -8960,32 +11059,76 @@ static void handleRadarConfig()
     bool recordingActive =
         recorderIsOpen();
 
+    bool justSaved =
+        server.hasArg("saved") &&
+        server.arg("saved") == "1";
+
+    bool justRestoredDefaults =
+        server.hasArg("defaults") &&
+        server.arg("defaults") == "1";
+
     bool readOk =
         false;
 
+    bool uartReadTimedOutButCacheAvailable =
+        false;
 
-    // While recording, do not interrupt normal radar reports just
-    // to render this page. Use the settings cached at startup or
-    // after the most recent successful write.
-    if (recordingActive) {
+
+    // radarWriteSettings() already performs a complete read-back verification
+    // inside the SAME configuration session and caches those verified values.
+    // Do not immediately open a second LD2410S configuration session after the
+    // POST/Redirect/GET cycle. Some modules need a short recovery period after
+    // returning to standard-report mode and occasionally miss that second
+    // enable-config ACK even though the write itself was fully successful.
+    if (
+        recordingActive ||
+        justSaved ||
+        justRestoredDefaults
+    ) {
 
         readOk =
             radarGetCachedSettings(
                 settings
             );
 
-        if (!readOk) {
+        if (!readOk && recordingActive) {
             error =
                 "no cached radar settings available while recording";
         }
+    }
 
-    } else {
 
-        readOk =
+    // Normal page opens still request a fresh hardware read. If that one
+    // synchronous configuration transaction happens to time out while the
+    // radar is otherwise alive, fall back to the most recently verified cache
+    // instead of presenting a misleading wiring/sensor failure to the user.
+    if (!readOk && !recordingActive) {
+
+        String freshReadError;
+
+        bool freshReadOk =
             radarReadSettings(
                 settings,
-                error
+                freshReadError
             );
+
+        if (freshReadOk) {
+            readOk = true;
+            error = "";
+
+        } else {
+            RadarSettings cachedSettings;
+
+            if (radarGetCachedSettings(cachedSettings)) {
+                settings = cachedSettings;
+                readOk = true;
+                uartReadTimedOutButCacheAvailable = true;
+                error = freshReadError;
+
+            } else {
+                error = freshReadError;
+            }
+        }
     }
 
 
@@ -9003,6 +11146,14 @@ static void handleRadarConfig()
             "Live-Energien laufen weiter. Speichern ist erlaubt; "
             "waehrend des kurzen UART-Schreibvorgangs kann es zu einer "
             "kleinen Luecke zwischen Videoframes kommen.</p>";
+
+    } else if (uartReadTimedOutButCacheAvailable) {
+        html +=
+            "<div class='flash-notice' style='border-color:#d6a100'>"
+            "<strong>Radar antwortet, Konfigurations-Lesen war kurzzeitig beschaeftigt</strong>"
+            "<span class='muted'>Die zuletzt erfolgreich gelesenen bzw. verifizierten Radar-Werte werden angezeigt. "
+            "Das ist kein Hinweis auf eine defekte Verdrahtung. Mit <b>Read again</b> kann jederzeit neu gelesen werden.</span>"
+            "</div>";
     }
 
 
@@ -9096,39 +11247,56 @@ static void handleRadarConfig()
     }
 
 
-    if (
-        server.hasArg("saved") &&
-        server.arg("saved") == "1"
-    ) {
+    if (justSaved) {
+
+        bool calibrationApplied =
+            server.hasArg("calibration") &&
+            server.arg("calibration") == "1";
 
         html +=
-            "<p style='color:#087a00'><b>Gespeichert und erfolgreich zurueckgelesen.</b></p>";
+            calibrationApplied
+            ? "<p style='color:#087a00'><b>Kalibrierung übernommen, in den LD2410S geschrieben und erfolgreich verifiziert.</b></p>"
+            : "<p style='color:#087a00'><b>Gespeichert und erfolgreich verifiziert.</b></p>";
     }
 
 
-    if (
-        server.hasArg("defaults") &&
-        server.arg("defaults") == "1"
-    ) {
+    if (justRestoredDefaults) {
 
         html +=
             "<div class='flash-notice'>"
             "<strong>Hi-Link Standardwerte wiederhergestellt</strong>"
-            "<span class='muted'>Die Radar-Parameter wurden geschrieben und erfolgreich zurueckgelesen.</span>"
+            "<span class='muted'>Die Radar-Parameter wurden geschrieben und erfolgreich verifiziert.</span>"
             "</div>";
     }
 
 
     html +=
-        "<h3>Live Gate Energy</h3>"
-        "<p>Aktualisierung ca. 4x pro Sekunde. "
-        "Energie und Trigger-Schwelle benutzen dieselbe dB-Skala. "
-        "Positiver Margin bedeutet: Gate liegt ueber der Trigger-Schwelle.</p>";
+        "<h3>Radar Live-Status</h3>"
+        "<div class='flash-notice' style='border-color:#8aa6bf'>"
+        "<strong>Aktueller Radarstatus</strong>"
+        "<div style='display:grid;grid-template-columns:minmax(120px,150px) minmax(0,1fr);column-gap:12px;row-gap:5px;margin-top:8px;align-items:start'>"
+        "<b style='white-space:nowrap'>Radar erkennt:</b><span id='radarSensorDecision' style='display:block;min-height:1.35em'>warte auf Daten...</span>"
+        "<b style='white-space:nowrap'>OT2-Ausgang:</b><span id='radarOt2Decision' style='display:block;min-height:1.35em'>-</span>"
+        "<b style='white-space:nowrap'>Warum:</b><span id='radarDerivedCause' style='display:block;min-height:2.7em;line-height:1.35'>-</span>"
+        "</div>"
+        "<div style='display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-top:10px'>"
+        "<a href='/radar_diag_download'><button type='button'>Radar-Diagnose herunterladen</button></a>"
+        "<span class='muted'>RAM-Puffer: <b id='radarDiagBufferStatus'>- / 400</b> Einträge · älteste werden automatisch überschrieben</span>"
+        "</div>"
+        "</div>";
 
     html +=
-        "<p><b>Live status:</b> "
+        "<h3>Live Gate Energy</h3>"
+        "<p>Aktualisierung ca. 4x pro Sekunde. "
+        "<b>TRIGGER</b> bedeutet: Energie liegt auf/über der Trigger-Schwelle. "
+        "<b>HOLD</b> bedeutet: unter Trigger, aber noch auf/über der Hold-Schwelle. "
+        "<b>Letzter Trigger</b> wird direkt im ESP aus jedem Radarreport gespeichert; "
+        "auch ein kurzer Trigger zwischen zwei Browser-Aktualisierungen bleibt daher sichtbar.</p>";
+
+    html +=
+        "<p><b>UART:</b> "
         "<span id='radarLiveStatus'>waiting...</span>"
-        " &nbsp; <b>Motion:</b> "
+        " &nbsp; <b>ESP-Schnelltrigger:</b> "
         "<span id='radarLiveMotion'>-</span>"
         " &nbsp; <b>Messstatistik:</b> "
         "<span id='radarCalLiveMode'>keine</span>"
@@ -9145,8 +11313,10 @@ static void handleRadarConfig()
         "<th style='padding:5px;border-bottom:1px solid #aaa'>Mess-P99</th>"
         "<th style='padding:5px;border-bottom:1px solid #aaa'>Mess-Peak</th>"
         "<th style='padding:5px;border-bottom:1px solid #aaa'>Trigger dB</th>"
-        "<th style='padding:5px;border-bottom:1px solid #aaa'>Margin</th>"
+        "<th style='padding:5px;border-bottom:1px solid #aaa'>Hold dB</th>"
+        "<th style='padding:5px;border-bottom:1px solid #aaa'>Trigger-Margin</th>"
         "<th style='padding:5px;border-bottom:1px solid #aaa'>Status</th>"
+        "<th style='padding:5px;border-bottom:1px solid #aaa'>Letzter Trigger</th>"
         "</tr>";
 
 
@@ -9163,6 +11333,12 @@ static void handleRadarConfig()
         html +=
             "<tr id='liveRow" +
             String(gate) +
+            "' data-active='" +
+            String(
+                inConfiguredRange
+                ? "1"
+                : "0"
+            ) +
             "'" +
             String(
                 inConfiguredRange
@@ -9200,12 +11376,24 @@ static void handleRadarConfig()
                 ]
             ) +
             "</td>"
+            "<td id='liveHoldThreshold" +
+            String(gate) +
+            "' style='padding:4px;text-align:right'>" +
+            String(
+                settings.holdThreshold[
+                    gate
+                ]
+            ) +
+            "</td>"
             "<td id='liveMargin" +
             String(gate) +
             "' style='padding:4px;text-align:right'>-</td>"
             "<td id='liveState" +
             String(gate) +
             "' style='padding:4px'>-</td>"
+            "<td id='liveLastTrigger" +
+            String(gate) +
+            "' style='padding:4px;text-align:right;white-space:nowrap'>-</td>"
             "</tr>";
     }
 
@@ -9218,6 +11406,19 @@ static void handleRadarConfig()
         "<script>"
         "(function(){"
         "var busy=false;"
+        "function formatTriggerAge(ms){"
+            "ms=Number(ms);"
+            "if(!Number.isFinite(ms)||ms<0)return '-';"
+            "if(ms<1000)return '<1s';"
+            "var sec=Math.floor(ms/1000);"
+            "if(sec<60)return sec+'s';"
+            "var min=Math.floor(sec/60);"
+            "var rem=sec%60;"
+            "if(min<60)return min+'m'+(rem<10?'0':'')+rem+'s';"
+            "var hour=Math.floor(min/60);"
+            "var minRem=min%60;"
+            "return hour+'h'+(minRem<10?'0':'')+minRem+'m';"
+        "}"
         "function updateRadarLive(){"
             "if(busy)return;"
             "busy=true;"
@@ -9226,29 +11427,58 @@ static void handleRadarConfig()
             ".then(function(d){"
                 "var s=document.getElementById('radarLiveStatus');"
                 "var m=document.getElementById('radarLiveMotion');"
+                "var sd=document.getElementById('radarSensorDecision');"
+                "var od=document.getElementById('radarOt2Decision');"
+                "var dc=document.getElementById('radarDerivedCause');"
+                "var db=document.getElementById('radarDiagBufferStatus');"
+                "if(db&&Number.isFinite(Number(d.diag_count))&&Number.isFinite(Number(d.diag_capacity)))db.textContent=Number(d.diag_count)+' / '+Number(d.diag_capacity);"
                 "if(!d.recent){"
-                    "s.textContent='no recent standard report';"
+                    "s.textContent='keine aktuellen Standarddaten';"
+                    "if(sd)sd.textContent='keine aktuellen Daten';"
+                    "if(od)od.textContent=d.ot2?'HIGH':'LOW';"
+                    "if(dc)dc.textContent='nicht bestimmbar';"
                 "}else{"
-                    "s.textContent='state='+d.state+', distance='+d.distance+' cm';"
+                    "s.textContent='Status '+d.state+' · Distanz '+d.distance+' cm';"
+                    "if(sd)sd.textContent=d.sensor_present?'BEWEGUNG':'Keine Bewegung';"
+                    "if(od){od.textContent=d.ot2?'HIGH':'LOW';od.style.fontWeight='bold';}"
                 "}"
-                "m.textContent=d.motion?'ACTIVE ('+d.remaining_ms+' ms)':'clear';"
+                "m.textContent=d.motion?'AKTIV ('+d.remaining_ms+' ms)':'keine Bewegung';"
+                "var bestTrigger=null,bestHold=null;"
                 "for(var i=0;i<16;i++){"
                     "var e=document.getElementById('liveEnergy'+i);"
                     "var t=document.getElementById('liveThreshold'+i);"
+                    "var h=document.getElementById('liveHoldThreshold'+i);"
                     "var g=document.getElementById('liveMargin'+i);"
                     "var q=document.getElementById('liveState'+i);"
-                    "if(!e||!t||!g||!q)continue;"
+                    "var a=document.getElementById('liveLastTrigger'+i);"
+                    "var row=document.getElementById('liveRow'+i);"
+                    "if(!e||!t||!h||!g||!q||!a)continue;"
+                    "a.textContent=(d.last_trigger_age_ms&&i<d.last_trigger_age_ms.length)?formatTriggerAge(d.last_trigger_age_ms[i]):'-';"
                     "if(!d.recent){"
-                        "e.textContent='-';g.textContent='-';q.textContent='-';"
+                        "e.textContent='-';g.textContent='-';q.textContent='-';q.style.fontWeight='normal';"
                         "continue;"
                     "}"
                     "var energy=Number(d.energy[i]);"
                     "var threshold=Number(t.textContent);"
+                    "var hold=Number(h.textContent);"
                     "var margin=energy-threshold;"
                     "e.textContent=energy.toFixed(1);"
                     "g.textContent=(margin>=0?'+':'')+margin.toFixed(1);"
-                    "q.textContent=margin>=0?'TRIGGER':'clear';"
-                    "q.style.fontWeight=margin>=0?'bold':'normal';"
+                    "var valid=Number.isFinite(energy)&&energy>0;"
+                    "if(!valid){q.textContent='keine Daten';q.style.fontWeight='normal';continue;}"
+                    "if(energy>=threshold){q.textContent='TRIGGER';q.style.fontWeight='bold';}"
+                    "else if(energy>=hold){q.textContent='HOLD';q.style.fontWeight='bold';}"
+                    "else{q.textContent='clear';q.style.fontWeight='normal';}"
+                    "var active=!row||row.dataset.active!=='0';"
+                    "if(active&&energy>=threshold){var tm=energy-threshold;if(!bestTrigger||tm>bestTrigger.margin)bestTrigger={gate:i,energy:energy,threshold:threshold,margin:tm};}"
+                    "else if(active&&energy>=hold){var hm=energy-hold;if(!bestHold||hm>bestHold.margin)bestHold={gate:i,energy:energy,hold:hold,margin:hm};}"
+                "}"
+                "if(d.recent&&dc){"
+                    "if(bestTrigger){dc.textContent='Gate '+bestTrigger.gate+' hat ausgelöst.';if(!d.sensor_present&&!d.ot2)dc.textContent+=' Der Sensor hat die Bewegung noch nicht übernommen.';}"
+                    "else if(bestHold){if(d.sensor_present||d.ot2)dc.textContent='Gate '+bestHold.gate+' hält die erkannte Bewegung noch aktiv.';else dc.textContent='Gate '+bestHold.gate+' liegt noch im Haltebereich, aber der Sensor meldet keine Bewegung.';}"
+                    "else if(d.sensor_present||d.ot2){dc.textContent='Der Sensor hält die letzte Erkennung noch nach.';}"
+                    "else{dc.textContent='Kein Gate meldet Bewegung.';}"
+                    "if(Boolean(d.sensor_present)!==Boolean(d.ot2))dc.textContent+=' Hinweis: Radarstatus und OT2 passen gerade nicht zusammen.';"
                 "}"
             "})"
             ".catch(function(){"
@@ -9266,27 +11496,41 @@ static void handleRadarConfig()
     html +=
         "<div id='radarCalibration' class='settings-section' style='margin-top:18px'>"
         "<h3>Radar Kalibrierung</h3>"
-        "<p class='muted'>Die Messung sammelt die 16 Gate-Energien direkt im Gerät. "
-        "Für eine Ruhemessung den Raum möglichst leer und unverändert lassen; etwa fünf Minuten "
-        "sind ein guter Ausgangspunkt. Danach eine separate Bewegungsmessung starten und den "
-        "relevanten Bereich mehrmals durchqueren.</p>"
+        "<p class='muted'>Die Kalibrierung ist bewusst einfach: Messart starten, den überwachten Bereich verlassen bzw. "
+        "für die Bewegungsmessung die gewünschte Bewegung vorbereiten. Danach läuft zuerst ein <b>10-Sekunden-Countdown</b>. "
+        "Erst anschließend werden Messwerte gesammelt. Die Messung beendet sich automatisch, sobald jedes Gate 100 gültige "
+        "Werte erreicht hat. Ein Gate mit 100 verworfenen Werten gilt als unzuverlässig; spätestens nach 150 Radar-Reports wird ebenfalls beendet. "
+        "Gates mit zu vielen Fehlwerten werden "
+        "bei der späteren Empfehlung vom nächstgelegenen brauchbaren Gate abgeleitet.</p>"
+        "<p class='muted'>Während der Messung wird der LD2410S vorübergehend auf Gate 0–16 erweitert. Der normale Min./Max.-Gate-Bereich "
+        "wird danach automatisch wiederhergestellt. Ausgeblendete Gates werden dadurch nur kalibriert und nicht für die normale "
+        "Alarmierung aktiviert.</p>"
         "<p><b>Status:</b> <span id='radarCalState'>keine Messung aktiv</span> "
         "&nbsp; <b>Laufzeit:</b> <span id='radarCalElapsed'>00:00</span> "
         "&nbsp; <b>Messzyklen:</b> <span id='radarCalSamples'>0</span></p>"
-        "<div style='display:flex;flex-wrap:wrap;gap:6px;margin:10px 0'>"
+        "<div style='display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 14px'>"
         "<button type='button' id='calStartQuiet'>Ruhemessung starten</button>"
         "<button type='button' id='calStartMotion'>Bewegungsmessung starten</button>"
-        "<button type='button' id='calStop'>Messung stoppen</button>"
         "</div>"
-        "<div style='display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 14px'>"
-        "<button type='button' id='calResetQuiet'>Ruhewerte löschen</button>"
-        "<button type='button' id='calResetMotion'>Bewegungswerte löschen</button>"
-        "<button type='button' id='calResetAll'>Alle Messwerte löschen</button>"
+        "<div id='radarCalProgressModal' class='modal-backdrop' hidden>"
+        "<div class='modal-card radar-cal-modal-card' role='dialog' aria-modal='true' aria-labelledby='radarCalModalTitle'>"
+        "<div class='radar-cal-kicker'>Radar-Kalibrierung</div>"
+        "<h3 id='radarCalModalTitle'>Messung</h3>"
+        "<div id='radarCalModalBig' class='radar-cal-big'>10</div>"
+        "<div id='radarCalModalBigLabel' class='radar-cal-big-label'>Sekunden bis Messbeginn</div>"
+        "<div class='radar-cal-progress'><span id='radarCalModalProgressBar'></span></div>"
+        "<div id='radarCalModalHint' class='radar-cal-hint'>Messbereich jetzt verlassen.</div>"
+        "<div class='radar-cal-meta'>"
+        "<div><b id='radarCalModalCompleted'>0 / 16</b><span>Gates abgeschlossen</span></div>"
+        "<div><b id='radarCalModalWeakest'>0 / 100</b><span>Wenigste gültige Werte</span></div>"
+        "<div><b id='radarCalModalReports'>0 / 150</b><span>Radar-Reports</span></div>"
         "</div>"
-        "<p class='muted'>Starten löscht jeweils nur die gewählte Messung. Die andere Messung bleibt "
-        "für den Vergleich erhalten. Die Messdaten liegen nur im RAM und verändern keine Radar-Konfiguration. "
-        "Ungültige 0-Werte des Radars werden pro Gate verworfen und beeinflussen Min, Mittelwert, "
-        "Perzentile und Peak nicht.</p>"
+        "<div class='modal-actions'>"
+        "<button type='button' id='radarCalModalCancel'>Messung abbrechen</button>"
+        "<button type='button' id='radarCalModalApply' class='primary' hidden>Werte übernehmen + auf Radar schreiben</button>"
+        "<button type='button' id='radarCalModalClose' hidden>Nur Ergebnisse anzeigen</button>"
+        "</div>"
+        "</div></div>"
 
         "<h4>Ruhemessung</h4>"
         "<div style='overflow-x:auto'><table style='border-collapse:collapse;min-width:760px'>"
@@ -9330,6 +11574,7 @@ static void handleRadarConfig()
         "<th style='padding:5px;border-bottom:1px solid #aaa'>Verworfen</th>"
         "<th style='padding:5px;border-bottom:1px solid #aaa'>Min</th>"
         "<th style='padding:5px;border-bottom:1px solid #aaa'>Ø</th>"
+        "<th style='padding:5px;border-bottom:1px solid #aaa'>P10</th>"
         "<th style='padding:5px;border-bottom:1px solid #aaa'>P95</th>"
         "<th style='padding:5px;border-bottom:1px solid #aaa'>P99</th>"
         "<th style='padding:5px;border-bottom:1px solid #aaa'>Peak</th>"
@@ -9344,6 +11589,7 @@ static void handleRadarConfig()
             "<td id='calMotionDiscarded" + String(gate) + "' style='padding:4px;text-align:right'>-</td>"
             "<td id='calMotionMin" + String(gate) + "' style='padding:4px;text-align:right'>-</td>"
             "<td id='calMotionMean" + String(gate) + "' style='padding:4px;text-align:right'>-</td>"
+            "<td id='calMotionP10" + String(gate) + "' style='padding:4px;text-align:right'>-</td>"
             "<td id='calMotionP95" + String(gate) + "' style='padding:4px;text-align:right'>-</td>"
             "<td id='calMotionP99" + String(gate) + "' style='padding:4px;text-align:right'>-</td>"
             "<td id='calMotionPeak" + String(gate) + "' style='padding:4px;text-align:right'>-</td>"
@@ -9353,18 +11599,31 @@ static void handleRadarConfig()
 
     html +=
         "</table></div>"
+        "<p class='muted'>P10 ist ein bewusst niedriger Bewegungswert: Etwa 90 % der gültigen "
+        "Bewegungsmessungen liegen auf oder über diesem Wert. Er wird nur für einen vorläufigen "
+        "Vorschlag verwendet, wenn keine Ruhemessung vorhanden ist.</p>"
 
-        "<h4>Vergleich und Trigger-Vorschlag</h4>"
-        "<p class='muted'>Der Vorschlag vergleicht den robusten oberen Ruhewert (P99) mit dem "
-        "robusten Bewegungswert (P99). Einzelne Peaks werden dafür bewusst nicht verwendet. "
-        "Je größer der Abstand, desto verlässlicher lässt sich dieses Gate trennen.</p>"
+        "<h4>Vergleich und Trigger-/Hold-Vorschlag</h4>"
+        "<p class='muted'>Am zuverlässigsten ist eine Messung mit <b>Ruhe und Bewegung</b>. Dann bleibt "
+        "die bisherige Vergleichslogik aktiv. Wenn nur eine Phase verfügbar ist, kann SensorForge "
+        "trotzdem klar als vorläufig markierte Werte vorschlagen: <b>nur Ruhe: Trigger = P99 + 3 dB</b>, "
+        "<b>nur Bewegung: Trigger = P10 - 3 dB</b>. Hold wird automatisch passend darunter gesetzt. "
+        "Wenn Ruhewerte vorhanden sind, bleibt Hold oberhalb des gemessenen Ruhepegels; bei nur Bewegung "
+        "wird Hold vorläufig 3 dB unter Trigger gesetzt. Pro Gate werden mindestens 100 gültige Messwerte "
+        "benötigt. Ein vorläufiger Wert sollte später möglichst mit einer vollständigen Ruhe-/Bewegungsmessung "
+        "kontrolliert werden. Erreicht ein Gate innerhalb der maximal 150 Radar-Reports keine 100 gültigen Werte, "
+        "wird sein Vorschlag vom nächstgelegenen brauchbaren Gate abgeleitet. Für näher liegende Gates werden "
+        "Trigger und Hold dabei konservativ um 3 dB pro Gate angehoben; solche Werte sind ausdrücklich als "
+        "<b>abgeleitet</b> gekennzeichnet.</p>"
         "<div style='overflow-x:auto'><table style='border-collapse:collapse;min-width:720px'>"
         "<tr><th style='padding:5px;border-bottom:1px solid #aaa'>Gate</th>"
         "<th style='padding:5px;border-bottom:1px solid #aaa'>Ruhe P99</th>"
         "<th style='padding:5px;border-bottom:1px solid #aaa'>Bewegung P99</th>"
         "<th style='padding:5px;border-bottom:1px solid #aaa'>Abstand</th>"
-        "<th style='padding:5px;border-bottom:1px solid #aaa'>Aktuell</th>"
-        "<th style='padding:5px;border-bottom:1px solid #aaa'>Vorschlag</th>"
+        "<th style='padding:5px;border-bottom:1px solid #aaa'>Trigger aktuell</th>"
+        "<th style='padding:5px;border-bottom:1px solid #aaa'>Hold aktuell</th>"
+        "<th style='padding:5px;border-bottom:1px solid #aaa'>Trigger Vorschlag</th>"
+        "<th style='padding:5px;border-bottom:1px solid #aaa'>Hold Vorschlag</th>"
         "<th style='padding:5px;border-bottom:1px solid #aaa'>Qualität</th></tr>";
 
     for (uint8_t gate = 0; gate < 16; ++gate) {
@@ -9374,9 +11633,12 @@ static void handleRadarConfig()
             "<td id='calCmpQuiet" + String(gate) + "' style='padding:4px;text-align:right'>-</td>"
             "<td id='calCmpMotion" + String(gate) + "' style='padding:4px;text-align:right'>-</td>"
             "<td id='calCmpGap" + String(gate) + "' style='padding:4px;text-align:right'>-</td>"
-            "<td id='calCmpCurrent" + String(gate) + "' style='padding:4px;text-align:right'>" +
+            "<td id='calCmpCurrentTrigger" + String(gate) + "' style='padding:4px;text-align:right'>" +
             String(settings.triggerThreshold[gate]) + "</td>"
-            "<td id='calCmpSuggested" + String(gate) + "' style='padding:4px;text-align:right'>-</td>"
+            "<td id='calCmpCurrentHold" + String(gate) + "' style='padding:4px;text-align:right'>" +
+            String(settings.holdThreshold[gate]) + "</td>"
+            "<td id='calCmpSuggestedTrigger" + String(gate) + "' style='padding:4px;text-align:right'>-</td>"
+            "<td id='calCmpSuggestedHold" + String(gate) + "' style='padding:4px;text-align:right'>-</td>"
             "<td id='calCmpQuality" + String(gate) + "' style='padding:4px'>-</td>"
             "</tr>";
     }
@@ -9385,66 +11647,147 @@ static void handleRadarConfig()
         "</table></div>"
         "<div style='margin-top:12px'>"
         "<button type='button' id='calApplyRecommendations' disabled>"
-        "Vorgeschlagene Trigger-Werte übernehmen</button>"
+        "Vorgeschlagene Trigger + Hold-Werte übernehmen + verifizieren</button>"
         "</div>"
-        "<p class='muted'>Übernehmen ändert nur die Trigger-Eingabefelder weiter unten auf dieser Seite. "
-        "Die Hold-Werte bleiben unverändert. In den Radar-Sensor geschrieben wird weiterhin erst mit "
-        "<b>Write + Verify</b>.</p>"
+        "<p class='muted'>Nach einer erfolgreich abgeschlossenen Messung werden die Vorschlagswerte automatisch in die "
+        "Eingabefelder weiter unten übernommen. Erst <b>Werte übernehmen + auf Radar schreiben</b> schreibt die komplette "
+        "Radar-Konfiguration mit Write + Verify in den LD2410S. Danach wird die Seite mit den tatsächlich bestätigten "
+        "Sensorwerten neu geladen. Die Kalibrierung schlägt für Hold niemals 0 vor.</p>"
         "</div>";
 
 
     html +=
         "<script>"
         "(function(){"
-        "var busy=false,lastData=null,lastDisplayMode='quiet',suggested=new Array(16).fill(null);"
+        "var busy=false,lastData=null,lastDisplayMode='quiet',modalCompletionVisible=false,suggestedTrigger=new Array(16).fill(null),suggestedHold=new Array(16).fill(null);"
         "function el(id){return document.getElementById(id);}"
         "function db(v){return Number(v).toFixed(1);}"
         "function timeText(ms){var s=Math.floor(Number(ms||0)/1000),m=Math.floor(s/60);s%=60;return String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');}"
         "function setText(id,v){var x=el(id);if(x)x.textContent=v;}"
-        "function renderSession(prefix,session){"
+        "function renderSession(prefix,session,target){"
+            "target=Number(target||100);"
             "for(var i=0;i<16;i++){"
                 "var g=session&&session.gates?session.gates[i]:null;"
-                "var ok=!!(g&&g.valid&&Number(g.samples)>0);"
-                "setText(prefix+'Samples'+i,g?String(Number(g.samples)||0):'-');"
+                "var samples=g?Number(g.samples)||0:0;"
+                "var ok=!!(g&&g.valid&&samples>0);"
+                "setText(prefix+'Samples'+i,g?String(samples):'-');"
                 "setText(prefix+'Discarded'+i,g?String(Number(g.discarded)||0):'-');"
                 "setText(prefix+'Min'+i,ok?db(g.min):'-');"
                 "setText(prefix+'Mean'+i,ok?db(g.mean):'-');"
+                "setText(prefix+'P10'+i,ok?db(g.p10):'-');"
                 "setText(prefix+'P95'+i,ok?db(g.p95):'-');"
                 "setText(prefix+'P99'+i,ok?db(g.p99):'-');"
                 "setText(prefix+'Peak'+i,ok?db(g.peak):'-');"
                 "var note='-';"
-                "if(ok&&Number(g.samples)>=100&&Number(g.peak)-Number(g.p99)>=6){note='Einzelspitze +'+db(Number(g.peak)-Number(g.p99))+' dB';}"
+                "if(session&&session.quality_limited&&samples<target)note='zu viele Fehlwerte · wird abgeleitet';"
+                "else if(session&&session.aborted&&samples<target)note='abgebrochen · unvollständig';"
+                "else if(ok&&samples>=target&&Number(g.peak)-Number(g.p99)>=6)note='Einzelspitze +'+db(Number(g.peak)-Number(g.p99))+' dB';"
+                "else if(samples>=target)note='OK';"
                 "setText(prefix+'Note'+i,note);"
             "}"
         "}"
+        "function holdFromQuiet(trigger,quiet){"
+            "if(!isFinite(trigger)||!isFinite(quiet)||trigger<2)return null;"
+            "var hold=Math.max(Math.ceil(quiet+1),trigger-3,1);"
+            "hold=Math.min(95,trigger-1,hold);"
+            "return hold>=1&&hold<trigger?hold:null;"
+        "}"
+        "function holdFromMotionOnly(trigger){"
+            "if(!isFinite(trigger)||trigger<2)return null;"
+            "var hold=Math.max(1,Math.min(95,trigger-3));"
+            "return hold<trigger?hold:null;"
+        "}"
         "function recommendation(q,m){"
-            "if(!q||!m||!q.valid||!m.valid||Number(q.samples)<100||Number(m.samples)<100)return null;"
-            "var quiet=Number(q.p99),move=Number(m.p99),gap=move-quiet;"
-            "if(!isFinite(gap)||gap<4)return {gap:gap,value:null,quality:'unzureichend'};"
-            "var margin=Math.max(3,Math.min(8,gap*0.25));"
-            "var value=Math.ceil(quiet+margin);"
-            "var upper=Math.floor(move-2);"
-            "if(value>upper)value=upper;"
-            "value=Math.max(0,Math.min(95,value));"
-            "if(value<=quiet)return {gap:gap,value:null,quality:'unzureichend'};"
-            "var quality=gap>=12?'sehr gut':(gap>=8?'gut':'knapp');"
-            "return {gap:gap,value:value,quality:quality};"
+            "var qReady=!!(q&&q.valid&&Number(q.samples)>=100&&isFinite(Number(q.p99)));"
+            "var mReady=!!(m&&m.valid&&Number(m.samples)>=100&&isFinite(Number(m.p99))&&isFinite(Number(m.p10)));"
+            "if(qReady&&mReady){"
+                "var quiet=Number(q.p99),move=Number(m.p99),gap=move-quiet;"
+                "if(!isFinite(gap)||gap<4)return {gap:gap,trigger:null,hold:null,quality:'unzureichend · Ruhe und Bewegung zu nah'};"
+                "var margin=Math.max(3,Math.min(8,gap*0.25));"
+                "var trigger=Math.ceil(quiet+margin);"
+                "var upper=Math.floor(move-2);"
+                "if(trigger>upper)trigger=upper;"
+                "trigger=Math.max(0,Math.min(95,trigger));"
+                "if(trigger<=quiet)return {gap:gap,trigger:null,hold:null,quality:'unzureichend · kein sicherer Spielraum'};"
+                "var hold=holdFromQuiet(trigger,quiet);"
+                "if(hold===null)return {gap:gap,trigger:null,hold:null,quality:'unzureichend · kein sicherer Hold-Spielraum'};"
+                "var quality=gap>=12?'sehr gut':(gap>=8?'gut':'knapp');"
+                "return {gap:gap,trigger:trigger,hold:hold,quality:'vollständig · '+quality};"
+            "}"
+            "if(qReady){"
+                "var quietOnly=Number(q.p99);"
+                "var quietTrigger=Math.max(0,Math.min(95,Math.ceil(quietOnly+3)));"
+                "if(quietTrigger<=quietOnly)return {gap:null,trigger:null,hold:null,quality:'kein Spielraum über dem Ruhewert'};"
+                "var quietHold=holdFromQuiet(quietTrigger,quietOnly);"
+                "if(quietHold===null)return {gap:null,trigger:null,hold:null,quality:'kein sicherer Hold-Spielraum'};"
+                "return {gap:null,trigger:quietTrigger,hold:quietHold,quality:'vorläufig · nur Ruhe (Trigger +3 dB, Hold über Ruhe)'};"
+            "}"
+            "if(mReady){"
+                "var motionLow=Number(m.p10);"
+                "var motionTrigger=Math.max(0,Math.min(95,Math.floor(motionLow-3)));"
+                "if(motionTrigger>=motionLow)return {gap:null,trigger:null,hold:null,quality:'kein Spielraum unter dem Bewegungswert'};"
+                "var motionHold=holdFromMotionOnly(motionTrigger);"
+                "if(motionHold===null)return {gap:null,trigger:null,hold:null,quality:'kein sicherer Hold-Spielraum'};"
+                "return {gap:null,trigger:motionTrigger,hold:motionHold,quality:'vorläufig · nur Bewegung (Trigger P10 - 3 dB, Hold -3 dB)'};"
+            "}"
+            "return null;"
+        "}"
+        "function gateHasAnyValidSamples(q,m){"
+            "return !!((q&&q.valid&&Number(q.samples)>0)||(m&&m.valid&&Number(m.samples)>0));"
+        "}"
+        "function gateNeedsDerived(index,data){"
+            "var target=Number(data.target_samples||100);"
+            "var q=data.quiet&&!data.quiet.aborted&&data.quiet.gates?data.quiet.gates[index]:null;"
+            "var m=data.motion&&!data.motion.aborted&&data.motion.gates?data.motion.gates[index]:null;"
+            "var qBad=!!(data.quiet&&!data.quiet.aborted&&data.quiet.quality_limited&&q&&Number(q.samples)<target);"
+            "var mBad=!!(data.motion&&!data.motion.aborted&&data.motion.quality_limited&&m&&Number(m.samples)<target);"
+            "return qBad||mBad;"
+        "}"
+        "function deriveMissingRecommendation(index,direct,data){"
+            "var q=data.quiet&&!data.quiet.aborted&&data.quiet.gates?data.quiet.gates[index]:null;"
+            "var m=data.motion&&!data.motion.aborted&&data.motion.gates?data.motion.gates[index]:null;"
+            "if(!gateNeedsDerived(index,data)&&gateHasAnyValidSamples(q,m))return null;"
+            "var best=-1,bestDistance=99;"
+            "for(var j=0;j<16;j++){"
+                "var candidate=direct[j];"
+                "if(!candidate||candidate.trigger===null||candidate.hold===null)continue;"
+                "var distance=Math.abs(j-index);"
+                "if(distance<bestDistance||(distance===bestDistance&&j<best)){best=j;bestDistance=distance;}"
+            "}"
+            "if(best<0)return null;"
+            "var source=direct[best];"
+            "var nearBoost=index<best?(best-index)*3:0;"
+            "var trigger=Math.max(2,Math.min(95,Number(source.trigger)+nearBoost));"
+            "var hold=Math.max(1,Math.min(trigger-1,Number(source.hold)+nearBoost));"
+            "if(!isFinite(trigger)||!isFinite(hold)||hold>=trigger)return null;"
+            "var detail=nearBoost>0?' +'+nearBoost+' dB Nahbereich':'';"
+            "return {gap:null,trigger:trigger,hold:hold,quality:'abgeleitet · Gate '+best+detail,derived:true,sourceGate:best};"
         "}"
         "function renderComparison(d){"
-            "var usable=0;"
+            "var usable=0,direct=new Array(16).fill(null),finalRec=new Array(16).fill(null);"
             "for(var i=0;i<16;i++){"
-                "var q=d.quiet&&d.quiet.gates?d.quiet.gates[i]:null;"
-                "var m=d.motion&&d.motion.gates?d.motion.gates[i]:null;"
-                "var qok=!!(q&&q.valid),mok=!!(m&&m.valid);"
+                "var q=d.quiet&&!d.quiet.aborted&&d.quiet.gates?d.quiet.gates[i]:null;"
+                "var m=d.motion&&!d.motion.aborted&&d.motion.gates?d.motion.gates[i]:null;"
+                "direct[i]=recommendation(q,m);"
+                "finalRec[i]=gateNeedsDerived(i,d)?null:direct[i];"
+            "}"
+            "for(var i=0;i<16;i++){if(!finalRec[i]||finalRec[i].trigger===null||finalRec[i].hold===null){var derived=deriveMissingRecommendation(i,direct,d);if(derived)finalRec[i]=derived;}}"
+            "for(var i=0;i<16;i++){"
+                "var q=d.quiet&&!d.quiet.aborted&&d.quiet.gates?d.quiet.gates[i]:null;"
+                "var m=d.motion&&!d.motion.aborted&&d.motion.gates?d.motion.gates[i]:null;"
+                "var target=Number(d.target_samples||100),qok=!!(q&&q.valid&&Number(q.samples)>=target),mok=!!(m&&m.valid&&Number(m.samples)>=target);"
                 "setText('calCmpQuiet'+i,qok?db(q.p99):'-');"
                 "setText('calCmpMotion'+i,mok?db(m.p99):'-');"
-                "var r=recommendation(q,m);suggested[i]=r&&r.value!==null?r.value:null;"
-                "setText('calCmpGap'+i,r&&isFinite(r.gap)?((r.gap>=0?'+':'')+db(r.gap)):'-');"
-                "setText('calCmpSuggested'+i,suggested[i]!==null?String(suggested[i]):'-');"
+                "var r=finalRec[i];"
+                "suggestedTrigger[i]=r&&r.trigger!==null?r.trigger:null;"
+                "suggestedHold[i]=r&&r.hold!==null?r.hold:null;"
+                "setText('calCmpGap'+i,r&&r.gap!==null&&isFinite(r.gap)?((r.gap>=0?'+':'')+db(r.gap)):(r&&r.derived?'abgeleitet':(r&&r.trigger!==null?'nicht messbar':'-')));"
+                "setText('calCmpSuggestedTrigger'+i,suggestedTrigger[i]!==null?String(suggestedTrigger[i]):'-');"
+                "setText('calCmpSuggestedHold'+i,suggestedHold[i]!==null?String(suggestedHold[i]):'-');"
                 "setText('calCmpQuality'+i,r?r.quality:'zu wenig Daten');"
-                "if(suggested[i]!==null)usable++;"
+                "if(suggestedTrigger[i]!==null&&suggestedHold[i]!==null)usable++;"
             "}"
-            "var b=el('calApplyRecommendations');if(b){b.disabled=usable===0;b.textContent=usable?'Vorgeschlagene Trigger-Werte übernehmen ('+usable+' Gates)':'Vorgeschlagene Trigger-Werte übernehmen';}"
+            "var b=el('calApplyRecommendations');if(b){b.disabled=usable===0;b.textContent=usable?'Vorgeschlagene Trigger + Hold-Werte übernehmen + verifizieren ('+usable+' Gates)':'Vorgeschlagene Trigger + Hold-Werte übernehmen + verifizieren';}"
         "}"
         "function renderLiveCalibration(d){"
             "var mode=d.active!=='none'?d.active:lastDisplayMode;"
@@ -9460,14 +11803,72 @@ static void handleRadarConfig()
                 "setText('liveCalPeak'+i,ok?db(g.peak):'-');"
             "}"
         "}"
+        "function calibrationProgress(session,target){"
+            "target=Number(target||100);var completed=0,failed=0,incomplete=0,weakest=target;"
+            "for(var i=0;i<16;i++){var g=session&&session.gates?session.gates[i]:null;var samples=g?Number(g.samples)||0:0;var discarded=g?Number(g.discarded)||0:0;var bad=samples<target&&discarded>=target;if(samples<target)incomplete++;if(samples>=target||bad)completed++;if(bad)failed++;if(!bad&&samples<target)weakest=Math.min(weakest,samples);}"
+            "if(completed>=16)weakest=target;return {completed:completed,failed:failed,incomplete:incomplete,weakest:weakest};"
+        "}"
+        "function showCalibrationModal(d,previousActive){"
+            "var modal=el('radarCalProgressModal'),cancel=el('radarCalModalCancel'),apply=el('radarCalModalApply'),close=el('radarCalModalClose');if(!modal||!cancel||!apply||!close)return;"
+            "var active=d.active||'none';"
+            "if(active!=='none'){"
+                "modalCompletionVisible=false;modal.hidden=false;cancel.hidden=false;apply.hidden=true;close.hidden=true;"
+                "var session=active==='motion'?d.motion:d.quiet,label=active==='motion'?'Bewegungsmessung':'Ruhemessung';var target=Number(d.target_samples||100),maxReports=Number(d.max_reports||150);"
+                "setText('radarCalModalTitle',label);setText('radarCalModalReports',String(Number(session&&session.samples||0))+' / '+String(maxReports));"
+                "var remaining=Number(session&&session.countdown_ms||0);"
+                "if(remaining>0){"
+                    "setText('radarCalModalBig',String(Math.max(1,Math.ceil(remaining/1000))));setText('radarCalModalBigLabel','Sekunden bis Messbeginn');setText('radarCalModalHint',active==='quiet'?'Messbereich jetzt verlassen.':'Position einnehmen – die Bewegungsmessung startet danach automatisch.');"
+                    "setText('radarCalModalCompleted','0 / 16');setText('radarCalModalWeakest','0 / '+String(target));var bar=el('radarCalModalProgressBar');if(bar)bar.style.width='0%';return;"
+                "}"
+                "var p=calibrationProgress(session,target);setText('radarCalModalBig',String(p.completed)+' / 16');setText('radarCalModalBigLabel','Gates abgeschlossen');setText('radarCalModalCompleted',String(p.completed)+' / 16');setText('radarCalModalWeakest',String(p.weakest)+' / '+String(target));"
+                "setText('radarCalModalHint',p.failed?(String(p.failed)+' Gate'+(p.failed===1?' liefert':'s liefern')+' zu viele Fehlwerte und '+(p.failed===1?'wird':'werden')+' später abgeleitet.'):'Messung läuft automatisch bis genügend gültige Werte vorliegen.');"
+                "var bar=el('radarCalModalProgressBar');if(bar)bar.style.width=String(Math.max(0,Math.min(100,p.completed/16*100)))+'%';return;"
+            "}"
+            "if(previousActive!=='none'){"
+                "var session=previousActive==='motion'?d.motion:d.quiet,label=previousActive==='motion'?'Bewegungsmessung':'Ruhemessung';var target=Number(d.target_samples||100),maxReports=Number(d.max_reports||150),p=calibrationProgress(session,target);"
+                "modalCompletionVisible=true;modal.hidden=false;cancel.hidden=true;close.hidden=false;setText('radarCalModalTitle',label);var derived=session&&session.quality_limited?p.incomplete:p.failed;"
+                "if(session&&session.aborted){apply.hidden=true;close.textContent='Schließen';setText('radarCalModalBig','Abgebrochen');setText('radarCalModalBigLabel','Messung beendet');setText('radarCalModalHint','Die Teilmessung wird nicht für neue Empfehlungen verwendet.');setText('radarCalModalCompleted',String(p.completed)+' / 16');}"
+                "else{stageSuggestedValues();apply.hidden=false;close.textContent='Nur Ergebnisse anzeigen';setText('radarCalModalBig','Fertig');setText('radarCalModalBigLabel','Messung abgeschlossen');setText('radarCalModalHint',(derived?(String(derived)+' Gate'+(derived===1?' wird':'s werden')+' aus benachbarten Messwerten abgeleitet. '):'')+'Die neuen Werte sind im Formular vorbereitet. Mit dem grünen Knopf werden sie auf den Radar geschrieben und verifiziert.');setText('radarCalModalCompleted','16 / 16');}"
+                "setText('radarCalModalWeakest',String(p.weakest)+' / '+String(target));setText('radarCalModalReports',String(Number(session&&session.samples||0))+' / '+String(maxReports));var bar=el('radarCalModalProgressBar');if(bar)bar.style.width='100%';return;"
+            "}"
+            "if(!modalCompletionVisible)modal.hidden=true;"
+        "}"
+        "function stageSuggestedValues(){"
+            "var n=0;for(var i=0;i<16;i++){if(suggestedTrigger[i]===null||suggestedHold[i]===null)continue;var triggerInput=el('radarTriggerInput'+i);var holdInput=el('radarHoldInput'+i);if(triggerInput&&holdInput){triggerInput.value=String(suggestedTrigger[i]);holdInput.value=String(suggestedHold[i]);n++;}}return n;"
+        "}"
+        "function applySuggestedValues(){"
+            "var n=stageSuggestedValues();if(!n){alert('Keine verwendbaren Kalibrierungsvorschläge vorhanden.');return;}"
+            "var form=el('radarConfigForm');var marker=el('radarCalibrationApply');if(!form||!marker){alert('Radar-Konfigurationsformular nicht gefunden. Seite bitte neu laden.');return;}"
+            "if(!confirm(n+' vorgeschlagene Trigger-/Hold-Paare jetzt in den LD2410S schreiben und verifizieren?'))return;"
+            "marker.value='1';var applyModal=el('radarCalModalApply');var applyPage=el('calApplyRecommendations');if(applyModal){applyModal.disabled=true;applyModal.textContent='Schreibe + verifiziere...';}if(applyPage){applyPage.disabled=true;applyPage.textContent='Schreibe + verifiziere...';}"
+            "if(typeof form.requestSubmit==='function')form.requestSubmit();else form.submit();"
+        "}"
+        "function renderCalibrationControls(d){"
+            "var active=d.active||'none',q=el('calStartQuiet'),m=el('calStartMotion');"
+            "if(!q||!m)return;"
+            "if(active==='quiet'){q.style.display='';m.style.display='none';q.textContent='Ruhemessung abbrechen';return;}"
+            "if(active==='motion'){m.style.display='';q.style.display='none';m.textContent='Bewegungsmessung abbrechen';return;}"
+            "q.style.display='';m.style.display='';q.textContent='Ruhemessung starten';m.textContent='Bewegungsmessung starten';"
+        "}"
         "function render(d){"
-            "lastData=d;"
-            "var active=d.active||'none',session=active==='quiet'?d.quiet:(active==='motion'?d.motion:null);"
-            "setText('radarCalState',active==='quiet'?'Ruhemessung läuft':(active==='motion'?'Bewegungsmessung läuft':'keine Messung aktiv'));"
+            "var previousActive=lastData&&lastData.active?lastData.active:'none';lastData=d;"
+            "var active=d.active||'none',mode=active!=='none'?active:lastDisplayMode;"
+            "var session=mode==='motion'?d.motion:d.quiet;"
+            "if(active!=='none')lastDisplayMode=active;"
+            "var label=mode==='motion'?'Bewegungsmessung':'Ruhemessung';"
+            "var state='keine Messung aktiv';"
+            "if(active!=='none'){"
+                "var remaining=Number(session&&session.countdown_ms||0);"
+                "if(remaining>0)state=label+' startet in '+Math.max(1,Math.ceil(remaining/1000))+' s – Messbereich jetzt verlassen';"
+                "else if(session&&!session.measurement_started)state=label+' startet …';"
+                "else state=label+' läuft · Ziel '+String(d.target_samples||100)+' gültige Werte je Gate';"
+            "}else if(session&&session.auto_completed){"
+                "state=label+(session.quality_limited?' abgeschlossen · fehlerhafte Gates werden abgeleitet':' automatisch abgeschlossen');"
+            "}else if(session&&session.aborted){state=label+' abgebrochen';}"
+            "setText('radarCalState',state);"
             "setText('radarCalElapsed',session?timeText(session.elapsed_ms):'00:00');"
-            "setText('radarCalSamples',session?String(session.samples||0):'0');"
-            "renderSession('calQuiet',d.quiet);renderSession('calMotion',d.motion);renderComparison(d);renderLiveCalibration(d);"
-            "var stop=el('calStop');if(stop)stop.disabled=active==='none';"
+            "setText('radarCalSamples',session?(String(session.samples||0)+' / '+String(d.max_reports||150)):'0');"
+            "renderSession('calQuiet',d.quiet,d.target_samples);renderSession('calMotion',d.motion,d.target_samples);renderComparison(d);renderLiveCalibration(d);renderCalibrationControls(d);showCalibrationModal(d,previousActive);"
         "}"
         "function poll(){"
             "if(busy)return;busy=true;"
@@ -9482,16 +11883,12 @@ static void handleRadarConfig()
             ".then(render).catch(function(e){alert('Radar-Kalibrierung: '+e.message);});"
         "}"
         "var b;"
-        "b=el('calStartQuiet');if(b)b.onclick=function(){lastDisplayMode='quiet';action('start_quiet','Eine neue Ruhemessung löscht die bisherigen Ruhewerte. Starten?');};"
-        "b=el('calStartMotion');if(b)b.onclick=function(){lastDisplayMode='motion';action('start_motion','Eine neue Bewegungsmessung löscht die bisherigen Bewegungswerte. Starten?');};"
-        "b=el('calStop');if(b)b.onclick=function(){action('stop');};"
-        "b=el('calResetQuiet');if(b)b.onclick=function(){action('reset_quiet','Ruhewerte wirklich löschen?');};"
-        "b=el('calResetMotion');if(b)b.onclick=function(){action('reset_motion','Bewegungswerte wirklich löschen?');};"
-        "b=el('calResetAll');if(b)b.onclick=function(){action('reset_all','Alle Kalibrierungswerte wirklich löschen?');};"
-        "b=el('calApplyRecommendations');if(b)b.onclick=function(){"
-            "var n=0;for(var i=0;i<16;i++){if(suggested[i]===null)continue;var input=document.querySelector('input[name=\\\"trigger_'+i+'\\\"]');if(input){input.value=String(suggested[i]);setText('calCmpCurrent'+i,String(suggested[i]));n++;}}"
-            "if(n){alert(n+' Trigger-Werte wurden in die Eingabefelder übernommen. Noch nicht in den Radar geschrieben – bitte unten mit Write + Verify speichern.');}"
-        "};"
+        "b=el('calStartQuiet');if(b)b.onclick=function(){lastDisplayMode='quiet';if(lastData&&lastData.active==='quiet'){action('stop');return;}if(lastData&&lastData.active!=='none')return;action('start_quiet','Neue Ruhemessung starten? Die bisherigen Ruhewerte werden ersetzt. Danach bleiben 10 Sekunden, um den Messbereich zu verlassen.');};"
+        "b=el('calStartMotion');if(b)b.onclick=function(){lastDisplayMode='motion';if(lastData&&lastData.active==='motion'){action('stop');return;}if(lastData&&lastData.active!=='none')return;action('start_motion','Neue Bewegungsmessung starten? Die bisherigen Bewegungswerte werden ersetzt. Die Messung beginnt nach 10 Sekunden.');};"
+        "b=el('radarCalModalCancel');if(b)b.onclick=function(){if(lastData&&lastData.active!=='none')action('stop');};"
+        "b=el('radarCalModalApply');if(b)b.onclick=applySuggestedValues;"
+        "b=el('radarCalModalClose');if(b)b.onclick=function(){modalCompletionVisible=false;var modal=el('radarCalProgressModal');if(modal)modal.hidden=true;};"
+        "b=el('calApplyRecommendations');if(b)b.onclick=applySuggestedValues;"
         "poll();setInterval(poll,1000);"
         "document.addEventListener('visibilitychange',function(){if(!document.hidden)poll();});"
         "})();"
@@ -9499,7 +11896,8 @@ static void handleRadarConfig()
 
 
     html +=
-        "<form method='POST' action='/radar_config_save'>";
+        "<form id='radarConfigForm' method='POST' action='/radar_config_save'>"
+        "<input type='hidden' id='radarCalibrationApply' name='calibration_apply' value='0'>";
 
     html +=
         "<h3>Allgemeine Parameter</h3>";
@@ -9589,7 +11987,9 @@ static void handleRadarConfig()
     html +=
         "<p>Niedrigerer dB-Wert = empfindlicher. "
         "Die Hi-Link-Protokollbeispiele enthalten auch Werte unter 10; "
-        "daher erlaubt diese Seite 0..95 und bewahrt vorhandene Werte.</p>";
+        "daher erlaubt diese Seite 0..95 und bewahrt vorhandene Werte. "
+        "<b>Hinweis:</b> Hold=0 kann einen bereits erkannten Presence-Zustand sehr lange festhalten. "
+        "Die Kalibrierung schlägt deshalb für Hold niemals 0 vor.</p>";
 
     html +=
         "<div style='overflow-x:auto'>"
@@ -9621,7 +12021,9 @@ static void handleRadarConfig()
             " m</td>"
             "<td style='padding:4px'>"
             "<input type='number' min='0' max='95' "
-            "name='trigger_" +
+            "id='radarTriggerInput" +
+            String(gate) +
+            "' name='trigger_" +
             String(gate) +
             "' value='" +
             String(
@@ -9630,7 +12032,9 @@ static void handleRadarConfig()
             "' style='width:70px'></td>"
             "<td style='padding:4px'>"
             "<input type='number' min='0' max='95' "
-            "name='hold_" +
+            "id='radarHoldInput" +
+            String(gate) +
+            "' name='hold_" +
             String(gate) +
             "' value='" +
             String(
@@ -9685,6 +12089,11 @@ static void handleRadarConfig()
 
 static void handleRadarConfigSave()
 {
+    if (rejectRadarConfigurationUnavailable())
+        return;
+
+    RadarWebMaintenanceGuard maintenanceGuard;
+
     bool recordingActive =
         recorderIsOpen();
 
@@ -9812,9 +12221,15 @@ static void handleRadarConfigSave()
     );
 
 
+    bool calibrationApply =
+        server.hasArg("calibration_apply") &&
+        server.arg("calibration_apply") == "1";
+
     server.sendHeader(
         "Location",
-        "/radar_config?saved=1"
+        calibrationApply
+        ? "/radar_config?saved=1&calibration=1"
+        : "/radar_config?saved=1"
     );
 
     server.send(
@@ -9827,6 +12242,19 @@ static void handleRadarConfigSave()
 
 static void handleRadarConfigDefaults()
 {
+    if (rejectRadarConfigurationUnavailable())
+        return;
+
+    RadarWebMaintenanceGuard maintenanceGuard;
+
+    Serial.println(
+        "LD2410S defaults restore | begin"
+    );
+
+    logWrite(
+        "LD2410S defaults restore started"
+    );
+
     bool recordingActive =
         recorderIsOpen();
 
@@ -9859,6 +12287,16 @@ static void handleRadarConfigDefaults()
 
     if (!writeOk) {
 
+        Serial.println(
+            "LD2410S defaults restore | failed | " +
+            error
+        );
+
+        logWrite(
+            "LD2410S defaults restore failed | " +
+            error
+        );
+
         String html =
             htmlHeader();
 
@@ -9885,11 +12323,11 @@ static void handleRadarConfigDefaults()
 
 
     Serial.println(
-        "LD2410S Hi-Link defaults written and verified"
+        "LD2410S defaults restore | success | written and verified"
     );
 
     logWrite(
-        "LD2410S Hi-Link defaults written and verified"
+        "LD2410S defaults restore successful | written and verified"
     );
 
 
@@ -9910,32 +12348,53 @@ static void handleRadarConfigDefaults()
 // WIFI FIRMWARE UPDATE
 // -------------------------------------------------------------
 //
-// The browser upload never flashes the running application directly.
-// It is first written to a non-.bin staging file on SD, validated with the
-// existing SD auto-update validator, and renamed to *.bin only after the
-// operator explicitly presses INSTALL. The next controlled reboot therefore
-// enters the already proven SD OTA path.
+// Browser uploads are staged directly in the inactive internal OTA partition.
+// The SD card is deliberately not part of the WiFi update path. This keeps
+// remote recovery available when the SD card is absent, damaged or unstable.
+//
+// Safety model:
+//   1. Upload writes only to the inactive OTA partition.
+//   2. ESP image magic, partition capacity and SensorForge board marker are
+//      checked while streaming.
+//   3. esp_ota_end() validates the completed application image.
+//   4. The running/boot partition is NOT changed by the upload.
+//   5. Only the explicit INSTALL action calls esp_ota_set_boot_partition().
+//
+// A failed/interrupted upload therefore leaves the currently running firmware
+// selected. The next upload simply overwrites the inactive OTA partition again.
 
-static const char *WEB_FW_DIR =
-    "/firmware";
-static const char *WEB_FW_UPLOAD_TEMP =
-    "/firmware/.wifi_upload.part";
-static const char *WEB_FW_UPLOAD_READY =
-    "/firmware/.wifi_upload.ready";
-static const char *WEB_FW_INSTALL_CANDIDATE =
-    "/firmware/wifi_update.bin";
+static const uint8_t WEB_FW_ESP_IMAGE_MAGIC = 0xE9U;
+static const size_t WEB_FW_MARKER_MAX_BYTES = 96U;
 
-static File webFirmwareUploadFile;
 static bool webFirmwareUploadAttempted = false;
 static bool webFirmwareUploadSucceeded = false;
 static bool webFirmwareUploadLocksHeld = false;
-static bool webFirmwareUploadOwnsTemp = false;
 static bool webFirmwarePreviousRecordingBlock = false;
-static bool webFirmwarePreviousStorageLock = false;
 static size_t webFirmwareUploadBytes = 0;
 static size_t webFirmwareUploadCapacity = 0;
 static String webFirmwareUploadFilename;
 static String webFirmwareUploadError;
+
+static bool webFirmwareOtaActive = false;
+static esp_ota_handle_t webFirmwareOtaHandle = 0;
+static const esp_partition_t *webFirmwareUploadPartition = nullptr;
+
+// A successfully uploaded image remains staged only in RAM state until the
+// operator either installs it or discards it. The image bytes themselves live
+// in the inactive OTA partition, but that partition is not selected for boot.
+static bool webFirmwareReady = false;
+static const esp_partition_t *webFirmwareReadyPartition = nullptr;
+static size_t webFirmwareReadyBytes = 0;
+static String webFirmwareReadyFilename;
+
+// Streaming SensorForge compatibility-marker matcher. The prefix table allows
+// matches to span arbitrary HTTP upload chunk boundaries without buffering the
+// complete firmware image in RAM.
+static size_t webFirmwareMarkerLength = 0;
+static size_t webFirmwareMarkerMatched = 0;
+static size_t webFirmwareMarkerPrefix[WEB_FW_MARKER_MAX_BYTES] = {};
+static bool webFirmwareMarkerFound = false;
+static bool webFirmwareImageMagicChecked = false;
 
 
 static String webFirmwareBaseName(
@@ -9982,100 +12441,21 @@ static String webFirmwareFormatBytes(
 }
 
 
-static bool webFirmwareEnsureDirectory(
-    String &error
+static String webFirmwareEspError(
+    esp_err_t result
 )
 {
-    error = "";
-
-    if (STORAGE.exists(WEB_FW_DIR)) {
-        File directory =
-            STORAGE.open(
-                WEB_FW_DIR,
-                FILE_READ
-            );
-
-        bool ok =
-            directory &&
-            directory.isDirectory();
-
-        if (directory)
-            directory.close();
-
-        if (!ok) {
-            error =
-                "/firmware exists but is not a directory";
-            return false;
-        }
-
-        return true;
-    }
-
-    if (!STORAGE.mkdir(WEB_FW_DIR)) {
-        error =
-            "cannot create /firmware directory";
-        return false;
-    }
-
-    return true;
-}
-
-
-static int webFirmwareCountBinCandidates(
-    String &firstCandidate
-)
-{
-    firstCandidate = "";
-
-    File directory =
-        STORAGE.open(
-            WEB_FW_DIR,
-            FILE_READ
+    const char *name =
+        esp_err_to_name(
+            result
         );
 
-    if (!directory || !directory.isDirectory()) {
-        if (directory)
-            directory.close();
-        return 0;
-    }
+    if (name && name[0] != '\0')
+        return String(name);
 
-    int count = 0;
-
-    File entry =
-        directory.openNextFile();
-
-    while (entry) {
-        if (!entry.isDirectory()) {
-            String name =
-                String(entry.name());
-
-            String lower =
-                name;
-            lower.toLowerCase();
-
-            if (lower.endsWith(".bin")) {
-                ++count;
-
-                if (count == 1) {
-                    firstCandidate =
-                        webFirmwareBaseName(
-                            name
-                        );
-                }
-            }
-        }
-
-        entry.close();
-
-        if (count > 1)
-            break;
-
-        entry =
-            directory.openNextFile();
-    }
-
-    directory.close();
-    return count;
+    return
+        String("ESP error ") +
+        String((int)result);
 }
 
 
@@ -10087,31 +12467,27 @@ static void webFirmwareReleaseUploadLocks()
     g_recordingStartBlocked =
         webFirmwarePreviousRecordingBlock;
 
-    g_storageLocked =
-        webFirmwarePreviousStorageLock;
-
     webFirmwareUploadLocksHeld = false;
+}
+
+
+static void webFirmwareAbortActiveOta()
+{
+    if (webFirmwareOtaActive) {
+        esp_ota_abort(
+            webFirmwareOtaHandle
+        );
+    }
+
+    webFirmwareOtaActive = false;
+    webFirmwareOtaHandle = 0;
+    webFirmwareUploadPartition = nullptr;
 }
 
 
 static void webFirmwareCleanupPartial()
 {
-    if (webFirmwareUploadFile)
-        webFirmwareUploadFile.close();
-
-    webFirmwareUploadFile = File();
-
-    // Only remove the temp file when this upload attempt actually created it.
-    // A request rejected because another subsystem owns the storage lock must
-    // not touch SD at all.
-    if (
-        webFirmwareUploadOwnsTemp &&
-        STORAGE.exists(WEB_FW_UPLOAD_TEMP)
-    ) {
-        STORAGE.remove(WEB_FW_UPLOAD_TEMP);
-    }
-
-    webFirmwareUploadOwnsTemp = false;
+    webFirmwareAbortActiveOta();
 }
 
 
@@ -10123,6 +12499,153 @@ static void webFirmwareFailUpload(
         webFirmwareUploadError = error;
 
     webFirmwareUploadSucceeded = false;
+}
+
+
+static bool webFirmwarePrepareMarkerMatcher(
+    String &error
+)
+{
+    error = "";
+
+    const char *marker =
+        firmwareExpectedCompatibilityMarker();
+
+    if (!marker || marker[0] == '\0') {
+        error =
+            "Firmware compatibility marker is unavailable.";
+        return false;
+    }
+
+    webFirmwareMarkerLength =
+        strlen(marker);
+
+    if (
+        webFirmwareMarkerLength == 0 ||
+        webFirmwareMarkerLength > WEB_FW_MARKER_MAX_BYTES
+    ) {
+        error =
+            "Firmware compatibility marker has an unsupported length.";
+        return false;
+    }
+
+    memset(
+        webFirmwareMarkerPrefix,
+        0,
+        sizeof(webFirmwareMarkerPrefix)
+    );
+
+    for (
+        size_t i = 1, prefix = 0;
+        i < webFirmwareMarkerLength;
+        ++i
+    ) {
+        while (
+            prefix > 0 &&
+            marker[i] != marker[prefix]
+        ) {
+            prefix =
+                webFirmwareMarkerPrefix[
+                    prefix - 1
+                ];
+        }
+
+        if (marker[i] == marker[prefix])
+            ++prefix;
+
+        webFirmwareMarkerPrefix[i] =
+            prefix;
+    }
+
+    webFirmwareMarkerMatched = 0;
+    webFirmwareMarkerFound = false;
+    return true;
+}
+
+
+static void webFirmwareScanCompatibilityMarker(
+    const uint8_t *data,
+    size_t length
+)
+{
+    if (
+        webFirmwareMarkerFound ||
+        !data ||
+        length == 0 ||
+        webFirmwareMarkerLength == 0
+    ) {
+        return;
+    }
+
+    const char *marker =
+        firmwareExpectedCompatibilityMarker();
+
+    if (!marker)
+        return;
+
+    for (size_t i = 0; i < length; ++i) {
+        char current =
+            (char)data[i];
+
+        while (
+            webFirmwareMarkerMatched > 0 &&
+            current != marker[webFirmwareMarkerMatched]
+        ) {
+            webFirmwareMarkerMatched =
+                webFirmwareMarkerPrefix[
+                    webFirmwareMarkerMatched - 1
+                ];
+        }
+
+        if (
+            current ==
+            marker[webFirmwareMarkerMatched]
+        ) {
+            ++webFirmwareMarkerMatched;
+        }
+
+        if (
+            webFirmwareMarkerMatched ==
+            webFirmwareMarkerLength
+        ) {
+            webFirmwareMarkerFound = true;
+            webFirmwareMarkerMatched =
+                webFirmwareMarkerPrefix[
+                    webFirmwareMarkerMatched - 1
+                ];
+            return;
+        }
+    }
+}
+
+
+static void webFirmwareClearReadyState()
+{
+    webFirmwareReady = false;
+    webFirmwareReadyPartition = nullptr;
+    webFirmwareReadyBytes = 0;
+    webFirmwareReadyFilename = "";
+}
+
+
+static bool webFirmwareReadyStateValid()
+{
+    if (
+        !webFirmwareReady ||
+        !webFirmwareReadyPartition ||
+        webFirmwareReadyBytes == 0
+    ) {
+        return false;
+    }
+
+    const esp_partition_t *running =
+        esp_ota_get_running_partition();
+
+    return
+        running &&
+        webFirmwareReadyPartition != running &&
+        webFirmwareReadyBytes <=
+            webFirmwareReadyPartition->size;
 }
 
 
@@ -10168,15 +12691,19 @@ static void handleFirmwareUploadData()
                 upload.filename
             );
         webFirmwareUploadError = "";
+        webFirmwareImageMagicChecked = false;
+        webFirmwareMarkerFound = false;
+        webFirmwareMarkerMatched = 0;
+        webFirmwareMarkerLength = 0;
 
-        // Recover only our in-memory lock state here. Do not touch SD until
-        // recording/storage ownership has been checked below.
+        // Recover from a malformed/interrupted previous HTTP request before
+        // accepting a new upload. A successfully staged image is retained and
+        // must be installed or discarded explicitly.
+        webFirmwareAbortActiveOta();
         webFirmwareReleaseUploadLocks();
-        webFirmwareUploadOwnsTemp = false;
-        webFirmwareUploadFile = File();
 
         // Defense in depth: multipart upload callbacks may run while the
-        // request body is being parsed. Never write unauthenticated upload
+        // request body is being parsed. Never write unauthenticated firmware
         // bytes even if route middleware behavior changes in a future core.
         if (
             cfg_web_auth_enabled &&
@@ -10209,181 +12736,231 @@ static void handleFirmwareUploadData()
             return;
         }
 
-        if (g_storageLocked) {
+        if (webFirmwareReady) {
             webFirmwareFailUpload(
-                "SD/storage is currently locked by another operation."
+                "A validated firmware image is already staged. Install or discard it first."
             );
             return;
         }
 
-        String directoryError;
-
-        if (!webFirmwareEnsureDirectory(
-                directoryError
-            )) {
-            webFirmwareFailUpload(
-                directoryError
-            );
-            return;
-        }
-
-        if (STORAGE.exists(WEB_FW_UPLOAD_READY)) {
-            webFirmwareFailUpload(
-                "A validated WiFi firmware image is already staged. Install or discard it first."
-            );
-            return;
-        }
-
-        // Safe now: no recorder and no competing storage owner. Remove only a
-        // stale partial file from an earlier interrupted WiFi upload.
-        if (STORAGE.exists(WEB_FW_UPLOAD_TEMP))
-            STORAGE.remove(WEB_FW_UPLOAD_TEMP);
-
-        String firstCandidate;
-        int binCount =
-            webFirmwareCountBinCandidates(
-                firstCandidate
+        const esp_partition_t *target =
+            esp_ota_get_next_update_partition(
+                nullptr
             );
 
-        if (binCount > 0) {
-            webFirmwareFailUpload(
-                "A .bin firmware candidate already exists in /firmware (" +
-                firstCandidate +
-                "). Reboot/install or remove it before another WiFi upload."
-            );
-            return;
-        }
+        const esp_partition_t *running =
+            esp_ota_get_running_partition();
 
-        webFirmwareUploadCapacity =
-            firmwareInactiveOtaCapacity();
-
-        if (webFirmwareUploadCapacity == 0) {
+        if (
+            !target ||
+            !running ||
+            target == running ||
+            target->size == 0
+        ) {
             webFirmwareFailUpload(
                 "No inactive OTA application partition is available."
             );
             return;
         }
 
+        webFirmwareUploadCapacity =
+            target->size;
+
+        String markerError;
+
+        if (!webFirmwarePrepareMarkerMatcher(
+                markerError
+            )) {
+            webFirmwareFailUpload(
+                markerError
+            );
+            return;
+        }
+
         webFirmwarePreviousRecordingBlock =
             g_recordingStartBlocked;
-        webFirmwarePreviousStorageLock =
-            g_storageLocked;
-
         g_recordingStartBlocked = true;
-        g_storageLocked = true;
         webFirmwareUploadLocksHeld = true;
 
-        // Release any recording-player file before opening the staging image.
+        // Release a playback file and reduce unnecessary SD activity. The SD
+        // itself is not required for this update path and is never locked here.
         webPlayerStop();
 
-        webFirmwareUploadFile =
-            STORAGE.open(
-                WEB_FW_UPLOAD_TEMP,
-                FILE_WRITE
+        esp_ota_handle_t otaHandle = 0;
+        esp_err_t beginResult =
+            esp_ota_begin(
+                target,
+                OTA_WITH_SEQUENTIAL_WRITES,
+                &otaHandle
             );
 
-        if (!webFirmwareUploadFile) {
+        if (beginResult != ESP_OK) {
             webFirmwareFailUpload(
-                "Cannot create firmware staging file on SD."
+                "Could not prepare the internal OTA partition: " +
+                webFirmwareEspError(
+                    beginResult
+                )
             );
             webFirmwareReleaseUploadLocks();
             return;
         }
 
-        webFirmwareUploadOwnsTemp = true;
+        webFirmwareOtaHandle =
+            otaHandle;
+        webFirmwareOtaActive = true;
+        webFirmwareUploadPartition =
+            target;
         return;
     }
 
     if (upload.status == UPLOAD_FILE_WRITE) {
         if (
             webFirmwareUploadError.length() ||
-            !webFirmwareUploadFile
+            !webFirmwareOtaActive ||
+            !webFirmwareUploadPartition
         ) {
             return;
+        }
+
+        if (upload.currentSize == 0)
+            return;
+
+        if (!webFirmwareImageMagicChecked) {
+            if (
+                webFirmwareUploadBytes != 0 ||
+                upload.buf[0] !=
+                    WEB_FW_ESP_IMAGE_MAGIC
+            ) {
+                webFirmwareFailUpload(
+                    "Firmware rejected: invalid ESP32 application image header."
+                );
+                webFirmwareAbortActiveOta();
+                return;
+            }
+
+            webFirmwareImageMagicChecked = true;
         }
 
         if (
+            webFirmwareUploadBytes >
+                webFirmwareUploadCapacity ||
             upload.currentSize >
-            webFirmwareUploadCapacity -
-                webFirmwareUploadBytes
+                webFirmwareUploadCapacity -
+                    webFirmwareUploadBytes
         ) {
             webFirmwareFailUpload(
-                "Firmware image is larger than the inactive OTA partition."
+                "Firmware rejected: image is larger than the inactive OTA partition."
             );
-            webFirmwareCleanupPartial();
+            webFirmwareAbortActiveOta();
             return;
         }
 
-        size_t written =
-            webFirmwareUploadFile.write(
+        webFirmwareScanCompatibilityMarker(
+            upload.buf,
+            upload.currentSize
+        );
+
+        esp_err_t writeResult =
+            esp_ota_write(
+                webFirmwareOtaHandle,
                 upload.buf,
                 upload.currentSize
             );
 
-        if (written != upload.currentSize) {
+        if (writeResult != ESP_OK) {
             webFirmwareFailUpload(
-                "SD write failed while receiving firmware image."
+                "Firmware upload failed while writing internal flash: " +
+                webFirmwareEspError(
+                    writeResult
+                )
             );
-            webFirmwareCleanupPartial();
+            webFirmwareAbortActiveOta();
             return;
         }
 
         webFirmwareUploadBytes +=
-            written;
+            upload.currentSize;
 
         serviceWebLongOperation();
         return;
     }
 
     if (upload.status == UPLOAD_FILE_END) {
-        if (webFirmwareUploadFile) {
-            webFirmwareUploadFile.flush();
-            webFirmwareUploadFile.close();
-        }
-
-        webFirmwareUploadFile = File();
-
-        if (!webFirmwareUploadError.length()) {
-            if (webFirmwareUploadBytes == 0) {
-                webFirmwareFailUpload(
-                    "Uploaded firmware image is empty."
-                );
-            } else {
-                size_t validatedSize = 0;
-                String validationError;
-
-                if (!firmwareValidateStagedImage(
-                        WEB_FW_UPLOAD_TEMP,
-                        validatedSize,
-                        validationError
-                    )) {
-                    webFirmwareFailUpload(
-                        "Firmware rejected: " +
-                        validationError
-                    );
-                } else if (
-                    validatedSize !=
-                    webFirmwareUploadBytes
-                ) {
-                    webFirmwareFailUpload(
-                        "Firmware staging size mismatch."
-                    );
-                } else if (!STORAGE.rename(
-                               WEB_FW_UPLOAD_TEMP,
-                               WEB_FW_UPLOAD_READY
-                           )) {
-                    webFirmwareFailUpload(
-                        "Firmware validated, but staging rename failed."
-                    );
-                } else {
-                    webFirmwareUploadOwnsTemp = false;
-                    webFirmwareUploadSucceeded = true;
-                }
-            }
-        }
-
-        if (!webFirmwareUploadSucceeded)
+        if (webFirmwareUploadError.length()) {
             webFirmwareCleanupPartial();
+            webFirmwareReleaseUploadLocks();
+            return;
+        }
+
+        if (
+            !webFirmwareOtaActive ||
+            !webFirmwareUploadPartition ||
+            webFirmwareUploadBytes == 0 ||
+            !webFirmwareImageMagicChecked
+        ) {
+            webFirmwareFailUpload(
+                "Firmware upload did not contain a complete application image."
+            );
+            webFirmwareCleanupPartial();
+            webFirmwareReleaseUploadLocks();
+            return;
+        }
+
+        if (
+            upload.totalSize != 0 &&
+            upload.totalSize !=
+                webFirmwareUploadBytes
+        ) {
+            webFirmwareFailUpload(
+                "Firmware upload size mismatch - upload may have been interrupted."
+            );
+            webFirmwareCleanupPartial();
+            webFirmwareReleaseUploadLocks();
+            return;
+        }
+
+        if (!webFirmwareMarkerFound) {
+            webFirmwareFailUpload(
+                "Firmware rejected: compatibility marker missing or wrong board."
+            );
+            webFirmwareCleanupPartial();
+            webFirmwareReleaseUploadLocks();
+            return;
+        }
+
+        const esp_partition_t *completedPartition =
+            webFirmwareUploadPartition;
+
+        esp_err_t endResult =
+            esp_ota_end(
+                webFirmwareOtaHandle
+            );
+
+        // esp_ota_end() consumes the OTA handle whether validation succeeds or
+        // fails. Do not call esp_ota_abort() on this handle afterwards.
+        webFirmwareOtaActive = false;
+        webFirmwareOtaHandle = 0;
+        webFirmwareUploadPartition = nullptr;
+
+        if (endResult != ESP_OK) {
+            webFirmwareFailUpload(
+                "Firmware rejected during final OTA image verification: " +
+                webFirmwareEspError(
+                    endResult
+                )
+            );
+            webFirmwareReleaseUploadLocks();
+            return;
+        }
+
+        webFirmwareReady = true;
+        webFirmwareReadyPartition =
+            completedPartition;
+        webFirmwareReadyBytes =
+            webFirmwareUploadBytes;
+        webFirmwareReadyFilename =
+            webFirmwareUploadFilename;
+        webFirmwareUploadSucceeded = true;
 
         webFirmwareReleaseUploadLocks();
         return;
@@ -10402,7 +12979,7 @@ static void handleFirmwareUploadData()
 static void handleFirmwareUploadFinished()
 {
     // Defensive cleanup: malformed/interrupted multipart requests must never
-    // leave an open staging file or one of our cooperative locks behind.
+    // leave an OTA handle or the recording-start gate behind.
     if (!webFirmwareUploadSucceeded)
         webFirmwareCleanupPartial();
 
@@ -10437,49 +13014,11 @@ static void sendFirmwareUpdatePage(
     bool blockedByRecording =
         recorderIsOpen();
 
-    bool blockedByStorage =
-        g_storageLocked;
+    bool readyExists =
+        webFirmwareReady;
 
-    bool canInspectStorage =
-        !blockedByRecording &&
-        !blockedByStorage;
-
-    bool readyExists = false;
-    bool readyValid = false;
-    size_t readySize = 0;
-    String readyError;
-    int existingBinCount = 0;
-    String existingBin;
-
-    if (canInspectStorage) {
-        String directoryError;
-
-        if (webFirmwareEnsureDirectory(
-                directoryError
-            )) {
-            readyExists =
-                STORAGE.exists(
-                    WEB_FW_UPLOAD_READY
-                );
-
-            if (readyExists) {
-                readyValid =
-                    firmwareValidateStagedImage(
-                        WEB_FW_UPLOAD_READY,
-                        readySize,
-                        readyError
-                    );
-            }
-
-            existingBinCount =
-                webFirmwareCountBinCandidates(
-                    existingBin
-                );
-        } else {
-            readyError =
-                directoryError;
-        }
-    }
+    bool readyValid =
+        webFirmwareReadyStateValid();
 
     String html =
         htmlHeader();
@@ -10519,8 +13058,8 @@ static void sendFirmwareUpdatePage(
         html +=
             "<div class='flash-notice'>"
             "<strong>Firmware erfolgreich hochgeladen und geprüft</strong>"
-            "<span class='muted'>Das Image liegt nur als Staging-Datei auf der SD-Karte. "
-            "Es wird erst nach ausdrücklicher Installationsbestätigung als .bin freigegeben.</span>"
+            "<span class='muted'>Die neue Firmware liegt sicher im internen Update-Speicher. "
+            "Die aktuell laufende Firmware wurde noch nicht umgeschaltet.</span>"
             "</div>";
 
     } else if (
@@ -10545,44 +13084,17 @@ static void sendFirmwareUpdatePage(
             "<strong>Aufnahme läuft</strong>"
             "<span class='muted'>Firmware-Upload und Installation sind bis zum sauberen Ende der laufenden Aufnahme gesperrt.</span>"
             "</div>";
-
-    } else if (blockedByStorage) {
-        html +=
-            "<div class='flash-notice error'>"
-            "<strong>SD-Karte momentan gesperrt</strong>"
-            "<span class='muted'>Eine andere Wartungsoperation verwendet den Storage-Lock. Bitte später erneut versuchen.</span>"
-            "</div>";
-    }
-
-    if (
-        canInspectStorage &&
-        existingBinCount > 0
-    ) {
-        html +=
-            "<div class='flash-notice error'>"
-            "<strong>Bereits vorhandener .bin-Kandidat</strong>"
-            "<span class='muted'>In <code>/firmware</code> liegt bereits " +
-            htmlEscape(
-                existingBinCount == 1
-                ? existingBin
-                : String("mehr als eine .bin-Datei")
-            ) +
-            ". Der bestehende SD-Updater verlangt genau einen Kandidaten; ein weiterer WiFi-Upload wird daher nicht zugelassen.</span>"
-            "</div>";
     }
 
     html +=
         "<div class='settings-section'>"
-        "<h3>1. Firmware hochladen</h3>"
-        "<p class='muted'>Bitte die kompilierte <code>.bin</code>-Datei auswählen. "
-        "Während des Uploads wird die laufende Firmware nicht verändert. Ein abgebrochener Upload bleibt als nicht bootfähige <code>.part</code>-Datei liegen und wird beim nächsten Upload bereinigt.</p>"
-        "<p><b>Kompatibilität:</b><br>"
-        "Die Firmware wird vor der Installation automatisch auf Kompatibilität mit diesem Gerät geprüft.</p>";
+        "<h3>1. Firmware auswählen</h3>"
+        "<p class='muted'>Wähle die kompilierte <code>.bin</code>-Datei. SensorForge prüft automatisch, "
+        "ob das Image vollständig ist, in den internen Update-Speicher passt und zu diesem Gerät gehört. "
+        "Die SD-Karte wird für ein WiFi-Update nicht benötigt.</p>";
 
     if (
         !blockedByRecording &&
-        !blockedByStorage &&
-        existingBinCount == 0 &&
         !readyExists
     ) {
         html +=
@@ -10613,24 +13125,19 @@ static void sendFirmwareUpdatePage(
                 "<p>✓ ESP32 Application Image<br>"
                 "✓ Größe: <b>" +
                 webFirmwareFormatBytes(
-                    readySize
+                    webFirmwareReadyBytes
                 ) +
                 "</b><br>"
-                "✓ Inaktive OTA-Partition: <b>" +
+                "✓ Interner Update-Speicher: <b>" +
                 webFirmwareFormatBytes(
-                    firmwareInactiveOtaCapacity()
+                    webFirmwareReadyPartition->size
                 ) +
                 "</b><br>"
                 "✓ Firmware ist mit diesem Gerät kompatibel</p>"
-                "<p class='muted'>Mit <b>JETZT INSTALLIEREN</b> wird die geprüfte Staging-Datei zu "
-                "<code>/firmware/wifi_update.bin</code> umbenannt. Danach startet SensorForge kontrolliert neu; "
-                "beim Boot übernimmt der bestehende SD-Auto-Updater die eigentliche OTA-Installation und prüft das Image nochmals.</p>";
+                "<p class='muted'>Mit <b>JETZT INSTALLIEREN</b> wird die bereits geprüfte Firmware "
+                "für den nächsten Neustart aktiviert. Bis dahin bleibt die aktuell laufende Firmware unverändert.</p>";
 
-            if (
-                !blockedByRecording &&
-                !blockedByStorage &&
-                existingBinCount == 0
-            ) {
+            if (!blockedByRecording) {
                 html +=
                     "<form method='POST' action='/firmware_install' "
                     "onsubmit=\"return confirm('Firmware wirklich installieren? Das Gerät startet danach automatisch neu.');\">"
@@ -10644,27 +13151,18 @@ static void sendFirmwareUpdatePage(
         } else {
             html +=
                 "<div class='flash-notice error'>"
-                "<strong>Staging-Datei ist nicht gültig</strong>"
-                "<span class='muted'>" +
-                htmlEscape(
-                    readyError.length()
-                    ? readyError
-                    : String("Validierung fehlgeschlagen")
-                ) +
-                "</span></div>";
+                "<strong>Bereitgestellte Firmware ist nicht mehr verfügbar</strong>"
+                "<span class='muted'>Bitte die Firmware erneut hochladen und prüfen.</span></div>";
         }
 
-        if (
-            !blockedByRecording &&
-            !blockedByStorage
-        ) {
+        if (!blockedByRecording) {
             html +=
                 "<form method='POST' action='/firmware_discard' "
                 "onsubmit=\"return confirm('Bereitgestellte Firmware verwerfen?');\">"
                 "<input type='hidden' name='token' value='" +
                 String(webBootSessionId) +
                 "'>"
-                "<button type='submit'>Staging-Datei verwerfen</button>"
+                "<button type='submit'>Bereitgestellte Firmware verwerfen</button>"
                 "</form>";
         }
 
@@ -10675,11 +13173,12 @@ static void sendFirmwareUpdatePage(
     html +=
         "<div class='settings-section'>"
         "<h3>Sicherheitsablauf</h3>"
-        "<p class='muted'>WiFi-Upload → SD-Staging → vollständige Validierung → manuelle Bestätigung → "
-        "Umbenennen zu <code>.bin</code> → kontrollierter Neustart → bestehender SD-Auto-Updater → "
-        "inaktive OTA-Partition → Verifikation → Neustart in die neue Firmware.</p>"
+        "<p class='muted'>WiFi-Upload → inaktive interne OTA-Partition → vollständige Image- und Geräteprüfung → "
+        "manuelle Bestätigung → neue Boot-Partition freigeben → kontrollierter Neustart.</p>"
+        "<p class='muted'>Bricht der Upload vorher ab, bleibt die bisherige Firmware als Boot-Firmware ausgewählt. "
+        "Auch eine fehlende oder defekte SD-Karte verhindert das WiFi-Update nicht.</p>"
         "<p><b>Wichtig:</b> Ein technisch gültiges, aber fehlerhaft programmiertes Image kann nach dem Update trotzdem den WiFi-Zugang verlieren. "
-        "Remote daher nur zuvor auf einem zweiten XIAO getestete Builds installieren.</p>"
+        "Remote daher nur Builds installieren, die vorher auf einem passenden zweiten Gerät getestet wurden.</p>"
         "</div>";
 
     html +=
@@ -10696,8 +13195,8 @@ static void sendFirmwareUpdatePage(
         html
     );
 
-    // The page has consumed the one-shot upload message. The persistent
-    // staged-file state is always rediscovered from SD on the next request.
+    // Clear only the one-shot upload result. A successfully staged image has
+    // separate RAM state and remains available until install/discard/reboot.
     if (
         notice == "upload_ok" ||
         notice == "upload_failed"
@@ -10738,43 +13237,12 @@ static void handleFirmwareDiscard()
         return;
     }
 
-    if (g_storageLocked) {
-        sendFirmwareUpdatePage(
-            409,
-            "SD/storage is currently locked by another operation."
-        );
-        return;
-    }
-
-    bool removed = true;
-
-    if (STORAGE.exists(WEB_FW_UPLOAD_READY)) {
-        removed =
-            STORAGE.remove(
-                WEB_FW_UPLOAD_READY
-            ) &&
-            removed;
-    }
-
-    if (STORAGE.exists(WEB_FW_UPLOAD_TEMP)) {
-        removed =
-            STORAGE.remove(
-                WEB_FW_UPLOAD_TEMP
-            ) &&
-            removed;
-    }
+    webFirmwareClearReadyState();
 
     server.sendHeader(
         "Location",
-        removed
-        ? "/firmware_update"
-        : "/firmware_update?notice=upload_failed"
+        "/firmware_update"
     );
-
-    if (!removed) {
-        webFirmwareUploadError =
-            "Could not remove the staged firmware file from SD.";
-    }
 
     server.send(
         303,
@@ -10803,15 +13271,8 @@ static void handleFirmwareInstall()
         return;
     }
 
-    if (g_storageLocked) {
-        sendFirmwareUpdatePage(
-            409,
-            "SD/storage is currently locked by another operation."
-        );
-        return;
-    }
-
-    if (!STORAGE.exists(WEB_FW_UPLOAD_READY)) {
+    if (!webFirmwareReadyStateValid()) {
+        webFirmwareClearReadyState();
         sendFirmwareUpdatePage(
             404,
             "No validated WiFi firmware image is staged."
@@ -10819,66 +13280,65 @@ static void handleFirmwareInstall()
         return;
     }
 
-    String firstCandidate;
-    int binCount =
-        webFirmwareCountBinCandidates(
-            firstCandidate
-        );
+    bool previousRecordingBlock =
+        g_recordingStartBlocked;
 
-    if (binCount > 0) {
-        sendFirmwareUpdatePage(
-            409,
-            "A .bin firmware candidate already exists in /firmware; installation would be ambiguous."
-        );
-        return;
-    }
-
-    size_t firmwareSize = 0;
-    String validationError;
-
-    if (!firmwareValidateStagedImage(
-            WEB_FW_UPLOAD_READY,
-            firmwareSize,
-            validationError
-        )) {
-        sendFirmwareUpdatePage(
-            400,
-            "Firmware rejected before installation: " +
-            validationError
-        );
-        return;
-    }
-
-    if (STORAGE.exists(WEB_FW_INSTALL_CANDIDATE)) {
-        sendFirmwareUpdatePage(
-            409,
-            "Install candidate already exists. Reboot or remove it before continuing."
-        );
-        return;
-    }
-
-    if (!STORAGE.rename(
-            WEB_FW_UPLOAD_READY,
-            WEB_FW_INSTALL_CANDIDATE
-        )) {
-        sendFirmwareUpdatePage(
-            500,
-            "Could not arm the validated image for the SD auto-updater."
-        );
-        return;
-    }
-
-    // From this point onward an explicit install was confirmed. Prevent any
-    // new recording start during the short hand-off to reboot. The boot-time
-    // SD updater performs the same full validation once again before flashing.
     g_recordingStartBlocked = true;
     webPlayerStop();
 
+    // The first boot of the newly selected WiFi image must not immediately be
+    // replaced by a stale .bin file that happens to be present on SD. The
+    // one-shot NVS flag is consumed at the next firmware boot before the SD
+    // auto-updater is considered.
+    if (!firmwareInfoArmDirectOtaBoot()) {
+        g_recordingStartBlocked =
+            previousRecordingBlock;
+
+        sendFirmwareUpdatePage(
+            500,
+            "Could not persist the safe first-boot guard for the firmware update."
+        );
+        return;
+    }
+
+    esp_err_t bootResult =
+        esp_ota_set_boot_partition(
+            webFirmwareReadyPartition
+        );
+
+    if (bootResult != ESP_OK) {
+        firmwareInfoCancelDirectOtaBoot();
+        g_recordingStartBlocked =
+            previousRecordingBlock;
+
+        sendFirmwareUpdatePage(
+            500,
+            "Could not activate the validated firmware image: " +
+            webFirmwareEspError(
+                bootResult
+            )
+        );
+        return;
+    }
+
+    if (!firmwareInfoMarkWifiUpdate(
+            webFirmwareReadyFilename
+        )) {
+        consoleWrite(
+            "FW",
+            "WiFi OTA selected, but installation metadata could not be persisted"
+        );
+    }
+
     logWrite(
-        "Firmware WiFi upload armed for SD auto-update | file=wifi_update.bin | bytes=" +
-        String((unsigned long)firmwareSize)
+        "Firmware WiFi OTA armed | file=" +
+        webFirmwareReadyFilename +
+        " | bytes=" +
+        String((unsigned long)webFirmwareReadyBytes)
     );
     logFlush();
+
+    webFirmwareClearReadyState();
 
     rebootScheduled = true;
     rebootAtMs =
@@ -10895,6 +13355,8 @@ static void handleFirmwareInstall()
         ""
     );
 }
+
+
 
 
 // -------------------------------------------------------------
@@ -11123,729 +13585,163 @@ static void handleRebootDo()
 
 
 // -------------------------------------------------------------
-// LOG VIEWER
+// SHUTDOWN
 // -------------------------------------------------------------
-static String activeWebLogPath()
+
+static String shutdownRecordingBlockedModalHtml()
 {
+    bool de =
+        cfg_web_language == "de";
+
     return
-        cfg_log_file.length()
-        ? cfg_log_file
-        : String("/log.txt");
-}
-
-
-static bool parseUnsignedLongLongArg(
-    const String &text,
-    uint64_t &value
-)
-{
-    if (!text.length()) {
-        value = 0;
-        return true;
-    }
-
-    uint64_t result = 0;
-
-    for (size_t i = 0; i < text.length(); ++i) {
-        char c = text[i];
-
-        if (c < '0' || c > '9')
-            return false;
-
-        uint8_t digit =
-            (uint8_t)(c - '0');
-
-        if (
-            result >
-            (UINT64_MAX - digit) / 10ULL
-        ) {
-            return false;
-        }
-
-        result =
-            result * 10ULL +
-            digit;
-    }
-
-    value = result;
-    return true;
-}
-
-
-static void handleLogRaw()
-{
-    if (rejectWhileRecording("log download"))
-        return;
-
-    logFlush();
-
-    String logPath =
-        activeWebLogPath();
-
-    File f = STORAGE.open(
-        logPath.c_str(),
-        FILE_READ
-    );
-
-    if (!f) {
-        server.send(
-            404,
-            "text/plain; charset=utf-8",
-            "Logdatei nicht gefunden: " + logPath
-        );
-        return;
-    }
-
-    uint64_t logSize =
-        f.size();
-
-    server.sendHeader(
-        "Cache-Control",
-        "no-store"
-    );
-
-    server.sendHeader(
-        "X-Log-Size",
-        String((unsigned long)logSize)
-    );
-
-    if (
-        server.hasArg("download") &&
-        server.arg("download") == "1"
-    ) {
-        int slashPos =
-            logPath.lastIndexOf('/');
-
-        String downloadName =
-            slashPos >= 0
-            ? logPath.substring(slashPos + 1)
-            : logPath;
-
-        if (!downloadName.length())
-            downloadName = "sensorforge.log";
-
-        downloadName.replace("\"", "_");
-        downloadName.replace("\r", "_");
-        downloadName.replace("\n", "_");
-
-        server.sendHeader(
-            "Content-Disposition",
-            "attachment; filename=\"" +
-            downloadName +
-            "\""
-        );
-    }
-
-    server.streamFile(
-        f,
-        "text/plain; charset=utf-8"
-    );
-
-    f.close();
-}
-
-
-static void handleLogChunk()
-{
-    if (rejectWhileRecording("log live update"))
-        return;
-
-    logFlush();
-
-    String logPath =
-        activeWebLogPath();
-
-    File f = STORAGE.open(
-        logPath.c_str(),
-        FILE_READ
-    );
-
-    if (!f) {
-        server.send(
-            404,
-            "text/plain; charset=utf-8",
-            "Logdatei nicht gefunden: " + logPath
-        );
-        return;
-    }
-
-    uint64_t fileSize =
-        f.size();
-
-    uint64_t offset = 0;
-
-    if (
-        server.hasArg("offset") &&
-        !parseUnsignedLongLongArg(
-            server.arg("offset"),
-            offset
-        )
-    ) {
-        f.close();
-        server.send(
-            400,
-            "text/plain; charset=utf-8",
-            "Invalid log offset"
-        );
-        return;
-    }
-
-    bool reset = false;
-
-    // Rotation or a manual clear makes the browser's old offset invalid.
-    // Restart from byte 0 of the new generation in that case.
-    if (offset > fileSize) {
-        offset = 0;
-        reset = true;
-    }
-
-    if (!f.seek((uint32_t)offset)) {
-        f.close();
-        server.send(
-            500,
-            "text/plain; charset=utf-8",
-            "Cannot seek log file"
-        );
-        return;
-    }
-
-    static const size_t MAX_LOG_CHUNK_BYTES =
-        16U * 1024U;
-
-    uint64_t remaining =
-        fileSize - offset;
-
-    size_t wanted =
-        remaining > MAX_LOG_CHUNK_BYTES
-        ? MAX_LOG_CHUNK_BYTES
-        : (size_t)remaining;
-
-    String body;
-    body.reserve(wanted + 1U);
-
-    char buffer[512];
-    size_t totalRead = 0;
-
-    while (totalRead < wanted) {
-        size_t request =
-            wanted - totalRead;
-
-        if (request > sizeof(buffer))
-            request = sizeof(buffer);
-
-        size_t got =
-            f.readBytes(
-                buffer,
-                request
-            );
-
-        if (got == 0)
-            break;
-
-        body.concat(
-            buffer,
-            got
-        );
-
-        totalRead += got;
-    }
-
-    f.close();
-
-    uint64_t nextOffset =
-        offset +
-        (uint64_t)totalRead;
-
-    server.sendHeader(
-        "Cache-Control",
-        "no-store"
-    );
-
-    server.sendHeader(
-        "X-Log-Offset",
-        String((unsigned long)nextOffset)
-    );
-
-    server.sendHeader(
-        "X-Log-Size",
-        String((unsigned long)fileSize)
-    );
-
-    server.sendHeader(
-        "X-Log-Reset",
-        reset ? "1" : "0"
-    );
-
-    server.sendHeader(
-        "X-Log-More",
-        nextOffset < fileSize ? "1" : "0"
-    );
-
-    server.send(
-        200,
-        "text/plain; charset=utf-8",
-        body
-    );
-}
-
-
-static void handleLogClear()
-{
-    if (rejectWhileRecording("log clear"))
-        return;
-
-    if (g_storageLocked) {
-        server.send(
-            409,
-            "text/plain; charset=utf-8",
-            "Storage ist momentan gesperrt"
-        );
-        return;
-    }
-
-    String error;
-
-    if (!logClear(error)) {
-        server.send(
-            500,
-            "text/plain; charset=utf-8",
-            "Log konnte nicht geleert werden: " +
-            error
-        );
-        return;
-    }
-
-    consoleWrite(
-        "LOG",
-        "Log cleared from WebConfig"
-    );
-
-    // POST/Redirect/GET: browser refresh must never repeat a destructive action.
-    server.sendHeader(
-        "Location",
-        "/log?notice=cleared"
-    );
-
-    server.send(
-        303,
-        "text/plain; charset=utf-8",
-        ""
-    );
-}
-
-
-static void handleLog()
-{
-    if (rejectWhileRecording("log viewer"))
-        return;
-
-    // Ensure the viewer sees all messages that have already been logged.
-    logFlush();
-
-    String logPath =
-        activeWebLogPath();
-
-    File f = STORAGE.open(
-        logPath.c_str(),
-        FILE_READ
-    );
-
-    if (!f) {
-        String html = htmlHeader();
-
-        html +=
-            "<div class='page-title'><div>"
-            "<h2>Log Viewer</h2>"
-            "<p>SensorForge System- und Ereignisprotokoll</p>"
-            "</div></div>"
-            "<div class='flash-notice error'>"
-            "<strong>Logdatei nicht gefunden</strong>"
-            "<span class='muted'><code>" +
-            htmlEscape(logPath) +
-            "</code></span></div>";
-
-        html += htmlFooter();
-
-        server.send(
-            404,
-            "text/html; charset=utf-8",
-            html
-        );
-        return;
-    }
-
-    uint64_t logSize =
-        f.size();
-
-    f.close();
-
-    String sizeText;
-
-    if (logSize >= 1024ULL * 1024ULL) {
-        sizeText =
-            String(
-                (double)logSize /
-                (1024.0 * 1024.0),
-                1
-            ) +
-            " MB";
-    } else if (logSize >= 1024ULL) {
-        sizeText =
-            String(
-                (double)logSize / 1024.0,
-                1
-            ) +
-            " KB";
-    } else {
-        sizeText =
-            String((unsigned long)logSize) +
-            " B";
-    }
-
-    bool justCleared =
-        server.hasArg("notice") &&
-        server.arg("notice") == "cleared";
-
-    String html = htmlHeader();
-
-    html +=
-        "<div class='page-title'><div>"
-        "<h2>Log Viewer</h2>"
-        "<p>SensorForge System- und Ereignisprotokoll</p>"
-        "</div></div>";
-
-    if (justCleared) {
-        html +=
-            "<div class='flash-notice success'>"
-            "<strong>Log wurde geleert.</strong> "
-            "Aktive Logdatei und Rotationsarchiv wurden entfernt. "
-            "Eine neue Audit-Zeile markiert den manuellen Neustart des Logs."
-            "</div>";
-    }
-
-    html +=
-        "<div class='log-analysis'>"
-        "<div class='log-analysis-head'><div><h3>Log Analyse</h3>"
-        "<div class='muted'>Statistik aus der aktuell geladenen Logdatei. Der Suchfilter beeinflusst die Analyse nicht.</div></div>"
-        "<div id='logAnalysisStatus' class='log-analysis-status'>Warte auf Logdaten...</div></div>"
-        "<div class='log-analysis-grid'>"
-        "<div class='log-stat'><div class='log-stat-label'>Log Start</div><div id='statLogStart' class='log-stat-value'>--</div><div class='log-stat-note'>frühester Zeitstempel</div></div>"
-        "<div class='log-stat'><div class='log-stat-label'>Log Ende</div><div id='statLogEnd' class='log-stat-value'>--</div><div class='log-stat-note'>spätester Zeitstempel</div></div>"
-        "<div class='log-stat'><div class='log-stat-label'>Zeitraum</div><div id='statPeriod' class='log-stat-value'>--</div><div class='log-stat-note'>zwischen Start und Ende</div></div>"
-        "<div class='log-stat'><div class='log-stat-label'>Sleep gesamt</div><div id='statSleep' class='log-stat-value'>--</div><div id='statSleepNote' class='log-stat-note'>--</div></div>"
-        "<div class='log-stat'><div class='log-stat-label'>Alarmereignisse</div><div id='statEvents' class='log-stat-value'>--</div><div class='log-stat-note'>Recording START, NEXT zählt nicht neu</div></div>"
-        "<div class='log-stat'><div class='log-stat-label'>Clips abgeschlossen</div><div id='statClips' class='log-stat-value'>--</div><div class='log-stat-note'>Clips mit STOP + duration</div></div>"
-        "<div class='log-stat'><div class='log-stat-label'>Aufnahmemodus gesamt</div><div id='statModeTime' class='log-stat-value'>--</div><div id='statModeNote' class='log-stat-note'>--</div></div>"
-        "<div class='log-stat'><div class='log-stat-label'>Clip-Länge gesamt</div><div id='statRecordTime' class='log-stat-value'>--</div><div id='statRecordNote' class='log-stat-note'>--</div></div>"
-        "<div class='log-stat'><div class='log-stat-label'>Cliplänge</div><div id='statClipAvg' class='log-stat-value'>--</div><div id='statClipNote' class='log-stat-note'>--</div></div>"
-        "<div class='log-stat'><div class='log-stat-label'>Frames gesamt</div><div id='statFrames' class='log-stat-value'>--</div><div class='log-stat-note'>aus abgeschlossenen Clips</div></div>"
-        "<div class='log-stat'><div class='log-stat-label'>Boots</div><div id='statBoots' class='log-stat-value'>--</div><div id='statBootNote' class='log-stat-note'>--</div></div>"
-        "<div class='log-stat'><div class='log-stat-label'>Warnungen / Fehler</div><div id='statHealth' class='log-stat-value'>--</div><div id='statHealthNote' class='log-stat-note'>--</div></div>"
-        "<div class='log-stat'><div class='log-stat-label'>Safety Limits</div><div id='statSafety' class='log-stat-value'>--</div><div id='statSafetyNote' class='log-stat-note'>--</div></div>"
-        "</div>"
-        "<div style='margin:18px 0 8px;font-weight:800;font-size:1.02rem'>Temperatur / Thermal Guard</div>"
-        "<div class='log-analysis-grid'>"
-        "<div class='log-stat'><div class='log-stat-label'>Thermal Warnings</div><div id='statThermalWarnings' class='log-stat-value'>--</div><div id='statThermalWarningsNote' class='log-stat-note'>--</div></div>"
-        "<div class='log-stat'><div class='log-stat-label'>Thermal Abschaltungen</div><div id='statThermalEmergency' class='log-stat-value'>--</div><div id='statThermalEmergencyNote' class='log-stat-note'>--</div></div>"
-        "<div class='log-stat'><div class='log-stat-label'>CPU Spitze</div><div id='statThermalCpuMax' class='log-stat-value'>--</div><div id='statThermalCpuMaxNote' class='log-stat-note'>--</div></div>"
-        "<div class='log-stat'><div class='log-stat-label'>RTC/Gehäuse Spitze</div><div id='statThermalRtcMax' class='log-stat-value'>--</div><div id='statThermalRtcMaxNote' class='log-stat-note'>--</div></div>"
-        "<div class='log-stat'><div class='log-stat-label'>Ø CPU bei Aufnahme</div><div id='statThermalCpuAvgRec' class='log-stat-value'>--</div><div id='statThermalCpuAvgRecNote' class='log-stat-note'>--</div></div>"
-        "<div class='log-stat'><div class='log-stat-label'>Ø RTC bei Aufnahme</div><div id='statThermalRtcAvgRec' class='log-stat-value'>--</div><div id='statThermalRtcAvgRecNote' class='log-stat-note'>--</div></div>"
-        "<div class='log-stat'><div class='log-stat-label'>Thermal Recoveries</div><div id='statThermalRecoveries' class='log-stat-value'>--</div><div id='statThermalRecoveriesNote' class='log-stat-note'>--</div></div>"
-        "<div class='log-stat'><div class='log-stat-label'>Aufnahme-Thermaldaten</div><div id='statThermalCoverage' class='log-stat-value'>--</div><div id='statThermalCoverageNote' class='log-stat-note'>--</div></div>"
-        "</div>"
-        "<div class='log-chart-card'>"
-        "<div class='log-chart-title'>Alarmereignisse nach Uhrzeit</div>"
-        "<div class='log-chart-note'>24 Stunden-Buckets über alle Tage im geladenen Log: 0–1, 1–2, ... 23–24 Uhr. Gezählt wird jedes <code>Recording START</code>; Segmentwechsel <code>NEXT</code> sind kein neuer Alarm.</div>"
-        "<div class='log-chart-scroll'><div class='log-chart-inner'><canvas id='logHourChart' class='log-hour-chart' width='1000' height='320' aria-label='Alarmereignisse pro Stunde'></canvas></div></div>"
-        "</div></div>"
-        ;
-
-    html +=
-        "<div class='log-toolbar'>"
-        "<button id='logReload' class='primary' type='button'>Neu laden</button>"
-        "<button id='logBottom' type='button'>Zum Ende</button>"
-        "<a class='button' href='/log_raw?download=1'>Download</a>"
-        "<form method='POST' action='/log_clear' style='display:inline;margin:0' "
-        "onsubmit=\"return confirm('Log wirklich leeren? Die aktuelle Logdatei und das .1-Rotationsarchiv werden gelöscht. Dieser Vorgang kann nicht rückgängig gemacht werden.');\">"
-        "<button class='danger' type='submit'>Log leeren</button>"
-        "</form>"
-        "<span id='logStatus' class='log-status'>Bereit</span>"
-        "</div>"
-        "<div class='log-filter-row'>"
-        "<input id='logSearch' class='log-search' type='search' autocomplete='off' "
-        "placeholder='Log durchsuchen / filtern...'>"
-        "<label class='log-live-label'><input id='logLive' type='checkbox'> "
-        "Live aktualisieren (5 s)</label>"
-        "</div>"
-        "<div class='log-meta'>"
-        "<span>Datei: <code>" +
-        htmlEscape(logPath) +
-        "</code></span>"
-        "<span>Größe: <span id='logSize'>" +
-        htmlEscape(sizeText) +
-        "</span></span>"
-        "<span id='logFilterMeta'></span>"
-        "</div>"
-        "<div id='logTerminal' class='log-terminal'>"
-        "<pre id='logOutput' class='log-view'>Log wird geladen...</pre>"
-        "</div>"
+        "<div id='shutdownBlockedModal' class='modal-backdrop'>"
+        "<div class='modal-card' role='dialog' aria-modal='true' "
+        "aria-labelledby='shutdownBlockedTitle'>"
+        "<span class='status-pill danger'>" +
+        String(de ? "AUFNAHME AKTIV" : "RECORDING ACTIVE") +
+        "</span>"
+        "<h3 id='shutdownBlockedTitle'>" +
+        String(de ? "Herunterfahren momentan gesperrt" : "Shutdown currently blocked") +
+        "</h3><p>" +
+        String(
+            de
+            ? "Eine Aufnahme läuft gerade. Zum Schutz der Videodatei und der SD-Karte ist das Herunterfahren vorübergehend deaktiviert."
+            : "A recording is currently running. Shutdown is temporarily disabled to protect the video file and SD card."
+        ) +
+        "</p><p>" +
+        String(
+            de
+            ? "Dieses Fenster verschwindet automatisch, sobald die Aufnahme beendet ist."
+            : "This window closes automatically when the recording has finished."
+        ) +
+        "</p><div class='modal-actions'><a class='button' href='/'>" +
+        String(de ? "Zur Übersicht" : "Back to overview") +
+        "</a></div>"
+        "<div id='shutdownBlockedState' class='modal-state'>" +
+        String(de ? "Warte auf Aufnahmeende ..." : "Waiting for recording to finish ...") +
+        "</div></div></div>"
         "<script>"
         "(function(){"
-        "var out=document.getElementById('logOutput');"
-        "var term=document.getElementById('logTerminal');"
-        "var status=document.getElementById('logStatus');"
-        "var reload=document.getElementById('logReload');"
-        "var bottom=document.getElementById('logBottom');"
-        "var search=document.getElementById('logSearch');"
-        "var live=document.getElementById('logLive');"
-        "var sizeEl=document.getElementById('logSize');"
-        "var filterMeta=document.getElementById('logFilterMeta');"
-        "var analysisStatus=document.getElementById('logAnalysisStatus');"
-        "var hourChart=document.getElementById('logHourChart');"
-        "var lastHourBuckets=new Array(24).fill(0);"
-        "var rawText='';"
-        "var logOffset=0;"
-        "var loading=false;"
-        "var liveTimer=0;"
-        "function scrollBottom(){term.scrollTop=term.scrollHeight;}"
-        "function byteSizeText(bytes){"
-            "if(bytes>=1048576)return (bytes/1048576).toFixed(1)+' MB';"
-            "if(bytes>=1024)return (bytes/1024).toFixed(1)+' KB';"
-            "return bytes+' B';"
-        "}"
-        "function statText(id,value){var e=document.getElementById(id);if(e)e.textContent=value;}"
-        "function parseTimestamp(line){"
-        "var m=/^\\[(\\d{4})-(\\d{2})-(\\d{2}) (\\d{2}):(\\d{2}):(\\d{2})(?:\\.(\\d{1,3}))?\\]/.exec(line);"
-        "if(!m)return null;"
-        "var ms=m[7]?Number((m[7]+'00').slice(0,3)):0;"
-        "var value=Date.UTC(+m[1],+m[2]-1,+m[3],+m[4],+m[5],+m[6],ms);"
-        "if(!Number.isFinite(value))return null;"
-        "return {ms:value,hour:+m[4],label:m[3]+'.'+m[2]+'.'+m[1]+' '+m[4]+':'+m[5]+':'+m[6]};"
-        "}"
-        "function durationText(ms){"
-        "if(!Number.isFinite(ms)||ms<0)return '--';"
-        "var total=Math.round(ms/1000),days=Math.floor(total/86400);total%=86400;"
-        "var hours=Math.floor(total/3600);total%=3600;"
-        "var mins=Math.floor(total/60),secs=total%60;"
-        "var parts=[];"
-        "if(days)parts.push(days+' d');"
-        "if(hours||days)parts.push(hours+' h');"
-        "if(mins||hours||days)parts.push(mins+' min');"
-        "if(!days&&!hours)parts.push(secs+' s');"
-        "return parts.join(' ');"
-        "}"
-        "function secondsText(seconds){return durationText(seconds*1000);}"
-        "function niceStep(maxValue){"
-        "if(maxValue<=4)return 1;"
-        "var rough=maxValue/4;"
-        "var p=Math.pow(10,Math.floor(Math.log10(rough)));"
-        "var n=rough/p;"
-        "if(n<=1)return p;if(n<=2)return 2*p;if(n<=5)return 5*p;return 10*p;"
-        "}"
-        "function drawHourChart(counts){"
-        "if(!hourChart||!hourChart.getContext)return;"
-        "var ctx=hourChart.getContext('2d'),w=hourChart.width,h=hourChart.height;"
-        "ctx.clearRect(0,0,w,h);"
-        "var root=getComputedStyle(document.documentElement);"
-        "var accent=(root.getPropertyValue('--accent')||'#2563eb').trim();"
-        "var muted=(root.getPropertyValue('--muted')||'#667085').trim();"
-        "var line=(root.getPropertyValue('--line')||'#d8dee6').trim();"
-        "var text=(root.getPropertyValue('--text')||'#1f2933').trim();"
-        "var left=52,right=18,top=26,bottom=48,pw=w-left-right,ph=h-top-bottom;"
-        "var maxValue=0;for(var i=0;i<24;i++)if(counts[i]>maxValue)maxValue=counts[i];"
-        "var step=niceStep(Math.max(1,maxValue));var yMax=Math.max(step,Math.ceil(maxValue/step)*step);"
-        "ctx.font='12px Arial';ctx.textBaseline='middle';"
-        "for(var yv=0;yv<=yMax;yv+=step){"
-        "var y=top+ph-(yv/yMax)*ph;ctx.strokeStyle=line;ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(left,y);ctx.lineTo(w-right,y);ctx.stroke();"
-        "ctx.fillStyle=muted;ctx.textAlign='right';ctx.fillText(String(yv),left-8,y);"
-        "}"
-        "var slot=pw/24,barW=Math.max(4,slot*0.68);"
-        "for(var hour=0;hour<24;hour++){"
-        "var value=counts[hour]||0;var bh=(value/yMax)*ph;var x=left+hour*slot+(slot-barW)/2;var yb=top+ph-bh;"
-        "ctx.fillStyle=accent;ctx.fillRect(x,yb,barW,bh);"
-        "if(value>0){ctx.fillStyle=text;ctx.textAlign='center';ctx.textBaseline='bottom';ctx.fillText(String(value),x+barW/2,Math.max(top+12,yb-3));ctx.textBaseline='middle';}"
-        "}"
-        "ctx.strokeStyle=text;ctx.lineWidth=1.2;ctx.beginPath();ctx.moveTo(left,top+ph);ctx.lineTo(w-right,top+ph);ctx.stroke();"
-        "ctx.fillStyle=muted;ctx.textAlign='center';ctx.textBaseline='top';"
-        "for(var tick=0;tick<=24;tick++){var x=left+(tick/24)*pw;ctx.beginPath();ctx.moveTo(x,top+ph);ctx.lineTo(x,top+ph+5);ctx.strokeStyle=text;ctx.stroke();ctx.fillText(String(tick),x,top+ph+9);}"
-        "ctx.save();ctx.translate(15,top+ph/2);ctx.rotate(-Math.PI/2);ctx.textAlign='center';ctx.textBaseline='top';ctx.fillStyle=muted;ctx.fillText('Anzahl Alarmereignisse',0,0);ctx.restore();"
-        "if(maxValue===0){ctx.fillStyle=muted;ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText('Keine Recording START Ereignisse im geladenen Log',left+pw/2,top+ph/2);}"
-        "}"
-        "function analyzeLog(){"
-        "var lines=rawText?rawText.split(/\\r?\\n/):[];"
-        "var first=null,last=null,events=0,clips=0,recordSeconds=0,frames=0,clipMin=null,clipMax=0;"
-        "var modeMs=0,modeEvents=0,activeEventStart=null;"
-        "var sleepMs=0,sleepCycles=0,sleepUnknown=0,sleepMax=0;"
-        "var boots=0,brownouts=0,wdt=0,warnings=0,errors=0,safety=0,sdRecoveries=0;"
-        "var thermalWarnCpu=0,thermalWarnRtc=0,thermalEmergencyCpu=0,thermalEmergencyRtc=0,thermalEmergencyBoth=0,thermalRecoveries=0;"
-        "var thermalCpuMax=null,thermalRtcMax=null;"
-        "var recThermalEvents=0,recCpuSamples=0,recCpuWeighted=0,recCpuMax=null,recRtcSamples=0,recRtcWeighted=0,recRtcMax=null;"
-        "var buckets=new Array(24).fill(0);"
-        "for(var i=0;i<lines.length;i++){"
-        "var line=lines[i];if(!line)continue;"
-        "var ts=parseTimestamp(line);"
-        "if(ts){if(!first||ts.ms<first.ms)first=ts;if(!last||ts.ms>last.ms)last=ts;}"
-        "if(line.indexOf('Recording START |')>=0){"
-        "events++;"
-        "activeEventStart=ts?ts.ms:null;"
-        "var hm=/\\/\\d{8}\\/(\\d{2})\\d{4}\\.[A-Za-z0-9]+/.exec(line);"
-        "var hour=hm?Number(hm[1]):(ts?ts.hour:-1);"
-        "if(hour>=0&&hour<24)buckets[hour]++;"
-        "}"
-        "var stop=/Recording STOP \\|.*?duration=([0-9]+(?:\\.[0-9]+)?) s/i.exec(line);"
-        "if(stop){var sec=Number(stop[1]);if(Number.isFinite(sec)&&sec>=0){clips++;recordSeconds+=sec;if(clipMin===null||sec<clipMin)clipMin=sec;if(sec>clipMax)clipMax=sec;}var fm=/frames=(\\d+)/i.exec(line);if(fm)frames+=Number(fm[1])||0;}"
-        "var eventEnded=line.indexOf('Recording stop | finalized')>=0||line.indexOf('Recording finalization failed')>=0||line.indexOf('Recording segment finalization failed')>=0;"
-        "if(eventEnded&&activeEventStart!==null&&ts&&ts.ms>=activeEventStart){modeMs+=ts.ms-activeEventStart;modeEvents++;activeEventStart=null;}"
-        "var sm=/SLEEP \\| mode=(light|deep) \\| duration_ms=(\\d+)/i.exec(line);"
-        "if(sm){var d=Number(sm[2]);if(Number.isFinite(d)&&d>=0){sleepCycles++;sleepMs+=d;if(d>sleepMax)sleepMax=d;}}"
-        "else if(/SLEEP \\| mode=(light|deep) \\| duration_ms=unknown/i.test(line)){sleepCycles++;sleepUnknown++;}"
-        "if(line.indexOf('BOOT | reset=')>=0){boots++;if(line.indexOf('reset=BROWNOUT')>=0)brownouts++;if(/reset=(?:INT_WDT|TASK_WDT|WDT)/.test(line))wdt++;}"
-        "if(/\\bWARNING\\b/i.test(line))warnings++;"
-        "if(/\\bERROR\\b/i.test(line)||/\\bfailed\\b/i.test(line))errors++;"
-        "if(line.indexOf('Recording safety limit reached')>=0)safety++;"
-        "if(line.indexOf('SD recovery successful')>=0)sdRecoveries++;"
-        "if(line.indexOf('THERMAL |')>=0){"
-        "var ev=/THERMAL \\| ([A-Z0-9_]+)/.exec(line);var eventName=ev?ev[1]:'';"
-        "if(eventName==='WARNING_CPU')thermalWarnCpu++;else if(eventName==='WARNING_RTC')thermalWarnRtc++;"
-        "else if(eventName==='EMERGENCY_CPU')thermalEmergencyCpu++;else if(eventName==='EMERGENCY_RTC')thermalEmergencyRtc++;else if(eventName==='EMERGENCY_CPU_RTC')thermalEmergencyBoth++;"
-        "if(eventName.indexOf('RECOVERED_')===0)thermalRecoveries++;"
-        "var cpuEvent=/\\| CPU=([-+]?[0-9]+(?:\\.[0-9]+)?) C/i.exec(line);"
-        "if(cpuEvent){var cv=Number(cpuEvent[1]);if(Number.isFinite(cv)&&(thermalCpuMax===null||cv>thermalCpuMax))thermalCpuMax=cv;}"
-        "var rtcEvent=/\\| RTC=([-+]?[0-9]+(?:\\.[0-9]+)?) C/i.exec(line);"
-        "if(rtcEvent){var rv=Number(rtcEvent[1]);if(Number.isFinite(rv)&&(thermalRtcMax===null||rv>thermalRtcMax))thermalRtcMax=rv;}"
-        "if(eventName==='RECORDING_SUMMARY'){"
-        "recThermalEvents++;"
-        "var cs=/cpu_samples=(\\d+)/i.exec(line),ca=/cpu_avg=([-+]?[0-9]+(?:\\.[0-9]+)?) C/i.exec(line),cx=/cpu_max=([-+]?[0-9]+(?:\\.[0-9]+)?) C/i.exec(line);"
-        "var rs=/rtc_samples=(\\d+)/i.exec(line),ra=/rtc_avg=([-+]?[0-9]+(?:\\.[0-9]+)?) C/i.exec(line),rx=/rtc_max=([-+]?[0-9]+(?:\\.[0-9]+)?) C/i.exec(line);"
-        "var csn=cs?Number(cs[1]):0,cav=ca?Number(ca[1]):NaN,cxv=cx?Number(cx[1]):NaN;"
-        "if(csn>0&&Number.isFinite(cav)){recCpuSamples+=csn;recCpuWeighted+=cav*csn;}"
-        "if(Number.isFinite(cxv)){if(recCpuMax===null||cxv>recCpuMax)recCpuMax=cxv;if(thermalCpuMax===null||cxv>thermalCpuMax)thermalCpuMax=cxv;}"
-        "var rsn=rs?Number(rs[1]):0,rav=ra?Number(ra[1]):NaN,rxv=rx?Number(rx[1]):NaN;"
-        "if(rsn>0&&Number.isFinite(rav)){recRtcSamples+=rsn;recRtcWeighted+=rav*rsn;}"
-        "if(Number.isFinite(rxv)){if(recRtcMax===null||rxv>recRtcMax)recRtcMax=rxv;if(thermalRtcMax===null||rxv>thermalRtcMax)thermalRtcMax=rxv;}"
-        "}"
-        "}"
-        "}"
-        "var periodMs=(first&&last&&last.ms>=first.ms)?last.ms-first.ms:null;"
-        "var avgClip=clips?recordSeconds/clips:0;"
-        "var modePct=(periodMs&&periodMs>0)?(modeMs/periodMs)*100:null;"
-        "statText('statLogStart',first?first.label:'nicht verfügbar');"
-        "statText('statLogEnd',last?last.label:'nicht verfügbar');"
-        "statText('statPeriod',periodMs!==null?durationText(periodMs):'nicht verfügbar');"
-        "statText('statSleep',sleepCycles?durationText(sleepMs):'noch keine Messdaten');"
-        "var sleepNote=sleepCycles?(sleepCycles+' Zyklen · Ø '+durationText(sleepMs/Math.max(1,sleepCycles))+' · max '+durationText(sleepMax)):'SLEEP-Datensätze werden ab dieser Firmware exakt protokolliert';"
-        "if(sleepUnknown)sleepNote+=' · '+sleepUnknown+' ohne Zeitwert';"
-        "statText('statSleepNote',sleepNote);"
-        "statText('statEvents',String(events));"
-        "statText('statClips',String(clips));"
-        "statText('statModeTime',modeEvents?durationText(modeMs):'--');"
-        "statText('statModeNote',modeEvents?(modeEvents+' abgeschlossene Ereignisse'+(modePct!==null?' · '+modePct.toFixed(2)+' % des Log-Zeitraums':'')):'keine vollständig begrenzten Ereignisse');"
-        "statText('statRecordTime',secondsText(recordSeconds));"
-        "statText('statRecordNote','Summe der STOP-duration-Werte');"
-        "statText('statClipAvg',clips?secondsText(avgClip):'--');"
-        "statText('statClipNote',clips?('min '+secondsText(clipMin)+' · max '+secondsText(clipMax)):'keine abgeschlossenen Clips');"
-        "statText('statFrames',String(frames));"
-        "statText('statBoots',String(boots));"
-        "statText('statBootNote','Brownout '+brownouts+' · WDT '+wdt);"
-        "statText('statHealth',warnings+' / '+errors);"
-        "statText('statHealthNote','Warnungen / Fehlerhinweise');"
-        "statText('statSafety',String(safety));"
-        "statText('statSafetyNote','SD-Recoveries '+sdRecoveries);"
-        "var thermalWarnings=thermalWarnCpu+thermalWarnRtc;"
-        "var thermalShutdowns=thermalEmergencyCpu+thermalEmergencyRtc+thermalEmergencyBoth;"
-        "var recCpuAvg=recCpuSamples?recCpuWeighted/recCpuSamples:null;"
-        "var recRtcAvg=recRtcSamples?recRtcWeighted/recRtcSamples:null;"
-        "statText('statThermalWarnings',String(thermalWarnings));"
-        "statText('statThermalWarningsNote','CPU '+thermalWarnCpu+' · RTC '+thermalWarnRtc+' · gezählt werden Warn-Episoden');"
-        "statText('statThermalEmergency',String(thermalShutdowns));"
-        "statText('statThermalEmergencyNote','CPU '+thermalEmergencyCpu+' · RTC '+thermalEmergencyRtc+' · beide '+thermalEmergencyBoth);"
-        "statText('statThermalCpuMax',thermalCpuMax!==null?thermalCpuMax.toFixed(1)+' °C':'--');"
-        "statText('statThermalCpuMaxNote',thermalCpuMax!==null?'höchster protokollierter CPU-Wert':'keine Thermal-Temperaturdaten im Log');"
-        "statText('statThermalRtcMax',thermalRtcMax!==null?thermalRtcMax.toFixed(1)+' °C':'--');"
-        "statText('statThermalRtcMaxNote',thermalRtcMax!==null?'höchster protokollierter RTC/Gehäuse-Wert':'keine RTC-Thermaldaten im Log');"
-        "statText('statThermalCpuAvgRec',recCpuAvg!==null?recCpuAvg.toFixed(1)+' °C':'--');"
-        "statText('statThermalCpuAvgRecNote',recCpuSamples?(recCpuSamples+' Samples · max '+(recCpuMax!==null?recCpuMax.toFixed(1)+' °C':'--')):'mit neuen RECORDING_SUMMARY-Einträgen verfügbar');"
-        "statText('statThermalRtcAvgRec',recRtcAvg!==null?recRtcAvg.toFixed(1)+' °C':'--');"
-        "statText('statThermalRtcAvgRecNote',recRtcSamples?(recRtcSamples+' Samples · max '+(recRtcMax!==null?recRtcMax.toFixed(1)+' °C':'--')):'mit RTC und neuen RECORDING_SUMMARY-Einträgen verfügbar');"
-        "statText('statThermalRecoveries',String(thermalRecoveries));"
-        "statText('statThermalRecoveriesNote','Warning-Recovery und Recovery nach Cooldown');"
-        "statText('statThermalCoverage',String(recThermalEvents));"
-        "statText('statThermalCoverageNote',recThermalEvents?('Aufnahmeereignisse · CPU '+recCpuSamples+' / RTC '+recRtcSamples+' Samples'):'ältere Logs enthalten noch keine Aufnahme-Thermalsummaries');"
-        "lastHourBuckets=buckets;drawHourChart(buckets);"
-        "if(analysisStatus){"
-        "var msg=events+' Alarmereignisse · '+clips+' Clips';"
-        "if(sleepCycles)msg+=' · '+sleepCycles+' Sleep-Zyklen';else msg+=' · Sleep ab neuer Firmware messbar';"
-        "if(thermalWarnings||thermalShutdowns)msg+=' · Thermal '+thermalWarnings+' Warnungen / '+thermalShutdowns+' Abschaltungen';"
-        "analysisStatus.textContent=msg;"
-        "}"
-        "}"
-        "function render(scroll){"
-            "var q=search.value.trim().toLowerCase();"
-            "var shown=rawText;"
-            "var matchCount=0,totalCount=0;"
-            "if(rawText.length){totalCount=rawText.split(/\\r?\\n/).filter(function(x){return x.length>0;}).length;}"
-            "if(q){"
-                "var lines=rawText.split(/\\r?\\n/);"
-                "var filtered=[];"
-                "for(var i=0;i<lines.length;i++){if(lines[i].toLowerCase().indexOf(q)>=0)filtered.push(lines[i]);}"
-                "matchCount=filtered.length;"
-                "shown=filtered.join('\\n');"
-                "filterMeta.textContent='Filter: '+matchCount+' von '+totalCount+' Zeilen';"
-            "}else{filterMeta.textContent=totalCount?totalCount+' Zeilen':'';}"
-            "out.textContent=shown.length?shown:(q?'(Keine Treffer)':'(Log ist leer)');"
-            "if(scroll)scrollBottom();"
-        "}"
-        "function loadLog(scroll){"
-            "if(loading)return;"
-            "loading=true;reload.disabled=true;status.textContent='Lade Log...';"
-            "fetch('/log_raw?t='+Date.now(),{cache:'no-store'})"
-            ".then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);"
-                "var size=Number(r.headers.get('X-Log-Size')||'0');"
-                "if(Number.isFinite(size)){logOffset=size;sizeEl.textContent=byteSizeText(size);}"
-                "return r.text();})"
-            ".then(function(text){rawText=text;status.textContent='Aktualisiert';analyzeLog();render(scroll);})"
-            ".catch(function(err){out.textContent='Log konnte nicht geladen werden: '+err.message;status.textContent='Fehler';})"
-            ".then(function(){loading=false;reload.disabled=false;});"
-        "}"
-        "function pollLog(){"
-            "if(!live.checked||loading)return;"
-            "loading=true;status.textContent='Prüfe neue Einträge...';"
-            "fetch('/log_chunk?offset='+encodeURIComponent(logOffset)+'&t='+Date.now(),{cache:'no-store'})"
-            ".then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);"
-                "var reset=r.headers.get('X-Log-Reset')==='1';"
-                "var next=Number(r.headers.get('X-Log-Offset')||String(logOffset));"
-                "var size=Number(r.headers.get('X-Log-Size')||String(next));"
-                "var more=r.headers.get('X-Log-More')==='1';"
-                "return r.text().then(function(text){return {text:text,reset:reset,next:next,size:size,more:more};});})"
-            ".then(function(x){"
-                "if(x.reset)rawText='';"
-                "if(x.text.length)rawText+=x.text;"
-                "logOffset=x.next;"
-                "if(Number.isFinite(x.size))sizeEl.textContent=byteSizeText(x.size);"
-                "status.textContent=x.text.length?'Neue Einträge':'Keine neuen Einträge';"
-                "if(x.reset||x.text.length)analyzeLog();"
-                "render(x.text.length>0&&!search.value.trim());"
-                "loading=false;"
-                "if(x.more&&live.checked)setTimeout(pollLog,80);"
-            "})"
-            ".catch(function(err){loading=false;status.textContent='Live-Update Fehler: '+err.message;});"
-        "}"
-        "function scheduleLive(){"
-            "if(liveTimer){clearInterval(liveTimer);liveTimer=0;}"
-            "if(live.checked){pollLog();liveTimer=setInterval(pollLog,5000);status.textContent='Live-Update aktiv';}"
-            "else status.textContent='Live-Update aus';"
-        "}"
-        "reload.addEventListener('click',function(){loadLog(true);});"
-        "bottom.addEventListener('click',scrollBottom);"
-        "search.addEventListener('input',function(){render(false);});"
-        "live.addEventListener('change',scheduleLive);"
-        "window.addEventListener('resize',function(){drawHourChart(lastHourBuckets);});"
-        "loadLog(true);"
+            "var modal=document.getElementById('shutdownBlockedModal');"
+            "var state=document.getElementById('shutdownBlockedState');"
+            "function poll(){"
+                "fetch('/ui_status?ts='+Date.now(),{cache:'no-store'})"
+                ".then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();})"
+                ".then(function(s){"
+                    "if(!s.recorder_open){"
+                        "if(state)state.textContent='" +
+                        String(de ? "Aufnahme beendet - Herunterfahren wieder verfügbar." : "Recording finished - shutdown available again.") +
+                        "';setTimeout(function(){if(modal)modal.hidden=true;},450);return;"
+                    "}setTimeout(poll,1000);"
+                "}).catch(function(){setTimeout(poll,1500);});"
+            "}setTimeout(poll,800);"
         "})();"
         "</script>";
+}
 
-    html += htmlFooter();
+
+static void sendShutdownPage(
+    int statusCode
+)
+{
+    bool de =
+        cfg_web_language == "de";
+
+    String html =
+        htmlHeader();
+
+    html +=
+        "<div class='page-title'><div><h2>" +
+        String(de ? "Herunterfahren" : "Shutdown") +
+        "</h2><p>" +
+        String(de ? "SensorForge in den Aus-Zustand versetzen" : "Put SensorForge into its off state") +
+        "</p></div></div>"
+        "<div class='settings-section'><h3>" +
+        String(de ? "System herunterfahren" : "Shut down system") +
+        "</h3><p class='muted'>" +
+        String(
+            de
+            ? "SensorForge beendet die Web-Sitzung, deaktiviert alle Wakequellen und geht in Deep Sleep. Radar, Magnetkontakt und der Snapshot-Timer können das Board danach nicht mehr aufwecken."
+            : "SensorForge ends the web session, disables all wake sources and enters deep sleep. Radar, magnet switch and the snapshot timer cannot wake the board afterwards."
+        ) +
+        "</p><p class='muted'><b>" +
+        String(de ? "Wieder einschalten:" : "Power on again:") +
+        "</b> " +
+        String(
+            de
+            ? "Stromversorgung trennen und wieder anlegen oder den Hardware-RESET betätigen."
+            : "Remove and reapply power, or press the hardware RESET button."
+        ) +
+        "</p><p class='muted'>" +
+        String(
+            de
+            ? "Hinweis: Das ist der tiefste Software-Aus-Zustand des ESP32-S3. Direkt versorgte Peripherie kann weiterhin einen kleinen Strom aufnehmen."
+            : "Note: this is the deepest software-off state of the ESP32-S3. Directly powered peripherals may still consume a small amount of current."
+        ) +
+        "</p>"
+        "<form method='POST' action='/shutdown_do' onsubmit=\"return confirm('" +
+        String(
+            de
+            ? "SensorForge wirklich herunterfahren? Danach ist das Webinterface nicht mehr erreichbar, bis die Stromversorgung neu angelegt oder RESET gedrückt wurde."
+            : "Really shut down SensorForge? The web interface will remain unavailable until power is reapplied or RESET is pressed."
+        ) +
+        "');\">"
+        "<button class='danger' type='submit'>" +
+        String(de ? "Jetzt herunterfahren" : "Shut down now") +
+        "</button><a class='button' href='/'>" +
+        String(de ? "Abbrechen" : "Cancel") +
+        "</a></form></div>";
+
+    if (recorderIsOpen())
+        html += shutdownRecordingBlockedModalHtml();
+
+    html +=
+        htmlFooter();
+
+    server.sendHeader(
+        "Cache-Control",
+        "no-store"
+    );
+
+    server.send(
+        statusCode,
+        "text/html; charset=utf-8",
+        html
+    );
+}
+
+
+static void handleShutdown()
+{
+    sendShutdownPage(
+        200
+    );
+}
+
+
+static void handleShuttingDown()
+{
+    bool de =
+        cfg_web_language == "de";
+
+    String html =
+        htmlHeader();
+
+    html +=
+        "<div class='operation-card'>"
+        "<span class='status-pill danger'>SHUTDOWN</span>"
+        "<h2 style='margin-top:16px'>" +
+        String(de ? "SensorForge wird heruntergefahren" : "SensorForge is shutting down") +
+        "</h2><p class='muted'>" +
+        String(
+            de
+            ? "Die Verbindung wird gleich beendet. Danach bleibt das Board ausgeschaltet, bis die Stromversorgung neu angelegt oder RESET gedrückt wird."
+            : "The connection will close shortly. The board then remains off until power is reapplied or RESET is pressed."
+        ) +
+        "</p><div class='countdown'>OFF</div></div>";
+
+    html +=
+        htmlFooter();
 
     server.sendHeader(
         "Cache-Control",
@@ -11857,6 +13753,83 @@ static void handleLog()
         "text/html; charset=utf-8",
         html
     );
+}
+
+
+static void handleShutdownDo()
+{
+    // Keep a server-side guard in case a recording starts between opening the
+    // page and pressing the shutdown button.
+    if (recorderIsOpen()) {
+        sendShutdownPage(
+            409
+        );
+        return;
+    }
+
+    // Prevent a new recording from starting during the short HTTP grace period
+    // before the actual power-down sequence.
+    g_recordingStartBlocked = true;
+
+    shutdownScheduled = true;
+    shutdownAtMs =
+        millis() + 2000UL;
+
+    server.sendHeader(
+        "Location",
+        "/shutting_down"
+    );
+
+    server.send(
+        303,
+        "text/plain; charset=utf-8",
+        ""
+    );
+}
+
+
+static void performManualShutdown()
+{
+    shutdownScheduled = false;
+    rebootScheduled = false;
+    g_recordingStartBlocked = true;
+
+    if (recorderIsOpen())
+        stopRecording();
+
+    consoleWrite(
+        "POWER",
+        "Manual shutdown | no wake sources"
+    );
+    logWrite(
+        "Manual shutdown | deep sleep without wake sources"
+    );
+    logFlush();
+
+    // webConfigStop() also restores a temporary LD2410S all-gate calibration
+    // range before the UART/WebConfig session disappears.
+    webConfigStop();
+
+    stopCameraPreview();
+    esp_camera_deinit();
+
+    WiFi.softAPdisconnect(true);
+    WiFi.disconnect(
+        true,
+        false
+    );
+    WiFi.mode(WIFI_OFF);
+
+    delay(100);
+
+    // Deliberately remove every normal wake source. Unlike ordinary light/deep
+    // sleep, no presence, magnet or timer wake is armed for manual shutdown.
+    esp_sleep_disable_wakeup_source(
+        ESP_SLEEP_WAKEUP_ALL
+    );
+
+    Serial.flush();
+    esp_deep_sleep_start();
 }
 
 
@@ -11873,6 +13846,7 @@ struct RecordingEntry {
     String fullPath;
     uint64_t size;
     bool isMkv;
+    bool isJpeg;
     bool hasSrt;
 };
 
@@ -12124,8 +14098,12 @@ static void handleFilesDay()
                 bool isMkv =
                     lowerName.endsWith(".mkv");
 
+                bool isJpeg =
+                    lowerName.endsWith(".jpg") ||
+                    lowerName.endsWith(".jpeg");
 
-                if (isAvi || isMkv) {
+
+                if (isAvi || isMkv || isJpeg) {
 
                     RecordingEntry entry;
 
@@ -12142,6 +14120,9 @@ static void handleFilesDay()
 
                     entry.isMkv =
                         isMkv;
+
+                    entry.isJpeg =
+                        isJpeg;
 
                     entry.hasSrt =
                         false;
@@ -12196,7 +14177,7 @@ static void handleFilesDay()
             entry.size = logicalSize;
         }
 
-        if (!entry.isMkv) {
+        if (!entry.isMkv && !entry.isJpeg) {
             entry.hasSrt =
                 hasMatchingSrt(
                     entry.name,
@@ -12236,12 +14217,24 @@ static void handleFilesDay()
 
         server.sendContent(
             "<div class='recording'>"
-            "Keine Aufnahmen an diesem Tag."
+            "Keine Aufnahmen oder Snapshots an diesem Tag."
             "</div>"
         );
 
         return;
     }
+
+
+    server.sendContent(
+        "<div class='dayMediaFilter'>"
+        "<button type='button' class='active' "
+        "onclick=\"filterDayMedia(this,'all')\">Show all</button>"
+        "<button type='button' "
+        "onclick=\"filterDayMedia(this,'videos')\">Show videos</button>"
+        "<button type='button' "
+        "onclick=\"filterDayMedia(this,'images')\">Show images/snapshots</button>"
+        "</div>"
+    );
 
 
     for (
@@ -12254,7 +14247,9 @@ static void handleFilesDay()
 
 
         row +=
-            "<div class='recording'>";
+            entry.isJpeg
+            ? "<div class='recording' data-media='image'>"
+            : "<div class='recording' data-media='video'>";
 
 
         row +=
@@ -12275,9 +14270,13 @@ static void handleFilesDay()
             "<span class='recmeta'>";
 
         row +=
-            entry.isMkv
-            ? "MKV"
-            : "AVI";
+            entry.isJpeg
+            ? "JPG"
+            : (
+                entry.isMkv
+                ? "MKV"
+                : "AVI"
+            );
 
         row +=
             " &nbsp; ";
@@ -12291,9 +14290,12 @@ static void handleFilesDay()
             "</span>";
 
 
-        // AVI and MKV use the same WebPlayer UI.
+        // Images and videos share the same viewer page so Previous/Next can
+        // navigate consistently according to the active day filter. The
+        // client-side openDayMedia() helper appends mode=all|videos|images
+        // immediately before navigation.
         row +=
-            "<a href='/play?path=";
+            "<a class='mediaOpen' onclick='return openDayMedia(this)' href='/play?path=";
 
         row +=
             urlEncode(
@@ -12301,7 +14303,15 @@ static void handleFilesDay()
             );
 
         row +=
-            "'><button>Play</button></a>";
+            "&mode=all'><button>";
+
+        row +=
+            entry.isJpeg
+            ? "Show"
+            : "Play";
+
+        row +=
+            "</button></a>";
 
 
         row +=
@@ -12318,6 +14328,7 @@ static void handleFilesDay()
 
         if (
             !entry.isMkv &&
+            !entry.isJpeg &&
             entry.hasSrt
         ) {
 
@@ -12387,7 +14398,9 @@ static bool isRecordingFileForDayDownload(
     return
         lower.endsWith(".avi") ||
         lower.endsWith(".mkv") ||
-        lower.endsWith(".srt");
+        lower.endsWith(".srt") ||
+        lower.endsWith(".jpg") ||
+        lower.endsWith(".jpeg");
 }
 
 
@@ -13227,9 +15240,13 @@ static bool isRecordingFileForDayDelete(
         lower.endsWith(".avi") ||
         lower.endsWith(".mkv") ||
         lower.endsWith(".srt") ||
+        lower.endsWith(".jpg") ||
+        lower.endsWith(".jpeg") ||
         lower.endsWith(".avi.part") ||
         lower.endsWith(".mkv.part") ||
-        lower.endsWith(".srt.part");
+        lower.endsWith(".srt.part") ||
+        lower.endsWith(".jpg.part") ||
+        lower.endsWith(".jpeg.part");
 }
 
 
@@ -13797,6 +15814,19 @@ static void handleFiles()
         ".deleteDayBtn{"
             "background:#b00020;color:white;border:1px solid #b00020;"
         "}"
+        ".dayMediaFilter{"
+            "display:flex;gap:6px;align-items:center;flex-wrap:wrap;"
+            "margin:2px 0 10px 0;padding-bottom:8px;"
+            "border-bottom:1px solid #d6d6d6;"
+        "}"
+        ".dayMediaFilter button{"
+            "width:auto;margin:0;padding:5px 9px;"
+            "border:1px solid #98a2b3;background:#f8fafc;color:#344054;"
+            "border-radius:4px;font-size:12px;cursor:pointer;"
+        "}"
+        ".dayMediaFilter button.active{"
+            "background:#344054;color:#fff;border-color:#344054;"
+        "}"
         ".daycontent{background:rgba(255,255,255,0.55);}"
         "@media(max-width:700px){"
             ".day summary{"
@@ -13881,7 +15911,7 @@ static void handleFiles()
             "if(/^\\d{8}$/.test(day)){"
                 "label=day.substring(6,8)+'.'+day.substring(4,6)+'.'+day.substring(0,4);"
             "}"
-            "if(!confirm('Alle Videos vom '+label+' wirklich löschen?\\n\\nDiese Aktion kann nicht rückgängig gemacht werden.'))return;"
+            "if(!confirm('Alle Videos und Bilder vom '+label+' wirklich löschen?\\n\\nDiese Aktion kann nicht rückgängig gemacht werden.'))return;"
             "ev.target.disabled=true;"
             "ev.target.textContent='Lösche...';"
             "fetch('/delete_day',{"
@@ -13912,12 +15942,39 @@ static void handleFiles()
             "});"
         "}"
 
+        "function filterDayMedia(button,mode){"
+            "const d=button.closest('details.day');"
+            "if(!d)return;"
+            "const content=d.querySelector('.daycontent');"
+            "if(!content)return;"
+            "if(mode!=='videos'&&mode!=='images')mode='all';"
+            "content.dataset.mediaMode=mode;"
+            "content.querySelectorAll('.recording[data-media]').forEach(function(row){"
+                "row.hidden=(mode==='videos'&&row.dataset.media!=='video')||(mode==='images'&&row.dataset.media!=='image');"
+            "});"
+            "content.querySelectorAll('.dayMediaFilter button').forEach(function(b){b.classList.remove('active');});"
+            "button.classList.add('active');"
+        "}"
+
+        "function openDayMedia(link){"
+            "if(!link)return false;"
+            "const content=link.closest('.daycontent');"
+            "let mode=content&&content.dataset.mediaMode?content.dataset.mediaMode:'all';"
+            "if(mode!=='videos'&&mode!=='images')mode='all';"
+            "try{"
+                "const u=new URL(link.getAttribute('href'),location.origin);"
+                "u.searchParams.set('mode',mode);"
+                "location.href=u.pathname+u.search;"
+            "}catch(e){location.href=link.href;}"
+            "return false;"
+        "}"
+
         "function updateDayCount(d){"
             "const c=d.querySelector('.daycontent');"
-            "const n=c.querySelectorAll('.recording').length;"
+            "const n=c.querySelectorAll('.recording[data-media]').length;"
             "const count=d.querySelector('.count');"
             "if(count){"
-                "count.textContent=n===1?' (1 Video)':' ('+n+' Videos)';"
+                "count.textContent=n===1?' (1 Datei)':' ('+n+' Dateien)';"
             "}"
         "}"
 
@@ -13928,6 +15985,7 @@ static void handleFiles()
             "if(!cached)return false;"
             "const c=d.querySelector('.daycontent');"
             "c.innerHTML=cached;"
+            "c.dataset.mediaMode='all';"
             "d.dataset.loaded='1';"
             "updateDayCount(d);"
             "return true;"
@@ -13952,6 +16010,7 @@ static void handleFiles()
             "})"
             ".then(function(t){"
                 "c.innerHTML=t;"
+                "c.dataset.mediaMode='all';"
                 "try{sessionStorage.setItem(CACHE_PREFIX+d.dataset.day,t);}catch(e){}"
                 "updateDayCount(d);"
             "})"
@@ -14049,14 +16108,16 @@ static void handleFile()
     bool allowedFile =
         lowerPath.endsWith(".avi") ||
         lowerPath.endsWith(".mkv") ||
-        lowerPath.endsWith(".srt");
+        lowerPath.endsWith(".srt") ||
+        lowerPath.endsWith(".jpg") ||
+        lowerPath.endsWith(".jpeg");
 
     if (!allowedFile) {
 
         server.send(
             403,
             "text/plain; charset=utf-8",
-            "Only AVI, MKV and SRT files are allowed"
+            "Only AVI, MKV, SRT and JPEG files are allowed"
         );
 
         return;
@@ -14106,9 +16167,18 @@ static void handleFile()
     // Download Header
     // ---------------------------------------------------------
 
+    bool inlineDisplay =
+        (
+            lowerPath.endsWith(".jpg") ||
+            lowerPath.endsWith(".jpeg")
+        ) &&
+        server.hasArg("inline") &&
+        server.arg("inline") == "1";
+
     server.sendHeader(
         "Content-Disposition",
-        "attachment; filename=\"" +
+        String(inlineDisplay ? "inline" : "attachment") +
+        "; filename=\"" +
         downloadName +
         "\""
     );
@@ -14134,7 +16204,12 @@ static void handleFile()
         : (
             lowerPath.endsWith(".srt")
             ? "application/x-subrip"
-            : "video/x-msvideo"
+            : (
+                lowerPath.endsWith(".jpg") ||
+                lowerPath.endsWith(".jpeg")
+                ? "image/jpeg"
+                : "video/x-msvideo"
+            )
         );
 
     uint64_t logicalSize =
@@ -14691,6 +16766,33 @@ static void handleSysInfo()
 
     html +=
         "<section class='settings-section'>"
+        "<h3>" +
+        htmlText(UI_MOTION_SENSOR_TYPE) +
+        "</h3><p><span class='status-pill ok'>" +
+        htmlText(motionSensorTypeUiId()) +
+        "</span></p>" +
+        htmlText(UI_PRESENCE_INPUT) +
+        ": GPIO" +
+        String((int)PIR_PIN);
+
+    if (radarConfigAvailable()) {
+        html +=
+            "<br>UART: RX=GPIO" +
+            String((int)RADAR_RX_PIN) +
+            " / TX=GPIO" +
+            String((int)RADAR_TX_PIN);
+    } else {
+        html +=
+            "<p class='muted'>" +
+            htmlText(UI_RADAR_CONFIG_PIR_NOTE) +
+            "</p>";
+    }
+
+    html +=
+        "</section>";
+
+    html +=
+        "<section class='settings-section'>"
         "<h3>Echtzeituhr (RTC)</h3>";
 
     if (rtcDetected()) {
@@ -15026,6 +17128,7 @@ void webConfigStart()
         });
 
         server.on("/ui_status", HTTP_GET, handleUiStatus);
+        server.on("/motion_status", HTTP_GET, handleMotionStatus);
         server.on("/language", HTTP_POST, handleLanguageChange);
         server.on("/recording_pause", HTTP_POST, handleRecordingPause);
         server.on("/recording_pause_keepalive", HTTP_POST, handleRecordingPauseKeepalive);
@@ -15052,12 +17155,24 @@ void webConfigStart()
 
     server.on("/radar_config", HTTP_GET, handleRadarConfig);
     server.on("/radar_live", HTTP_GET, handleRadarLive);
+    server.on("/radar_diag_download", HTTP_GET, handleRadarDiagnosticDownload);
     server.on("/radar_calibration_status", HTTP_GET, handleRadarCalibrationStatus);
     server.on("/radar_calibration_action", HTTP_POST, handleRadarCalibrationAction);
     server.on("/radar_config_save", HTTP_POST, handleRadarConfigSave);
     server.on("/radar_config_defaults", HTTP_POST, handleRadarConfigDefaults);
 
+    server.on("/image_motion", HTTP_GET, handleImageMotionPage);
+    server.on("/image_motion_save", HTTP_POST, handleImageMotionSave);
+    server.on("/image_motion_test", HTTP_POST, handleImageMotionTest);
+    server.on("/image_motion_reset", HTTP_POST, handleImageMotionResetBackground);
+    server.on("/image_motion_status", HTTP_GET, handleImageMotionStatus);
+    server.on("/image_motion_diag_download", HTTP_GET, handleImageMotionDiagnosticDownload);
+
     server.on("/sdstatus", HTTP_GET, handleSDStatus);
+#if defined(STORAGE_SPI)
+    server.on("/sd_recovery", HTTP_GET, handleSDRecovery);
+    server.on("/sd_recovery_run", HTTP_POST, handleSDRecoveryRun);
+#endif
     server.on("/sd_maintenance", HTTP_GET, handleSDMaintenance);
     server.on("/sdformat", HTTP_GET, handleSDFormat);
     server.on("/sdformat_do", HTTP_POST, handleSDFormatDo);
@@ -15089,11 +17204,18 @@ void webConfigStart()
     server.on("/reboot", HTTP_GET, handleReboot);
     server.on("/rebooting", HTTP_GET, handleRebooting);
     server.on("/reboot_do", HTTP_POST, handleRebootDo);
+    server.on("/shutdown", HTTP_GET, handleShutdown);
+    server.on("/shutting_down", HTTP_GET, handleShuttingDown);
+    server.on("/shutdown_do", HTTP_POST, handleShutdownDo);
 
-    server.on("/log", HTTP_GET, handleLog);
-    server.on("/log_raw", HTTP_GET, handleLogRaw);
-    server.on("/log_chunk", HTTP_GET, handleLogChunk);
-    server.on("/log_clear", HTTP_POST, handleLogClear);
+    WebLogUiHooks logUiHooks = {
+        htmlHeader,
+        htmlFooter
+    };
+    webLogRegisterRoutes(
+        server,
+        logUiHooks
+    );
     server.on("/files", HTTP_GET, handleFiles);
     server.on("/files_day", HTTP_GET, handleFilesDay);
     server.on("/download_day", HTTP_GET, handleDownloadDay);
@@ -15141,6 +17263,38 @@ void webConfigStop()
     if (!webActive)
         return;
 
+    // Never leave the LD2410S in the temporary all-gate calibration range when
+    // WebConfig/WiFi is closed. This is especially important for an inactivity
+    // timeout after the operator has left a calibration page open.
+    if (
+        radarCalibrationActiveMode() !=
+            RADAR_CALIBRATION_NONE
+    ) {
+        String calibrationError;
+
+        if (!radarCalibrationStop(
+                calibrationError
+            )) {
+            Serial.println(
+                "LD2410S calibration cleanup before WebConfig stop failed | " +
+                calibrationError
+            );
+
+            logWrite(
+                "Radar calibration cleanup before WebConfig stop failed | " +
+                calibrationError
+            );
+        } else {
+            Serial.println(
+                "LD2410S calibration stopped before WebConfig shutdown"
+            );
+
+            logWrite(
+                "Radar calibration stopped before WebConfig shutdown"
+            );
+        }
+    }
+
     // A temporary maintenance pause is never allowed to survive the WebConfig
     // session that created it.
     if (recordingAutomationPaused) {
@@ -15173,7 +17327,9 @@ bool webConfigInactiveFor(
     if (
         !webActive ||
         timeoutSec == 0 ||
-        sdSecureJobActive
+        sdSecureJobActive ||
+        radarWebMaintenanceDepth > 0 ||
+        radarWebMaintenanceGraceActive()
     ) {
         return false;
     }
@@ -15183,6 +17339,19 @@ bool webConfigInactiveFor(
             millis() -
             webLastActivityMs
         );
+
+    // During an intentional radar calibration the operator may move away from
+    // the browser for several minutes. Keep WebConfig available for a bounded
+    // maintenance window even if browser timers are throttled. A truly
+    // abandoned calibration still falls back to the normal WiFi timeout after
+    // ten minutes without any authenticated web activity.
+    if (
+        radarCalibrationActiveMode() !=
+            RADAR_CALIBRATION_NONE &&
+        elapsedMs < RADAR_CALIBRATION_MAX_IDLE_HOLD_MS
+    ) {
+        return false;
+    }
 
     uint64_t timeoutMs =
         (uint64_t)timeoutSec *
@@ -15200,6 +17369,17 @@ bool webConfigInactiveFor(
 
 void webConfigLoop()
 {
+    if (
+        shutdownScheduled &&
+        (int32_t)(
+            millis() -
+            shutdownAtMs
+        ) >= 0
+    ) {
+        performManualShutdown();
+        return;
+    }
+
     if (
         rebootScheduled &&
         (int32_t)(

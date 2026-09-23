@@ -1,7 +1,8 @@
 SENSORFORGE / ESP32-S3 CAMERA (XIAO + FREENOVE)
 PROJEKTBESCHREIBUNG, RELEASESTAND UND WIEDEREINSTIEGSPROMPT
-Stand: 2026-09-22
-Dokumentrevision: Sitzung bis v22 / WebLog-Modularisierung
+Stand: 2026-09-23
+Dokumentrevision: v35 / Release-Tracking + WebPlayer/WebConfig/Shooter/Logger-Fixes v23-v35
+Aktueller Entwicklungs-Release: v35
 Produktname: SensorForge
 Plattformname: Fabric Node
 Core-Version im Branding: 7.1.0
@@ -14,14 +15,32 @@ Dieses Dokument ist eine technische Zusammenfassung des aktuellen
 SensorForge-Entwicklungsstands und soll gleichzeitig als Wiedereinstiegsprompt
 fuer einen neuen Chat verwendet werden koennen.
 
-Wichtig:
+Wichtig / VERBINDLICHE ENTWICKLUNGSREGELN:
 
-- Der jeweils aktuell hochgeladene Quellcode ist immer autoritativ.
-- Dieses Dokument beschreibt den derzeit bekannten Stand, ersetzt aber keine
-  Codepruefung bei spaeteren Aenderungen.
-- Bereits geloeste Themen sollen nicht ohne konkreten Grund neu designt werden.
+- Der jeweils aktuell hochgeladene bzw. im gemeinsamen Arbeitsstand tatsaechlich
+  gesehene Quellcode ist IMMER autoritativ.
+- NIEMALS Code, Funktionsnamen, Datenfluesse, Config-Verhalten oder Abhaengigkeiten
+  aus Erinnerung, alten Beschreibungen oder Vermutungen ableiten, wenn eine
+  Aenderung daran vorgenommen werden soll.
+- JEDE Codeaenderung muss auf dem tatsaechlich vorhandenen und zuvor eingesehenen
+  aktuellen Code der betroffenen Datei(en) basieren. Vor einer Aenderung die
+  relevanten Stellen und ihre Aufrufer/Abhaengigkeiten lesen und gegenpruefen.
+- Wenn der aktuelle Stand einer benoetigten Datei nicht sicher vorliegt, NICHT
+  raten und NICHT auf einer vermeintlich passenden Altversion weiterarbeiten.
+  In diesem Fall den aktuellen Quellstand erneut verwenden/hochladen lassen.
+- Dieses Dokument ist Orientierung, Historie und Wiedereinstiegsprompt. Es ersetzt
+  NIEMALS die Codepruefung. Bei einem Widerspruch gilt der aktuelle Quellcode.
+- SensorForge ist inzwischen ein umfangreiches, eng verzahntes Programm. Kleine
+  Aenderungen koennen Recording, Power, Storage, Encryption, Recovery, WebPlayer,
+  API oder Sleep indirekt beeinflussen. Deshalb Aenderungen minimal-invasiv und
+  mit groesster Vorsicht ausfuehren. BETTER SAFE THAN SORRY.
+- Bereits funktionierende oder auf Hardware bewaehrte Bereiche ohne konkreten,
+  reproduzierbaren Anlass NICHT neu designen.
 - Bei groesseren Aenderungen immer auf dem letzten funktionierenden Stand
-  aufbauen.
+  aufbauen und bestehende Sicherheits-/Recovery-Pfade erhalten.
+- Keine Build-, Hardware- oder Feldtest-Erfolge behaupten, die nicht wirklich
+  ausgefuehrt wurden. Struktur-/Diff-/Syntaxchecks klar von einem echten
+  Arduino-Build oder Hardwaretest unterscheiden.
 - Der Benutzer bevorzugt komplette austauschbare Dateien und keine schwer
   anzuwendenden Patch-Schnipsel.
 - WICHTIGE PAKETREGEL: Bei Codeaenderungen duerfen ZIP-/Dateipakete nur die
@@ -29,10 +48,17 @@ Wichtig:
   Unveraenderte Dateien nicht erneut mitsenden und kein komplettes Projektarchiv
   erzeugen, ausser der Benutzer fordert das ausdruecklich an. Projektdateien
   immer unter ihrem originalen Dateinamen liefern.
+- Deltapakete sind KEINE vollstaendigen Projekt-Snapshots. Fuer eine neue
+  Aenderung immer die aktuellste Version jeder konkret betroffenen Datei als
+  Basis verwenden. Nach jeder freigegebenen Release-Version soll dagegen der
+  komplette zusammengefuehrte Projektstand ins Git-Repository committed und mit
+  demselben Release-Tag (v35, v36, ...) markiert werden.
 
 Der aktuelle Quellstand besteht im Kern aus:
 
 - sensorforge.ino
+- sensorforge_version.h fuer die zentrale Entwicklungs-/Release-ID
+- CHANGELOG.md fuer die Releasehistorie und Git-Tag-Zuordnung
 - config.cpp / config.h
 - image_motion.cpp / image_motion.h
 - motion_diagnostics.cpp / motion_diagnostics.h
@@ -144,6 +170,316 @@ Die konkrete Funktionseinschraenkung fuer UNLICENSED ist bewusst noch nicht
 definiert und bleibt ein eigener naechster Entwicklungsschritt.
 
 
+
+======================================================================
+AKTUELLER RELEASESTAND 2026-09-23 - v23 BIS v35
+======================================================================
+
+AKTUELLER ENTWICKLUNGS-RELEASE: v35
+
+WICHTIG: Die Versionsnummer v35 ist die menschliche Projekt-/Release-ID fuer den
+zusammengefuehrten SensorForge-Quellstand. Sie ist bewusst getrennt von:
+
+- Core-Version 7.1.0 in branding.h
+- Compile-Zeitpunkt __DATE__/__TIME__ eines konkreten Binaries
+- Sync-/Integration-API-Versionen
+
+Ab v35 existieren:
+
+- sensorforge_version.h als zentrale Release-Identitaet
+- CHANGELOG.md als fortlaufende Release-Historie
+- SENSORFORGE_RELEASE_NUMBER
+- SENSORFORGE_RELEASE_TAG, z.B. "v35"
+- SENSORFORGE_RELEASE_DATE
+- SENSORFORGE_RELEASE_SUMMARY
+
+Die Release-ID wird im Firmware-Bootlog mitgeschrieben und in WebConfig angezeigt.
+Ein laufendes Geraet kann dadurch einem Git-Stand zugeordnet werden.
+
+VERBINDLICHER RELEASE-/GIT-WORKFLOW AB v35:
+
+1. Jede freigegebene neue Entwicklungsstufe bekommt genau eine fortlaufende
+   Release-ID v36, v37, ... .
+2. sensorforge_version.h und CHANGELOG.md werden mit jeder Release aktualisiert.
+3. Die vom Assistenten gelieferten ZIPs enthalten weiterhin NUR geaenderte/neue
+   Dateien; das ist fuer sichere, kleine Deltas beabsichtigt.
+4. Vor dem Git-Commit werden diese Deltas in den vollstaendigen lokalen
+   Projektbaum des Benutzers eingespielt.
+5. Danach den KOMPLETTEN Projektstand committen.
+6. Git-Tag exakt gleich der Firmware-Release-ID setzen, z.B. v35.
+7. Release-ID im Geraet, CHANGELOG und Git-Tag muessen denselben logischen Stand
+   bezeichnen.
+8. Ein Deltapaket wie v35.zip darf niemals als vollstaendiges Projektarchiv
+   missverstanden werden.
+
+Effektiver letzter im Chat erzeugter Dateistand fuer die seit v23 beruehrten
+Hauptdateien (nur als Rekonstruktionshilfe, nicht als Ersatz fuer Codepruefung):
+
+- sensorforge.ino: letzter geaenderter Stand v26
+- webconfig.cpp: aktueller Stand v35; enthaelt die aufeinander aufgebauten
+  WebConfig/WebViewer-Deltas v23, v24, v25, v27-v32 und Releaseanzeige v35
+- webplayer.cpp: letzter geaenderter Stand v25
+- storage_guard.cpp/.h: letzter geaenderter Stand v24
+- logger.cpp: aktueller Stand v35, funktional auf v34/v33 aufbauend
+- log_storage.cpp: letzter geaenderter Stand v33
+- sensorforge_version.h: neu v35
+- CHANGELOG.md: neu v35
+
+Diese Liste darf spaeter NICHT blind verwendet werden. Sobald ein neuerer
+Upload/Git-Stand existiert, ist dieser autoritativ.
+
+Empfohlenes Git-Schema:
+
+  git add .
+  git commit -m "SensorForge v35"
+  git tag -a v35 -m "SensorForge v35"
+  git push origin main
+  git push origin v35
+
+WICHTIG FUER SPAETERE CODEAENDERUNGEN:
+
+- Release-Nummer allein beweist NICHT, dass eine beliebige einzelne Datei im Chat
+  aktuell vorliegt. Da Deltapakete nur geaenderte Dateien enthalten, fuer jede
+  Aenderung die tatsaechliche neueste Version der BETROFFENEN Datei ansehen.
+- Nie eine Datei aus einem alten Paket nur deshalb als Basis verwenden, weil die
+  Paketnummer hoch oder aehnlich klingt.
+- Wenn die aktuelle Datei nicht sicher vorliegt: aktuellen Code hochladen/holen,
+  dann erst aendern. NIEMALS raten.
+- Abhaengigkeiten und Aufrufer ebenfalls pruefen, wenn die Aenderung deren
+  Verhalten beruehren kann.
+
+---------------------------------------------------------------------
+v23 - RECORDING-LISTE / ZEITBEREICH / DAY-ZIP-BASIS
+---------------------------------------------------------------------
+
+- Recording-Liste verwendet Medien-Icons fuer Bild/Video statt AVI/MKV/JPG-Text.
+- Dateigroesse bleibt sichtbar.
+- Fuer Videos wird die reale Containerdauer ueber WebPlayer-Metadaten ermittelt.
+- Normale Recording-Dateien koennen als Start-bis-Ende-Zeit dargestellt werden.
+- Day-ZIP-Preflight verwendet logische RecordingStorage-Groesse und kann
+  verschluesselte Dateien ueber den transparenten Reader pruefen.
+
+---------------------------------------------------------------------
+v24 - AUSWAHL / DELETE / ANNOTATION / CORRUPT-WARNUNG / PLAYER-PERFORMANCE
+---------------------------------------------------------------------
+
+- Checkbox pro Recording, Select/Deselect und Delete selected.
+- Video-Annotationen als Sidecar <video>.note.
+- Annotation wird ueber RecordingStorage gespeichert; bei aktivierter
+  Recording-Verschluesselung damit transparent im bestehenden Storage-Pfad.
+- Annotation wird im Player angezeigt, mit dem Medium geloescht und in
+  Tages-ZIP aufgenommen.
+- AVI/MKV mit unlesbaren/nicht entschluesselbaren Metadaten erhalten eine
+  sichtbare Warn-/Corrupt-Markierung in der Recording-Liste.
+- WebPlayer-Batch und Transferpuffer wurden vergroessert (u.a. 10er Batch,
+  groessere Transferpuffer) fuer fluessigeren Browser-Transfer.
+
+---------------------------------------------------------------------
+v25 - ANNOTATION IN LISTE / DELETE-QUEUE
+---------------------------------------------------------------------
+
+- Annotationen werden kompakt bereits in der Recording-Liste dargestellt.
+- Aenderungen an Annotationen invalidieren den Tagescache.
+- Delete-Queue deutlich vergroessert und nach Ende einer Aufnahme in Batches
+  schneller abgearbeitet.
+
+---------------------------------------------------------------------
+v26 - WEBCONFIG-AUTOPAUSE FUER RECORDING UND POWER SHOOTER
+---------------------------------------------------------------------
+
+- WebConfig-Pause/Lease wurde robuster gemacht und kann sich bei realer UI-
+  Aktivitaet wieder herstellen.
+- Aktive automatische WebConfig-Pause stoppt eine laufende normale Aufnahme und
+  blockiert NEUE Motion-/Alarm-Aufnahmestarts.
+- Seit v26 blockiert dieselbe Pause auch NEUE Power-Shooter-Captures.
+- Bereits gepufferte Shooterbilder werden NICHT verworfen; ein Flush darf sie
+  weiterhin sicher persistieren.
+- /activity, Pause-Keepalive sowie kritische Firmware-Upload-/Installpfade
+  beruecksichtigen die Auto-Pause.
+- Manual Resume innerhalb derselben aktiven UI-Session wird respektiert; nach
+  ausreichend langer Inaktivitaet kann eine neue UI-Session wieder automatisch
+  pausieren.
+- Diese v26-Regel UEBERSCHREIBT die historische v18-Aussage, wonach eine offene
+  WebConfig den Dauershooter grundsaetzlich nicht pausierte.
+
+---------------------------------------------------------------------
+v27 - PROGRESSIVE RECORDING-LISTE / RANGE-SELECTION
+---------------------------------------------------------------------
+
+- Tagesverzeichnis wird einmal eingelesen und sortiert.
+- Danach werden Metadaten/Zeilen progressiv zum Browser gestreamt statt erst nach
+  kompletter Metadatenanalyse die ganze Seite auszuliefern.
+- Ladezaehler zeigt geladen/gesamt.
+- Shift-Klick und Bereichsauswahl fuer sichtbare Zeilen.
+- Filterwechsel setzt den Range-Anker zurueck.
+- WICHTIG: Vor der ersten progressiven Zeile bleibt die initiale
+  Verzeichniseinlesung/Sortierung notwendig.
+
+---------------------------------------------------------------------
+v28 - ROBUSTER TAGES-ZIP / EIN DOWNLOAD GLEICHZEITIG
+---------------------------------------------------------------------
+
+- Eine einzelne unlesbare/corrupte Recording-Datei bricht den gesamten
+  Tagesdownload nicht mehr automatisch ab.
+- Verschluesselte Dateien werden vor dem ZIP vollstaendig durch den transparenten
+  Reader validiert, damit auch spaete Chunk-/Auth-Fehler vor HTTP-Streaming
+  erkannt werden koennen.
+- AVI/MKV werden zusaetzlich ueber die WebPlayer-Metadatenprobe geprueft.
+- Nicht lesbare Dateien werden uebersprungen und im ZIP in
+  _SENSORFORGE_SKIPPED_CORRUPT.txt aufgelistet.
+- Sind alle Medien unlesbar, kann das ZIP nur diesen Report enthalten.
+- Serverseitiger Active/Cooldown-Guard plus UI-Sperre verhindert nach Moeglichkeit
+  mehrere gleichzeitige/sofort hintereinander gestartete Tages-ZIP-Downloads.
+- WebServer arbeitet synchron; der Status-Endpunkt ist deshalb waehrend eines
+  langen laufenden ZIP-Handlers nicht echt parallel bedienbar. Die UI/Guard-
+  Logik serialisiert den Vorgang trotzdem bewusst.
+
+---------------------------------------------------------------------
+v29 - FILTERSICHERE MEDIENAUSWAHL
+---------------------------------------------------------------------
+
+- Select all wirkt nur auf aktuell sichtbare/gefilterte Zeilen.
+- Deselect all wirkt ebenfalls nur auf sichtbare Zeilen.
+- Delete selected loescht nur sichtbare, tatsaechlich markierte Medien.
+- Beim Filterwechsel werden nun versteckte Checkboxen automatisch abgewahlt.
+- Dadurch kann "Images -> Select all -> Delete selected" keine ausgeblendeten
+  Videos mehr mitloeschen und umgekehrt.
+
+---------------------------------------------------------------------
+v30/v31 - POWER-SHOOTER-KONFIGURATION WIEDERHERGESTELLT
+---------------------------------------------------------------------
+
+v30:
+
+- Config-Maske erhielt die echten Power-Shooter-Parameter zurueck.
+- Kritischer Save-Bug behoben: shooter_* und motion_recording_enabled wurden
+  vorher beim Neuaufbau von config.txt nicht mitgeschrieben und konnten damit
+  auf Defaults zurueckfallen.
+- Gegen den damaligen aktuellen Config-Stand wurde geprueft, dass alle 65
+  vorhandenen Keys vom Save-Pfad wieder geschrieben werden.
+- Alte ueberholte UI "Periodische Snapshots" entfernt; es gibt nur den einen
+  universellen Power-/Dauershooter.
+
+v31:
+
+- Shooter-Ein/Aus wird nicht unten redundant geschaltet, sondern aus dem oberen
+  Recording-Modus abgeleitet.
+- Vier UI-Modi:
+    Aus
+    Normal Recording / Motion-Alarm
+    Power Shooter standalone
+    Normal Recording + Power Shooter
+- Intern bleiben die bestehenden kompatiblen Keys autoritativ:
+    motion_recording_enabled=0|1
+    shooter_enabled=0|1
+  Es wurde KEIN neuer persistenter recording_mode-Key eingefuehrt.
+- Die normale Ausloeselogik direct / image_verify / image_only bleibt davon
+  unberuehrt.
+- Power-Shooter-Dunkelgrenze wieder als Slider 0..255 mit Live-Grauwert und
+  kleinem Helligkeitsquadrat.
+- Intervall-Hilfe zeigt direkte FPS-Beispiele, u.a.:
+    250 ms = 4 fps
+    500 ms = 2 fps
+    1000 ms = 1 fps
+    2000 ms = 0.5 fps
+  Dabei sind dies Shooter-PRUEFSLOTS, nicht garantiert gespeicherte Bilder.
+
+---------------------------------------------------------------------
+v32 - VON/BIS-ZEIT FUER POWER-SHOOTER-SPARSE-MKV
+---------------------------------------------------------------------
+
+- Zeitparser der Recording-Liste akzeptiert nun auch Shooter-Dateinamen wie
+  083434_500_shooter.mkv statt nur exakt HHMMSS.ext.
+- Startzeit kommt aus dem Dateinamen; Endzeit wird aus der tatsaechlichen
+  Sparse-MKV-Containerdauer berechnet.
+- Damit koennen auch Power-Shooter-MKVs in der Liste als Zeitbereich erscheinen.
+
+---------------------------------------------------------------------
+v33 - SFLOG1 LINE-SAFE RECOVERY
+---------------------------------------------------------------------
+
+Aus einem mehrstuendigen Feldlog wurde sichtbar, dass bei beschaedigten/verlorenen
+SFLOG1-Records Textfragmente aus verschiedenen Zeiten ohne Separator zu einer
+scheinbaren Logzeile verklebt werden konnten. Ursache: der RAM-Logger konnte
+1024-Byte-SFLOG1-Recordgrenzen mitten in Textzeilen setzen.
+
+Fix v33:
+
+- Writer waehlt Recordgrenzen nach Moeglichkeit an kompletten Zeilenenden.
+- Reader setzt bei Torn-Record-Recovery/Resynchronisation einen expliziten CRLF-
+  Separator, bevor ein spaeterer gueltiger Record ausgegeben wird.
+- Das verhindert falsche zusammengesetzte Logzeilen.
+- Bereits physisch verlorene Bytes koennen nicht wiederhergestellt werden.
+- SFLOG1 bleibt weiterhin Authenticated Encryption; Recovery darf einen
+  tatsaechlichen Auth-Fehler nicht als gueltigen Inhalt darstellen.
+
+---------------------------------------------------------------------
+v34 - SHOOTER/LOGGER CO-FLUSH UND LANGES RAM-BATCHING
+---------------------------------------------------------------------
+
+Ziel: Bei langen Power-Shooter-Pufferzeiten (z.B. 30 Minuten) soll der Logger
+nicht zwischendurch nur wegen normaler Logmeldungen die SD-Karte aktivieren.
+
+Aktueller v34/v35-Stand:
+
+- normaler Logger-Zielpuffer bleibt 16 KiB
+- wenn shooter_enabled aktiv und shooter_flush_seconds>0 ist, bevorzugt der
+  Logger bis 256 KiB PSRAM fuer normale Logmeldungen
+- normale Shooter-/Statusmeldungen bleiben nach Moeglichkeit im RAM
+- bevorzugter Persistenzpunkt ist der ohnehin stattfindende Shooter-Medienflush;
+  unmittelbar danach wird auch der Logpuffer persistiert
+- voller 256-KiB-Loggerpuffer bzw. PSRAM-Druck darf fail-safe einen frueheren
+  SD-Flush ausloesen, damit Logs nicht still verloren gehen
+- Logviewer/Download und kontrollierte Sicherheitsuebergaenge duerfen weiterhin
+  bewusst einen Logflush erzwingen
+- Light Sleep behaelt PSRAM; Reboot/Shutdown/Deep Sleep muessen vor dem Uebergang
+  persistieren
+- Shooter-Bildpuffer und Logger-Puffer sind getrennte PSRAM-Puffer, werden aber
+  fuer die SD-Aktivitaet moeglichst gemeinsam geflusht
+
+---------------------------------------------------------------------
+v35 - ZENTRALES RELEASE-TRACKING / CHANGELOG / GIT-TAGS
+---------------------------------------------------------------------
+
+- Neue Datei sensorforge_version.h mit zentraler Entwicklungs-Release-ID.
+- Neue Datei CHANGELOG.md.
+- Bootlog schreibt Release-Tag und Release-Datum zusammen mit den bestehenden
+  Build-/Installationsmetadaten.
+- WebConfig zeigt die Release-ID ebenfalls an.
+- Release-ID ist nicht die Core-Version und nicht die API-Version.
+- Zukuenftige Releases sollen fortlaufend v36, v37, ... heissen.
+- Nach jeder Release soll der komplett zusammengefuehrte lokale Projektstand ins
+  Git-Repository und mit genau demselben Tag versehen werden.
+
+---------------------------------------------------------------------
+MEHRSTUENDIGER POWER-SHOOTER-FELDLAUF VOR v33/v34
+---------------------------------------------------------------------
+
+Ein am 2026-09-23 ausgewerteter mehrstuendiger 500-ms-/2-fps-Lauf zeigte:
+
+- Scheduler ueber Stunden praktisch bei 2 fps Prueffrequenz
+- Darkness-/Similarity-Verteilung plausibel fuer Nacht->Morgen
+- mehrere erfolgreiche Sparse-MKV-Flushes
+- ein einzelner gemeldeter queue/SD-persistence-Fehler; der nachfolgende Flush
+  schrieb denselben erhaltenen Batch spaeter erfolgreich weiter, was zum
+  vorgesehenen "bei Fehler RAM-Batch behalten"-Verhalten passt
+- sleep_cycles=0 beim 500-ms-Shooter, wie seit v20 beabsichtigt
+- dabei wurden die oben beschriebenen SFLOG1-Zusammenklebungen sichtbar; daraus
+  entstanden v33/v34
+
+Dieser Feldlauf bestaetigt NICHT automatisch v33/v34/v35 auf Hardware; diese
+spaeteren Deltas muessen nach Build/Flash separat regressionsgeprueft werden.
+
+AKTUELLER TESTSTATUS v23-v35:
+
+- verschiedene Deltas wurden in der Assistenzumgebung per Diff, Struktur,
+  Delimiter, JavaScript oder ZIP-Inhalt geprueft, je nach Aenderung
+- der Benutzer hat Teile des v23-v32-Funktionspfads bereits real verwendet,
+  insbesondere den mehrstuendigen Power-Shooter-Lauf
+- fuer v33/v34/v35 wurde in der Assistenzumgebung KEIN kompletter Arduino-
+  ESP32-Build und kein abschliessender Hardware-Langzeittest ausgefuehrt
+- daher niemals "Build bestanden" oder "Hardware verifiziert" fuer diese Deltas
+  behaupten, bis das wirklich erfolgt ist
 
 ======================================================================
 AKTUELLER AENDERUNGSSTAND 2026-09-21
@@ -292,11 +628,10 @@ Light Sleep / Dauershooter, aktueller Stand ab v20:
   programmiert wurde. Schlaegt das Timer-Arming fehl oder ist kein Shooter-Wake
   verfuegbar, bleibt das Geraet fail-safe wach
 - WLAN blockiert den normalen Light-Sleep-Pfad weiterhin ohnehin
-- web_recording_auto_pause=1 pausiert weiterhin die normale Motion-/Alarm-
-  Recording-Automatik. Der unabhaengige Dauershooter wird seit v18 NICHT mehr
-  allein durch eine offene WebConfig-Sitzung pausiert. Nur eine aktive
-  Live-Preview blockiert einen Shooter-Capture, weil sie die Kamera-Pipeline
-  besitzt
+- HISTORISCH galt in v18: offene WebConfig pausiert nur Motion/Alarm. AKTUELL
+  seit v26 gilt wieder die gemeinsame WebConfig-Autopause fuer neue Motion-/
+  Alarm-Aufnahmestarts UND neue Power-Shooter-Captures. Bereits gepufferte
+  Shooterbilder bleiben erhalten und duerfen weiter geflusht werden
 - im reinen Shooterbetrieb mit motion_recording_enabled=0 werden Presence/PIR/
   OT2 nicht als notwendige Shooter-Wakequelle behandelt
 
@@ -341,16 +676,23 @@ zwei verschiedene Dinge. Nach einer langen komprimierten Luecke kann die
 Aufnahmezeit im Player sichtbar springen. Das ist korrekt und bewahrt die echte
 Zeitinformation.
 
-Logger / Stromoptimierung fuer den Dauershooter:
+Logger / Stromoptimierung fuer den Dauershooter, aktueller Stand bis v35:
 
-- normale logWrite()-Aufrufe werden im aktuellen Stand in einem 16-KiB-
-  PSRAM-Puffer gesammelt statt jede Zeile sofort auf SD zu flushen
-- Flush bei vollem Puffer bzw. an sinnvollen Persistenzpunkten
-- Flush zusammen mit Shooter-SD-Flush, beim Logviewer, vor Reboot/Shutdown und
-  vor Deep Sleep
+- normale logWrite()-Aufrufe werden zunaechst im PSRAM gesammelt statt jede
+  Zeile sofort auf SD zu flushen
+- normaler Zielpuffer 16 KiB; bei aktivem Power Shooter mit
+  shooter_flush_seconds>0 seit v34 bevorzugt bis 256 KiB
+- normale Logmeldungen sollen bei langen Shooter-Batches die SD moeglichst NICHT
+  zwischendurch aktivieren
+- bevorzugter gemeinsamer Persistenzpunkt: Shooter-Medienflush und direkt danach
+  Logger-Flush
+- Sicherheitsgrenze/PSRAM-Druck darf fail-safe einen frueheren Logflush ausloesen
+- Logviewer/Download sowie Reboot/Shutdown/Deep Sleep duerfen bewusst flushen
 - ohne PSRAM existiert ein sicherer direkter SD-Fallback
 - reine Shooter-Timer-Wakes erzeugen nicht mehr einzeln SD-Logwrites
 - Sleep-Zyklen werden im RAM gezaehlt und spaeter zusammengefasst
+- v33 verhindert nach Moeglichkeit SFLOG1-Recordgrenzen mitten in Textzeilen und
+  trennt Recovery-Fragmente mit einem expliziten Zeilenumbruch
 - bei hartem Stromverlust koennen noch nicht persistierte Logzeilen verloren
   gehen; kontrollierte Systemuebergaenge flushen den Puffer
 
@@ -975,10 +1317,15 @@ BOARD-AUSWAHL UND ARDUINO BUILD-UMGEBUNG
 
 Die Quellcode-Boardauswahl erfolgt in board_config.h.
 
-Aktueller Entwicklungs-/Teststand:
+Aktueller im eingesehenen board_config.h aktiver Source-Stand:
 
-#define BOARD_FREENOVE
-//#define BOARD_XIAO
+//#define BOARD_FREENOVE
+#define BOARD_XIAO
+
+WICHTIG: Diese Aussage wurde am 2026-09-23 direkt am vorhandenen
+board_config.h gegengeprueft. Vor JEDEM spaeteren Build trotzdem erneut den
+aktuellen Header ansehen; nicht aus diesem Dokument auf das aktive Board
+schliessen.
 
 Die XIAO-Variante bleibt weiterhin unterstuetzt und ist auf mehreren
 Produktionsgeraeten im Einsatz. Vor einem Build immer pruefen, welches
@@ -1228,27 +1575,42 @@ WLAN / Web im zuletzt real verwendeten Dauershooter-Feldconfig:
 - web_recording_auto_pause=1
 - web_language=de
 
-Seit v18 gilt die WebConfig-Pause nur fuer die normale Motion-/Alarm-Recording-
-Automatik. Der unabhaengige Dauershooter laeuft bei bloss geoeffneter WebConfig
-weiter. Eine aktive Live-Preview blockiert den Shooter weiterhin, weil sie die
-Kamera aktiv besitzt. Fuer Strom-/Dauertests WebConfig/WLAN trotzdem nicht
-unnoetig offen halten, weil aktives WLAN den Schlafpfad und den Stromverbrauch
-veraendert.
+HISTORIE: v18 hatte die WebConfig-Pause zunaechst wieder vom Dauershooter
+entkoppelt. Dieser historische Zwischenstand ist seit v26 UEBERHOLT.
+
+AKTUELL AB v26: Wenn die WebConfig-Recording-Pause aktiv ist, werden sowohl neue
+Motion-/Alarm-Aufnahmestarts als auch NEUE Power-Shooter-Captures unterdrueckt.
+Bereits im Shooter-PSRAM gepufferte Bilder werden NICHT verworfen und duerfen
+weiter kontrolliert geflusht werden. Die Pause ist eine RAM-only Lease und kann
+nach WebConfig-Inaktivitaet wieder freigegeben werden. Eine aktive Live-Preview
+blockiert die Kamera-Pipeline weiterhin ebenfalls. API-Verkehr allein gilt nicht
+als normale Web-UI-Session. Fuer Strom-/Dauertests WebConfig/WLAN nicht
+unnoetig offen halten; aktives WLAN blockiert den normalen Light-Sleep-Pfad.
 
 Aus Sicherheitsgruenden werden Zugangsdaten, Passwoerter, Hardware-IDs,
 Lizenz-/Private-Key-Daten und andere Secrets in diesem Dokument nicht wiederholt.
 
-Logging:
+Logging, aktueller Stand bis v35:
 
 - log_file=/log.txt
 - debug_enabled=0
-- normaler Logger besitzt fuer den Dauershooter einen 16-KiB-PSRAM-Puffer
-- normale Logzeilen werden nicht mehr einzeln sofort auf SD geflusht
-- kontrollierte Persistenz bei sinnvollen System-/Shooter-Uebergaengen
+- normaler Logger verwendet weiterhin einen 16-KiB-PSRAM-Zielpuffer
+- wenn Power Shooter aktiv ist UND shooter_flush_seconds>0, bevorzugt der Logger
+  seit v34 einen 256-KiB-PSRAM-Puffer (bei PSRAM-Druck stufenweise kleiner)
+- normale Logzeilen werden waehrend Shooter-Batching nach Moeglichkeit NUR im
+  RAM gesammelt und zusammen mit dem naechsten Shooter-Medienflush persistiert
+- erreicht selbst der vergroesserte Puffer seine Sicherheitsgrenze, darf der
+  Logger ausnahmsweise vorzeitig auf SD schreiben, damit Logs nicht verloren gehen
+- Logviewer/Download, Reboot, Shutdown, Deep Sleep und andere bewusste
+  Sicherheits-/Bedienpfade duerfen ebenfalls einen expliziten Logflush erzwingen
+- v33 haelt neue SFLOG1-Recordgrenzen nach Moeglichkeit auf kompletten
+  Textzeilengrenzen; der Reader setzt bei Torn-Record-Resynchronisation einen
+  expliziten Zeilenumbruch, damit Fragmente nicht zu falschen Logzeilen verklebt
+  werden. Bereits physisch verlorene Bytes alter Records sind nicht rekonstruierbar
 - bei recording_encryption=1 wird die physische Loggeneration als SFLOG1
   verschluesselt gespeichert
-- bei recording_encryption=0 bleibt der neue Logpfad plaintext; bereits
-  vorhandene SFLOG1-Generationen werden nicht mit Plaintext vermischt
+- bei recording_encryption=0 bleibt der Logpfad plaintext; bereits vorhandene
+  SFLOG1-Generationen werden nicht mit Plaintext vermischt
 - v21: Viewer laedt den Log stueckweise ueber 16-KiB-/log_chunk-Requests mit
   Retry statt als einen langen /log_raw-Stream; Statistik nur noch per Button
 - v22: komplette Web-Log-UI/Routen aus webconfig.cpp in web_log.cpp/.h
@@ -2409,20 +2771,28 @@ Im Dauershooter-Test wurde festgestellt, dass der alte Logger jede normale
 Logzeile unmittelbar auf SD schrieb und flushte. Bei 2 fps konnte dadurch selbst
 ein reiner Shooter-Timer-Wake unnoetige SD-Aktivitaet verursachen.
 
-Aktueller Stand:
+Aktueller Stand bis v35:
 
-- 16 KiB Log-Puffer bevorzugt in PSRAM
+- normaler Logger-Zielpuffer: 16 KiB PSRAM
+- bei cfg_shooter_enabled!=0 UND cfg_shooter_flush_seconds>0 wird seit v34 ein
+  dedizierter Shooter-Batching-Zielpuffer bis 256 KiB bevorzugt
 - normale logWrite()-Aufrufe schreiben zuerst in RAM
-- kein sofortiges SD-flush() fuer jede normale Zeile
-- Flush bei vollem Puffer und an gezielten Persistenzpunkten
-- Shooter-SD-Flush zieht den Log-Puffer mit
-- Logviewer-/Downloadpfade duerfen vorher flushen
+- im Shooter-Batching sollen normale Logmeldungen die SD NICHT zwischen zwei
+  langen Shooter-Medienflushes aufwecken
+- der bestehende Shooter-Flush persistiert den Medienbatch und zieht unmittelbar
+  danach den Log-Puffer mit; das ist der bevorzugte gemeinsame SD-Schreibpunkt
+- wenn der 256-KiB-Puffer wegen realem Logaufkommen/PSRAM-Druck nicht reicht,
+  darf der Logger fail-safe vorzeitig persistieren statt Meldungen zu verlieren
+- Logviewer-/Downloadpfade duerfen einen aktuellen Logflush erzwingen
 - kontrollierter Reboot, Shutdown und Deep Sleep flushen Logs
 - ohne PSRAM sicherer direkter SD-Fallback
 - reine Shooter-Timer-Wakezyklen werden nicht einzeln persistent geloggt
 - Sleep-Zyklen/Zeiten koennen im RAM gesammelt und spaeter als Summary
   geschrieben werden
 - repetitive POWER-/Shooter-Serial-Ausgaben sind bei debug_enabled=0 reduziert
+- seit v33 werden SFLOG1-Records nach Moeglichkeit nicht mitten in einer
+  Textzeile getrennt. Nach Recovery/Resynchronisation fuegt der Reader einen
+  Zeilenumbruch ein, damit keine irrefuehrend zusammengeklebten Zeilen entstehen
 
 Tradeoff:
 
@@ -4908,11 +5278,20 @@ Seeed XIAO ESP32S3 Sense und Freenove FNK0085 (8 MB). Physischer Kamerasensor
 ist OV3660. XIAO-Produktionsgeraete verwenden typischerweise LD2410S Radar;
 der aktuelle Freenove-PIR-Referenzaufbau verwendet SR602.
 
-WICHTIGE ARBEITSREGELN:
+WICHTIGE ARBEITSREGELN - BETTER SAFE THAN SORRY:
 
-- Der jeweils zuletzt hochgeladene bzw. zuletzt gemeinsam erzeugte Quellcode ist
-  autoritativ. Nicht aus alten Projektbeschreibungen oder Erinnerungen raten.
-- Aenderungen nur auf tatsaechlich gesehenem aktuellen Code vornehmen.
+- Der jeweils zuletzt hochgeladene bzw. zuletzt gemeinsam erzeugte und
+  TATSAECHLICH GESEHENE Quellcode ist autoritativ. Nicht aus alten
+  Projektbeschreibungen, Release-Namen oder Erinnerungen raten.
+- Aenderungen nur auf tatsaechlich gesehenem aktuellen Code vornehmen. Vor der
+  Aenderung relevante Funktion, Aufrufer und Abhaengigkeiten lesen.
+- Wenn die aktuelle Version einer benoetigten Datei nicht sicher vorliegt, STOP:
+  aktuellen Code erneut hochladen/verwenden und erst danach aendern. Keine
+  vermeintlich passende Altversion als Ersatz benutzen.
+- SensorForge ist inzwischen umfangreich und stark verzahnt. Aenderungen so klein
+  und lokal wie moeglich halten; bestehende Recording-/Storage-/Crypto-/Recovery-/
+  Power-/API-Pfade nicht beiläufig umgestalten.
+- Keine nicht ausgefuehrten Builds oder Hardwaretests als bestanden bezeichnen.
 - Dateien bei Rueckgabe unter ihrem Original-Projektdateinamen liefern.
 - Bei Codeaenderungen nur die tatsaechlich geaenderten bzw. neuen Dateien
   mitsenden; ZIPs standardmaessig NICHT mit unveraenderten Projektdateien fuellen.
@@ -4925,11 +5304,44 @@ WICHTIGE ARBEITSREGELN:
 - Keine .lic-Datei-Userflows fuer die Lizenzierung wieder einfuehren.
 - WebLog ist ab v22 eigenes Modul web_log.cpp/.h; log_storage.cpp/.h bleibt die
   separate SFLOG1-/Storage-Schicht.
+- Aktueller Entwicklungs-Release ist v35. sensorforge_version.h traegt die
+  Release-ID, CHANGELOG.md die Historie. Release-ID, Core-Version 7.1.0,
+  Build-Zeitpunkt und API-Version sind getrennte Begriffe.
+- ZIPs sind Deltapakete und enthalten nur geaenderte/neue Dateien. Nach jeder
+  Release werden die Deltas in den vollstaendigen lokalen Projektbaum gemergt,
+  der komplette Stand nach GitHub committed und mit exakt demselben Tag vNN
+  markiert.
+
+
+AKTUELLER v35-FUNKTIONSDELTA:
+
+- Recording-Liste: Icons, Video-Zeitbereiche, Annotationen, Auswahl/Loeschen,
+  Corrupt-Warnung, progressives Laden und sichtbare Range-/Filterauswahl.
+- Tages-ZIP: korrupte/unlesbare Medien werden soweit im Preflight erkannt und
+  uebersprungen; Report _SENSORFORGE_SKIPPED_CORRUPT.txt; Download-Serialisierung.
+- Recording-Modus in WebConfig: Aus / Normal / Power Shooter standalone /
+  Normal + Power Shooter. Persistiert weiterhin ueber motion_recording_enabled
+  und shooter_enabled; kein neuer recording_mode-Key.
+- Power-Shooter-Settings: Storageformat, Intervall >=250 ms mit FPS-Hilfe,
+  Darkness-Slider 0..255 mit Grauwert-Swatch, Mindestveraenderung, Force-Save,
+  Flushzeit. 500 ms = 2 fps Pruefslots.
+- Seit v26 pausiert eine aktive WebConfig-Recording-Pause auch NEUE Shooter-
+  Captures. Bereits gepufferte Shooterbilder bleiben erhalten und duerfen
+  geflusht werden.
+- Sparse-MKV-Shooternamen wie HHMMSS_500_shooter.mkv erhalten in der Liste einen
+  Start-/Endzeitbereich aus Dateistart + echter Containerdauer.
+- Logger: v33 line-safe SFLOG1-Recovery; v34 bei Shooter-Batching bis 256 KiB
+  PSRAM und bevorzugter gemeinsamer Persistenzpunkt direkt beim Shooter-Medienflush.
+- v35: zentrale Release-ID in sensorforge_version.h, CHANGELOG.md, Anzeige im
+  Bootlog und WebConfig; Git-Tag soll exakt der Release-ID entsprechen.
+
 
 BUILD / HARDWARE:
 
-Aktueller Entwicklungs-/Teststand hat BOARD_FREENOVE aktiv; XIAO bleibt
-unterstuetzt und produktiv im Feld. Vor jedem Build board_config.h pruefen.
+Im am 2026-09-23 eingesehenen aktuellen board_config.h ist BOARD_XIAO aktiv
+und BOARD_FREENOVE auskommentiert. Beide Hardwarepfade bleiben unterstuetzt.
+Vor JEDEM Build den tatsaechlich aktuellen board_config.h erneut pruefen; niemals
+aus diesem Dokument oder einer alten Sitzung auf das aktive Board schliessen.
 Der historische bewaehrte Arduino-Build verwendet ESP32S3 Dev Module mit
 Arduino-ESP32 3.3.11, 8 MB Flash, DIO, OPI PSRAM und der 8-MB-OTA-
 Partitionierung. Die aktuelle Feldsitzung wurde mit Arduino-ESP32 3.3.12 gebaut.
@@ -4984,13 +5396,13 @@ Aktuell AVI/MJPEG, Timestamp/SRT aktiv. Segment 30 s, Segment-Maximum 20 MB,
 Event-Gesamtgrenze 65 s, danach 30 s Cooldown, post_record_ms=3000.
 recording_not_before ist vorhanden und aktuell off.
 
-WebConfig besitzt eine RAM-only Recording-Pause. web_recording_auto_pause=1
-pausiert die normale Motion-/Alarm-Recording-Automatik beim Oeffnen normaler
-WebConfig-UI-Sessions. Der unabhaengige Dauershooter wird seit v18 NICHT mehr
-durch diese Pause blockiert; nur eine aktive Live-Preview besitzt die Kamera und
-blockiert einen Shooter-Capture. Normale Lease etwa 35 s; Transportvorbereitung
-besitzt einen laengeren Sicherheits-Hold. API-Verkehr allein zaehlt nicht als
-Web-UI-Session.
+WebConfig besitzt eine RAM-only Recording-Pause. Historisch hatte v18 den
+Dauershooter davon entkoppelt; das ist seit v26 nicht mehr der aktuelle Stand.
+web_recording_auto_pause=1 kann in einer normalen WebConfig-UI-Session sowohl
+neue Motion-/Alarm-Aufnahmestarts als auch neue Power-Shooter-Captures
+unterdruecken. Bereits gepufferte Shooterbilder bleiben erhalten und koennen
+geflusht werden. Normale Lease etwa 35 s; Transportvorbereitung besitzt einen
+laengeren Sicherheits-Hold. API-Verkehr allein zaehlt nicht als Web-UI-Session.
 
 IMAGE MOTION:
 
@@ -5038,11 +5450,14 @@ Betrieb wach. Den frueheren 500-ms-Light-Sleep-Zyklus NICHT wieder aktivieren,
 solange kein reproduzierbarer Langzeit-A/B-Nachweis vorliegt. Langsamere Shooter
 duerfen Light Sleep nur mit sicher armed Shooter-/Flush-Timer verwenden.
 
-Fehlergeschichte: WebConfig-Pause wurde in v18 korrekt vom Shooter entkoppelt,
-war aber nicht Hauptursache. v19 fuehrte nach Transportende einen sauberen
-ESP.restart()/SW-Normalboot ein; ein 7-h-Ausfall blieb bestehen. Erst v20 mit
-awake fallback zeigte im Feld wieder stabilen 2-fps-Betrieb und mehrere reale
-Sparse-MKV-Flushes. Der aktuelle grobe Stromwert liegt dabei etwa bei 120 mA.
+Historische Fehlergeschichte: v18 entkoppelte die WebConfig-Pause zunaechst
+vom Shooter; das war fuer die damalige Fehlersuche nicht die Hauptursache. v19
+fuehrte nach Transportende einen sauberen ESP.restart()/SW-Normalboot ein; ein
+7-h-Ausfall blieb bestehen. Erst v20 mit awake fallback zeigte im Feld wieder
+stabilen 2-fps-Betrieb und mehrere reale Sparse-MKV-Flushes. Die v18-Pause-
+Semantik wurde spaeter in v26 bewusst erneut geaendert: eine aktive WebConfig-
+Recording-Pause blockiert nun auch neue Shooter-Captures. Der grobe Stromwert
+des 500-ms-Awake-Fallbacks lag im Feld etwa bei 120 mA.
 
 Flushpfad statisch geprueft: timeout, buffer_full, API/manuell, before_restart,
 Shutdown und Deep Sleep verwenden denselben zentralen Pfad; .mkv.part wird erst
@@ -5394,6 +5809,7 @@ keine bereits geloesten Themen neu designen, keine APIs/Funktionen erfinden und
 Codeaenderungen nur auf dem zuletzt wirklich gesehenen Quellstand vornehmen.
 Bei Rueckgabe von Code standardmaessig nur geaenderte/neue Dateien unter ihren
 Originalnamen mitsenden; keine unveraenderten Dateien in Update-ZIPs aufnehmen.
+
 
 
 

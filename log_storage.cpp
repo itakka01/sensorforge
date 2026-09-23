@@ -1408,6 +1408,17 @@ bool logStorageReadChunk(
                     nextMagic
                 )) {
                 recoveredTornRecord = true;
+
+                // Older logger versions could split a text line across two
+                // independently authenticated SFLOG1 records. If one of those
+                // records is damaged and we resynchronize to a later valid
+                // record, concatenate-without-separator would manufacture a
+                // false log line from two unrelated fragments. Insert an
+                // explicit line break at every recovery boundary. This also
+                // makes already existing affected logs readable without
+                // pretending that the missing bytes can be reconstructed.
+                body += "\r\n";
+
                 current = nextMagic;
                 continue;
             }
