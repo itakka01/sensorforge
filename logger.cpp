@@ -25,9 +25,15 @@ static uint64_t logBytesWritten = 0;
 static uint8_t *logRamBuffer = nullptr;
 static size_t logRamBufferCapacity = 0;
 static size_t logRamBufferUsed = 0;
+static uint32_t logRamBufferFirstQueuedMs = 0;
+static uint32_t logRamBufferLastAutoFlushAttemptMs = 0;
 static const size_t LOG_RAM_BUFFER_NORMAL_TARGET_BYTES = 16U * 1024U;
 static const size_t LOG_RAM_BUFFER_SHOOTER_TARGET_BYTES = 256U * 1024U;
 static const size_t LOG_RAM_BUFFER_MIN_BYTES = 4U * 1024U;
+static const uint32_t LOG_RAM_BUFFER_NORMAL_MAX_AGE_MS =
+    5UL * 60UL * 1000UL;
+static const uint32_t LOG_RAM_BUFFER_AUTO_FLUSH_RETRY_MS =
+    10UL * 1000UL;
 
 // While the continuous shooter batches accepted JPEGs in PSRAM, normal log
 // traffic should follow the same persistence rhythm: keep it in PSRAM and let
@@ -48,6 +54,19 @@ static size_t logDesiredRamBufferBytes()
         logShooterBatchingPreferred()
         ? LOG_RAM_BUFFER_SHOOTER_TARGET_BYTES
         : LOG_RAM_BUFFER_NORMAL_TARGET_BYTES;
+}
+
+
+static uint32_t logRamBufferMaxAgeMs()
+{
+    if (logShooterBatchingPreferred()) {
+        return
+            (uint32_t)cfg_shooter_flush_seconds *
+            1000UL;
+    }
+
+    return
+        LOG_RAM_BUFFER_NORMAL_MAX_AGE_MS;
 }
 
 // Keep encrypted SFLOG1 record boundaries on complete text-line boundaries.
@@ -878,6 +897,8 @@ static bool ensureLogRamBuffer()
     logRamBuffer = nullptr;
     logRamBufferCapacity = 0;
     logRamBufferUsed = 0;
+    logRamBufferFirstQueuedMs = 0;
+    logRamBufferLastAutoFlushAttemptMs = 0;
 
     Serial.println(
         "Logger RAM buffer unavailable - direct SD logging fallback"
@@ -949,6 +970,9 @@ static bool flushPendingLogBuffer()
                 written,
                 error
             )) {
+            if (logWriter.file)
+                logBytesWritten = logStorageWriterSize(logWriter);
+
             Serial.println(
                 "Logger: buffered write failed | " + error
             );
@@ -972,6 +996,16 @@ static bool flushPendingLogBuffer()
         }
 
         logRamBufferUsed = remaining;
+    }
+
+    if (logRamBufferUsed == 0) {
+        logRamBufferFirstQueuedMs = 0;
+        logRamBufferLastAutoFlushAttemptMs = 0;
+    } else if (logRamBufferFirstQueuedMs == 0) {
+        // Defensive only. A non-empty queue should always have an age marker,
+        // but preserve a bounded persistence window if an older runtime state
+        // reaches this point without one.
+        logRamBufferFirstQueuedMs = millis();
     }
 
     if (logWriter.file)
@@ -1008,6 +1042,9 @@ static bool appendBufferedLogBytes(
                 written,
                 error
             )) {
+            if (logWriter.file)
+                logBytesWritten = logStorageWriterSize(logWriter);
+
             Serial.println(
                 "Logger: direct fallback write failed | " + error
             );
@@ -1038,6 +1075,9 @@ static bool appendBufferedLogBytes(
                 written,
                 error
             )) {
+            if (logWriter.file)
+                logBytesWritten = logStorageWriterSize(logWriter);
+
             Serial.println(
                 "Logger: oversized direct write failed | " + error
             );
@@ -1059,6 +1099,9 @@ static bool appendBufferedLogBytes(
             return false;
     }
 
+    bool queueWasEmpty =
+        logRamBufferUsed == 0;
+
     memcpy(
         logRamBuffer + logRamBufferUsed,
         data,
@@ -1066,6 +1109,12 @@ static bool appendBufferedLogBytes(
     );
 
     logRamBufferUsed += length;
+
+    if (queueWasEmpty) {
+        logRamBufferFirstQueuedMs = millis();
+        logRamBufferLastAutoFlushAttemptMs = 0;
+    }
+
     return true;
 }
 
@@ -1142,6 +1191,58 @@ void logFlush()
 {
     flushPendingLogBuffer();
     logStorageFlushWriter(logWriter);
+}
+
+
+void logService()
+{
+    if (
+        g_storageLocked ||
+        !logWriter.file ||
+        logRamBufferUsed == 0
+    ) {
+        return;
+    }
+
+    uint32_t now =
+        millis();
+
+    if (logRamBufferFirstQueuedMs == 0) {
+        logRamBufferFirstQueuedMs = now;
+        return;
+    }
+
+    uint32_t maxAgeMs =
+        logRamBufferMaxAgeMs();
+
+    if (
+        maxAgeMs == 0 ||
+        (uint32_t)(
+            now -
+            logRamBufferFirstQueuedMs
+        ) < maxAgeMs
+    ) {
+        return;
+    }
+
+    if (
+        logRamBufferLastAutoFlushAttemptMs != 0 &&
+        (uint32_t)(
+            now -
+            logRamBufferLastAutoFlushAttemptMs
+        ) <
+        LOG_RAM_BUFFER_AUTO_FLUSH_RETRY_MS
+    ) {
+        return;
+    }
+
+    logRamBufferLastAutoFlushAttemptMs = now;
+
+    // This is a durability fallback, not the preferred shooter path. When the
+    // Power Shooter is active, its successful media flush still calls
+    // logFlush() first. This timer only prevents a paused/idle shooter from
+    // leaving rare but important log lines in PSRAM indefinitely.
+    flushPendingLogBuffer();
 }
 
 
@@ -1400,6 +1501,17 @@ void debugDump()
         " | min_free_mb=" + String(cfg_min_free_space_mb) +
         " | disk_action=" + cfg_disk_full_action +
         " | led=" + String(cfg_led_enabled)
+    );
+
+    writeFormattedLogLine(
+        "DEBUG",
+        "CONFIG | encryption=" + String(cfg_recording_encryption) +
+        " | shooter=" + String(cfg_shooter_enabled) +
+        " | shooter_storage=" + cfg_shooter_storage_format +
+        " | shooter_interval_ms=" + String(cfg_shooter_interval_ms) +
+        " | shooter_flush_s=" + String(cfg_shooter_flush_seconds) +
+        " | motion_recording=" + String(cfg_motion_recording_enabled) +
+        " | motion_mode=" + cfg_motion_recording_decision
     );
 
     writeFormattedLogLine(

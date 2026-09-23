@@ -9,6 +9,65 @@ and identifies the concrete binary compilation time.
 > change sequence beginning with v23. Earlier development history remains in the
 > repository history/project documentation.
 
+## v39 — 2026-09-23
+
+- SD Maintenance now exposes fixed, visible controls for status refresh, read-only
+  SD recovery and the SD benchmark on the unified page.
+- The Recovery action remains visible even while the SD is mounted. In that state
+  it reports that recovery is not required instead of silently hiding the action;
+  an actual remount recovery still runs only when the SD is unavailable.
+- SD Recovery is now represented on all storage backends: XIAO/SPI keeps the
+  detailed read-only raw/sector/multi-clock recovery, while SD_MMC uses the
+  existing robust mount/retry recovery path without format or wipe.
+- Recovery and benchmark actions remain visibly present but are disabled while a
+  recording is active.
+- Removed the obsolete standalone `/sdstatus`, `/sd_recovery` and `/sdbench` GET
+  routes; SD tools are now reached only through the unified SD Maintenance page
+  and its dedicated POST action endpoints.
+
+## v38 — 2026-09-23
+
+- Consolidated SD Status, SD Recovery and SD Benchmark into the existing
+  SD Maintenance page and reduced the System menu to one SD maintenance entry.
+- SD Maintenance now shows capacity/readiness first, SPI read-only recovery when
+  applicable, and the existing 1 MiB write benchmark on the same page.
+- Existing Wipe, Format and Secure Erase workflows remain on the same page with
+  their established safety checks and config-preservation behavior unchanged.
+- Legacy `/sdstatus` and `/sd_recovery` URLs remain compatible by redirecting to
+  the corresponding section of SD Maintenance; `/sdbench` returns the unified
+  page with its benchmark result.
+
+## v37 — 2026-09-23
+
+- Logger RAM batching now has an independent maximum persistence age. Normal
+  logging is forced to storage after at most five minutes; while Power Shooter
+  batching is configured, the logger uses the configured shooter flush window.
+  This prevents WebConfig pause/idle periods from leaving rare log events only
+  in PSRAM indefinitely.
+- The main loop services the logger deadline only while SD storage is safe to
+  use (no active recorder, storage lock or Sync API exclusive operation), while
+  successful Power Shooter media flushes remain the preferred co-flush point.
+- SFLOG1 now rolls a detected partial physical record write back to the previous
+  authenticated file boundary using the existing crash-recoverable temp/backup
+  transaction files before a retry can append behind the torn record.
+- On encrypted logger open, a bounded tail scan authenticates only the last few
+  possible records and removes a torn/authentication-damaged terminal tail
+  before new records are appended. Existing mid-file recovery gaps with later
+  valid records are preserved for the v36 reader instead of discarding history.
+- The persistent boot config snapshot now includes the effective recording
+  encryption, Power Shooter and motion-recording settings so config-source
+  mismatches can be diagnosed from the downloaded log without exposing secrets.
+
+## v36 — 2026-09-23
+
+- SFLOG1 reader now preserves authenticated log data when the final encrypted
+  record is complete-looking but fails authentication; the damaged terminal
+  record is skipped and unauthenticated bytes are never exposed.
+- Log Viewer surfaces recovery as a customer-facing warning instead of a raw
+  system-style failure and retains technical details separately for diagnosis.
+- Log Viewer fetch errors now include the server-provided diagnostic detail
+  instead of reducing every failure to a bare `HTTP 500`.
+
 ## v35 — 2026-09-23
 
 - Added central `sensorforge_version.h` release identity.

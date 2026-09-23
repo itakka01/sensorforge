@@ -131,6 +131,11 @@ static void handleLogRaw()
         encrypted ? "1" : "0"
     );
 
+    server.sendHeader(
+        "X-Log-Recovered",
+        recoveredTornRecord ? "1" : "0"
+    );
+
     if (
         server.hasArg("download") &&
         server.arg("download") == "1"
@@ -524,6 +529,26 @@ static void handleLog()
         ? "Read failed - retrying..."
         : "Lesefehler - neuer Versuch...";
 
+    const String logRecoveryTitle =
+        logUiEnglish
+        ? "Log partially recovered"
+        : "Log teilweise wiederhergestellt";
+
+    const String logRecoveryText =
+        logUiEnglish
+        ? "One or more encrypted log records were damaged and were skipped. Only successfully authenticated entries are shown."
+        : "Ein oder mehrere verschlüsselte Log-Datensätze waren beschädigt und wurden übersprungen. Angezeigt werden ausschließlich erfolgreich authentifizierte Einträge.";
+
+    const String logReadErrorTitle =
+        logUiEnglish
+        ? "Log currently unavailable"
+        : "Log momentan nicht verfügbar";
+
+    const String logReadErrorText =
+        logUiEnglish
+        ? "SensorForge could not read the log completely. No unauthenticated data is displayed."
+        : "SensorForge konnte das Log nicht vollständig lesen. Nicht authentifizierte Daten werden grundsätzlich nicht angezeigt.";
+
     String html = webConfigLogReaderHtmlHeader();
 
     html +=
@@ -540,6 +565,22 @@ static void handleLog()
             "Eine neue Audit-Zeile markiert den manuellen Neustart des Logs."
             "</div>";
     }
+
+    html +=
+        "<div id='logRecoveryNotice' class='flash-notice' style='display:none;border-color:#f0c36a;border-left-color:#d97706;background:#fff7e8'>"
+        "<strong style='color:#8a4b08'>" +
+        webConfigLogReaderHtmlEscape(logRecoveryTitle) +
+        "</strong><span class='muted'>" +
+        webConfigLogReaderHtmlEscape(logRecoveryText) +
+        "</span></div>"
+        "<div id='logReadErrorNotice' class='flash-notice error' style='display:none'>"
+        "<strong>" +
+        webConfigLogReaderHtmlEscape(logReadErrorTitle) +
+        "</strong><span class='muted'>" +
+        webConfigLogReaderHtmlEscape(logReadErrorText) +
+        "</span><details style='margin-top:8px'><summary>" +
+        String(logUiEnglish ? "Technical details" : "Technische Details") +
+        "</summary><code id='logReadErrorDetail'></code></details></div>";
 
     html +=
         "<div class='log-analysis'>"
@@ -625,6 +666,9 @@ static void handleLog()
         "var live=document.getElementById('logLive');"
         "var sizeEl=document.getElementById('logSize');"
         "var filterMeta=document.getElementById('logFilterMeta');"
+        "var recoveryNotice=document.getElementById('logRecoveryNotice');"
+        "var readErrorNotice=document.getElementById('logReadErrorNotice');"
+        "var readErrorDetail=document.getElementById('logReadErrorDetail');"
         "var analysisStatus=document.getElementById('logAnalysisStatus');"
         "var analyzeButton=document.getElementById('logAnalyze');"
         "var hourChart=document.getElementById('logHourChart');"
@@ -632,6 +676,7 @@ static void handleLog()
         "var rawText='';"
         "var logOffset=0;"
         "var logGeneration='';"
+        "var recoverySeen=false;"
         "var loading=false;"
         "var analysisCalculated=false;"
         "var liveTimer=0;"
@@ -815,6 +860,10 @@ static void handleLog()
         "}"
         "analysisCalculated=true;"
         "}"
+        "function showRecovery(){recoverySeen=true;if(recoveryNotice)recoveryNotice.style.display='block';}"
+        "function clearReadError(){if(readErrorNotice)readErrorNotice.style.display='none';if(readErrorDetail)readErrorDetail.textContent='';}"
+        "function showReadError(detail){if(readErrorNotice)readErrorNotice.style.display='block';if(readErrorDetail)readErrorDetail.textContent=detail||'';}"
+        "function responseOrError(r){if(r.ok)return Promise.resolve(r);return r.text().then(function(detail){var e=new Error(detail||('HTTP '+r.status));e.httpStatus=r.status;throw e;});}"
         "function render(scroll){"
             "var q=search.value.trim().toLowerCase();"
             "var shown=rawText;"
@@ -834,18 +883,22 @@ static void handleLog()
         "function loadLog(scroll){"
             "if(loading)return;"
             "loading=true;reload.disabled=true;if(analyzeButton)analyzeButton.disabled=true;"
-            "rawText='';logOffset=0;logGeneration='';analysisCalculated=false;markAnalysisDirty();"
+            "rawText='';logOffset=0;logGeneration='';recoverySeen=false;analysisCalculated=false;markAnalysisDirty();"
+            "if(recoveryNotice)recoveryNotice.style.display='none';clearReadError();"
             "out.textContent='Log wird geladen...';status.textContent=uiLoadingChunks;"
             "function loadNext(attempt){"
                 "fetch('/log_chunk?offset='+encodeURIComponent(logOffset)+'&generation='+encodeURIComponent(logGeneration)+'&t='+Date.now(),{cache:'no-store'})"
-                ".then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);"
+                ".then(responseOrError)"
+                ".then(function(r){"
                     "var reset=r.headers.get('X-Log-Reset')==='1';"
                     "var generation=r.headers.get('X-Log-Generation')||'';"
                     "var next=Number(r.headers.get('X-Log-Offset')||String(logOffset));"
                     "var size=Number(r.headers.get('X-Log-Size')||String(next));"
                     "var more=r.headers.get('X-Log-More')==='1';"
-                    "return r.text().then(function(text){return {text:text,reset:reset,next:next,size:size,more:more,generation:generation};});})"
+                    "var recovered=r.headers.get('X-Log-Recovered')==='1';"
+                    "return r.text().then(function(text){return {text:text,reset:reset,next:next,size:size,more:more,generation:generation,recovered:recovered};});})"
                 ".then(function(x){"
+                    "clearReadError();if(x.recovered)showRecovery();"
                     "if(x.reset)rawText='';"
                     "if(x.text.length)rawText+=x.text;"
                     "logOffset=x.next;"
@@ -863,8 +916,8 @@ static void handleLog()
                 ".catch(function(err){"
                     "if(attempt<2){status.textContent=uiRetry+' ('+(attempt+2)+'/3)';setTimeout(function(){loadNext(attempt+1);},250*(attempt+1));return;}"
                     "loading=false;reload.disabled=false;if(analyzeButton)analyzeButton.disabled=true;"
-                    "status.textContent='Fehler: '+err.message;"
-                    "if(rawText.length){render(false);}else{out.textContent='Log konnte nicht geladen werden: '+err.message;}"
+                    "status.textContent='Log momentan nicht verfügbar';showReadError(err.message);"
+                    "if(rawText.length){render(false);}else{out.textContent='Keine verifizierten Logdaten verfügbar.';}"
                     "markAnalysisDirty();"
                 "});"
             "}"
@@ -874,14 +927,17 @@ static void handleLog()
             "if(!live.checked||loading)return;"
             "loading=true;status.textContent='Prüfe neue Einträge...';"
             "fetch('/log_chunk?offset='+encodeURIComponent(logOffset)+'&generation='+encodeURIComponent(logGeneration)+'&flush=1&t='+Date.now(),{cache:'no-store'})"
-            ".then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);"
+            ".then(responseOrError)"
+            ".then(function(r){"
                 "var reset=r.headers.get('X-Log-Reset')==='1';"
                 "var generation=r.headers.get('X-Log-Generation')||'';"
                 "var next=Number(r.headers.get('X-Log-Offset')||String(logOffset));"
                 "var size=Number(r.headers.get('X-Log-Size')||String(next));"
                 "var more=r.headers.get('X-Log-More')==='1';"
-                "return r.text().then(function(text){return {text:text,reset:reset,next:next,size:size,more:more,generation:generation};});})"
+                "var recovered=r.headers.get('X-Log-Recovered')==='1';"
+                "return r.text().then(function(text){return {text:text,reset:reset,next:next,size:size,more:more,generation:generation,recovered:recovered};});})"
             ".then(function(x){"
+                "clearReadError();if(x.recovered)showRecovery();"
                 "if(x.reset)rawText='';"
                 "if(x.text.length)rawText+=x.text;"
                 "logOffset=x.next;"
@@ -893,7 +949,7 @@ static void handleLog()
                 "loading=false;"
                 "if(x.more&&live.checked)setTimeout(pollLog,80);"
             "})"
-            ".catch(function(err){loading=false;status.textContent='Live-Update Fehler: '+err.message;});"
+            ".catch(function(err){loading=false;status.textContent='Live-Update momentan nicht verfügbar';showReadError(err.message);});"
         "}"
         "function scheduleLive(){"
             "if(liveTimer){clearInterval(liveTimer);liveTimer=0;}"

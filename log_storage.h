@@ -42,6 +42,11 @@ bool logStorageOpenWriter(
 void logStorageCloseWriter(LogStorageWriter &writer);
 void logStorageFlushWriter(LogStorageWriter &writer);
 
+// Append plaintext to the current generation. For SFLOG1, terminal damage from
+// an earlier interrupted write is repaired before append-open, and a detected
+// physical partial-record write is rolled back to the previous authenticated
+// file boundary when possible before this function reports failure. A retry
+// therefore does not knowingly append behind a torn terminal record.
 bool logStorageAppend(
     LogStorageWriter &writer,
     const uint8_t *plaintext,
@@ -66,8 +71,10 @@ bool logStorageGetInfo(
 // Read up to maxPlaintextBytes from the logical plaintext stream. cursor is a
 // physical cursor returned by a previous call (0 starts from the beginning).
 // This keeps live-tail reads efficient without repeatedly decrypting old data.
-// A torn final record is ignored. If a valid later record exists after a torn
-// record, the reader resynchronizes to it and sets recoveredTornRecord=true.
+// An incomplete or authentication-damaged record is never exposed as plaintext.
+// The reader skips damaged records, resynchronizes to later valid records when
+// possible, and preserves an authenticated prefix when only a damaged terminal
+// tail remains. recoveredTornRecord=true reports that recovery occurred.
 bool logStorageReadChunk(
     const String &path,
     uint64_t cursor,

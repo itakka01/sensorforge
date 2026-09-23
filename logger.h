@@ -6,6 +6,13 @@ void logInit();
 void logClose();
 void logWrite(const String &msg);
 void logFlush();
+
+// Main-loop durability service. The caller should invoke this only while SD
+// storage is available and no recorder/exclusive storage operation owns it.
+// It enforces a maximum RAM residence time for buffered log lines so a paused
+// or idle Power Shooter cannot leave diagnostics unpersisted indefinitely.
+void logService();
+
 void logBlankLine();
 
 // Clears the active log generation and its .1 rotation backup, then reopens

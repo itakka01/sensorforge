@@ -13805,9 +13805,25 @@ void loop() {
     }
 
 
-    // Service persistence before sampling. A due flush is harmless while the
-    // recorder owns storage: it simply remains queued until the recorder stops.
+    // Service persistence before sampling. A due shooter flush is harmless
+    // while the recorder owns storage: it simply remains queued until the
+    // recorder stops.
     continuousShooterServiceFlush();
+
+    // Logger batching normally co-flushes immediately after a successful Power
+    // Shooter media flush. If the shooter is paused (for example by WebConfig)
+    // or accepts no frames for a long time, there may be no media flush at all.
+    // Enforce the logger's independent maximum RAM-residence deadline whenever
+    // storage is otherwise safe to use.
+    if (
+        sdReady &&
+        !recording &&
+        !recorderIsOpen() &&
+        !g_storageLocked &&
+        !syncApiExclusiveActive()
+    ) {
+        logService();
+    }
 
     // Keep the shooter clock serviced even while an alarm video is running.
     // The fixed slot is consumed before capture, so an overlapping alarm skips

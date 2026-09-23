@@ -373,6 +373,12 @@ static bool createEncryptedFile(
     return true;
 }
 
+static bool repairEncryptedTerminalTailBeforeAppend(
+    LogStorageWriter &writer,
+    String &error
+);
+
+
 static bool openEncryptedWriterDirect(
     const String &path,
     LogStorageWriter &writer,
@@ -424,17 +430,45 @@ static bool openEncryptedWriterDirect(
         return false;
     }
 
-    writer.file = STORAGE.open(path.c_str(), FILE_APPEND);
+    writer.path = path;
+    writer.encrypted = true;
+
+    // A power loss can leave the final SFLOG1 record physically incomplete or
+    // authentication-damaged before the firmware gets a chance to execute the
+    // runtime rollback path. Repair only such terminal damage before appending
+    // new records. Older mid-file recovery gaps that already have later valid
+    // records are preserved for the reader instead of discarding good history.
+    String repairError;
+
+    if (!repairEncryptedTerminalTailBeforeAppend(
+            writer,
+            repairError
+        )) {
+        psa_destroy_key(writer.keyId);
+        writer.keyId = 0;
+        writer.path = "";
+        writer.encrypted = false;
+        error =
+            "cannot repair SFLOG1 terminal tail before append: " +
+            repairError;
+        return false;
+    }
+
+    // A successful terminal-tail repair already reopens the writer at the
+    // authenticated boundary. Otherwise open the untouched generation now.
+    if (!writer.file) {
+        writer.file = STORAGE.open(path.c_str(), FILE_APPEND);
+    }
 
     if (!writer.file) {
         psa_destroy_key(writer.keyId);
         writer.keyId = 0;
+        writer.path = "";
+        writer.encrypted = false;
         error = "cannot open SFLOG1 for append: " + path;
         return false;
     }
 
-    writer.path = path;
-    writer.encrypted = true;
     return true;
 }
 
@@ -458,6 +492,13 @@ static bool openPlainWriterDirect(
     writer.encrypted = false;
     return true;
 }
+
+static bool rollbackEncryptedAppend(
+    LogStorageWriter &writer,
+    uint64_t recordOffset,
+    String &error
+);
+
 
 static bool appendEncryptedRecord(
     LogStorageWriter &writer,
@@ -591,7 +632,24 @@ static bool appendEncryptedRecord(
     secureWipe(ciphertext, sizeof(ciphertext));
 
     if (!ok) {
-        error = "SFLOG1 physical write failed";
+        String rollbackError;
+
+        bool rollbackOk =
+            rollbackEncryptedAppend(
+                writer,
+                recordOffset,
+                rollbackError
+            );
+
+        if (rollbackOk) {
+            error =
+                "SFLOG1 physical write failed; partial record rolled back";
+        } else {
+            error =
+                "SFLOG1 physical write failed; rollback failed: " +
+                rollbackError;
+        }
+
         return false;
     }
 
@@ -608,6 +666,210 @@ static String migrationBackupPath(const String &path)
 {
     return path + ".sflog.migrate";
 }
+
+
+static bool reopenWriterAfterRollbackFailure(
+    LogStorageWriter &writer
+)
+{
+    if (!writer.path.length())
+        return false;
+
+    writer.file =
+        STORAGE.open(
+            writer.path.c_str(),
+            FILE_APPEND
+        );
+
+    return (bool)writer.file;
+}
+
+
+static bool rollbackEncryptedAppend(
+    LogStorageWriter &writer,
+    uint64_t recordOffset,
+    String &error
+)
+{
+    error = "";
+
+    if (!writer.path.length()) {
+        error = "log writer path unavailable";
+        return false;
+    }
+
+    // SensorForge rotates logs near 5 MiB. Keep the rollback bounded to the
+    // same 32-bit file-offset range used throughout the existing storage code
+    // and fail closed on an impossible/corrupt writer state.
+    if (recordOffset > 0xFFFFFFFFULL) {
+        error = "rollback offset out of range";
+        return false;
+    }
+
+    if (writer.file) {
+        writer.file.flush();
+        writer.file.close();
+    }
+
+    String temp =
+        migrationTempPath(writer.path);
+
+    String backup =
+        migrationBackupPath(writer.path);
+
+    if (STORAGE.exists(temp.c_str()))
+        STORAGE.remove(temp.c_str());
+
+    if (STORAGE.exists(backup.c_str()))
+        STORAGE.remove(backup.c_str());
+
+    File source =
+        STORAGE.open(
+            writer.path.c_str(),
+            FILE_READ
+        );
+
+    if (!source) {
+        error = "cannot open damaged SFLOG1 file for rollback";
+        reopenWriterAfterRollbackFailure(writer);
+        return false;
+    }
+
+    if ((uint64_t)source.size() < recordOffset) {
+        source.close();
+        error = "damaged SFLOG1 file is shorter than rollback offset";
+        reopenWriterAfterRollbackFailure(writer);
+        return false;
+    }
+
+    File target =
+        STORAGE.open(
+            temp.c_str(),
+            FILE_WRITE
+        );
+
+    if (!target) {
+        source.close();
+        error = "cannot create SFLOG1 rollback file";
+        reopenWriterAfterRollbackFailure(writer);
+        return false;
+    }
+
+    uint8_t buffer[512];
+    uint64_t remaining =
+        recordOffset;
+
+    bool copyOk = true;
+
+    while (remaining > 0) {
+        size_t wanted =
+            remaining > sizeof(buffer)
+            ? sizeof(buffer)
+            : (size_t)remaining;
+
+        size_t got =
+            source.read(
+                buffer,
+                wanted
+            );
+
+        if (got != wanted ||
+            !writeAll(
+                target,
+                buffer,
+                got
+            )) {
+            copyOk = false;
+            break;
+        }
+
+        remaining -= got;
+    }
+
+    secureWipe(buffer, sizeof(buffer));
+    target.flush();
+    target.close();
+    source.close();
+
+    if (!copyOk || remaining != 0) {
+        STORAGE.remove(temp.c_str());
+        error = "cannot copy authenticated SFLOG1 prefix for rollback";
+        reopenWriterAfterRollbackFailure(writer);
+        return false;
+    }
+
+    File verify =
+        STORAGE.open(
+            temp.c_str(),
+            FILE_READ
+        );
+
+    if (!verify ||
+        (uint64_t)verify.size() != recordOffset) {
+        if (verify)
+            verify.close();
+
+        STORAGE.remove(temp.c_str());
+        error = "SFLOG1 rollback prefix verification failed";
+        reopenWriterAfterRollbackFailure(writer);
+        return false;
+    }
+
+    verify.close();
+
+    // Reuse the same crash-recovery artifacts as plaintext->SFLOG1 migration.
+    // If power fails after staging the original away, recoverMigrationArtifacts()
+    // will promote the complete prefix temp file on the next open/boot.
+    if (!STORAGE.rename(
+            writer.path.c_str(),
+            backup.c_str()
+        )) {
+        STORAGE.remove(temp.c_str());
+        error = "cannot stage damaged SFLOG1 file for rollback";
+        reopenWriterAfterRollbackFailure(writer);
+        return false;
+    }
+
+    if (!STORAGE.rename(
+            temp.c_str(),
+            writer.path.c_str()
+        )) {
+        bool restored =
+            STORAGE.rename(
+                backup.c_str(),
+                writer.path.c_str()
+            );
+
+        if (restored && STORAGE.exists(temp.c_str()))
+            STORAGE.remove(temp.c_str());
+
+        error = "cannot commit SFLOG1 rollback";
+        reopenWriterAfterRollbackFailure(writer);
+        return false;
+    }
+
+    STORAGE.remove(backup.c_str());
+
+    writer.file =
+        STORAGE.open(
+            writer.path.c_str(),
+            FILE_APPEND
+        );
+
+    if (!writer.file) {
+        error = "cannot reopen SFLOG1 file after rollback";
+        return false;
+    }
+
+    if ((uint64_t)writer.file.size() != recordOffset) {
+        writer.file.close();
+        error = "SFLOG1 rollback size verification failed";
+        return false;
+    }
+
+    return true;
+}
+
 
 static bool recoverMigrationArtifacts(
     const String &path,
@@ -1021,6 +1283,191 @@ static bool decryptRecordAt(
     return true;
 }
 
+
+static bool repairEncryptedTerminalTailBeforeAppend(
+    LogStorageWriter &writer,
+    String &error
+)
+{
+    error = "";
+
+    if (
+        !writer.path.length() ||
+        !writer.encrypted ||
+        writer.keyId == 0
+    ) {
+        error = "invalid SFLOG1 repair state";
+        return false;
+    }
+
+    File file =
+        STORAGE.open(
+            writer.path.c_str(),
+            FILE_READ
+        );
+
+    if (!file) {
+        error = "cannot open SFLOG1 file for terminal-tail scan";
+        return false;
+    }
+
+    uint64_t physicalSize =
+        file.size();
+
+    if (physicalSize <= SFLOG_HEADER_BYTES) {
+        file.close();
+        return true;
+    }
+
+    // A torn append can affect only the terminal record being written. Scan a
+    // small bounded tail instead of decrypting the complete (up to 5 MiB) log
+    // on every logger open. Eight maximum-sized records leave ample room for a
+    // valid predecessor plus false magic bytes inside encrypted payload.
+    static const uint64_t TAIL_SCAN_BYTES =
+        (uint64_t)SFLOG_MAX_RECORD_TOTAL * 8ULL;
+
+    uint64_t scanStart =
+        physicalSize >
+            SFLOG_HEADER_BYTES + TAIL_SCAN_BYTES
+        ? physicalSize - TAIL_SCAN_BYTES
+        : SFLOG_HEADER_BYTES;
+
+    if (!file.seek((uint32_t)scanStart)) {
+        file.close();
+        error = "cannot seek SFLOG1 terminal tail";
+        return false;
+    }
+
+    static const size_t MAX_TAIL_MAGIC_CANDIDATES = 24;
+    uint64_t candidates[MAX_TAIL_MAGIC_CANDIDATES] = {};
+    size_t candidateCount = 0;
+
+    uint8_t window[sizeof(SFLOG_RECORD_MAGIC)] = {};
+    size_t filled = 0;
+    uint64_t position = scanStart;
+
+    while (position < physicalSize) {
+        int value = file.read();
+
+        if (value < 0)
+            break;
+
+        if (filled < sizeof(window)) {
+            window[filled++] = (uint8_t)value;
+        } else {
+            memmove(
+                window,
+                window + 1,
+                sizeof(window) - 1U
+            );
+            window[sizeof(window) - 1U] =
+                (uint8_t)value;
+        }
+
+        ++position;
+
+        if (
+            filled == sizeof(window) &&
+            memcmp(
+                window,
+                SFLOG_RECORD_MAGIC,
+                sizeof(window)
+            ) == 0
+        ) {
+            uint64_t candidate =
+                position - sizeof(window);
+
+            if (candidateCount < MAX_TAIL_MAGIC_CANDIDATES) {
+                candidates[candidateCount++] = candidate;
+            } else {
+                memmove(
+                    candidates,
+                    candidates + 1,
+                    sizeof(candidates) - sizeof(candidates[0])
+                );
+                candidates[MAX_TAIL_MAGIC_CANDIDATES - 1U] =
+                    candidate;
+            }
+        }
+    }
+
+    // Work backwards. The first successfully authenticated candidate is the
+    // latest trustworthy record in the file. If it already ends at physical
+    // EOF the tail is clean. Otherwise everything after its authenticated end
+    // is a terminal torn/corrupt append and can be removed safely.
+    for (size_t i = candidateCount; i > 0; --i) {
+        uint64_t candidate =
+            candidates[i - 1U];
+
+        uint8_t plaintext[SFLOG_MAX_RECORD_PLAINTEXT] = {};
+        size_t plaintextLength = 0;
+        uint64_t afterRecord = candidate;
+        bool incomplete = false;
+        String recordError;
+
+        bool recordOk =
+            decryptRecordAt(
+                file,
+                writer.keyId,
+                writer.fileNonce,
+                candidate,
+                physicalSize,
+                plaintext,
+                plaintextLength,
+                afterRecord,
+                incomplete,
+                recordError
+            );
+
+        secureWipe(plaintext, sizeof(plaintext));
+
+        if (!recordOk)
+            continue;
+
+        file.close();
+
+        if (afterRecord == physicalSize)
+            return true;
+
+        if (afterRecord < physicalSize) {
+            return
+                rollbackEncryptedAppend(
+                    writer,
+                    afterRecord,
+                    error
+                );
+        }
+
+        error = "authenticated SFLOG1 tail extends beyond file size";
+        return false;
+    }
+
+    file.close();
+
+    // If the file contains at most one possible record after the authenticated
+    // header, failure to authenticate any candidate can only describe a torn
+    // first append. Resetting to the header is therefore safe and prevents the
+    // first good record after reboot from being written behind corrupt bytes.
+    if (
+        physicalSize <=
+            (uint64_t)SFLOG_HEADER_BYTES +
+            (uint64_t)SFLOG_MAX_RECORD_TOTAL
+    ) {
+        return
+            rollbackEncryptedAppend(
+                writer,
+                SFLOG_HEADER_BYTES,
+                error
+            );
+    }
+
+    // Otherwise no authenticated candidate was found in the bounded tail. Do
+    // not make a destructive guess. The v36+ reader can still resynchronize
+    // around damage, and a later explicit recovery can diagnose the generation.
+    return true;
+}
+
+
 } // namespace
 
 String logStorageRotatedPath(const String &path)
@@ -1427,16 +1874,27 @@ bool logStorageReadChunk(
                 // Power loss while the last record was being appended. Ignore
                 // only this incomplete tail. A future append starts at the
                 // current physical EOF and the live cursor will resume there.
+                recoveredTornRecord = true;
                 current = physicalSize;
                 break;
             }
 
-            psa_destroy_key(keyId);
-            file.close();
-            error = recordError.length()
-                ? recordError
-                : String("invalid SFLOG1 record");
-            return false;
+            // A complete-looking final record can still be damaged (for example
+            // a torn SD-sector write where the header/declared length survived
+            // but the AES-GCM ciphertext/tag did not). The file header has
+            // already verified that this generation belongs to the current
+            // board key, and decryptRecordAt() never releases unauthenticated
+            // plaintext. If no later SFLOG1 record marker exists, preserve the
+            // authenticated prefix and discard only this unreadable terminal
+            // tail instead of making the entire log unavailable.
+            //
+            // If valid records are appended later, their first record starts at
+            // the previous physical EOF; a live reader cursor parked there can
+            // therefore continue normally on the next request.
+            recoveredTornRecord = true;
+            body += "\r\n";
+            current = physicalSize;
+            break;
         }
 
         if (

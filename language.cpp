@@ -340,6 +340,7 @@ static const UiTextEntry UI_TEXTS[] = {
     {"Geschätzt bis Aufnahmestopp", "Estimated until recording stop"}, // UI_SHOOTER_EST_UNTIL_STOP
     {"noch zu wenig Daten", "not enough data yet"}, // UI_SHOOTER_EST_WAITING
     {"Grobe Schätzung aus bisheriger Filterquote und JPEG-Größe; Dateisystem-/Verschlüsselungs-Overhead ist nicht eingerechnet.", "Rough estimate from the observed filter ratio and JPEG size; filesystem/encryption overhead is not included."}, // UI_SHOOTER_EST_NOTE
+    {"SD-Wartung", "SD maintenance"}, // UI_NAV_SD_MAINTENANCE
 };
 
 static_assert(
