@@ -30,7 +30,8 @@ extern int cfg_recording_encryption;  // 0/1, encrypt newly created video/snapsh
 
 // Optional audio capture policy. Hardware source/backend/pins are independent
 // from the output format so board-integrated and user-wired microphones feed the
-// same capture API. Container muxing can consume the same PCM interface later.
+// same capture API. Normal MKV recordings can embed this PCM directly; AVI
+// remains video-only in the current production path.
 extern int cfg_audio_enabled;          // 0/1
 // User mode uses board_default. Expert mode can select/configure an external
 // microphone without requiring a separate firmware image.

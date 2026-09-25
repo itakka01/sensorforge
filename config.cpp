@@ -2117,7 +2117,7 @@ static bool validateValues(
             }
 
             // 24-bit DMA packing is intentionally not enabled yet. 16-bit PCM
-            // is the qualified common denominator for WAV and future MKV muxing.
+            // is the qualified common denominator for WAV and MKV muxing.
             if (values.audioBitsPerSample != 16) {
                 error = "external I2S currently supports 16-bit PCM";
                 return false;

@@ -9,6 +9,42 @@ and identifies the concrete binary compilation time.
 > change sequence beginning with v23. Earlier development history remains in the
 > repository history/project documentation.
 
+## v53 — 2026-09-25
+
+- Added production audio muxing to normal MKV recordings. When `audio_enabled=1`,
+  the configured generic PCM capture source is embedded as Matroska Track 3 using
+  `A_PCM/INT/LIT`; video remains Track 1 and timestamp subtitles remain Track 2.
+- Audio capture starts with the first real camera frame so the PCM and video
+  timelines share the same zero point. PCM block timestamps are derived from the
+  number of muxed samples; audio is drained around video-frame timestamps to keep
+  Matroska Cluster ordering monotonic across Cluster rotations.
+- Finalization gives the capture task a short bounded tail-drain window and patches
+  MKV Duration to cover the longer of video or embedded audio. Segment rotation
+  therefore restarts A/V synchronization cleanly for every recording segment.
+- Audio backend/start/runtime failure is deliberately non-fatal to video: SensorForge
+  logs the audio warning and keeps the MKV video recording running. Shared MKV/SD
+  write failures remain fatal because video and audio use the same container file.
+- Embedded audio inherits the existing `RecordingStorageFile` path and therefore the
+  same `recording_encryption` policy as the MKV video. No plaintext audio sidecar is
+  created when recording encryption is enabled.
+- Sparse Power-Shooter MKVs remain intentionally image-only. AVI also remains
+  video-only; WebConfig automatically selects MKV whenever Audio is switched on,
+  and the recorder logs a warning for manually supplied legacy AVI+audio configs.
+- Reworked the 10-second capture-only Audio load test into a customer-facing
+  GREEN/ORANGE/RED assessment. It rates delivery ratio, dropped bytes, PSRAM-ring
+  high-water, maximum drain gap, minimum internal heap and minimum free PSRAM
+  independently, then uses the worst criterion as the overall verdict.
+- Initial GREEN limits are deliberately conservative: delivery >=98%, zero drops,
+  ring high-water <50%, drain gap <=500 ms, internal heap >=64 KiB and free PSRAM
+  >=512 KiB. RED begins below 95% delivery, at >=1% dropped audio, >=90% ring use,
+  >2 s drain gap, <32 KiB internal heap or <256 KiB free PSRAM; intermediate values
+  are ORANGE. Raw engineering measurements remain available under Technical details.
+- The capture-only benchmark explicitly remains a subsystem test. Production load
+  qualification still requires a real camera + MKV + audio + SD + optional SFENC1
+  recording on hardware. The current SensorForge WebPlayer continues to parse the
+  MJPEG/subtitle tracks and does not yet play the new PCM track; downloaded MKV files
+  can be used for the first audio-container qualification.
+
 ## v52 — 2026-09-25
 
 - Simplified the normal WebConfig audio section to the single operator-facing

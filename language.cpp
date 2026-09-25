@@ -371,9 +371,24 @@ static const UiTextEntry UI_TEXTS[] = {
     {"Mikrofon, PSRAM-Puffer und Speicherpfad werden geprüft. Die Seite wechselt nach Abschluss automatisch zum Ergebnis.", "Microphone, PSRAM buffering and the storage path are being tested. The page changes to the result automatically when finished."}, // UI_AUDIO_TEST_RUNNING_HELP
     {"Die Bewegung des Balkens zeigt Aktivität, keinen künstlichen Prozentwert.", "The moving bar indicates activity, not an artificial percentage."}, // UI_AUDIO_PROGRESS_NOTE
     {"Audio-Belastungstest", "Audio load test"}, // UI_AUDIO_BENCHMARK
-    {"Prüft den Capture-Pfad ohne SD-Schreiblast und meldet Datenrate, Drops, Puffer-High-Water sowie Heap/PSRAM-Verhalten. Ein echter Video+Audio-Stresstest folgt nach der MKV-Integration.", "Tests the capture path without SD write load and reports data rate, drops, buffer high-water and heap/PSRAM behavior. A real video+audio stress test follows after MKV integration."}, // UI_AUDIO_BENCHMARK_HELP
+    {"Prüft bewusst nur den Audio-Capture-Pfad ohne SD-Schreiblast. Für die Produktionsqualifikation zusätzlich eine echte MKV-Aufnahme mit Kamera + Audio + SD und gegebenenfalls Verschlüsselung testen.", "Deliberately tests only the audio capture path without SD write load. For production qualification, also test a real MKV recording with camera + audio + SD and encryption when enabled."}, // UI_AUDIO_BENCHMARK_HELP
     {"Audio-Belastungstest läuft", "Audio load test running"}, // UI_AUDIO_BENCHMARK_RUNNING
     {"Der Audio-Capture-Pfad wird 10 Sekunden belastet und vermessen. Es wird dabei keine Benchmark-Audiodatei auf SD geschrieben.", "The audio capture path is stressed and measured for 10 seconds. No benchmark audio file is written to SD."}, // UI_AUDIO_BENCHMARK_RUNNING_HELP
+    {"Bei Audio = an verwendet SensorForge für normale Aufnahmen automatisch MKV. AVI bleibt vorerst video-only.", "When Audio = on, SensorForge automatically uses MKV for normal recordings. AVI remains video-only for now."}, // UI_AUDIO_MKV_REQUIRED
+    {"AUDIO CAPTURE GOOD", "AUDIO CAPTURE GOOD"}, // UI_AUDIO_LOAD_GOOD
+    {"AUDIO CAPTURE PRÜFEN", "CHECK AUDIO CAPTURE"}, // UI_AUDIO_LOAD_CHECK
+    {"AUDIO CAPTURE NICHT EMPFOHLEN", "AUDIO CAPTURE NOT RECOMMENDED"}, // UI_AUDIO_LOAD_NOT_RECOMMENDED
+    {"Bewertet nur Mikrofon, Capture-Task und PSRAM-Puffer. Kamera, MKV, SD und Verschlüsselung sind in diesem Test nicht gleichzeitig aktiv.", "Rates only microphone, capture task and PSRAM buffering. Camera, MKV, SD and encryption are not active simultaneously in this test."}, // UI_AUDIO_LOAD_SCOPE
+    {"Datenrate", "Data delivery"}, // UI_AUDIO_LOAD_DELIVERY
+    {"Verlorene Audiodaten", "Dropped audio"}, // UI_AUDIO_LOAD_DROPS
+    {"PSRAM-Puffer", "PSRAM buffer"}, // UI_AUDIO_LOAD_BUFFER
+    {"Drain-Timing", "Drain timing"}, // UI_AUDIO_LOAD_DRAIN
+    {"Interner Heap", "Internal heap"}, // UI_AUDIO_LOAD_HEAP
+    {"Freies PSRAM", "Free PSRAM"}, // UI_AUDIO_LOAD_PSRAM
+    {"Technische Messwerte", "Technical measurements"}, // UI_AUDIO_LOAD_TECH_DETAILS
+    {"GRÜN", "GREEN"}, // UI_AUDIO_LOAD_GREEN
+    {"ORANGE", "ORANGE"}, // UI_AUDIO_LOAD_ORANGE
+    {"ROT", "RED"}, // UI_AUDIO_LOAD_RED
     {"SD-Wartung", "SD maintenance"}, // UI_NAV_SD_MAINTENANCE
 };
 

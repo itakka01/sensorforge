@@ -2,6 +2,7 @@
 
 #include "board_config.h"
 #include "config.h"
+#include "audio_capture.h"
 #include "logger.h"
 #include "image_motion.h"
 #include "recording_storage.h"
@@ -26,9 +27,16 @@
 //   Start time = Block timestamp.
 //   Display time = BlockDuration.
 //
+// Audio:
+//   Track 3
+//   CodecID = A_PCM/INT/LIT
+//   Packed little-endian PCM from the generic audio_capture subsystem.
+//
 // TimestampScale = 1,000,000 ns => one Matroska tick = 1 ms.
 //
-// No audio.
+// Audio is optional and deliberately non-fatal: capture/backend failure leaves
+// the video recording running. Shared storage write failures remain fatal.
+//
 // No JPEG decoding/re-encoding.
 // =============================================================
 
@@ -53,6 +61,19 @@ static uint64_t nextSubtitleMs      = 0;
 static bool mkvSparseMode           = false;
 static uint64_t mkvLastFrameTimeMs  = 0;
 static uint32_t mkvSparseTailMs     = 1;
+
+
+// Optional production audio state. Audio is embedded only in normal MKV
+// recordings, never in sparse shooter MKVs.
+static bool audioRequested = false;
+static bool audioTrackEnabled = false;
+static bool audioCaptureStarted = false;
+static bool audioRuntimeFailed = false;
+static AudioFormat mkvAudioFormat = {0, 0, 0};
+static uint64_t audioBytesWritten = 0;
+static uint64_t audioLastEndTimeMs = 0;
+static AudioCaptureStats finalAudioStats = {};
+static uint8_t audioMuxBuffer[4080];
 
 
 // Keep files below 4 GiB for broad FAT32/storage compatibility.
@@ -104,6 +125,11 @@ static const uint32_t ID_LANGUAGE     = 0x22B59C;
 static const uint32_t ID_VIDEO        = 0xE0;
 static const uint32_t ID_PIXEL_WIDTH  = 0xB0;
 static const uint32_t ID_PIXEL_HEIGHT = 0xBA;
+
+static const uint32_t ID_AUDIO               = 0xE1;
+static const uint32_t ID_SAMPLING_FREQUENCY  = 0xB5;
+static const uint32_t ID_CHANNELS            = 0x9F;
+static const uint32_t ID_BIT_DEPTH           = 0x6264;
 
 static const uint32_t ID_CLUSTER       = 0x1F43B675;
 static const uint32_t ID_TIMESTAMP     = 0xE7;
@@ -952,6 +978,58 @@ static bool writeMatroskaHeader(
         return false;
 
 
+    // ---------------- Audio Track ----------------
+
+    if (audioTrackEnabled) {
+
+        MasterMark audioTrack;
+
+        if (!beginMaster(
+                ID_TRACK_ENTRY,
+                audioTrack
+            )) {
+            return false;
+        }
+
+        writeUIntElement(ID_TRACK_NUMBER, 3);
+        writeUIntElement(ID_TRACK_UID, 3);
+        writeUIntElement(ID_TRACK_TYPE, 2);
+        writeUIntElement(ID_FLAG_ENABLED, 1);
+        writeUIntElement(ID_FLAG_DEFAULT, 1);
+        writeUIntElement(ID_FLAG_LACING, 0);
+
+        writeStringElement(ID_CODEC_ID, "A_PCM/INT/LIT");
+        writeStringElement(ID_NAME, "Audio");
+        writeStringElement(ID_LANGUAGE, "und");
+
+        MasterMark audio;
+
+        if (!beginMaster(ID_AUDIO, audio))
+            return false;
+
+        writeFloat64Element(
+            ID_SAMPLING_FREQUENCY,
+            (double)mkvAudioFormat.sampleRate
+        );
+
+        writeUIntElement(
+            ID_CHANNELS,
+            mkvAudioFormat.channels
+        );
+
+        writeUIntElement(
+            ID_BIT_DEPTH,
+            mkvAudioFormat.bitsPerSample
+        );
+
+        if (!endMaster(audio))
+            return false;
+
+        if (!endMaster(audioTrack))
+            return false;
+    }
+
+
     // ---------------- Subtitle Track ----------------
 
     if (subtitleTrackEnabled) {
@@ -1124,6 +1202,301 @@ static bool ensureClusterForTime(
         );
     }
 
+
+    return true;
+}
+
+
+// =============================================================
+// AUDIO PCM BLOCKS
+// =============================================================
+
+static uint64_t audioByteRate()
+{
+    if (
+        mkvAudioFormat.sampleRate == 0 ||
+        mkvAudioFormat.channels == 0 ||
+        mkvAudioFormat.bitsPerSample == 0
+    ) {
+        return 0;
+    }
+
+    return
+        (uint64_t)mkvAudioFormat.sampleRate *
+        (uint64_t)mkvAudioFormat.channels *
+        (uint64_t)(mkvAudioFormat.bitsPerSample / 8U);
+}
+
+
+static uint64_t audioTimestampMsForBytes(
+    uint64_t bytes
+)
+{
+    uint64_t rate = audioByteRate();
+
+    if (rate == 0)
+        return 0;
+
+    return
+        (bytes * 1000ULL) /
+        rate;
+}
+
+
+static void collectAndStopAudioCapture()
+{
+    if (!audioCaptureStarted)
+        return;
+
+    finalAudioStats =
+        audioCaptureStats();
+
+    audioCaptureStop();
+    audioCaptureStarted = false;
+}
+
+
+static void disableAudioAfterRuntimeFailure(
+    const String &reason
+)
+{
+    if (!audioRuntimeFailed) {
+        audioRuntimeFailed = true;
+
+        consoleWrite(
+            "REC",
+            "WARN | MKV audio stopped | " + reason
+        );
+
+        logWrite(
+            "Recording WARN | MKV audio stopped | " + reason
+        );
+    }
+
+    collectAndStopAudioCapture();
+}
+
+
+static bool writeAudioBlock(
+    const uint8_t *pcmData,
+    size_t pcmBytes,
+    uint64_t timestampMs
+)
+{
+    if (
+        !audioTrackEnabled ||
+        !pcmData ||
+        pcmBytes == 0
+    ) {
+        return true;
+    }
+
+    if (!ensureClusterForTime(timestampMs))
+        return false;
+
+    if (timestampMs < clusterTimestampMs)
+        return false;
+
+    uint64_t relative64 =
+        timestampMs - clusterTimestampMs;
+
+    if (relative64 > 32767ULL) {
+        Serial.println("MKV: audio timestamp outside Cluster range");
+        writeFailed = true;
+        return false;
+    }
+
+    uint64_t blockPayloadSize =
+        1ULL +
+        2ULL +
+        1ULL +
+        (uint64_t)pcmBytes;
+
+    uint64_t totalWriteSize =
+        elementIdLength(ID_SIMPLE_BLOCK) +
+        vintSizeLength(blockPayloadSize) +
+        blockPayloadSize;
+
+    uint64_t nextFileSize =
+        (uint64_t)mkvFile.size() +
+        totalWriteSize +
+        64ULL;
+
+    if (nextFileSize > MKV_MAX_FILE_SIZE) {
+        if (!sizeLimitHit) {
+            Serial.println("MKV: file size limit reached by audio");
+            sizeLimitHit = true;
+        }
+        return false;
+    }
+
+    if (!writeElementId(ID_SIMPLE_BLOCK))
+        return false;
+
+    if (!writeVintSize(blockPayloadSize))
+        return false;
+
+    // Track 3 as EBML VINT.
+    if (!writeByte(0x83))
+        return false;
+
+    if (!writeInt16BE((int16_t)relative64))
+        return false;
+
+    // PCM: no lacing, no keyframe semantics required.
+    if (!writeByte(0x00))
+        return false;
+
+    if (!writeRaw(pcmData, pcmBytes))
+        return false;
+
+    audioBytesWritten +=
+        (uint64_t)pcmBytes;
+
+    uint64_t rate = audioByteRate();
+
+    if (rate > 0) {
+        audioLastEndTimeMs =
+            (
+                audioBytesWritten * 1000ULL +
+                rate - 1ULL
+            ) /
+            rate;
+    }
+
+    return true;
+}
+
+
+static bool drainAudioUntil(
+    uint64_t timestampLimitMs,
+    bool includeEqualStart
+)
+{
+    if (
+        !audioTrackEnabled ||
+        !audioCaptureStarted ||
+        audioRuntimeFailed
+    ) {
+        return true;
+    }
+
+    uint32_t bytesPerSample =
+        mkvAudioFormat.bitsPerSample / 8U;
+
+    size_t blockAlign =
+        (size_t)mkvAudioFormat.channels *
+        (size_t)bytesPerSample;
+
+    if (blockAlign == 0) {
+        disableAudioAfterRuntimeFailure("invalid PCM block alignment");
+        return true;
+    }
+
+    while (true) {
+        uint64_t blockTimeMs =
+            audioTimestampMsForBytes(audioBytesWritten);
+
+        if (
+            includeEqualStart
+            ? blockTimeMs > timestampLimitMs
+            : blockTimeMs >= timestampLimitMs
+        ) {
+            break;
+        }
+
+        size_t available =
+            audioCaptureBufferedBytes();
+
+        size_t toRead =
+            available < sizeof(audioMuxBuffer)
+            ? available
+            : sizeof(audioMuxBuffer);
+
+        toRead -=
+            toRead % blockAlign;
+
+        if (toRead == 0)
+            break;
+
+        size_t got =
+            audioCaptureRead(
+                audioMuxBuffer,
+                toRead,
+                0
+            );
+
+        if (got == 0)
+            break;
+
+        if (got % blockAlign) {
+            disableAudioAfterRuntimeFailure(
+                "unaligned PCM block from capture backend"
+            );
+            return true;
+        }
+
+        if (!writeAudioBlock(
+                audioMuxBuffer,
+                got,
+                blockTimeMs
+            )) {
+            return false;
+        }
+
+        if (writeFailed || sizeLimitHit)
+            return false;
+    }
+
+    return true;
+}
+
+
+static bool drainAudioToRecordingEnd(
+    uint64_t targetDurationMs
+)
+{
+    if (
+        !audioTrackEnabled ||
+        !audioCaptureStarted ||
+        audioRuntimeFailed
+    ) {
+        return true;
+    }
+
+    // Give the capture task a short bounded opportunity to deliver final PCM
+    // up to the video endpoint instead of truncating the audio tail merely
+    // because the last camera frame was just written.
+    uint32_t deadline =
+        millis() + 250UL;
+
+    while (
+        audioTimestampMsForBytes(audioBytesWritten) <
+            targetDurationMs
+    ) {
+        uint64_t before =
+            audioBytesWritten;
+
+        if (!drainAudioUntil(
+                targetDurationMs,
+                true
+            )) {
+            return false;
+        }
+
+        if (
+            audioTimestampMsForBytes(audioBytesWritten) >=
+                targetDurationMs
+        ) {
+            break;
+        }
+
+        if ((int32_t)(deadline - millis()) <= 0)
+            break;
+
+        if (audioBytesWritten == before)
+            delay(2);
+    }
 
     return true;
 }
@@ -1448,6 +1821,46 @@ void mkvStart(
     mkvLastFrameTimeMs = 0;
     mkvSparseTailMs = 1;
 
+    audioRequested =
+        cfg_audio_enabled != 0;
+
+    audioTrackEnabled = false;
+    audioCaptureStarted = false;
+    audioRuntimeFailed = false;
+    audioBytesWritten = 0;
+    audioLastEndTimeMs = 0;
+    finalAudioStats = {};
+
+    mkvAudioFormat.sampleRate =
+        (uint32_t)cfg_audio_sample_rate;
+
+    mkvAudioFormat.bitsPerSample =
+        (uint16_t)cfg_audio_bits_per_sample;
+
+    mkvAudioFormat.channels =
+        (uint8_t)cfg_audio_channels;
+
+    if (audioRequested) {
+        String audioError;
+
+        if (!audioCaptureFormatSupported(
+                mkvAudioFormat,
+                audioError
+            )) {
+
+            audioRequested = false;
+
+            consoleWrite(
+                "REC",
+                "WARN | MKV audio unavailable | " + audioError
+            );
+
+            logWrite(
+                "Recording WARN | MKV audio unavailable | " + audioError
+            );
+        }
+    }
+
 
     recordingStartEpoch =
         time(nullptr);
@@ -1547,6 +1960,35 @@ void mkvAddFrame()
 
     if (!headerWritten) {
 
+        if (audioRequested) {
+            String audioError;
+
+            if (audioCaptureStart(
+                    mkvAudioFormat,
+                    audioError
+                )) {
+
+                audioCaptureStarted = true;
+                audioTrackEnabled = true;
+
+            } else {
+
+                audioRequested = false;
+                audioTrackEnabled = false;
+
+                consoleWrite(
+                    "REC",
+                    "WARN | MKV audio start failed, continuing video-only | " +
+                    audioError
+                );
+
+                logWrite(
+                    "Recording WARN | MKV audio start failed, continuing video-only | " +
+                    audioError
+                );
+            }
+        }
+
         if (!writeMatroskaHeader(
                 (uint16_t)fb->width,
                 (uint16_t)fb->height
@@ -1557,6 +1999,7 @@ void mkvAddFrame()
             );
 
             writeFailed = true;
+            collectAndStopAudioCapture();
 
             esp_camera_fb_return(fb);
 
@@ -1586,6 +2029,21 @@ void mkvAddFrame()
             1000ULL
         ) /
         (uint64_t)mkvFps;
+
+
+    // Preserve chronological block order around Cluster rotations: drain audio
+    // whose block start is strictly before this video timestamp first.
+    if (!drainAudioUntil(
+            frameTimeMs,
+            false
+        )) {
+
+        if (!sizeLimitHit)
+            writeFailed = true;
+
+        esp_camera_fb_return(fb);
+        return;
+    }
 
 
     if (!ensureClusterForTime(
@@ -1626,6 +2084,21 @@ void mkvAddFrame()
 
         esp_camera_fb_return(fb);
 
+        return;
+    }
+
+
+    // Audio starting exactly at this video timestamp can now be emitted
+    // without moving Cluster time ahead of a not-yet-written video frame.
+    if (!drainAudioUntil(
+            frameTimeMs,
+            true
+        )) {
+
+        if (!sizeLimitHit)
+            writeFailed = true;
+
+        esp_camera_fb_return(fb);
         return;
     }
 
@@ -1689,6 +2162,16 @@ bool mkvStartSparseJpeg(
     mkvSparseMode = true;
     mkvLastFrameTimeMs = 0;
     mkvSparseTailMs = nominalFrameDurationMs > 0 ? nominalFrameDurationMs : 1U;
+
+    // Sparse shooter MKVs intentionally remain image-only.
+    audioRequested = false;
+    audioTrackEnabled = false;
+    audioCaptureStarted = false;
+    audioRuntimeFailed = false;
+    audioBytesWritten = 0;
+    audioLastEndTimeMs = 0;
+    finalAudioStats = {};
+    mkvAudioFormat = {0, 0, 0};
 
     recordingStartEpoch = startEpoch;
     recordingStartTimeValid = startEpoch >= (time_t)1609459200;
@@ -1782,6 +2265,8 @@ bool mkvEnd()
         frameCount == 0
     ) {
 
+        collectAndStopAudioCapture();
+
         if (writeFailed) {
             Serial.println(
                 "MKV: recording failed - removing incomplete file"
@@ -1812,12 +2297,9 @@ bool mkvEnd()
     bool ok = true;
 
 
-    ok &= closeCluster();
-
-
-    // Duration is in Segment Ticks; with our TimestampScale
-    // one tick equals one millisecond.
-    double durationMs =
+    // Compute the video duration before stopping audio so final buffered PCM
+    // can be drained to the same timeline endpoint.
+    double videoDurationMs =
         mkvSparseMode
         ? (double)(mkvLastFrameTimeMs + (uint64_t)mkvSparseTailMs)
         : (
@@ -1825,6 +2307,37 @@ bool mkvEnd()
             1000.0
           ) /
           (double)mkvFps;
+
+
+    if (
+        !mkvSparseMode &&
+        audioTrackEnabled &&
+        audioCaptureStarted
+    ) {
+        if (!drainAudioToRecordingEnd(
+                (uint64_t)videoDurationMs
+            )) {
+            if (!sizeLimitHit)
+                ok = false;
+        }
+
+        collectAndStopAudioCapture();
+    }
+
+
+    ok &= closeCluster();
+
+
+    double durationMs =
+        videoDurationMs;
+
+    if (
+        audioTrackEnabled &&
+        audioLastEndTimeMs > (uint64_t)durationMs
+    ) {
+        durationMs =
+            (double)audioLastEndTimeMs;
+    }
 
 
     ok &= patchFloat64(
@@ -1851,20 +2364,39 @@ bool mkvEnd()
     if (ok) {
 
         if (!mkvSparseMode) {
-            char summary[192];
+            char summary[320];
 
             snprintf(
                 summary,
                 sizeof(summary),
-                "STOP | MKV | frames=%lu | duration=%.1f s | maxJPEG=%.1f KB%s",
+                "STOP | MKV | frames=%lu | duration=%.1f s | maxJPEG=%.1f KB%s%s | audioBytes=%llu | audioDropped=%llu | audioBuffer=%u/%u",
                 (unsigned long)frameCount,
                 (double)(durationMs / 1000.0),
                 (double)maxFrameSize / 1024.0,
-                subtitleTrackEnabled ? " | subtitles=yes" : ""
+                subtitleTrackEnabled ? " | subtitles=yes" : "",
+                audioTrackEnabled
+                    ? (audioRuntimeFailed ? " | audio=partial" : " | audio=yes")
+                    : " | audio=no",
+                (unsigned long long)audioBytesWritten,
+                (unsigned long long)finalAudioStats.bytesDropped,
+                (unsigned)finalAudioStats.bufferHighWater,
+                (unsigned)finalAudioStats.bufferCapacity
             );
 
             consoleWrite("REC", String(summary));
             logWrite("Recording " + String(summary));
+
+            if (
+                audioTrackEnabled &&
+                finalAudioStats.bytesDropped > 0
+            ) {
+                consoleWrite(
+                    "REC",
+                    "WARN | MKV audio capture dropped " +
+                    String((unsigned long)finalAudioStats.bytesDropped) +
+                    " bytes; video recording remained active"
+                );
+            }
         }
 
     } else {

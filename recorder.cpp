@@ -225,6 +225,17 @@ bool recorderStart(
 
     if (cfg_recording_format == "avi") {
 
+        if (cfg_audio_enabled) {
+            consoleWrite(
+                "REC",
+                "WARN | audio_enabled=1 but AVI recording is video-only; use MKV for production audio"
+            );
+
+            logWrite(
+                "Recording WARN | audio_enabled=1 but AVI recording is video-only; use MKV for production audio"
+            );
+        }
+
         aviStart(
             activeTempPath,
             fps

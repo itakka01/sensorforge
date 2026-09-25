@@ -3840,7 +3840,7 @@ static void handleConfig()
 
     html += "</div>";
 
-    html += "recording_format: <select name='recording_format'>";
+    html += "recording_format: <select id='cfgRecordingFormat' name='recording_format' onchange='sfAudioUi()'>";
 
     html += "<option value='avi'" +
             String(cfg_recording_format == "avi" ? " selected" : "") +
@@ -3936,14 +3936,19 @@ static void handleConfig()
 
     html +=
         htmlText(UI_AUDIO_ENABLE) +
-        ": <select name='audio_enabled'>";
+        ": <select id='cfgAudioEnabled' name='audio_enabled' onchange='sfAudioUi()'>";
     html += "<option value='0'" +
             String(!cfg_audio_enabled ? " selected" : "") +
             ">0 - " + htmlText(UI_AUDIO_OFF) + "</option>";
     html += "<option value='1'" +
             String(cfg_audio_enabled ? " selected" : "") +
             ">1 - " + htmlText(UI_AUDIO_ON) + "</option>";
-    html += "</select><br><br>";
+    html += "</select><br>";
+
+    html +=
+        "<small class='muted'>" +
+        htmlText(UI_AUDIO_MKV_REQUIRED) +
+        "</small><br><br>";
 
     html +=
         "<button type='button' onclick=\"sfAudioAdvancedOpen()\">" +
@@ -4126,7 +4131,8 @@ static void handleConfig()
         "if(m)m.style.display='block';return true;}"
         "function sfAudioProgressSubmit(btn,kind){sfAudioProgressStart(kind);setTimeout(function(){var f=btn&&btn.form;if(!f)return;f.action=btn.formAction;f.method='post';f.submit();},80);return false;}"
         "function sfAudioUi(){"
-        "var e=document.getElementById('cfgAudioExpertMode');var s=document.getElementById('cfgAudioSource');var p=document.getElementById('cfgAudioExpertPanel');var b=document.getElementById('cfgAudioBackend');var pp=document.getElementById('cfgAudioPdmPanel');var ip=document.getElementById('cfgAudioI2sPanel');"
+        "var a=document.getElementById('cfgAudioEnabled');var r=document.getElementById('cfgRecordingFormat');var e=document.getElementById('cfgAudioExpertMode');var s=document.getElementById('cfgAudioSource');var p=document.getElementById('cfgAudioExpertPanel');var b=document.getElementById('cfgAudioBackend');var pp=document.getElementById('cfgAudioPdmPanel');var ip=document.getElementById('cfgAudioI2sPanel');"
+        "if(a&&r&&a.value==='1')r.value='mkv';"
         "if(!e||!s||!p||!b||!pp||!ip)return;var expert=e.value==='1';if(!expert&&s.value==='external')s.value='board_default';p.style.display=expert?'block':'none';var external=expert&&s.value==='external';b.disabled=!external;pp.style.display=external&&b.value==='pdm'?'block':'none';ip.style.display=external&&b.value==='i2s'?'block':'none';}"
         "sfAudioUi();"
         "</script>"
@@ -4891,6 +4897,12 @@ static void handleSave()
         );
         return;
     }
+
+    // Production audio muxing is deliberately limited to MKV. Keep old
+    // persisted AVI+audio configurations loadable for backward compatibility;
+    // a normal WebConfig save automatically selects MKV when audio is enabled.
+    if (audioEnabled)
+        recordingFormat = "mkv";
 
     String recordingMode =
         server.arg("recording_mode");
@@ -15781,29 +15793,204 @@ static void handleAudioBenchmark()
             ? (100.0f * (float)stats.bufferHighWater / (float)stats.bufferCapacity)
             : 0.0f;
 
-        bool red = stats.bytesDropped > 0;
-        bool orange =
-            !red &&
-            (
-                highWaterPct >= 75.0f ||
-                deliveredPct < 95.0f
-            );
+        float droppedPct =
+            stats.bytesCaptured > 0
+            ? (100.0f * (float)stats.bytesDropped / (float)stats.bytesCaptured)
+            : 0.0f;
+
+        enum AudioLoadLevel {
+            AUDIO_LOAD_GREEN = 0,
+            AUDIO_LOAD_ORANGE = 1,
+            AUDIO_LOAD_RED = 2
+        };
+
+        static const float AUDIO_DELIVERY_GREEN_MIN_PCT = 98.0f;
+        static const float AUDIO_DELIVERY_RED_BELOW_PCT = 95.0f;
+        static const float AUDIO_DROPS_RED_FROM_PCT = 1.0f;
+        static const float AUDIO_BUFFER_ORANGE_FROM_PCT = 50.0f;
+        static const float AUDIO_BUFFER_RED_FROM_PCT = 90.0f;
+        static const uint32_t AUDIO_DRAIN_ORANGE_ABOVE_MS = 500UL;
+        static const uint32_t AUDIO_DRAIN_RED_ABOVE_MS = 2000UL;
+        static const uint32_t AUDIO_HEAP_ORANGE_BELOW_BYTES = 64UL * 1024UL;
+        static const uint32_t AUDIO_HEAP_RED_BELOW_BYTES = 32UL * 1024UL;
+        static const uint32_t AUDIO_PSRAM_ORANGE_BELOW_BYTES = 512UL * 1024UL;
+        static const uint32_t AUDIO_PSRAM_RED_BELOW_BYTES = 256UL * 1024UL;
+
+        auto maxLevel = [](int a, int b) -> int {
+            return a > b ? a : b;
+        };
+
+        int deliveryLevel =
+            deliveredPct < AUDIO_DELIVERY_RED_BELOW_PCT
+            ? AUDIO_LOAD_RED
+            : deliveredPct < AUDIO_DELIVERY_GREEN_MIN_PCT
+              ? AUDIO_LOAD_ORANGE
+              : AUDIO_LOAD_GREEN;
+
+        int dropsLevel =
+            droppedPct >= AUDIO_DROPS_RED_FROM_PCT
+            ? AUDIO_LOAD_RED
+            : stats.bytesDropped > 0
+              ? AUDIO_LOAD_ORANGE
+              : AUDIO_LOAD_GREEN;
+
+        int bufferLevel =
+            highWaterPct >= AUDIO_BUFFER_RED_FROM_PCT
+            ? AUDIO_LOAD_RED
+            : highWaterPct >= AUDIO_BUFFER_ORANGE_FROM_PCT
+              ? AUDIO_LOAD_ORANGE
+              : AUDIO_LOAD_GREEN;
+
+        int drainLevel =
+            maxDrainGapMs > AUDIO_DRAIN_RED_ABOVE_MS
+            ? AUDIO_LOAD_RED
+            : maxDrainGapMs > AUDIO_DRAIN_ORANGE_ABOVE_MS
+              ? AUDIO_LOAD_ORANGE
+              : AUDIO_LOAD_GREEN;
+
+        int heapLevel =
+            internalMin < AUDIO_HEAP_RED_BELOW_BYTES
+            ? AUDIO_LOAD_RED
+            : internalMin < AUDIO_HEAP_ORANGE_BELOW_BYTES
+              ? AUDIO_LOAD_ORANGE
+              : AUDIO_LOAD_GREEN;
+
+        int psramLevel =
+            psramMin < AUDIO_PSRAM_RED_BELOW_BYTES
+            ? AUDIO_LOAD_RED
+            : psramMin < AUDIO_PSRAM_ORANGE_BELOW_BYTES
+              ? AUDIO_LOAD_ORANGE
+              : AUDIO_LOAD_GREEN;
+
+        int overallLevel = AUDIO_LOAD_GREEN;
+        overallLevel = maxLevel(overallLevel, deliveryLevel);
+        overallLevel = maxLevel(overallLevel, dropsLevel);
+        overallLevel = maxLevel(overallLevel, bufferLevel);
+        overallLevel = maxLevel(overallLevel, drainLevel);
+        overallLevel = maxLevel(overallLevel, heapLevel);
+        overallLevel = maxLevel(overallLevel, psramLevel);
+
+        auto levelClass = [](int level) -> const char * {
+            return
+                level == AUDIO_LOAD_RED
+                ? "danger"
+                : level == AUDIO_LOAD_ORANGE
+                  ? "warn"
+                  : "ok";
+        };
+
+        auto levelTextId = [](int level) -> UiTextId {
+            return
+                level == AUDIO_LOAD_RED
+                ? UI_AUDIO_LOAD_RED
+                : level == AUDIO_LOAD_ORANGE
+                  ? UI_AUDIO_LOAD_ORANGE
+                  : UI_AUDIO_LOAD_GREEN;
+        };
+
+        auto levelPill = [&](int level) -> String {
+            return
+                "<span class='status-pill " +
+                String(levelClass(level)) +
+                "'>" +
+                htmlText(levelTextId(level)) +
+                "</span>";
+        };
 
         const char *border =
-            red ? "#b91c1c" :
-            orange ? "#c47a00" :
-            "#15803d";
+            overallLevel == AUDIO_LOAD_RED
+            ? "#b91c1c"
+            : overallLevel == AUDIO_LOAD_ORANGE
+              ? "#c47a00"
+              : "#15803d";
 
-        String verdict =
-            red ? "DROPS DETECTED" :
-            orange ? "CHECK CAPTURE MARGIN" :
-            "CAPTURE STABLE";
+        UiTextId verdictId =
+            overallLevel == AUDIO_LOAD_RED
+            ? UI_AUDIO_LOAD_NOT_RECOMMENDED
+            : overallLevel == AUDIO_LOAD_ORANGE
+              ? UI_AUDIO_LOAD_CHECK
+              : UI_AUDIO_LOAD_GOOD;
 
         html +=
             "<section class='settings-section' style='border-left:5px solid " +
             String(border) +
             "'><h3>10 s capture-only result</h3>"
-            "<p><b>" + verdict + "</b></p>";
+            "<p>" + levelPill(overallLevel) +
+            " <b>" + htmlText(verdictId) + "</b></p>"
+            "<p class='muted'>" + htmlText(UI_AUDIO_LOAD_SCOPE) + "</p>";
+
+        html +=
+            "<div style='line-height:1.9'>" +
+            levelPill(deliveryLevel) + " <b>" +
+            htmlText(UI_AUDIO_LOAD_DELIVERY) +
+            ":</b> " + String(deliveredPct, 1) +
+            "% <small class='muted'>(" + htmlText(UI_AUDIO_LOAD_GREEN) +
+            " &ge; " + String(AUDIO_DELIVERY_GREEN_MIN_PCT, 0) +
+            "%, " + htmlText(UI_AUDIO_LOAD_ORANGE) + " " +
+            String(AUDIO_DELIVERY_RED_BELOW_PCT, 0) + "..&lt;" +
+            String(AUDIO_DELIVERY_GREEN_MIN_PCT, 0) +
+            "%, " + htmlText(UI_AUDIO_LOAD_RED) + " &lt;" +
+            String(AUDIO_DELIVERY_RED_BELOW_PCT, 0) + "%)</small><br>" +
+
+            levelPill(dropsLevel) + " <b>" +
+            htmlText(UI_AUDIO_LOAD_DROPS) +
+            ":</b> " + String((unsigned long)stats.bytesDropped) +
+            " B (" + String(droppedPct, 3) +
+            "%) <small class='muted'>(" + htmlText(UI_AUDIO_LOAD_GREEN) +
+            " = 0, " + htmlText(UI_AUDIO_LOAD_ORANGE) +
+            " &gt;0..&lt;" + String(AUDIO_DROPS_RED_FROM_PCT, 0) +
+            "%, " + htmlText(UI_AUDIO_LOAD_RED) + " &ge;" +
+            String(AUDIO_DROPS_RED_FROM_PCT, 0) + "%)</small><br>" +
+
+            levelPill(bufferLevel) + " <b>" +
+            htmlText(UI_AUDIO_LOAD_BUFFER) +
+            ":</b> " + String(highWaterPct, 1) +
+            "% <small class='muted'>(" + htmlText(UI_AUDIO_LOAD_GREEN) +
+            " &lt;" + String(AUDIO_BUFFER_ORANGE_FROM_PCT, 0) +
+            "%, " + htmlText(UI_AUDIO_LOAD_ORANGE) + " " +
+            String(AUDIO_BUFFER_ORANGE_FROM_PCT, 0) + "..&lt;" +
+            String(AUDIO_BUFFER_RED_FROM_PCT, 0) +
+            "%, " + htmlText(UI_AUDIO_LOAD_RED) + " &ge;" +
+            String(AUDIO_BUFFER_RED_FROM_PCT, 0) + "%)</small><br>" +
+
+            levelPill(drainLevel) + " <b>" +
+            htmlText(UI_AUDIO_LOAD_DRAIN) +
+            ":</b> " + String((unsigned long)maxDrainGapMs) +
+            " ms <small class='muted'>(" + htmlText(UI_AUDIO_LOAD_GREEN) +
+            " &le;" + String((unsigned long)AUDIO_DRAIN_ORANGE_ABOVE_MS) +
+            " ms, " + htmlText(UI_AUDIO_LOAD_ORANGE) + " &gt;" +
+            String((unsigned long)AUDIO_DRAIN_ORANGE_ABOVE_MS) + ".." +
+            String((unsigned long)AUDIO_DRAIN_RED_ABOVE_MS) +
+            " ms, " + htmlText(UI_AUDIO_LOAD_RED) + " &gt;" +
+            String((unsigned long)AUDIO_DRAIN_RED_ABOVE_MS) + " ms)</small><br>" +
+
+            levelPill(heapLevel) + " <b>" +
+            htmlText(UI_AUDIO_LOAD_HEAP) +
+            ":</b> " + String((double)internalMin / 1024.0, 1) +
+            " KiB min <small class='muted'>(" + htmlText(UI_AUDIO_LOAD_GREEN) +
+            " &ge;" + String((unsigned long)(AUDIO_HEAP_ORANGE_BELOW_BYTES / 1024UL)) +
+            " KiB, " + htmlText(UI_AUDIO_LOAD_ORANGE) + " " +
+            String((unsigned long)(AUDIO_HEAP_RED_BELOW_BYTES / 1024UL)) + "..&lt;" +
+            String((unsigned long)(AUDIO_HEAP_ORANGE_BELOW_BYTES / 1024UL)) +
+            " KiB, " + htmlText(UI_AUDIO_LOAD_RED) + " &lt;" +
+            String((unsigned long)(AUDIO_HEAP_RED_BELOW_BYTES / 1024UL)) + " KiB)</small><br>" +
+
+            levelPill(psramLevel) + " <b>" +
+            htmlText(UI_AUDIO_LOAD_PSRAM) +
+            ":</b> " + String((double)psramMin / 1024.0, 1) +
+            " KiB min <small class='muted'>(" + htmlText(UI_AUDIO_LOAD_GREEN) +
+            " &ge;" + String((unsigned long)(AUDIO_PSRAM_ORANGE_BELOW_BYTES / 1024UL)) +
+            " KiB, " + htmlText(UI_AUDIO_LOAD_ORANGE) + " " +
+            String((unsigned long)(AUDIO_PSRAM_RED_BELOW_BYTES / 1024UL)) + "..&lt;" +
+            String((unsigned long)(AUDIO_PSRAM_ORANGE_BELOW_BYTES / 1024UL)) +
+            " KiB, " + htmlText(UI_AUDIO_LOAD_RED) + " &lt;" +
+            String((unsigned long)(AUDIO_PSRAM_RED_BELOW_BYTES / 1024UL)) + " KiB)</small>" +
+            "</div>";
+
+        html +=
+            "<details style='margin-top:14px'><summary>" +
+            htmlText(UI_AUDIO_LOAD_TECH_DETAILS) +
+            "</summary><div style='margin-top:10px'>";
 
         html += "Backend: <b>" +
                 htmlEscape(String(audioCaptureBackendName())) +
@@ -15845,7 +16032,7 @@ static void handleAudioBenchmark()
                 String((unsigned long)psramAfter) + " B</b><br>";
 
         html +=
-            "<p class='muted'>" +
+            "</div></details><p class='muted'>" +
             htmlText(UI_AUDIO_BENCHMARK_HELP) +
             "</p></section>";
     }
