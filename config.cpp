@@ -2,6 +2,7 @@
 #include "board_config.h"
 #include "config_secrets.h"
 #include "image_motion.h"
+#include "branding.h"
 
 #include <FS.h>
 #include <LittleFS.h>
@@ -15,6 +16,49 @@
 // =============================================================
 // DEFAULT CONFIG
 // =============================================================
+
+// The factory hostname also becomes the Access-Point SSID. Derive it from the
+// central product branding so a future product rename automatically changes
+// the factory AP name without duplicating another product-name constant here.
+// Keep it ASCII/hostname friendly and within the 32-byte Wi-Fi SSID limit.
+static String makeDefaultHostnameFromBranding()
+{
+    String source = Branding::APP_NAME;
+    source.trim();
+
+    String result;
+    result.reserve(32);
+
+    bool lastWasSeparator = false;
+
+    for (size_t i = 0; i < source.length() && result.length() < 32; ++i) {
+        char c = source[i];
+
+        if (c >= 'A' && c <= 'Z')
+            c = (char)(c - 'A' + 'a');
+
+        bool alphaNumeric =
+            (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9');
+
+        if (alphaNumeric) {
+            result += c;
+            lastWasSeparator = false;
+        } else if (result.length() && !lastWasSeparator && result.length() < 32) {
+            result += '-';
+            lastWasSeparator = true;
+        }
+    }
+
+    while (result.endsWith("-"))
+        result.remove(result.length() - 1);
+
+    // Defensive fallback only for an unusable/empty branding literal.
+    if (!result.length())
+        result = "device";
+
+    return result;
+}
 
 #ifdef BOARD_FREENOVE
 String cfg_camera = "OV3660";
@@ -44,6 +88,10 @@ int cfg_led_enabled = 1;
 String cfg_recording_format = "avi";
 int cfg_timestamp_enabled   = 1;
 int cfg_recording_encryption = 0;
+int cfg_audio_enabled = 0;
+int cfg_audio_sample_rate = 16000;
+int cfg_audio_bits_per_sample = 16;
+int cfg_audio_channels = 1;
 int cfg_shooter_enabled = 0;
 String cfg_shooter_storage_format = "mkv";
 int cfg_shooter_interval_ms = 60000;
@@ -82,15 +130,15 @@ int cfg_transport_black_threshold = 25;
 int cfg_min_free_space_mb = 100;
 String cfg_disk_full_action = "rollover";
 
-String cfg_hostname  = "esp32board";
+String cfg_hostname  = makeDefaultHostnameFromBranding();
 String cfg_timezone = "CET-1CEST,M3.5.0,M10.5.0/3";
 String cfg_wifi_on_system_start = "off";
-int cfg_wifi_timeout_sec = 60;
+int cfg_wifi_timeout_sec = 0;
 String cfg_wifi_ssid = "";
 String cfg_wifi_pass = "";
 
 int cfg_hotspot_enabled = 1;
-String cfg_hotspot_password = "sensorforge1234";
+String cfg_hotspot_password = "";
 int cfg_hotspot_hidden = 0;
 
 int cfg_web_auth_enabled = 0;
@@ -386,6 +434,10 @@ struct ConfigValues {
     String recordingFormat;
     int timestampEnabled;
     int recordingEncryption;
+    int audioEnabled;
+    int audioSampleRate;
+    int audioBitsPerSample;
+    int audioChannels;
     int shooterEnabled;
     String shooterStorageFormat;
     int shooterIntervalMs;
@@ -465,6 +517,10 @@ struct ConfigSeen {
     bool recordingFormat;
     bool timestampEnabled;
     bool recordingEncryption;
+    bool audioEnabled;
+    bool audioSampleRate;
+    bool audioBitsPerSample;
+    bool audioChannels;
     bool shooterEnabled;
     bool shooterStorageFormat;
     bool shooterIntervalMs;
@@ -589,6 +645,18 @@ static ConfigValues makeDefaultValues()
     values.recordingEncryption =
         0;
 
+    values.audioEnabled =
+        0;
+
+    values.audioSampleRate =
+        16000;
+
+    values.audioBitsPerSample =
+        16;
+
+    values.audioChannels =
+        1;
+
     values.shooterEnabled =
         0;
 
@@ -704,10 +772,10 @@ static ConfigValues makeDefaultValues()
         "off";
 
     values.wifiTimeoutSec =
-        60;
+        0;
 
     values.hostname =
-        "esp32board";
+        makeDefaultHostnameFromBranding();
 
     values.timezone =
         "CET-1CEST,M3.5.0,M10.5.0/3";
@@ -722,7 +790,7 @@ static ConfigValues makeDefaultValues()
         1;
 
     values.hotspotPassword =
-        "sensorforge1234";
+        "";
 
     values.hotspotHidden =
         0;
@@ -749,6 +817,119 @@ static ConfigValues makeDefaultValues()
         "/log.txt";
 
     return values;
+}
+
+
+static bool serializeConfigValues(
+    const ConfigValues &values,
+    String &text,
+    String &error
+)
+{
+    error = "";
+    text = "";
+
+    // Keep one canonical complete representation for generated factory
+    // defaults. All current known keys are written explicitly so a reset does
+    // not depend on whatever happened to exist in an older config.txt.
+    if (!text.reserve(3200)) {
+        error = "not enough memory for factory config";
+        return false;
+    }
+
+#define APPEND_CONFIG_VALUE(keyName, valueExpr) \
+    do { \
+        text += keyName; \
+        text += '='; \
+        text += (valueExpr); \
+        text += '\n'; \
+    } while (0)
+
+    APPEND_CONFIG_VALUE("camera", values.camera);
+    APPEND_CONFIG_VALUE("resolution", values.resolution);
+    APPEND_CONFIG_VALUE("fps", String(values.fps));
+    APPEND_CONFIG_VALUE("quality", String(values.quality));
+    APPEND_CONFIG_VALUE("camera_xclk_mhz", String(values.cameraXclkMhz));
+    APPEND_CONFIG_VALUE("camera_auto_exposure", String(values.cameraAutoExposure));
+    APPEND_CONFIG_VALUE("camera_ae_level", String(values.cameraAeLevel));
+    APPEND_CONFIG_VALUE("camera_crop_zoom", values.cameraCropZoom);
+    APPEND_CONFIG_VALUE("camera_crop_x", String(values.cameraCropX));
+    APPEND_CONFIG_VALUE("camera_crop_y", String(values.cameraCropY));
+    APPEND_CONFIG_VALUE("rotation", String(values.rotation));
+
+    APPEND_CONFIG_VALUE("recording_format", values.recordingFormat);
+    APPEND_CONFIG_VALUE("timestamp_enabled", String(values.timestampEnabled));
+    APPEND_CONFIG_VALUE("recording_encryption", String(values.recordingEncryption));
+    APPEND_CONFIG_VALUE("audio_enabled", String(values.audioEnabled));
+    APPEND_CONFIG_VALUE("audio_sample_rate", String(values.audioSampleRate));
+    APPEND_CONFIG_VALUE("audio_bits_per_sample", String(values.audioBitsPerSample));
+    APPEND_CONFIG_VALUE("audio_channels", String(values.audioChannels));
+
+    APPEND_CONFIG_VALUE("shooter_enabled", String(values.shooterEnabled));
+    APPEND_CONFIG_VALUE("shooter_storage_format", values.shooterStorageFormat);
+    APPEND_CONFIG_VALUE("shooter_interval_ms", String(values.shooterIntervalMs));
+    APPEND_CONFIG_VALUE("shooter_dark_mean_min", String(values.shooterDarkMeanMin));
+    APPEND_CONFIG_VALUE("shooter_min_change_pct", String(values.shooterMinChangePct, 1));
+    APPEND_CONFIG_VALUE("shooter_force_save_seconds", String(values.shooterForceSaveSeconds));
+    APPEND_CONFIG_VALUE("shooter_flush_seconds", String(values.shooterFlushSeconds));
+
+    APPEND_CONFIG_VALUE("recording_segment_seconds", String(values.recordingSegmentSeconds));
+    APPEND_CONFIG_VALUE("recording_segment_max_mb", String(values.recordingSegmentMaxMb));
+    APPEND_CONFIG_VALUE("recording_event_max_seconds", String(values.recordingEventMaxSeconds));
+    APPEND_CONFIG_VALUE("recording_event_cooldown_seconds", String(values.recordingEventCooldownSeconds));
+    APPEND_CONFIG_VALUE("recording_not_before", values.recordingNotBefore);
+
+    APPEND_CONFIG_VALUE("motion_recording_enabled", String(values.motionRecordingEnabled));
+    APPEND_CONFIG_VALUE("motion_recording_decision", values.motionRecordingDecision);
+    APPEND_CONFIG_VALUE("image_motion_sensitivity", String(values.imageMotionSensitivity));
+    APPEND_CONFIG_VALUE("image_motion_min_area_pct", String(values.imageMotionMinAreaPct, 1));
+    APPEND_CONFIG_VALUE("image_motion_confirm_frames", String(values.imageMotionConfirmFrames));
+    APPEND_CONFIG_VALUE("image_motion_release_frames", String(values.imageMotionReleaseFrames));
+    APPEND_CONFIG_VALUE("image_motion_background_learning", String(values.imageMotionBackgroundLearning));
+    APPEND_CONFIG_VALUE("image_motion_global_mean_delta", String(values.imageMotionGlobalMeanDelta));
+    APPEND_CONFIG_VALUE("image_motion_global_change_pct", String(values.imageMotionGlobalChangePct));
+    APPEND_CONFIG_VALUE("image_motion_roi_mask", values.imageMotionRoiMask);
+
+    APPEND_CONFIG_VALUE("post_record_ms", String(values.postMs));
+    APPEND_CONFIG_VALUE("led_enabled", String(values.ledEnabled));
+
+    APPEND_CONFIG_VALUE("sleep_mode", values.sleepMode);
+    APPEND_CONFIG_VALUE("sleep_delay_ms", String(values.sleepDelayMs));
+    APPEND_CONFIG_VALUE("bootloop_protection", String(values.bootloopProtection));
+
+    APPEND_CONFIG_VALUE("transport_mode", String(values.transportMode));
+    APPEND_CONFIG_VALUE("transport_check_seconds", String(values.transportCheckSeconds));
+    APPEND_CONFIG_VALUE("transport_light_confirm_seconds", String(values.transportLightConfirmSeconds));
+    APPEND_CONFIG_VALUE("transport_install_delay_seconds", String(values.transportInstallDelaySeconds));
+    APPEND_CONFIG_VALUE("transport_max_duration_seconds", String(values.transportMaxDurationSeconds));
+    APPEND_CONFIG_VALUE("transport_black_threshold", String(values.transportBlackThreshold));
+
+    APPEND_CONFIG_VALUE("min_free_space_mb", String(values.minFreeSpaceMb));
+    APPEND_CONFIG_VALUE("disk_full_action", values.diskFullAction);
+
+    APPEND_CONFIG_VALUE("wifi_on_system_start", values.wifiOnSystemStart);
+    APPEND_CONFIG_VALUE("wifi_timeout_sec", String(values.wifiTimeoutSec));
+    APPEND_CONFIG_VALUE("hostname", values.hostname);
+    APPEND_CONFIG_VALUE("timezone", values.timezone);
+    APPEND_CONFIG_VALUE("wifi_ssid", values.wifiSsid);
+    APPEND_CONFIG_VALUE("wifi_pass", values.wifiPass);
+
+    APPEND_CONFIG_VALUE("hotspot_enabled", String(values.hotspotEnabled));
+    APPEND_CONFIG_VALUE("hotspot_password", values.hotspotPassword);
+    APPEND_CONFIG_VALUE("hotspot_hidden", String(values.hotspotHidden));
+
+    APPEND_CONFIG_VALUE("web_auth_enabled", String(values.webAuthEnabled));
+    APPEND_CONFIG_VALUE("web_recording_auto_pause", String(values.webRecordingAutoPause));
+    APPEND_CONFIG_VALUE("web_language", values.webLanguage);
+    APPEND_CONFIG_VALUE("web_username", values.webUsername);
+    APPEND_CONFIG_VALUE("web_password", values.webPassword);
+
+    APPEND_CONFIG_VALUE("debug_enabled", String(values.debugEnabled));
+    APPEND_CONFIG_VALUE("log_file", values.logFile);
+
+#undef APPEND_CONFIG_VALUE
+
+    return true;
 }
 
 
@@ -1478,6 +1659,39 @@ static bool validateValues(
     }
 
     if (
+        values.audioEnabled != 0 &&
+        values.audioEnabled != 1
+    ) {
+        error = "audio_enabled must be 0 or 1";
+        return false;
+    }
+
+    if (
+        values.audioSampleRate < 8000 ||
+        values.audioSampleRate > 96000
+    ) {
+        error = "audio_sample_rate out of range (8000..96000)";
+        return false;
+    }
+
+    if (
+        values.audioBitsPerSample != 16 &&
+        values.audioBitsPerSample != 24 &&
+        values.audioBitsPerSample != 32
+    ) {
+        error = "audio_bits_per_sample must be 16, 24 or 32";
+        return false;
+    }
+
+    if (
+        values.audioChannels != 1 &&
+        values.audioChannels != 2
+    ) {
+        error = "audio_channels must be 1 or 2";
+        return false;
+    }
+
+    if (
         values.shooterEnabled != 0 &&
         values.shooterEnabled != 1
     ) {
@@ -1879,13 +2093,18 @@ static bool validateValues(
     }
 
 
+    // Empty means an intentionally open local access point.
+    // Non-empty WPA2 passphrases must remain within the normal 8..63 range.
     if (
-        values.hotspotPassword.length() < 8 ||
-        values.hotspotPassword.length() > 63
+        values.hotspotPassword.length() != 0 &&
+        (
+            values.hotspotPassword.length() < 8 ||
+            values.hotspotPassword.length() > 63
+        )
     ) {
 
         error =
-            "hotspot_password length must be 8..63";
+            "hotspot_password must be empty (open AP) or 8..63 characters";
 
         return false;
     }
@@ -2440,6 +2659,22 @@ static bool parseConfigText(
 
                 values.recordingEncryption =
                     (int)numericValue;
+
+            } else if (key == "audio_enabled") {
+                if (!markOnce(seen.audioEnabled, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid audio_enabled"; return false; }
+                values.audioEnabled = (int)numericValue;
+
+            } else if (key == "audio_sample_rate") {
+                if (!markOnce(seen.audioSampleRate, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid audio_sample_rate"; return false; }
+                values.audioSampleRate = (int)numericValue;
+
+            } else if (key == "audio_bits_per_sample") {
+                if (!markOnce(seen.audioBitsPerSample, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid audio_bits_per_sample"; return false; }
+                values.audioBitsPerSample = (int)numericValue;
+
+            } else if (key == "audio_channels") {
+                if (!markOnce(seen.audioChannels, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid audio_channels"; return false; }
+                values.audioChannels = (int)numericValue;
 
             } else if (key == "shooter_enabled") {
                 if (!markOnce(seen.shooterEnabled, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid shooter_enabled"; return false; }
@@ -3449,6 +3684,44 @@ bool configValidateText(
 }
 
 
+String configDefaultHostname()
+{
+    return makeDefaultHostnameFromBranding();
+}
+
+
+bool configBuildFactoryDefaultText(
+    String &text,
+    String &error
+)
+{
+    ConfigValues defaults =
+        makeDefaultValues();
+
+    if (!serializeConfigValues(
+            defaults,
+            text,
+            error
+        )) {
+        return false;
+    }
+
+    String validationError;
+
+    if (!configValidateText(
+            text,
+            validationError
+        )) {
+        error =
+            "generated factory config invalid: " +
+            validationError;
+        return false;
+    }
+
+    return true;
+}
+
+
 // =============================================================
 // APPLY PARSED VALUES
 // =============================================================
@@ -3498,6 +3771,18 @@ static void applyValues(
 
     cfg_recording_encryption =
         values.recordingEncryption;
+
+    cfg_audio_enabled =
+        values.audioEnabled;
+
+    cfg_audio_sample_rate =
+        values.audioSampleRate;
+
+    cfg_audio_bits_per_sample =
+        values.audioBitsPerSample;
+
+    cfg_audio_channels =
+        values.audioChannels;
 
     cfg_shooter_enabled = values.shooterEnabled;
     cfg_shooter_storage_format = values.shooterStorageFormat;
@@ -4537,6 +4822,17 @@ config_loaded:
     );
 
     Serial.println(
+        "Config Audio: enabled=" +
+        String(cfg_audio_enabled) +
+        " rate=" +
+        String(cfg_audio_sample_rate) +
+        " bits=" +
+        String(cfg_audio_bits_per_sample) +
+        " channels=" +
+        String(cfg_audio_channels)
+    );
+
+    Serial.println(
         "Config Shooter: enabled=" +
         String(cfg_shooter_enabled) +
         " storage_format=" +
@@ -5106,6 +5402,64 @@ ConfigSaveResult configSaveText(
         CONFIG_SAVE_BOTH;
 }
 
+
+ConfigSaveResult configResetToFactoryDefaults(
+    String &error
+)
+{
+    error = "";
+
+    ConfigValues defaults =
+        makeDefaultValues();
+
+    String text;
+
+    if (!configBuildFactoryDefaultText(
+            text,
+            error
+        )) {
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    // configSaveText always rewrites the internal LittleFS copy and, by the
+    // established SensorForge policy, also rewrites SD /config.txt when that
+    // file already exists. It deliberately does not create a new SD config on
+    // a card that previously had none.
+    ConfigSaveResult result =
+        configSaveText(
+            text,
+            sdAvailableState &&
+                STORAGE.exists("/config.txt"),
+            error
+        );
+
+    if (
+        result != CONFIG_SAVE_BOTH &&
+        result != CONFIG_SAVE_INTERNAL_ONLY
+    ) {
+        return result;
+    }
+
+    // A stale deferred transport-mode marker must never override the freshly
+    // persisted factory transport_mode=0 on the following boot.
+    transportModePendingClear();
+
+    // Keep the short interval before the scheduled reboot internally coherent.
+    applyValues(defaults);
+    activeConfigSource =
+        result == CONFIG_SAVE_BOTH
+        ? CONFIG_SOURCE_SD
+        : CONFIG_SOURCE_INTERNAL;
+
+    internalValidState = true;
+
+    if (result == CONFIG_SAVE_BOTH) {
+        sdPresentState = true;
+        sdValidState = true;
+    }
+
+    return result;
+}
 
 
 // -------------------------------------------------------------

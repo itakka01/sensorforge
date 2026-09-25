@@ -9,6 +9,221 @@ and identifies the concrete binary compilation time.
 > change sequence beginning with v23. Earlier development history remains in the
 > repository history/project documentation.
 
+## v50 — 2026-09-25
+
+- Fixed the 5-second WebConfig WAV audio diagnostic incorrectly reporting
+  `not enough free SD space above SensorForge reserve` on an almost-empty card.
+- Root cause: the diagnostic intentionally owns `g_storageLocked` during capture,
+  while the normal `storageFreeBytes()` helper deliberately returns zero whenever
+  that lock is active. The WAV diagnostic now performs its owner-side reserve
+  check from the mounted storage backend's `totalBytes()` / `usedBytes()` values
+  while retaining the configured SensorForge reserve and 128 KiB safety margin.
+- No changes to the global storage-lock semantics, normal recording reserve logic,
+  audio capture backend, WAV format, encryption behavior or AVI/MKV recording.
+
+## v49 — 2026-09-24
+
+- Factory/default hostname and hotspot SSID are now derived from the central
+  `Branding::APP_NAME` product identity instead of duplicating a literal in
+  `config.cpp`. The branding value is normalized to a lowercase, hostname-safe
+  maximum 32-byte identifier; current `SensorForge` therefore becomes
+  `sensorforge`. A future product rename in `branding.h` automatically changes
+  the factory AP name on newly defaulted devices.
+- Added a complete generated factory-config serializer based on the current
+  firmware default value set, including audio, recording, motion, transport,
+  network, hotspot, web, storage and debug settings. The generated config is
+  validated through the normal config parser before persistence.
+- Added WebConfig action **Alle Konfigurationswerte auf Werkseinstellungen**.
+  It replaces every known config value with current firmware defaults, always
+  writes the internal LittleFS config, and also replaces an already-existing
+  SD `/config.txt` so an old SD config cannot win again after reboot. A card
+  without `/config.txt` remains internal-only and is not given a new config
+  implicitly.
+- Factory-config reset clears the deferred transport-mode reconciliation marker,
+  applies the defaults coherently for the short pre-reboot interval, then
+  schedules a controlled reboot. The transition page tells the operator the
+  branding-derived open hotspot SSID and that Wi-Fi remains active indefinitely.
+- This is a configuration reset only: recordings/media, license state, firmware,
+  board/eFuse cryptographic keys and other non-config persistent identities are
+  deliberately not erased.
+
+## v48 — 2026-09-24
+
+- Changed firmware defaults used only when no valid SD config and no valid internal
+  LittleFS config exist: hostname / hotspot SSID is now `sensorforge`, the hotspot
+  password is empty (open AP), and `wifi_timeout_sec=0` keeps WebConfig Wi-Fi on
+  indefinitely. Existing persisted configs remain authoritative and unchanged.
+- Hotspot validation now accepts either an empty password (open AP) or a normal
+  8..63-character WPA passphrase. The AP startup passes a null passphrase explicitly
+  for the open-network case.
+- `hotspot_enabled=1` remains the first-boot default, so the local SensorForge AP
+  starts automatically. Infrastructure Wi-Fi policy remains independent and
+  `wifi_on_system_start` remains `off` by default.
+- WebConfig now shows whether the currently active hotspot is open or password
+  protected without exposing any password value.
+
+## v47 — 2026-09-24
+
+- Added a new independent `audio_capture.cpp/.h` subsystem with a backend-neutral
+  packed-PCM interface. Microphone transport, audio format and recorder/container
+  integration are deliberately separated so future PDM, standard I2S and codec/ADC
+  backends can share the same higher-level API.
+- Added the XIAO ESP32S3 Sense onboard PDM microphone as the first backend: PDM CLK
+  GPIO42 and DATA GPIO41. The board profile declares backend capabilities rather
+  than hard-coding microphone details into the recorder.
+- Audio capture runs in its own task and buffers PCM in a PSRAM ring buffer so short
+  filesystem/SD latency does not directly stall the microphone input path. Buffer
+  overrun and high-water statistics are exposed for diagnostics.
+- Added optional, backward-compatible config keys `audio_enabled`,
+  `audio_sample_rate`, `audio_bits_per_sample` and `audio_channels`. Existing v46
+  configs remain valid; audio defaults to disabled. Unsupported format combinations
+  are rejected against the active board backend.
+- Added `audio_wav.cpp/.h` and a WebConfig 5-second WAV diagnostic. It records through
+  the normal `RecordingStorageFile` abstraction, performs SD reserve checks, reports
+  signal/buffer statistics and allows transparent WAV download. Existing recording
+  encryption policy is honored by the diagnostic storage path.
+- Freenove currently declares no microphone backend; this is intentional and can be
+  extended later without changing the generic audio API.
+- AVI/MKV writers and the normal recorder lifecycle are intentionally unchanged in
+  v47. This release validates capture, buffering and storage first; container audio
+  tracks are a later integration stage.
+
+## v46 — 2026-09-24
+
+- Added a dedicated professional in-progress state for the extended SD benchmark.
+  Submitting the benchmark now opens a blocking modal immediately, disables the
+  start button and clearly states that write/read throughput, latency, integrity
+  and bus-clock diagnostics are running.
+- The benchmark modal uses a neutral progress track with a red animated point
+  moving continuously across it, so long synchronous diagnostic runs visibly
+  remain active without pretending to know a percentage that is not available.
+- The progress state is bilingual and uses the existing SD Maintenance modal
+  visual language. Benchmark logic, rating thresholds, formatting policy and
+  production storage clocks are unchanged.
+
+## v45 — 2026-09-24
+
+- Added a customer-facing green/orange/red storage assessment to the extended
+  SD benchmark. The rating evaluates the complete SensorForge storage path
+  (card + filesystem + bus), not the SD card in isolation.
+- The assessment uses the verified 32 KiB reference case and considers write/read
+  throughput, write latency and data verification. Green requires at least
+  1.0 MB/s verified write throughput, at least 0.75 MB/s read throughput and
+  bounded write latency; clearly slow or failed/incorrect storage becomes red.
+- Filesystem geometry below the SensorForge 32 KiB cluster recommendation now
+  produces a prominent warning and prevents a green result. The UI explicitly
+  tells the operator to use SensorForge SD Format and rerun the benchmark.
+- The benchmark page now presents verdict and "what next" guidance before the
+  engineering data. Full diagnostic output is retained but collapsed under
+  Technical diagnostic details by default.
+- No production SD clock, recording behavior or formatting policy changed in
+  this release.
+
+## v44 — 2026-09-24
+
+- Changed SensorForge SD Format to create FAT32 explicitly with a 32 KiB
+  allocation unit instead of relying on Arduino's format-on-mount-failure
+  default. The same formatter is used for SPI and SD_MMC storage backends.
+- The formatter keeps the existing Arduino VFS/storage driver registration,
+  temporarily detaches only the mounted FatFs logical volume, runs `f_mkfs()`
+  with FAT32 / two FATs / 32 KiB clusters, and remounts the same FatFs volume.
+- Formatting now verifies the effective FatFs cluster size after remount and
+  fails closed if it is not exactly 32 KiB. No silent fallback to 512-byte
+  clusters is accepted.
+- SD Maintenance UI now states that SD Format creates FAT32 with 32 KiB
+  clusters. Existing config protection, storage/recording gates, config restore
+  and reboot behavior remain unchanged.
+- Benchmark, production SD clock policy and normal recording/storage behavior
+  are unchanged.
+
+## v43 — 2026-09-24
+
+- Extended the generic SD benchmark with filesystem geometry reporting derived
+  read-only from the mounted card boot sector where the backend/core exposes raw
+  sector reads. Reports FAT12/16/32 or exFAT, bytes per sector, sectors per
+  cluster, cluster size, volume start LBA and cluster count. Geometry reporting
+  is diagnostic only and does not fail the benchmark when unavailable.
+- Added an 8 MiB / 32 KiB long-file comparison on the normal production mount.
+  The first verified pass measures normal file growth/allocation; the second
+  verified pass reopens the exact same 8 MiB file with read/write access and
+  overwrites its already allocated clusters using a different deterministic
+  pattern. This isolates FAT allocation/file-growth cost from steady-state
+  sequential writes without formatting or touching user files.
+- Reports growing-file and preallocated-overwrite throughput plus their speed
+  ratio, while retaining full write/read latency, flush timing and read-back
+  verification for both passes.
+- The existing 2 MiB multi-block tests and generic verified bus-clock sweep are
+  retained unchanged. Free-space safety now reserves enough room for the 8 MiB
+  diagnostic file above the configured SensorForge storage reserve.
+- No production SD clock, filesystem format policy, recorder behavior or normal
+  storage path was changed.
+
+## v42 — 2026-09-24
+
+- Extended the standard SD diagnostic with a generic verified bus-clock sweep in
+  `web_sd_maintenance.cpp`; the implementation is shared by SPI and SD_MMC
+  backends rather than being specific to the Freenove board.
+- The existing production-mount 4/16/32/64 KiB benchmark remains unchanged and
+  still provides the primary 32 KiB comparison result.
+- SPI diagnostics build a conservative clock plan from standard test points and
+  never exceed the board profile's `SD_SPI_MAX_FREQUENCY_HZ`; the current XIAO
+  profile therefore tests 4/10/20 MHz and never exceeds its approved 20 MHz.
+- SD_MMC diagnostics use standard 10/20/40 MHz points up to the platform's
+  high-speed diagnostic ceiling and additionally respect Arduino's
+  `BOARD_MAX_SDMMC_FREQ` when the selected board variant declares a lower cap.
+  The current Freenove 1-bit profile therefore gets the same generic clock sweep
+  without changing its normal 20 MHz policy.
+- Every clock point remounts the backend, performs a compact 512 KiB write/read
+  test with 32 KiB blocks, records throughput and latency, and verifies the full
+  deterministic data pattern. A diagnostic clock that cannot mount or verify is
+  reported as such but does not by itself invalidate the production setting.
+- Before any diagnostic remount the persistent logger is flushed and closed and
+  the storage gate is held. After the sweep SensorForge must restore the exact
+  production mount clock before the logger is reopened; restore failure marks
+  the overall benchmark as failed and leaves `sdReady` false.
+- SD_MMC reporting is width-aware for future board profiles that provide D1-D3;
+  current Freenove remains reported and mounted as 1-bit. No format/raw write or
+  permanent production clock change is performed by the benchmark.
+
+## v41 — 2026-09-24
+
+- Replaced the former single 1 MiB / 32 KiB write-only SD benchmark with an
+  extended non-destructive storage diagnostic in `web_sd_maintenance.cpp`.
+- The diagnostic reports board/storage backend, configured mount clock, storage
+  pins, Arduino-ESP32 version, card type/capacity and filesystem total/used/free
+  space before running the data tests.
+- Runs 2 MiB write/read tests with 32 KiB first for direct historical comparison,
+  followed by 4 KiB, 16 KiB and 64 KiB block sizes.
+- Reports write I/O, loop and total-with-flush throughput; read I/O and verified
+  read-path throughput; open/flush/close timings; and per-call min/average/P95/
+  worst latency for every tested block size.
+- Every test file is read back and verified against a deterministic data pattern;
+  integrity failure or an unremovable temporary benchmark file fails the test.
+- The benchmark uses only `/.__sensorforge_sd_benchmark.bin`, deletes it after
+  each case/final cleanup, respects the configured free-space reserve and remains
+  unavailable while recording or another storage operation owns the storage gate.
+- The 32 KiB result is summarized directly on the SD Maintenance page; the full
+  engineering report is shown in an expandable diagnostics section.
+- No production SD/SPI/SD_MMC clock or mount policy was changed in this release.
+
+## v40 — 2026-09-24
+
+- Extracted the complete SD Maintenance implementation from `webconfig.cpp` into
+  the new `web_sd_maintenance.cpp` / `web_sd_maintenance.h` module.
+- SD status, recovery, benchmark, wipe, format and secure-erase routes keep their
+  v39 paths and behavior; the route set is unchanged.
+- Long-running Secure Erase remains incrementally serviced from the WebConfig
+  firmware loop through the new module loop entry point, including operation
+  continuation after WebConfig is stopped.
+- Shared WebConfig dependencies are limited to page-header/page-footer callbacks
+  and the existing delayed reboot scheduler; storage/config/recorder logic stays
+  owned by the SD module.
+- This release is a structural refactor only; no intentional SD-maintenance UI or
+  storage-policy change was introduced.
+- Fixed the module-boundary compile issue in the WebConfig inactivity guard by
+  querying SD-maintenance busy state through the module API instead of its private
+  Secure Erase state variable.
+
 ## v39 — 2026-09-23
 
 - SD Maintenance now exposes fixed, visible controls for status refresh, read-only

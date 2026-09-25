@@ -27,6 +27,15 @@ extern int cfg_led_enabled;
 extern String cfg_recording_format;   // "avi" or "mkv"
 extern int cfg_timestamp_enabled;     // 0/1
 extern int cfg_recording_encryption;  // 0/1, encrypt newly created video/snapshot media on SD
+
+// Optional audio capture policy. v47 introduces the generic capture subsystem
+// and standalone WAV verification. AVI/MKV muxing is intentionally not changed
+// in this release. Format values remain generic so future I2S/codec backends can
+// support higher quality without changing the config schema.
+extern int cfg_audio_enabled;          // 0/1
+extern int cfg_audio_sample_rate;      // 8000..96000 Hz (backend may be narrower)
+extern int cfg_audio_bits_per_sample;  // 16, 24 or 32 (backend-specific support)
+extern int cfg_audio_channels;         // 1 or 2 (backend-specific support)
 // Continuous JPEG shooter. It is independent of motion-triggered recording
 // and can run alone or in parallel with it. Accepted frames can be filtered
 // before entering an automatically sized PSRAM queue. The queue is persisted
@@ -88,13 +97,13 @@ extern String cfg_disk_full_action;   // "rollover" or "stop"
 extern String cfg_hostname;
 extern String cfg_timezone;             // POSIX TZ string, e.g. CET-1CEST,M3.5.0,M10.5.0/3
 extern String cfg_wifi_on_system_start; // "off", "on", "on_missing_time"
-extern int cfg_wifi_timeout_sec;       // 0 = auto-off disabled, default 60 s
+extern int cfg_wifi_timeout_sec;       // 0 = auto-off disabled; firmware default is 0
 extern String cfg_wifi_ssid;
 extern String cfg_wifi_pass;
 
 // Hotspot / access point
 extern int cfg_hotspot_enabled;       // 0/1, automatic AP start at boot
-extern String cfg_hotspot_password;  // 8..63 chars
+extern String cfg_hotspot_password;  // empty = open AP; otherwise 8..63 chars
 extern int cfg_hotspot_hidden;        // 0/1
 
 // Web interface authentication
@@ -211,6 +220,17 @@ bool configValidateText(
     String &error
 );
 
+// Factory/default identity is derived from Branding::APP_NAME and normalized
+// for hostname / hotspot-SSID use (for example SensorForge -> sensorforge).
+String configDefaultHostname();
+
+// Build the complete canonical config.txt for the current firmware defaults.
+// This is used by the explicit WebConfig factory-reset path.
+bool configBuildFactoryDefaultText(
+    String &text,
+    String &error
+);
+
 
 // Save a complete config.txt.
 //
@@ -236,6 +256,13 @@ enum ConfigSaveResult {
 ConfigSaveResult configSaveText(
     const String &text,
     bool writeToSd,
+    String &error
+);
+
+// Replace every known config value with the current firmware defaults. Internal
+// LittleFS is always updated; an already-existing SD /config.txt is synchronized
+// by the normal configSaveText policy. No new SD config is created.
+ConfigSaveResult configResetToFactoryDefaults(
     String &error
 );
 

@@ -1,0 +1,346 @@
+# SECURITY NOTE:
+# wifi_pass, hotspot_password and web_password may be supplied as plaintext
+# for initial provisioning. SensorForge automatically rewrites persistent
+# copies to board-bound SFSEC1 ciphertext on first successful load/save.
+# Commented secret assignments are protected as well.
+
+############################################################
+# ESP32-S3 Kamera-System – Konfigurationsdatei
+############################################################
+
+###########################
+# AUTHENTICATION        
+###########################
+
+
+# Automatische Aufnahmepause beim Oeffnen des Webinterfaces:
+# 1 = Aufnahmeautomatik beim Oeffnen automatisch pausieren
+# 0 = Aufnahmezustand beim Oeffnen nicht veraendern
+web_recording_auto_pause=1
+
+# Web interface language: de or en.
+# This affects only visible UI text; API/config/log identifiers stay unchanged.
+web_language=de
+
+web_auth_enabled=1
+web_username=ja1
+# passwort min 8  max 62 characters!
+web_password=sensor4337
+
+
+############################
+# KAMERA
+############################
+
+# Kamera-Modell:
+#   OV2640
+#   OV3660
+#   OV5640
+camera=OV3660
+
+# Auflösung:
+#   160x120
+#   320x240
+#   640x480
+#   800x600
+#   1024x768
+#   1280x1024
+#   1600x1200
+#   2048x1536
+resolution=1024x768
+
+# Bildrotation:
+# 0
+# 180
+rotation=0
+
+
+
+# Bilder pro Sekunde
+fps=5
+
+# JPEG-Qualität:
+# 0 = beste Qualität
+# 63 = schlechteste Qualität
+quality=12
+
+
+
+
+
+# Belichtungsautomatik:
+# 1 = Auto Exposure aktiv
+# 0 = Auto Exposure deaktiviert
+camera_auto_exposure=1
+
+# Zielhelligkeit der Auto Exposure:
+# Bereich -2..2
+# Negativer = dunkleres Belichtungsziel; kann Bewegungsunschärfe reduzieren
+# Startwert für Bewegung: -1
+camera_ae_level=-2
+
+# OV3660 Sensor-Crop.
+# 1.0 = volles Sichtfeld (bisheriges Verhalten)
+# 1.5 / 2.0 = engerer Sensor-Ausschnitt bei gleicher Ausgabeaufloesung.
+# Position ist ein 3x3 Raster: X 0=links,1=Mitte,2=rechts; Y 0=oben,1=Mitte,2=unten.
+# Bei anderen Sensoren wird der Crop nicht angewendet.
+camera_crop_zoom=1.0
+camera_crop_x=1
+camera_crop_y=1
+
+
+
+############################
+# AUFNAHME / TRIGGER
+############################
+
+# Recording-Container:
+#   avi = MJPEG AVI + separate standard .srt subtitle file
+#   mkv = MJPEG in Matroska + embedded UTF-8 subtitle track
+#
+# Hinweis: MKV wird in einem späteren Implementierungsschritt aktiviert.
+recording_format=avi
+
+# Datum/Uhrzeit als Untertitel erzeugen:
+#   1 = aktiviert
+#   0 = deaktiviert
+timestamp_enabled=1
+
+# SD encryption policy:
+#   0 = new AVI/MKV recordings, shooter JPEGs and system logs are stored normally
+#   1 = new AVI/MKV recordings and shooter JPEGs use SFENC1; system logs use SFLOG1; SensorForge
+#       decrypts both transparently for WebPlayer, downloads and the Log Viewer
+# Existing encrypted and unencrypted recordings remain readable independent of this setting.
+# When encryption is enabled, existing plaintext log generations are migrated once to SFLOG1.
+# Config passwords use the separate SFSEC1 protection whenever the hardware key is available.
+# On first activation SensorForge automatically creates a random board-bound 256-bit
+# root key in an unused ESP32-S3 eFuse key block (HMAC_UP). This one-time hardware
+# provisioning is permanent. Existing foreign/used key blocks are never overwritten.
+recording_encryption=0
+
+# Dauershooter: einziger zeitgesteuerter JPEG-Pfad. Unabhaengig von der
+# bewegungsgesteuerten Aufnahme und daher auch als alleiniger Modus nutzbar.
+shooter_enabled=1
+
+# 500 = 2 fps; 1000 = 1 fps; 60000 = 1 Bild/Minute.
+shooter_interval_ms=500
+
+# Zu dunkle Bilder verwerfen. Gemessen wird der mittlere Grauwert 0..255.
+# 0 deaktiviert den Dunkelfilter.
+shooter_dark_mean_min=20
+
+# Nahezu identische Bilder verwerfen. 99 bedeutet: wenn mindestens 99 Prozent
+# des 20x15-Rasters gegenueber dem letzten akzeptierten Bild praktisch gleich
+# bleiben, wird das neue Bild nicht gespeichert. 0 deaktiviert den Filter.
+shooter_similarity_threshold=99
+
+# Spaetestens nach dieser Zeit wieder ein Bild akzeptieren, auch wenn die Szene
+# nahezu identisch ist. Der Dunkelfilter bleibt trotzdem aktiv. 0 = aus.
+shooter_force_save_seconds=60
+
+# Akzeptierte JPEGs werden zuerst im PSRAM gesammelt. Nach diesem Timeout wird
+# der Puffer auf SD geschrieben. 0 = sofort schreiben. Bei Stromausfall koennen
+# hoechstens noch nicht geflushte Bilder verloren gehen.
+shooter_flush_seconds=300
+
+# Die PSRAM-Queue wird automatisch dimensioniert. SensorForge reserviert
+# Laufzeitreserve und verwendet 80 Prozent des danach sicher nutzbaren freien
+# PSRAM. Ist die Queue vor dem Timeout voll, wird sofort auf SD geflusht.
+
+# Zeitgesteuerte Scharfschaltung fuer automatische Aufnahmen.
+# off = keine Zeitsperre, Aufnahme sofort erlaubt
+# sonst lokale Zeit gemaess timezone im Format YYYY-MM-DDTHH:MM:SS
+# Beispiel: recording_not_before=2026-09-10T05:30:00
+# Im Webinterface wird dieser Wert ueber Auswahlmenues gesetzt.
+recording_not_before=off
+
+# Bewegungsgesteuerte Aufnahme. 0 deaktiviert Radar/PIR/Bildbewegung als
+# Aufnahmeausloeser und als Presence-Wakequelle. Der Dauershooter bleibt davon
+# unabhaengig aktiv, wenn shooter_enabled=1.
+motion_recording_enabled=1
+
+# Motion recording decision (nur bei motion_recording_enabled=1):
+# direct       = existing behavior; sensor trigger starts recording immediately
+# image_verify = radar/OT2 trigger wakes the camera, image analysis must confirm
+#                local motion before a new recording starts
+motion_recording_decision=direct
+
+# Image-motion engine. Keep disabled for a regression-free first flash, then
+# enable/configure from WebConfig -> Sensor -> Image motion.
+image_motion_enabled=0
+image_motion_sensitivity=5
+image_motion_min_area_pct=6
+image_motion_confirm_frames=2
+image_motion_release_frames=2
+image_motion_background_learning=4
+image_motion_global_mean_delta=24
+image_motion_global_change_pct=70
+
+# 20x15 ROI bit mask = 300 cells = 38 bytes = 76 hex characters.
+# Default: all 300 cells active (upper unused 4 bits in the last byte are zero).
+image_motion_roi_mask=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0f
+
+# Nachlaufzeit nach letzter Bewegung (ms)
+post_record_ms=3000
+
+# Maximale Dauer eines einzelnen Aufnahme-Segments in Sekunden.
+# 0 = keine zeitliche Segmentbegrenzung
+recording_segment_seconds=30
+
+# Maximale Groesse eines einzelnen Video-Segments in MB.
+# 0 = keine zusaetzliche Groessenbegrenzung
+recording_segment_max_mb=20
+
+
+# Sicherheitsgrenze fuer ein komplettes Aufnahmeereignis ueber alle Segmente.
+# 0 = unbegrenzt / Sicherheitsgrenze deaktiviert
+recording_event_max_seconds=65
+
+# Pause nach Erreichen der Ereignis-Sicherheitsgrenze.
+# Waehrend dieser Zeit startet keine neue Aufnahme, auch bei dauernder Bewegung.
+# 0 = keine Pause (nicht empfohlen)
+recording_event_cooldown_seconds=120
+
+
+############################
+# SLEEP / STROMSPAREN
+############################
+
+# Sleep-Modus bei Inaktivitaet und ausgeschaltetem WLAN:
+#   off         = kein Sleep, ESP32 bleibt wach
+#   light_sleep = schneller Wake, Programmzustand bleibt erhalten
+#   deep_sleep  = maximal stromsparend, Wake fuehrt zu einem Neustart
+sleep_mode=light_sleep
+
+# Wartezeit nach Aufnahmeende / letzter Aktivitaet vor Sleep (ms)
+# Bereich: 0..60000
+# Standard: 2000
+sleep_delay_ms=2000
+
+
+############################
+# TRANSPORTMODUS
+############################
+
+# 0 = normaler Betrieb
+# 1 = Transportmodus aktiv. Im Webinterface wird dieser Zustand normalerweise
+#     ueber den Transportmodus-Button gesetzt und automatisch wieder geloescht.
+transport_mode=0
+
+# Solange die Kamera abgedeckt/schwarz ist, wird nur in diesem Abstand geprueft.
+# Dazwischen: timer-only Deep Sleep, Radar/PIR wecken das Geraet nicht.
+transport_check_seconds=120
+
+# Wenn Licht erkannt wird, muss die Kamera ueber diese Zeit mehrfach hell bleiben,
+# bevor das Tape als entfernt gilt.
+transport_light_confirm_seconds=10
+
+# Zeit nach bestaetigtem Entfernen des Tapes, in der der Techniker montieren und
+# den Bildbereich verlassen kann. Waehrenddessen bleibt das Geraet im Deep Sleep.
+transport_install_delay_seconds=300
+
+# Harte Sicherheitsgrenze fuer die gesamte Transportphase.
+# Nach Ablauf wird der Transportmodus unabhaengig von der Lichtmessung beendet.
+# Bereich: 3600..604800 Sekunden (1 Stunde .. 7 Tage)
+# Standard: 86400 Sekunden = 24 Stunden
+transport_max_duration_seconds=86400
+
+# Schwarzerkennung fuer den Transport-Check (Graustufen 0..255).
+# BLACK nur wenn sowohl Mittelwert als auch P95 unter den Grenzen liegen.
+# Im Web-Menue "Transportsicherung" wird beim Aufruf automatisch mit der
+# echten Transport-Messmethode gemessen und ein etwas hellerer Grenzwert
+# vorgeschlagen. Der Vorschlag kann direkt gespeichert oder manuell geaendert werden.
+transport_black_mean_max=25
+transport_black_p95_max=45
+
+
+############################
+# LED
+############################
+
+# 1 = LED während Aufnahme
+# 0 = LED aus
+led_enabled=1
+
+############################
+# SPEICHER / SD-SICHERHEIT
+############################
+
+# Mindestreserve auf der SD-Karte in MB.
+# Standard: 100 MB
+min_free_space_mb=100
+
+# Verhalten beim Erreichen der Mindestreserve:
+# rollover = älteste vollständige Aufnahmen löschen
+# stop     = keine weitere Aufnahme, bis wieder genug Platz frei ist
+disk_full_action=rollover
+
+
+
+
+############################
+# WLAN / NTP
+############################
+
+# WLAN-Verhalten beim Systemstart:
+# off             = WLAN beim Systemstart nicht einschalten
+# on              = WLAN beim Systemstart einschalten
+# on_missing_time = WLAN beim Systemstart nur einschalten,
+#                   wenn keine gueltige Uhrzeit vorhanden ist
+wifi_on_system_start=on
+
+# Automatische WLAN-Abschaltung nach Inaktivität in Sekunden.
+# 0 = WLAN wird nicht automatisch/manuell abgeschaltet
+# Standard: 60 Sekunden
+wifi_timeout_sec=60
+
+
+hostname=printer51
+wifi_ssid=wlan-ny
+wifi_pass=klammer123
+
+#wifi_ssid=cp902
+#wifi_pass=Amen.4#4.Amen
+
+# Wenn hotspot_enabled so wird der hostname als hotspot verwendet
+hotspot_enabled=1
+hotspot_password=sensor4337
+hotspot_hidden=0
+
+
+
+############################
+# ZEITZONE
+############################
+
+# Zeitzone im POSIX-TZ-Format.
+#
+# Österreich / Mitteleuropa:
+#   Winterzeit = CET  (UTC+1)
+#   Sommerzeit = CEST (UTC+2)
+timezone=CET-1CEST,M3.5.0,M10.5.0/3
+
+# Beispiel London / UK:
+#   Winterzeit = GMT  (UTC+0)
+#   Sommerzeit = BST  (UTC+1)
+# timezone=GMT0BST,M3.5.0/1,M10.5.0/2
+
+
+
+############################
+# DEBUG
+############################
+
+# 1 = Debug aktiv
+# 0 = Debug aus
+debug_enabled=0
+
+log_file=/log.txt
+
+
+# Bootloop-/Unterspannungsschutz
+# Erkennt mehrere kurze, instabile Neustarts in Folge und versetzt das
+# Gerät anschließend für eine längere Zeit in Deep Sleep.
+# Verhindert dauernde Neustarts bei leerem bzw. instabilem Akku.
+# 1 = aktiviert, 0 = deaktiviert
+bootloop_protection=1

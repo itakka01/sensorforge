@@ -58,6 +58,13 @@
 #define RTC_SDA_PIN          GPIO_NUM_1   // (grün)
 #define RTC_SCL_PIN          GPIO_NUM_47  // (blau)
 
+// Optional audio input.
+// The current Freenove product profile has no qualified microphone backend.
+// Future external PDM/I2S hardware can be added here without changing the
+// generic audio_capture interface.
+#define AUDIO_INPUT_BACKEND_NONE 1
+#define AUDIO_INPUT_NAME "No configured microphone"
+
 // Board-specific native sensor orientation correction.
 // User-facing rotation=0 is defined as the normal, non-mirrored product image.
 // Freenove currently needs no additional mirror/flip correction.
@@ -123,6 +130,21 @@
 // RTC / I2C bus.
 #define RTC_SDA_PIN          GPIO_NUM_5      // D4 ← RTC SDA (grün)
 #define RTC_SCL_PIN          GPIO_NUM_6      // D5 ← RTC SCL (blau)
+
+// Audio input: onboard XIAO ESP32-S3 Sense PDM microphone.
+// Seeed hardware routing: GPIO42=PDM CLK, GPIO41=PDM DATA.
+// Keep microphone hardware selection in the board profile. The generic audio
+// module only consumes the backend + capability declarations below, so future
+// boards can provide external/high-quality microphone backends independently.
+// Seeed currently documents 16 kHz / 16-bit mono as the stable reference point;
+// keep the onboard backend qualified there until higher rates are hardware-tested.
+#define AUDIO_INPUT_BACKEND_PDM 1
+#define AUDIO_INPUT_NAME "XIAO onboard PDM microphone"
+#define AUDIO_PDM_CLK_PIN                  GPIO_NUM_42
+#define AUDIO_PDM_DATA_PIN                 GPIO_NUM_41
+#define AUDIO_INPUT_MIN_SAMPLE_RATE_HZ     16000UL
+#define AUDIO_INPUT_MAX_SAMPLE_RATE_HZ     16000UL
+#define AUDIO_INPUT_RECOMMENDED_SAMPLE_RATE_HZ 16000UL
 
 // Board-specific native sensor orientation correction.
 // On the current SensorForge XIAO + OV3660 assembly the native sensor feed is

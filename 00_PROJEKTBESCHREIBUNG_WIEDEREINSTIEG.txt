@@ -1,8 +1,8 @@
 SENSORFORGE / ESP32-S3 CAMERA (XIAO + FREENOVE)
 PROJEKTBESCHREIBUNG, RELEASESTAND UND WIEDEREINSTIEGSPROMPT
-Stand: 2026-09-23
-Dokumentrevision: v35 / Release-Tracking + WebPlayer/WebConfig/Shooter/Logger-Fixes v23-v35
-Aktueller Entwicklungs-Release: v35
+Stand: 2026-09-24
+Dokumentrevision: v46 / Produktivstand + Logger/SFLOG1 + SD Maintenance/Diagnostik v36-v46
+Aktueller Entwicklungs-/Produktiv-Release: v46
 Produktname: SensorForge
 Plattformname: Fabric Node
 Core-Version im Branding: 7.1.0
@@ -63,6 +63,7 @@ Der aktuelle Quellstand besteht im Kern aus:
 - image_motion.cpp / image_motion.h
 - motion_diagnostics.cpp / motion_diagnostics.h
 - webconfig.cpp
+- web_sd_maintenance.cpp / web_sd_maintenance.h fuer SD Maintenance, Format und Diagnostik
 - web_log.cpp / web_log.h fuer den ausgelagerten Logviewer
 - language.cpp / language.h
 - license.cpp / license.h
@@ -151,6 +152,17 @@ beide Testdateien wurden fehlerfrei zurueckgelesen. Die Frame-/Storage-Latenzen
 verbesserten sich deutlich. Die Sync-API muss bei NORMAL=MAX=20 MHz nicht mehr
 zwischen zwei SD-Taktraten remounten.
 
+Seit v44 ist fuer SensorForge SD Format FAT32 mit 32-KiB-Clustern verbindlich.
+Der Anlass war ein realer Freenove-Test, bei dem eine zuvor mit 512-Byte-Clustern
+formatierte ca. 32-GB-Karte nur rund 0.23 MB/s Schreibrate erreichte. Nach
+Neuformatierung mit 32-KiB-Clustern stieg derselbe verifizierte SD_MMC-1-bit-Pfad
+bei 20 MHz auf rund 1.7 bis 1.8 MB/s Schreiben/Lesen; ein diagnostischer
+40-MHz-Test erreichte rund 2.6 MB/s Schreiben und 3.2 MB/s Lesen, jeweils mit
+erfolgreichem Read-back-Verify. Der aktuelle Produktivstand v46 aendert den
+normalen Freenove-Mount trotzdem noch NICHT auf 40 MHz: Produktion bleibt 20 MHz;
+40 MHz ist als naechster separat zu qualifizierender Board-Policy-Schritt
+vorgemerkt.
+
 Seit dem Stand vom 2026-09-18 wurden ausserdem folgende wesentliche
 Betriebs-/Stabilitaetsthemen integriert und auf Freenove-Hardware getestet:
 
@@ -172,13 +184,14 @@ definiert und bleibt ein eigener naechster Entwicklungsschritt.
 
 
 ======================================================================
-AKTUELLER RELEASESTAND 2026-09-23 - v23 BIS v35
+AKTUELLER RELEASESTAND 2026-09-24 - v23 BIS v46
 ======================================================================
 
-AKTUELLER ENTWICKLUNGS-RELEASE: v35
+AKTUELLER ENTWICKLUNGS-/PRODUKTIV-RELEASE: v46
 
-WICHTIG: Die Versionsnummer v35 ist die menschliche Projekt-/Release-ID fuer den
-zusammengefuehrten SensorForge-Quellstand. Sie ist bewusst getrennt von:
+WICHTIG: Die Versionsnummer v46 ist die menschliche Projekt-/Release-ID fuer den
+zusammengefuehrten SensorForge-Quellstand. Der Benutzer hat v46 in dieser Sitzung
+als neuen Produktiv-Release festgelegt. Die Release-ID ist bewusst getrennt von:
 
 - Core-Version 7.1.0 in branding.h
 - Compile-Zeitpunkt __DATE__/__TIME__ eines konkreten Binaries
@@ -189,7 +202,7 @@ Ab v35 existieren:
 - sensorforge_version.h als zentrale Release-Identitaet
 - CHANGELOG.md als fortlaufende Release-Historie
 - SENSORFORGE_RELEASE_NUMBER
-- SENSORFORGE_RELEASE_TAG, z.B. "v35"
+- SENSORFORGE_RELEASE_TAG, z.B. "v46"
 - SENSORFORGE_RELEASE_DATE
 - SENSORFORGE_RELEASE_SUMMARY
 
@@ -206,24 +219,28 @@ VERBINDLICHER RELEASE-/GIT-WORKFLOW AB v35:
 4. Vor dem Git-Commit werden diese Deltas in den vollstaendigen lokalen
    Projektbaum des Benutzers eingespielt.
 5. Danach den KOMPLETTEN Projektstand committen.
-6. Git-Tag exakt gleich der Firmware-Release-ID setzen, z.B. v35.
+6. Git-Tag exakt gleich der Firmware-Release-ID setzen, z.B. v46.
 7. Release-ID im Geraet, CHANGELOG und Git-Tag muessen denselben logischen Stand
    bezeichnen.
-8. Ein Deltapaket wie v35.zip darf niemals als vollstaendiges Projektarchiv
+8. Ein Deltapaket wie v46.zip darf niemals als vollstaendiges Projektarchiv
    missverstanden werden.
 
 Effektiver letzter im Chat erzeugter Dateistand fuer die seit v23 beruehrten
 Hauptdateien (nur als Rekonstruktionshilfe, nicht als Ersatz fuer Codepruefung):
 
-- sensorforge.ino: letzter geaenderter Stand v26
-- webconfig.cpp: aktueller Stand v35; enthaelt die aufeinander aufgebauten
-  WebConfig/WebViewer-Deltas v23, v24, v25, v27-v32 und Releaseanzeige v35
+- sensorforge.ino: letzter in dieser Sitzung geaenderter Stand v37
+- webconfig.cpp: letzter geaenderter Stand v40; seit v40 nur noch Integration/Hooks
+  fuer das ausgelagerte SD-Maintenance-Modul
+- web_sd_maintenance.cpp: neues Modul ab v40, aktueller Stand v46
+- web_sd_maintenance.h: neues Modul ab v40, letzter geaenderter Stand v40
 - webplayer.cpp: letzter geaenderter Stand v25
 - storage_guard.cpp/.h: letzter geaenderter Stand v24
-- logger.cpp: aktueller Stand v35, funktional auf v34/v33 aufbauend
-- log_storage.cpp: letzter geaenderter Stand v33
-- sensorforge_version.h: neu v35
-- CHANGELOG.md: neu v35
+- logger.cpp / logger.h: aktueller Stand v37
+- log_storage.cpp / log_storage.h: aktueller Stand v37
+- web_log_reader.cpp: letzter geaenderter Stand v36
+- language.cpp / language.h: letzter geaenderter Stand v38
+- sensorforge_version.h: aktueller Stand v46
+- CHANGELOG.md: aktueller Stand v46
 
 Diese Liste darf spaeter NICHT blind verwendet werden. Sobald ein neuerer
 Upload/Git-Stand existiert, ist dieser autoritativ.
@@ -231,10 +248,10 @@ Upload/Git-Stand existiert, ist dieser autoritativ.
 Empfohlenes Git-Schema:
 
   git add .
-  git commit -m "SensorForge v35"
-  git tag -a v35 -m "SensorForge v35"
+  git commit -m "SensorForge v46"
+  git tag -a v46 -m "SensorForge v46"
   git push origin main
-  git push origin v35
+  git push origin v46
 
 WICHTIG FUER SPAETERE CODEAENDERUNGEN:
 
@@ -247,6 +264,202 @@ WICHTIG FUER SPAETERE CODEAENDERUNGEN:
   dann erst aendern. NIEMALS raten.
 - Abhaengigkeiten und Aufrufer ebenfalls pruefen, wenn die Aenderung deren
   Verhalten beruehren kann.
+
+---------------------------------------------------------------------
+v46 - SD BENCHMARK PROFESSIONAL PROGRESS UI / AKTUELLER PRODUKTIVSTAND
+---------------------------------------------------------------------
+
+- Benutzer hat v46 in dieser Sitzung als neuen produktiven Release festgelegt.
+- Beim Start des erweiterten SD-Benchmarks oeffnet sofort ein blockierender
+  In-Progress-Dialog; der Startbutton ist bis zum Ende gesperrt.
+- Ein roter Punkt laeuft professionell und bewusst ohne falsche Prozentangabe
+  kontinuierlich von links nach rechts ueber eine neutrale Fortschrittslinie.
+- Der Dialog erklaert, dass Schreib-/Lesedurchsatz, Latenz, Integritaet und
+  Bustakt-Diagnostik laufen und dass SD-Karte/Strom nicht unterbrochen werden
+  sollen.
+- Benchmarklogik, Bewertungsgrenzen, Formatpolicy und Produktions-SD-Takte
+  wurden in v46 NICHT veraendert.
+
+---------------------------------------------------------------------
+v45 - SD DIAGNOSTIK GREEN / ORANGE / RED + HANDLUNGSEMPFEHLUNG
+---------------------------------------------------------------------
+
+- Erweiterter SD-Benchmark besitzt eine kundenorientierte Ampelbewertung
+  GREEN / ORANGE / RED fuer den GESAMTEN Storage-Pfad
+  (Karte + Filesystem + Bus), nicht fuer die Karte isoliert.
+- Referenz ist der verifizierte 32-KiB-Test. GREEN verlangt mindestens
+  1.0 MB/s Schreiben, 0.75 MB/s Lesen, begrenzte Schreiblatenz und erfolgreiche
+  Datenverifikation.
+- Cluster kleiner als die SensorForge-Empfehlung von 32 KiB erzeugen einen
+  deutlichen Warnhinweis und verhindern GREEN.
+- Bei zu kleinen Clustern weist die UI explizit auf SensorForge SD Format und
+  einen anschliessenden erneuten Benchmark hin.
+- Ergebnis/Ampel und "was jetzt tun" stehen VOR den technischen Details.
+  Der vollstaendige Diagnosebericht bleibt erhalten, ist aber standardmaessig
+  unter Technical diagnostic details eingeklappt.
+- Keine Produktions-SD-Takt- oder Recording-Aenderung in v45.
+
+---------------------------------------------------------------------
+v44 - SENSORFORGE SD FORMAT = FAT32 MIT 32-KiB-CLUSTERN
+---------------------------------------------------------------------
+
+- Interner SD-Formatpfad formatiert nun explizit FAT32 mit 32-KiB-
+  Allocation-Unit statt den Arduino-Default fuer Format-on-Mount-Failure zu
+  uebernehmen.
+- Gilt generisch fuer SPI- und SD_MMC-Storage-Backends.
+- Bestehende Arduino-VFS-/Storage-Driver-Registrierung bleibt erhalten; nur das
+  gemountete FatFs-Logical-Volume wird fuer f_mkfs() temporaer geloest und
+  anschliessend wieder gemountet.
+- Formatparameter: FAT32, zwei FAT-Kopien, 32-KiB-Cluster.
+- Nach Format/Remount wird die reale FatFs-Clustergroesse geprueft. SensorForge
+  meldet nur Erfolg, wenn exakt 32 KiB erreicht wurden; kein stiller Fallback auf
+  512-Byte-Cluster.
+- Bestehende Config-Sicherung/-Wiederherstellung, Recording-/Storage-Gates und
+  Rebootlogik bleiben unveraendert.
+
+HARDWAREERGEBNIS NACH v44 AUF FREENOVE FNK0085:
+
+- Vorherige Karte: FAT32, 512 B/Sektor, 1 Sektor/Cluster = 512-Byte-Cluster.
+- Bei 20 MHz SD_MMC 1-bit lagen lange normale Writes nur bei ca. 0.23 MB/s;
+  Preallocated-Overwrite ca. 0.30 MB/s.
+- Nach interner v44-Neuformatierung: FAT32, 64 Sektoren/Cluster = 32.0 KiB.
+- Verifizierter 2-MiB-/32-KiB-Test bei 20 MHz:
+    Write ca. 1.807 MB/s, Read ca. 1.797 MB/s, Verify OK.
+- 8-MiB-Growing-File:
+    Write total+flush ca. 1.498 MB/s, Verify OK.
+- 8-MiB-Preallocated-Overwrite:
+    Write total+flush ca. 1.772 MB/s, Verify OK.
+- Diagnostischer 40-MHz-Punkt:
+    Write ca. 2.627 MB/s, Read ca. 3.201 MB/s, Verify OK.
+- Damit wurde die extrem niedrige Schreibrate als Filesystem-/Clusterproblem
+  identifiziert; die Freenove-Hardware wurde NICHT verworfen.
+- Produktivstand v46 verwendet fuer Freenove weiterhin 20 MHz. 40 MHz wurde
+  diagnostisch erfolgreich getestet, ist aber noch KEINE implementierte
+  Produktionspolicy dieses Releases.
+
+---------------------------------------------------------------------
+v43 - FILESYSTEM-GEOMETRIE + GROWING VS PREALLOCATED WRITE
+---------------------------------------------------------------------
+
+- Benchmark meldet read-only aus dem gemounteten Filesystem u.a. FAT-Typ,
+  Bytes/Sektor, Sektoren/Cluster, Clustergroesse, Volume-Start-LBA und
+  Clusteranzahl, soweit der Backend/Core-Pfad Raw-Sector-Reads erlaubt.
+- Neuer 8-MiB-/32-KiB-Langtest vergleicht:
+    1. normal wachsendes File
+    2. erneutes Ueberschreiben derselben bereits allokierten Cluster
+- Beide Pfade enthalten vollstaendigen Read-back-Verify und Latenz-/Flushwerte.
+- Der Test zeigte vor der v44-Formatkorrektur auf Freenove nur eine moderate
+  Verbesserung durch Preallocation (ca. 1.29x), waehrend die Clustergroesse nur
+  512 Byte betrug. Das fuehrte direkt zur v44-Formatpolicy.
+
+---------------------------------------------------------------------
+v42 - GENERISCHE VERIFIZIERTE SD-BUSTAKT-DIAGNOSTIK
+---------------------------------------------------------------------
+
+- Standarddiagnostik wurde um einen generischen Clock-Sweep fuer SPI UND SD_MMC
+  erweitert.
+- XIAO/SPI-Testplan respektiert immer SD_SPI_MAX_FREQUENCY_HZ; beim aktuellen
+  20-MHz-XIAO-Profil werden 4/10/20 MHz getestet.
+- SD_MMC verwendet konservative 10/20/40-MHz-Punkte bis zur Plattform-/Board-
+  Obergrenze.
+- Pro Takt: kontrollierter Remount, kompakter 512-KiB-Test mit 32-KiB-Bloecken,
+  Write/Read/Latenz und kompletter deterministischer Datenverify.
+- Vor Remount wird der Logger geflusht/geschlossen und der Storage-Guard gesetzt.
+- Nach dem Sweep MUSS der konfigurierte Produktionstakt wiederhergestellt werden;
+  Restore-Fehler macht den Gesamtbenchmark FAIL und laesst sdReady=false.
+- Diagnostische Taktfehler sind ansonsten informativ und aendern keine
+  Produktionspolicy.
+- Auf Freenove wurden 10/20/40 MHz jeweils erfolgreich gemountet und verifiziert.
+
+---------------------------------------------------------------------
+v41 - ERWEITERTE NICHT-DESTRUKTIVE SD-DIAGNOSTIK
+---------------------------------------------------------------------
+
+- Alter 1-MiB-/32-KiB-Write-only-Test wurde durch eine nicht-destruktive
+  Storage-Diagnostik ersetzt.
+- Bericht: Board, Backend, konfigurierter Mounttakt, Pins, Arduino-ESP32-Version,
+  Kartentyp/-kapazitaet, Filesystem total/used/free und Reserve.
+- 2-MiB Write/Read/Verify mit 32 KiB zuerst, danach 4/16/64 KiB.
+- Meldet I/O-/Loop-/Total+Flush-Durchsatz, Open/Flush/Close-Zeiten sowie
+  Min/Avg/P95/Worst-Latenzen.
+- Jeder Test wird deterministisch zurueckgelesen und verifiziert.
+- Verwendet nur /.__sensorforge_sd_benchmark.bin, respektiert Free-Space-Reserve
+  und bestehende Recording-/Storage-Gates.
+- Kein Produktionsclock wurde dadurch geaendert.
+
+---------------------------------------------------------------------
+v40 - SD MAINTENANCE AUS WEBCONFIG AUSGELAGERT
+---------------------------------------------------------------------
+
+- Vollstaendige SD-Maintenance-Implementierung aus webconfig.cpp in neues Modul
+  web_sd_maintenance.cpp / web_sd_maintenance.h ausgelagert.
+- Das Modul besitzt SD Status, Recovery, Benchmark, Wipe, Format, Secure Erase,
+  Progress/Abort und den inkrementellen Secure-Erase-Loop.
+- webconfig.cpp behaelt nur Integration/Hooks und registriert die Routen ueber
+  webSdMaintenanceRegisterRoutes(...); Loop ueber webSdMaintenanceLoop().
+- Bestehende Routen/Storage-Safety sollten funktional unveraendert bleiben.
+- Ein nach der Auslagerung gefundener Compilefehler durch direkten Zugriff auf
+  die nun private Secure-Erase-Statevariable wurde innerhalb v40 korrigiert:
+  webconfig.cpp fragt den Busy-Zustand nun ueber webSdMaintenanceBusy() ab.
+- v40 ist damit der strukturelle Modulstand inklusive Compilefix.
+
+---------------------------------------------------------------------
+v39 - SD MAINTENANCE ACTIONS KORRIGIERT
+---------------------------------------------------------------------
+
+- Unified SD Maintenance zeigt immer feste Aktionen:
+    SD STATUS AKTUALISIEREN
+    SD RECOVERY
+    SD BENCHMARK STARTEN
+- Recovery bleibt auch bei gemounteter SD sichtbar; dann wird ruhig gemeldet,
+  dass keine Recovery erforderlich ist.
+- XIAO/SPI behaelt die detaillierte read-only Recovery.
+- SD_MMC verwendet den vorhandenen robusten Mount-/Retry-Recoverypfad.
+- Standalone-GET-Seiten /sdstatus, /sd_recovery und /sdbench wurden entfernt;
+  SD-Werkzeuge laufen nur noch ueber die gemeinsame SD-Maintenance-Seite und
+  dedizierte POST-Aktionen.
+- Wipe, Format und Secure Erase bleiben erhalten.
+
+---------------------------------------------------------------------
+v38 - SD STATUS / RECOVERY / BENCHMARK ZUSAMMENGEFUEHRT
+---------------------------------------------------------------------
+
+- SD Status, SD Recovery und SD Benchmark wurden erstmals auf die gemeinsame
+  SD-Maintenance-Seite konsolidiert; Systemmenue nur noch mit einem SD-Eintrag.
+- Wipe, Format und Secure Erase blieben auf derselben Seite.
+- In v38 war Recovery jedoch bei gemounteter SD verborgen und im UI fuer SD_MMC
+  nicht sichtbar. Dieser UI-/Backend-Randfall wurde unmittelbar in v39
+  korrigiert. v39 ueberschreibt daher die v38-Darstellung.
+
+---------------------------------------------------------------------
+v37 - LOGGER-PERSISTENZ + SFLOG1-APPEND-ROBUSTHEIT
+---------------------------------------------------------------------
+
+- Logger-RAM-Batching besitzt eine unabhaengige maximale Persistenzzeit.
+  Normale Logs muessen spaetestens nach rund fuenf Minuten persistiert werden;
+  bei aktivem Power-Shooter-Batching wird dessen konfiguriertes Flushfenster
+  verwendet.
+- Main Loop bedient diese Deadline nur, wenn SD sicher frei ist; Media-Co-Flush
+  bleibt bevorzugt.
+- Teilweise physische SFLOG1-Recordwrites werden vor erneutem Append auf die
+  letzte authentifizierte Dateigrenze zurueckgerollt.
+- Beim Oeffnen authentifiziert ein begrenzter Tail-Scan nur die letzten
+  moeglichen Records und entfernt einen torn/auth-beschaedigten Endbereich.
+- Mittlere Recovery-Gaps mit spaeteren gueltigen Records bleiben erhalten.
+- Boot-Konfigsnapshot wurde um effektive Encryption-/Shooter-/Motion-Werte
+  erweitert, ohne Secrets zu loggen.
+
+---------------------------------------------------------------------
+v36 - SFLOG1 LOGVIEWER / TERMINAL-RECORD RECOVERY
+---------------------------------------------------------------------
+
+- Ein vollstaendig aussehender, aber authentifizierungsfehlerhafter letzter
+  SFLOG1-Record macht nicht mehr das gesamte Log unlesbar.
+- Der beschaedigte Terminal-Record wird verworfen; vorherige authentifizierte
+  Logdaten bleiben sichtbar. Nicht authentifizierte Bytes werden nie ausgegeben.
+- Log Viewer zeigt diesen Fall als verstaendliche Recovery-Warnung mit getrennten
+  technischen Details statt als rohe Systemfehlermeldung.
+- Fetch-Fehler enthalten den Server-Diagnosetext statt nur "HTTP 500".
 
 ---------------------------------------------------------------------
 v23 - RECORDING-LISTE / ZEITBEREICH / DAY-ZIP-BASIS
@@ -420,7 +633,7 @@ v34 - SHOOTER/LOGGER CO-FLUSH UND LANGES RAM-BATCHING
 Ziel: Bei langen Power-Shooter-Pufferzeiten (z.B. 30 Minuten) soll der Logger
 nicht zwischendurch nur wegen normaler Logmeldungen die SD-Karte aktivieren.
 
-Aktueller v34/v35-Stand:
+Historischer Basisstand v34/v35; ab v37 zusaetzlich Logger-Max-Age und SFLOG1-Append-Reparatur:
 
 - normaler Logger-Zielpuffer bleibt 16 KiB
 - wenn shooter_enabled aktiv und shooter_flush_seconds>0 ist, bevorzugt der
@@ -470,7 +683,7 @@ Ein am 2026-09-23 ausgewerteter mehrstuendiger 500-ms-/2-fps-Lauf zeigte:
 Dieser Feldlauf bestaetigt NICHT automatisch v33/v34/v35 auf Hardware; diese
 spaeteren Deltas muessen nach Build/Flash separat regressionsgeprueft werden.
 
-AKTUELLER TESTSTATUS v23-v35:
+HISTORISCHER TESTSTATUS v23-v35:
 
 - verschiedene Deltas wurden in der Assistenzumgebung per Diff, Struktur,
   Delimiter, JavaScript oder ZIP-Inhalt geprueft, je nach Aenderung
@@ -1590,7 +1803,7 @@ unnoetig offen halten; aktives WLAN blockiert den normalen Light-Sleep-Pfad.
 Aus Sicherheitsgruenden werden Zugangsdaten, Passwoerter, Hardware-IDs,
 Lizenz-/Private-Key-Daten und andere Secrets in diesem Dokument nicht wiederholt.
 
-Logging, aktueller Stand bis v35:
+Logging, aktueller Stand bis v37:
 
 - log_file=/log.txt
 - debug_enabled=0
@@ -1615,6 +1828,11 @@ Logging, aktueller Stand bis v35:
   Retry statt als einen langen /log_raw-Stream; Statistik nur noch per Button
 - v22: komplette Web-Log-UI/Routen aus webconfig.cpp in web_log.cpp/.h
   ausgelagert; log_storage.cpp/.h bleibt davon getrennte Crypto-/Storage-Schicht
+- v36: terminaler kompletter-looking Auth-Fehler zerstoert nicht mehr die gesamte
+  lesbare SFLOG1-Historie; nur authentifizierte Daten werden ausgegeben
+- v37: Logger-Max-Age erzwingt spaeteste Persistenz; teilgeschriebene terminale
+  Records werden vor neuem Append auf die letzte authentifizierte Grenze
+  zurueckgerollt und ein begrenzter Tail-Scan repariert beschaedigte Endbereiche
 
 
 ======================================================================
@@ -2771,7 +2989,7 @@ Im Dauershooter-Test wurde festgestellt, dass der alte Logger jede normale
 Logzeile unmittelbar auf SD schrieb und flushte. Bei 2 fps konnte dadurch selbst
 ein reiner Shooter-Timer-Wake unnoetige SD-Aktivitaet verursachen.
 
-Aktueller Stand bis v35:
+Aktueller Stand bis v37:
 
 - normaler Logger-Zielpuffer: 16 KiB PSRAM
 - bei cfg_shooter_enabled!=0 UND cfg_shooter_flush_seconds>0 wird seit v34 ein
@@ -2793,6 +3011,11 @@ Aktueller Stand bis v35:
 - seit v33 werden SFLOG1-Records nach Moeglichkeit nicht mitten in einer
   Textzeile getrennt. Nach Recovery/Resynchronisation fuegt der Reader einen
   Zeilenumbruch ein, damit keine irrefuehrend zusammengeklebten Zeilen entstehen
+- seit v37 existiert zusaetzlich eine maximale Persistenzzeit fuer seltene
+  Logereignisse; Power-Shooter-Co-Flush bleibt bevorzugt, darf Logs aber nicht
+  unbegrenzt nur im PSRAM halten
+- v37 repariert einen torn/auth-beschaedigten terminalen SFLOG1-Tail vor neuem
+  Append, ohne spaetere gueltige Mid-file-Recovery-Historie pauschal zu verwerfen
 
 Tradeoff:
 
@@ -5269,6 +5492,34 @@ WICHTIGE ENTWICKLUNGSREGELN
 
 
 ======================================================================
+AKTUELLER TEST-/FELDSTATUS v36-v46 (2026-09-24)
+======================================================================
+
+- v36/v37 wurden in der Assistenzumgebung strukturell geprueft; kein kompletter
+  Arduino-Build und kein Hardwaretest durch die Assistenz behauptet.
+- v40 erhielt nach einem vom Benutzer gemeldeten Compilefehler einen Compilefix
+  fuer die Modulgrenze webSdMaintenanceBusy().
+- v41-v43 wurden statisch/zweigorientiert geprueft; v42-Helper wurden in einem
+  lokalen C++-Syntaxharness fuer SPI, SD_MMC 1-bit und SD_MMC 4-bit kompiliert.
+  Das ersetzt keinen vollstaendigen Arduino-Build.
+- v43 wurde auf echter Freenove-Hardware ausgefuehrt. Der Bericht zeigte FAT32
+  mit nur 512-Byte-Clustern und ca. 0.23 MB/s normaler Schreibrate.
+- v44 wurde auf echter Freenove-Hardware verwendet, um die Karte intern neu als
+  FAT32 mit 32-KiB-Clustern zu formatieren. Anschliessender Diagnosebericht:
+    20 MHz / 32 KiB: Write ca. 1.807 MB/s, Read ca. 1.797 MB/s, Verify OK
+    40 MHz Diagnose: Write ca. 2.627 MB/s, Read ca. 3.201 MB/s, Verify OK
+    Gesamtresultat: OK
+- Dieser A/B-Test gilt als klare reale Bestaetigung, dass die vorherige sehr
+  niedrige Schreibrate wesentlich durch die 512-Byte-FAT32-Cluster verursacht
+  wurde und nicht als unvermeidbare Freenove-/ESP32-S3-Grenze zu behandeln ist.
+- v45/v46 wurden in der Assistenzumgebung statisch/strukturell geprueft. Ein
+  kompletter Arduino-Build oder separater Hardware-Langzeittest wurde dort nicht
+  ausgefuehrt.
+- Der Benutzer hat v46 am 2026-09-24 als neuen Produktiv-Release festgelegt.
+- 40 MHz fuer Freenove ist trotz erfolgreichem Verify noch ein eigener naechster
+  Qualifikationsschritt und NICHT Bestandteil der v46-Produktionspolicy.
+
+======================================================================
 EMPFOHLENER WIEDEREINSTIEGSPROMPT FUER EINEN NEUEN CHAT
 ======================================================================
 
@@ -5304,8 +5555,8 @@ WICHTIGE ARBEITSREGELN - BETTER SAFE THAN SORRY:
 - Keine .lic-Datei-Userflows fuer die Lizenzierung wieder einfuehren.
 - WebLog ist ab v22 eigenes Modul web_log.cpp/.h; log_storage.cpp/.h bleibt die
   separate SFLOG1-/Storage-Schicht.
-- Aktueller Entwicklungs-Release ist v35. sensorforge_version.h traegt die
-  Release-ID, CHANGELOG.md die Historie. Release-ID, Core-Version 7.1.0,
+- Aktueller Entwicklungs-/Produktiv-Release ist v46. sensorforge_version.h
+  traegt die Release-ID, CHANGELOG.md die Historie. Release-ID, Core-Version 7.1.0,
   Build-Zeitpunkt und API-Version sind getrennte Begriffe.
 - ZIPs sind Deltapakete und enthalten nur geaenderte/neue Dateien. Nach jeder
   Release werden die Deltas in den vollstaendigen lokalen Projektbaum gemergt,
@@ -5313,7 +5564,7 @@ WICHTIGE ARBEITSREGELN - BETTER SAFE THAN SORRY:
   markiert.
 
 
-AKTUELLER v35-FUNKTIONSDELTA:
+AKTUELLER v46-FUNKTIONSSTAND:
 
 - Recording-Liste: Icons, Video-Zeitbereiche, Annotationen, Auswahl/Loeschen,
   Corrupt-Warnung, progressives Laden und sichtbare Range-/Filterauswahl.
@@ -5335,13 +5586,42 @@ AKTUELLER v35-FUNKTIONSDELTA:
 - v35: zentrale Release-ID in sensorforge_version.h, CHANGELOG.md, Anzeige im
   Bootlog und WebConfig; Git-Tag soll exakt der Release-ID entsprechen.
 
+- v36/v37: SFLOG1 terminale Auth-/Torn-Record-Recovery und robustes Append/
+  Rollback; Logger-Max-Age verhindert unbegrenztes reines RAM-Logging.
+- v38/v39: SD Status, Recovery, Benchmark, Wipe, Format und Secure Erase sind in
+  EINER SD-Maintenance-Seite konsolidiert; v39 korrigiert sichtbare Recovery-
+  Aktionen fuer gemountete SD und SD_MMC.
+- v40: SD Maintenance aus webconfig.cpp in web_sd_maintenance.cpp/.h ausgelagert.
+  Bei spaeteren SD-Aenderungen deshalb NICHT wieder in webconfig.cpp implementieren.
+- v41-v43: erweiterte verifizierte SD-Diagnostik mit 4/16/32/64-KiB-Tests,
+  Latenzen, Read-back, generischem SPI/SD_MMC-Clock-Sweep, Filesystem-Geometrie
+  und 8-MiB-Growing-vs.-Preallocated-Vergleich.
+- v44: SensorForge SD Format erzeugt verbindlich FAT32 mit 32-KiB-Clustern und
+  verifiziert die effektive Clustergroesse. Dieser Punkt ist fuer Performance
+  KRITISCH; 512-Byte-Cluster auf einer ca. 32-GB-Karte verursachten real nur
+  ca. 0.23 MB/s Write.
+- Nach v44-Formatierung erreichte derselbe Freenove-1-bit-Pfad bei 20 MHz rund
+  1.7-1.8 MB/s Write/Read und bei diagnostischen 40 MHz ca. 2.6 MB/s Write /
+  3.2 MB/s Read, jeweils Verify OK.
+- v45: Ampelbewertung GREEN/ORANGE/RED, Clusterwarnung und direkte
+  Handlungsempfehlung stehen vor den eingeklappten technischen Details.
+- v46: professioneller blockierender Benchmark-In-Progress-Dialog mit rotem,
+  von links nach rechts laufendem Punkt. v46 wurde vom Benutzer als neuer
+  Produktiv-Release festgelegt.
+- WICHTIG: Freenove-Produktionstakt ist in v46 weiterhin 20 MHz. Der 40-MHz-
+  Sweep war erfolgreich, aber eine permanente 40-MHz-Boardpolicy wurde in dieser
+  Sitzung noch NICHT implementiert.
+
 
 BUILD / HARDWARE:
 
-Im am 2026-09-23 eingesehenen aktuellen board_config.h ist BOARD_XIAO aktiv
-und BOARD_FREENOVE auskommentiert. Beide Hardwarepfade bleiben unterstuetzt.
-Vor JEDEM Build den tatsaechlich aktuellen board_config.h erneut pruefen; niemals
-aus diesem Dokument oder einer alten Sitzung auf das aktive Board schliessen.
+Der zuletzt separat eingesehene board_config.h-Upload vom 2026-09-23 hatte
+BOARD_XIAO aktiv. Die reale v43/v44-Diagnostik dieser Sitzung lief dagegen auf
+Freenove FNK0085, d.h. der Benutzer hat seinen lokalen Buildstand danach auf
+Freenove umgestellt. Da board_config.h nicht Teil der v46-Deltas ist, vor JEDEM
+Build den tatsaechlich aktuellen lokalen board_config.h erneut pruefen; NIEMALS
+aus diesem Dokument auf das aktive Board schliessen. Beide Hardwarepfade bleiben
+unterstuetzt.
 Der historische bewaehrte Arduino-Build verwendet ESP32S3 Dev Module mit
 Arduino-ESP32 3.3.11, 8 MB Flash, DIO, OPI PSRAM und der 8-MB-OTA-
 Partitionierung. Die aktuelle Feldsitzung wurde mit Arduino-ESP32 3.3.12 gebaut.
@@ -5359,12 +5639,19 @@ Korrektur ersetzt; rotation=0 ist in Livebild, Image Motion und Aufnahme korrekt
 orientiert und nicht gespiegelt.
 
 microSD auf XIAO verwendet SPI auf CS21/SCK7/MISO8/MOSI9. Der aktuelle
-Produktionsstand verwendet NORMAL=20 MHz und MAX=20 MHz. Die Umstellung von
+XIAO-Produktionsstand verwendet NORMAL=20 MHz und MAX=20 MHz. Die Umstellung von
 4 MHz wurde auf echter Hardware mit synthetischem SD-Verify und realem
 OV3660/AVI/SFENC1-Recording verifiziert. Realer P95-Frame-Call verbesserte sich
 dabei von etwa 102.3 auf 47.2 ms; Worst von etwa 123.1 auf 54.4 ms, Verify OK.
 API Exclusive behaelt 20 MHz und ueberspringt unnoetige 20->20-MHz-Remounts.
-Freenove/SD_MMC bleibt davon unberuehrt.
+
+Freenove verwendet den onboard-Slot als SD_MMC 1-bit auf CLK39/CMD38/D0=40.
+Der v46-Produktivstand mountet weiterhin mit 20 MHz. Die v42-v44-Diagnostik
+verifizierte 10/20/40 MHz und zeigte nach FAT32-32-KiB-Formatierung bei 20 MHz
+rund 1.7-1.8 MB/s und bei 40 MHz diagnostisch rund 2.6 MB/s Write / 3.2 MB/s
+Read. 40 MHz ist damit ein plausibler naechster Produktivkandidat, wurde aber
+NOCH NICHT als permanenter Boardtakt in v46 umgesetzt. Keine automatische
+Annahme aus dem erfolgreichen Sweep ableiten.
 
 Der XIAO-Firmware-Default fuer cfg_camera in config.cpp ist weiterhin bewusst
 OV2640, obwohl die reale Produkt-Hardware und aktive Config OV3660 verwenden.
@@ -5752,9 +6039,10 @@ WEITERE PRIORITAETEN:
   High-Rate-Light-Sleep nicht ohne reproduzierbaren Langzeit-A/B-Test reaktivieren
 - v22 nach Build/Flash kurz auf Logseite regressionspruefen: Chunk-Load, Retry,
   Button-Statistik, Live-Update, Download und Log-Clear
-- webconfig.cpp kuenftig nur schrittweise nach fachlich geschlossenen Modulen
-  verkleinern; web_log.cpp/.h ist der erste ausgelagerte Bereich. Keine grosse
-  gleichzeitige Komplettrefaktorierung vor Feldqualifikation
+- webconfig.cpp weiterhin nur schrittweise nach fachlich geschlossenen Modulen
+  verkleinern; web_log.cpp/.h ist seit v22 ausgelagert und SD Maintenance seit
+  v40 als web_sd_maintenance.cpp/.h. Keine grosse gleichzeitige
+  Komplettrefaktorierung vor Feldqualifikation
 - Integration-API-Vertrag von v17 (Host 1.12 / Integration API 1.0) als stabile
   Basis einfrieren; bei Wiederaufnahme von HA den dann aktuellen Firmwarestand
   gegen bestehende Kamera-/Sync-Funktion regressionsfrei pruefen
@@ -5791,6 +6079,12 @@ WEITERE PRIORITAETEN:
   Aufnahmeentscheidung einbeziehen
 - XIAO-SD 20 MHz bei weiteren Karten/Boardchargen und hoeheren Aufloesungen/FPS
   weiter auf Latenzspikes, Recovery, Temperatur und Strom beobachten
+- Freenove SD_MMC: 32-KiB-FAT32-Cluster als verbindliche Formatpolicy beibehalten;
+  bei Benchmark-Clusterwarnung zuerst ueber SensorForge SD Format neu formatieren
+  und danach Benchmark wiederholen
+- Freenove 40 MHz separat als Produktionspolicy qualifizieren (Langzeit-
+  Recording, Power-Cut/Recovery, weitere Karten/Boardchargen). In v46 bleibt
+  Produktion 20 MHz; erfolgreichen Diagnosesweep NICHT mit Freigabe verwechseln
 - XCLK 16 vs 20 MHz nur bei neuer Energieoptimierungs-Prioritaet A/B testen
 - Freenove-PIR-Referenzhardware ist SR602; AM312 nicht wieder einfuehren oder
   als gleichwertigen Ersatz dokumentieren
@@ -5809,6 +6103,7 @@ keine bereits geloesten Themen neu designen, keine APIs/Funktionen erfinden und
 Codeaenderungen nur auf dem zuletzt wirklich gesehenen Quellstand vornehmen.
 Bei Rueckgabe von Code standardmaessig nur geaenderte/neue Dateien unter ihren
 Originalnamen mitsenden; keine unveraenderten Dateien in Update-ZIPs aufnehmen.
+
 
 
 

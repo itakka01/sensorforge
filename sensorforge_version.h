@@ -20,8 +20,8 @@
 // The same release tag is written to the firmware boot log and shown in
 // WebConfig, so a running device can be mapped back to the exact Git tag.
 
-#define SENSORFORGE_RELEASE_NUMBER 39
-#define SENSORFORGE_RELEASE_TAG "v39"
-#define SENSORFORGE_RELEASE_DATE "2026-09-23"
+#define SENSORFORGE_RELEASE_NUMBER 50
+#define SENSORFORGE_RELEASE_TAG "v50"
+#define SENSORFORGE_RELEASE_DATE "2026-09-25"
 #define SENSORFORGE_RELEASE_SUMMARY \
-    "SD maintenance actions made explicit with fixed status, recovery and benchmark controls."
+    "Fix audio diagnostic free-space check while owning the storage maintenance lock."
