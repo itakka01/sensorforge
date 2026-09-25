@@ -44,6 +44,8 @@
 #include "license.h"
 #include "recording_crypto.h"
 #include "recording_storage.h"
+#include "audio_capture.h"
+#include "recording_load_test.h"
 #include "mkv_writer.h"
 #include "log_storage.h"
 #include "image_motion.h"
@@ -160,20 +162,37 @@ static unsigned long recordingSegmentStartMs = 0;
 // synchronous camera+container+storage call takes compared with the configured
 // frame budget. Logging is deferred to safe segment/event boundaries so the
 // monitor itself does not add SD/Serial work to the per-frame critical path.
+//
+// A compact 5 ms histogram adds P95/P99 without retaining every frame sample.
+// Two live statistics blocks (segment + complete event) consume only a few KiB
+// and each frame adds one bounded integer increment.
+static const uint32_t RECORDING_PERF_BIN_US = 5000UL;
+static const uint16_t RECORDING_PERF_BIN_COUNT = 201;
+
 struct RecordingPerformanceStats {
     uint32_t frameCalls;
     uint32_t nearBudgetFrames;
     uint32_t overBudgetFrames;
     uint32_t worstCallUs;
     uint64_t totalCallUs;
+    uint32_t latencyBins[RECORDING_PERF_BIN_COUNT];
+};
+
+struct RecordingResourceStats {
+    uint32_t internalHeapStart;
+    uint32_t internalHeapMin;
+    uint32_t psramStart;
+    uint32_t psramMin;
+    uint32_t lastSampleMs;
 };
 
 static RecordingPerformanceStats recordingPerformanceSegment = {};
 static RecordingPerformanceStats recordingPerformanceEvent = {};
+static RecordingResourceStats recordingResourceEvent = {};
 
 // Explicit prototypes are required in the .ino because Arduino's sketch
-// preprocessor otherwise auto-generates prototypes before the custom struct
-// above is visible, which causes "RecordingPerformanceStats was not declared".
+// preprocessor otherwise auto-generates prototypes before the custom structs
+// above are visible.
 static void recordingPerformanceReset(
     RecordingPerformanceStats &stats
 );
@@ -182,9 +201,24 @@ static void recordingPerformanceNoteCall(
     uint32_t callUs,
     uint32_t frameBudgetUs
 );
+static uint32_t recordingPerformancePercentileUs(
+    const RecordingPerformanceStats &stats,
+    uint8_t percentile
+);
 static void recordingPerformanceLogSummary(
     const char *scope,
     const RecordingPerformanceStats &stats
+);
+static void recordingResourceReset(
+    RecordingResourceStats &stats
+);
+static void recordingResourceSample(
+    RecordingResourceStats &stats,
+    bool force
+);
+static void recordingResourceLogSummary(
+    const char *scope,
+    const RecordingResourceStats &stats
 );
 
 // Recording-event safety limit. Unlike recording_segment_seconds, this timer
@@ -7509,11 +7543,11 @@ static void recordingPerformanceReset(
     RecordingPerformanceStats &stats
 )
 {
-    stats.frameCalls = 0;
-    stats.nearBudgetFrames = 0;
-    stats.overBudgetFrames = 0;
-    stats.worstCallUs = 0;
-    stats.totalCallUs = 0;
+    memset(
+        &stats,
+        0,
+        sizeof(stats)
+    );
 }
 
 
@@ -7530,6 +7564,15 @@ static void recordingPerformanceNoteCall(
     if (callUs > stats.worstCallUs)
         stats.worstCallUs = callUs;
 
+    uint32_t bin =
+        callUs /
+        RECORDING_PERF_BIN_US;
+
+    if (bin >= RECORDING_PERF_BIN_COUNT)
+        bin = RECORDING_PERF_BIN_COUNT - 1U;
+
+    stats.latencyBins[bin]++;
+
     // 80% is an early pressure indicator. It does not mean a frame was lost;
     // only calls above 100% have consumed more than one complete frame budget.
     uint32_t nearBudgetUs =
@@ -7543,6 +7586,56 @@ static void recordingPerformanceNoteCall(
 
     if (callUs > frameBudgetUs)
         stats.overBudgetFrames++;
+}
+
+
+static uint32_t recordingPerformancePercentileUs(
+    const RecordingPerformanceStats &stats,
+    uint8_t percentile
+)
+{
+    if (stats.frameCalls == 0)
+        return 0;
+
+    if (percentile < 1)
+        percentile = 1;
+    if (percentile > 100)
+        percentile = 100;
+
+    uint64_t target =
+        (
+            (uint64_t)stats.frameCalls *
+            (uint64_t)percentile +
+            99ULL
+        ) /
+        100ULL;
+
+    uint64_t cumulative = 0;
+
+    for (
+        uint16_t i = 0;
+        i < RECORDING_PERF_BIN_COUNT;
+        ++i
+    ) {
+        cumulative +=
+            (uint64_t)stats.latencyBins[i];
+
+        if (cumulative >= target) {
+            if (i == RECORDING_PERF_BIN_COUNT - 1U)
+                return stats.worstCallUs;
+
+            uint32_t upperUs =
+                (uint32_t)(i + 1U) *
+                RECORDING_PERF_BIN_US;
+
+            if (upperUs > stats.worstCallUs)
+                upperUs = stats.worstCallUs;
+
+            return upperUs;
+        }
+    }
+
+    return stats.worstCallUs;
 }
 
 
@@ -7562,6 +7655,18 @@ static void recordingPerformanceLogSummary(
         (uint32_t)(
             stats.totalCallUs /
             (uint64_t)stats.frameCalls
+        );
+
+    uint32_t p95Us =
+        recordingPerformancePercentileUs(
+            stats,
+            95
+        );
+
+    uint32_t p99Us =
+        recordingPerformancePercentileUs(
+            stats,
+            99
         );
 
     String message =
@@ -7584,6 +7689,10 @@ static void recordingPerformanceLogSummary(
         String((unsigned long)stats.overBudgetFrames) +
         " | avg_ms=" +
         String((float)averageUs / 1000.0f, 1) +
+        " | p95_ms=" +
+        String((float)p95Us / 1000.0f, 1) +
+        " | p99_ms=" +
+        String((float)p99Us / 1000.0f, 1) +
         " | worst_ms=" +
         String((float)stats.worstCallUs / 1000.0f, 1);
 
@@ -7599,6 +7708,102 @@ static void recordingPerformanceLogSummary(
             message
         );
     }
+}
+
+
+static void recordingResourceReset(
+    RecordingResourceStats &stats
+)
+{
+    stats.internalHeapStart =
+        (uint32_t)heap_caps_get_free_size(
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+        );
+
+    stats.internalHeapMin =
+        stats.internalHeapStart;
+
+    stats.psramStart =
+        (uint32_t)heap_caps_get_free_size(
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+        );
+
+    stats.psramMin =
+        stats.psramStart;
+
+    // Zero forces a first post-start sample after the audio/video path has had
+    // a chance to allocate its runtime buffers. Subsequent samples are 1 Hz.
+    stats.lastSampleMs = 0;
+}
+
+
+static void recordingResourceSample(
+    RecordingResourceStats &stats,
+    bool force
+)
+{
+    uint32_t now = millis();
+
+    if (
+        !force &&
+        stats.lastSampleMs != 0 &&
+        (uint32_t)(now - stats.lastSampleMs) < 1000UL
+    ) {
+        return;
+    }
+
+    stats.lastSampleMs = now;
+
+    uint32_t internalNow =
+        (uint32_t)heap_caps_get_free_size(
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+        );
+
+    uint32_t psramNow =
+        (uint32_t)heap_caps_get_free_size(
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+        );
+
+    if (internalNow < stats.internalHeapMin)
+        stats.internalHeapMin = internalNow;
+
+    if (psramNow < stats.psramMin)
+        stats.psramMin = psramNow;
+}
+
+
+static void recordingResourceLogSummary(
+    const char *scope,
+    const RecordingResourceStats &stats
+)
+{
+    uint32_t internalAfter =
+        (uint32_t)heap_caps_get_free_size(
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+        );
+
+    uint32_t psramAfter =
+        (uint32_t)heap_caps_get_free_size(
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+        );
+
+    String message =
+        "RECORDING RESOURCES | scope=" +
+        String(scope ? scope : "unknown") +
+        " | heap_start=" +
+        String((unsigned long)stats.internalHeapStart) +
+        " | heap_min=" +
+        String((unsigned long)stats.internalHeapMin) +
+        " | heap_after=" +
+        String((unsigned long)internalAfter) +
+        " | psram_start=" +
+        String((unsigned long)stats.psramStart) +
+        " | psram_min=" +
+        String((unsigned long)stats.psramMin) +
+        " | psram_after=" +
+        String((unsigned long)psramAfter);
+
+    logWrite(message);
 }
 
 
@@ -7984,6 +8189,9 @@ bool startRecording() {
     recordingPerformanceReset(
         recordingPerformanceEvent
     );
+    recordingResourceReset(
+        recordingResourceEvent
+    );
 
     // Start a fresh event-level thermal accumulator. The regular thermal
     // monitor will add samples in RAM while recording is active.
@@ -8012,9 +8220,35 @@ static bool rotateRecordingSegment(const String &reason)
 
     // Finalize the current container first. For AVI this also creates
     // and promotes the matching .srt sidecar; MKV subtitles are already
-    // embedded in the segment itself.
+    // embedded in the segment itself. Capture a final resource sample while
+    // the segment's runtime buffers are still allocated.
+    recordingResourceSample(
+        recordingResourceEvent,
+        true
+    );
+
+    uint64_t finalizeStartUs =
+        (uint64_t)esp_timer_get_time();
+
     bool finalized =
         recorderEnd();
+
+    uint32_t finalizeMs =
+        (uint32_t)(
+            (
+                (uint64_t)esp_timer_get_time() -
+                finalizeStartUs +
+                999ULL
+            ) /
+            1000ULL
+        );
+
+    logWrite(
+        "RECORDING FINALIZE | scope=segment | ms=" +
+        String((unsigned long)finalizeMs) +
+        " | result=" +
+        String(finalized ? "ok" : "failed")
+    );
 
     if (!finalized) {
 
@@ -8184,12 +8418,44 @@ void stopRecording() {
     if (!recording)
         return;
 
+    // Capture one final in-recording memory sample before recorderEnd() frees
+    // the audio ring and writer buffers. This makes short recordings useful for
+    // passive resource telemetry too.
+    recordingResourceSample(
+        recordingResourceEvent,
+        true
+    );
+
+    uint64_t finalizeStartUs =
+        (uint64_t)esp_timer_get_time();
+
     bool finalized =
         recorderEnd();
+
+    uint32_t finalizeMs =
+        (uint32_t)(
+            (
+                (uint64_t)esp_timer_get_time() -
+                finalizeStartUs +
+                999ULL
+            ) /
+            1000ULL
+        );
+
+    logWrite(
+        "RECORDING FINALIZE | scope=event | ms=" +
+        String((unsigned long)finalizeMs) +
+        " | result=" +
+        String(finalized ? "ok" : "failed")
+    );
 
     recordingPerformanceLogSummary(
         "event",
         recordingPerformanceEvent
+    );
+    recordingResourceLogSummary(
+        "event",
+        recordingResourceEvent
     );
 
     if (!finalized) {
@@ -8256,6 +8522,497 @@ void stopRecording() {
     // sleep_delay_ms starts only after the recording has been fully
     // finalized and all immediate recorder cleanup is complete.
     resetSleepDelayTimer();
+}
+
+
+
+// =============================================================
+// EXPLICIT PRODUCTION RECORDING LOAD TEST
+// =============================================================
+
+bool recordingLoadTestRun(
+    uint32_t durationMs,
+    RecordingLoadTestResult &result,
+    String &error
+)
+{
+    result = {};
+    error = "";
+
+    if (
+        durationMs != 30000UL &&
+        durationMs != 60000UL
+    ) {
+        error = "recording load test duration must be 30 or 60 seconds";
+        return false;
+    }
+
+    result.requestedDurationMs = durationMs;
+    result.targetFps = (uint32_t)max(cfg_fps, 1);
+    result.frameBudgetUs =
+        1000000UL /
+        result.targetFps;
+    result.encrypted =
+        cfg_recording_encryption != 0;
+    result.audioRequested =
+        cfg_audio_enabled != 0;
+    result.format =
+        cfg_recording_format;
+
+    if (
+        recording ||
+        recorderIsOpen()
+    ) {
+        error = "recording is already active";
+        return false;
+    }
+
+    if (g_storageLocked) {
+        error = "storage maintenance is active";
+        return false;
+    }
+
+    if (g_recordingStartBlocked) {
+        error = "new recording starts are currently blocked";
+        return false;
+    }
+
+    if (!sdReady) {
+        error = "SD storage is not available";
+        return false;
+    }
+
+    if (webConfigCameraPreviewActive()) {
+        error = "close the live camera preview before running the recording load test";
+        return false;
+    }
+
+    if (thermalEmergencyState) {
+        error = "thermal emergency is active";
+        return false;
+    }
+
+    if (syncApiExclusiveActive()) {
+        error = "Sync API exclusive mode is active";
+        return false;
+    }
+
+    uint32_t performanceLoad = 0;
+    uint32_t performanceLimit = 0;
+
+    if (!configRecordingPerformanceAllowed(
+            cfg_resolution,
+            cfg_fps,
+            cfg_quality,
+            performanceLoad,
+            performanceLimit
+        )) {
+        error =
+            "recording performance guard rejects the saved configuration";
+        return false;
+    }
+
+    // A benchmark must never trigger rollover/deletion of customer recordings.
+    // Require generous disposable headroom above the configured reserve instead.
+    uint64_t freeBytes =
+        storageFreeBytes();
+    uint64_t reserveBytes =
+        storageReserveBytes();
+    uint64_t testHeadroomBytes =
+        32ULL * 1024ULL * 1024ULL +
+        (uint64_t)(durationMs / 1000UL) *
+        8ULL * 1024ULL * 1024ULL;
+
+    if (
+        freeBytes <= reserveBytes ||
+        freeBytes - reserveBytes < testHeadroomBytes
+    ) {
+        error =
+            "not enough disposable SD space above the SensorForge reserve for the recording load test";
+        return false;
+    }
+
+    const bool cameraWasInitialized =
+        cameraInitialized;
+    const bool cameraWasStandby =
+        cameraSoftPowerDownActive;
+
+    if (!initCamera(
+            cfg_camera,
+            cfg_resolution,
+            cfg_quality
+        )) {
+        error = "camera initialization failed";
+        return false;
+    }
+
+    if (!cameraExitSoftPowerDown()) {
+        error = "camera wake failed";
+
+        if (!cameraWasInitialized)
+            cameraDeinitRuntime();
+
+        return false;
+    }
+
+    String extension =
+        cfg_recording_format == "avi"
+            ? ".avi"
+            : ".mkv";
+
+    String testPath =
+        "/.__sensorforge_recording_load_test" +
+        extension;
+
+    String tempPath =
+        testPath +
+        ".part";
+
+    STORAGE.remove(testPath.c_str());
+    STORAGE.remove(tempPath.c_str());
+
+    if (cfg_recording_format == "avi") {
+        STORAGE.remove(
+            "/.__sensorforge_recording_load_test.srt"
+        );
+        STORAGE.remove(
+            "/.__sensorforge_recording_load_test.srt.part"
+        );
+    }
+
+    result.internalHeapBefore =
+        (uint32_t)heap_caps_get_free_size(
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+        );
+    result.internalHeapMin =
+        result.internalHeapBefore;
+
+    result.psramBefore =
+        (uint32_t)heap_caps_get_free_size(
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+        );
+    result.psramMin =
+        result.psramBefore;
+
+    result.cpuTempStartC =
+        thermalCpuTemperatureC();
+    result.cpuTempMaxC =
+        result.cpuTempStartC;
+
+    RecordingPerformanceStats performance = {};
+    recordingPerformanceReset(performance);
+
+    AudioCaptureStats audioStatsBaseline =
+        audioCaptureStats();
+
+    const bool previousRecordingBlock =
+        g_recordingStartBlocked;
+
+    if (!recorderStart(
+            testPath,
+            cfg_fps
+        )) {
+        error = "recorder could not start the load-test file";
+
+        if (!cameraWasInitialized)
+            cameraDeinitRuntime();
+        else if (cameraWasStandby)
+            cameraEnterSoftPowerDown();
+
+        return false;
+    }
+
+    // The synchronous WebConfig handler owns the loopTask while this test runs,
+    // so no motion automation can race us. Block any other explicit NEW start
+    // after our recorder is open, without changing normal storage semantics.
+    g_recordingStartBlocked = true;
+
+    result.recorderHealthy = true;
+
+    uint32_t testStartMs = millis();
+    uint32_t lastFrameUs = 0;
+    uint32_t lastResourceSampleMs = 0;
+
+    while (
+        (uint32_t)(millis() - testStartMs) <
+            durationMs
+    ) {
+        thermalMonitorLoop();
+
+        uint32_t nowMs = millis();
+        uint32_t nowUs = micros();
+
+        if (
+            lastFrameUs == 0 ||
+            (uint32_t)(nowUs - lastFrameUs) >=
+                result.frameBudgetUs
+        ) {
+            uint64_t callStartUs =
+                (uint64_t)esp_timer_get_time();
+
+            recorderAddFrame();
+
+            uint64_t callDoneUs =
+                (uint64_t)esp_timer_get_time();
+
+            uint32_t callUs =
+                (uint32_t)(
+                    callDoneUs -
+                    callStartUs
+                );
+
+            recordingPerformanceNoteCall(
+                performance,
+                callUs,
+                result.frameBudgetUs
+            );
+
+            lastFrameUs = nowUs;
+
+            if (!recorderIsHealthy()) {
+                result.recorderHealthy = false;
+                error = "recorder/storage write failed during load test";
+                break;
+            }
+        }
+
+        if (
+            lastResourceSampleMs == 0 ||
+            (uint32_t)(nowMs - lastResourceSampleMs) >=
+                500UL
+        ) {
+            lastResourceSampleMs = nowMs;
+
+            uint32_t internalNow =
+                (uint32_t)heap_caps_get_free_size(
+                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+                );
+            uint32_t psramNow =
+                (uint32_t)heap_caps_get_free_size(
+                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+                );
+
+            if (internalNow < result.internalHeapMin)
+                result.internalHeapMin = internalNow;
+            if (psramNow < result.psramMin)
+                result.psramMin = psramNow;
+
+            float cpuNow =
+                thermalCpuTemperatureC();
+
+            if (
+                isfinite(cpuNow) &&
+                (
+                    !isfinite(result.cpuTempMaxC) ||
+                    cpuNow > result.cpuTempMaxC
+                )
+            ) {
+                result.cpuTempMaxC = cpuNow;
+            }
+
+            if (thermalWarningState)
+                result.thermalWarningSeen = true;
+        }
+
+        esp_task_wdt_reset();
+        yield();
+        delay(1);
+    }
+
+    result.elapsedMs =
+        (uint32_t)(millis() - testStartMs);
+
+    result.frameCalls =
+        performance.frameCalls;
+    result.framesWritten =
+        recorderGetFrameCount();
+    result.nearBudgetFrames =
+        performance.nearBudgetFrames;
+    result.overBudgetFrames =
+        performance.overBudgetFrames;
+    result.worstCallUs =
+        performance.worstCallUs;
+
+    if (performance.frameCalls > 0) {
+        result.averageCallUs =
+            (uint32_t)(
+                performance.totalCallUs /
+                (uint64_t)performance.frameCalls
+            );
+        result.p95CallUs =
+            recordingPerformancePercentileUs(
+                performance,
+                95
+            );
+        result.p99CallUs =
+            recordingPerformancePercentileUs(
+                performance,
+                99
+            );
+    }
+
+    result.mediaBytesBeforeFinalize =
+        recorderGetBytesWritten();
+
+    result.audioActive =
+        audioCaptureIsRunning();
+
+    AudioCaptureStats audioBeforeFinalize =
+        audioCaptureStats();
+
+    result.audioBufferCapacity =
+        audioBeforeFinalize.bufferCapacity;
+    result.audioBufferHighWater =
+        audioBeforeFinalize.bufferHighWater;
+
+    uint64_t finalizeStartUs =
+        (uint64_t)esp_timer_get_time();
+
+    result.finalized =
+        recorderEnd();
+
+    result.finalizeMs =
+        (uint32_t)(
+            (
+                (uint64_t)esp_timer_get_time() -
+                finalizeStartUs +
+                999ULL
+            ) /
+            1000ULL
+        );
+
+    AudioCaptureStats audioAfterFinalize =
+        audioCaptureStats();
+
+    bool audioStatsChanged =
+        audioAfterFinalize.bytesCaptured != audioStatsBaseline.bytesCaptured ||
+        audioAfterFinalize.bytesDelivered != audioStatsBaseline.bytesDelivered ||
+        audioAfterFinalize.bytesDropped != audioStatsBaseline.bytesDropped ||
+        audioAfterFinalize.bufferHighWater != audioStatsBaseline.bufferHighWater;
+
+    if (
+        result.audioRequested &&
+        audioStatsChanged
+    ) {
+        result.audioBytesCaptured =
+            audioAfterFinalize.bytesCaptured;
+        result.audioBytesDelivered =
+            audioAfterFinalize.bytesDelivered;
+        result.audioBytesDropped =
+            audioAfterFinalize.bytesDropped;
+
+        if (
+            audioAfterFinalize.bufferHighWater >
+            result.audioBufferHighWater
+        ) {
+            result.audioBufferHighWater =
+                audioAfterFinalize.bufferHighWater;
+        }
+    } else if (result.audioRequested) {
+        // Prevent stale statistics from a previous WAV/recording test being
+        // presented when this recording never started an audio backend.
+        result.audioBytesCaptured = 0;
+        result.audioBytesDelivered = 0;
+        result.audioBytesDropped = 0;
+        result.audioBufferHighWater = 0;
+        result.audioBufferCapacity = 0;
+    }
+
+    result.internalHeapAfter =
+        (uint32_t)heap_caps_get_free_size(
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+        );
+    result.psramAfter =
+        (uint32_t)heap_caps_get_free_size(
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+        );
+
+    result.cpuTempEndC =
+        thermalCpuTemperatureC();
+
+    if (
+        isfinite(result.cpuTempEndC) &&
+        (
+            !isfinite(result.cpuTempMaxC) ||
+            result.cpuTempEndC > result.cpuTempMaxC
+        )
+    ) {
+        result.cpuTempMaxC =
+            result.cpuTempEndC;
+    }
+
+    if (thermalWarningState)
+        result.thermalWarningSeen = true;
+
+    result.completed =
+        result.recorderHealthy &&
+        result.finalized &&
+        result.elapsedMs >= durationMs;
+
+    // Test media is disposable and must never appear in the recordings list.
+    STORAGE.remove(testPath.c_str());
+    STORAGE.remove(tempPath.c_str());
+
+    if (cfg_recording_format == "avi") {
+        STORAGE.remove(
+            "/.__sensorforge_recording_load_test.srt"
+        );
+        STORAGE.remove(
+            "/.__sensorforge_recording_load_test.srt.part"
+        );
+    }
+
+    g_recordingStartBlocked =
+        previousRecordingBlock;
+
+    if (!cameraWasInitialized) {
+        cameraDeinitRuntime();
+    } else if (cameraWasStandby) {
+        cameraEnterSoftPowerDown();
+    }
+
+    String summary =
+        "RECORDING LOAD TEST | format=" +
+        result.format +
+        " | duration_ms=" +
+        String((unsigned long)result.elapsedMs) +
+        " | fps=" +
+        String((unsigned long)result.targetFps) +
+        " | calls=" +
+        String((unsigned long)result.frameCalls) +
+        " | frames=" +
+        String((unsigned long)result.framesWritten) +
+        " | over_budget=" +
+        String((unsigned long)result.overBudgetFrames) +
+        " | avg_ms=" +
+        String((float)result.averageCallUs / 1000.0f, 1) +
+        " | p95_ms=" +
+        String((float)result.p95CallUs / 1000.0f, 1) +
+        " | p99_ms=" +
+        String((float)result.p99CallUs / 1000.0f, 1) +
+        " | worst_ms=" +
+        String((float)result.worstCallUs / 1000.0f, 1) +
+        " | finalize_ms=" +
+        String((unsigned long)result.finalizeMs) +
+        " | audio=" +
+        String(result.audioActive ? "yes" : "no") +
+        " | audio_drop=" +
+        String((unsigned long)result.audioBytesDropped) +
+        " | heap_min=" +
+        String((unsigned long)result.internalHeapMin) +
+        " | psram_min=" +
+        String((unsigned long)result.psramMin) +
+        " | cpu_max_c=" +
+        String(result.cpuTempMaxC, 1) +
+        " | result=" +
+        String(result.completed ? "complete" : "failed");
+
+    logWrite(summary);
+
+    if (!result.completed && !error.length())
+        error = "recording load test did not complete cleanly";
+
+    return result.completed;
 }
 
 
@@ -14194,6 +14951,11 @@ void loop() {
             recordingPerformanceEvent,
             frameCallDurationUs,
             frameIntervalUs
+        );
+
+        recordingResourceSample(
+            recordingResourceEvent,
+            false
         );
 
         uint32_t framesAfter =

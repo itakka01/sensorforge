@@ -20,8 +20,8 @@
 // The same release tag is written to the firmware boot log and shown in
 // WebConfig, so a running device can be mapped back to the exact Git tag.
 
-#define SENSORFORGE_RELEASE_NUMBER 55
-#define SENSORFORGE_RELEASE_TAG "v55"
+#define SENSORFORGE_RELEASE_NUMBER 56
+#define SENSORFORGE_RELEASE_TAG "v56"
 #define SENSORFORGE_RELEASE_DATE "2026-09-25"
 #define SENSORFORGE_RELEASE_SUMMARY \
-    "Restore immediate WebPlayer video autoplay and defer embedded audio loading."
+    "Add production-path recording load benchmark and passive P95/P99/resource telemetry."

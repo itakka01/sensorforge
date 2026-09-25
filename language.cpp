@@ -389,6 +389,44 @@ static const UiTextEntry UI_TEXTS[] = {
     {"GRÜN", "GREEN"}, // UI_AUDIO_LOAD_GREEN
     {"ORANGE", "ORANGE"}, // UI_AUDIO_LOAD_ORANGE
     {"ROT", "RED"}, // UI_AUDIO_LOAD_RED
+    {"Recording Load Test", "Recording load test"}, // UI_RECORDING_LOAD_TITLE
+    {"Misst den echten gespeicherten Medienpfad mit Kamera, aktuellem Container, Audio falls aktiviert, SD und optionaler Verschlüsselung. Bewegungs-/Eventlogik und automatische Segmentrotation steuern den Test bewusst nicht; der temporäre Testcontainer läuft für die gewählte Dauer durch und wird danach gelöscht. Reale Segment-Finalisierungszeiten werden zusätzlich im normalen Aufnahme-Log erfasst.", "Measures the real saved media path with camera, current container, audio when enabled, SD and optional encryption. Motion/event logic and automatic segment rotation deliberately do not control the test; the temporary test container runs for the selected duration and is then removed. Real segment finalization times are additionally captured in the normal recording log."}, // UI_RECORDING_LOAD_HELP
+    {"Testdauer", "Test duration"}, // UI_RECORDING_LOAD_DURATION
+    {"Recording Load Test starten", "Start recording load test"}, // UI_RECORDING_LOAD_BUTTON
+    {"Verwendet ausschließlich die aktuell gespeicherten Einstellungen. Änderungen im Formular daher zuerst speichern. 30 s ist der Standardtest; 60 s eignet sich zusätzlich für Temperatur- und Langzeitreserve.", "Uses only the currently saved settings. Save form changes first. 30 s is the standard test; 60 s additionally helps assess thermal and sustained headroom."}, // UI_RECORDING_LOAD_SAVED_NOTE
+    {"Recording Load Test läuft", "Recording load test running"}, // UI_RECORDING_LOAD_RUNNING
+    {"Kamera, Recorder, Audio, SD und gegebenenfalls Verschlüsselung werden gemeinsam belastet. Die Seite wechselt nach Abschluss automatisch zum Ergebnis.", "Camera, recorder, audio, SD and encryption when enabled are stressed together. The page changes to the result automatically when finished."}, // UI_RECORDING_LOAD_RUNNING_HELP
+    {"Recording Load Test fehlgeschlagen", "Recording load test failed"}, // UI_RECORDING_LOAD_FAILED
+    {"RECORDING LOAD GOOD", "RECORDING LOAD GOOD"}, // UI_RECORDING_LOAD_GOOD
+    {"RECORDING LOAD PRÜFEN", "CHECK RECORDING LOAD"}, // UI_RECORDING_LOAD_CHECK
+    {"RECORDING LOAD NICHT EMPFOHLEN", "RECORDING LOAD NOT RECOMMENDED"}, // UI_RECORDING_LOAD_NOT_RECOMMENDED
+    {"Die Gesamtampel entspricht immer der schlechtesten Einzelbewertung. Es wird kein Mittelwert verwendet, der einen kritischen Engpass verdecken könnte.", "The overall rating always follows the worst individual rating. No average score is used that could hide a critical bottleneck."}, // UI_RECORDING_LOAD_SCOPE
+    {"Video-/Frame-Timing", "Video/frame timing"}, // UI_RECORDING_LOAD_TIMING
+    {"Audio-Capture", "Audio capture"}, // UI_RECORDING_LOAD_AUDIO
+    {"Storage / Finalize", "Storage / finalize"}, // UI_RECORDING_LOAD_STORAGE
+    {"Heap / PSRAM", "Heap / PSRAM"}, // UI_RECORDING_LOAD_MEMORY
+    {"Temperatur", "Temperature"}, // UI_RECORDING_LOAD_THERMAL
+    {"Technische Messwerte", "Technical measurements"}, // UI_RECORDING_LOAD_TECH_DETAILS
+    {"Verschlüsselung", "Encryption"}, // UI_RECORDING_LOAD_ENCRYPTION
+    {"Timing: Grün ohne Budgetüberschreitung und P99 unter 80 % des Framebudgets; Orange bei geringer Reserve oder vereinzelter Überschreitung; Rot bei P99 über Budget, mindestens 1 % Budgetüberschreitungen oder deutlichem Frameverlust. Audio: Grün ohne Drops und unter 50 % Puffer, Orange bei einzelnen Drops/50–90 %, Rot ab 1 % Drops oder 90 % Puffer. Finalisierung: Grün bis 2 s, Orange bis 5 s, darüber Rot. Interner Heap: Grün ab 64 KiB, Orange 32–64 KiB, darunter Rot; PSRAM: Grün ab 512 KiB, Orange 256–512 KiB, darunter Rot. Temperatur folgt den Firmware-Sicherheitsgrenzen 70 °C Warnung / 80 °C Notprogramm.", "Timing: Green with no budget overrun and P99 below 80% of the frame budget; orange for reduced headroom or an isolated overrun; red when P99 exceeds budget, at least 1% of calls exceed budget, or meaningful frame loss occurs. Audio: green with no drops and below 50% buffer, orange for isolated drops/50–90%, red from 1% drops or 90% buffer. Finalize: green up to 2 s, orange up to 5 s, red above that. Internal heap: green from 64 KiB, orange 32–64 KiB, red below; PSRAM: green from 512 KiB, orange 256–512 KiB, red below. Temperature follows the firmware safety limits of 70 °C warning / 80 °C emergency."}, // UI_RECORDING_LOAD_THRESHOLDS_NOTE
+    {"Verstrichen", "Elapsed"}, // UI_RECORDING_LOAD_ELAPSED
+    {"Frames", "Frames"}, // UI_RECORDING_LOAD_FRAMES
+    {"Aufrufe", "calls"}, // UI_RECORDING_LOAD_CALLS
+    {"erreicht", "achieved"}, // UI_RECORDING_LOAD_ACHIEVED
+    {"Ziel", "target"}, // UI_RECORDING_LOAD_TARGET
+    {"Framebudget", "Frame budget"}, // UI_RECORDING_LOAD_FRAME_BUDGET
+    {"P99-Budgetnutzung", "P99 budget use"}, // UI_RECORDING_LOAD_BUDGET_USE
+    {"Medienrate vor Finalisierung", "Media rate before finalize"}, // UI_RECORDING_LOAD_MEDIA_RATE
+    {"Finalisierung", "Finalize"}, // UI_RECORDING_LOAD_FINALIZE
+    {"aktiv", "active"}, // UI_RECORDING_LOAD_ACTIVE
+    {"nicht aktiv", "not active"}, // UI_RECORDING_LOAD_INACTIVE
+    {"erfasst", "captured"}, // UI_RECORDING_LOAD_CAPTURED
+    {"übergeben", "delivered"}, // UI_RECORDING_LOAD_DELIVERED
+    {"verworfen", "dropped"}, // UI_RECORDING_LOAD_DROPPED
+    {"Puffer", "buffer"}, // UI_RECORDING_LOAD_BUFFER
+    {"Interner Heap vor/min/nach", "Internal heap before/min/after"}, // UI_RECORDING_LOAD_HEAP_STATS
+    {"PSRAM vor/min/nach", "PSRAM before/min/after"}, // UI_RECORDING_LOAD_PSRAM_STATS
+    {"CPU-Temperatur Start/Max/Ende", "CPU temperature start/max/end"}, // UI_RECORDING_LOAD_CPU_STATS
     {"SD-Wartung", "SD maintenance"}, // UI_NAV_SD_MAINTENANCE
 };
 

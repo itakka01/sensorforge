@@ -4,6 +4,7 @@
 #include "config.h"
 #include "audio_capture.h"
 #include "audio_wav.h"
+#include "recording_load_test.h"
 #include "language.h"
 #include "board_config.h"
 
@@ -1350,7 +1351,7 @@ static String htmlFooter()
         "var p=location.pathname;"
         "var group='';"
         "if(p==='/')group='home';"
-        "else if(p==='/config'||p==='/save'||p==='/audio_test_record'||p==='/audio_benchmark')group='config';"
+        "else if(p==='/config'||p==='/save'||p==='/audio_test_record'||p==='/audio_benchmark'||p==='/recording_load_test')group='config';"
         "else if(p.indexOf('/files')===0||p==='/file'||p==='/play')group='recordings';"
         "else if(p==='/preview'||p==='/snapshot')group='camera';else if(p==='/image_motion')group='sensor';"
         "else if(p.indexOf('/radar_')===0)group='sensor';"
@@ -3979,6 +3980,21 @@ static void handleConfig()
     }
 
     html +=
+        "<div style='margin-top:14px;padding:12px;border:1px solid #c8d0da;border-radius:7px;background:#fff'>"
+        "<b>" + htmlText(UI_RECORDING_LOAD_TITLE) + "</b><br>"
+        "<small class='muted'>" + htmlText(UI_RECORDING_LOAD_HELP) + "</small><br><br>"
+        + htmlText(UI_RECORDING_LOAD_DURATION) +
+        ": <select id='sfRecordingLoadSeconds'>"
+        "<option value='30' selected>30 s</option>"
+        "<option value='60'>60 s</option>"
+        "</select> "
+        "<button type='button' onclick=\"return sfRecordingLoadTestSubmit()\">" +
+        htmlText(UI_RECORDING_LOAD_BUTTON) +
+        "</button><br>"
+        "<small class='muted'>" + htmlText(UI_RECORDING_LOAD_SAVED_NOTE) + "</small>"
+        "</div>";
+
+    html +=
         "<br><small class='muted'>" +
         htmlText(UI_AUDIO_ENCRYPTION_NOTE) +
         "</small>";
@@ -4126,10 +4142,12 @@ static void handleConfig()
         "function sfAudioAdvancedClose(){var m=document.getElementById('sfAudioAdvancedModal');if(m)m.style.display='none';}"
         "function sfAudioProgressStart(kind){"
         "var m=document.getElementById('sfAudioProgressModal');var t=document.getElementById('sfAudioProgressTitle');var p=document.getElementById('sfAudioProgressText');"
-        "if(kind==='benchmark'){if(t)t.textContent='" + htmlJsString(tr(UI_AUDIO_BENCHMARK_RUNNING)) + "';if(p)p.textContent='" + htmlJsString(tr(UI_AUDIO_BENCHMARK_RUNNING_HELP)) + "';}"
+        "if(kind==='recording'){if(t)t.textContent='" + htmlJsString(tr(UI_RECORDING_LOAD_RUNNING)) + "';if(p)p.textContent='" + htmlJsString(tr(UI_RECORDING_LOAD_RUNNING_HELP)) + "';}"
+        "else if(kind==='benchmark'){if(t)t.textContent='" + htmlJsString(tr(UI_AUDIO_BENCHMARK_RUNNING)) + "';if(p)p.textContent='" + htmlJsString(tr(UI_AUDIO_BENCHMARK_RUNNING_HELP)) + "';}"
         "else{if(t)t.textContent='" + htmlJsString(tr(UI_AUDIO_TEST_RUNNING)) + "';if(p)p.textContent='" + htmlJsString(tr(UI_AUDIO_TEST_RUNNING_HELP)) + "';}"
         "if(m)m.style.display='block';return true;}"
         "function sfAudioProgressSubmit(btn,kind){sfAudioProgressStart(kind);setTimeout(function(){var f=btn&&btn.form;if(!f)return;f.action=btn.formAction;f.method='post';f.submit();},80);return false;}"
+        "function sfRecordingLoadTestSubmit(){sfAudioProgressStart('recording');setTimeout(function(){var seconds=document.getElementById('sfRecordingLoadSeconds');var f=document.createElement('form');f.method='post';f.action='/recording_load_test';var i=document.createElement('input');i.type='hidden';i.name='seconds';i.value=seconds?seconds.value:'30';f.appendChild(i);document.body.appendChild(f);f.submit();},80);return false;}"
         "function sfAudioUi(){"
         "var a=document.getElementById('cfgAudioEnabled');var r=document.getElementById('cfgRecordingFormat');var e=document.getElementById('cfgAudioExpertMode');var s=document.getElementById('cfgAudioSource');var p=document.getElementById('cfgAudioExpertPanel');var b=document.getElementById('cfgAudioBackend');var pp=document.getElementById('cfgAudioPdmPanel');var ip=document.getElementById('cfgAudioI2sPanel');"
         "if(a&&r&&a.value==='1')r.value='mkv';"
@@ -16067,6 +16085,531 @@ static void handleAudioBenchmark()
 }
 
 
+
+enum RecordingLoadUiLevel : uint8_t {
+    RECORDING_LOAD_GREEN = 0,
+    RECORDING_LOAD_ORANGE,
+    RECORDING_LOAD_RED
+};
+
+
+static RecordingLoadUiLevel recordingLoadWorst(
+    RecordingLoadUiLevel a,
+    RecordingLoadUiLevel b
+)
+{
+    return
+        a > b
+        ? a
+        : b;
+}
+
+
+static String recordingLoadPill(
+    RecordingLoadUiLevel level
+)
+{
+    const char *css =
+        level == RECORDING_LOAD_GREEN
+        ? "ok"
+        : (
+            level == RECORDING_LOAD_ORANGE
+            ? "warn"
+            : "danger"
+        );
+
+    UiTextId textId =
+        level == RECORDING_LOAD_GREEN
+        ? UI_AUDIO_LOAD_GREEN
+        : (
+            level == RECORDING_LOAD_ORANGE
+            ? UI_AUDIO_LOAD_ORANGE
+            : UI_AUDIO_LOAD_RED
+        );
+
+    return
+        "<span class='status-pill " +
+        String(css) +
+        "'>" +
+        htmlText(textId) +
+        "</span>";
+}
+
+
+static RecordingLoadUiLevel recordingLoadTimingLevel(
+    const RecordingLoadTestResult &result
+)
+{
+    if (
+        !result.completed ||
+        !result.recorderHealthy ||
+        result.frameCalls == 0 ||
+        result.framesWritten == 0
+    ) {
+        return RECORDING_LOAD_RED;
+    }
+
+    double expectedFrames =
+        (double)result.targetFps *
+        (double)result.elapsedMs /
+        1000.0;
+
+    double frameDeliveryPct =
+        expectedFrames > 0.0
+        ? (double)result.framesWritten * 100.0 /
+            expectedFrames
+        : 0.0;
+
+    double overPct =
+        result.frameCalls > 0
+        ? (double)result.overBudgetFrames * 100.0 /
+            (double)result.frameCalls
+        : 100.0;
+
+    if (
+        frameDeliveryPct < 95.0 ||
+        overPct >= 1.0 ||
+        result.p99CallUs > result.frameBudgetUs ||
+        result.worstCallUs >
+            (uint32_t)(
+                (uint64_t)result.frameBudgetUs *
+                120ULL /
+                100ULL
+            )
+    ) {
+        return RECORDING_LOAD_RED;
+    }
+
+    if (
+        frameDeliveryPct < 98.0 ||
+        result.overBudgetFrames > 0 ||
+        result.p99CallUs >=
+            (uint32_t)(
+                (uint64_t)result.frameBudgetUs *
+                80ULL /
+                100ULL
+            )
+    ) {
+        return RECORDING_LOAD_ORANGE;
+    }
+
+    return RECORDING_LOAD_GREEN;
+}
+
+
+static RecordingLoadUiLevel recordingLoadAudioLevel(
+    const RecordingLoadTestResult &result
+)
+{
+    if (!result.audioRequested)
+        return RECORDING_LOAD_GREEN;
+
+    if (
+        !result.audioActive ||
+        result.audioBytesCaptured == 0
+    ) {
+        return RECORDING_LOAD_RED;
+    }
+
+    double dropPct =
+        result.audioBytesCaptured > 0
+        ? (double)result.audioBytesDropped * 100.0 /
+            (double)result.audioBytesCaptured
+        : 100.0;
+
+    double bufferPct =
+        result.audioBufferCapacity > 0
+        ? (double)result.audioBufferHighWater * 100.0 /
+            (double)result.audioBufferCapacity
+        : 100.0;
+
+    if (
+        dropPct >= 1.0 ||
+        bufferPct >= 90.0
+    ) {
+        return RECORDING_LOAD_RED;
+    }
+
+    if (
+        result.audioBytesDropped > 0 ||
+        bufferPct >= 50.0
+    ) {
+        return RECORDING_LOAD_ORANGE;
+    }
+
+    return RECORDING_LOAD_GREEN;
+}
+
+
+static RecordingLoadUiLevel recordingLoadStorageLevel(
+    const RecordingLoadTestResult &result
+)
+{
+    if (
+        !result.recorderHealthy ||
+        !result.finalized
+    ) {
+        return RECORDING_LOAD_RED;
+    }
+
+    if (result.finalizeMs > 5000UL)
+        return RECORDING_LOAD_RED;
+
+    if (result.finalizeMs > 2000UL)
+        return RECORDING_LOAD_ORANGE;
+
+    return RECORDING_LOAD_GREEN;
+}
+
+
+static RecordingLoadUiLevel recordingLoadMemoryLevel(
+    const RecordingLoadTestResult &result
+)
+{
+    if (
+        result.internalHeapMin < 32UL * 1024UL ||
+        result.psramMin < 256UL * 1024UL
+    ) {
+        return RECORDING_LOAD_RED;
+    }
+
+    if (
+        result.internalHeapMin < 64UL * 1024UL ||
+        result.psramMin < 512UL * 1024UL
+    ) {
+        return RECORDING_LOAD_ORANGE;
+    }
+
+    return RECORDING_LOAD_GREEN;
+}
+
+
+static RecordingLoadUiLevel recordingLoadThermalLevel(
+    const RecordingLoadTestResult &result
+)
+{
+    if (
+        isfinite(result.cpuTempMaxC) &&
+        result.cpuTempMaxC >=
+            SENSORFORGE_THERMAL_EMERGENCY_C
+    ) {
+        return RECORDING_LOAD_RED;
+    }
+
+    if (
+        result.thermalWarningSeen ||
+        (
+            isfinite(result.cpuTempMaxC) &&
+            result.cpuTempMaxC >=
+                SENSORFORGE_THERMAL_WARNING_C
+        )
+    ) {
+        return RECORDING_LOAD_ORANGE;
+    }
+
+    return RECORDING_LOAD_GREEN;
+}
+
+
+static void handleRecordingLoadTest()
+{
+    if (rejectWhileRecording("recording load test"))
+        return;
+
+    if (g_storageLocked) {
+        server.send(
+            409,
+            "text/plain; charset=utf-8",
+            "Storage maintenance is already active"
+        );
+        return;
+    }
+
+    uint32_t seconds =
+        server.hasArg("seconds")
+        ? (uint32_t)server.arg("seconds").toInt()
+        : 30UL;
+
+    if (
+        seconds != 30UL &&
+        seconds != 60UL
+    ) {
+        server.send(
+            400,
+            "text/plain; charset=utf-8",
+            "Recording load test duration must be 30 or 60 seconds"
+        );
+        return;
+    }
+
+    RecordingLoadTestResult result = {};
+    String error;
+
+    bool ok =
+        recordingLoadTestRun(
+            seconds * 1000UL,
+            result,
+            error
+        );
+
+    String html = htmlHeader();
+    html +=
+        "<h2>" +
+        htmlText(UI_RECORDING_LOAD_TITLE) +
+        "</h2>";
+
+    bool hasMeasurements =
+        result.frameCalls > 0 ||
+        result.elapsedMs > 0;
+
+    if (!ok && !hasMeasurements) {
+        html +=
+            "<section class='settings-section' style='border-left:5px solid #b91c1c'>"
+            "<h3>" + htmlText(UI_RECORDING_LOAD_FAILED) + "</h3>"
+            "<p><span class='status-pill danger'>" +
+            htmlText(UI_RECORDING_LOAD_NOT_RECOMMENDED) +
+            "</span></p><p>" +
+            htmlEscape(
+                error.length()
+                ? error
+                : String("Recording load test failed")
+            ) +
+            "</p></section>";
+    } else {
+        RecordingLoadUiLevel timingLevel =
+            recordingLoadTimingLevel(result);
+        RecordingLoadUiLevel audioLevel =
+            recordingLoadAudioLevel(result);
+        RecordingLoadUiLevel storageLevel =
+            recordingLoadStorageLevel(result);
+        RecordingLoadUiLevel memoryLevel =
+            recordingLoadMemoryLevel(result);
+        RecordingLoadUiLevel thermalLevel =
+            recordingLoadThermalLevel(result);
+
+        RecordingLoadUiLevel overall =
+            RECORDING_LOAD_GREEN;
+        overall = recordingLoadWorst(overall, timingLevel);
+        overall = recordingLoadWorst(overall, audioLevel);
+        overall = recordingLoadWorst(overall, storageLevel);
+        overall = recordingLoadWorst(overall, memoryLevel);
+        overall = recordingLoadWorst(overall, thermalLevel);
+
+        UiTextId overallText =
+            overall == RECORDING_LOAD_GREEN
+            ? UI_RECORDING_LOAD_GOOD
+            : (
+                overall == RECORDING_LOAD_ORANGE
+                ? UI_RECORDING_LOAD_CHECK
+                : UI_RECORDING_LOAD_NOT_RECOMMENDED
+            );
+
+        const char *border =
+            overall == RECORDING_LOAD_GREEN
+            ? "#15803d"
+            : (
+                overall == RECORDING_LOAD_ORANGE
+                ? "#b7791f"
+                : "#b91c1c"
+            );
+
+        html +=
+            "<section class='settings-section' style='border-left:5px solid " +
+            String(border) +
+            "'>"
+            "<h3>" + htmlText(overallText) + "</h3>"
+            "<p>" + recordingLoadPill(overall) + "</p>"
+            "<p class='muted'>" +
+            htmlText(UI_RECORDING_LOAD_SCOPE) +
+            "</p>";
+
+        if (!ok && error.length()) {
+            html +=
+                "<p><span class='status-pill danger'>" +
+                htmlText(UI_RECORDING_LOAD_FAILED) +
+                "</span> " +
+                htmlEscape(error) +
+                "</p>";
+        }
+
+        html +=
+            "<div style='line-height:1.9'>" +
+            recordingLoadPill(timingLevel) +
+            " <b>" + htmlText(UI_RECORDING_LOAD_TIMING) + "</b><br>" +
+            recordingLoadPill(audioLevel) +
+            " <b>" + htmlText(UI_RECORDING_LOAD_AUDIO) + "</b><br>" +
+            recordingLoadPill(storageLevel) +
+            " <b>" + htmlText(UI_RECORDING_LOAD_STORAGE) + "</b><br>" +
+            recordingLoadPill(memoryLevel) +
+            " <b>" + htmlText(UI_RECORDING_LOAD_MEMORY) + "</b><br>" +
+            recordingLoadPill(thermalLevel) +
+            " <b>" + htmlText(UI_RECORDING_LOAD_THERMAL) + "</b>"
+            "</div>";
+
+        double budgetMs =
+            (double)result.frameBudgetUs /
+            1000.0;
+        double averageMs =
+            (double)result.averageCallUs /
+            1000.0;
+        double p95Ms =
+            (double)result.p95CallUs /
+            1000.0;
+        double p99Ms =
+            (double)result.p99CallUs /
+            1000.0;
+        double worstMs =
+            (double)result.worstCallUs /
+            1000.0;
+        double p99BudgetPct =
+            result.frameBudgetUs > 0
+            ? (double)result.p99CallUs * 100.0 /
+                (double)result.frameBudgetUs
+            : 0.0;
+        double achievedFps =
+            result.elapsedMs > 0
+            ? (double)result.framesWritten * 1000.0 /
+                (double)result.elapsedMs
+            : 0.0;
+        double mediaRateKiB =
+            result.elapsedMs > 0
+            ? (double)result.mediaBytesBeforeFinalize * 1000.0 /
+                (double)result.elapsedMs /
+                1024.0
+            : 0.0;
+        double audioBufferPct =
+            result.audioBufferCapacity > 0
+            ? (double)result.audioBufferHighWater * 100.0 /
+                (double)result.audioBufferCapacity
+            : 0.0;
+
+        html +=
+            "<details open style='margin-top:16px'><summary><b>" +
+            htmlText(UI_RECORDING_LOAD_TECH_DETAILS) +
+            "</b></summary><div style='margin-top:10px'>";
+
+        html +=
+            htmlText(UI_CARD_FORMAT) + ": <b>" +
+            htmlEscape(result.format) +
+            "</b> | " +
+            htmlText(UI_RECORDING_LOAD_ENCRYPTION) +
+            ": <b>" +
+            htmlText(result.encrypted ? UI_AUDIO_ON : UI_AUDIO_OFF) +
+            "</b><br>";
+        html +=
+            htmlText(UI_RECORDING_LOAD_ELAPSED) + ": " +
+            String((unsigned long)result.elapsedMs) +
+            " ms<br>";
+        html +=
+            htmlText(UI_RECORDING_LOAD_FRAMES) + ": <b>" +
+            String((unsigned long)result.framesWritten) +
+            "</b> | " + htmlText(UI_RECORDING_LOAD_CALLS) + "=" +
+            String((unsigned long)result.frameCalls) +
+            " | " + htmlText(UI_RECORDING_LOAD_ACHIEVED) + "=" +
+            String(achievedFps, 2) +
+            " fps | " + htmlText(UI_RECORDING_LOAD_TARGET) + "=" +
+            String((unsigned long)result.targetFps) +
+            " fps<br>";
+        html +=
+            htmlText(UI_RECORDING_LOAD_FRAME_BUDGET) + ": <b>" +
+            String(budgetMs, 1) +
+            " ms</b> | avg=" +
+            String(averageMs, 1) +
+            " | P95=" +
+            String(p95Ms, 1) +
+            " | P99=" +
+            String(p99Ms, 1) +
+            " | worst=" +
+            String(worstMs, 1) +
+            " ms<br>";
+        html +=
+            htmlText(UI_RECORDING_LOAD_BUDGET_USE) + ": <b>" +
+            String(p99BudgetPct, 1) +
+            "%</b> | near80=" +
+            String((unsigned long)result.nearBudgetFrames) +
+            " | over_budget=" +
+            String((unsigned long)result.overBudgetFrames) +
+            "<br>";
+        html +=
+            htmlText(UI_RECORDING_LOAD_MEDIA_RATE) + ": " +
+            String((unsigned long)(
+                result.mediaBytesBeforeFinalize /
+                1024ULL
+            )) +
+            " KiB | " +
+            String(mediaRateKiB, 1) +
+            " KiB/s | " +
+            htmlText(UI_RECORDING_LOAD_FINALIZE) + "=" +
+            String((unsigned long)result.finalizeMs) +
+            " ms<br>";
+
+        if (result.audioRequested) {
+            html +=
+                htmlText(UI_AUDIO_ENABLE) + ": <b>" +
+                htmlText(result.audioActive ? UI_RECORDING_LOAD_ACTIVE : UI_RECORDING_LOAD_INACTIVE) +
+                "</b> | " + htmlText(UI_RECORDING_LOAD_CAPTURED) + "=" +
+                String((unsigned long)result.audioBytesCaptured) +
+                " B | " + htmlText(UI_RECORDING_LOAD_DELIVERED) + "=" +
+                String((unsigned long)result.audioBytesDelivered) +
+                " B | " + htmlText(UI_RECORDING_LOAD_DROPPED) + "=<b>" +
+                String((unsigned long)result.audioBytesDropped) +
+                " B</b> | " + htmlText(UI_RECORDING_LOAD_BUFFER) + "=" +
+                String((unsigned long)result.audioBufferHighWater) +
+                "/" +
+                String((unsigned long)result.audioBufferCapacity) +
+                " (" +
+                String(audioBufferPct, 1) +
+                "%)<br>";
+        } else {
+            html +=
+                htmlText(UI_AUDIO_ENABLE) + ": <b>" +
+                htmlText(UI_AUDIO_OFF) +
+                "</b><br>";
+        }
+
+        html +=
+            htmlText(UI_RECORDING_LOAD_HEAP_STATS) + ": <b>" +
+            String((unsigned long)result.internalHeapBefore) +
+            " / " +
+            String((unsigned long)result.internalHeapMin) +
+            " / " +
+            String((unsigned long)result.internalHeapAfter) +
+            " B</b><br>";
+        html +=
+            htmlText(UI_RECORDING_LOAD_PSRAM_STATS) + ": <b>" +
+            String((unsigned long)result.psramBefore) +
+            " / " +
+            String((unsigned long)result.psramMin) +
+            " / " +
+            String((unsigned long)result.psramAfter) +
+            " B</b><br>";
+        html +=
+            htmlText(UI_RECORDING_LOAD_CPU_STATS) + ": <b>" +
+            String(result.cpuTempStartC, 1) +
+            " / " +
+            String(result.cpuTempMaxC, 1) +
+            " / " +
+            String(result.cpuTempEndC, 1) +
+            " C</b>";
+
+        html +=
+            "</div></details>"
+            "<p class='muted'>" +
+            htmlText(UI_RECORDING_LOAD_THRESHOLDS_NOTE) +
+            "</p></section>";
+    }
+
+    html +=
+        "<p><a href='/config'><button>" +
+        htmlText(UI_NAV_CONFIGURATION) +
+        "</button></a></p>";
+    html += htmlFooter();
+
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "text/html; charset=utf-8", html);
+}
+
+
 static void handleFile()
 {
     if (rejectWhileRecording("file download"))
@@ -17009,6 +17552,7 @@ void webConfigStart()
         server.on("/save", HTTP_POST, handleSave);
         server.on("/audio_test_record", HTTP_POST, handleAudioTestRecord);
         server.on("/audio_benchmark", HTTP_POST, handleAudioBenchmark);
+        server.on("/recording_load_test", HTTP_POST, handleRecordingLoadTest);
         server.on("/config_download", HTTP_GET, handleConfigDownload);
         server.on(
             "/config_upload",

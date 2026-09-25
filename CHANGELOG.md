@@ -9,6 +9,33 @@ and identifies the concrete binary compilation time.
 > change sequence beginning with v23. Earlier development history remains in the
 > repository history/project documentation.
 
+## v56 — 2026-09-25
+
+- Added a WebConfig **Recording Load Test** with selectable 30 s / 60 s duration.
+  The test uses the currently saved media configuration and the real camera ->
+  recorder/container -> `RecordingStorageFile` -> SD path, including embedded MKV
+  audio and SFENC1 encryption when enabled. Motion/event logic and automatic segment
+  rotation do not terminate the synthetic test container; real segment/event finalize
+  latency is now logged passively during normal recordings. Temporary benchmark media
+  is removed afterwards and the benchmark never invokes rollover deletion of customer
+  files.
+- The load report evaluates video/frame timing, audio capture, storage/finalization,
+  internal heap/PSRAM and CPU temperature independently. Green/orange/red overall
+  status always follows the worst subsystem result rather than averaging away a
+  critical bottleneck.
+- Added P95 and P99 frame-call latency to the existing passive recording-performance
+  monitor using a compact 5 ms histogram. Normal recording behavior, frame pacing
+  and storage writes are unchanged; per-frame overhead is one bounded counter update.
+- Added low-frequency passive heap/PSRAM telemetry to normal recording events. The
+  event-end log now records start/minimum/after values while existing MKV audio-drop
+  and thermal summaries continue to provide audio and temperature telemetry. Segment
+  and event finalization duration are also logged explicitly.
+- Recording-load timing assessment reports achieved FPS, average/P95/P99/worst call
+  time, frame-budget use and overruns. Audio assessment uses capture availability,
+  dropped bytes and ring-buffer high-water; storage includes clean finalization time.
+- The explicit benchmark services the watchdog and existing thermal safety monitor
+  while running. A thermal emergency retains the existing firmware safety behavior.
+
 ## v55 — 2026-09-25
 
 - Restored the established WebPlayer behavior in which opening a video from the
