@@ -8530,148 +8530,145 @@ void stopRecording() {
 // EXPLICIT PRODUCTION RECORDING LOAD TEST
 // =============================================================
 
-bool recordingLoadTestRun(
-    uint32_t durationMs,
-    RecordingLoadTestResult &result,
-    String &error
+struct RecordingLoadTestContext {
+    bool active;
+    bool resultReady;
+    bool abortRequested;
+    bool previousRecordingBlock;
+    bool cameraWasInitialized;
+    bool cameraWasStandby;
+
+    uint64_t maxMediaBytes;
+    uint32_t testStartMs;
+    uint32_t lastFrameUs;
+    uint32_t lastResourceSampleMs;
+
+    String testPath;
+    String tempPath;
+    String error;
+
+    RecordingPerformanceStats performance;
+    AudioCaptureStats audioStatsBaseline;
+    RecordingLoadTestResult result;
+};
+
+static RecordingLoadTestContext recordingLoadTestContext = {};
+
+
+static bool recordingLoadDurationAllowed(
+    uint32_t durationMs
 )
 {
-    result = {};
-    error = "";
+    return
+        durationMs == 30000UL ||
+        durationMs == 60000UL ||
+        durationMs == 300000UL ||
+        durationMs == 900000UL ||
+        durationMs == 1800000UL ||
+        durationMs == 3600000UL;
+}
 
-    if (
-        durationMs != 30000UL &&
-        durationMs != 60000UL
+
+static void recordingLoadInsertSlowFrame(
+    uint32_t frameCall,
+    uint32_t totalUs,
+    const RecorderFrameTiming &timing
+)
+{
+    RecordingLoadTestResult &result =
+        recordingLoadTestContext.result;
+
+    RecordingLoadSlowFrame entry = {};
+    entry.frameCall = frameCall;
+    entry.totalUs = totalUs;
+    entry.stageBreakdownValid =
+        timing.stageBreakdownValid;
+    entry.cameraUs = timing.cameraUs;
+    entry.headerUs = timing.headerUs;
+    entry.audioReadUs = timing.audioReadUs;
+    entry.audioWriteUs = timing.audioWriteUs;
+    entry.clusterUs = timing.clusterUs;
+    entry.subtitleUs = timing.subtitleUs;
+    entry.videoWriteUs = timing.videoWriteUs;
+    entry.imageAnalysisUs = timing.imageAnalysisUs;
+
+    entry.storageIoValid = timing.storageIoValid;
+    entry.storageWriteCalls = timing.storageWriteCalls;
+    entry.storageWriteBytes = timing.storageWriteBytes;
+    entry.storageWriteTotalUs = timing.storageWriteTotalUs;
+    entry.storageWriteMaxUs = timing.storageWriteMaxUs;
+    entry.storageWriteMaxBytes = timing.storageWriteMaxBytes;
+    entry.storageSlowWriteCalls = timing.storageSlowWriteCalls;
+    entry.storageSeekCalls = timing.storageSeekCalls;
+    entry.storageSeekTotalUs = timing.storageSeekTotalUs;
+    entry.storageSeekMaxUs = timing.storageSeekMaxUs;
+
+    uint64_t accountedUs =
+        (uint64_t)entry.cameraUs +
+        (uint64_t)entry.headerUs +
+        (uint64_t)entry.audioReadUs +
+        (uint64_t)entry.audioWriteUs +
+        (uint64_t)entry.clusterUs +
+        (uint64_t)entry.subtitleUs +
+        (uint64_t)entry.videoWriteUs +
+        (uint64_t)entry.imageAnalysisUs;
+
+    entry.otherUs =
+        accountedUs < (uint64_t)totalUs
+        ? totalUs - (uint32_t)accountedUs
+        : 0;
+
+    uint8_t count =
+        result.slowFrameCount;
+
+    uint8_t insertAt = count;
+
+    if (count < RECORDING_LOAD_SLOW_FRAME_COUNT) {
+        result.slowFrameCount++;
+    } else {
+        if (
+            totalUs <=
+            result.slowFrames[
+                RECORDING_LOAD_SLOW_FRAME_COUNT - 1U
+            ].totalUs
+        ) {
+            return;
+        }
+
+        insertAt =
+            RECORDING_LOAD_SLOW_FRAME_COUNT - 1U;
+    }
+
+    while (
+        insertAt > 0 &&
+        result.slowFrames[insertAt - 1U].totalUs <
+            entry.totalUs
     ) {
-        error = "recording load test duration must be 30 or 60 seconds";
-        return false;
+        if (insertAt < RECORDING_LOAD_SLOW_FRAME_COUNT) {
+            result.slowFrames[insertAt] =
+                result.slowFrames[insertAt - 1U];
+        }
+
+        insertAt--;
     }
 
-    result.requestedDurationMs = durationMs;
-    result.targetFps = (uint32_t)max(cfg_fps, 1);
-    result.frameBudgetUs =
-        1000000UL /
-        result.targetFps;
-    result.encrypted =
-        cfg_recording_encryption != 0;
-    result.audioRequested =
-        cfg_audio_enabled != 0;
-    result.format =
-        cfg_recording_format;
+    result.slowFrames[insertAt] =
+        entry;
+}
 
-    if (
-        recording ||
-        recorderIsOpen()
-    ) {
-        error = "recording is already active";
-        return false;
-    }
 
-    if (g_storageLocked) {
-        error = "storage maintenance is active";
-        return false;
-    }
+static void recordingLoadRemoveTestMedia()
+{
+    RecordingLoadTestContext &ctx =
+        recordingLoadTestContext;
 
-    if (g_recordingStartBlocked) {
-        error = "new recording starts are currently blocked";
-        return false;
-    }
+    if (ctx.testPath.length())
+        STORAGE.remove(ctx.testPath.c_str());
 
-    if (!sdReady) {
-        error = "SD storage is not available";
-        return false;
-    }
+    if (ctx.tempPath.length())
+        STORAGE.remove(ctx.tempPath.c_str());
 
-    if (webConfigCameraPreviewActive()) {
-        error = "close the live camera preview before running the recording load test";
-        return false;
-    }
-
-    if (thermalEmergencyState) {
-        error = "thermal emergency is active";
-        return false;
-    }
-
-    if (syncApiExclusiveActive()) {
-        error = "Sync API exclusive mode is active";
-        return false;
-    }
-
-    uint32_t performanceLoad = 0;
-    uint32_t performanceLimit = 0;
-
-    if (!configRecordingPerformanceAllowed(
-            cfg_resolution,
-            cfg_fps,
-            cfg_quality,
-            performanceLoad,
-            performanceLimit
-        )) {
-        error =
-            "recording performance guard rejects the saved configuration";
-        return false;
-    }
-
-    // A benchmark must never trigger rollover/deletion of customer recordings.
-    // Require generous disposable headroom above the configured reserve instead.
-    uint64_t freeBytes =
-        storageFreeBytes();
-    uint64_t reserveBytes =
-        storageReserveBytes();
-    uint64_t testHeadroomBytes =
-        32ULL * 1024ULL * 1024ULL +
-        (uint64_t)(durationMs / 1000UL) *
-        8ULL * 1024ULL * 1024ULL;
-
-    if (
-        freeBytes <= reserveBytes ||
-        freeBytes - reserveBytes < testHeadroomBytes
-    ) {
-        error =
-            "not enough disposable SD space above the SensorForge reserve for the recording load test";
-        return false;
-    }
-
-    const bool cameraWasInitialized =
-        cameraInitialized;
-    const bool cameraWasStandby =
-        cameraSoftPowerDownActive;
-
-    if (!initCamera(
-            cfg_camera,
-            cfg_resolution,
-            cfg_quality
-        )) {
-        error = "camera initialization failed";
-        return false;
-    }
-
-    if (!cameraExitSoftPowerDown()) {
-        error = "camera wake failed";
-
-        if (!cameraWasInitialized)
-            cameraDeinitRuntime();
-
-        return false;
-    }
-
-    String extension =
-        cfg_recording_format == "avi"
-            ? ".avi"
-            : ".mkv";
-
-    String testPath =
-        "/.__sensorforge_recording_load_test" +
-        extension;
-
-    String tempPath =
-        testPath +
-        ".part";
-
-    STORAGE.remove(testPath.c_str());
-    STORAGE.remove(tempPath.c_str());
-
-    if (cfg_recording_format == "avi") {
+    if (ctx.result.format == "avi") {
         STORAGE.remove(
             "/.__sensorforge_recording_load_test.srt"
         );
@@ -8679,174 +8676,51 @@ bool recordingLoadTestRun(
             "/.__sensorforge_recording_load_test.srt.part"
         );
     }
+}
 
-    result.internalHeapBefore =
-        (uint32_t)heap_caps_get_free_size(
-            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
-        );
-    result.internalHeapMin =
-        result.internalHeapBefore;
 
-    result.psramBefore =
-        (uint32_t)heap_caps_get_free_size(
-            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
-        );
-    result.psramMin =
-        result.psramBefore;
+static void recordingLoadFinalize(
+    bool reachedRequestedDuration,
+    bool restoreRecordingStartBlock
+)
+{
+    RecordingLoadTestContext &ctx =
+        recordingLoadTestContext;
 
-    result.cpuTempStartC =
-        thermalCpuTemperatureC();
-    result.cpuTempMaxC =
-        result.cpuTempStartC;
+    if (!ctx.active)
+        return;
 
-    RecordingPerformanceStats performance = {};
-    recordingPerformanceReset(performance);
-
-    AudioCaptureStats audioStatsBaseline =
-        audioCaptureStats();
-
-    const bool previousRecordingBlock =
-        g_recordingStartBlocked;
-
-    if (!recorderStart(
-            testPath,
-            cfg_fps
-        )) {
-        error = "recorder could not start the load-test file";
-
-        if (!cameraWasInitialized)
-            cameraDeinitRuntime();
-        else if (cameraWasStandby)
-            cameraEnterSoftPowerDown();
-
-        return false;
-    }
-
-    // The synchronous WebConfig handler owns the loopTask while this test runs,
-    // so no motion automation can race us. Block any other explicit NEW start
-    // after our recorder is open, without changing normal storage semantics.
-    g_recordingStartBlocked = true;
-
-    result.recorderHealthy = true;
-
-    uint32_t testStartMs = millis();
-    uint32_t lastFrameUs = 0;
-    uint32_t lastResourceSampleMs = 0;
-
-    while (
-        (uint32_t)(millis() - testStartMs) <
-            durationMs
-    ) {
-        thermalMonitorLoop();
-
-        uint32_t nowMs = millis();
-        uint32_t nowUs = micros();
-
-        if (
-            lastFrameUs == 0 ||
-            (uint32_t)(nowUs - lastFrameUs) >=
-                result.frameBudgetUs
-        ) {
-            uint64_t callStartUs =
-                (uint64_t)esp_timer_get_time();
-
-            recorderAddFrame();
-
-            uint64_t callDoneUs =
-                (uint64_t)esp_timer_get_time();
-
-            uint32_t callUs =
-                (uint32_t)(
-                    callDoneUs -
-                    callStartUs
-                );
-
-            recordingPerformanceNoteCall(
-                performance,
-                callUs,
-                result.frameBudgetUs
-            );
-
-            lastFrameUs = nowUs;
-
-            if (!recorderIsHealthy()) {
-                result.recorderHealthy = false;
-                error = "recorder/storage write failed during load test";
-                break;
-            }
-        }
-
-        if (
-            lastResourceSampleMs == 0 ||
-            (uint32_t)(nowMs - lastResourceSampleMs) >=
-                500UL
-        ) {
-            lastResourceSampleMs = nowMs;
-
-            uint32_t internalNow =
-                (uint32_t)heap_caps_get_free_size(
-                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
-                );
-            uint32_t psramNow =
-                (uint32_t)heap_caps_get_free_size(
-                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
-                );
-
-            if (internalNow < result.internalHeapMin)
-                result.internalHeapMin = internalNow;
-            if (psramNow < result.psramMin)
-                result.psramMin = psramNow;
-
-            float cpuNow =
-                thermalCpuTemperatureC();
-
-            if (
-                isfinite(cpuNow) &&
-                (
-                    !isfinite(result.cpuTempMaxC) ||
-                    cpuNow > result.cpuTempMaxC
-                )
-            ) {
-                result.cpuTempMaxC = cpuNow;
-            }
-
-            if (thermalWarningState)
-                result.thermalWarningSeen = true;
-        }
-
-        esp_task_wdt_reset();
-        yield();
-        delay(1);
-    }
+    RecordingLoadTestResult &result =
+        ctx.result;
 
     result.elapsedMs =
-        (uint32_t)(millis() - testStartMs);
+        (uint32_t)(millis() - ctx.testStartMs);
 
     result.frameCalls =
-        performance.frameCalls;
+        ctx.performance.frameCalls;
     result.framesWritten =
         recorderGetFrameCount();
     result.nearBudgetFrames =
-        performance.nearBudgetFrames;
+        ctx.performance.nearBudgetFrames;
     result.overBudgetFrames =
-        performance.overBudgetFrames;
+        ctx.performance.overBudgetFrames;
     result.worstCallUs =
-        performance.worstCallUs;
+        ctx.performance.worstCallUs;
 
-    if (performance.frameCalls > 0) {
+    if (ctx.performance.frameCalls > 0) {
         result.averageCallUs =
             (uint32_t)(
-                performance.totalCallUs /
-                (uint64_t)performance.frameCalls
+                ctx.performance.totalCallUs /
+                (uint64_t)ctx.performance.frameCalls
             );
         result.p95CallUs =
             recordingPerformancePercentileUs(
-                performance,
+                ctx.performance,
                 95
             );
         result.p99CallUs =
             recordingPerformancePercentileUs(
-                performance,
+                ctx.performance,
                 99
             );
     }
@@ -8864,6 +8738,11 @@ bool recordingLoadTestRun(
         audioBeforeFinalize.bufferCapacity;
     result.audioBufferHighWater =
         audioBeforeFinalize.bufferHighWater;
+
+    // Detailed frame instrumentation is only for the active frame loop. Keep
+    // finalization timing comparable to production and avoid attributing tail
+    // audio/container work to the last frame.
+    recorderSetDetailedFrameTimingEnabled(false);
 
     uint64_t finalizeStartUs =
         (uint64_t)esp_timer_get_time();
@@ -8885,10 +8764,14 @@ bool recordingLoadTestRun(
         audioCaptureStats();
 
     bool audioStatsChanged =
-        audioAfterFinalize.bytesCaptured != audioStatsBaseline.bytesCaptured ||
-        audioAfterFinalize.bytesDelivered != audioStatsBaseline.bytesDelivered ||
-        audioAfterFinalize.bytesDropped != audioStatsBaseline.bytesDropped ||
-        audioAfterFinalize.bufferHighWater != audioStatsBaseline.bufferHighWater;
+        audioAfterFinalize.bytesCaptured !=
+            ctx.audioStatsBaseline.bytesCaptured ||
+        audioAfterFinalize.bytesDelivered !=
+            ctx.audioStatsBaseline.bytesDelivered ||
+        audioAfterFinalize.bytesDropped !=
+            ctx.audioStatsBaseline.bytesDropped ||
+        audioAfterFinalize.bufferHighWater !=
+            ctx.audioStatsBaseline.bufferHighWater;
 
     if (
         result.audioRequested &&
@@ -8909,8 +8792,6 @@ bool recordingLoadTestRun(
                 audioAfterFinalize.bufferHighWater;
         }
     } else if (result.audioRequested) {
-        // Prevent stale statistics from a previous WAV/recording test being
-        // presented when this recording never started an audio backend.
         result.audioBytesCaptured = 0;
         result.audioBytesDelivered = 0;
         result.audioBytesDropped = 0;
@@ -8945,35 +8826,30 @@ bool recordingLoadTestRun(
         result.thermalWarningSeen = true;
 
     result.completed =
+        reachedRequestedDuration &&
         result.recorderHealthy &&
         result.finalized &&
-        result.elapsedMs >= durationMs;
+        result.elapsedMs >=
+            result.requestedDurationMs;
 
-    // Test media is disposable and must never appear in the recordings list.
-    STORAGE.remove(testPath.c_str());
-    STORAGE.remove(tempPath.c_str());
+    recordingLoadRemoveTestMedia();
 
-    if (cfg_recording_format == "avi") {
-        STORAGE.remove(
-            "/.__sensorforge_recording_load_test.srt"
-        );
-        STORAGE.remove(
-            "/.__sensorforge_recording_load_test.srt.part"
-        );
+    if (restoreRecordingStartBlock) {
+        g_recordingStartBlocked =
+            ctx.previousRecordingBlock;
     }
 
-    g_recordingStartBlocked =
-        previousRecordingBlock;
-
-    if (!cameraWasInitialized) {
+    if (!ctx.cameraWasInitialized) {
         cameraDeinitRuntime();
-    } else if (cameraWasStandby) {
+    } else if (ctx.cameraWasStandby) {
         cameraEnterSoftPowerDown();
     }
 
     String summary =
         "RECORDING LOAD TEST | format=" +
         result.format +
+        " | requested_ms=" +
+        String((unsigned long)result.requestedDurationMs) +
         " | duration_ms=" +
         String((unsigned long)result.elapsedMs) +
         " | fps=" +
@@ -9007,12 +8883,565 @@ bool recordingLoadTestRun(
         " | result=" +
         String(result.completed ? "complete" : "failed");
 
+    if (ctx.error.length()) {
+        summary +=
+            " | reason=" +
+            ctx.error;
+    }
+
     logWrite(summary);
 
-    if (!result.completed && !error.length())
-        error = "recording load test did not complete cleanly";
+    for (
+        uint8_t i = 0;
+        i < result.slowFrameCount;
+        ++i
+    ) {
+        const RecordingLoadSlowFrame &slow =
+            result.slowFrames[i];
 
-    return result.completed;
+        String detail =
+            "RECORDING LOAD SLOW FRAME | rank=" +
+            String((unsigned)(i + 1U)) +
+            " | call=" +
+            String((unsigned long)slow.frameCall) +
+            " | total_ms=" +
+            String((float)slow.totalUs / 1000.0f, 1);
+
+        if (slow.stageBreakdownValid) {
+            detail +=
+                " | camera_ms=" +
+                String((float)slow.cameraUs / 1000.0f, 1) +
+                " | header_ms=" +
+                String((float)slow.headerUs / 1000.0f, 1) +
+                " | audio_read_ms=" +
+                String((float)slow.audioReadUs / 1000.0f, 1) +
+                " | audio_write_ms=" +
+                String((float)slow.audioWriteUs / 1000.0f, 1) +
+                " | cluster_ms=" +
+                String((float)slow.clusterUs / 1000.0f, 1) +
+                " | subtitle_ms=" +
+                String((float)slow.subtitleUs / 1000.0f, 1) +
+                " | video_write_ms=" +
+                String((float)slow.videoWriteUs / 1000.0f, 1) +
+                " | image_ms=" +
+                String((float)slow.imageAnalysisUs / 1000.0f, 1) +
+                " | other_ms=" +
+                String((float)slow.otherUs / 1000.0f, 1);
+        }
+
+        if (slow.storageIoValid) {
+            detail +=
+                " | storage_write_calls=" +
+                String((unsigned long)slow.storageWriteCalls) +
+                " | storage_write_kib=" +
+                String((double)slow.storageWriteBytes / 1024.0, 1) +
+                " | storage_write_ms=" +
+                String((double)slow.storageWriteTotalUs / 1000.0, 1) +
+                " | storage_max_write_ms=" +
+                String((float)slow.storageWriteMaxUs / 1000.0f, 1) +
+                " | storage_max_write_bytes=" +
+                String((unsigned long)slow.storageWriteMaxBytes) +
+                " | storage_slow_writes=" +
+                String((unsigned long)slow.storageSlowWriteCalls) +
+                " | storage_seek_calls=" +
+                String((unsigned long)slow.storageSeekCalls) +
+                " | storage_seek_ms=" +
+                String((double)slow.storageSeekTotalUs / 1000.0, 1) +
+                " | storage_max_seek_ms=" +
+                String((float)slow.storageSeekMaxUs / 1000.0f, 1);
+        }
+
+        logWrite(detail);
+    }
+
+    if (
+        !result.completed &&
+        !ctx.error.length()
+    ) {
+        ctx.error =
+            "recording load test did not complete cleanly";
+    }
+
+    ctx.active = false;
+    ctx.resultReady = true;
+    ctx.abortRequested = false;
+}
+
+
+bool recordingLoadTestStart(
+    uint32_t durationMs,
+    String &error
+)
+{
+    error = "";
+
+    if (recordingLoadTestContext.active) {
+        error = "recording load test is already active";
+        return false;
+    }
+
+    if (!recordingLoadDurationAllowed(durationMs)) {
+        error =
+            "recording load test duration must be 30 s, 60 s, 5 min, 15 min, 30 min or 60 min";
+        return false;
+    }
+
+    RecordingLoadTestContext fresh = {};
+    recordingLoadTestContext = fresh;
+
+    RecordingLoadTestContext &ctx =
+        recordingLoadTestContext;
+
+    RecordingLoadTestResult &result =
+        ctx.result;
+
+    result.requestedDurationMs = durationMs;
+    result.targetFps =
+        (uint32_t)max(cfg_fps, 1);
+    result.frameBudgetUs =
+        1000000UL /
+        result.targetFps;
+    result.encrypted =
+        cfg_recording_encryption != 0;
+    result.audioRequested =
+        cfg_audio_enabled != 0;
+    result.format =
+        cfg_recording_format;
+
+    if (
+        recording ||
+        recorderIsOpen()
+    ) {
+        error = "recording is already active";
+        return false;
+    }
+
+    if (g_storageLocked) {
+        error = "storage maintenance is active";
+        return false;
+    }
+
+    if (g_recordingStartBlocked) {
+        error = "new recording starts are currently blocked";
+        return false;
+    }
+
+    if (!sdReady) {
+        error = "SD storage is not available";
+        return false;
+    }
+
+    if (webConfigCameraPreviewActive()) {
+        error =
+            "close the live camera preview before running the recording load test";
+        return false;
+    }
+
+    if (thermalEmergencyState) {
+        error = "thermal emergency is active";
+        return false;
+    }
+
+    if (syncApiExclusiveActive()) {
+        error = "Sync API exclusive mode is active";
+        return false;
+    }
+
+    uint32_t performanceLoad = 0;
+    uint32_t performanceLimit = 0;
+
+    if (!configRecordingPerformanceAllowed(
+            cfg_resolution,
+            cfg_fps,
+            cfg_quality,
+            performanceLoad,
+            performanceLimit
+        )) {
+        error =
+            "recording performance guard rejects the saved configuration";
+        return false;
+    }
+
+    // Never trigger rollover from a benchmark. The initial free-space snapshot
+    // defines a hard disposable byte budget. The loop stops before crossing the
+    // configured reserve and keeps an additional 64 MiB physical margin for
+    // filesystem/encryption overhead. This scales safely from 30 s to 1 h
+    // without guessing a JPEG bitrate.
+    uint64_t freeBytes =
+        storageFreeBytes();
+    uint64_t reserveBytes =
+        storageReserveBytes();
+    const uint64_t safetyMarginBytes =
+        64ULL * 1024ULL * 1024ULL;
+
+    if (
+        freeBytes <= reserveBytes +
+            safetyMarginBytes
+    ) {
+        error =
+            "not enough disposable SD space above the SensorForge reserve for the recording load test";
+        return false;
+    }
+
+    ctx.maxMediaBytes =
+        freeBytes -
+        reserveBytes -
+        safetyMarginBytes;
+
+    ctx.cameraWasInitialized =
+        cameraInitialized;
+    ctx.cameraWasStandby =
+        cameraSoftPowerDownActive;
+
+    if (!initCamera(
+            cfg_camera,
+            cfg_resolution,
+            cfg_quality
+        )) {
+        error = "camera initialization failed";
+        return false;
+    }
+
+    if (!cameraExitSoftPowerDown()) {
+        error = "camera wake failed";
+
+        if (!ctx.cameraWasInitialized)
+            cameraDeinitRuntime();
+
+        return false;
+    }
+
+    String extension =
+        cfg_recording_format == "avi"
+        ? ".avi"
+        : ".mkv";
+
+    ctx.testPath =
+        "/.__sensorforge_recording_load_test" +
+        extension;
+    ctx.tempPath =
+        ctx.testPath +
+        ".part";
+
+    recordingLoadRemoveTestMedia();
+
+    result.internalHeapBefore =
+        (uint32_t)heap_caps_get_free_size(
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+        );
+    result.internalHeapMin =
+        result.internalHeapBefore;
+
+    result.psramBefore =
+        (uint32_t)heap_caps_get_free_size(
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+        );
+    result.psramMin =
+        result.psramBefore;
+
+    result.cpuTempStartC =
+        thermalCpuTemperatureC();
+    result.cpuTempMaxC =
+        result.cpuTempStartC;
+
+    recordingPerformanceReset(
+        ctx.performance
+    );
+
+    ctx.audioStatsBaseline =
+        audioCaptureStats();
+
+    ctx.previousRecordingBlock =
+        g_recordingStartBlocked;
+
+    recorderSetDetailedFrameTimingEnabled(true);
+
+    if (!recorderStart(
+            ctx.testPath,
+            cfg_fps
+        )) {
+        recorderSetDetailedFrameTimingEnabled(false);
+
+        error =
+            "recorder could not start the load-test file";
+
+        if (!ctx.cameraWasInitialized)
+            cameraDeinitRuntime();
+        else if (ctx.cameraWasStandby)
+            cameraEnterSoftPowerDown();
+
+        recordingLoadRemoveTestMedia();
+        return false;
+    }
+
+    // The benchmark now runs from the normal firmware loop instead of keeping
+    // one HTTP request open. Block all competing NEW recorder starts while the
+    // test owns the camera/storage path.
+    g_recordingStartBlocked = true;
+
+    result.recorderHealthy = true;
+
+    ctx.testStartMs = millis();
+    ctx.lastFrameUs = 0;
+    ctx.lastResourceSampleMs = 0;
+    ctx.active = true;
+    ctx.resultReady = false;
+    ctx.abortRequested = false;
+    ctx.error = "";
+
+    return true;
+}
+
+
+void recordingLoadTestLoop()
+{
+    RecordingLoadTestContext &ctx =
+        recordingLoadTestContext;
+
+    if (!ctx.active)
+        return;
+
+    RecordingLoadTestResult &result =
+        ctx.result;
+
+    if (ctx.abortRequested) {
+        ctx.error =
+            "recording load test aborted by operator";
+        recordingLoadFinalize(false, true);
+        return;
+    }
+
+    if (thermalEmergencyState) {
+        ctx.error =
+            "recording load test stopped by thermal emergency";
+        recordingLoadFinalize(false, false);
+        return;
+    }
+
+    uint32_t elapsedMs =
+        (uint32_t)(millis() - ctx.testStartMs);
+
+    if (elapsedMs >= result.requestedDurationMs) {
+        recordingLoadFinalize(true, true);
+        return;
+    }
+
+    if (
+        recorderHitSizeLimit() ||
+        recorderGetBytesWritten() >=
+            ctx.maxMediaBytes
+    ) {
+        ctx.error =
+            recorderHitSizeLimit()
+            ? "recording load test reached the container file-size limit"
+            : "recording load test stopped before crossing the configured SD reserve";
+        recordingLoadFinalize(false, true);
+        return;
+    }
+
+    uint32_t nowMs = millis();
+    uint32_t nowUs = micros();
+
+    if (
+        ctx.lastFrameUs == 0 ||
+        (uint32_t)(nowUs - ctx.lastFrameUs) >=
+            result.frameBudgetUs
+    ) {
+        uint64_t callStartUs =
+            (uint64_t)esp_timer_get_time();
+
+        recorderAddFrame();
+
+        uint64_t callDoneUs =
+            (uint64_t)esp_timer_get_time();
+
+        uint32_t callUs =
+            (uint32_t)(
+                callDoneUs -
+                callStartUs
+            );
+
+        recordingPerformanceNoteCall(
+            ctx.performance,
+            callUs,
+            result.frameBudgetUs
+        );
+
+        RecorderFrameTiming frameTiming = {};
+        recorderGetLastFrameTiming(
+            frameTiming
+        );
+
+        recordingLoadInsertSlowFrame(
+            ctx.performance.frameCalls,
+            callUs,
+            frameTiming
+        );
+
+        ctx.lastFrameUs =
+            nowUs;
+
+        if (!recorderIsHealthy()) {
+            result.recorderHealthy = false;
+            ctx.error =
+                "recorder/storage write failed during load test";
+            recordingLoadFinalize(false, true);
+            return;
+        }
+    }
+
+    if (
+        ctx.lastResourceSampleMs == 0 ||
+        (uint32_t)(
+            nowMs -
+            ctx.lastResourceSampleMs
+        ) >=
+            500UL
+    ) {
+        ctx.lastResourceSampleMs =
+            nowMs;
+
+        uint32_t internalNow =
+            (uint32_t)heap_caps_get_free_size(
+                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+            );
+        uint32_t psramNow =
+            (uint32_t)heap_caps_get_free_size(
+                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+            );
+
+        if (internalNow < result.internalHeapMin)
+            result.internalHeapMin = internalNow;
+        if (psramNow < result.psramMin)
+            result.psramMin = psramNow;
+
+        float cpuNow =
+            thermalCpuTemperatureC();
+
+        if (
+            isfinite(cpuNow) &&
+            (
+                !isfinite(result.cpuTempMaxC) ||
+                cpuNow > result.cpuTempMaxC
+            )
+        ) {
+            result.cpuTempMaxC = cpuNow;
+        }
+
+        if (thermalWarningState)
+            result.thermalWarningSeen = true;
+    }
+
+    esp_task_wdt_reset();
+    yield();
+    delay(1);
+}
+
+
+bool recordingLoadTestIsActive()
+{
+    return
+        recordingLoadTestContext.active;
+}
+
+
+bool recordingLoadTestHasResult()
+{
+    return
+        recordingLoadTestContext.resultReady;
+}
+
+
+bool recordingLoadTestGetSnapshot(
+    RecordingLoadTestResult &result,
+    String &error,
+    bool &active,
+    bool &resultReady
+)
+{
+    RecordingLoadTestContext &ctx =
+        recordingLoadTestContext;
+
+    active = ctx.active;
+    resultReady = ctx.resultReady;
+    error = ctx.error;
+    result = ctx.result;
+
+    if (ctx.active) {
+        result.elapsedMs =
+            (uint32_t)(millis() - ctx.testStartMs);
+        result.frameCalls =
+            ctx.performance.frameCalls;
+        result.framesWritten =
+            recorderGetFrameCount();
+        result.nearBudgetFrames =
+            ctx.performance.nearBudgetFrames;
+        result.overBudgetFrames =
+            ctx.performance.overBudgetFrames;
+        result.worstCallUs =
+            ctx.performance.worstCallUs;
+        result.mediaBytesBeforeFinalize =
+            recorderGetBytesWritten();
+
+        if (ctx.performance.frameCalls > 0) {
+            result.averageCallUs =
+                (uint32_t)(
+                    ctx.performance.totalCallUs /
+                    (uint64_t)ctx.performance.frameCalls
+                );
+            result.p95CallUs =
+                recordingPerformancePercentileUs(
+                    ctx.performance,
+                    95
+                );
+            result.p99CallUs =
+                recordingPerformancePercentileUs(
+                    ctx.performance,
+                    99
+                );
+        }
+
+        AudioCaptureStats audioNow =
+            audioCaptureStats();
+        result.audioActive =
+            audioCaptureIsRunning();
+        result.audioBufferCapacity =
+            audioNow.bufferCapacity;
+        result.audioBufferHighWater =
+            audioNow.bufferHighWater;
+    }
+
+    return active || resultReady;
+}
+
+
+bool recordingLoadTestRequestAbort(
+    String &error
+)
+{
+    error = "";
+
+    if (!recordingLoadTestContext.active) {
+        error = "no recording load test is active";
+        return false;
+    }
+
+    recordingLoadTestContext.abortRequested =
+        true;
+
+    return true;
+}
+
+
+void recordingLoadTestEmergencyStop()
+{
+    if (!recordingLoadTestContext.active)
+        return;
+
+    recordingLoadTestContext.error =
+        "recording load test stopped by thermal emergency";
+
+    recordingLoadFinalize(false, false);
 }
 
 
@@ -11647,7 +12076,14 @@ static void enterThermalEmergencySleep(
     );
 
 
-    // Finalize the active container before taking the SD offline.
+    // Finalize any explicit load-test container before taking storage offline.
+    // The emergency start block stays asserted; the test cleanup must not
+    // re-enable new recordings on a hot device.
+    if (recordingLoadTestIsActive()) {
+        recordingLoadTestEmergencyStop();
+    }
+
+    // Finalize the active normal recording before taking the SD offline.
     if (recording) {
         stopRecording();
     }
@@ -14545,6 +14981,16 @@ void loop() {
 
     if (webConfigStarted)
         webConfigLoop();
+
+
+    // The explicit Recording Load Test owns the normal camera/recorder path but
+    // is advanced from this same loopTask. WebConfig remains responsive for
+    // status/abort polling, while motion/shooter/sleep automation stays out of
+    // the measurement path until the test has finalized.
+    if (recordingLoadTestIsActive()) {
+        recordingLoadTestLoop();
+        return;
+    }
 
 
     bool wifiTimedOut =

@@ -393,7 +393,7 @@ static const UiTextEntry UI_TEXTS[] = {
     {"Misst den echten gespeicherten Medienpfad mit Kamera, aktuellem Container, Audio falls aktiviert, SD und optionaler Verschlüsselung. Bewegungs-/Eventlogik und automatische Segmentrotation steuern den Test bewusst nicht; der temporäre Testcontainer läuft für die gewählte Dauer durch und wird danach gelöscht. Reale Segment-Finalisierungszeiten werden zusätzlich im normalen Aufnahme-Log erfasst.", "Measures the real saved media path with camera, current container, audio when enabled, SD and optional encryption. Motion/event logic and automatic segment rotation deliberately do not control the test; the temporary test container runs for the selected duration and is then removed. Real segment finalization times are additionally captured in the normal recording log."}, // UI_RECORDING_LOAD_HELP
     {"Testdauer", "Test duration"}, // UI_RECORDING_LOAD_DURATION
     {"Recording Load Test starten", "Start recording load test"}, // UI_RECORDING_LOAD_BUTTON
-    {"Verwendet ausschließlich die aktuell gespeicherten Einstellungen. Änderungen im Formular daher zuerst speichern. 30 s ist der Standardtest; 60 s eignet sich zusätzlich für Temperatur- und Langzeitreserve.", "Uses only the currently saved settings. Save form changes first. 30 s is the standard test; 60 s additionally helps assess thermal and sustained headroom."}, // UI_RECORDING_LOAD_SAVED_NOTE
+    {"Verwendet ausschließlich die aktuell gespeicherten Einstellungen. Änderungen im Formular daher zuerst speichern. 30 s ist der schnelle Standardtest; 5 bis 60 Minuten eignen sich für Langzeit-, Temperatur- und seltene Latenzspitzen.", "Uses only the currently saved settings. Save form changes first. 30 s is the quick standard test; 5 to 60 minutes are intended for sustained load, thermal behavior and rare latency spikes."}, // UI_RECORDING_LOAD_SAVED_NOTE
     {"Recording Load Test läuft", "Recording load test running"}, // UI_RECORDING_LOAD_RUNNING
     {"Kamera, Recorder, Audio, SD und gegebenenfalls Verschlüsselung werden gemeinsam belastet. Die Seite wechselt nach Abschluss automatisch zum Ergebnis.", "Camera, recorder, audio, SD and encryption when enabled are stressed together. The page changes to the result automatically when finished."}, // UI_RECORDING_LOAD_RUNNING_HELP
     {"Recording Load Test fehlgeschlagen", "Recording load test failed"}, // UI_RECORDING_LOAD_FAILED
@@ -408,9 +408,10 @@ static const UiTextEntry UI_TEXTS[] = {
     {"Temperatur", "Temperature"}, // UI_RECORDING_LOAD_THERMAL
     {"Technische Messwerte", "Technical measurements"}, // UI_RECORDING_LOAD_TECH_DETAILS
     {"Verschlüsselung", "Encryption"}, // UI_RECORDING_LOAD_ENCRYPTION
-    {"Timing: Grün ohne Budgetüberschreitung und P99 unter 80 % des Framebudgets; Orange bei geringer Reserve oder vereinzelter Überschreitung; Rot bei P99 über Budget, mindestens 1 % Budgetüberschreitungen oder deutlichem Frameverlust. Audio: Grün ohne Drops und unter 50 % Puffer, Orange bei einzelnen Drops/50–90 %, Rot ab 1 % Drops oder 90 % Puffer. Finalisierung: Grün bis 2 s, Orange bis 5 s, darüber Rot. Interner Heap: Grün ab 64 KiB, Orange 32–64 KiB, darunter Rot; PSRAM: Grün ab 512 KiB, Orange 256–512 KiB, darunter Rot. Temperatur folgt den Firmware-Sicherheitsgrenzen 70 °C Warnung / 80 °C Notprogramm.", "Timing: Green with no budget overrun and P99 below 80% of the frame budget; orange for reduced headroom or an isolated overrun; red when P99 exceeds budget, at least 1% of calls exceed budget, or meaningful frame loss occurs. Audio: green with no drops and below 50% buffer, orange for isolated drops/50–90%, red from 1% drops or 90% buffer. Finalize: green up to 2 s, orange up to 5 s, red above that. Internal heap: green from 64 KiB, orange 32–64 KiB, red below; PSRAM: green from 512 KiB, orange 256–512 KiB, red below. Temperature follows the firmware safety limits of 70 °C warning / 80 °C emergency."}, // UI_RECORDING_LOAD_THRESHOLDS_NOTE
+    {"Timing: Grün ohne Budgetüberschreitung, mindestens 99,5 % Frame-Lieferquote und P99 unter 80 % des Framebudgets. Orange bei einzelnen Budgetüberschreitungen unter 1 %, 98–99,5 % Frame-Lieferquote, P99 ab 80 % oder einem einzelnen Aufruf über Budget. Rot bei P99 über dem Budget, mindestens 1 % Budgetüberschreitungen, unter 98 % Frame-Lieferquote oder einem extremen Einzelhänger über dem Fünffachen des Framebudgets. Audio: Grün ohne Drops und unter 50 % Puffer, Orange bei einzelnen Drops/50–90 %, Rot ab 1 % Drops oder 90 % Puffer. Finalisierung: Grün bis 2 s, Orange bis 5 s, darüber Rot. Interner Heap: Grün ab 64 KiB, Orange 32–64 KiB, darunter Rot; PSRAM: Grün ab 512 KiB, Orange 256–512 KiB, darunter Rot. Temperatur folgt den Firmware-Sicherheitsgrenzen 70 °C Warnung / 80 °C Notprogramm.", "Timing: Green with no budget overrun, at least 99.5% frame delivery and P99 below 80% of the frame budget. Orange for isolated overruns below 1%, 98–99.5% frame delivery, P99 from 80%, or a single call above budget. Red when P99 exceeds budget, at least 1% of calls exceed budget, frame delivery falls below 98%, or one extreme stall exceeds five times the frame budget. Audio: green with no drops and below 50% buffer, orange for isolated drops/50–90%, red from 1% drops or 90% buffer. Finalize: green up to 2 s, orange up to 5 s, red above that. Internal heap: green from 64 KiB, orange 32–64 KiB, red below; PSRAM: green from 512 KiB, orange 256–512 KiB, red below. Temperature follows the firmware safety limits of 70 °C warning / 80 °C emergency."}, // UI_RECORDING_LOAD_THRESHOLDS_NOTE
     {"Verstrichen", "Elapsed"}, // UI_RECORDING_LOAD_ELAPSED
     {"Frames", "Frames"}, // UI_RECORDING_LOAD_FRAMES
+    {"Frame-Lieferquote", "Frame delivery"}, // UI_RECORDING_LOAD_FRAME_DELIVERY
     {"Aufrufe", "calls"}, // UI_RECORDING_LOAD_CALLS
     {"erreicht", "achieved"}, // UI_RECORDING_LOAD_ACHIEVED
     {"Ziel", "target"}, // UI_RECORDING_LOAD_TARGET
@@ -427,6 +428,29 @@ static const UiTextEntry UI_TEXTS[] = {
     {"Interner Heap vor/min/nach", "Internal heap before/min/after"}, // UI_RECORDING_LOAD_HEAP_STATS
     {"PSRAM vor/min/nach", "PSRAM before/min/after"}, // UI_RECORDING_LOAD_PSRAM_STATS
     {"CPU-Temperatur Start/Max/Ende", "CPU temperature start/max/end"}, // UI_RECORDING_LOAD_CPU_STATS
+    {"Lange Tests laufen unabhängig von der geöffneten Browserseite im normalen Firmware-Loop weiter. 5, 15, 30 und 60 Minuten sind verfügbar. Über 60 Minuten wird bewusst nicht als einzelner Test angeboten, da der MKV-Writer Dateien unter 4 GiB hält; längere Endurance-Tests sollten segmentiert werden.", "Long tests continue in the normal firmware loop independently of the open browser page. 5, 15, 30 and 60 minutes are available. More than 60 minutes is deliberately not offered as one test because the MKV writer keeps files below 4 GiB; longer endurance tests should be segmented."}, // UI_RECORDING_LOAD_LONG_NOTE
+    {"Recording Load Test läuft", "Recording Load Test running"}, // UI_RECORDING_LOAD_STATUS_TITLE
+    {"Fortschritt", "Progress"}, // UI_RECORDING_LOAD_PROGRESS
+    {"Test abbrechen", "Abort test"}, // UI_RECORDING_LOAD_ABORT
+    {"Abbruch angefordert ...", "Abort requested ..."}, // UI_RECORDING_LOAD_ABORTING
+    {"Der Test wird im Firmware-Loop ausgeführt. Diese Seite fragt den Status nur periodisch ab; die Aufnahme selbst läuft auch weiter, wenn die Seite geschlossen wird.", "The test runs in the firmware loop. This page only polls status periodically; the recording itself continues even if the page is closed."}, // UI_RECORDING_LOAD_RESULT_WAIT
+    {"Laufenden Test öffnen", "Open running test"}, // UI_RECORDING_LOAD_OPEN_STATUS
+    {"Letztes Testergebnis anzeigen", "Show last test result"}, // UI_RECORDING_LOAD_LAST_RESULT
+    {"Langsamste Frames", "Slowest frames"}, // UI_RECORDING_LOAD_SLOW_FRAMES
+    {"Die zehn langsamsten recorderAddFrame-Aufrufe. Bei MKV werden die gemessenen Teilzeiten getrennt ausgewiesen. Storage I/O misst darunter die echten File::write()/seek()-Aufrufe: write = Anzahl / KiB / Summenzeit / längster einzelner Write mit Größe / Anzahl Writes ab 20 ms; seek = Anzahl / Summenzeit / längster Seek. Die Restzeit enthält Funktions-/Timer-Overhead und nicht separat instrumentierte Arbeit.", "The ten slowest recorderAddFrame calls. For MKV, measured stage times are shown separately. Storage I/O measures the actual File::write()/seek() calls below that layer: write = count / KiB / total time / longest individual write with size / count of writes from 20 ms; seek = count / total time / longest seek. Remaining time contains function/timer overhead and work that is not instrumented separately."}, // UI_RECORDING_LOAD_SLOW_HELP
+    {"Aufruf", "Call"}, // UI_RECORDING_LOAD_STAGE_CALL
+    {"Gesamt", "Total"}, // UI_RECORDING_LOAD_STAGE_TOTAL
+    {"Kamera/JPEG", "Camera/JPEG"}, // UI_RECORDING_LOAD_STAGE_CAMERA
+    {"Header/Start", "Header/start"}, // UI_RECORDING_LOAD_STAGE_HEADER
+    {"Audio lesen", "Audio read"}, // UI_RECORDING_LOAD_STAGE_AUDIO_READ
+    {"Audio schreiben", "Audio write"}, // UI_RECORDING_LOAD_STAGE_AUDIO_WRITE
+    {"Cluster", "Cluster"}, // UI_RECORDING_LOAD_STAGE_CLUSTER
+    {"Untertitel", "Subtitle"}, // UI_RECORDING_LOAD_STAGE_SUBTITLE
+    {"Video schreiben", "Video write"}, // UI_RECORDING_LOAD_STAGE_VIDEO_WRITE
+    {"Bildanalyse", "Image analysis"}, // UI_RECORDING_LOAD_STAGE_IMAGE
+    {"Sonstiges", "Other"}, // UI_RECORDING_LOAD_STAGE_OTHER
+    {"Storage I/O", "Storage I/O"}, // UI_RECORDING_LOAD_STAGE_STORAGE_IO
+    {"Teilzeitdiagnose ist für diesen Container nicht verfügbar.", "Stage timing diagnostics are not available for this container."}, // UI_RECORDING_LOAD_STAGE_UNAVAILABLE
     {"SD-Wartung", "SD maintenance"}, // UI_NAV_SD_MAINTENANCE
 };
 

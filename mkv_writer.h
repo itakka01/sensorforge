@@ -3,8 +3,26 @@
 #include <Arduino.h>
 #include <time.h>
 
+struct MkvFrameTiming {
+    bool valid;
+    uint32_t cameraUs;
+    uint32_t headerUs;
+    uint32_t audioReadUs;
+    uint32_t audioWriteUs;
+    uint32_t clusterUs;
+    uint32_t subtitleUs;
+    uint32_t videoWriteUs;
+    uint32_t imageAnalysisUs;
+};
+
 void mkvStart(const String &fullpath, int fps);
 void mkvAddFrame();
+
+// Detailed stage timing is disabled during normal production recordings.
+// The explicit Recording Load Test enables it temporarily so diagnostic timer
+// calls do not become permanent per-frame overhead.
+void mkvSetDetailedFrameTimingEnabled(bool enabled);
+bool mkvGetLastFrameTiming(MkvFrameTiming &timing);
 
 // Sparse MJPEG path used by the continuous shooter. JPEGs are supplied from
 // PSRAM and retain their real relative capture timestamps; no camera capture or

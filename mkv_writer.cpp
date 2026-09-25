@@ -9,6 +9,7 @@
 
 #include <FS.h>
 #include <esp_camera.h>
+#include <esp_timer.h>
 #include <time.h>
 #include <string.h>
 
@@ -74,6 +75,36 @@ static uint64_t audioBytesWritten = 0;
 static uint64_t audioLastEndTimeMs = 0;
 static AudioCaptureStats finalAudioStats = {};
 static uint8_t audioMuxBuffer[4080];
+
+// Detailed per-stage timing is enabled only by the explicit Recording Load
+// Test. Normal recordings keep the established low-overhead path.
+static bool detailedFrameTimingEnabled = false;
+static MkvFrameTiming lastFrameTiming = {};
+
+static uint64_t frameTimingNowUs()
+{
+    return detailedFrameTimingEnabled
+        ? (uint64_t)esp_timer_get_time()
+        : 0ULL;
+}
+
+static uint32_t frameTimingElapsedUs(uint64_t startUs)
+{
+    if (!detailedFrameTimingEnabled || startUs == 0)
+        return 0;
+
+    uint64_t nowUs =
+        (uint64_t)esp_timer_get_time();
+
+    uint64_t elapsed =
+        nowUs >= startUs
+        ? nowUs - startUs
+        : 0ULL;
+
+    return elapsed > 0xFFFFFFFFULL
+        ? 0xFFFFFFFFUL
+        : (uint32_t)elapsed;
+}
 
 
 // Keep files below 4 GiB for broad FAT32/storage compatibility.
@@ -1129,14 +1160,17 @@ static bool closeCluster()
     if (!clusterOpen)
         return true;
 
-    bool ok =
-        endMaster(
-            clusterMark
-        );
-
+    // Clusters deliberately keep the 8-byte unknown-size VINT written by
+    // beginMaster(). Matroska permits unknown-size Clusters, and the next
+    // Cluster element unambiguously terminates the previous one. Avoiding a
+    // final size backpatch here removes two synchronous seeks from the
+    // time-critical recording path every time a Cluster rolls over.
+    //
+    // Other masters (Info, Tracks, Segment, etc.) continue to use endMaster()
+    // and therefore retain their final known sizes.
     clusterOpen = false;
 
-    return ok;
+    return true;
 }
 
 
@@ -1291,8 +1325,22 @@ static bool writeAudioBlock(
         return true;
     }
 
-    if (!ensureClusterForTime(timestampMs))
+    uint64_t clusterStartUs =
+        frameTimingNowUs();
+
+    if (!ensureClusterForTime(timestampMs)) {
+        if (detailedFrameTimingEnabled)
+            lastFrameTiming.clusterUs +=
+                frameTimingElapsedUs(clusterStartUs);
         return false;
+    }
+
+    if (detailedFrameTimingEnabled)
+        lastFrameTiming.clusterUs +=
+            frameTimingElapsedUs(clusterStartUs);
+
+    uint64_t audioWriteStartUs =
+        frameTimingNowUs();
 
     if (timestampMs < clusterTimestampMs)
         return false;
@@ -1364,6 +1412,10 @@ static bool writeAudioBlock(
             rate;
     }
 
+    if (detailedFrameTimingEnabled)
+        lastFrameTiming.audioWriteUs +=
+            frameTimingElapsedUs(audioWriteStartUs);
+
     return true;
 }
 
@@ -1419,12 +1471,19 @@ static bool drainAudioUntil(
         if (toRead == 0)
             break;
 
+        uint64_t audioReadStartUs =
+            frameTimingNowUs();
+
         size_t got =
             audioCaptureRead(
                 audioMuxBuffer,
                 toRead,
                 0
             );
+
+        if (detailedFrameTimingEnabled)
+            lastFrameTiming.audioReadUs +=
+                frameTimingElapsedUs(audioReadStartUs);
 
         if (got == 0)
             break;
@@ -1923,6 +1982,10 @@ void mkvStart(
 
 void mkvAddFrame()
 {
+    lastFrameTiming = {};
+    lastFrameTiming.valid =
+        detailedFrameTimingEnabled;
+
     if (
         !mkvFile ||
         writeFailed ||
@@ -1932,8 +1995,15 @@ void mkvAddFrame()
     }
 
 
+    uint64_t cameraStartUs =
+        frameTimingNowUs();
+
     camera_fb_t *fb =
         esp_camera_fb_get();
+
+    if (detailedFrameTimingEnabled)
+        lastFrameTiming.cameraUs =
+            frameTimingElapsedUs(cameraStartUs);
 
 
     if (!fb) {
@@ -1959,6 +2029,9 @@ void mkvAddFrame()
 
 
     if (!headerWritten) {
+
+        uint64_t headerStartUs =
+            frameTimingNowUs();
 
         if (audioRequested) {
             String audioError;
@@ -1994,6 +2067,10 @@ void mkvAddFrame()
                 (uint16_t)fb->height
             )) {
 
+            if (detailedFrameTimingEnabled)
+                lastFrameTiming.headerUs =
+                    frameTimingElapsedUs(headerStartUs);
+
             Serial.println(
                 "MKV: header write failed"
             );
@@ -2005,6 +2082,10 @@ void mkvAddFrame()
 
             return;
         }
+
+        if (detailedFrameTimingEnabled)
+            lastFrameTiming.headerUs =
+                frameTimingElapsedUs(headerStartUs);
     }
 
 
@@ -2046,23 +2127,41 @@ void mkvAddFrame()
     }
 
 
+    uint64_t clusterStartUs =
+        frameTimingNowUs();
+
     if (!ensureClusterForTime(
             frameTimeMs
         )) {
 
+        if (detailedFrameTimingEnabled)
+            lastFrameTiming.clusterUs +=
+                frameTimingElapsedUs(clusterStartUs);
+
         writeFailed = true;
 
         esp_camera_fb_return(fb);
 
         return;
     }
+
+    if (detailedFrameTimingEnabled)
+        lastFrameTiming.clusterUs +=
+            frameTimingElapsedUs(clusterStartUs);
 
 
     // Subtitle blocks are written before the first video frame
     // whose timestamp reaches that subtitle start time.
+    uint64_t subtitleStartUs =
+        frameTimingNowUs();
+
     if (!writePendingSubtitles(
             frameTimeMs
         )) {
+
+        if (detailedFrameTimingEnabled)
+            lastFrameTiming.subtitleUs +=
+                frameTimingElapsedUs(subtitleStartUs);
 
         writeFailed = true;
 
@@ -2070,11 +2169,18 @@ void mkvAddFrame()
 
         return;
     }
+
+    if (detailedFrameTimingEnabled)
+        lastFrameTiming.subtitleUs +=
+            frameTimingElapsedUs(subtitleStartUs);
 
 
     uint32_t jpegSize =
         (uint32_t)fb->len;
 
+
+    uint64_t videoWriteStartUs =
+        frameTimingNowUs();
 
     if (!writeVideoFrame(
             fb->buf,
@@ -2082,10 +2188,18 @@ void mkvAddFrame()
             frameTimeMs
         )) {
 
+        if (detailedFrameTimingEnabled)
+            lastFrameTiming.videoWriteUs +=
+                frameTimingElapsedUs(videoWriteStartUs);
+
         esp_camera_fb_return(fb);
 
         return;
     }
+
+    if (detailedFrameTimingEnabled)
+        lastFrameTiming.videoWriteUs +=
+            frameTimingElapsedUs(videoWriteStartUs);
 
 
     // Audio starting exactly at this video timestamp can now be emitted
@@ -2109,12 +2223,19 @@ void mkvAddFrame()
     // Same image_only frame tap as AVI. The first written frame is deliberately
     // left untouched so wake/start latency is not inflated by image analysis.
     if (frameCount > 1U) {
+        uint64_t imageAnalysisStartUs =
+            frameTimingNowUs();
+
         imageMotionObserveRecordingJpeg(
             fb->buf,
             fb->len,
             (uint16_t)fb->width,
             (uint16_t)fb->height
         );
+
+        if (detailedFrameTimingEnabled)
+            lastFrameTiming.imageAnalysisUs +=
+                frameTimingElapsedUs(imageAnalysisStartUs);
     }
 
 
@@ -2122,6 +2243,7 @@ void mkvAddFrame()
         maxFrameSize =
             jpegSize;
     }
+
 
 
     esp_camera_fb_return(fb);
@@ -2426,6 +2548,22 @@ bool mkvEnd()
 // =============================================================
 // STATUS
 // =============================================================
+
+void mkvSetDetailedFrameTimingEnabled(bool enabled)
+{
+    detailedFrameTimingEnabled = enabled;
+    lastFrameTiming = {};
+}
+
+
+bool mkvGetLastFrameTiming(MkvFrameTiming &timing)
+{
+    timing = lastFrameTiming;
+    return
+        detailedFrameTimingEnabled &&
+        lastFrameTiming.valid;
+}
+
 
 bool mkvIsOpen()
 {

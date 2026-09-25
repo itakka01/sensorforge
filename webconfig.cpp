@@ -1351,7 +1351,7 @@ static String htmlFooter()
         "var p=location.pathname;"
         "var group='';"
         "if(p==='/')group='home';"
-        "else if(p==='/config'||p==='/save'||p==='/audio_test_record'||p==='/audio_benchmark'||p==='/recording_load_test')group='config';"
+        "else if(p==='/config'||p==='/save'||p==='/audio_test_record'||p==='/audio_benchmark'||p.indexOf('/recording_load_test')===0)group='config';"
         "else if(p.indexOf('/files')===0||p==='/file'||p==='/play')group='recordings';"
         "else if(p==='/preview'||p==='/snapshot')group='camera';else if(p==='/image_motion')group='sensor';"
         "else if(p.indexOf('/radar_')===0)group='sensor';"
@@ -3987,12 +3987,29 @@ static void handleConfig()
         ": <select id='sfRecordingLoadSeconds'>"
         "<option value='30' selected>30 s</option>"
         "<option value='60'>60 s</option>"
+        "<option value='300'>5 min</option>"
+        "<option value='900'>15 min</option>"
+        "<option value='1800'>30 min</option>"
+        "<option value='3600'>60 min</option>"
         "</select> "
         "<button type='button' onclick=\"return sfRecordingLoadTestSubmit()\">" +
         htmlText(UI_RECORDING_LOAD_BUTTON) +
         "</button><br>"
-        "<small class='muted'>" + htmlText(UI_RECORDING_LOAD_SAVED_NOTE) + "</small>"
+        "<small class='muted'>" + htmlText(UI_RECORDING_LOAD_SAVED_NOTE) + "</small><br>"
+        "<small class='muted'>" + htmlText(UI_RECORDING_LOAD_LONG_NOTE) + "</small>"
         "</div>";
+
+    if (recordingLoadTestIsActive()) {
+        html +=
+            "<p><a href='/recording_load_test_status_page'><button type='button'>" +
+            htmlText(UI_RECORDING_LOAD_OPEN_STATUS) +
+            "</button></a></p>";
+    } else if (recordingLoadTestHasResult()) {
+        html +=
+            "<p><a href='/recording_load_test_result'><button type='button'>" +
+            htmlText(UI_RECORDING_LOAD_LAST_RESULT) +
+            "</button></a></p>";
+    }
 
     html +=
         "<br><small class='muted'>" +
@@ -16167,28 +16184,28 @@ static RecordingLoadUiLevel recordingLoadTimingLevel(
         : 100.0;
 
     if (
-        frameDeliveryPct < 95.0 ||
+        frameDeliveryPct < 98.0 ||
         overPct >= 1.0 ||
         result.p99CallUs > result.frameBudgetUs ||
         result.worstCallUs >
             (uint32_t)(
                 (uint64_t)result.frameBudgetUs *
-                120ULL /
-                100ULL
+                5ULL
             )
     ) {
         return RECORDING_LOAD_RED;
     }
 
     if (
-        frameDeliveryPct < 98.0 ||
+        frameDeliveryPct < 99.5 ||
         result.overBudgetFrames > 0 ||
         result.p99CallUs >=
             (uint32_t)(
                 (uint64_t)result.frameBudgetUs *
                 80ULL /
                 100ULL
-            )
+            ) ||
+        result.worstCallUs > result.frameBudgetUs
     ) {
         return RECORDING_LOAD_ORANGE;
     }
@@ -16311,46 +16328,239 @@ static RecordingLoadUiLevel recordingLoadThermalLevel(
 }
 
 
-static void handleRecordingLoadTest()
+static bool recordingLoadDurationSecondsAllowed(uint32_t seconds)
 {
-    if (rejectWhileRecording("recording load test"))
-        return;
+    return
+        seconds == 30UL ||
+        seconds == 60UL ||
+        seconds == 300UL ||
+        seconds == 900UL ||
+        seconds == 1800UL ||
+        seconds == 3600UL;
+}
 
-    if (g_storageLocked) {
+
+static String recordingLoadJsonEscape(String value)
+{
+    value.replace("\\", "\\\\");
+    value.replace("\"", "\\\"");
+    value.replace("\r", " ");
+    value.replace("\n", " ");
+    return value;
+}
+
+
+static void handleRecordingLoadTestStart()
+{
+    if (recordingLoadTestIsActive()) {
+        server.sendHeader(
+            "Location",
+            "/recording_load_test_status_page",
+            true
+        );
         server.send(
-            409,
+            303,
             "text/plain; charset=utf-8",
-            "Storage maintenance is already active"
+            "Recording load test already active"
         );
         return;
     }
+
+    if (rejectWhileRecording("recording load test"))
+        return;
 
     uint32_t seconds =
         server.hasArg("seconds")
         ? (uint32_t)server.arg("seconds").toInt()
         : 30UL;
 
-    if (
-        seconds != 30UL &&
-        seconds != 60UL
-    ) {
+    if (!recordingLoadDurationSecondsAllowed(seconds)) {
         server.send(
             400,
             "text/plain; charset=utf-8",
-            "Recording load test duration must be 30 or 60 seconds"
+            "Recording load test duration must be 30 s, 60 s, 5 min, 15 min, 30 min or 60 min"
         );
         return;
     }
 
-    RecordingLoadTestResult result = {};
     String error;
 
-    bool ok =
-        recordingLoadTestRun(
+    if (!recordingLoadTestStart(
             seconds * 1000UL,
-            result,
+            error
+        )) {
+        String html = htmlHeader();
+        html +=
+            "<h2>" + htmlText(UI_RECORDING_LOAD_TITLE) + "</h2>"
+            "<section class='settings-section' style='border-left:5px solid #b91c1c'>"
+            "<h3>" + htmlText(UI_RECORDING_LOAD_FAILED) + "</h3><p>" +
+            htmlEscape(error) +
+            "</p></section><p><a href='/config'><button>" +
+            htmlText(UI_NAV_CONFIGURATION) +
+            "</button></a></p>" +
+            htmlFooter();
+
+        server.sendHeader("Cache-Control", "no-store");
+        server.send(409, "text/html; charset=utf-8", html);
+        return;
+    }
+
+    server.sendHeader(
+        "Location",
+        "/recording_load_test_status_page",
+        true
+    );
+    server.send(
+        303,
+        "text/plain; charset=utf-8",
+        "Recording load test started"
+    );
+}
+
+
+static void handleRecordingLoadTestStatusJson()
+{
+    RecordingLoadTestResult result = {};
+    String error;
+    bool active = false;
+    bool resultReady = false;
+
+    recordingLoadTestGetSnapshot(
+        result,
+        error,
+        active,
+        resultReady
+    );
+
+    String json;
+    json.reserve(420);
+    json += "{\"active\":";
+    json += active ? "true" : "false";
+    json += ",\"result_ready\":";
+    json += resultReady ? "true" : "false";
+    json += ",\"elapsed_ms\":";
+    json += String((unsigned long)result.elapsedMs);
+    json += ",\"requested_ms\":";
+    json += String((unsigned long)result.requestedDurationMs);
+    json += ",\"frames\":";
+    json += String((unsigned long)result.framesWritten);
+    json += ",\"calls\":";
+    json += String((unsigned long)result.frameCalls);
+    json += ",\"over_budget\":";
+    json += String((unsigned long)result.overBudgetFrames);
+    json += ",\"p99_us\":";
+    json += String((unsigned long)result.p99CallUs);
+    json += ",\"worst_us\":";
+    json += String((unsigned long)result.worstCallUs);
+    json += ",\"media_bytes\":";
+    json += String((unsigned long)result.mediaBytesBeforeFinalize);
+    json += ",\"cpu_max_c\":";
+    if (isfinite(result.cpuTempMaxC))
+        json += String(result.cpuTempMaxC, 1);
+    else
+        json += "null";
+    json += ",\"error\":\"";
+    json += recordingLoadJsonEscape(error);
+    json += "\"}";
+
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json; charset=utf-8", json);
+}
+
+
+static void handleRecordingLoadTestStatusPage()
+{
+    if (!recordingLoadTestIsActive()) {
+        if (recordingLoadTestHasResult()) {
+            server.sendHeader(
+                "Location",
+                "/recording_load_test_result",
+                true
+            );
+            server.send(303, "text/plain", "Recording load test finished");
+            return;
+        }
+
+        server.sendHeader("Location", "/config", true);
+        server.send(303, "text/plain", "No recording load test active");
+        return;
+    }
+
+    String html = htmlHeader();
+    html +=
+        "<h2>" + htmlText(UI_RECORDING_LOAD_STATUS_TITLE) + "</h2>"
+        "<section class='settings-section'>"
+        "<p class='muted'>" + htmlText(UI_RECORDING_LOAD_RESULT_WAIT) + "</p>"
+        "<p><b>" + htmlText(UI_RECORDING_LOAD_PROGRESS) + ": <span id='rlPct'>0%</span></b></p>"
+        "<div style='height:12px;background:#d7dde3;border-radius:999px;overflow:hidden'>"
+        "<div id='rlBar' style='height:100%;width:0;background:#2e7d32;transition:width .3s'></div></div>"
+        "<p id='rlInfo' class='muted'>...</p>"
+        "<button id='rlAbort' type='button' onclick='rlAbort()'>" +
+        htmlText(UI_RECORDING_LOAD_ABORT) +
+        "</button>"
+        "</section>"
+        "<script>"
+        "function rlFmt(ms){var s=Math.floor(ms/1000);var h=Math.floor(s/3600);s-=h*3600;var m=Math.floor(s/60);s-=m*60;return(h?String(h).padStart(2,'0')+':':'')+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');}"
+        "async function rlPoll(){try{var r=await fetch('/recording_load_test_status',{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);var d=await r.json();if(d.result_ready&&!d.active){location.href='/recording_load_test_result';return;}var pct=d.requested_ms?Math.min(100,d.elapsed_ms*100/d.requested_ms):0;document.getElementById('rlPct').textContent=pct.toFixed(1)+'%';document.getElementById('rlBar').style.width=pct+'%';document.getElementById('rlInfo').textContent=rlFmt(d.elapsed_ms)+' / '+rlFmt(d.requested_ms)+' | frames='+d.frames+' | P99='+(d.p99_us/1000).toFixed(1)+' ms | worst='+(d.worst_us/1000).toFixed(1)+' ms | over='+d.over_budget+' | CPU max='+(d.cpu_max_c===null?'--':Number(d.cpu_max_c).toFixed(1))+' C';}catch(e){document.getElementById('rlInfo').textContent=e.message;}setTimeout(rlPoll,5000);}"
+        "async function rlAbort(){var b=document.getElementById('rlAbort');b.disabled=true;b.textContent='" + htmlJsString(tr(UI_RECORDING_LOAD_ABORTING)) + "';try{await fetch('/recording_load_test_abort',{method:'POST',cache:'no-store'});}catch(e){}setTimeout(rlPoll,500);}"
+        "setTimeout(rlPoll,250);"
+        "</script>"
+        "<p><a href='/config'><button>" + htmlText(UI_NAV_CONFIGURATION) + "</button></a></p>" +
+        htmlFooter();
+
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "text/html; charset=utf-8", html);
+}
+
+
+static void handleRecordingLoadTestAbort()
+{
+    String error;
+
+    if (!recordingLoadTestRequestAbort(error)) {
+        server.send(
+            409,
+            "text/plain; charset=utf-8",
             error
         );
+        return;
+    }
+
+    server.send(
+        200,
+        "text/plain; charset=utf-8",
+        "Abort requested"
+    );
+}
+
+
+static void handleRecordingLoadTestResult()
+{
+    RecordingLoadTestResult result = {};
+    String error;
+    bool active = false;
+    bool resultReady = false;
+
+    if (!recordingLoadTestGetSnapshot(
+            result,
+            error,
+            active,
+            resultReady
+        )) {
+        server.sendHeader("Location", "/config", true);
+        server.send(303, "text/plain", "No recording load test result");
+        return;
+    }
+
+    if (active) {
+        server.sendHeader("Location", "/recording_load_test_status_page", true);
+        server.send(303, "text/plain", "Recording load test active");
+        return;
+    }
+
+    bool ok =
+        resultReady &&
+        result.completed;
 
     String html = htmlHeader();
     html +=
@@ -16471,6 +16681,15 @@ static void handleRecordingLoadTest()
             ? (double)result.framesWritten * 1000.0 /
                 (double)result.elapsedMs
             : 0.0;
+        double expectedFrames =
+            (double)result.targetFps *
+            (double)result.elapsedMs /
+            1000.0;
+        double frameDeliveryPct =
+            expectedFrames > 0.0
+            ? (double)result.framesWritten * 100.0 /
+                expectedFrames
+            : 0.0;
         double mediaRateKiB =
             result.elapsedMs > 0
             ? (double)result.mediaBytesBeforeFinalize * 1000.0 /
@@ -16509,7 +16728,9 @@ static void handleRecordingLoadTest()
             String(achievedFps, 2) +
             " fps | " + htmlText(UI_RECORDING_LOAD_TARGET) + "=" +
             String((unsigned long)result.targetFps) +
-            " fps<br>";
+            " fps | " + htmlText(UI_RECORDING_LOAD_FRAME_DELIVERY) + "=" +
+            String(frameDeliveryPct, 2) +
+            "%<br>";
         html +=
             htmlText(UI_RECORDING_LOAD_FRAME_BUDGET) + ": <b>" +
             String(budgetMs, 1) +
@@ -16593,7 +16814,92 @@ static void handleRecordingLoadTest()
             " C</b>";
 
         html +=
-            "</div></details>"
+            "</div></details>";
+
+        if (result.slowFrameCount > 0) {
+            html +=
+                "<details open style='margin-top:16px'><summary><b>" +
+                htmlText(UI_RECORDING_LOAD_SLOW_FRAMES) +
+                "</b></summary>"
+                "<p class='muted'>" +
+                htmlText(UI_RECORDING_LOAD_SLOW_HELP) +
+                "</p><div style='overflow-x:auto'><table style='border-collapse:collapse;width:100%;font-size:.88em'>"
+                "<tr>"
+                "<th style='text-align:left;padding:4px'>" + htmlText(UI_RECORDING_LOAD_STAGE_CALL) + "</th>"
+                "<th style='text-align:right;padding:4px'>" + htmlText(UI_RECORDING_LOAD_STAGE_TOTAL) + "</th>"
+                "<th style='text-align:right;padding:4px'>" + htmlText(UI_RECORDING_LOAD_STAGE_CAMERA) + "</th>"
+                "<th style='text-align:right;padding:4px'>" + htmlText(UI_RECORDING_LOAD_STAGE_HEADER) + "</th>"
+                "<th style='text-align:right;padding:4px'>" + htmlText(UI_RECORDING_LOAD_STAGE_AUDIO_READ) + "</th>"
+                "<th style='text-align:right;padding:4px'>" + htmlText(UI_RECORDING_LOAD_STAGE_AUDIO_WRITE) + "</th>"
+                "<th style='text-align:right;padding:4px'>" + htmlText(UI_RECORDING_LOAD_STAGE_CLUSTER) + "</th>"
+                "<th style='text-align:right;padding:4px'>" + htmlText(UI_RECORDING_LOAD_STAGE_SUBTITLE) + "</th>"
+                "<th style='text-align:right;padding:4px'>" + htmlText(UI_RECORDING_LOAD_STAGE_VIDEO_WRITE) + "</th>"
+                "<th style='text-align:right;padding:4px'>" + htmlText(UI_RECORDING_LOAD_STAGE_IMAGE) + "</th>"
+                "<th style='text-align:right;padding:4px'>" + htmlText(UI_RECORDING_LOAD_STAGE_OTHER) + "</th>"
+                "<th style='text-align:left;padding:4px;min-width:250px'>" + htmlText(UI_RECORDING_LOAD_STAGE_STORAGE_IO) + "</th>"
+                "</tr>";
+
+            for (
+                uint8_t i = 0;
+                i < result.slowFrameCount;
+                ++i
+            ) {
+                const RecordingLoadSlowFrame &slow =
+                    result.slowFrames[i];
+
+                html +=
+                    "<tr style='border-top:1px solid #dde3e8'>"
+                    "<td style='padding:4px'>#" +
+                    String((unsigned long)slow.frameCall) +
+                    "</td>"
+                    "<td style='text-align:right;padding:4px'><b>" +
+                    String((float)slow.totalUs / 1000.0f, 1) +
+                    "</b></td>";
+
+                if (slow.stageBreakdownValid) {
+                    html +=
+                        "<td style='text-align:right;padding:4px'>" + String((float)slow.cameraUs / 1000.0f, 1) + "</td>"
+                        "<td style='text-align:right;padding:4px'>" + String((float)slow.headerUs / 1000.0f, 1) + "</td>"
+                        "<td style='text-align:right;padding:4px'>" + String((float)slow.audioReadUs / 1000.0f, 1) + "</td>"
+                        "<td style='text-align:right;padding:4px'>" + String((float)slow.audioWriteUs / 1000.0f, 1) + "</td>"
+                        "<td style='text-align:right;padding:4px'>" + String((float)slow.clusterUs / 1000.0f, 1) + "</td>"
+                        "<td style='text-align:right;padding:4px'>" + String((float)slow.subtitleUs / 1000.0f, 1) + "</td>"
+                        "<td style='text-align:right;padding:4px'>" + String((float)slow.videoWriteUs / 1000.0f, 1) + "</td>"
+                        "<td style='text-align:right;padding:4px'>" + String((float)slow.imageAnalysisUs / 1000.0f, 1) + "</td>"
+                        "<td style='text-align:right;padding:4px'>" + String((float)slow.otherUs / 1000.0f, 1) + "</td>";
+                } else {
+                    html +=
+                        "<td colspan='9' style='padding:4px' class='muted'>" +
+                        htmlText(UI_RECORDING_LOAD_STAGE_UNAVAILABLE) +
+                        "</td>";
+                }
+
+                if (slow.storageIoValid) {
+                    html +=
+                        "<td style='padding:4px;white-space:nowrap;font-family:monospace'>"
+                        "write " + String((unsigned long)slow.storageWriteCalls) +
+                        " / " + String((double)slow.storageWriteBytes / 1024.0, 1) + " KiB"
+                        " / Σ" + String((double)slow.storageWriteTotalUs / 1000.0, 1) + " ms"
+                        " / max " + String((float)slow.storageWriteMaxUs / 1000.0f, 1) + " ms@" +
+                        String((unsigned long)slow.storageWriteMaxBytes) + " B"
+                        " / ≥20ms:" + String((unsigned long)slow.storageSlowWriteCalls) +
+                        "<br>seek " + String((unsigned long)slow.storageSeekCalls) +
+                        " / Σ" + String((double)slow.storageSeekTotalUs / 1000.0, 1) + " ms"
+                        " / max " + String((float)slow.storageSeekMaxUs / 1000.0f, 1) + " ms"
+                        "</td>";
+                } else {
+                    html +=
+                        "<td style='padding:4px' class='muted'>-</td>";
+                }
+
+                html += "</tr>";
+            }
+
+            html +=
+                "</table></div></details>";
+        }
+
+        html +=
             "<p class='muted'>" +
             htmlText(UI_RECORDING_LOAD_THRESHOLDS_NOTE) +
             "</p></section>";
@@ -17552,7 +17858,11 @@ void webConfigStart()
         server.on("/save", HTTP_POST, handleSave);
         server.on("/audio_test_record", HTTP_POST, handleAudioTestRecord);
         server.on("/audio_benchmark", HTTP_POST, handleAudioBenchmark);
-        server.on("/recording_load_test", HTTP_POST, handleRecordingLoadTest);
+        server.on("/recording_load_test", HTTP_POST, handleRecordingLoadTestStart);
+        server.on("/recording_load_test_status_page", HTTP_GET, handleRecordingLoadTestStatusPage);
+        server.on("/recording_load_test_status", HTTP_GET, handleRecordingLoadTestStatusJson);
+        server.on("/recording_load_test_abort", HTTP_POST, handleRecordingLoadTestAbort);
+        server.on("/recording_load_test_result", HTTP_GET, handleRecordingLoadTestResult);
         server.on("/config_download", HTTP_GET, handleConfigDownload);
         server.on(
             "/config_upload",

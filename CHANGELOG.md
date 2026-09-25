@@ -9,6 +9,77 @@ and identifies the concrete binary compilation time.
 > change sequence beginning with v23. Earlier development history remains in the
 > repository history/project documentation.
 
+## v59 — 2026-09-25
+
+- Added benchmark-only physical storage diagnostics below `RecordingStorageFile`.
+  The ten slowest frame calls now report the actual underlying `File::write()`
+  count/bytes/total time, longest individual write and its size, count of writes
+  taking at least 20 ms, plus `File::seek()` count/total/max time. This measures
+  the plain SD path directly and also exposes the real 4 KiB physical SFENC1
+  writes/seeks when recording encryption is enabled.
+- Physical I/O timing is bracketed only around `recorderAddFrame()` while the
+  explicit Recording Load Test has detailed timing enabled. Normal production
+  recording and WebPlayer/storage operations therefore retain the previous
+  no-diagnostics path and do not gain permanent per-write timer overhead.
+- Refined the Recording Load Test frame-timing traffic light so isolated rare
+  stalls are orange instead of automatically red. Red now requires P99 above the
+  frame budget, at least 1% budget overruns, frame delivery below 98%, a recorder
+  failure, or one extreme call above five times the frame budget. Green still
+  requires no overruns, at least 99.5% frame delivery and P99 below 80% of the
+  budget; reduced headroom or isolated overruns remain orange.
+- Updated the bilingual threshold explanation so every timing rule used by the
+  result page is visible, added the calculated frame-delivery percentage to the
+  technical results, and expanded the slow-frame table with a compact Storage-I/O
+  column for diagnosing SD/filesystem busy periods before considering a
+  write-behind architecture change. No recording, MKV, audio, SD clock or
+  encryption behavior was changed in this release.
+
+## v58 — 2026-09-25
+
+- Changed normal MKV Cluster finalization to retain the standards-compliant
+  unknown-size VINT already written when each Cluster opens. The next Cluster
+  therefore terminates the previous one without seeking back to patch its size.
+- Removes the two synchronous storage seeks that the v57 slow-frame diagnostics
+  identified as the dominant approximately 140–170 ms periodic latency spike at
+  each 5-second Cluster rollover. The 5-second Cluster duration/size policy itself
+  is unchanged.
+- Extended the SensorForge WebPlayer EBML scanner to recognize unknown-size
+  Clusters and terminate them at the next Cluster header. Existing known-size MKV
+  files remain supported, while new v58 recordings keep video, subtitles and PCM
+  audio playable in the built-in player.
+- Other Matroska masters, including Info, Tracks and the enclosing Segment, still
+  receive their final known sizes. Video, PCM audio, timestamp subtitles,
+  encryption/storage handling and load-test thresholds are otherwise unchanged.
+
+## v57 — 2026-09-25
+
+- Extended the Recording Load Test duration choices from 30 s / 60 s to 30 s,
+  60 s, 5 min, 15 min, 30 min and 60 min. Tests longer than one hour are not
+  exposed as a single file because the MKV writer deliberately stays below the
+  FAT32/compatibility 4 GiB limit; multi-hour endurance testing should use
+  segmented media instead of one ever-growing container.
+- Converted the explicit load test from one long blocking HTTP request to a
+  state machine advanced by the normal firmware loop. WebConfig starts the test
+  immediately, polls lightweight status every five seconds and can request an
+  abort. The test continues even if the browser page is closed, while normal
+  motion/shooter/sleep automation remains excluded from the measured recorder
+  path. No separate FreeRTOS recorder task was introduced, so scheduling remains
+  representative of production recording.
+- Added a hard disposable-media byte budget based on the free-space snapshot at
+  test start. The benchmark still never invokes rollover and now stops before
+  crossing the configured SD reserve, retaining an additional 64 MiB margin for
+  filesystem/encryption overhead. Container size-limit hits also end the test
+  cleanly instead of consuming storage indefinitely.
+- Added detailed diagnostics for the ten slowest frame calls during the explicit
+  benchmark. MKV timing is split into camera/JPEG acquisition, first-frame
+  header/audio start, audio capture reads, audio/container writes, Cluster
+  management, subtitle work, video writes, image-motion analysis and residual
+  uninstrumented time. The added high-resolution stage timers are enabled only
+  during the benchmark and do not add permanent per-frame production overhead.
+- Thermal emergency handling now finalizes and removes an active benchmark
+  container before storage is taken offline, while preserving the emergency
+  recording-start block.
+
 ## v56 — 2026-09-25
 
 - Added a WebConfig **Recording Load Test** with selectable 30 s / 60 s duration.

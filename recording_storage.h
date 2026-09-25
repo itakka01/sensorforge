@@ -5,6 +5,26 @@
 #include <stdint.h>
 #include <psa/crypto.h>
 
+
+// Optional per-frame physical storage diagnostics used only by the explicit
+// Recording Load Test. Normal production recording keeps this disabled.
+struct RecordingStorageFrameDiagnostics {
+    bool valid;
+    uint32_t writeCalls;
+    uint64_t writeBytes;
+    uint64_t writeTotalUs;
+    uint32_t writeMaxUs;
+    uint32_t writeMaxBytes;
+    uint32_t slowWriteCalls;
+    uint32_t seekCalls;
+    uint64_t seekTotalUs;
+    uint32_t seekMaxUs;
+};
+
+void recordingStorageSetFrameDiagnosticsEnabled(bool enabled);
+void recordingStorageBeginFrameDiagnostics();
+bool recordingStorageGetFrameDiagnostics(RecordingStorageFrameDiagnostics &diagnostics);
+
 // Transparent recording-file abstraction.
 //
 // Plain files are passed through unchanged.

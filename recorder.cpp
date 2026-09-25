@@ -6,9 +6,11 @@
 #include "mkv_writer.h"
 #include "logger.h"
 #include "storage_guard.h"
+#include "recording_storage.h"
 #include "webconfig.h"
 
 #include <FS.h>
+#include <esp_timer.h>
 
 
 enum RecorderType {
@@ -23,6 +25,9 @@ static RecorderType activeRecorder =
 
 static String activeFinalPath;
 static String activeTempPath;
+
+static bool detailedFrameTimingEnabled = false;
+static RecorderFrameTiming lastFrameTiming = {};
 
 
 // Public global start lock declared in recorder.h.
@@ -299,6 +304,16 @@ bool recorderStart(
 
 void recorderAddFrame()
 {
+    uint64_t callStartUs =
+        detailedFrameTimingEnabled
+        ? (uint64_t)esp_timer_get_time()
+        : 0ULL;
+
+    lastFrameTiming = {};
+
+    if (detailedFrameTimingEnabled)
+        recordingStorageBeginFrameDiagnostics();
+
     switch (activeRecorder) {
         case RECORDER_AVI:
             aviAddFrame();
@@ -311,6 +326,86 @@ void recorderAddFrame()
         default:
             break;
     }
+
+    if (!detailedFrameTimingEnabled)
+        return;
+
+    uint64_t callDoneUs =
+        (uint64_t)esp_timer_get_time();
+
+    lastFrameTiming.valid = true;
+    uint64_t totalUs64 =
+        callDoneUs >= callStartUs
+        ? callDoneUs - callStartUs
+        : 0ULL;
+
+    lastFrameTiming.totalUs =
+        totalUs64 > 0xFFFFFFFFULL
+        ? 0xFFFFFFFFUL
+        : (uint32_t)totalUs64;
+
+    RecordingStorageFrameDiagnostics storageTiming = {};
+    if (recordingStorageGetFrameDiagnostics(storageTiming)) {
+        lastFrameTiming.storageIoValid = true;
+        lastFrameTiming.storageWriteCalls = storageTiming.writeCalls;
+        lastFrameTiming.storageWriteBytes = storageTiming.writeBytes;
+        lastFrameTiming.storageWriteTotalUs = storageTiming.writeTotalUs;
+        lastFrameTiming.storageWriteMaxUs = storageTiming.writeMaxUs;
+        lastFrameTiming.storageWriteMaxBytes = storageTiming.writeMaxBytes;
+        lastFrameTiming.storageSlowWriteCalls = storageTiming.slowWriteCalls;
+        lastFrameTiming.storageSeekCalls = storageTiming.seekCalls;
+        lastFrameTiming.storageSeekTotalUs = storageTiming.seekTotalUs;
+        lastFrameTiming.storageSeekMaxUs = storageTiming.seekMaxUs;
+    }
+
+    if (activeRecorder == RECORDER_MKV) {
+        MkvFrameTiming mkvTiming = {};
+
+        if (mkvGetLastFrameTiming(mkvTiming)) {
+            lastFrameTiming.stageBreakdownValid = true;
+            lastFrameTiming.cameraUs = mkvTiming.cameraUs;
+            lastFrameTiming.headerUs = mkvTiming.headerUs;
+            lastFrameTiming.audioReadUs = mkvTiming.audioReadUs;
+            lastFrameTiming.audioWriteUs = mkvTiming.audioWriteUs;
+            lastFrameTiming.clusterUs = mkvTiming.clusterUs;
+            lastFrameTiming.subtitleUs = mkvTiming.subtitleUs;
+            lastFrameTiming.videoWriteUs = mkvTiming.videoWriteUs;
+            lastFrameTiming.imageAnalysisUs = mkvTiming.imageAnalysisUs;
+        }
+    }
+
+    uint64_t accountedUs =
+        (uint64_t)lastFrameTiming.cameraUs +
+        (uint64_t)lastFrameTiming.headerUs +
+        (uint64_t)lastFrameTiming.audioReadUs +
+        (uint64_t)lastFrameTiming.audioWriteUs +
+        (uint64_t)lastFrameTiming.clusterUs +
+        (uint64_t)lastFrameTiming.subtitleUs +
+        (uint64_t)lastFrameTiming.videoWriteUs +
+        (uint64_t)lastFrameTiming.imageAnalysisUs;
+
+    lastFrameTiming.otherUs =
+        accountedUs < (uint64_t)lastFrameTiming.totalUs
+        ? lastFrameTiming.totalUs - (uint32_t)accountedUs
+        : 0;
+}
+
+
+void recorderSetDetailedFrameTimingEnabled(bool enabled)
+{
+    detailedFrameTimingEnabled = enabled;
+    lastFrameTiming = {};
+    recordingStorageSetFrameDiagnosticsEnabled(enabled);
+    mkvSetDetailedFrameTimingEnabled(enabled);
+}
+
+
+bool recorderGetLastFrameTiming(RecorderFrameTiming &timing)
+{
+    timing = lastFrameTiming;
+    return
+        detailedFrameTimingEnabled &&
+        lastFrameTiming.valid;
 }
 
 

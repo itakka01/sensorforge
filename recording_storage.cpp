@@ -4,6 +4,7 @@
 #include "recording_crypto.h"
 
 #include <esp_heap_caps.h>
+#include <esp_timer.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,6 +44,75 @@ static const uint32_t CIPHER_OUTPUT_EXTRA_BYTES = 64U;
 // SensorForge firmware does not need another 32 KiB temporary DMA allocation.
 // This does not change the on-disk chunk size or cryptographic stream.
 static const uint32_t CRYPTO_SLICE_BYTES = 4U * 1024U;
+
+// Physical storage timing is sampled only while the explicit Recording Load
+// Test brackets one recorderAddFrame() call. It deliberately measures the
+// actual Arduino FS File::write()/seek() calls beneath RecordingStorageFile so
+// plain and encrypted recordings can be compared on the same I/O boundary.
+static const uint32_t DIAG_SLOW_WRITE_US = 20000UL;
+static bool storageFrameDiagEnabled = false;
+static bool storageFrameDiagActive = false;
+static RecordingStorageFrameDiagnostics storageFrameDiag = {};
+
+static uint32_t diagElapsedUs(uint64_t startUs)
+{
+    uint64_t nowUs = (uint64_t)esp_timer_get_time();
+    uint64_t elapsed = nowUs >= startUs ? nowUs - startUs : 0ULL;
+    return elapsed > 0xFFFFFFFFULL ? 0xFFFFFFFFUL : (uint32_t)elapsed;
+}
+
+static size_t storageFileWrite(
+    File &file,
+    const uint8_t *buffer,
+    size_t length
+)
+{
+    if (!storageFrameDiagEnabled || !storageFrameDiagActive)
+        return file.write(buffer, length);
+
+    uint64_t startUs = (uint64_t)esp_timer_get_time();
+    size_t written = file.write(buffer, length);
+    uint32_t elapsedUs = diagElapsedUs(startUs);
+
+    storageFrameDiag.valid = true;
+    storageFrameDiag.writeCalls++;
+    storageFrameDiag.writeBytes += (uint64_t)written;
+    storageFrameDiag.writeTotalUs += (uint64_t)elapsedUs;
+
+    if (elapsedUs > storageFrameDiag.writeMaxUs) {
+        storageFrameDiag.writeMaxUs = elapsedUs;
+        storageFrameDiag.writeMaxBytes =
+            length > 0xFFFFFFFFULL
+            ? 0xFFFFFFFFUL
+            : (uint32_t)length;
+    }
+
+    if (elapsedUs >= DIAG_SLOW_WRITE_US)
+        storageFrameDiag.slowWriteCalls++;
+
+    return written;
+}
+
+static bool storageFileSeek(
+    File &file,
+    uint32_t position
+)
+{
+    if (!storageFrameDiagEnabled || !storageFrameDiagActive)
+        return file.seek(position);
+
+    uint64_t startUs = (uint64_t)esp_timer_get_time();
+    bool ok = file.seek(position);
+    uint32_t elapsedUs = diagElapsedUs(startUs);
+
+    storageFrameDiag.valid = true;
+    storageFrameDiag.seekCalls++;
+    storageFrameDiag.seekTotalUs += (uint64_t)elapsedUs;
+    if (elapsedUs > storageFrameDiag.seekMaxUs)
+        storageFrameDiag.seekMaxUs = elapsedUs;
+
+    return ok;
+}
 
 static uint16_t readU16LE(const uint8_t *p)
 {
@@ -347,6 +417,30 @@ static bool verifyEncryptedHeaderSmall(
 }
 
 } // namespace
+
+void recordingStorageSetFrameDiagnosticsEnabled(bool enabled)
+{
+    storageFrameDiagEnabled = enabled;
+    storageFrameDiagActive = false;
+    storageFrameDiag = {};
+}
+
+void recordingStorageBeginFrameDiagnostics()
+{
+    storageFrameDiag = {};
+    storageFrameDiagActive = storageFrameDiagEnabled;
+    storageFrameDiag.valid = storageFrameDiagActive;
+}
+
+bool recordingStorageGetFrameDiagnostics(
+    RecordingStorageFrameDiagnostics &diagnostics
+)
+{
+    diagnostics = storageFrameDiag;
+    bool valid = storageFrameDiagEnabled && storageFrameDiag.valid;
+    storageFrameDiagActive = false;
+    return valid;
+}
 
 RecordingStorageFile::RecordingStorageFile()
 {
@@ -888,12 +982,12 @@ bool RecordingStorageFile::writeHeader(bool finalized)
         return false;
     }
 
-    if (!file_.seek(0)) {
+    if (!storageFileSeek(file_, 0)) {
         logStorageError(path_, "header seek failed");
         return false;
     }
 
-    if (file_.write(
+    if (storageFileWrite(file_,
             header,
             sizeof(header)
         ) != sizeof(header)) {
@@ -908,7 +1002,7 @@ bool RecordingStorageFile::readAndValidateHeader()
 {
     uint8_t header[HEADER_BYTES] = {};
 
-    if (!file_.seek(0))
+    if (!storageFileSeek(file_, 0))
         return false;
 
     if (file_.read(
@@ -1056,7 +1150,7 @@ bool RecordingStorageFile::openRead(const String &path)
         sizeof(magic)
     );
 
-    if (!file_.seek(0)) {
+    if (!storageFileSeek(file_, 0)) {
         close();
         return false;
     }
@@ -1180,7 +1274,7 @@ bool RecordingStorageFile::loadChunk(uint32_t chunkIndex)
     if (physicalOffset > 0xFFFFFFFFULL)
         return false;
 
-    if (!file_.seek((uint32_t)physicalOffset)) {
+    if (!storageFileSeek(file_, (uint32_t)physicalOffset)) {
         logStorageError(path_, "chunk read seek failed");
         return false;
     }
@@ -1370,7 +1464,7 @@ bool RecordingStorageFile::flushCachedChunk()
     if (physicalOffset > 0xFFFFFFFFULL)
         return false;
 
-    if (!file_.seek((uint32_t)physicalOffset)) {
+    if (!storageFileSeek(file_, (uint32_t)physicalOffset)) {
         logStorageError(path_, "chunk write seek failed");
         return false;
     }
@@ -1390,7 +1484,7 @@ bool RecordingStorageFile::flushCachedChunk()
             take
         );
 
-        size_t written = file_.write(
+        size_t written = storageFileWrite(file_,
             cryptoInput_,
             take
         );
@@ -1522,7 +1616,7 @@ size_t RecordingStorageFile::write(
 
     if (!encrypted_) {
         size_t written =
-            file_.write(buffer, length);
+            storageFileWrite(file_, buffer, length);
 
         logicalPosition_ +=
             (uint64_t)written;
@@ -1615,7 +1709,7 @@ bool RecordingStorageFile::seek(uint32_t position)
         return false;
 
     if (!encrypted_) {
-        if (!file_.seek(position))
+        if (!storageFileSeek(file_, position))
             return false;
 
         logicalPosition_ = position;

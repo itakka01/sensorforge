@@ -1124,6 +1124,7 @@ struct EbmlElement {
     uint64_t size;
     uint32_t dataStart;
     uint32_t end;
+    bool unknownSize;
 };
 
 
@@ -1166,25 +1167,27 @@ static MkvMeta mkvMeta = {
 struct MkvScanState {
     uint32_t pos;
     uint32_t clusterEnd;
+    bool clusterUnknownSize;
     uint64_t clusterTimestampTicks;
     uint32_t nextFrame;
 };
 
 
 static MkvScanState mkvScan = {
-    0, 0, 0, 0
+    0, 0, false, 0, 0
 };
 
 
 struct MkvSubtitleScanState {
     uint32_t pos;
     uint32_t clusterEnd;
+    bool clusterUnknownSize;
     uint64_t clusterTimestampTicks;
 };
 
 
 static MkvSubtitleScanState mkvSubtitleScan = {
-    0, 0, 0
+    0, 0, false, 0
 };
 
 
@@ -1417,13 +1420,20 @@ static bool readEbmlElementAt(
         idLength +
         sizeLength;
 
-    uint64_t end64 =
-        dataStart64 +
-        size;
+    uint64_t unknownSizeValue =
+        (1ULL << (7U * sizeLength)) - 1ULL;
+
+    bool unknownSize =
+        size == unknownSizeValue;
 
 
     uint64_t fileSize =
         file.size();
+
+    uint64_t end64 =
+        unknownSize
+        ? fileSize
+        : dataStart64 + size;
 
 
     if (
@@ -1449,6 +1459,9 @@ static bool readEbmlElementAt(
 
     element.end =
         (uint32_t)end64;
+
+    element.unknownSize =
+        unknownSize;
 
 
     return true;
@@ -2196,6 +2209,9 @@ static void initMkvScan(
     state.clusterEnd =
         0;
 
+    state.clusterUnknownSize =
+        false;
+
     state.clusterTimestampTicks =
         0;
 
@@ -2254,7 +2270,12 @@ static bool nextMkvVideoFrame(
             ) {
 
                 state.clusterEnd =
-                    topLevel.end;
+                    topLevel.unknownSize
+                    ? containerMeta.segmentEnd
+                    : topLevel.end;
+
+                state.clusterUnknownSize =
+                    topLevel.unknownSize;
 
                 state.clusterTimestampTicks =
                     0;
@@ -2287,6 +2308,9 @@ static bool nextMkvVideoFrame(
             state.clusterEnd =
                 0;
 
+            state.clusterUnknownSize =
+                false;
+
 
             continue;
         }
@@ -2301,6 +2325,18 @@ static bool nextMkvVideoFrame(
                 child
             )) {
             return false;
+        }
+
+
+        // An unknown-size Cluster ends when the next top-level Cluster
+        // starts. Re-process that element as top-level on the next loop.
+        if (
+            state.clusterUnknownSize &&
+            child.id == MKV_ID_CLUSTER
+        ) {
+            state.clusterEnd = 0;
+            state.clusterUnknownSize = false;
+            continue;
         }
 
 
@@ -2484,6 +2520,9 @@ static void initMkvSubtitleScan(
 
     state.clusterEnd =
         0;
+
+    state.clusterUnknownSize =
+        false;
 
     state.clusterTimestampTicks =
         0;
@@ -2833,7 +2872,12 @@ static bool readNextMkvSubtitle(
             ) {
 
                 mkvSubtitleScan.clusterEnd =
-                    topLevel.end;
+                    topLevel.unknownSize
+                    ? mkvMeta.segmentEnd
+                    : topLevel.end;
+
+                mkvSubtitleScan.clusterUnknownSize =
+                    topLevel.unknownSize;
 
                 mkvSubtitleScan.clusterTimestampTicks =
                     0;
@@ -2865,6 +2909,9 @@ static bool readNextMkvSubtitle(
             mkvSubtitleScan.clusterEnd =
                 0;
 
+            mkvSubtitleScan.clusterUnknownSize =
+                false;
+
 
             continue;
         }
@@ -2879,6 +2926,16 @@ static bool readNextMkvSubtitle(
                 child
             )) {
             return false;
+        }
+
+
+        if (
+            mkvSubtitleScan.clusterUnknownSize &&
+            child.id == MKV_ID_CLUSTER
+        ) {
+            mkvSubtitleScan.clusterEnd = 0;
+            mkvSubtitleScan.clusterUnknownSize = false;
+            continue;
         }
 
 
@@ -4222,6 +4279,9 @@ static bool processMkvAudioBlocks(
     uint32_t clusterEnd =
         0;
 
+    bool clusterUnknownSize =
+        false;
+
     uint64_t blockAlign =
         (uint64_t)containerMeta.audioChannels *
         (uint64_t)(containerMeta.audioBitsPerSample / 8U);
@@ -4243,7 +4303,11 @@ static bool processMkvAudioBlocks(
                 return false;
 
             if (topLevel.id == MKV_ID_CLUSTER) {
-                clusterEnd = topLevel.end;
+                clusterEnd =
+                    topLevel.unknownSize
+                    ? containerMeta.segmentEnd
+                    : topLevel.end;
+                clusterUnknownSize = topLevel.unknownSize;
                 pos = topLevel.dataStart;
                 continue;
             }
@@ -4255,6 +4319,7 @@ static bool processMkvAudioBlocks(
         if (pos >= clusterEnd) {
             pos = clusterEnd;
             clusterEnd = 0;
+            clusterUnknownSize = false;
             continue;
         }
 
@@ -4262,6 +4327,12 @@ static bool processMkvAudioBlocks(
 
         if (!readEbmlElementAt(file, pos, child))
             return false;
+
+        if (clusterUnknownSize && child.id == MKV_ID_CLUSTER) {
+            clusterEnd = 0;
+            clusterUnknownSize = false;
+            continue;
+        }
 
         if (child.end <= pos || child.end > clusterEnd)
             return false;
