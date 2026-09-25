@@ -12164,6 +12164,7 @@ struct RecordingEntry {
     bool isMkv;
     bool isJpeg;
     bool hasSrt;
+    bool hasAudio;
     bool corrupt;
 };
 
@@ -12652,6 +12653,9 @@ static void handleFilesDay()
                     entry.hasSrt =
                         false;
 
+                    entry.hasAudio =
+                        false;
+
                     entry.corrupt =
                         false;
 
@@ -12796,16 +12800,21 @@ static void handleFilesDay()
 
         if (!entry.isJpeg) {
             uint64_t durationMs = 0;
+            bool hasAudio = false;
 
-            if (webPlayerProbeDurationMs(
+            if (webPlayerProbeMediaInfo(
                     entry.fullPath,
-                    durationMs
+                    durationMs,
+                    hasAudio
                 )) {
                 entry.durationMs =
                     durationMs;
 
                 entry.durationValid =
                     true;
+
+                entry.hasAudio =
+                    hasAudio;
             } else {
                 // Lightweight AVI/MKV parsing failed: mark the file visibly
                 // instead of discovering the problem only after opening it.
@@ -12834,7 +12843,7 @@ static void handleFilesDay()
         }
 
         String row;
-        row.reserve(512);
+        row.reserve(640);
 
 
         row +=
@@ -12877,6 +12886,17 @@ static void handleFilesDay()
               "<rect x='2.5' y='5' width='13.5' height='14' rx='2'></rect>"
               "<path d='M16 9l5-3v12l-5-3z'></path>"
               "</svg></span>";
+
+
+        if (entry.hasAudio) {
+            row +=
+                "<span class='mediaAudioIcon' title='Audio' aria-label='Audio'>"
+                "<svg viewBox='0 0 24 24' aria-hidden='true'>"
+                "<path d='M4 10v4h4l5 4V6L8 10H4z'></path>"
+                "<path d='M16 9c1.3 1.3 1.3 4.7 0 6'></path>"
+                "<path d='M18.5 6.5c3 3 3 8 0 11'></path>"
+                "</svg></span>";
+        }
 
 
         row +=
@@ -14885,6 +14905,8 @@ static void handleFiles()
             "width:18px;height:18px;fill:none;stroke:currentColor;"
             "stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;"
         "}"
+        ".mediaAudioIcon{display:inline-flex;width:20px;height:20px;align-items:center;justify-content:center;margin-right:5px;vertical-align:middle;color:#1769aa;}"
+        ".mediaAudioIcon svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;}"
         ".recname{display:inline-block;min-width:150px;}"
         ".recmeta{display:inline-block;min-width:70px;color:#667085;}"
         ".recannotation{display:inline-flex;align-items:center;gap:5px;max-width:min(440px,38vw);margin-left:10px;padding:3px 8px;border:1px solid #cbd5e1;border-radius:999px;background:#f8fafc;color:#475467;font-size:12px;line-height:1.3;vertical-align:middle;white-space:nowrap;overflow:hidden;}"
@@ -14902,7 +14924,7 @@ static void handleFiles()
         "</style>"
         "<script>"
         "const OPEN_DAY_KEY='recordings.openDay';"
-        "const CACHE_PREFIX='recordings.day.';"
+        "const CACHE_PREFIX='recordings.v54.day.';"
         "const BOOT_KEY='recordings.bootId';"
         "const BOOT_ID='" +
         String(webBootSessionId, HEX) +

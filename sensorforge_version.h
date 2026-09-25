@@ -20,8 +20,8 @@
 // The same release tag is written to the firmware boot log and shown in
 // WebConfig, so a running device can be mapped back to the exact Git tag.
 
-#define SENSORFORGE_RELEASE_NUMBER 53
-#define SENSORFORGE_RELEASE_TAG "v53"
+#define SENSORFORGE_RELEASE_NUMBER 55
+#define SENSORFORGE_RELEASE_TAG "v55"
 #define SENSORFORGE_RELEASE_DATE "2026-09-25"
 #define SENSORFORGE_RELEASE_SUMMARY \
-    "MKV PCM audio integration with traffic-light audio capture assessment."
+    "Restore immediate WebPlayer video autoplay and defer embedded audio loading."

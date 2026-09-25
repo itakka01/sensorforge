@@ -9,6 +9,44 @@ and identifies the concrete binary compilation time.
 > change sequence beginning with v23. Earlier development history remains in the
 > repository history/project documentation.
 
+## v55 — 2026-09-25
+
+- Restored the established WebPlayer behavior in which opening a video from the
+  recordings list starts video playback automatically, including MKVs with audio.
+- Changed v54 audio startup ordering so the first JPEG frame and video playback are
+  no longer held behind the complete embedded-PCM WAV download. Audio extraction is
+  deferred briefly after video playback starts, allowing the existing finite frame
+  batch prefetch to get a head start and substantially improving perceived startup.
+- When embedded audio becomes ready during playback, it is synchronized to the
+  current video timestamp and started automatically when browser autoplay policy
+  permits it. If unmuted autoplay is blocked, video keeps running and the next user
+  pointer/key interaction enables audio instead of forcing the whole player to wait.
+- While browser policy is blocking audio, the normal Play/Pause control temporarily
+  shows `Enable audio`; using it starts the synchronized audio without pausing video.
+- No MKV container, recording, encryption, file-list probing or storage behavior was
+  changed in this release.
+
+## v54 — 2026-09-25
+
+- Added WebPlayer playback for SensorForge MKV recordings containing the v53
+  `A_PCM/INT/LIT` audio track. The ESP32 exposes embedded PCM as a transient WAV
+  HTTP response generated directly from the MKV; no sidecar WAV is written to SD.
+- Audio playback uses the existing player controls. Recordings with audio remain
+  paused after loading so the operator's Play click satisfies browser audio autoplay
+  restrictions; image-only recordings retain the existing automatic start behavior.
+- Player speed changes are applied to both video timing and browser audio playback.
+  Pause, restart, frame stepping and seek operations keep the embedded audio timeline
+  aligned with the displayed video, with bounded drift correction during playback.
+- Extended lightweight MKV header probing to inspect Info + Tracks only, stopping
+  before the first Cluster. The recording-day list can therefore identify audio
+  tracks without scanning JPEG/PCM media payloads or counting sparse frames.
+- MKV recordings containing audio now show an additional speaker icon in the
+  recordings list. AVI and image entries remain unchanged.
+- Embedded audio extraction reads through `RecordingStorageFile`, so encrypted MKV
+  recordings continue to use the existing transparent SFENC1 read/decrypt path.
+- Bumped the recordings-list session cache namespace so browsers do not reuse cached
+  pre-v54 day rows that lack the new audio indicator.
+
 ## v53 — 2026-09-25
 
 - Added production audio muxing to normal MKV recordings. When `audio_enabled=1`,

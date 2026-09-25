@@ -19,7 +19,7 @@
 //
 // Supported:
 //   AVI / MJPEG
-//   MKV / Matroska V_MJPEG
+//   MKV / Matroska V_MJPEG + embedded PCM audio
 //
 // Architecture:
 //   - one JPEG frame per HTTP request
@@ -1106,6 +1106,10 @@ static const uint32_t MKV_ID_CODEC_ID       = 0x86;
 static const uint32_t MKV_ID_VIDEO          = 0xE0;
 static const uint32_t MKV_ID_PIXEL_WIDTH    = 0xB0;
 static const uint32_t MKV_ID_PIXEL_HEIGHT   = 0xBA;
+static const uint32_t MKV_ID_AUDIO          = 0xE1;
+static const uint32_t MKV_ID_SAMPLING_FREQUENCY = 0xB5;
+static const uint32_t MKV_ID_CHANNELS       = 0x9F;
+static const uint32_t MKV_ID_BIT_DEPTH      = 0x6264;
 
 static const uint32_t MKV_ID_CLUSTER        = 0x1F43B675;
 static const uint32_t MKV_ID_CLUSTER_TIMESTAMP = 0xE7;
@@ -1127,7 +1131,12 @@ struct MkvMeta {
     uint64_t timestampScaleNs;
     uint64_t videoTrackNumber;
     uint64_t subtitleTrackNumber;
+    uint64_t audioTrackNumber;
     bool hasSubtitleTrack;
+    bool hasAudioTrack;
+    uint32_t audioSampleRate;
+    uint16_t audioBitsPerSample;
+    uint8_t audioChannels;
     bool hasDateUtc;
     uint32_t startEpochSec;
     uint32_t segmentDataStart;
@@ -1140,7 +1149,12 @@ static MkvMeta mkvMeta = {
     1000000ULL,
     1,
     0,
+    0,
     false,
+    false,
+    0,
+    0,
+    0,
     false,
     0,
     0,
@@ -1874,6 +1888,59 @@ static bool parseMkvVideoElement(
 
 
 // -------------------------------------------------------------
+// Parse Matroska Audio settings for PCM playback.
+// -------------------------------------------------------------
+
+static bool parseMkvAudioElement(
+    RecordingStorageFile &file,
+    const EbmlElement &audio,
+    uint32_t &sampleRate,
+    uint16_t &bitsPerSample,
+    uint8_t &channels
+)
+{
+    sampleRate = 0;
+    bitsPerSample = 0;
+    channels = 0;
+
+    uint32_t pos = audio.dataStart;
+
+    while (pos < audio.end) {
+        EbmlElement child;
+
+        if (!readEbmlElementAt(file, pos, child))
+            return false;
+
+        if (child.end <= pos || child.end > audio.end)
+            return false;
+
+        if (child.id == MKV_ID_SAMPLING_FREQUENCY) {
+            double value = 0.0;
+            if (!readEbmlFloat(file, child, value) || value < 1.0 || value > 384000.0)
+                return false;
+            sampleRate = (uint32_t)(value + 0.5);
+
+        } else if (child.id == MKV_ID_CHANNELS) {
+            uint64_t value = 0;
+            if (!readEbmlUnsigned(file, child, value) || value == 0 || value > 8)
+                return false;
+            channels = (uint8_t)value;
+
+        } else if (child.id == MKV_ID_BIT_DEPTH) {
+            uint64_t value = 0;
+            if (!readEbmlUnsigned(file, child, value) || value == 0 || value > 32)
+                return false;
+            bitsPerSample = (uint16_t)value;
+        }
+
+        pos = child.end;
+    }
+
+    return sampleRate > 0 && bitsPerSample > 0 && channels > 0;
+}
+
+
+// -------------------------------------------------------------
 // Parse Tracks and locate V_MJPEG video track.
 // -------------------------------------------------------------
 
@@ -1933,6 +2000,15 @@ static bool parseMkvTracks(
                 0;
 
             uint32_t entryHeight =
+                0;
+
+            uint32_t entryAudioSampleRate =
+                0;
+
+            uint16_t entryAudioBitsPerSample =
+                0;
+
+            uint8_t entryAudioChannels =
                 0;
 
 
@@ -2011,6 +2087,21 @@ static bool parseMkvTracks(
                         )) {
                         return false;
                     }
+
+                } else if (
+                    child.id ==
+                    MKV_ID_AUDIO
+                ) {
+
+                    if (!parseMkvAudioElement(
+                            file,
+                            child,
+                            entryAudioSampleRate,
+                            entryAudioBitsPerSample,
+                            entryAudioChannels
+                        )) {
+                        return false;
+                    }
                 }
 
 
@@ -2036,6 +2127,32 @@ static bool parseMkvTracks(
 
                 videoFound =
                     true;
+            }
+
+
+            if (
+                trackType == 2 &&
+                codecId == "A_PCM/INT/LIT" &&
+                trackNumber > 0 &&
+                entryAudioSampleRate > 0 &&
+                entryAudioBitsPerSample > 0 &&
+                entryAudioChannels > 0
+            ) {
+
+                containerMeta.audioTrackNumber =
+                    trackNumber;
+
+                containerMeta.hasAudioTrack =
+                    true;
+
+                containerMeta.audioSampleRate =
+                    entryAudioSampleRate;
+
+                containerMeta.audioBitsPerSample =
+                    entryAudioBitsPerSample;
+
+                containerMeta.audioChannels =
+                    entryAudioChannels;
             }
 
 
@@ -2992,8 +3109,23 @@ static bool parseMkvMeta(
     containerMeta.subtitleTrackNumber =
         0;
 
+    containerMeta.audioTrackNumber =
+        0;
+
     containerMeta.hasSubtitleTrack =
         false;
+
+    containerMeta.hasAudioTrack =
+        false;
+
+    containerMeta.audioSampleRate =
+        0;
+
+    containerMeta.audioBitsPerSample =
+        0;
+
+    containerMeta.audioChannels =
+        0;
 
     containerMeta.hasDateUtc =
         false;
@@ -3288,9 +3420,9 @@ static bool parseMkvMeta(
 // -------------------------------------------------------------
 // Lightweight duration probe used by the recording list.
 //
-// Unlike parseMkvMeta(), the MKV path deliberately stops after the Info
-// element and does NOT count all sparse video blocks. This keeps the day list
-// responsive even when a sparse shooter MKV spans many minutes.
+// Unlike parseMkvMeta(), the MKV path reads only Info + Tracks and stops before
+// the first Cluster. This provides duration and audio-presence metadata without
+// counting sparse video blocks or scanning media payloads.
 // -------------------------------------------------------------
 
 static bool probeAviDurationMs(
@@ -3343,12 +3475,14 @@ static bool probeAviDurationMs(
 }
 
 
-static bool probeMkvDurationMs(
+static bool probeMkvMediaInfo(
     RecordingStorageFile &file,
-    uint64_t &durationMs
+    uint64_t &durationMs,
+    bool &hasAudio
 )
 {
     durationMs = 0;
+    hasAudio = false;
 
     uint32_t fileSize =
         (uint32_t)file.size();
@@ -3363,13 +3497,8 @@ static bool probeMkvDurationMs(
     while (pos < fileSize) {
         EbmlElement element;
 
-        if (!readEbmlElementAt(
-                file,
-                pos,
-                element
-            )) {
+        if (!readEbmlElementAt(file, pos, element))
             return false;
-        }
 
         if (element.end <= pos)
             return false;
@@ -3390,7 +3519,12 @@ static bool probeMkvDurationMs(
     containerMeta.timestampScaleNs = 1000000ULL;
     containerMeta.videoTrackNumber = 1;
     containerMeta.subtitleTrackNumber = 0;
+    containerMeta.audioTrackNumber = 0;
     containerMeta.hasSubtitleTrack = false;
+    containerMeta.hasAudioTrack = false;
+    containerMeta.audioSampleRate = 0;
+    containerMeta.audioBitsPerSample = 0;
+    containerMeta.audioChannels = 0;
     containerMeta.hasDateUtc = false;
     containerMeta.startEpochSec = 0;
     containerMeta.segmentDataStart = segment.dataStart;
@@ -3398,26 +3532,21 @@ static bool probeMkvDurationMs(
     containerMeta.firstClusterPos = 0;
 
     double durationTicks = 0.0;
+    bool infoFound = false;
+    bool tracksFound = false;
+    uint32_t ignoredWidth = 0;
+    uint32_t ignoredHeight = 0;
 
     pos = segment.dataStart;
 
     while (pos < segment.end) {
         EbmlElement child;
 
-        if (!readEbmlElementAt(
-                file,
-                pos,
-                child
-            )) {
+        if (!readEbmlElementAt(file, pos, child))
             return false;
-        }
 
-        if (
-            child.end <= pos ||
-            child.end > segment.end
-        ) {
+        if (child.end <= pos || child.end > segment.end)
             return false;
-        }
 
         if (child.id == MKV_ID_INFO) {
             if (!parseMkvInfo(
@@ -3429,41 +3558,75 @@ static bool probeMkvDurationMs(
                 return false;
             }
 
-            if (durationTicks <= 0.0)
+            infoFound =
+                durationTicks > 0.0;
+
+        } else if (child.id == MKV_ID_TRACKS) {
+            if (!parseMkvTracks(
+                    file,
+                    child,
+                    containerMeta,
+                    ignoredWidth,
+                    ignoredHeight
+                )) {
                 return false;
+            }
 
-            double durationNs =
-                durationTicks *
-                (double)containerMeta.timestampScaleNs;
+            tracksFound =
+                true;
 
-            durationMs =
-                (uint64_t)(
-                    durationNs /
-                    1000000.0 +
-                    0.5
-                );
-
-            return durationMs > 0;
-        }
-
-        // Info is written before the first Cluster by SensorForge. There is no
-        // reason to walk JPEG payloads when the metadata is absent/corrupt.
-        if (child.id == MKV_ID_CLUSTER)
+        } else if (child.id == MKV_ID_CLUSTER) {
             break;
+        }
 
         pos = child.end;
     }
 
-    return false;
+    if (!infoFound)
+        return false;
+
+    double durationNs =
+        durationTicks *
+        (double)containerMeta.timestampScaleNs;
+
+    durationMs =
+        (uint64_t)(
+            durationNs /
+            1000000.0 +
+            0.5
+        );
+
+    hasAudio =
+        tracksFound &&
+        containerMeta.hasAudioTrack;
+
+    return durationMs > 0;
 }
 
 
-bool webPlayerProbeDurationMs(
-    const String &path,
+static bool probeMkvDurationMs(
+    RecordingStorageFile &file,
     uint64_t &durationMs
 )
 {
+    bool ignoredHasAudio = false;
+
+    return probeMkvMediaInfo(
+        file,
+        durationMs,
+        ignoredHasAudio
+    );
+}
+
+
+bool webPlayerProbeMediaInfo(
+    const String &path,
+    uint64_t &durationMs,
+    bool &hasAudio
+)
+{
     durationMs = 0;
+    hasAudio = false;
 
     if (
         !validRecordingPath(path) ||
@@ -3485,20 +3648,45 @@ bool webPlayerProbeDurationMs(
         return false;
     }
 
-    bool ok =
-        isAviPath(path)
-        ? probeAviDurationMs(
-            file,
-            durationMs
-        )
-        : probeMkvDurationMs(
-            file,
-            durationMs
-        );
+    bool ok = false;
+
+    if (isAviPath(path)) {
+        ok =
+            probeAviDurationMs(
+                file,
+                durationMs
+            );
+
+        hasAudio =
+            false;
+
+    } else {
+        ok =
+            probeMkvMediaInfo(
+                file,
+                durationMs,
+                hasAudio
+            );
+    }
 
     file.close();
 
     return ok;
+}
+
+
+bool webPlayerProbeDurationMs(
+    const String &path,
+    uint64_t &durationMs
+)
+{
+    bool ignoredHasAudio = false;
+
+    return webPlayerProbeMediaInfo(
+        path,
+        durationMs,
+        ignoredHasAudio
+    );
 }
 
 
@@ -4005,6 +4193,388 @@ static void putU32LE(
 
 
 // =============================================================
+// MKV PCM AUDIO -> WAV FOR BROWSER PLAYBACK
+// =============================================================
+
+static bool processMkvAudioBlocks(
+    RecordingStorageFile &file,
+    const MkvMeta &containerMeta,
+    uint64_t &pcmBytes,
+    WiFiClient *client
+)
+{
+    pcmBytes = 0;
+
+    if (
+        !containerMeta.hasAudioTrack ||
+        containerMeta.audioTrackNumber == 0 ||
+        containerMeta.firstClusterPos == 0
+    ) {
+        return false;
+    }
+
+    uint32_t fileSize =
+        (uint32_t)file.size();
+
+    uint32_t pos =
+        containerMeta.firstClusterPos;
+
+    uint32_t clusterEnd =
+        0;
+
+    uint64_t blockAlign =
+        (uint64_t)containerMeta.audioChannels *
+        (uint64_t)(containerMeta.audioBitsPerSample / 8U);
+
+    if (blockAlign == 0)
+        return false;
+
+    while (
+        pos < fileSize &&
+        pos < containerMeta.segmentEnd
+    ) {
+        if (clusterEnd == 0) {
+            EbmlElement topLevel;
+
+            if (!readEbmlElementAt(file, pos, topLevel))
+                return false;
+
+            if (topLevel.end <= pos)
+                return false;
+
+            if (topLevel.id == MKV_ID_CLUSTER) {
+                clusterEnd = topLevel.end;
+                pos = topLevel.dataStart;
+                continue;
+            }
+
+            pos = topLevel.end;
+            continue;
+        }
+
+        if (pos >= clusterEnd) {
+            pos = clusterEnd;
+            clusterEnd = 0;
+            continue;
+        }
+
+        EbmlElement child;
+
+        if (!readEbmlElementAt(file, pos, child))
+            return false;
+
+        if (child.end <= pos || child.end > clusterEnd)
+            return false;
+
+        if (child.id == MKV_ID_SIMPLE_BLOCK) {
+            uint64_t trackNumber = 0;
+            uint8_t trackVintLength = 0;
+
+            if (!readEbmlVintValueAt(
+                    file,
+                    child.dataStart,
+                    trackNumber,
+                    trackVintLength
+                )) {
+                return false;
+            }
+
+            if (child.size < (uint64_t)trackVintLength + 3ULL)
+                return false;
+
+            uint8_t blockHeader[3];
+
+            if (!readAt(
+                    file,
+                    child.dataStart + trackVintLength,
+                    blockHeader,
+                    sizeof(blockHeader)
+                )) {
+                return false;
+            }
+
+            bool laced =
+                (blockHeader[2] & 0x06U) != 0;
+
+            if (
+                trackNumber == containerMeta.audioTrackNumber &&
+                !laced
+            ) {
+                uint32_t payloadPosition =
+                    child.dataStart + trackVintLength + 3U;
+
+                uint32_t payloadBytes =
+                    (uint32_t)(
+                        child.size -
+                        trackVintLength -
+                        3U
+                    );
+
+                if (
+                    payloadBytes == 0 ||
+                    (payloadBytes % blockAlign) != 0
+                ) {
+                    return false;
+                }
+
+                if (
+                    pcmBytes > 0xFFFFFF00ULL -
+                        (uint64_t)payloadBytes
+                ) {
+                    return false;
+                }
+
+                pcmBytes +=
+                    (uint64_t)payloadBytes;
+
+                if (client) {
+                    if (!file.seek(payloadPosition))
+                        return false;
+
+                    uint32_t remaining =
+                        payloadBytes;
+
+                    while (remaining > 0) {
+                        size_t wanted =
+                            remaining < sizeof(transferBuffer)
+                            ? remaining
+                            : sizeof(transferBuffer);
+
+                        size_t got =
+                            file.read(
+                                transferBuffer,
+                                wanted
+                            );
+
+                        if (got == 0)
+                            return false;
+
+                        if (!clientWriteAll(
+                                *client,
+                                transferBuffer,
+                                got
+                            )) {
+                            return false;
+                        }
+
+                        remaining -=
+                            (uint32_t)got;
+
+                        yield();
+                    }
+                }
+            }
+        }
+
+        pos = child.end;
+    }
+
+    return pcmBytes > 0;
+}
+
+
+static bool buildPlayerWavHeader(
+    const MkvMeta &containerMeta,
+    uint32_t pcmBytes,
+    uint8_t header[44]
+)
+{
+    if (
+        !containerMeta.hasAudioTrack ||
+        containerMeta.audioSampleRate == 0 ||
+        containerMeta.audioChannels == 0 ||
+        (
+            containerMeta.audioBitsPerSample != 16 &&
+            containerMeta.audioBitsPerSample != 24 &&
+            containerMeta.audioBitsPerSample != 32
+        )
+    ) {
+        return false;
+    }
+
+    uint32_t bytesPerSample =
+        containerMeta.audioBitsPerSample / 8U;
+
+    uint64_t byteRate64 =
+        (uint64_t)containerMeta.audioSampleRate *
+        (uint64_t)containerMeta.audioChannels *
+        (uint64_t)bytesPerSample;
+
+    uint64_t riffSize64 =
+        36ULL +
+        (uint64_t)pcmBytes;
+
+    if (
+        byteRate64 > 0xFFFFFFFFULL ||
+        riffSize64 > 0xFFFFFFFFULL
+    ) {
+        return false;
+    }
+
+    memset(header, 0, 44);
+    memcpy(header + 0, "RIFF", 4);
+    putU32LE(header + 4, (uint32_t)riffSize64);
+    memcpy(header + 8, "WAVE", 4);
+    memcpy(header + 12, "fmt ", 4);
+    putU32LE(header + 16, 16U);
+    putU16LE(header + 20, 1U);
+    putU16LE(header + 22, containerMeta.audioChannels);
+    putU32LE(header + 24, containerMeta.audioSampleRate);
+    putU32LE(header + 28, (uint32_t)byteRate64);
+    putU16LE(
+        header + 32,
+        (uint16_t)(
+            containerMeta.audioChannels *
+            bytesPerSample
+        )
+    );
+    putU16LE(
+        header + 34,
+        containerMeta.audioBitsPerSample
+    );
+    memcpy(header + 36, "data", 4);
+    putU32LE(header + 40, pcmBytes);
+
+    return true;
+}
+
+
+static void handlePlayerAudio()
+{
+    if (rejectPlayerWhileRecording())
+        return;
+
+    if (!playerServer)
+        return;
+
+    String path =
+        playerServer->arg("path");
+
+    if (
+        !validRecordingPath(path) ||
+        !isMkvPath(path)
+    ) {
+        playerServer->send(
+            400,
+            "text/plain; charset=utf-8",
+            "invalid MKV path"
+        );
+        return;
+    }
+
+    if (!openMkvSession(path)) {
+        playerServer->send(
+            404,
+            "text/plain; charset=utf-8",
+            "cannot open MKV"
+        );
+        return;
+    }
+
+    if (!mkvMeta.hasAudioTrack) {
+        playerServer->send(
+            404,
+            "text/plain; charset=utf-8",
+            "recording has no audio track"
+        );
+        return;
+    }
+
+    uint64_t pcmBytes64 = 0;
+
+    if (!processMkvAudioBlocks(
+            playerFile,
+            mkvMeta,
+            pcmBytes64,
+            nullptr
+        ) ||
+        pcmBytes64 == 0 ||
+        pcmBytes64 > 0xFFFFFF00ULL
+    ) {
+        playerServer->send(
+            500,
+            "text/plain; charset=utf-8",
+            "cannot read MKV audio"
+        );
+        return;
+    }
+
+    uint32_t pcmBytes =
+        (uint32_t)pcmBytes64;
+
+    uint8_t wavHeader[44];
+
+    if (!buildPlayerWavHeader(
+            mkvMeta,
+            pcmBytes,
+            wavHeader
+        )) {
+        playerServer->send(
+            415,
+            "text/plain; charset=utf-8",
+            "unsupported PCM audio format"
+        );
+        return;
+    }
+
+    playerLastAccessMs =
+        millis();
+
+    playerServer->sendHeader(
+        "Cache-Control",
+        "no-store"
+    );
+
+    playerServer->sendHeader(
+        "X-Content-Type-Options",
+        "nosniff"
+    );
+
+    playerServer->setContentLength(
+        (size_t)pcmBytes +
+        sizeof(wavHeader)
+    );
+
+    playerServer->send(
+        200,
+        "audio/wav",
+        ""
+    );
+
+    WiFiClient client =
+        playerServer->client();
+
+    if (!clientWriteAll(
+            client,
+            wavHeader,
+            sizeof(wavHeader)
+        )) {
+        return;
+    }
+
+    uint64_t streamedBytes = 0;
+
+    if (!processMkvAudioBlocks(
+            playerFile,
+            mkvMeta,
+            streamedBytes,
+            &client
+        ) ||
+        streamedBytes != pcmBytes64
+    ) {
+        Serial.println(
+            "WebPlayer: MKV audio stream interrupted"
+        );
+        client.stop();
+        return;
+    }
+
+    playerLastAccessMs =
+        millis();
+}
+
+
+// =============================================================
 // META RESPONSE
 // =============================================================
 
@@ -4117,6 +4687,57 @@ static void handlePlayerMeta()
         playerHasSubtitles
         ? "true"
         : "false";
+
+    json +=
+        ",\"audio\":";
+
+    json +=
+        (
+            playerFormat == PLAYER_MKV &&
+            mkvMeta.hasAudioTrack
+        )
+        ? "true"
+        : "false";
+
+    bool metaHasAudio =
+        playerFormat == PLAYER_MKV &&
+        mkvMeta.hasAudioTrack;
+
+    json +=
+        ",\"audio_sample_rate\":";
+
+    json +=
+        String(
+            (unsigned long)(
+                metaHasAudio
+                ? mkvMeta.audioSampleRate
+                : 0
+            )
+        );
+
+    json +=
+        ",\"audio_bits_per_sample\":";
+
+    json +=
+        String(
+            (unsigned int)(
+                metaHasAudio
+                ? mkvMeta.audioBitsPerSample
+                : 0
+            )
+        );
+
+    json +=
+        ",\"audio_channels\":";
+
+    json +=
+        String(
+            (unsigned int)(
+                metaHasAudio
+                ? mkvMeta.audioChannels
+                : 0
+            )
+        );
 
     json +=
         ",\"start_epoch_sec\":";
@@ -6142,6 +6763,7 @@ R"HTML(</span></a>
     </div>
 </div>
 
+<audio id="audioTrack" preload="auto"></audio>
 <div id="status">Loading...</div>
 
 </div></main>
@@ -6176,6 +6798,7 @@ const deleteBtns = document.querySelectorAll('.deleteBtn');
 const seek = document.getElementById('seek');
 const timeLabel = document.getElementById('time');
 const statusEl = document.getElementById('status');
+const audioEl = document.getElementById('audioTrack');
 const timestampEl = document.getElementById('timestamp');
 const annotationOverlayEl = document.getElementById('annotationOverlay');
 const annotationTextEl = document.getElementById('annotationText');
@@ -6210,6 +6833,11 @@ const sparseGapDisplayMs = 500;
 let playing = false;
 let loading = false;
 let currentObjectUrl = null;
+let audioObjectUrl = null;
+let audioReady = false;
+let audioFailed = false;
+let audioNeedsGesture = false;
+let audioLoadStarted = false;
 
 let subtitleSecond = -1;
 let subtitleRequestSerial = 0;
@@ -6539,6 +7167,184 @@ function formatCaptureTimestamp(epochMs) {
 }
 
 
+function playbackTimeMsForCurrentFrame() {
+    if (!meta)
+        return 0;
+
+    return Math.min(
+        Number(meta.duration_ms || 0),
+        meta.variable_timing
+            ? Math.max(0, Number(currentFrameTimeMs || 0))
+            : Math.round(
+                currentFrame * 1000 /
+                Math.max(1, Number(meta.fps || 1))
+            )
+    );
+}
+
+function pauseAudio() {
+    if (!audioEl)
+        return;
+
+    try {
+        audioEl.pause();
+    } catch (e) {}
+}
+
+function syncAudioToCurrentFrame(force=false) {
+    if (
+        !audioEl ||
+        !audioReady ||
+        !meta ||
+        !meta.audio
+    ) {
+        return;
+    }
+
+    const targetSeconds =
+        playbackTimeMsForCurrentFrame() /
+        1000;
+
+    const currentSeconds =
+        Number(audioEl.currentTime || 0);
+
+    if (
+        force ||
+        Math.abs(currentSeconds - targetSeconds) > 0.35
+    ) {
+        try {
+            audioEl.currentTime =
+                Math.max(
+                    0,
+                    Math.min(
+                        targetSeconds,
+                        Number(audioEl.duration || targetSeconds)
+                    )
+                );
+        } catch (e) {}
+    }
+}
+
+function startAudioPlayback() {
+    if (
+        !audioEl ||
+        !audioReady ||
+        !meta ||
+        !meta.audio
+    ) {
+        return;
+    }
+
+    syncAudioToCurrentFrame(true);
+    audioEl.playbackRate = playbackSpeed;
+
+    const promise =
+        audioEl.play();
+
+    if (promise && typeof promise.then === 'function') {
+        promise.then(function() {
+            audioNeedsGesture = false;
+            updateUi();
+            updateStatus();
+        }).catch(function() {
+            audioNeedsGesture = true;
+            updateUi();
+            updateStatus();
+        });
+    } else {
+        audioNeedsGesture = false;
+        updateUi();
+    }
+}
+
+function tryResumeAudioFromGesture() {
+    if (
+        !playing ||
+        !audioNeedsGesture ||
+        !audioReady ||
+        !meta ||
+        !meta.audio
+    ) {
+        return;
+    }
+
+    startAudioPlayback();
+}
+
+async function loadEmbeddedAudio() {
+    audioLoadStarted = true;
+    audioReady = false;
+    audioFailed = false;
+    audioNeedsGesture = false;
+
+    if (
+        !audioEl ||
+        !meta ||
+        !meta.audio
+    ) {
+        return true;
+    }
+
+    statusEl.textContent =
+        'Loading embedded audio...';
+
+    const response =
+        await fetch(
+            '/player_audio?path=' +
+            encodeURIComponent(path) +
+            '&t=' +
+            Date.now(),
+            {cache:'no-store'}
+        );
+
+    if (!response.ok)
+        throw new Error(
+            'Audio HTTP ' +
+            response.status
+        );
+
+    const blob =
+        await response.blob();
+
+    if (audioObjectUrl)
+        URL.revokeObjectURL(audioObjectUrl);
+
+    audioObjectUrl =
+        URL.createObjectURL(blob);
+
+    await new Promise(function(resolve, reject) {
+        const cleanup = function() {
+            audioEl.removeEventListener('loadedmetadata', onLoaded);
+            audioEl.removeEventListener('error', onError);
+        };
+
+        const onLoaded = function() {
+            cleanup();
+            resolve();
+        };
+
+        const onError = function() {
+            cleanup();
+            reject(new Error('Audio decode failed'));
+        };
+
+        audioEl.addEventListener('loadedmetadata', onLoaded);
+        audioEl.addEventListener('error', onError);
+        audioEl.src = audioObjectUrl;
+        audioEl.load();
+    });
+
+    audioEl.playbackRate = playbackSpeed;
+    audioReady = true;
+    syncAudioToCurrentFrame(true);
+
+    if (playing)
+        startAudioPlayback();
+
+    return true;
+}
+
+
 function updateUi() {
     if (!meta) return;
 
@@ -6563,7 +7369,9 @@ function updateUi() {
 
     playBtns.forEach(function(button) {
         button.textContent =
-            playing ? 'Pause' : 'Play';
+            playing
+            ? (audioNeedsGesture ? 'Enable audio' : 'Pause')
+            : 'Play';
     });
 
     prevFrameBtns.forEach(function(button) {
@@ -6630,7 +7438,7 @@ async function saveAnnotationText(text) {
         try {
             const parts = path.split('/');
             if (parts.length >= 3 && parts[1]) {
-                sessionStorage.removeItem('recordings.day.' + parts[1]);
+                sessionStorage.removeItem('recordings.v54.day.' + parts[1]);
                 sessionStorage.setItem('recordings.annotationDirtyDay', parts[1]);
             }
         } catch (e) {}
@@ -6672,6 +7480,15 @@ function updateStatus() {
         (
             meta.subtitles
             ? ' | Timestamp'
+            : ''
+        ) +
+        (
+            meta.audio
+            ? (
+                audioReady
+                ? (audioNeedsGesture ? ' | Audio ready - click to enable' : ' | Audio')
+                : (audioFailed ? ' | Audio unavailable' : ' | Audio loading')
+            )
             : ''
         );
 }
@@ -7051,6 +7868,13 @@ function showBatchFrame(item) {
     updateSubtitle(
         currentFrame
     );
+
+    if (
+        playing &&
+        audioReady
+    ) {
+        syncAudioToCurrentFrame(false);
+    }
 }
 
 
@@ -7118,6 +7942,7 @@ async function runSingleFramePlayback(
             meta.frames - 1
     ) {
         playing = false;
+        pauseAudio();
         updateUi();
     }
 }
@@ -7229,6 +8054,7 @@ async function runBatchPlayback(
                 releaseBatch(batch);
 
                 playing = false;
+                pauseAudio();
                 updateUi();
                 return;
             }
@@ -7237,6 +8063,7 @@ async function runBatchPlayback(
 
             if (!nextBatchPromise) {
                 playing = false;
+                pauseAudio();
                 updateUi();
                 return;
             }
@@ -7344,6 +8171,9 @@ async function loadFrame(frameNumber) {
             frameNumber
         );
 
+        if (!playing)
+            syncAudioToCurrentFrame(true);
+
         return true;
 
     } catch (e) {
@@ -7354,6 +8184,8 @@ async function loadFrame(frameNumber) {
 
         playing =
             false;
+
+        pauseAudio();
 
         updateUi();
 
@@ -7371,7 +8203,17 @@ function togglePlayback() {
         return;
 
     if (playing) {
+        if (
+            audioNeedsGesture &&
+            audioReady &&
+            meta.audio
+        ) {
+            startAudioPlayback();
+            return;
+        }
+
         playing = false;
+        pauseAudio();
 
         playbackGeneration++;
 
@@ -7400,6 +8242,8 @@ function togglePlayback() {
 
     updateUi();
 
+    startAudioPlayback();
+
     runBatchPlayback(
         generation
     );
@@ -7408,6 +8252,8 @@ function togglePlayback() {
 async function restartPlayback() {
     playing =
         false;
+
+    pauseAudio();
 
     playbackGeneration++;
 
@@ -7442,6 +8288,7 @@ restartBtns.forEach(function(button) {
 
 function stopPlaybackForFrameStep() {
     playing = false;
+    pauseAudio();
     playbackGeneration++;
 
     if (batchController) {
@@ -7662,6 +8509,9 @@ speedSelects.forEach(function(select) {
             other.value = String(playbackSpeed);
         });
 
+        if (audioEl && audioReady)
+            audioEl.playbackRate = playbackSpeed;
+
         updatePlaybackSpeedUrl();
         refreshMediaNavigationHrefs();
         updateStatus();
@@ -7712,7 +8562,7 @@ function removeRecordingFromListCache(recordingPath) {
 
 
         const cacheKey =
-            'recordings.day.' +
+            'recordings.v54.day.' +
             parts[1];
 
         const cached =
@@ -7796,6 +8646,8 @@ async function deleteRecording() {
     playing =
         false;
 
+    pauseAudio();
+
     playbackGeneration++;
 
     if (batchController)
@@ -7877,6 +8729,8 @@ seek.addEventListener(
 
         playing =
             false;
+
+        pauseAudio();
 
         playbackGeneration++;
 
@@ -7997,6 +8851,7 @@ document.addEventListener(
     'pointerdown',
     function() {
         sendActivityHeartbeat(false);
+        tryResumeAudioFromGesture();
     },
     { passive:true }
 );
@@ -8005,6 +8860,7 @@ document.addEventListener(
     'keydown',
     function() {
         sendActivityHeartbeat(false);
+        tryResumeAudioFromGesture();
     }
 );
 
@@ -8116,9 +8972,11 @@ async function initPlayer() {
         if (!firstFrameLoaded)
             return;
 
-        // Start playback automatically after metadata and the first
-        // frame have loaded. This player uses JPEG requests, so it is
-        // not subject to browser audio/video autoplay restrictions.
+        // Preserve the established SensorForge player behavior: entering a video
+        // from the recordings list starts picture playback automatically. Audio
+        // loading is deliberately deferred until the first video batch has had a
+        // short head start, so extracting the embedded PCM track no longer blocks
+        // the first visible frame / initial playback startup.
         playing = true;
 
         playbackGeneration++;
@@ -8131,6 +8989,22 @@ async function initPlayer() {
         runBatchPlayback(
             generation
         );
+
+        if (meta.audio && !audioLoadStarted) {
+            setTimeout(function() {
+                loadEmbeddedAudio().catch(function(audioError) {
+                    audioReady = false;
+                    audioFailed = true;
+                    audioNeedsGesture = false;
+                    console.warn(
+                        'Embedded audio unavailable:',
+                        audioError
+                    );
+                    updateUi();
+                    updateStatus();
+                });
+            }, 350);
+        }
 
     } catch (e) {
 
@@ -8154,9 +9028,16 @@ window.addEventListener(
         if (batchController)
             batchController.abort();
 
+        pauseAudio();
+
         if (currentObjectUrl)
             URL.revokeObjectURL(
                 currentObjectUrl
+            );
+
+        if (audioObjectUrl)
+            URL.revokeObjectURL(
+                audioObjectUrl
             );
     }
 );
@@ -8222,6 +9103,13 @@ void webPlayerRegisterRoutes(
         "/player_batch",
         HTTP_GET,
         handlePlayerBatch
+    );
+
+
+    server.on(
+        "/player_audio",
+        HTTP_GET,
+        handlePlayerAudio
     );
 
 
