@@ -1,6 +1,7 @@
 #include "audio_capture.h"
 
 #include "board_config.h"
+#include "config.h"
 
 #include <ESP_I2S.h>
 #include <esp_heap_caps.h>
@@ -244,109 +245,351 @@ static void captureTask(void *)
 }
 
 static bool beginBackend(
+    const AudioInputSettings &settings,
     const AudioFormat &format,
     String &error
 )
 {
-#if defined(AUDIO_INPUT_BACKEND_PDM)
-
     audioI2S.setPort(I2S_NUM_0);
-    audioI2S.setPinsPdmRx(
-        (int8_t)AUDIO_PDM_CLK_PIN,
-        (int8_t)AUDIO_PDM_DATA_PIN
-    );
     audioI2S.setTimeout(150);
 
-    if (!audioI2S.begin(
-            I2S_MODE_PDM_RX,
-            format.sampleRate,
-            I2S_DATA_BIT_WIDTH_16BIT,
-            I2S_SLOT_MODE_MONO
-        )) {
-        error = "PDM I2S initialization failed";
-        return false;
+    if (settings.backend == AUDIO_BACKEND_PDM) {
+        audioI2S.setPinsPdmRx(
+            settings.pdmClkPin,
+            settings.pdmDataPin
+        );
+
+        if (!audioI2S.begin(
+                I2S_MODE_PDM_RX,
+                format.sampleRate,
+                I2S_DATA_BIT_WIDTH_16BIT,
+                I2S_SLOT_MODE_MONO
+            )) {
+            error = "PDM I2S initialization failed";
+            return false;
+        }
+
+        i2sStarted = true;
+        return true;
     }
 
-    i2sStarted = true;
-    return true;
+    if (settings.backend == AUDIO_BACKEND_I2S_STD) {
+        audioI2S.setPins(
+            settings.i2sBclkPin,
+            settings.i2sWsPin,
+            -1,
+            settings.i2sDataPin,
+            settings.i2sMclkPin
+        );
 
-#else
+        i2s_slot_mode_t slotMode =
+            format.channels == 2
+            ? I2S_SLOT_MODE_STEREO
+            : I2S_SLOT_MODE_MONO;
 
-    (void)format;
-    error = "no audio capture backend configured for this board";
+        int8_t slotMask =
+            settings.i2sSlot == AUDIO_I2S_SLOT_RIGHT
+            ? (int8_t)I2S_STD_SLOT_RIGHT
+            : settings.i2sSlot == AUDIO_I2S_SLOT_STEREO
+              ? (int8_t)I2S_STD_SLOT_BOTH
+              : (int8_t)I2S_STD_SLOT_LEFT;
+
+        if (!audioI2S.begin(
+                I2S_MODE_STD,
+                format.sampleRate,
+                I2S_DATA_BIT_WIDTH_16BIT,
+                slotMode,
+                slotMask
+            )) {
+            error = "standard I2S initialization failed";
+            return false;
+        }
+
+        i2sStarted = true;
+        return true;
+    }
+
+    error = "no audio capture backend configured";
     return false;
-
-#endif
 }
+
 
 } // namespace
 
 
-bool audioCaptureHardwareAvailable()
+bool audioCaptureConfiguredInput(
+    AudioInputSettings &settings,
+    String &error
+)
 {
-#if defined(AUDIO_INPUT_BACKEND_PDM)
+    error = "";
+    settings = {};
+    settings.source = AUDIO_SOURCE_BOARD_DEFAULT;
+    settings.backend = AUDIO_BACKEND_NONE;
+    settings.pdmClkPin = -1;
+    settings.pdmDataPin = -1;
+    settings.i2sBclkPin = -1;
+    settings.i2sWsPin = -1;
+    settings.i2sDataPin = -1;
+    settings.i2sMclkPin = -1;
+    settings.i2sSlot = AUDIO_I2S_SLOT_LEFT;
+
+    if (cfg_audio_source == "external") {
+        if (!cfg_audio_expert_mode) {
+            error = "external audio source requires expert mode";
+            return false;
+        }
+
+        settings.source = AUDIO_SOURCE_EXTERNAL;
+
+        if (cfg_audio_backend == "pdm") {
+            settings.backend = AUDIO_BACKEND_PDM;
+            settings.pdmClkPin = (int8_t)cfg_audio_pdm_clk_pin;
+            settings.pdmDataPin = (int8_t)cfg_audio_pdm_data_pin;
+            return true;
+        }
+
+        if (cfg_audio_backend == "i2s") {
+            settings.backend = AUDIO_BACKEND_I2S_STD;
+            settings.i2sBclkPin = (int8_t)cfg_audio_i2s_bclk_pin;
+            settings.i2sWsPin = (int8_t)cfg_audio_i2s_ws_pin;
+            settings.i2sDataPin = (int8_t)cfg_audio_i2s_data_pin;
+            settings.i2sMclkPin = (int8_t)cfg_audio_i2s_mclk_pin;
+
+            if (cfg_audio_i2s_slot == "right") {
+                settings.i2sSlot = AUDIO_I2S_SLOT_RIGHT;
+            } else if (cfg_audio_i2s_slot == "stereo") {
+                settings.i2sSlot = AUDIO_I2S_SLOT_STEREO;
+            } else {
+                settings.i2sSlot = AUDIO_I2S_SLOT_LEFT;
+            }
+
+            return true;
+        }
+
+        error = "unsupported external audio backend";
+        return false;
+    }
+
+#if BOARD_HAS_INTEGRATED_MIC
+#if defined(BOARD_INTEGRATED_MIC_BACKEND_PDM)
+    settings.source = AUDIO_SOURCE_BOARD_DEFAULT;
+    settings.backend = AUDIO_BACKEND_PDM;
+    settings.pdmClkPin =
+        (int8_t)BOARD_INTEGRATED_MIC_PDM_CLK_PIN;
+    settings.pdmDataPin =
+        (int8_t)BOARD_INTEGRATED_MIC_PDM_DATA_PIN;
     return true;
 #else
+#error "BOARD_HAS_INTEGRATED_MIC requires a supported integrated mic backend"
+#endif
+#else
+    error = "this board has no integrated microphone";
     return false;
 #endif
+}
+
+
+const char *audioCaptureBackendName(
+    const AudioInputSettings &settings
+)
+{
+    if (settings.source == AUDIO_SOURCE_BOARD_DEFAULT) {
+#if BOARD_HAS_INTEGRATED_MIC
+        return BOARD_INTEGRATED_MIC_NAME;
+#else
+        return "No integrated microphone";
+#endif
+    }
+
+    if (settings.backend == AUDIO_BACKEND_PDM)
+        return "External PDM microphone";
+
+    if (settings.backend == AUDIO_BACKEND_I2S_STD)
+        return "External I2S microphone";
+
+    return "No audio input";
+}
+
+
+AudioCaptureCapabilities audioCaptureCapabilities(
+    const AudioInputSettings &settings
+)
+{
+    AudioCaptureCapabilities caps = {};
+    caps.backend = settings.backend;
+    caps.available = settings.backend != AUDIO_BACKEND_NONE;
+
+    if (!caps.available)
+        return caps;
+
+    if (
+        settings.source == AUDIO_SOURCE_BOARD_DEFAULT &&
+        settings.backend == AUDIO_BACKEND_PDM
+    ) {
+#if BOARD_HAS_INTEGRATED_MIC && defined(BOARD_INTEGRATED_MIC_BACKEND_PDM)
+        caps.minSampleRate =
+            BOARD_INTEGRATED_MIC_MIN_SAMPLE_RATE_HZ;
+        caps.maxSampleRate =
+            BOARD_INTEGRATED_MIC_MAX_SAMPLE_RATE_HZ;
+        caps.recommendedSampleRate =
+            BOARD_INTEGRATED_MIC_RECOMMENDED_SAMPLE_RATE_HZ;
+        caps.supports16Bit = true;
+        caps.supports24Bit = false;
+        caps.supports32Bit = false;
+        caps.supportsMono = true;
+        caps.supportsStereo = false;
+#else
+        caps.available = false;
+        caps.backend = AUDIO_BACKEND_NONE;
+#endif
+        return caps;
+    }
+
+    if (settings.backend == AUDIO_BACKEND_PDM) {
+        caps.minSampleRate = 8000UL;
+        caps.maxSampleRate = 48000UL;
+        caps.recommendedSampleRate = 16000UL;
+        caps.supports16Bit = true;
+        caps.supports24Bit = false;
+        caps.supports32Bit = false;
+        caps.supportsMono = true;
+        caps.supportsStereo = false;
+        return caps;
+    }
+
+    if (settings.backend == AUDIO_BACKEND_I2S_STD) {
+        caps.minSampleRate = 8000UL;
+        caps.maxSampleRate = 96000UL;
+        caps.recommendedSampleRate = 16000UL;
+        caps.supports16Bit = true;
+        caps.supports24Bit = false;
+        caps.supports32Bit = false;
+        caps.supportsMono = true;
+        caps.supportsStereo = true;
+        return caps;
+    }
+
+    caps.available = false;
+    caps.backend = AUDIO_BACKEND_NONE;
+    return caps;
+}
+
+
+bool audioCaptureHardwareAvailable()
+{
+    AudioInputSettings settings;
+    String error;
+
+    return
+        audioCaptureConfiguredInput(settings, error) &&
+        audioCaptureCapabilities(settings).available;
 }
 
 
 AudioBackendKind audioCaptureBackendKind()
 {
-#if defined(AUDIO_INPUT_BACKEND_PDM)
-    return AUDIO_BACKEND_PDM;
-#else
-    return AUDIO_BACKEND_NONE;
-#endif
+    AudioInputSettings settings;
+    String error;
+
+    if (!audioCaptureConfiguredInput(settings, error))
+        return AUDIO_BACKEND_NONE;
+
+    return settings.backend;
 }
 
 
 const char *audioCaptureBackendName()
 {
-#ifdef AUDIO_INPUT_NAME
-    return AUDIO_INPUT_NAME;
-#elif defined(AUDIO_INPUT_BACKEND_PDM)
-    return "PDM microphone";
-#else
-    return "No audio input";
-#endif
+    AudioInputSettings settings;
+    String error;
+
+    if (!audioCaptureConfiguredInput(settings, error))
+        return "No audio input";
+
+    return audioCaptureBackendName(settings);
 }
 
 
 AudioCaptureCapabilities audioCaptureCapabilities()
 {
-    AudioCaptureCapabilities caps = {};
-    caps.backend = audioCaptureBackendKind();
-    caps.available = audioCaptureHardwareAvailable();
+    AudioInputSettings settings;
+    String error;
 
-#if defined(AUDIO_INPUT_BACKEND_PDM)
-    caps.minSampleRate = AUDIO_INPUT_MIN_SAMPLE_RATE_HZ;
-    caps.maxSampleRate = AUDIO_INPUT_MAX_SAMPLE_RATE_HZ;
-    caps.recommendedSampleRate = AUDIO_INPUT_RECOMMENDED_SAMPLE_RATE_HZ;
-    caps.supports16Bit = true;
-    caps.supports24Bit = false;
-    caps.supports32Bit = false;
-    caps.supportsMono = true;
-    caps.supportsStereo = false;
-#endif
+    if (!audioCaptureConfiguredInput(settings, error)) {
+        AudioCaptureCapabilities caps = {};
+        caps.backend = AUDIO_BACKEND_NONE;
+        caps.available = false;
+        return caps;
+    }
 
-    return caps;
+    return audioCaptureCapabilities(settings);
 }
 
 
 bool audioCaptureFormatSupported(
+    const AudioInputSettings &settings,
     const AudioFormat &format,
     String &error
 )
 {
     error = "";
 
-    AudioCaptureCapabilities caps = audioCaptureCapabilities();
+    AudioCaptureCapabilities caps =
+        audioCaptureCapabilities(settings);
 
     if (!caps.available) {
-        error = "no audio input configured for this board";
+        error = "no audio input configured";
         return false;
+    }
+
+    if (settings.backend == AUDIO_BACKEND_PDM) {
+        if (
+            settings.pdmClkPin < 0 ||
+            settings.pdmDataPin < 0 ||
+            settings.pdmClkPin == settings.pdmDataPin
+        ) {
+            error = "invalid PDM pin configuration";
+            return false;
+        }
+    }
+
+    if (settings.backend == AUDIO_BACKEND_I2S_STD) {
+        if (
+            settings.i2sBclkPin < 0 ||
+            settings.i2sWsPin < 0 ||
+            settings.i2sDataPin < 0 ||
+            settings.i2sBclkPin == settings.i2sWsPin ||
+            settings.i2sBclkPin == settings.i2sDataPin ||
+            settings.i2sWsPin == settings.i2sDataPin ||
+            (
+                settings.i2sMclkPin >= 0 &&
+                (
+                    settings.i2sMclkPin == settings.i2sBclkPin ||
+                    settings.i2sMclkPin == settings.i2sWsPin ||
+                    settings.i2sMclkPin == settings.i2sDataPin
+                )
+            )
+        ) {
+            error = "invalid I2S pin configuration";
+            return false;
+        }
+
+        if (
+            format.channels == 2 &&
+            settings.i2sSlot != AUDIO_I2S_SLOT_STEREO
+        ) {
+            error = "stereo I2S requires stereo slot selection";
+            return false;
+        }
+
+        if (
+            format.channels == 1 &&
+            settings.i2sSlot == AUDIO_I2S_SLOT_STEREO
+        ) {
+            error = "mono I2S requires left or right slot selection";
+            return false;
+        }
     }
 
     if (
@@ -385,7 +628,26 @@ bool audioCaptureFormatSupported(
 }
 
 
+bool audioCaptureFormatSupported(
+    const AudioFormat &format,
+    String &error
+)
+{
+    AudioInputSettings settings;
+
+    if (!audioCaptureConfiguredInput(settings, error))
+        return false;
+
+    return audioCaptureFormatSupported(
+        settings,
+        format,
+        error
+    );
+}
+
+
 bool audioCaptureStart(
+    const AudioInputSettings &settings,
     const AudioFormat &format,
     String &error
 )
@@ -397,8 +659,13 @@ bool audioCaptureStart(
         return false;
     }
 
-    if (!audioCaptureFormatSupported(format, error))
+    if (!audioCaptureFormatSupported(
+            settings,
+            format,
+            error
+        )) {
         return false;
+    }
 
     releaseBuffers();
     resetStats();
@@ -406,7 +673,11 @@ bool audioCaptureStart(
     if (!allocateBuffers(format, error))
         return false;
 
-    if (!beginBackend(format, error)) {
+    if (!beginBackend(
+            settings,
+            format,
+            error
+        )) {
         releaseBuffers();
         return false;
     }
@@ -442,6 +713,25 @@ bool audioCaptureStart(
     }
 
     return true;
+}
+
+
+
+bool audioCaptureStart(
+    const AudioFormat &format,
+    String &error
+)
+{
+    AudioInputSettings settings;
+
+    if (!audioCaptureConfiguredInput(settings, error))
+        return false;
+
+    return audioCaptureStart(
+        settings,
+        format,
+        error
+    );
 }
 
 

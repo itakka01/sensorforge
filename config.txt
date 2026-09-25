@@ -1,6 +1,6 @@
-# SensorForge v49 canonical configuration
-# Cleaned from the supplied configuration on 2026-09-24.
-# All 69 current canonical v49 configuration keys are present exactly once.
+# SensorForge v51 canonical configuration
+# Updated from the supplied configuration on 2026-09-25.
+# All 79 current canonical v51 configuration keys are present exactly once.
 # Legacy keys were migrated to their current equivalents.
 #
 # SECURITY NOTE:
@@ -80,8 +80,30 @@ timestamp_enabled=1
 # 1 = new recording media uses SensorForge encryption; 0 = normal storage
 recording_encryption=0
 
-# v49 audio foundation: 1 = audio capture enabled; 0 = disabled
+# 1 = audio capture enabled; 0 = disabled
 audio_enabled=0
+
+# 0 = normal user mode; 1 = expert hardware configuration available
+audio_expert_mode=0
+
+# board_default = fixed microphone from board_config.h; external = user-wired microphone
+audio_source=board_default
+
+# External backend used only when audio_source=external: pdm or i2s
+audio_backend=pdm
+
+# External PDM GPIOs; -1 = not configured/unused
+audio_pdm_clk_pin=-1
+audio_pdm_data_pin=-1
+
+# External standard-I2S GPIOs; MCLK may stay -1 when the microphone does not need it
+audio_i2s_bclk_pin=-1
+audio_i2s_ws_pin=-1
+audio_i2s_data_pin=-1
+audio_i2s_mclk_pin=-1
+
+# Standard-I2S receive slot: left, right or stereo
+audio_i2s_slot=left
 
 # Audio sample rate in Hz
 audio_sample_rate=16000
@@ -221,7 +243,7 @@ disk_full_action=rollover
 wifi_on_system_start=on
 
 # Automatic Wi-Fi shutdown after inactivity; 0 = never auto-shut down
-wifi_timeout_sec=60
+wifi_timeout_sec=0
 
 # Device hostname; also used as hotspot SSID
 hostname=printer51

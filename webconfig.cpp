@@ -13,6 +13,7 @@
 #include <WebServer.h>
 #include <esp_camera.h>
 #include <esp_system.h>
+#include <esp_heap_caps.h>
 #include <esp_sleep.h>
 #include <esp_task_wdt.h>
 #include <esp_ota_ops.h>
@@ -534,6 +535,28 @@ static String htmlEscape(const String &value)
             case '"':  out += F("&quot;"); break;
             case '\'': out += F("&#39;");  break;
             default:   out += c;            break;
+        }
+    }
+
+    return out;
+}
+
+
+static String htmlJsString(const String &value)
+{
+    String out;
+    out.reserve(value.length() + 16);
+
+    for (size_t i = 0; i < value.length(); ++i) {
+        char c = value[i];
+
+        switch (c) {
+            case '\\': out += F("\\\\"); break;
+            case '\'': out += F("\\'"); break;
+            case '\r': out += F("\\r"); break;
+            case '\n': out += F("\\n"); break;
+            case '<': out += F("\\x3C"); break;
+            default: out += c; break;
         }
     }
 
@@ -1327,7 +1350,7 @@ static String htmlFooter()
         "var p=location.pathname;"
         "var group='';"
         "if(p==='/')group='home';"
-        "else if(p==='/config'||p==='/save'||p==='/audio_test_record')group='config';"
+        "else if(p==='/config'||p==='/save'||p==='/audio_test_record'||p==='/audio_benchmark')group='config';"
         "else if(p.indexOf('/files')===0||p==='/file'||p==='/play')group='recordings';"
         "else if(p==='/preview'||p==='/snapshot')group='camera';else if(p==='/image_motion')group='sensor';"
         "else if(p.indexOf('/radar_')===0)group='sensor';"
@@ -3904,55 +3927,209 @@ static void handleConfig()
 
     html +=
         "<div style='margin-top:18px;padding:14px;border:1px solid #8fb5c9;border-radius:8px;background:#f7fbfd'>"
-        "<b>Audio / Mikrofon</b><br>"
-        "<span class='muted'>Backend: <b>" +
-        htmlEscape(String(audioCaptureBackendName())) +
-        "</b>. Die Audio-Schnittstelle ist bewusst unabhängig von Kamera und Video-Writer aufgebaut. "
-        "v47 verwendet sie zunächst für einen separaten WAV-Hardwaretest; AVI/MKV bleiben in dieser Phase unverändert.</span><br><br>";
+        "<b>" +
+        htmlText(UI_AUDIO_TITLE) +
+        "</b><br>"
+        "<span class='muted'>" +
+        htmlText(UI_AUDIO_SIMPLE_HELP) +
+        "</span><br><br>";
 
-    html += "audio_enabled: <select name='audio_enabled'>";
+    html +=
+        htmlText(UI_AUDIO_ENABLE) +
+        ": <select name='audio_enabled'>";
     html += "<option value='0'" +
             String(!cfg_audio_enabled ? " selected" : "") +
-            ">0 - aus</option>";
+            ">0 - " + htmlText(UI_AUDIO_OFF) + "</option>";
     html += "<option value='1'" +
             String(cfg_audio_enabled ? " selected" : "") +
-            String(audioCaps.available ? "" : " disabled") +
-            ">1 - an</option>";
-    html += "</select><br>";
+            ">1 - " + htmlText(UI_AUDIO_ON) + "</option>";
+    html += "</select><br><br>";
+
+    html +=
+        "<button type='button' onclick=\"sfAudioAdvancedOpen()\">" +
+        htmlText(UI_AUDIO_ADVANCED_SETTINGS) +
+        "</button> ";
+
+    if (audioCaps.available) {
+        html +=
+            "<button type='submit' formaction='/audio_test_record' formmethod='post' "
+            "onclick=\"return sfAudioProgressSubmit(this,'test')\">" +
+            htmlText(UI_AUDIO_TEST) +
+            "</button> "
+            "<button type='submit' formaction='/audio_benchmark' formmethod='post' "
+            "onclick=\"return sfAudioProgressSubmit(this,'benchmark')\">" +
+            htmlText(UI_AUDIO_BENCHMARK) +
+            "</button><br>"
+            "<small class='muted'>" +
+            htmlText(UI_AUDIO_TEST_HELP) +
+            "</small><br>"
+            "<small class='muted'>" +
+            htmlText(UI_AUDIO_BENCHMARK_HELP) +
+            "</small>";
+    } else {
+        html +=
+            "<br><small style='color:#9a5a00'>" +
+            htmlText(UI_AUDIO_NO_INPUT) +
+            "</small>";
+    }
+
+    html +=
+        "<br><small class='muted'>" +
+        htmlText(UI_AUDIO_ENCRYPTION_NOTE) +
+        "</small>";
+
+    html +=
+        "<div id='sfAudioAdvancedModal' style='display:none;position:fixed;z-index:12000;inset:0;background:rgba(0,0,0,.48);padding:18px;overflow:auto'>"
+        "<div style='max-width:720px;margin:5vh auto;background:#fff;border-radius:10px;padding:18px;box-shadow:0 10px 36px rgba(0,0,0,.3)'>"
+        "<div style='display:flex;justify-content:space-between;align-items:center;gap:12px'>"
+        "<h3 style='margin:0'>" + htmlText(UI_AUDIO_ADVANCED_TITLE) + "</h3>"
+        "<button type='button' onclick=\"sfAudioAdvancedClose()\">&times;</button>"
+        "</div><p class='muted'>" + htmlText(UI_AUDIO_ADVANCED_HELP) + "</p>";
+
+#if BOARD_HAS_INTEGRATED_MIC
+    String boardAudioName = BOARD_INTEGRATED_MIC_NAME;
+#else
+    String boardAudioName = tr(UI_NOT_DETECTED);
+#endif
+
+    html +=
+        "<p class='muted'>" +
+        htmlText(UI_AUDIO_SOURCE_BOARD_DEFAULT) +
+        ": <b>" + htmlEscape(boardAudioName) + "</b><br>" +
+        htmlText(UI_AUDIO_SOURCE) +
+        " (" + htmlText(UI_STATUS_ACTIVE) + "): <b>" +
+        htmlEscape(String(audioCaptureBackendName())) +
+        "</b></p>";
+
+    html +=
+        htmlText(UI_AUDIO_EXPERT_MODE) +
+        ": <select id='cfgAudioExpertMode' name='audio_expert_mode' onchange='sfAudioUi()'>"
+        "<option value='0'" +
+        String(!cfg_audio_expert_mode ? " selected" : "") +
+        ">0 - User</option>"
+        "<option value='1'" +
+        String(cfg_audio_expert_mode ? " selected" : "") +
+        ">1 - Expert</option>"
+        "</select><br>";
+
+    html +=
+        htmlText(UI_AUDIO_SOURCE) +
+        ": <select id='cfgAudioSource' name='audio_source' onchange='sfAudioUi()'>"
+        "<option value='board_default'" +
+        String(cfg_audio_source == "board_default" ? " selected" : "") +
+        ">" + htmlText(UI_AUDIO_SOURCE_BOARD_DEFAULT) + "</option>"
+        "<option value='external'" +
+        String(cfg_audio_source == "external" ? " selected" : "") +
+        ">" + htmlText(UI_AUDIO_SOURCE_EXTERNAL) + "</option>"
+        "</select><br>";
 
     html +=
         "audio_sample_rate: <input name='audio_sample_rate' type='number' min='8000' max='96000' step='1000' value='" +
         String(cfg_audio_sample_rate) +
-        "'> Hz<br>";
+        "' style='width:110px'> Hz<br>";
 
     html += "audio_bits_per_sample: <select name='audio_bits_per_sample'>";
-    html += "<option value='16'" + String(cfg_audio_bits_per_sample == 16 ? " selected" : "") + String(audioCaps.supports16Bit ? "" : " disabled") + ">16 bit</option>";
-    html += "<option value='24'" + String(cfg_audio_bits_per_sample == 24 ? " selected" : "") + String(audioCaps.supports24Bit ? "" : " disabled") + ">24 bit</option>";
-    html += "<option value='32'" + String(cfg_audio_bits_per_sample == 32 ? " selected" : "") + String(audioCaps.supports32Bit ? "" : " disabled") + ">32 bit</option>";
+    html += "<option value='16'" + String(cfg_audio_bits_per_sample == 16 ? " selected" : "") + ">16 bit</option>";
+    html += "<option value='24'" + String(cfg_audio_bits_per_sample == 24 ? " selected" : "") + ">24 bit</option>";
+    html += "<option value='32'" + String(cfg_audio_bits_per_sample == 32 ? " selected" : "") + ">32 bit</option>";
     html += "</select><br>";
 
     html += "audio_channels: <select name='audio_channels'>";
-    html += "<option value='1'" + String(cfg_audio_channels == 1 ? " selected" : "") + String(audioCaps.supportsMono ? "" : " disabled") + ">1 - mono</option>";
-    html += "<option value='2'" + String(cfg_audio_channels == 2 ? " selected" : "") + String(audioCaps.supportsStereo ? "" : " disabled") + ">2 - stereo</option>";
+    html += "<option value='1'" + String(cfg_audio_channels == 1 ? " selected" : "") + ">1 - mono</option>";
+    html += "<option value='2'" + String(cfg_audio_channels == 2 ? " selected" : "") + ">2 - stereo</option>";
     html += "</select><br>";
+
+    html +=
+        "<div id='cfgAudioExpertPanel' style='margin-top:12px;padding:12px;border:1px dashed #78909c;border-radius:6px'>"
+        "<b>" + htmlText(UI_AUDIO_EXTERNAL_PINS) + "</b><br>"
+        "<small class='muted'>" + htmlText(UI_AUDIO_EXPERT_HELP) + "</small><br>"
+        "<small style='color:#9a5a00'>" + htmlText(UI_AUDIO_GPIO_WARNING) + "</small><br><br>" +
+        htmlText(UI_AUDIO_BACKEND) +
+        ": <select id='cfgAudioBackend' name='audio_backend' onchange='sfAudioUi()'>"
+        "<option value='pdm'" +
+        String(cfg_audio_backend == "pdm" ? " selected" : "") +
+        ">" + htmlText(UI_AUDIO_BACKEND_PDM) + "</option>"
+        "<option value='i2s'" +
+        String(cfg_audio_backend == "i2s" ? " selected" : "") +
+        ">" + htmlText(UI_AUDIO_BACKEND_I2S) + "</option>"
+        "</select><br>";
+
+    html +=
+        "<div id='cfgAudioPdmPanel' style='margin-top:8px'>"
+        "audio_pdm_clk_pin: <input name='audio_pdm_clk_pin' type='number' min='-1' max='48' value='" +
+        String(cfg_audio_pdm_clk_pin) +
+        "' style='width:80px'><br>"
+        "audio_pdm_data_pin: <input name='audio_pdm_data_pin' type='number' min='-1' max='48' value='" +
+        String(cfg_audio_pdm_data_pin) +
+        "' style='width:80px'><br>"
+        "</div>";
+
+    html +=
+        "<div id='cfgAudioI2sPanel' style='margin-top:8px'>"
+        "audio_i2s_bclk_pin: <input name='audio_i2s_bclk_pin' type='number' min='-1' max='48' value='" +
+        String(cfg_audio_i2s_bclk_pin) +
+        "' style='width:80px'><br>"
+        "audio_i2s_ws_pin: <input name='audio_i2s_ws_pin' type='number' min='-1' max='48' value='" +
+        String(cfg_audio_i2s_ws_pin) +
+        "' style='width:80px'><br>"
+        "audio_i2s_data_pin: <input name='audio_i2s_data_pin' type='number' min='-1' max='48' value='" +
+        String(cfg_audio_i2s_data_pin) +
+        "' style='width:80px'><br>"
+        "audio_i2s_mclk_pin: <input name='audio_i2s_mclk_pin' type='number' min='-1' max='48' value='" +
+        String(cfg_audio_i2s_mclk_pin) +
+        "' style='width:80px'> <small class='muted'>-1 = unused</small><br>" +
+        htmlText(UI_AUDIO_I2S_SLOT) +
+        ": <select name='audio_i2s_slot'>"
+        "<option value='left'" + String(cfg_audio_i2s_slot == "left" ? " selected" : "") + ">left</option>"
+        "<option value='right'" + String(cfg_audio_i2s_slot == "right" ? " selected" : "") + ">right</option>"
+        "<option value='stereo'" + String(cfg_audio_i2s_slot == "stereo" ? " selected" : "") + ">stereo</option>"
+        "</select><br>"
+        "</div>"
+        "<small class='muted'>" + htmlText(UI_AUDIO_SAVE_HARDWARE_NOTE) + "</small>"
+        "</div>";
 
     if (audioCaps.available) {
         html +=
-            "<small class='muted'>Backend-Bereich: " +
-            String((unsigned long)audioCaps.minSampleRate) +
-            ".." +
-            String((unsigned long)audioCaps.maxSampleRate) +
-            " Hz; empfohlen für dieses Board: " +
+            "<p class='muted'>Backend: " +
+            String((unsigned long)audioCaps.minSampleRate) + ".." +
+            String((unsigned long)audioCaps.maxSampleRate) + " Hz; " +
+            htmlText(UI_AUDIO_RECOMMENDED) + " " +
             String((unsigned long)audioCaps.recommendedSampleRate) +
-            " Hz. Beim XIAO-PDM-Mikrofon sind 16 bit / mono hardwarebedingt.</small><br><br>"
-            "<button type='submit' formaction='/audio_test_record' formmethod='post'>5 s WAV-Audiotest aufnehmen</button> "
-            "<small class='muted'>Testet die aktuell im Formular gewählten Audio-Werte, ohne die Konfiguration zu speichern.</small>";
-    } else {
-        html +=
-            "<small style='color:#9a5a00'>Für dieses Boardprofil ist noch kein Audio-Eingang konfiguriert.</small>";
+            " Hz.</p>";
     }
 
     html +=
+        "<div style='margin-top:16px;text-align:right'>"
+        "<button type='button' onclick=\"sfAudioAdvancedClose()\">" +
+        htmlText(UI_AUDIO_CLOSE) +
+        "</button>"
+        "</div></div></div>";
+
+    html +=
+        "<div id='sfAudioProgressModal' style='display:none;position:fixed;z-index:13000;inset:0;background:rgba(0,0,0,.56);padding:18px'>"
+        "<div style='max-width:520px;margin:18vh auto;background:#fff;border-radius:10px;padding:20px;box-shadow:0 10px 36px rgba(0,0,0,.35)'>"
+        "<h3 id='sfAudioProgressTitle' style='margin-top:0'>" + htmlText(UI_AUDIO_TEST_RUNNING) + "</h3>"
+        "<p id='sfAudioProgressText' class='muted'>" + htmlText(UI_AUDIO_TEST_RUNNING_HELP) + "</p>"
+        "<div style='height:8px;background:#d7dde3;border-radius:999px;overflow:hidden;position:relative;margin:20px 0'>"
+        "<span style='position:absolute;top:0;width:18%;height:100%;border-radius:999px;background:#c62828;animation:sfAudioSlide 1.2s ease-in-out infinite alternate'></span>"
+        "</div>"
+        "<small class='muted'>" + htmlText(UI_AUDIO_PROGRESS_NOTE) + "</small>"
+        "</div></div>"
+        "<style>@keyframes sfAudioSlide{from{left:0}to{left:82%}}</style>"
+        "<script>"
+        "function sfAudioAdvancedOpen(){var m=document.getElementById('sfAudioAdvancedModal');if(m)m.style.display='block';}"
+        "function sfAudioAdvancedClose(){var m=document.getElementById('sfAudioAdvancedModal');if(m)m.style.display='none';}"
+        "function sfAudioProgressStart(kind){"
+        "var m=document.getElementById('sfAudioProgressModal');var t=document.getElementById('sfAudioProgressTitle');var p=document.getElementById('sfAudioProgressText');"
+        "if(kind==='benchmark'){if(t)t.textContent='" + htmlJsString(tr(UI_AUDIO_BENCHMARK_RUNNING)) + "';if(p)p.textContent='" + htmlJsString(tr(UI_AUDIO_BENCHMARK_RUNNING_HELP)) + "';}"
+        "else{if(t)t.textContent='" + htmlJsString(tr(UI_AUDIO_TEST_RUNNING)) + "';if(p)p.textContent='" + htmlJsString(tr(UI_AUDIO_TEST_RUNNING_HELP)) + "';}"
+        "if(m)m.style.display='block';return true;}"
+        "function sfAudioProgressSubmit(btn,kind){sfAudioProgressStart(kind);setTimeout(function(){var f=btn&&btn.form;if(!f)return;f.action=btn.formAction;f.method='post';f.submit();},80);return false;}"
+        "function sfAudioUi(){"
+        "var e=document.getElementById('cfgAudioExpertMode');var s=document.getElementById('cfgAudioSource');var p=document.getElementById('cfgAudioExpertPanel');var b=document.getElementById('cfgAudioBackend');var pp=document.getElementById('cfgAudioPdmPanel');var ip=document.getElementById('cfgAudioI2sPanel');"
+        "if(!e||!s||!p||!b||!pp||!ip)return;var expert=e.value==='1';if(!expert&&s.value==='external')s.value='board_default';p.style.display=expert?'block':'none';var external=expert&&s.value==='external';b.disabled=!external;pp.style.display=external&&b.value==='pdm'?'block':'none';ip.style.display=external&&b.value==='i2s'?'block':'none';}"
+        "sfAudioUi();"
+        "</script>"
         "</div>";
 
     html +=
@@ -4626,6 +4803,62 @@ static void handleSave()
         ? (server.arg("audio_enabled").toInt() ? 1 : 0)
         : cfg_audio_enabled;
 
+    int audioExpertMode =
+        server.hasArg("audio_expert_mode")
+        ? (server.arg("audio_expert_mode").toInt() ? 1 : 0)
+        : cfg_audio_expert_mode;
+
+    String audioSource =
+        server.hasArg("audio_source")
+        ? server.arg("audio_source")
+        : cfg_audio_source;
+    audioSource.trim();
+    audioSource.toLowerCase();
+
+    String audioBackend =
+        server.hasArg("audio_backend")
+        ? server.arg("audio_backend")
+        : cfg_audio_backend;
+    audioBackend.trim();
+    audioBackend.toLowerCase();
+
+    int audioPdmClkPin =
+        server.hasArg("audio_pdm_clk_pin")
+        ? server.arg("audio_pdm_clk_pin").toInt()
+        : cfg_audio_pdm_clk_pin;
+
+    int audioPdmDataPin =
+        server.hasArg("audio_pdm_data_pin")
+        ? server.arg("audio_pdm_data_pin").toInt()
+        : cfg_audio_pdm_data_pin;
+
+    int audioI2sBclkPin =
+        server.hasArg("audio_i2s_bclk_pin")
+        ? server.arg("audio_i2s_bclk_pin").toInt()
+        : cfg_audio_i2s_bclk_pin;
+
+    int audioI2sWsPin =
+        server.hasArg("audio_i2s_ws_pin")
+        ? server.arg("audio_i2s_ws_pin").toInt()
+        : cfg_audio_i2s_ws_pin;
+
+    int audioI2sDataPin =
+        server.hasArg("audio_i2s_data_pin")
+        ? server.arg("audio_i2s_data_pin").toInt()
+        : cfg_audio_i2s_data_pin;
+
+    int audioI2sMclkPin =
+        server.hasArg("audio_i2s_mclk_pin")
+        ? server.arg("audio_i2s_mclk_pin").toInt()
+        : cfg_audio_i2s_mclk_pin;
+
+    String audioI2sSlot =
+        server.hasArg("audio_i2s_slot")
+        ? server.arg("audio_i2s_slot")
+        : cfg_audio_i2s_slot;
+    audioI2sSlot.trim();
+    audioI2sSlot.toLowerCase();
+
     int audioSampleRate =
         server.hasArg("audio_sample_rate")
         ? server.arg("audio_sample_rate").toInt()
@@ -4657,29 +4890,6 @@ static void handleSave()
             "Ungueltige Audio-Formatwerte"
         );
         return;
-    }
-
-    if (audioEnabled) {
-        AudioFormat requestedAudio = {
-            (uint32_t)audioSampleRate,
-            (uint16_t)audioBitsPerSample,
-            (uint8_t)audioChannels
-        };
-
-        String audioError;
-
-        if (!audioCaptureFormatSupported(
-                requestedAudio,
-                audioError
-            )) {
-            server.send(
-                400,
-                "text/plain; charset=utf-8",
-                "Audio-Format fuer dieses Board nicht verfuegbar: " +
-                audioError
-            );
-            return;
-        }
     }
 
     String recordingMode =
@@ -5193,7 +5403,7 @@ static void handleSave()
     String text;
 
     text.reserve(
-        2800
+        3600
     );
 
 
@@ -5255,6 +5465,46 @@ static void handleSave()
 
     text += "audio_enabled=";
     text += String(audioEnabled);
+    text += '\n';
+
+    text += "audio_expert_mode=";
+    text += String(audioExpertMode);
+    text += '\n';
+
+    text += "audio_source=";
+    text += audioSource;
+    text += '\n';
+
+    text += "audio_backend=";
+    text += audioBackend;
+    text += '\n';
+
+    text += "audio_pdm_clk_pin=";
+    text += String(audioPdmClkPin);
+    text += '\n';
+
+    text += "audio_pdm_data_pin=";
+    text += String(audioPdmDataPin);
+    text += '\n';
+
+    text += "audio_i2s_bclk_pin=";
+    text += String(audioI2sBclkPin);
+    text += '\n';
+
+    text += "audio_i2s_ws_pin=";
+    text += String(audioI2sWsPin);
+    text += '\n';
+
+    text += "audio_i2s_data_pin=";
+    text += String(audioI2sDataPin);
+    text += '\n';
+
+    text += "audio_i2s_mclk_pin=";
+    text += String(audioI2sMclkPin);
+    text += '\n';
+
+    text += "audio_i2s_slot=";
+    text += audioI2sSlot;
     text += '\n';
 
     text += "audio_sample_rate=";
@@ -5611,6 +5861,36 @@ static void handleSave()
             cfg_audio_enabled =
                 audioEnabled;
 
+            cfg_audio_expert_mode =
+                audioExpertMode;
+
+            cfg_audio_source =
+                audioSource;
+
+            cfg_audio_backend =
+                audioBackend;
+
+            cfg_audio_pdm_clk_pin =
+                audioPdmClkPin;
+
+            cfg_audio_pdm_data_pin =
+                audioPdmDataPin;
+
+            cfg_audio_i2s_bclk_pin =
+                audioI2sBclkPin;
+
+            cfg_audio_i2s_ws_pin =
+                audioI2sWsPin;
+
+            cfg_audio_i2s_data_pin =
+                audioI2sDataPin;
+
+            cfg_audio_i2s_mclk_pin =
+                audioI2sMclkPin;
+
+            cfg_audio_i2s_slot =
+                audioI2sSlot;
+
             cfg_audio_sample_rate =
                 audioSampleRate;
 
@@ -5740,6 +6020,36 @@ static void handleSave()
 
             cfg_audio_enabled =
                 audioEnabled;
+
+            cfg_audio_expert_mode =
+                audioExpertMode;
+
+            cfg_audio_source =
+                audioSource;
+
+            cfg_audio_backend =
+                audioBackend;
+
+            cfg_audio_pdm_clk_pin =
+                audioPdmClkPin;
+
+            cfg_audio_pdm_data_pin =
+                audioPdmDataPin;
+
+            cfg_audio_i2s_bclk_pin =
+                audioI2sBclkPin;
+
+            cfg_audio_i2s_ws_pin =
+                audioI2sWsPin;
+
+            cfg_audio_i2s_data_pin =
+                audioI2sDataPin;
+
+            cfg_audio_i2s_mclk_pin =
+                audioI2sMclkPin;
+
+            cfg_audio_i2s_slot =
+                audioI2sSlot;
 
             cfg_audio_sample_rate =
                 audioSampleRate;
@@ -15077,8 +15387,80 @@ static void handleFiles()
 
 
 // -------------------------------------------------------------
-// AUDIO CAPTURE DIAGNOSTIC (v47)
+// AUDIO CAPTURE DIAGNOSTIC
 // -------------------------------------------------------------
+
+static bool audioPostedHardwareDiffers()
+{
+    String postedAudioSource = server.arg("audio_source");
+    postedAudioSource.trim();
+    postedAudioSource.toLowerCase();
+
+    String postedAudioBackend = server.arg("audio_backend");
+    postedAudioBackend.trim();
+    postedAudioBackend.toLowerCase();
+
+    String postedAudioI2sSlot = server.arg("audio_i2s_slot");
+    postedAudioI2sSlot.trim();
+    postedAudioI2sSlot.toLowerCase();
+
+    return
+        (
+            server.hasArg("audio_expert_mode") &&
+            (server.arg("audio_expert_mode").toInt() ? 1 : 0) !=
+                cfg_audio_expert_mode
+        ) ||
+        (
+            server.hasArg("audio_source") &&
+            postedAudioSource != cfg_audio_source
+        ) ||
+        (
+            server.hasArg("audio_backend") &&
+            postedAudioBackend != cfg_audio_backend
+        ) ||
+        (
+            server.hasArg("audio_pdm_clk_pin") &&
+            server.arg("audio_pdm_clk_pin").toInt() != cfg_audio_pdm_clk_pin
+        ) ||
+        (
+            server.hasArg("audio_pdm_data_pin") &&
+            server.arg("audio_pdm_data_pin").toInt() != cfg_audio_pdm_data_pin
+        ) ||
+        (
+            server.hasArg("audio_i2s_bclk_pin") &&
+            server.arg("audio_i2s_bclk_pin").toInt() != cfg_audio_i2s_bclk_pin
+        ) ||
+        (
+            server.hasArg("audio_i2s_ws_pin") &&
+            server.arg("audio_i2s_ws_pin").toInt() != cfg_audio_i2s_ws_pin
+        ) ||
+        (
+            server.hasArg("audio_i2s_data_pin") &&
+            server.arg("audio_i2s_data_pin").toInt() != cfg_audio_i2s_data_pin
+        ) ||
+        (
+            server.hasArg("audio_i2s_mclk_pin") &&
+            server.arg("audio_i2s_mclk_pin").toInt() != cfg_audio_i2s_mclk_pin
+        ) ||
+        (
+            server.hasArg("audio_i2s_slot") &&
+            postedAudioI2sSlot != cfg_audio_i2s_slot
+        );
+}
+
+
+static AudioFormat audioPostedFormat()
+{
+    AudioFormat format = {};
+    format.sampleRate =
+        (uint32_t)server.arg("audio_sample_rate").toInt();
+    format.bitsPerSample =
+        (uint16_t)server.arg("audio_bits_per_sample").toInt();
+    format.channels =
+        (uint8_t)server.arg("audio_channels").toInt();
+    return format;
+}
+
 
 static void handleAudioTestRecord()
 {
@@ -15103,13 +15485,19 @@ static void handleAudioTestRecord()
         return;
     }
 
-    AudioFormat format = {};
-    format.sampleRate =
-        (uint32_t)server.arg("audio_sample_rate").toInt();
-    format.bitsPerSample =
-        (uint16_t)server.arg("audio_bits_per_sample").toInt();
-    format.channels =
-        (uint8_t)server.arg("audio_channels").toInt();
+    // Hardware routing is intentionally persistent and explicit. Do not
+    // silently test a different microphone when the operator changed Expert
+    // fields in the form but has not saved them yet.
+    if (audioPostedHardwareDiffers()) {
+        server.send(
+            409,
+            "text/plain; charset=utf-8",
+            tr(UI_AUDIO_SAVE_HARDWARE_NOTE)
+        );
+        return;
+    }
+
+    AudioFormat format = audioPostedFormat();
 
     String formatError;
 
@@ -15134,7 +15522,7 @@ static void handleAudioTestRecord()
 
     bool ok = audioWavRecordTest(
         testPath,
-        5000UL,
+        10000UL,
         format,
         cfg_recording_encryption != 0,
         result,
@@ -15157,7 +15545,7 @@ static void handleAudioTestRecord()
     } else {
         html +=
             "<section class='settings-section' style='border-left:5px solid #15803d'>"
-            "<h3>5 s WAV test completed</h3>"
+            "<h3>10 s WAV test completed</h3>"
             "<p><span class='status-pill ok'>AUDIO OK</span></p>";
 
         html += "Backend: <b>" +
@@ -15198,10 +15586,268 @@ static void handleAudioTestRecord()
         html +=
             "<p><a class='button primary' href='/file?path=%2Faudio_test.wav'>"
             "WAV herunterladen</a></p>"
-            "<p class='muted'>Dieser Test ändert die gespeicherte Audio-Konfiguration nicht. "
-            "Die Datei wird beim nächsten Audiotest ersetzt. AVI/MKV-Aufnahmen sind in v47 "
-            "absichtlich noch unverändert.</p>"
+            "<p class='muted'>" +
+            htmlText(UI_AUDIO_TEST_HELP) +
+            " " +
+            htmlText(UI_AUDIO_ENCRYPTION_NOTE) +
+            "</p>"
             "</section>";
+    }
+
+    html += "<p><a href='/config'><button>Back to Config</button></a></p>";
+    html += htmlFooter();
+
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "text/html; charset=utf-8", html);
+}
+
+
+static void handleAudioBenchmark()
+{
+    if (rejectWhileRecording("audio benchmark"))
+        return;
+
+    if (g_storageLocked) {
+        server.send(
+            409,
+            "text/plain; charset=utf-8",
+            "Storage maintenance is already active"
+        );
+        return;
+    }
+
+    if (audioPostedHardwareDiffers()) {
+        server.send(
+            409,
+            "text/plain; charset=utf-8",
+            tr(UI_AUDIO_SAVE_HARDWARE_NOTE)
+        );
+        return;
+    }
+
+    AudioFormat format = audioPostedFormat();
+    String formatError;
+
+    if (!audioCaptureFormatSupported(format, formatError)) {
+        server.send(
+            400,
+            "text/plain; charset=utf-8",
+            "Unsupported audio format: " + formatError
+        );
+        return;
+    }
+
+    static const uint32_t BENCHMARK_DURATION_MS = 10000UL;
+    static const size_t BENCHMARK_READ_BYTES = 8U * 1024U;
+
+    uint32_t internalBefore =
+        (uint32_t)heap_caps_get_free_size(
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+        );
+    uint32_t psramBefore =
+        (uint32_t)heap_caps_get_free_size(
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+        );
+
+    uint8_t *buffer =
+        (uint8_t *)heap_caps_malloc(
+            BENCHMARK_READ_BYTES,
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+        );
+
+    if (!buffer) {
+        server.send(
+            500,
+            "text/plain; charset=utf-8",
+            "Audio benchmark buffer allocation failed"
+        );
+        return;
+    }
+
+    uint32_t internalMin =
+        (uint32_t)heap_caps_get_free_size(
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+        );
+    uint32_t psramMin =
+        (uint32_t)heap_caps_get_free_size(
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+        );
+
+    bool previousRecordingBlock = g_recordingStartBlocked;
+    g_recordingStartBlocked = true;
+
+    String error;
+    bool started = audioCaptureStart(format, error);
+
+    uint64_t deliveredBytes = 0;
+    uint32_t emptyReads = 0;
+    uint32_t maxDrainGapMs = 0;
+    uint32_t benchmarkStartMs = millis();
+    uint32_t lastDrainMs = benchmarkStartMs;
+
+    if (started) {
+        while (
+            (uint32_t)(millis() - benchmarkStartMs) <
+                BENCHMARK_DURATION_MS
+        ) {
+            size_t got =
+                audioCaptureRead(
+                    buffer,
+                    BENCHMARK_READ_BYTES,
+                    50UL
+                );
+
+            uint32_t now = millis();
+            uint32_t gap = now - lastDrainMs;
+            if (gap > maxDrainGapMs)
+                maxDrainGapMs = gap;
+            lastDrainMs = now;
+
+            if (got)
+                deliveredBytes += (uint64_t)got;
+            else
+                emptyReads++;
+
+            uint32_t internalNow =
+                (uint32_t)heap_caps_get_free_size(
+                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+                );
+            uint32_t psramNow =
+                (uint32_t)heap_caps_get_free_size(
+                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+                );
+
+            if (internalNow < internalMin)
+                internalMin = internalNow;
+            if (psramNow < psramMin)
+                psramMin = psramNow;
+
+            serviceWebLongOperation();
+        }
+    }
+
+    uint32_t elapsedMs =
+        started
+        ? (uint32_t)(millis() - benchmarkStartMs)
+        : 0;
+
+    AudioCaptureStats stats = {};
+    if (started)
+        stats = audioCaptureStats();
+
+    if (started)
+        audioCaptureStop();
+
+    g_recordingStartBlocked = previousRecordingBlock;
+
+    free(buffer);
+
+    uint32_t internalAfter =
+        (uint32_t)heap_caps_get_free_size(
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+        );
+    uint32_t psramAfter =
+        (uint32_t)heap_caps_get_free_size(
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+        );
+
+    String html = htmlHeader();
+    html += "<h2>" + htmlText(UI_AUDIO_BENCHMARK) + "</h2>";
+
+    if (!started) {
+        html +=
+            "<section class='settings-section' style='border-left:5px solid #b91c1c'>"
+            "<h3>Test failed</h3><p>" +
+            htmlEscape(error) +
+            "</p></section>";
+    } else {
+        uint64_t bytesPerSecond =
+            (uint64_t)format.sampleRate *
+            (uint64_t)format.channels *
+            (uint64_t)(format.bitsPerSample / 8U);
+
+        uint64_t expectedBytes =
+            elapsedMs > 0
+            ? (bytesPerSecond * (uint64_t)elapsedMs) / 1000ULL
+            : 0;
+
+        float deliveredPct =
+            expectedBytes > 0
+            ? (100.0f * (float)deliveredBytes / (float)expectedBytes)
+            : 0.0f;
+
+        float highWaterPct =
+            stats.bufferCapacity > 0
+            ? (100.0f * (float)stats.bufferHighWater / (float)stats.bufferCapacity)
+            : 0.0f;
+
+        bool red = stats.bytesDropped > 0;
+        bool orange =
+            !red &&
+            (
+                highWaterPct >= 75.0f ||
+                deliveredPct < 95.0f
+            );
+
+        const char *border =
+            red ? "#b91c1c" :
+            orange ? "#c47a00" :
+            "#15803d";
+
+        String verdict =
+            red ? "DROPS DETECTED" :
+            orange ? "CHECK CAPTURE MARGIN" :
+            "CAPTURE STABLE";
+
+        html +=
+            "<section class='settings-section' style='border-left:5px solid " +
+            String(border) +
+            "'><h3>10 s capture-only result</h3>"
+            "<p><b>" + verdict + "</b></p>";
+
+        html += "Backend: <b>" +
+                htmlEscape(String(audioCaptureBackendName())) +
+                "</b><br>";
+        html += "Format: <b>" +
+                String((unsigned long)format.sampleRate) + " Hz / " +
+                String((unsigned int)format.bitsPerSample) + " bit / " +
+                String((unsigned int)format.channels) +
+                (format.channels == 1 ? " channel" : " channels") +
+                "</b><br>";
+        html += "Nominal PCM rate: <b>" +
+                String((double)bytesPerSecond / 1024.0, 1) +
+                " KiB/s</b><br>";
+        html += "Elapsed: " + String((unsigned long)elapsedMs) + " ms<br>";
+        html += "Captured: " +
+                String((unsigned long)stats.bytesCaptured) + " bytes<br>";
+        html += "Delivered/drained: " +
+                String((unsigned long)deliveredBytes) + " bytes (" +
+                String(deliveredPct, 1) + "% of nominal)<br>";
+        html += "Dropped: <b>" +
+                String((unsigned long)stats.bytesDropped) +
+                " bytes</b><br>";
+        html += "PSRAM ring high-water: " +
+                String((unsigned long)stats.bufferHighWater) + " / " +
+                String((unsigned long)stats.bufferCapacity) + " bytes (" +
+                String(highWaterPct, 1) + "%)<br>";
+        html += "Max drain-loop gap: " +
+                String((unsigned long)maxDrainGapMs) + " ms<br>";
+        html += "Empty reads: " +
+                String((unsigned long)emptyReads) + "<br><br>";
+
+        html += "Internal heap free before/min/after: <b>" +
+                String((unsigned long)internalBefore) + " / " +
+                String((unsigned long)internalMin) + " / " +
+                String((unsigned long)internalAfter) + " B</b><br>";
+        html += "PSRAM free before/min/after: <b>" +
+                String((unsigned long)psramBefore) + " / " +
+                String((unsigned long)psramMin) + " / " +
+                String((unsigned long)psramAfter) + " B</b><br>";
+
+        html +=
+            "<p class='muted'>" +
+            htmlText(UI_AUDIO_BENCHMARK_HELP) +
+            "</p></section>";
     }
 
     html += "<p><a href='/config'><button>Back to Config</button></a></p>";
@@ -16153,6 +16799,7 @@ void webConfigStart()
         server.on("/config", HTTP_GET, handleConfig);
         server.on("/save", HTTP_POST, handleSave);
         server.on("/audio_test_record", HTTP_POST, handleAudioTestRecord);
+        server.on("/audio_benchmark", HTTP_POST, handleAudioBenchmark);
         server.on("/config_download", HTTP_GET, handleConfigDownload);
         server.on(
             "/config_upload",

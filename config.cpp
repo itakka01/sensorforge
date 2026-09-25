@@ -3,6 +3,7 @@
 #include "config_secrets.h"
 #include "image_motion.h"
 #include "branding.h"
+#include "camera_select.h"
 
 #include <FS.h>
 #include <LittleFS.h>
@@ -89,6 +90,16 @@ String cfg_recording_format = "avi";
 int cfg_timestamp_enabled   = 1;
 int cfg_recording_encryption = 0;
 int cfg_audio_enabled = 0;
+int cfg_audio_expert_mode = 0;
+String cfg_audio_source = "board_default";
+String cfg_audio_backend = "pdm";
+int cfg_audio_pdm_clk_pin = -1;
+int cfg_audio_pdm_data_pin = -1;
+int cfg_audio_i2s_bclk_pin = -1;
+int cfg_audio_i2s_ws_pin = -1;
+int cfg_audio_i2s_data_pin = -1;
+int cfg_audio_i2s_mclk_pin = -1;
+String cfg_audio_i2s_slot = "left";
 int cfg_audio_sample_rate = 16000;
 int cfg_audio_bits_per_sample = 16;
 int cfg_audio_channels = 1;
@@ -435,6 +446,16 @@ struct ConfigValues {
     int timestampEnabled;
     int recordingEncryption;
     int audioEnabled;
+    int audioExpertMode;
+    String audioSource;
+    String audioBackend;
+    int audioPdmClkPin;
+    int audioPdmDataPin;
+    int audioI2sBclkPin;
+    int audioI2sWsPin;
+    int audioI2sDataPin;
+    int audioI2sMclkPin;
+    String audioI2sSlot;
     int audioSampleRate;
     int audioBitsPerSample;
     int audioChannels;
@@ -518,6 +539,16 @@ struct ConfigSeen {
     bool timestampEnabled;
     bool recordingEncryption;
     bool audioEnabled;
+    bool audioExpertMode;
+    bool audioSource;
+    bool audioBackend;
+    bool audioPdmClkPin;
+    bool audioPdmDataPin;
+    bool audioI2sBclkPin;
+    bool audioI2sWsPin;
+    bool audioI2sDataPin;
+    bool audioI2sMclkPin;
+    bool audioI2sSlot;
     bool audioSampleRate;
     bool audioBitsPerSample;
     bool audioChannels;
@@ -647,6 +678,36 @@ static ConfigValues makeDefaultValues()
 
     values.audioEnabled =
         0;
+
+    values.audioExpertMode =
+        0;
+
+    values.audioSource =
+        "board_default";
+
+    values.audioBackend =
+        "pdm";
+
+    values.audioPdmClkPin =
+        -1;
+
+    values.audioPdmDataPin =
+        -1;
+
+    values.audioI2sBclkPin =
+        -1;
+
+    values.audioI2sWsPin =
+        -1;
+
+    values.audioI2sDataPin =
+        -1;
+
+    values.audioI2sMclkPin =
+        -1;
+
+    values.audioI2sSlot =
+        "left";
 
     values.audioSampleRate =
         16000;
@@ -861,6 +922,16 @@ static bool serializeConfigValues(
     APPEND_CONFIG_VALUE("timestamp_enabled", String(values.timestampEnabled));
     APPEND_CONFIG_VALUE("recording_encryption", String(values.recordingEncryption));
     APPEND_CONFIG_VALUE("audio_enabled", String(values.audioEnabled));
+    APPEND_CONFIG_VALUE("audio_expert_mode", String(values.audioExpertMode));
+    APPEND_CONFIG_VALUE("audio_source", values.audioSource);
+    APPEND_CONFIG_VALUE("audio_backend", values.audioBackend);
+    APPEND_CONFIG_VALUE("audio_pdm_clk_pin", String(values.audioPdmClkPin));
+    APPEND_CONFIG_VALUE("audio_pdm_data_pin", String(values.audioPdmDataPin));
+    APPEND_CONFIG_VALUE("audio_i2s_bclk_pin", String(values.audioI2sBclkPin));
+    APPEND_CONFIG_VALUE("audio_i2s_ws_pin", String(values.audioI2sWsPin));
+    APPEND_CONFIG_VALUE("audio_i2s_data_pin", String(values.audioI2sDataPin));
+    APPEND_CONFIG_VALUE("audio_i2s_mclk_pin", String(values.audioI2sMclkPin));
+    APPEND_CONFIG_VALUE("audio_i2s_slot", values.audioI2sSlot);
     APPEND_CONFIG_VALUE("audio_sample_rate", String(values.audioSampleRate));
     APPEND_CONFIG_VALUE("audio_bits_per_sample", String(values.audioBitsPerSample));
     APPEND_CONFIG_VALUE("audio_channels", String(values.audioChannels));
@@ -1411,6 +1482,195 @@ static bool allRequiredKeysSeen(
 }
 
 
+
+static bool audioPinMatchesCamera(
+    int pin,
+    const ConfigValues &values
+)
+{
+    if (pin < 0)
+        return false;
+
+    camera_pins_t cameraPins =
+        selectCamera(values.camera);
+
+    const int cameraPinList[] = {
+        cameraPins.pin_pwdn,
+        cameraPins.pin_reset,
+        cameraPins.pin_xclk,
+        cameraPins.pin_sscb_sda,
+        cameraPins.pin_sscb_scl,
+        cameraPins.pin_d7,
+        cameraPins.pin_d6,
+        cameraPins.pin_d5,
+        cameraPins.pin_d4,
+        cameraPins.pin_d3,
+        cameraPins.pin_d2,
+        cameraPins.pin_d1,
+        cameraPins.pin_d0,
+        cameraPins.pin_vsync,
+        cameraPins.pin_href,
+        cameraPins.pin_pclk
+    };
+
+    for (int reservedPin : cameraPinList) {
+        if (reservedPin >= 0 && pin == reservedPin)
+            return true;
+    }
+
+    return false;
+}
+
+
+static bool audioExternalPinConflict(
+    int pin,
+    const ConfigValues &values,
+    String &reason
+)
+{
+    reason = "";
+
+    if (pin < 0)
+        return false;
+
+    // ESP32-S3 SPI0/1 flash/PSRAM bus. Do not permit expert audio routing
+    // onto pins that may be physically tied to module memory.
+    if (pin >= 26 && pin <= 37) {
+        reason = "ESP32-S3 flash/PSRAM bus";
+        return true;
+    }
+
+    if (audioPinMatchesCamera(pin, values)) {
+        reason = "camera";
+        return true;
+    }
+
+    if (pin == (int)PRESENCE_PIN) {
+        reason = "presence/PIR";
+        return true;
+    }
+
+    if (pin == (int)MAGNET_SWITCH_PIN) {
+        reason = "magnet switch";
+        return true;
+    }
+
+    if (pin == (int)RADAR_RX_PIN || pin == (int)RADAR_TX_PIN) {
+        reason = "radar UART";
+        return true;
+    }
+
+    if (pin == (int)RTC_SDA_PIN || pin == (int)RTC_SCL_PIN) {
+        reason = "RTC/I2C";
+        return true;
+    }
+
+#if STATUS_LED_AVAILABLE
+    if (pin == (int)LED_PIN) {
+        reason = "status LED";
+        return true;
+    }
+#endif
+
+#if defined(STORAGE_SPI)
+    if (
+        pin == (int)SD_CS_PIN ||
+        pin == (int)SD_SCK_PIN ||
+        pin == (int)SD_MISO_PIN ||
+        pin == (int)SD_MOSI_PIN
+    ) {
+        reason = "microSD SPI";
+        return true;
+    }
+#elif defined(STORAGE_SDMMC)
+    if (
+        pin == (int)SD_MMC_CMD ||
+        pin == (int)SD_MMC_CLK ||
+        pin == (int)SD_MMC_D0
+    ) {
+        reason = "microSD SD_MMC";
+        return true;
+    }
+#endif
+
+#if BOARD_HAS_INTEGRATED_MIC
+#if defined(BOARD_INTEGRATED_MIC_BACKEND_PDM)
+    if (
+        pin == (int)BOARD_INTEGRATED_MIC_PDM_CLK_PIN ||
+        pin == (int)BOARD_INTEGRATED_MIC_PDM_DATA_PIN
+    ) {
+        reason = "integrated microphone";
+        return true;
+    }
+#endif
+#endif
+
+    return false;
+}
+
+
+static bool validateExternalAudioPin(
+    int pin,
+    bool optional,
+    const char *keyName,
+    const ConfigValues &values,
+    String &error
+)
+{
+    if (optional && pin == -1)
+        return true;
+
+    if (pin < 0 || pin > 48) {
+        error =
+            String(keyName) +
+            " must be GPIO 0..48" +
+            (optional ? " or -1" : "");
+        return false;
+    }
+
+    String reason;
+
+    if (audioExternalPinConflict(
+            pin,
+            values,
+            reason
+        )) {
+        error =
+            String(keyName) +
+            "=GPIO" +
+            String(pin) +
+            " conflicts with " +
+            reason;
+        return false;
+    }
+
+    return true;
+}
+
+
+static bool audioPinsAreUnique(
+    const int *pins,
+    size_t count,
+    String &error
+)
+{
+    for (size_t i = 0; i < count; ++i) {
+        if (pins[i] < 0)
+            continue;
+
+        for (size_t j = i + 1; j < count; ++j) {
+            if (pins[j] >= 0 && pins[i] == pins[j]) {
+                error =
+                    "external audio GPIO assignments must be unique";
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+
 static bool validateValues(
     ConfigValues &values,
     String &error
@@ -1423,6 +1683,15 @@ static bool validateValues(
 
     values.recordingFormat.trim();
     values.recordingFormat.toLowerCase();
+
+    values.audioSource.trim();
+    values.audioSource.toLowerCase();
+
+    values.audioBackend.trim();
+    values.audioBackend.toLowerCase();
+
+    values.audioI2sSlot.trim();
+    values.audioI2sSlot.toLowerCase();
 
     values.recordingNotBefore.trim();
 
@@ -1667,6 +1936,55 @@ static bool validateValues(
     }
 
     if (
+        values.audioExpertMode != 0 &&
+        values.audioExpertMode != 1
+    ) {
+        error = "audio_expert_mode must be 0 or 1";
+        return false;
+    }
+
+    if (
+        values.audioSource != "board_default" &&
+        values.audioSource != "external"
+    ) {
+        error = "audio_source must be board_default or external";
+        return false;
+    }
+
+    if (
+        values.audioBackend != "pdm" &&
+        values.audioBackend != "i2s"
+    ) {
+        error = "audio_backend must be pdm or i2s";
+        return false;
+    }
+
+    if (
+        values.audioI2sSlot != "left" &&
+        values.audioI2sSlot != "right" &&
+        values.audioI2sSlot != "stereo"
+    ) {
+        error = "audio_i2s_slot must be left, right or stereo";
+        return false;
+    }
+
+    const int audioConfiguredPins[] = {
+        values.audioPdmClkPin,
+        values.audioPdmDataPin,
+        values.audioI2sBclkPin,
+        values.audioI2sWsPin,
+        values.audioI2sDataPin,
+        values.audioI2sMclkPin
+    };
+
+    for (int pin : audioConfiguredPins) {
+        if (pin < -1 || pin > 48) {
+            error = "audio GPIO values must be -1 or GPIO 0..48";
+            return false;
+        }
+    }
+
+    if (
         values.audioSampleRate < 8000 ||
         values.audioSampleRate > 96000
     ) {
@@ -1689,6 +2007,164 @@ static bool validateValues(
     ) {
         error = "audio_channels must be 1 or 2";
         return false;
+    }
+
+    if (values.audioSource == "external") {
+        if (!values.audioExpertMode) {
+            error = "audio_source=external requires audio_expert_mode=1";
+            return false;
+        }
+
+        if (values.audioBackend == "pdm") {
+            if (
+                !validateExternalAudioPin(
+                    values.audioPdmClkPin,
+                    false,
+                    "audio_pdm_clk_pin",
+                    values,
+                    error
+                ) ||
+                !validateExternalAudioPin(
+                    values.audioPdmDataPin,
+                    false,
+                    "audio_pdm_data_pin",
+                    values,
+                    error
+                )
+            ) {
+                return false;
+            }
+
+            const int pdmPins[] = {
+                values.audioPdmClkPin,
+                values.audioPdmDataPin
+            };
+
+            if (!audioPinsAreUnique(
+                    pdmPins,
+                    sizeof(pdmPins) / sizeof(pdmPins[0]),
+                    error
+                )) {
+                return false;
+            }
+
+            // Keep the first external PDM implementation deliberately
+            // conservative. Higher quality can be qualified later without
+            // changing the config schema or container interface.
+            if (
+                values.audioSampleRate < 8000 ||
+                values.audioSampleRate > 48000
+            ) {
+                error = "external PDM supports 8000..48000 Hz";
+                return false;
+            }
+
+            if (
+                values.audioBitsPerSample != 16 ||
+                values.audioChannels != 1
+            ) {
+                error = "external PDM currently supports 16-bit mono";
+                return false;
+            }
+
+        } else {
+            if (
+                !validateExternalAudioPin(
+                    values.audioI2sBclkPin,
+                    false,
+                    "audio_i2s_bclk_pin",
+                    values,
+                    error
+                ) ||
+                !validateExternalAudioPin(
+                    values.audioI2sWsPin,
+                    false,
+                    "audio_i2s_ws_pin",
+                    values,
+                    error
+                ) ||
+                !validateExternalAudioPin(
+                    values.audioI2sDataPin,
+                    false,
+                    "audio_i2s_data_pin",
+                    values,
+                    error
+                ) ||
+                !validateExternalAudioPin(
+                    values.audioI2sMclkPin,
+                    true,
+                    "audio_i2s_mclk_pin",
+                    values,
+                    error
+                )
+            ) {
+                return false;
+            }
+
+            const int i2sPins[] = {
+                values.audioI2sBclkPin,
+                values.audioI2sWsPin,
+                values.audioI2sDataPin,
+                values.audioI2sMclkPin
+            };
+
+            if (!audioPinsAreUnique(
+                    i2sPins,
+                    sizeof(i2sPins) / sizeof(i2sPins[0]),
+                    error
+                )) {
+                return false;
+            }
+
+            // 24-bit DMA packing is intentionally not enabled yet. 16-bit PCM
+            // is the qualified common denominator for WAV and future MKV muxing.
+            if (values.audioBitsPerSample != 16) {
+                error = "external I2S currently supports 16-bit PCM";
+                return false;
+            }
+
+            if (
+                values.audioChannels == 2 &&
+                values.audioI2sSlot != "stereo"
+            ) {
+                error = "stereo I2S requires audio_i2s_slot=stereo";
+                return false;
+            }
+
+            if (
+                values.audioChannels == 1 &&
+                values.audioI2sSlot == "stereo"
+            ) {
+                error = "mono I2S requires audio_i2s_slot=left or right";
+                return false;
+            }
+        }
+
+    } else if (values.audioEnabled) {
+#if BOARD_HAS_INTEGRATED_MIC
+#if defined(BOARD_INTEGRATED_MIC_BACKEND_PDM)
+        if (
+            values.audioSampleRate <
+                (int)BOARD_INTEGRATED_MIC_MIN_SAMPLE_RATE_HZ ||
+            values.audioSampleRate >
+                (int)BOARD_INTEGRATED_MIC_MAX_SAMPLE_RATE_HZ ||
+            values.audioBitsPerSample != 16 ||
+            values.audioChannels != 1
+        ) {
+            error =
+                "board-default microphone requires " +
+                String((unsigned long)BOARD_INTEGRATED_MIC_RECOMMENDED_SAMPLE_RATE_HZ) +
+                " Hz, 16-bit mono";
+            return false;
+        }
+#else
+#error "BOARD_HAS_INTEGRATED_MIC requires a supported integrated mic backend"
+#endif
+#else
+        error =
+            "audio_enabled=1 with audio_source=board_default but this board has no integrated microphone";
+        return false;
+#endif
     }
 
     if (
@@ -2663,6 +3139,46 @@ static bool parseConfigText(
             } else if (key == "audio_enabled") {
                 if (!markOnce(seen.audioEnabled, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid audio_enabled"; return false; }
                 values.audioEnabled = (int)numericValue;
+
+            } else if (key == "audio_expert_mode") {
+                if (!markOnce(seen.audioExpertMode, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid audio_expert_mode"; return false; }
+                values.audioExpertMode = (int)numericValue;
+
+            } else if (key == "audio_source") {
+                if (!markOnce(seen.audioSource, key, error)) return false;
+                values.audioSource = value;
+
+            } else if (key == "audio_backend") {
+                if (!markOnce(seen.audioBackend, key, error)) return false;
+                values.audioBackend = value;
+
+            } else if (key == "audio_pdm_clk_pin") {
+                if (!markOnce(seen.audioPdmClkPin, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid audio_pdm_clk_pin"; return false; }
+                values.audioPdmClkPin = (int)numericValue;
+
+            } else if (key == "audio_pdm_data_pin") {
+                if (!markOnce(seen.audioPdmDataPin, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid audio_pdm_data_pin"; return false; }
+                values.audioPdmDataPin = (int)numericValue;
+
+            } else if (key == "audio_i2s_bclk_pin") {
+                if (!markOnce(seen.audioI2sBclkPin, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid audio_i2s_bclk_pin"; return false; }
+                values.audioI2sBclkPin = (int)numericValue;
+
+            } else if (key == "audio_i2s_ws_pin") {
+                if (!markOnce(seen.audioI2sWsPin, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid audio_i2s_ws_pin"; return false; }
+                values.audioI2sWsPin = (int)numericValue;
+
+            } else if (key == "audio_i2s_data_pin") {
+                if (!markOnce(seen.audioI2sDataPin, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid audio_i2s_data_pin"; return false; }
+                values.audioI2sDataPin = (int)numericValue;
+
+            } else if (key == "audio_i2s_mclk_pin") {
+                if (!markOnce(seen.audioI2sMclkPin, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid audio_i2s_mclk_pin"; return false; }
+                values.audioI2sMclkPin = (int)numericValue;
+
+            } else if (key == "audio_i2s_slot") {
+                if (!markOnce(seen.audioI2sSlot, key, error)) return false;
+                values.audioI2sSlot = value;
 
             } else if (key == "audio_sample_rate") {
                 if (!markOnce(seen.audioSampleRate, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid audio_sample_rate"; return false; }
@@ -3775,6 +4291,36 @@ static void applyValues(
     cfg_audio_enabled =
         values.audioEnabled;
 
+    cfg_audio_expert_mode =
+        values.audioExpertMode;
+
+    cfg_audio_source =
+        values.audioSource;
+
+    cfg_audio_backend =
+        values.audioBackend;
+
+    cfg_audio_pdm_clk_pin =
+        values.audioPdmClkPin;
+
+    cfg_audio_pdm_data_pin =
+        values.audioPdmDataPin;
+
+    cfg_audio_i2s_bclk_pin =
+        values.audioI2sBclkPin;
+
+    cfg_audio_i2s_ws_pin =
+        values.audioI2sWsPin;
+
+    cfg_audio_i2s_data_pin =
+        values.audioI2sDataPin;
+
+    cfg_audio_i2s_mclk_pin =
+        values.audioI2sMclkPin;
+
+    cfg_audio_i2s_slot =
+        values.audioI2sSlot;
+
     cfg_audio_sample_rate =
         values.audioSampleRate;
 
@@ -4824,6 +5370,12 @@ config_loaded:
     Serial.println(
         "Config Audio: enabled=" +
         String(cfg_audio_enabled) +
+        " expert=" +
+        String(cfg_audio_expert_mode) +
+        " source=" +
+        cfg_audio_source +
+        " backend=" +
+        cfg_audio_backend +
         " rate=" +
         String(cfg_audio_sample_rate) +
         " bits=" +

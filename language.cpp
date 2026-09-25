@@ -340,6 +340,40 @@ static const UiTextEntry UI_TEXTS[] = {
     {"Geschätzt bis Aufnahmestopp", "Estimated until recording stop"}, // UI_SHOOTER_EST_UNTIL_STOP
     {"noch zu wenig Daten", "not enough data yet"}, // UI_SHOOTER_EST_WAITING
     {"Grobe Schätzung aus bisheriger Filterquote und JPEG-Größe; Dateisystem-/Verschlüsselungs-Overhead ist nicht eingerechnet.", "Rough estimate from the observed filter ratio and JPEG size; filesystem/encryption overhead is not included."}, // UI_SHOOTER_EST_NOTE
+    {"Audio / Mikrofon", "Audio / microphone"}, // UI_AUDIO_TITLE
+    {"Im normalen Modus verwendet SensorForge die fest im Boardprofil definierte Audioquelle. Externe Mikrofone werden im Expert-Modus zur Laufzeit konfiguriert; dafür ist keine eigene Firmwarevariante nötig.", "In normal mode SensorForge uses the fixed audio source defined by the board profile. External microphones are configured at runtime in Expert mode; no separate firmware variant is required."}, // UI_AUDIO_SUBTITLE
+    {"Audioquelle", "Audio source"}, // UI_AUDIO_SOURCE
+    {"Board-Standard", "Board default"}, // UI_AUDIO_SOURCE_BOARD_DEFAULT
+    {"Externes Mikrofon", "External microphone"}, // UI_AUDIO_SOURCE_EXTERNAL
+    {"Audio Expert-Modus", "Audio Expert mode"}, // UI_AUDIO_EXPERT_MODE
+    {"Nur für externe Hardware. Falsche GPIO-Zuordnungen können Kamera, SD, Radar, RTC oder andere Boardfunktionen stören und werden soweit möglich von SensorForge abgewiesen.", "For external hardware only. Incorrect GPIO assignments can interfere with camera, SD, radar, RTC or other board functions and are rejected by SensorForge where possible."}, // UI_AUDIO_EXPERT_HELP
+    {"Hinweis: GPIO19/20 sind standardmäßig USB/JTAG; GPIO0/3/45/46 sind Boot-Strapping-Pins. Deren Verwendung bleibt eine bewusste Expert-Entscheidung. GPIO26..37 werden für externe Audio-Hardware grundsätzlich gesperrt, um Flash/PSRAM nicht zu gefährden.", "Note: GPIO19/20 are USB/JTAG by default; GPIO0/3/45/46 are boot strapping pins. Using them remains an explicit Expert decision. GPIO26..37 are always blocked for external audio hardware to protect flash/PSRAM."}, // UI_AUDIO_GPIO_WARNING
+    {"Audio-Backend", "Audio backend"}, // UI_AUDIO_BACKEND
+    {"PDM-Mikrofon", "PDM microphone"}, // UI_AUDIO_BACKEND_PDM
+    {"Standard-I2S-Mikrofon", "Standard I2S microphone"}, // UI_AUDIO_BACKEND_I2S
+    {"Externe GPIO-Zuordnung", "External GPIO assignment"}, // UI_AUDIO_EXTERNAL_PINS
+    {"I2S Slot", "I2S slot"}, // UI_AUDIO_I2S_SLOT
+    {"Änderungen an Audioquelle, Backend oder GPIOs zuerst speichern. Der WAV-Test verwendet die gespeicherte Hardwarekonfiguration; die Formatwerte im Formular können dagegen direkt getestet werden.", "Save changes to audio source, backend or GPIOs first. The WAV test uses the saved hardware configuration; format values in the form can still be tested directly."}, // UI_AUDIO_SAVE_HARDWARE_NOTE
+    {"10 s WAV-Audiotest aufnehmen", "Record 10 s WAV audio test"}, // UI_AUDIO_TEST
+    {"Testet Mikrofon, PSRAM-Puffer und den normalen SensorForge-Speicherpfad. Bei aktivierter Aufnahmeverschlüsselung wird auch die WAV-Datei verschlüsselt gespeichert und transparent heruntergeladen.", "Tests microphone, PSRAM buffering and the normal SensorForge storage path. When recording encryption is enabled, the WAV file is also stored encrypted and downloaded transparently."}, // UI_AUDIO_TEST_HELP
+    {"Für die aktuell gespeicherte Audioquelle ist kein Eingang verfügbar.", "No input is available for the currently saved audio source."}, // UI_AUDIO_NO_INPUT
+    {"Audio verwendet dieselbe recording_encryption-Policy wie Video und Shooter-Medien; es gibt keinen separaten unverschlüsselten Audio-Sonderpfad.", "Audio uses the same recording_encryption policy as video and shooter media; there is no separate unencrypted audio path."}, // UI_AUDIO_ENCRYPTION_NOTE
+    {"empfohlen", "recommended"}, // UI_AUDIO_RECOMMENDED
+    {"Audio", "Audio"}, // UI_AUDIO_ENABLE
+    {"an", "on"}, // UI_AUDIO_ON
+    {"aus", "off"}, // UI_AUDIO_OFF
+    {"Für den normalen Betrieb genügt Audio ein- oder auszuschalten. Quelle, Format und externe Hardware liegen unter Erweiterte Audioeinstellungen.", "For normal operation it is sufficient to turn audio on or off. Source, format and external hardware are under Advanced audio settings."}, // UI_AUDIO_SIMPLE_HELP
+    {"Erweiterte Audioeinstellungen ...", "Advanced audio settings ..."}, // UI_AUDIO_ADVANCED_SETTINGS
+    {"Erweiterte Audioeinstellungen", "Advanced audio settings"}, // UI_AUDIO_ADVANCED_TITLE
+    {"Diese Werte sind für erfahrene Benutzer und externe Mikrofonhardware gedacht. Der User-Modus verwendet den Board-Standard.", "These values are intended for experienced users and external microphone hardware. User mode uses the board default."}, // UI_AUDIO_ADVANCED_HELP
+    {"Schließen", "Close"}, // UI_AUDIO_CLOSE
+    {"10-Sekunden-Audiotest läuft", "10-second audio test running"}, // UI_AUDIO_TEST_RUNNING
+    {"Mikrofon, PSRAM-Puffer und Speicherpfad werden geprüft. Die Seite wechselt nach Abschluss automatisch zum Ergebnis.", "Microphone, PSRAM buffering and the storage path are being tested. The page changes to the result automatically when finished."}, // UI_AUDIO_TEST_RUNNING_HELP
+    {"Die Bewegung des Balkens zeigt Aktivität, keinen künstlichen Prozentwert.", "The moving bar indicates activity, not an artificial percentage."}, // UI_AUDIO_PROGRESS_NOTE
+    {"Audio-Belastungstest", "Audio load test"}, // UI_AUDIO_BENCHMARK
+    {"Prüft den Capture-Pfad ohne SD-Schreiblast und meldet Datenrate, Drops, Puffer-High-Water sowie Heap/PSRAM-Verhalten. Ein echter Video+Audio-Stresstest folgt nach der MKV-Integration.", "Tests the capture path without SD write load and reports data rate, drops, buffer high-water and heap/PSRAM behavior. A real video+audio stress test follows after MKV integration."}, // UI_AUDIO_BENCHMARK_HELP
+    {"Audio-Belastungstest läuft", "Audio load test running"}, // UI_AUDIO_BENCHMARK_RUNNING
+    {"Der Audio-Capture-Pfad wird 10 Sekunden belastet und vermessen. Es wird dabei keine Benchmark-Audiodatei auf SD geschrieben.", "The audio capture path is stressed and measured for 10 seconds. No benchmark audio file is written to SD."}, // UI_AUDIO_BENCHMARK_RUNNING_HELP
     {"SD-Wartung", "SD maintenance"}, // UI_NAV_SD_MAINTENANCE
 };
 

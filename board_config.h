@@ -58,12 +58,12 @@
 #define RTC_SDA_PIN          GPIO_NUM_1   // (grün)
 #define RTC_SCL_PIN          GPIO_NUM_47  // (blau)
 
-// Optional audio input.
-// The current Freenove product profile has no qualified microphone backend.
-// Future external PDM/I2S hardware can be added here without changing the
-// generic audio_capture interface.
-#define AUDIO_INPUT_BACKEND_NONE 1
-#define AUDIO_INPUT_NAME "No configured microphone"
+// Fixed board audio hardware.
+// External microphones are NOT described here. They are runtime-configurable
+// through config.txt / WebConfig Expert mode so one firmware image can support
+// different user wiring.
+#define BOARD_HAS_INTEGRATED_MIC 0
+#define BOARD_INTEGRATED_MIC_NAME "No integrated microphone"
 
 // Board-specific native sensor orientation correction.
 // User-facing rotation=0 is defined as the normal, non-mirrored product image.
@@ -131,20 +131,18 @@
 #define RTC_SDA_PIN          GPIO_NUM_5      // D4 ← RTC SDA (grün)
 #define RTC_SCL_PIN          GPIO_NUM_6      // D5 ← RTC SCL (blau)
 
-// Audio input: onboard XIAO ESP32-S3 Sense PDM microphone.
+// Fixed board audio hardware: onboard XIAO ESP32-S3 Sense PDM microphone.
 // Seeed hardware routing: GPIO42=PDM CLK, GPIO41=PDM DATA.
-// Keep microphone hardware selection in the board profile. The generic audio
-// module only consumes the backend + capability declarations below, so future
-// boards can provide external/high-quality microphone backends independently.
-// Seeed currently documents 16 kHz / 16-bit mono as the stable reference point;
-// keep the onboard backend qualified there until higher rates are hardware-tested.
-#define AUDIO_INPUT_BACKEND_PDM 1
-#define AUDIO_INPUT_NAME "XIAO onboard PDM microphone"
-#define AUDIO_PDM_CLK_PIN                  GPIO_NUM_42
-#define AUDIO_PDM_DATA_PIN                 GPIO_NUM_41
-#define AUDIO_INPUT_MIN_SAMPLE_RATE_HZ     16000UL
-#define AUDIO_INPUT_MAX_SAMPLE_RATE_HZ     16000UL
-#define AUDIO_INPUT_RECOMMENDED_SAMPLE_RATE_HZ 16000UL
+// Only physically integrated hardware belongs in the board profile. External
+// microphones are selected and wired at runtime through config.txt / WebConfig.
+#define BOARD_HAS_INTEGRATED_MIC 1
+#define BOARD_INTEGRATED_MIC_BACKEND_PDM 1
+#define BOARD_INTEGRATED_MIC_NAME "XIAO onboard PDM microphone"
+#define BOARD_INTEGRATED_MIC_PDM_CLK_PIN                  GPIO_NUM_42
+#define BOARD_INTEGRATED_MIC_PDM_DATA_PIN                 GPIO_NUM_41
+#define BOARD_INTEGRATED_MIC_MIN_SAMPLE_RATE_HZ            16000UL
+#define BOARD_INTEGRATED_MIC_MAX_SAMPLE_RATE_HZ            16000UL
+#define BOARD_INTEGRATED_MIC_RECOMMENDED_SAMPLE_RATE_HZ    16000UL
 
 // Board-specific native sensor orientation correction.
 // On the current SensorForge XIAO + OV3660 assembly the native sensor feed is

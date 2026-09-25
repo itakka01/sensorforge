@@ -28,11 +28,22 @@ extern String cfg_recording_format;   // "avi" or "mkv"
 extern int cfg_timestamp_enabled;     // 0/1
 extern int cfg_recording_encryption;  // 0/1, encrypt newly created video/snapshot media on SD
 
-// Optional audio capture policy. v47 introduces the generic capture subsystem
-// and standalone WAV verification. AVI/MKV muxing is intentionally not changed
-// in this release. Format values remain generic so future I2S/codec backends can
-// support higher quality without changing the config schema.
+// Optional audio capture policy. Hardware source/backend/pins are independent
+// from the output format so board-integrated and user-wired microphones feed the
+// same capture API. Container muxing can consume the same PCM interface later.
 extern int cfg_audio_enabled;          // 0/1
+// User mode uses board_default. Expert mode can select/configure an external
+// microphone without requiring a separate firmware image.
+extern int cfg_audio_expert_mode;      // 0/1; external source requires 1
+extern String cfg_audio_source;        // "board_default" or "external"
+extern String cfg_audio_backend;       // external backend: "pdm" or "i2s"
+extern int cfg_audio_pdm_clk_pin;      // external PDM; -1 when unused
+extern int cfg_audio_pdm_data_pin;     // external PDM; -1 when unused
+extern int cfg_audio_i2s_bclk_pin;     // external standard-I2S BCLK
+extern int cfg_audio_i2s_ws_pin;       // external standard-I2S WS/LRCLK
+extern int cfg_audio_i2s_data_pin;     // external standard-I2S DIN
+extern int cfg_audio_i2s_mclk_pin;     // optional external standard-I2S MCLK; -1 = unused
+extern String cfg_audio_i2s_slot;      // "left", "right" or "stereo"
 extern int cfg_audio_sample_rate;      // 8000..96000 Hz (backend may be narrower)
 extern int cfg_audio_bits_per_sample;  // 16, 24 or 32 (backend-specific support)
 extern int cfg_audio_channels;         // 1 or 2 (backend-specific support)

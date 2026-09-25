@@ -9,6 +9,57 @@ and identifies the concrete binary compilation time.
 > change sequence beginning with v23. Earlier development history remains in the
 > repository history/project documentation.
 
+## v52 — 2026-09-25
+
+- Simplified the normal WebConfig audio section to the single operator-facing
+  Audio on/off control. Source, format and hardware routing now live behind an
+  **Advanced audio settings** modal so normal users do not need to understand
+  sample rates, bit depth, channels or GPIO routing.
+- The advanced modal retains User/Expert mode, board-default/external source,
+  sample rate, bit depth, channel count and the v51 external PDM/I2S hardware
+  configuration. User mode continues to force the board-default source.
+- Increased the WAV diagnostic from 5 seconds to 10 seconds. Starting the WAV
+  test now opens an indeterminate activity popup with a moving bar before the
+  synchronous capture begins; it deliberately does not display a fabricated
+  percentage.
+- Added a separate 10-second capture-only **Audio load test**. It drains the
+  generic PCM ring without writing a benchmark file to SD and reports nominal
+  PCM rate, captured/drained bytes, dropped bytes, PSRAM ring high-water,
+  maximum drain-loop gap, empty reads, and internal-heap/PSRAM before/min/after.
+- The load-test verdict is intentionally based on real capture margin/drops and
+  does not invent a CPU-utilization percentage. It is an early subsystem check;
+  full production qualification still requires a simultaneous camera + audio +
+  MKV/storage/encryption stress test after container integration.
+- Normal AVI/MKV recording remains video-only in this release; `audio_enabled`
+  does not yet mux audio into production recordings.
+
+## v51 — 2026-09-25
+
+- Refactored audio hardware ownership: `board_config.h` now describes only
+  physically integrated board audio. XIAO keeps its fixed onboard PDM microphone
+  and pins there; Freenove declares that no microphone is integrated.
+- Added runtime-configurable audio source selection to `config.txt`: normal
+  `board_default` mode uses integrated board hardware, while Expert mode can
+  select an external `pdm` or standard `i2s` microphone without requiring a
+  separate firmware build.
+- Added external PDM clock/data GPIOs and standard-I2S BCLK/WS/DATA/optional
+  MCLK plus left/right/stereo slot selection. Known SensorForge pin conflicts
+  with camera, SD, presence/radar, RTC, status LED, integrated microphone and
+  ESP32-S3 flash/PSRAM bus pins are rejected during config validation.
+- Extended the generic audio-capture abstraction so backend/pin selection is
+  resolved at runtime. The already-qualified XIAO onboard path remains
+  16 kHz / 16-bit / mono; external PDM is conservatively limited to 16-bit
+  mono and external standard-I2S currently to 16-bit PCM until broader formats
+  are hardware-qualified.
+- WebConfig now separates normal audio controls from Expert hardware settings.
+  Hardware routing must be saved before the 5-second WAV diagnostic can use it,
+  preventing a test from silently exercising a different microphone.
+- Audio continues to use the same `recording_encryption` media policy as video,
+  shooter media and the existing WAV diagnostic through `RecordingStorageFile`;
+  no separate unencrypted audio storage path was introduced.
+- AVI/MKV recorder muxing remains intentionally unchanged in this release. This
+  step establishes the hardware/config abstraction before container integration.
+
 ## v50 — 2026-09-25
 
 - Fixed the 5-second WebConfig WAV audio diagnostic incorrectly reporting
