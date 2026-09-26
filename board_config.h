@@ -92,6 +92,7 @@
 // camera/AVI/SFENC1 methodology as the XIAO profile, so do not invent a limit
 // here. Once measured, place the validated conservative ceiling here.
 #define RECORDING_MAX_WEIGHTED_PIXEL_RATE 0UL
+#define RECORDING_PRODUCTION_FPS_CAP_1024X768 0
 
 
 // =============================================================
@@ -174,15 +175,16 @@
 // write latency than the former 4 MHz setting. Power measurements showed no
 // material increase for the tested workload.
 //
-// MAX is the board-approved upper production clock used by Sync API diagnostics
-// and any future high-speed policy. NORMAL and MAX are intentionally equal on
-// this board now, so entering/leaving API-exclusive mode does not require an SD
-// remount solely to change the clock. These values are firmware/board knowledge
-// and therefore do NOT belong in config.txt.
+// v67 restores the previously qualified 20 MHz XIAO production/storage clock.
+// v66 temporarily reduced the clock to 10 MHz as an A/B stability experiment,
+// but that change did not improve the observed thermal margin and did not address
+// the separate foreground-WebConfig/system-load trigger under investigation.
+// Repeated 64 MiB raw, w+ and full SFENC1 write-behind endurance tests already
+// verified the storage stack at 20 MHz with complete read-back integrity.
 //
-// On the current XIAO ESP32S3 Sense hardware, measurements showed that 20 MHz
-// reaches the practical throughput plateau; higher diagnostic test clocks did
-// not provide useful additional transfer speed.
+// NORMAL and MAX remain equal so API-exclusive operation never changes the SD
+// clock behind the recorder's back. These values are firmware/board knowledge
+// and do NOT belong in config.txt.
 #define SD_SPI_NORMAL_FREQUENCY_HZ 20000000UL
 #define SD_SPI_MAX_FREQUENCY_HZ    20000000UL
 
@@ -207,18 +209,16 @@
 // larger JPEGs, so the generic guard adds 5% load per step below 12, capped at
 // 160%. Lower JPEG quality must never be used to raise this board ceiling.
 //
-// Why 8,000,000:
-// - real XIAO ESP32S3 Sense + OV3660 + AVI + SFENC1 + SD-SPI 20 MHz benchmark
-// - 1024x768 @ 5 fps, JPEG quality 12: VERIFIED, read-back VERIFY=OK
-// - P95 frame call about 47 ms, P99 about 49 ms, worst about 54 ms
-// - 10 fps gives a 100 ms frame budget and therefore a deliberately useful
-//   safety margin over the measured production path
-// - 1024x768 @ quality 12 therefore allows max 10 fps (7,864,320 score)
-//   while 11 fps is rejected (8,650,752 score)
+// The weighted ceiling remains the generic guard for other resolutions. v67
+// retains the conservative 1024x768 production cap of 4 fps for the XIAO. The
+// previous 5 fps path has ample raw throughput, but combined camera/audio/SFENC1/
+// Image-Motion/WebConfig operation needs additional system margin. The 4 fps cap
+// remains in place while the production SD clock returns to the already qualified
+// 20 MHz setting.
 //
-// Re-benchmark before increasing this value, after changing SD backend/clock,
-// or when qualifying substantially different camera/board hardware.
+// Re-qualify before raising either policy after a board/SD/core change.
 #define RECORDING_MAX_WEIGHTED_PIXEL_RATE 8000000UL
+#define RECORDING_PRODUCTION_FPS_CAP_1024X768 4
 
 #if CAMERA_BASE_HMIRROR != 0 && CAMERA_BASE_HMIRROR != 1
 #error "CAMERA_BASE_HMIRROR must be 0 or 1"

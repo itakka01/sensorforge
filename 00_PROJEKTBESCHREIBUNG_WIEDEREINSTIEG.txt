@@ -1,8 +1,8 @@
 SENSORFORGE / ESP32-S3 CAMERA (XIAO + FREENOVE)
 PROJEKTBESCHREIBUNG, RELEASESTAND UND WIEDEREINSTIEGSPROMPT
-Stand: 2026-09-24
-Dokumentrevision: v46 / Produktivstand + Logger/SFLOG1 + SD Maintenance/Diagnostik v36-v46
-Aktueller Entwicklungs-/Produktiv-Release: v46
+Stand: 2026-09-26
+Dokumentrevision: v67 / eingefrorener Arbeitsstand + Audio/MKV + Recording Load Test + Write-Behind + SFENC1-/SD-Endurance + offene Langzeitqualifikation
+Aktueller Entwicklungs-/Arbeits-Release: v67 (Produktionsqualifikation fuer XIAO-Langzeitrecording noch offen)
 Produktname: SensorForge
 Plattformname: Fabric Node
 Core-Version im Branding: 7.1.0
@@ -74,6 +74,10 @@ Der aktuelle Quellstand besteht im Kern aus:
 - SENSORFORGE_API_V1.md fuer den stabilen lokalen Integration-API-Vertrag
 - recording_crypto.cpp / recording_crypto.h
 - recording_storage.cpp / recording_storage.h
+- recording_write_buffer.cpp / recording_write_buffer.h fuer 512-KiB-PSRAM-Write-Behind
+- recording_load_test.h sowie die zugehoerige Load-Test-State-Machine im aktuellen Quellstand
+- audio_capture.cpp / audio_capture.h
+- audio_wav.cpp / audio_wav.h
 - config_secrets.cpp / config_secrets.h
 - log_storage.cpp / log_storage.h
 - mkv_writer.cpp / mkv_writer.h
@@ -82,6 +86,311 @@ Der aktuelle Quellstand besteht im Kern aus:
 - sensorforge_license.py fuer PC-seitige Lizenzcode-Erzeugung
 - den dazugehoerigen bestehenden Headern und Modulen fuer Recorder, Logger,
   Radar, RTC, Thermal, Storage Guard und WebPlayer
+
+
+======================================================================
+AKTUELLER EINGEFRORENER ARBEITSSTAND 2026-09-26 - v67
+======================================================================
+
+STATUS / WICHTIG FUER DEN NAECHSTEN WIEDEREINSTIEG:
+
+- Der Entwicklungsstand wird vorerst bei v67 eingefroren, weil andere
+  Reparaturarbeiten Prioritaet haben.
+- v67 ist der aktuelle technische Arbeitsstand, aber NOCH KEIN vollstaendig
+  langzeitqualifizierter XIAO-Produktionsabschluss.
+- Keinen neuen Storage-/Crypto-Umbau aus Vermutung starten. Die isolierten
+  Storage- und SFENC1-Pfade sind stark positiv getestet; offen ist die
+  sporadische EIO-Stoerung nur im kombinierten Langzeit-Systembetrieb.
+- Beim Wiedereinstieg zuerst die unten dokumentierten offenen A/B-/Segmenttests
+  ausfuehren, bevor weitere Optimierungen begonnen werden.
+- Der aktuell hochgeladene Quellcode bleibt immer autoritativ. Dieser Block ist
+  nur der dokumentierte Test-/Entscheidungsstand.
+
+AKTUELLE XIAO-BETRIEBSPOLICY v67:
+
+- Board: Seeed XIAO ESP32S3 Sense
+- Kamera: reale Testhardware OV3660
+- Qualifikationsprofil: 1024x768
+- v67 behaelt den konservativen XIAO-Cap von 4 fps bei 1024x768
+- eine alte config.txt mit fps=5 bleibt lesbar; die Runtime clampte im Test auf
+  4 fps. Fuer die naechsten Tests die persistierte Config bewusst auf fps=4
+  speichern, damit Datei und Runtime denselben Wert zeigen
+- SD SPI: NORMAL=MAX=20 MHz
+- v66 10-MHz-Versuch wurde in v67 rueckgaengig gemacht
+- WebConfig-Polling bleibt gegenueber dem alten Stand reduziert:
+  normale Heartbeat/UI/Pause-Lease-Abfragen etwa 20 s, Recording-Load-Status
+  etwa 15 s
+- MKV + Audio + recording_encryption=1 ist der relevante kombinierte Testpfad
+- Image Motion soll fuer Kunden NICHT entfernt werden; image_only ist ein
+  realistischer Zielbetrieb. direct dient nur als diagnostische A/B-Referenz
+- aktuelles Image-Motion-Tuning im Teststand weiterhin Sensitivity 5 /
+  Confirm 2 / Release 2 / Background Learning 4 / Mindestflaeche 6 Prozent,
+  sofern der tatsaechlich aktuelle Configstand nichts Neueres zeigt
+- normale Produktkonfiguration segmentiert Aufnahmen (im zuletzt gesehenen
+  Testconfig: 30 s / max. 20 MiB). Der Recording Load Test unterdrueckt diese
+  Segmentrotation absichtlich und ist deshalb bei langen Laeufen haerter als
+  der reale segmentierte Produktbetrieb.
+
+WESENTLICHE NEUERUNGEN v47-v67, KONDENSIERT:
+
+v47-v53 AUDIO:
+- generisches audio_capture-Subsystem mit eigenem Capture-Task und PSRAM-Ring
+- XIAO-Onboard-PDM-Mikrofon als Board-Default; Freenove ohne integriertes Mikro
+- Runtime-Auswahl board_default / external PDM / external I2S im Expert-Modus
+- WAV-Diagnose und Capture-only-Audio-Load-Test
+- ab v53 PCM-Audio im normalen MKV als Matroska A_PCM/INT/LIT Track 3
+- Video bleibt Track 1, Timestamp-Subtitle Track 2
+- Audio startet mit dem ersten realen Kameraframe; Samplezaehler bestimmt
+  Audio-Zeitstempel
+- Audiofehler allein sind nicht fatal fuer Video; gemeinsamer Storagefehler
+  bleibt fatal
+- Audio erbt recording_encryption und erzeugt keinen Klartext-Sidecar
+
+v54-v55 WEBPLAYER AUDIO:
+- Browser kann eingebettetes MKV-PCM als transienten WAV-Stream auslesen
+- Audio wird zum Video synchronisiert; Autoplay-Policy wird abgefangen
+- Audioindikator in der Recording-Liste
+- WebPlayer-Start wurde wieder so geordnet, dass Video nicht auf kompletten
+  Audio-Download warten muss
+
+v56-v59 RECORDING LOAD TEST / TIMING:
+- echter Kamera -> Recorder/MKV -> Audio -> RecordingStorage -> SD Load Test
+- 30 s / 60 s / 5 / 15 / 30 / 60 min
+- lange Tests laufen als State-Machine im normalen Firmware-Loop und bleiben
+  aktiv, auch wenn die Browserseite geschlossen wird
+- detaillierte Bewertung Video/Timing, Audio, Storage/Finalize, Heap/PSRAM,
+  Temperatur
+- Slow-Frame-Aufschluesselung inkl. Kamera, Audio, Cluster, Subtitle,
+  Video-Write, Image-Analyse und sonstiger Zeit
+- v58 entfernte die zwei synchronen Cluster-Rollover-Seeks, indem neue MKV-
+  Cluster ihre standardkonforme Unknown-Size-VINT behalten
+- v59 ergaenzte physische File::write()/seek()-Diagnostik fuer synchrone Pfade
+
+v60 WRITE-BEHIND:
+- MKV erhielt 512 KiB PSRAM Write-Behind
+- Low-Priority Drain-Task schreibt 32-KiB-Bloecke durch denselben
+  RecordingStorageFile-Pfad
+- Plain und SFENC1 nutzen dieselbe Buffer-Architektur
+- seek/flush/finalize drainen zuerst den Queue-Inhalt
+- Telemetrie fuer High-Water, Producer-Waits, committed bytes, Drain-Latenzen
+- Storagefehler bleiben fatal; kein stilles Maskieren
+
+v61-v63 FEHLERDIAGNOSE / OWNERSHIP:
+- v61 trennte Open-State und Health-State sauber, damit ein fehlgeschlagener
+  MKV-Writer nicht als bereits geschlossen erscheint
+- Cleanup/Finalize sammelt nach Fehler weiterhin Telemetrie und gibt Crypto-/
+  Storage-Ressourcen frei
+- v61 reserviert grosse Write-Behind-PSRAM-Bloecke vor den Crypto-Caches
+- v62 entfernt redundantes fseek vor rein sequentiellen SFENC1-Chunks, wenn die
+  physische Position bereits stimmt
+- v62 protokolliert bei physischem Write-/Seek-Fehler errno, Streamposition und
+  beobachtete Dateigroesse
+- v63 verhindert, dass WebConfig-Pause einen vom Recording Load Test besessenen
+  Recorder als vermeintlich verwaist beendet
+- v63 fail-fast, falls ein Load-Test-Recorder trotzdem extern verschwindet
+
+v64 STORAGE-FAULT / LOGGER / RAW-ENDURANCE:
+- echter VFS/SD-EIO wird gelatcht
+- nach EIO kein blindes Weiterarbeiten auf dem vergifteten Mount
+- SD Recovery remountet kontrolliert; Latch wird erst nach erfolgreichem Mount
+  geloescht
+- Logger wird bei bekanntem EIO vor dem Remount OHNE zusaetzliches
+  RAM->SD-Flush geschlossen; RAM-Logqueue bleibt erhalten und kann nach dem
+  Remount persistiert werden
+- Recording Load Test nutzt nach physischem EIO denselben kontrollierten
+  Recovery-Pfad
+- SD Benchmark erweitert um 64 MiB / 4 KiB FILE_WRITE und 64 MiB / 4 KiB w+
+  mit vollstaendigem Read-back-Verify
+
+v65 SFENC1-PRODUKTIONSSTACK-ENDURANCE:
+- zusaetzlicher 64-MiB-Test durch den exakten Produktionspfad:
+  RecordingWriteBufferedFile -> PSRAM Write-Behind -> RecordingStorageFile
+  encrypted -> SFENC1 -> SD
+- danach vollstaendiger logischer Decrypt-/Read-back-Verify
+- Logger ist fuer diesen isolierten Test geschlossen, Storage exklusiv gegated
+- Test verlangt aktiven Write-Behind; synchroner Fallback waere nicht
+  repraesentativ
+- 10-MHz-Fallback nur nach echtem Produktionstakt-EIO und sauberem Remount
+
+v66 KONSERVATIVER STABILITAETSVERSUCH:
+- XIAO testweise NORMAL=MAX=10 MHz
+- 1024x768 auf 4 fps begrenzt; alte fps=5-Configs bleiben gueltig und werden
+  nur effektiv geclamped
+- WebConfig-/Load-Test-Polling reduziert
+- keine Aenderung an SFENC1-Format, Crypto, Write-Behind oder Audioformat
+
+v67 AKTUELLER ARBEITSSTAND:
+- XIAO SD wieder NORMAL=MAX=20 MHz
+- 4-fps-Cap und reduziertes Web-Polling bleiben erhalten
+- 10 MHz brachte im kurzen Feldtest keinen erkennbaren Thermalvorteil
+- keine Aenderung an SFENC1, Write-Behind, Audio, Thermalgrenzen oder
+  Image-Motion-Algorithmus
+
+WICHTIGE STORAGE-/RECORDING-TESTHISTORIE v60-v67:
+
+1. v60:
+   - erster kombinierter Encryption+Audio-Load-Test schlug nach rund 94 s fehl
+   - damalige Report-/Cleanup-Fehler machten Write-Behind/Medienwerte teilweise
+     irrefuehrend; daraus entstanden v61-Fixes
+
+2. v61:
+   - verschluesselter 5-min-Test scheiterte nach ca. 93.055 s
+   - physischer 4-KiB-Write bei SFENC1 chunk=468 / offset=15382592 lieferte 0
+   - unverschluesselter A/B-Test mit sonst gleichen Lastbedingungen lief dagegen
+     300 s / rund 47.7 MiB durch
+   - dadurch wurde der SFENC1-/VFS-Writepfad weiter isoliert
+
+3. v62:
+   - redundanter sequentieller fseek entfernt und Low-Level-Fehlerdiagnostik
+     erweitert
+   - danach ein verschluesselter 5-min-Test erfolgreich:
+     ca. 300004 ms / 1495 Frames / 4.98 fps / rund 48.7 MiB / 0 Audio-Drops /
+     Write-Behind ohne Producer-Waits
+   - ein anschliessender 60-min-Test lieferte scheinbar 0 Frames, obwohl intern
+     Daten geschrieben worden waren. Ursache war KEIN Storagefehler, sondern
+     WebConfig-Pause/Recorder-Ownership; daraus entstand v63
+
+4. v63:
+   - Ownership-/Fail-fast-Fix fuer langen Recording Load Test
+   - danach echter verschluesselter EIO nach ca. 127.418 s:
+     chunk=655 / offset=21523280 / 0 von 4096 Byte / errno=5
+   - derselbe Firmware-/Logstand zeigte auch ausserhalb des Benchmarks einen
+     normalen Recording-Write-Fehler mit anschliessender SD Recovery
+   - damit war klar, dass der EIO nicht nur ein Fehler der Benchmark-State-
+     Machine war
+
+5. v64 RAW-STORAGE:
+   - 64 MiB FILE_WRITE / 4 KiB: kompletter Verify OK
+   - 64 MiB w+ / 4 KiB, also SFENC1-Dateimodus: kompletter Verify OK
+   - 4/10/20-MHz-Clock-Sweep jeweils mount+verify OK
+   - FAT32 / 32-KiB-Cluster korrekt
+   - einfacher Kartenkapazitaets-, FAT-Geometrie- oder grundsaetzlicher w+-
+     Fehler damit stark unwahrscheinlich
+
+6. v65 ECHTER SFENC1-STACK:
+   - zwei getrennt gemeldete 64-MiB-Laeufe am 20-MHz-Produktionstakt
+   - jeweils realer 512-KiB-Write-Behind + Drain-Task + SFENC1 + SD
+   - physische Datei ca. 67,207,296 Byte
+   - jeweils kompletter logischer Decrypt-/Read-back-Verify OK
+   - Storage-EIO-Latch jeweils clear
+   - synthetischer Producer fuellte den Ring bewusst bis 100 Prozent und wartete;
+     das ist fuer diesen Maximal-Endurance-Test normal und nicht mit dem
+     4/5-fps-Produktbetrieb gleichzusetzen
+
+7. FOREGROUND-/BACKGROUND-WEBCONFIG-HINWEIS:
+   - ein 5-min-Test mit Seite im Hintergrund lief komplett ohne EIO
+   - ein spaeterer 5-min-Test mit sichtbarer Vordergrund-Statusseite scheiterte
+     nach ca. 69.9 s mit errno=5/EIO bei chunk=451 / offset=14800144
+   - damals entstand die Hypothese, dass aktive HTTP/WiFi-Systemlast mitwirkt
+   - spaetere v67-Ergebnisse zeigen aber, dass dies NICHT als alleinige Ursache
+     gelten darf: ein 5-min-Vordergrundlauf bei 4 fps konnte auch erfolgreich
+     durchlaufen
+
+8. v66 10-MHz-/4-fps-Lauf:
+   - kein Storage-EIO, sondern Thermal Emergency
+   - Test nach ca. 23.3 s bei CPU=81.2 C beendet
+   - Start war bereits warm; nach Cooling-Deep-Sleep Neustart bei etwa 40.2 C
+   - 10 MHz brachte damit keinen erkennbaren Thermalvorteil und wurde verworfen
+
+9. v67 20 MHz / 4 fps:
+   - ein 5-min-Lauf mit MKV + Encryption + Audio + Image Motion lief komplett
+     durch
+   - 1196 Frames / 3.99 fps / P99 108.7 ms bei 250-ms-Budget
+   - 0 Audio-Drops, 0 Producer-Waits
+   - Write-Behind High-Water 52.5 Prozent; einzelner Drain-Stall bis 879.1 ms
+     wurde vom Puffer abgefangen
+   - CPU max 76.2 C; Finalisierung 298 ms
+   - danach gestarteter 15-min-Lauf schlug nach 473340 ms / 1888 Frames /
+     rund 74.8 MiB logischem Medium erneut mit echtem EIO fehl:
+     chunk=2337 / offset=76715696 / written=0/4096 / errno=5
+   - zum Fehlerzeitpunkt KEIN Laststau:
+     Write-Behind High-Water 9.5 Prozent, 0 Producer-Waits,
+     Audio 0 Drops, Heap/PSRAM gesund, CPU max 77.2 C
+   - dieser Befund ist aktuell der wichtigste offene Langzeitrandfall
+
+AKTUELLE INTERPRETATION DES EIO-RANDFALLS:
+
+- NICHT als bewiesener SFENC1-Algorithmusfehler behandeln.
+- NICHT als bewiesenes Kapazitaets-/FAT-/w+-Problem behandeln.
+- NICHT als einfacher Throughput-/Write-Behind-Ueberlauf behandeln.
+- NICHT als Thermal Emergency erklaeren; der letzte v67-EIO trat klar unter
+  der 80-C-Notgrenze auf.
+- Aktive Vordergrund-WebConfig kann Systemlast erhoehen, ist aber nach den
+  spaeteren Laeufen keine hinreichende Einzelursache.
+- Image Motion ist mit etwa 93-102 ms Analysezeit in den langsamsten Frames
+  der groesste CPU-Anteil. Bei 4 fps bleibt das Framebudget trotzdem deutlich
+  im gruenen Bereich. Ob diese Zusatzlast den Lower-Level-EIO triggern kann,
+  ist noch offen.
+- Der aktuelle Recording Load Test haelt fuer lange Tests absichtlich EINE
+  monolithische Datei offen und unterdrueckt die normale Segmentrotation.
+  Der reale Produktbetrieb mit z.B. 30-s-Segmenten ist deshalb weniger
+  repraesentativ durch einen 15-/60-min-Einzelfile-Test abgebildet als bisher
+  angenommen.
+- Der Fehler kann weiterhin im Arduino-ESP32/VFS/SD-SPI-Treiber, in einer
+  Board-/Power-/Signalrandlage oder in einer nur unter kombinierter Last
+  auftretenden Integration liegen.
+- Keine automatische Wiederholung eines fehlgeschlagenen Writes auf demselben
+  File/Mount einfuehren; nach EIO bleibt kontrollierter Recovery der sichere Weg.
+
+OFFENE TESTS BEIM NAECHSTEN WIEDEREINSTIEG - ZIELGERICHTETE REIHENFOLGE:
+
+A. EIN letzter Image-Motion-A/B-Test, bevor an der Bildanalyse optimiert wird:
+   - v67 unveraendert
+   - 20 MHz SD, 4 fps, 1024x768
+   - MKV + Audio + Encryption an
+   - gleiche SD-Karte, gleiche Stromversorgung, gleiche WebConfig-Situation
+   - 15 Minuten mit motion_recording_decision=direct
+   - danach Vergleich mit image_only
+   Erwartung/Auswertung:
+   - scheitert direct ebenfalls mit EIO -> Image Motion als Hauptursache stark
+     unwahrscheinlich; NICHT weiter an Image Motion herumoptimieren
+   - laeuft direct stabil und image_only reproduzierbar nicht -> Bildanalyse/
+     CPU-/Scheduling-Last gezielt reduzieren, Feature aber NICHT entfernen
+
+B. Danach einen REPRAESENTATIVEN segmentierten Production-Endurance-Test bauen:
+   - Ziel spaeterer v68-Block, wenn Entwicklung wieder aufgenommen wird
+   - 60 Minuten Gesamtlauf, aber mit normaler Segmentierung statt einer
+     monolithischen 60-min-Datei
+   - aktuelle Produktparameter verwenden, z.B. 30-s-Segmente / max. 20 MiB
+   - Kamera + Audio + Encryption + image_only + WebConfig aktiv
+   - jede Segmentfinalisierung und Neueroeffnung protokollieren
+   - EIO/Recovery, Temperatur, Audio-Drops, Write-Behind High-Water/Waits und
+     Segmentvollstaendigkeit auswerten
+   - wenn dieser realistische 60-min-Test sauber ist, kann der XIAO-
+     Produktbetrieb trotz kuenstlichem Monolith-Stresstest als deutlich
+     besser qualifiziert gelten
+
+C. Falls auch der segmentierte Production-Endurance-Test EIO produziert:
+   - Firmware-Mikrooptimierung nicht endlos fortsetzen
+   - XIAO SPI-SD / Arduino-Core / Strom-/Signalreserve als Plattformgrenze
+     behandeln und gezielte Hardware-/Core-A/B-Tests planen
+   - moegliche spaetere A/Bs: weitere bekannte gute SD-Karte, Zweitboard,
+     Versorgung/USB-Netzteil, Arduino-ESP32-Core-Vergleich, ggf. alternative
+     Storage-/Boardarchitektur
+   - erst mit konkreter Evidenz neue Architektur bauen
+
+D. Kein 60-min-Monolith-Test als naechster Schritt.
+   Der aktuelle offene Erkenntnisgewinn ist mit direct-vs-image_only und
+   anschliessendem segmentierten Langzeittest deutlich hoeher.
+
+E. Vor dem naechsten Qualifikationslauf:
+   - persisted config kontrollieren: fps=4
+   - Image-Motion-Zielbetrieb image_only beibehalten; direct nur fuer A/B
+   - Karte korrekt FAT32 / 32-KiB-Cluster
+   - Board vor Thermaltests nicht bereits bei >70 C starten
+   - exakte Kartenidentitaet/Testkarte im Testprotokoll notieren, damit alte
+     und neue Karte spaeter nicht verwechselt werden
+
+NIEDRIG PRIORISIERTER UI-PUNKT:
+
+- Beim Start eines Recording-/Benchmarktests wechselt die Browsermaske kurz auf
+  eine Zwischenansicht und unmittelbar danach auf die laufende Statusseite.
+- Das ist aktuell als UI-/Redirect-Flicker zu behandeln, nicht als Recording-
+  oder Rebootfehler.
+- Spaeter Startflow glatter machen: sofort eindeutige "Test wird gestartet"-
+  bzw. stabile Statusansicht anzeigen und erst nach bestaetigtem Start in den
+  laufenden Zustand wechseln.
+
 
 ======================================================================
 WICHTIGER AKTUELLER HARDWARE-/STABILITAETSHINWEIS (2026-09-19)
@@ -145,12 +454,28 @@ Image-Motion-Diagnoselog mit bis zu 400 Frames und zusaetzlicher Frame-to-Frame-
 Bewegungsmessung. Der Pfad ist funktional, aber weiterhin noch nicht abschliessend
 im Feld validiert und bleibt deshalb ein ausdruecklicher TODO-Punkt.
 
-Die XIAO-microSD laeuft im aktuellen Zwischenstand im normalen Recordingbetrieb
-mit 20 MHz SPI statt 4 MHz. Die Umstellung wurde mit synthetischem SD-Test und
-mit dem realen OV3660->AVI->SFENC1-Aufnahmepfad auf echter Hardware verifiziert;
-beide Testdateien wurden fehlerfrei zurueckgelesen. Die Frame-/Storage-Latenzen
-verbesserten sich deutlich. Die Sync-API muss bei NORMAL=MAX=20 MHz nicht mehr
-zwischen zwei SD-Taktraten remounten.
+Die XIAO-microSD laeuft im aktuellen v67-Arbeitsstand wieder mit 20 MHz SPI
+(NORMAL=MAX=20 MHz). Der temporaere v66-Versuch mit 10 MHz brachte keinen
+erkennbaren thermischen Vorteil und wurde deshalb in v67 rueckgaengig gemacht.
+FAT32 mit 32-KiB-Clustern bleibt verbindlich.
+
+Die isolierte Storage-Strecke ist inzwischen deutlich haerter qualifiziert als
+im frueheren Stand: 64-MiB-Rohdatei mit FILE_WRITE, 64-MiB mit w+ sowie der
+vollstaendige Produktionsstack RecordingWriteBufferedFile -> 512-KiB-PSRAM-
+Write-Behind -> RecordingStorageFile(encrypted) -> SFENC1 -> SD wurden bei
+20 MHz jeweils mit vollstaendigem Read-back/Decrypt-Verify erfolgreich getestet.
+Der komplette 64-MiB-SFENC1-Stack-Test wurde in zwei getrennten Laeufen ohne EIO
+bestanden.
+
+TROTZDEM ist die kombinierte Langzeitqualifikation noch NICHT abgeschlossen:
+unter echtem Kamera+Audio+Encryption+Image-Motion+WebConfig-Systembetrieb trat
+sporadisch weiterhin errno=5/EIO bei einem physischen 4-KiB-SFENC1-Write auf.
+Der aktuell relevante v67-Fehler kam nach rund 473 s / 1888 Frames / ca. 75 MiB
+bei 4 fps, obwohl Write-Behind nur 9.5 Prozent High-Water, 0 Producer-Waits,
+0 Audio-Drops und max. 77.2 C meldete. Das spricht gegen einen simplen
+Durchsatz-, Puffer- oder Thermal-Engpass und fuer einen intermittierenden
+Lower-Level-/Integrationsrandfall, der spaeter gezielt weiter eingegrenzt werden
+muss. Nach echtem EIO wird NICHT blind auf demselben File weitergeschrieben.
 
 Seit v44 ist fuer SensorForge SD Format FAT32 mit 32-KiB-Clustern verbindlich.
 Der Anlass war ein realer Freenove-Test, bei dem eine zuvor mit 512-Byte-Clustern
@@ -184,14 +509,16 @@ definiert und bleibt ein eigener naechster Entwicklungsschritt.
 
 
 ======================================================================
-AKTUELLER RELEASESTAND 2026-09-24 - v23 BIS v46
+HISTORISCHER RELEASESTAND 2026-09-24 - v23 BIS v46
 ======================================================================
 
-AKTUELLER ENTWICKLUNGS-/PRODUKTIV-RELEASE: v46
+HISTORISCHER DAMALIGER ENTWICKLUNGS-/PRODUKTIV-RELEASE: v46
+AKTUELLER ARBEITSSTAND SIEHE v67-BLOCK WEITER OBEN.
 
-WICHTIG: Die Versionsnummer v46 ist die menschliche Projekt-/Release-ID fuer den
-zusammengefuehrten SensorForge-Quellstand. Der Benutzer hat v46 in dieser Sitzung
-als neuen Produktiv-Release festgelegt. Die Release-ID ist bewusst getrennt von:
+WICHTIG: Die Versionsnummer v46 war die damalige menschliche Projekt-/Release-ID
+fuer den zusammengefuehrten SensorForge-Quellstand. Dieser Abschnitt bleibt als
+Historie erhalten und wird durch den v47-v67-Block weiter oben erweitert.
+Die Release-ID ist bewusst getrennt von:
 
 - Core-Version 7.1.0 in branding.h
 - Compile-Zeitpunkt __DATE__/__TIME__ eines konkreten Binaries
@@ -245,13 +572,15 @@ Hauptdateien (nur als Rekonstruktionshilfe, nicht als Ersatz fuer Codepruefung):
 Diese Liste darf spaeter NICHT blind verwendet werden. Sobald ein neuerer
 Upload/Git-Stand existiert, ist dieser autoritativ.
 
-Empfohlenes Git-Schema:
+Empfohlenes Git-Schema fuer den aktuellen zusammengefuehrten Arbeitsstand:
 
   git add .
-  git commit -m "SensorForge v46"
-  git tag -a v46 -m "SensorForge v46"
+  git commit -m "SensorForge v67"
+  git tag -a v67 -m "SensorForge v67"
   git push origin main
-  git push origin v46
+  git push origin v67
+
+Der darunter dokumentierte v46-Block bleibt historische Releasebeschreibung.
 
 WICHTIG FUER SPAETERE CODEAENDERUNGEN:
 
@@ -5194,6 +5523,20 @@ Kein Health-Rollback nach neuem Boot
 OFFENE PUNKTE NACH PRIORITAET
 ======================================================================
 
+NEUE HOECHSTE PRIORITAET BEIM WIEDEREINSTIEG (STAND v67):
+
+- XIAO Recording-Langzeitstabilitaet NICHT mit weiteren Blind-Patches verfolgen.
+- Zuerst den im v67-Block beschriebenen 15-min-direct-vs-image_only-A/B-Test.
+- Danach einen segmentierten 60-min-Production-Endurance-Test entwickeln/ausfuehren.
+- Erst wenn auch der segmentierte reale Produktpfad EIO zeigt, Hardware/Core/
+  Storage-Architektur als naechsten Block anfassen.
+- Bis dahin v67 als eingefrorenen Arbeitsstand behandeln: 20 MHz, 4-fps-Cap,
+  reduziertes Web-Polling, SFENC1/Write-Behind unveraendert.
+- Der UI-Flicker beim Teststart ist ein spaeterer Komfortpunkt, kein Blocker.
+
+Die folgende historische Prioritaetsliste bleibt weiterhin gueltig, wird aber
+durch diesen v67-Block fuer die unmittelbare Wiederaufnahme ueberstimmt.
+
 0. SFLOG1 LETZTEN HARDWARESTAND BESTAETIGEN
 
    Der aktuelle Quellstand enthaelt bereits den Fix fuer den beim WebConfig-
@@ -5384,14 +5727,26 @@ OFFENE PUNKTE NACH PRIORITAET
     - Frame-to-Frame-Messung vorerst nur diagnostisch verwenden und erst nach
       Messdaten entscheiden, ob sie spaeter die Aufnahmeentscheidung beeinflussen soll
 
-23. XIAO SD 20 MHZ LANGZEIT-/VARIANTENBEOBACHTUNG
+23. XIAO SD 20 MHZ / KOMBINIERTE LANGZEITQUALIFIKATION
 
-    20 MHz ist auf dem aktuellen XIAO/SD-Aufbau mit synthetischem Readback und
-    realem OV3660/AVI/SFENC1-Pfad positiv verifiziert und ist der aktuelle
-    Produktionswert. Bei anderen SD-Karten, Boardchargen oder groesseren
-    Aufloesungen/FPS trotzdem auf Write-Spikes, SD-Recovery, Temperatur und
-    Strom achten. Bei Problemen zuerst messen und reproduzieren; nicht vorschnell
-    die Storage-Architektur oder SD_MMC des Freenove-Pfads umbauen.
+    20 MHz ist in v67 wieder der aktive XIAO-Wert. Der isolierte Storagepfad ist
+    mit 64-MiB-FILE_WRITE, 64-MiB-w+ und zweimaligem 64-MiB-Voll-SFENC1-Stack
+    inklusive Read-back/Decrypt-Verify stark positiv qualifiziert.
+
+    Offen bleibt ein sporadischer echter errno=5/EIO nur unter kombiniertem
+    Kamera+Audio+Encryption+Image-Motion+WebConfig-Langzeitbetrieb. Der letzte
+    relevante v67-Fehler trat nach 473340 ms bei rund 75 MiB auf, obwohl
+    Write-Behind 9.5 Prozent / 0 Waits, Audio 0 Drops und CPU max 77.2 C meldete.
+
+    Naechste Schritte NICHT weiter verbreitern:
+    1. 15 min direct vs image_only A/B, sonst alles identisch.
+    2. Danach segmentierten 60-min-Production-Endurance-Test mit normaler
+       Segmentrotation statt monolithischer Benchmarkdatei.
+    3. Erst wenn auch dieser reale Segmentpfad EIO produziert, Hardware/Core/
+       Power/Signalreserve oder alternative Storagearchitektur weiter untersuchen.
+
+    Keine automatische Write-Wiederholung auf demselben vergifteten File/Mount.
+    Freenove-SD_MMC nicht aus dem XIAO-Randfall heraus umdesignen.
 
 
 ======================================================================
@@ -5555,8 +5910,10 @@ WICHTIGE ARBEITSREGELN - BETTER SAFE THAN SORRY:
 - Keine .lic-Datei-Userflows fuer die Lizenzierung wieder einfuehren.
 - WebLog ist ab v22 eigenes Modul web_log.cpp/.h; log_storage.cpp/.h bleibt die
   separate SFLOG1-/Storage-Schicht.
-- Aktueller Entwicklungs-/Produktiv-Release ist v46. sensorforge_version.h
-  traegt die Release-ID, CHANGELOG.md die Historie. Release-ID, Core-Version 7.1.0,
+- Aktueller eingefrorener Entwicklungs-/Arbeitsrelease ist v67.
+  sensorforge_version.h traegt die Release-ID, CHANGELOG.md die Historie.
+  Die XIAO-Langzeit-Produktqualifikation ist wegen eines sporadischen
+  kombinierten EIO-Randfalls noch offen. Release-ID, Core-Version 7.1.0,
   Build-Zeitpunkt und API-Version sind getrennte Begriffe.
 - ZIPs sind Deltapakete und enthalten nur geaenderte/neue Dateien. Nach jeder
   Release werden die Deltas in den vollstaendigen lokalen Projektbaum gemergt,
@@ -5564,7 +5921,37 @@ WICHTIGE ARBEITSREGELN - BETTER SAFE THAN SORRY:
   markiert.
 
 
-AKTUELLER v46-FUNKTIONSSTAND:
+
+AKTUELLER v67-ZUSATZ FUER EINEN NEUEN CHAT:
+
+- v47-v53 fuehrten Audio-Capture, XIAO-Onboard-PDM, externe PDM/I2S-Optionen,
+  Audio-Diagnose und ab v53 eingebettetes PCM-Audio im normalen MKV ein.
+- v56-v59 fuehrten den echten Recording Load Test und detaillierte Timing-/
+  Storage-Diagnostik ein.
+- v60 fuehrte den 512-KiB-PSRAM-Write-Behind fuer MKV ein.
+- v61-v64 haerteten Cleanup, Ownership, EIO-Diagnostik, Logger-Recovery und
+  SD-Remount nach echtem I/O-Fehler.
+- v64: 64 MiB FILE_WRITE + 64 MiB w+ jeweils kompletter Verify OK.
+- v65: zweimal 64 MiB durch den echten verschluesselten Write-Behind/SFENC1-
+  Produktionsstack mit komplettem Decrypt-/Read-back-Verify OK bei 20 MHz.
+- v66 testete 10 MHz + 4 fps; 10 MHz brachte keinen klaren Thermalvorteil.
+- v67 stellt XIAO auf 20 MHz zurueck, behaelt aber 4-fps-Cap und reduziertes
+  WebConfig-Polling.
+- Aktuell offen: sporadischer echter errno=5/EIO im kombinierten Langzeitpfad.
+  Ein v67-5-min-Lauf bei 4 fps lief sauber; ein 15-min-Lauf scheiterte nach
+  473340 ms / ca. 75 MiB bei chunk=2337 / offset=76715696, trotz 0 Producer-
+  Waits, 0 Audio-Drops, gesundem Heap/PSRAM und CPU max 77.2 C.
+- Naechster Test bei Wiederaufnahme: 15 min direct vs image_only A/B.
+- Danach segmentierten 60-min-Production-Endurance-Test mit normaler
+  Segmentrotation bauen; keinen weiteren monolithischen 60-min-Test priorisieren.
+- Image Motion ist weiterhin ein gewolltes Kundenfeature; direct ist nur
+  diagnostische Referenz.
+- Persistierte XIAO-1024x768-Config vor Tests auf fps=4 bringen.
+- Kein fehlgeschlagenes SD-Write auf demselben File/Mount blind wiederholen.
+- UI-Nebenpunkt: Beim Start von Benchmark/Recording-Test flackert die Maske kurz
+  durch Redirect/Zwischenansicht; spaeter UX glatter machen.
+
+HISTORISCHER BASIS-FUNKTIONSSTAND BIS v46 (ZUSAETZLICH GILT DER v47-v67-BLOCK OBEN):
 
 - Recording-Liste: Icons, Video-Zeitbereiche, Annotationen, Auswahl/Loeschen,
   Corrupt-Warnung, progressives Laden und sichtbare Range-/Filterauswahl.
@@ -6035,6 +6422,13 @@ neutraler Platzhalter.
 
 WEITERE PRIORITAETEN:
 
+- AKTUELLER v67-BLOCKER BEIM WIEDEREINSTIEG: zuerst 15-min direct vs image_only
+  unter identischen Bedingungen; danach segmentierten 60-min-Production-
+  Endurance-Test mit normaler Segmentrotation. Keine weitere Blindoptimierung
+  des SFENC1-/Write-Behind-Pfads, solange die isolierten 64-MiB-Verifies sauber
+  bleiben.
+- v67-XIAO-Policy fuer die naechste Qualifikation: 20 MHz SD, 4 fps bei
+  1024x768, reduziertes WebConfig-Polling. Image Motion bleibt Produktziel.
 - v20 fuer den 500-ms-Dauershooter als aktuellen Zuverlaessigkeitsstand halten;
   High-Rate-Light-Sleep nicht ohne reproduzierbaren Langzeit-A/B-Test reaktivieren
 - v22 nach Build/Flash kurz auf Logseite regressionspruefen: Chunk-Load, Retry,
@@ -6055,8 +6449,10 @@ WEITERE PRIORITAETEN:
   Rotation/Power-Loss und Transport-Journal
 - SFSEC1 ist auf echter Hardware inklusive Migration + Power-Cycle bestaetigt;
   diesen Persistenzpfad nicht wieder auf Klartext zurueckbauen
-- SFENC1/eFuse-Storage-Encryption ist funktional abgeschlossen; bestehende
-  Grundarchitektur nur bei reproduzierbarem Fehler veraendern
+- SFENC1/eFuse-Storage-Encryption und der isolierte 64-MiB-Write-Behind-
+  Storagepfad sind funktional stark positiv getestet. Die bestehende Crypto-/
+  Formatarchitektur nicht aus dem noch offenen kombinierten Langzeit-EIO heraus
+  ohne konkrete Evidenz neu designen
 - Netzwerksicherheit bleibt ein eigener naechster Hardening-Bereich:
   geschuetzte Secrets at rest sind umgesetzt, aber WebConfig/Sync laufen noch
   ueber HTTP/Basic Auth; Route/Auth-Audit und HTTPS/TLS spaeter separat planen
@@ -6077,8 +6473,11 @@ WEITERE PRIORITAETEN:
   Sensitivity 5 / Confirm 2 / Release 2 / Background Learning 4 zunaechst halten
 - Frame-to-Frame-Motion vorerst nur diagnostisch auswerten; noch nicht in die
   Aufnahmeentscheidung einbeziehen
-- XIAO-SD 20 MHz bei weiteren Karten/Boardchargen und hoeheren Aufloesungen/FPS
-  weiter auf Latenzspikes, Recovery, Temperatur und Strom beobachten
+- XIAO-SD 20 MHz bleibt v67-Policy. Weiter auf sporadischen errno=5/EIO unter
+  kombiniertem Kamera+Audio+Encryption+Image-Motion+WebConfig-Langzeitbetrieb
+  achten; isolierte 64-MiB-Raw/w+/SFENC1-Verifies sind dagegen positiv.
+  Naechste Aussage soll aus direct-vs-image_only und segmentiertem
+  Production-Endurance kommen, nicht aus weiteren monolithischen Blindtests
 - Freenove SD_MMC: 32-KiB-FAT32-Cluster als verbindliche Formatpolicy beibehalten;
   bei Benchmark-Clusterwarnung zuerst ueber SensorForge SD Format neu formatieren
   und danach Benchmark wiederholen
@@ -6097,6 +6496,19 @@ WEITERE PRIORITAETEN:
   bewerten
 - Watchdog/Radar/SD-Randfaelle weiter beobachten
 - XIAO camera default OV2640 vs reale OV3660-Hardware bewusst spaeter entscheiden
+
+
+PAUSE-/UEBERGABESTAND 2026-09-26:
+
+Die Arbeit an der XIAO-Recording-Langzeitqualifikation ist bewusst PAUSIERT.
+Nicht automatisch weiterpatchen. Bei Wiederaufnahme zuerst diesen Dokumentblock
+und den dann aktuellen Quellcode lesen. Aktueller Arbeitsrelease v67.
+
+Der wichtigste offene technische Befund ist der sporadische errno=5/EIO im
+kombinierten Langzeitpfad trotz positiver isolierter 64-MiB-Storage-/SFENC1-
+Verifies. Naechste zwei Schritte sind bereits festgelegt:
+1. 15 min direct vs image_only A/B.
+2. Danach segmentierter 60-min-Production-Endurance-Test.
 
 Bitte bei weiterer Entwicklung den funktionierenden aktuellen Stand erhalten,
 keine bereits geloesten Themen neu designen, keine APIs/Funktionen erfinden und

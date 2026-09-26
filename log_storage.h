@@ -39,7 +39,12 @@ bool logStorageOpenWriter(
     String &error
 );
 
-void logStorageCloseWriter(LogStorageWriter &writer);
+// flushBeforeClose=false is reserved for a known-bad SD/VFS mount. It avoids
+// an explicit flush on a poisoned filesystem while still releasing the handle.
+void logStorageCloseWriter(
+    LogStorageWriter &writer,
+    bool flushBeforeClose = true
+);
 void logStorageFlushWriter(LogStorageWriter &writer);
 
 // Append plaintext to the current generation. For SFLOG1, terminal damage from

@@ -3695,7 +3695,18 @@ bool recoverSD()
         "Attempting SD recovery..."
     );
 
-    logClose();
+    bool ioFaultLatched =
+        storageIoFaultActive();
+
+    if (ioFaultLatched) {
+        Serial.println(
+            "SD recovery: EIO latched - closing logger without buffered flush"
+        );
+    }
+
+    // A known-bad mount must not receive another RAM->SD logger flush. Pending
+    // logger lines stay in RAM and are written after a successful remount.
+    logClose(!ioFaultLatched);
 
     resetStorageInterface();
 
@@ -3721,6 +3732,8 @@ bool recoverSD()
     sdReady =
         true;
 
+    // Only a successful fresh mount clears the hard VFS/SD I/O fault latch.
+    storageClearIoFault();
     storageFaultClearRtcState();
 
     logInit();
@@ -8883,7 +8896,31 @@ static void recordingLoadFinalize(
         result.elapsedMs >=
             result.requestedDurationMs;
 
-    recordingLoadRemoveTestMedia();
+    // A physical EIO means the mounted filesystem can no longer be trusted.
+    // Recover only after recorderEnd() has released its handles. The recovery
+    // path skips the logger's RAM->SD flush while this latch is active.
+    if (storageIoFaultActive()) {
+        Serial.println(
+            "Recording Load Test: storage EIO latched - recovering SD mount"
+        );
+
+        bool recovered =
+            recoverSD();
+
+        if (ctx.error.length())
+            ctx.error += recovered
+                ? " | SD recovery=ok"
+                : " | SD recovery=failed";
+        else
+            ctx.error = recovered
+                ? "storage I/O fault | SD recovery=ok"
+                : "storage I/O fault | SD recovery=failed";
+    }
+
+    // Never issue cleanup filesystem operations against a mount that is still
+    // faulted. A successful recovery already removes interrupted *.part media.
+    if (!storageIoFaultActive())
+        recordingLoadRemoveTestMedia();
 
     if (restoreRecordingStartBlock) {
         g_recordingStartBlocked =

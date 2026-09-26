@@ -11,6 +11,27 @@
 // Cooperative global storage gate declared in storage_guard.h.
 volatile bool g_storageLocked = false;
 
+// Hard I/O fault latch. A recorder/storage worker may set this from another
+// FreeRTOS task; bool reads/writes are atomic on ESP32-S3 and the state changes
+// only false->true until the main recovery path clears it after a successful
+// remount.
+static volatile bool g_storageIoFault = false;
+
+void storageMarkIoFault()
+{
+    g_storageIoFault = true;
+}
+
+bool storageIoFaultActive()
+{
+    return g_storageIoFault;
+}
+
+void storageClearIoFault()
+{
+    g_storageIoFault = false;
+}
+
 
 // =============================================================
 // ROLLOVER TUNING
@@ -121,7 +142,7 @@ static bool isTemporaryRecordingName(
 
 uint64_t storageFreeBytes()
 {
-    if (g_storageLocked)
+    if (g_storageLocked || storageIoFaultActive())
         return 0;
 
     uint64_t total =
@@ -151,7 +172,7 @@ uint64_t storageReserveBytes()
 
 bool storageHasRequiredFreeSpace()
 {
-    if (g_storageLocked)
+    if (g_storageLocked || storageIoFaultActive())
         return false;
 
     uint64_t reserve =
@@ -624,7 +645,7 @@ static int deleteOldestBatchFromFolder(
 
 bool storagePrepareForRecording()
 {
-    if (g_storageLocked)
+    if (g_storageLocked || storageIoFaultActive())
         return false;
 
     uint64_t reserveBytes =

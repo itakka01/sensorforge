@@ -1,5 +1,20 @@
 # SensorForge Changelog
 
+## v67 — 2026-09-26
+
+- Restored the Seeed XIAO ESP32S3 Sense SPI-SD production clock from the temporary v66 10 MHz experiment to the previously qualified 20 MHz setting. `NORMAL` and `MAX` are both 20 MHz, so API-exclusive operation still never changes the card clock behind the recorder's back.
+- Retained the v66 conservative 4 fps production cap at 1024x768 and the reduced WebConfig/Recording-Load polling cadence. These remain the active system-load controls while Image Motion is qualified separately.
+- The 10 MHz experiment did not improve the observed thermal margin: a v66 4 fps load test entered the existing 80 C thermal emergency path before any storage failure occurred. The storage stack had already completed repeated 64 MiB raw, `w+` and full SFENC1 encrypted write-behind verification at 20 MHz.
+- No SFENC1 format, write-behind, audio, recovery, thermal thresholds, Image Motion algorithm or recording-load thresholds were changed.
+
+## v66 — 2026-09-26
+
+- Changed the XIAO SPI-SD production policy from 20 MHz to 10 MHz for stability under combined camera, audio, SFENC1 and active WebConfig traffic. `NORMAL` and `MAX` are both 10 MHz in this profile, so API-exclusive operation no longer raises the card clock. Repeated v65 64 MiB raw, `w+` and full SFENC1 write-behind endurance tests had verified the isolated storage stack, while real 5 fps recording could still reproduce lower-layer `EIO` only with an actively polling foreground WebConfig page.
+- Added a conservative XIAO production cap of 4 fps at 1024x768. Existing config files containing a higher value remain loadable; the runtime clamps that specific profile to 4 fps instead of invalidating the complete config, and WebConfig now exposes/saves the same cap. Factory defaults use 4 fps on XIAO. Other boards and lower-resolution weighted-performance policy remain unchanged.
+- Reduced common WebConfig heartbeat/status/pause-lease polling from 10 s to 20 s and the Recording Load Test status poll from 5 s to 15 s. This preserves operator visibility and the existing pause lease while reducing concurrent WiFi/HTTP activity during recording qualification.
+- Updated the SFENC1 endurance diagnostic wording for the new 10 MHz production clock. The existing code already performs its controlled 10 MHz fallback only when the production clock is above 10 MHz, so v66 never retries an `EIO` at the same clock.
+- No SFENC1 format, cryptography, write-behind architecture, audio format, SD recovery semantics or recording-load rating thresholds were changed. Image Motion remains a separately selectable feature; the conservative v66 qualification target uses the direct/non-image-analysis path.
+
 This file tracks the project release number used by `sensorforge_version.h`.
 For each release, commit the complete project tree and create a Git tag with the
 same name (`v35`, `v36`, ...). The firmware build timestamp remains independent
@@ -8,6 +23,41 @@ and identifies the concrete binary compilation time.
 > Historical release notes below are reconstructed from the maintained project
 > change sequence beginning with v23. Earlier development history remains in the
 > repository history/project documentation.
+
+## v65 — 2026-09-26
+
+- Extended SD Maintenance with a 64 MiB endurance test through the exact production encrypted-recording storage stack: `RecordingWriteBufferedFile` -> 512 KiB PSRAM write-behind/drain task -> `RecordingStorageFile(encrypt=true)` -> SFENC1 -> SD.
+- The new test writes deterministic data in 4 KiB producer calls, closes/finalizes through the normal encrypted path, then reopens the SFENC1 file through `RecordingStorageFile` and performs a complete logical decrypt/read-back verification.
+- Reports write-behind initialization, capacity/high-water, producer waits, committed bytes, drain-call timing, physical encrypted size, logical read-back duration and the existing detailed storage error/EIO reason.
+- The isolated SFENC1 phase closes the persistent logger and holds the global storage gate, ensuring no unrelated filesystem writer can perturb the diagnostic result. No failed media write is automatically retried on the same mount.
+- If and only if the production-clock SFENC1 run fails with a hard EIO, the diagnostic cleanly remounts at 10 MHz and repeats the same 64 MiB encrypted-stack test once. It then restores the board production mount before returning. A production-clock failure remains a benchmark failure even when the 10 MHz diagnostic fallback passes.
+- Existing raw FILE_WRITE/w+ endurance cases, FAT geometry checks, block-size tests, allocation comparison, clock sweep, recording format and SFENC1 on-disk format remain unchanged.
+
+## v64 — 2026-09-26
+
+- Added a hard storage-I/O fault latch for real VFS/SD `EIO` failures.
+  `RecordingStorageFile` now marks the mount faulted when a physical
+  `File::write()` or `File::seek()` fails with `EIO`; SFLOG1 low-level
+  read/write helpers do the same. No failed media write is automatically
+  retried or hidden.
+- Made SD recovery fault-aware. When an EIO is latched, the persistent logger
+  is closed without pushing its pending RAM queue through the already poisoned
+  filesystem. The RAM log queue is preserved across the remount and can be
+  persisted after the writer is reopened. The EIO latch is cleared only after
+  a successful fresh SD mount.
+- Recording Load Test now performs the same controlled SD recovery after a
+  physical storage EIO that normal recording already uses. Cleanup operations
+  are not issued against a mount that remains faulted, and the result reports
+  whether SD recovery succeeded.
+- Extended the existing non-destructive SD benchmark with two 64 MiB endurance
+  passes using real 4 KiB writes plus complete read-back verification. The first
+  uses normal `FILE_WRITE`; the second uses `w+`, matching the SFENC1 recording
+  file mode. The test stops on the first short/EIO operation, records the
+  failing offset/errno, performs no write retry, and remounts storage after a
+  latched EIO.
+- Kept SFENC1 crypto, on-disk format, 4 KiB crypto slice size, 512 KiB
+  write-behind capacity, board SD clocks, recording timing and traffic-light
+  thresholds unchanged.
 
 ## v63 — 2026-09-26
 

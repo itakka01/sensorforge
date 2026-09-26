@@ -20,8 +20,8 @@
 // The same release tag is written to the firmware boot log and shown in
 // WebConfig, so a running device can be mapped back to the exact Git tag.
 
-#define SENSORFORGE_RELEASE_NUMBER 63
-#define SENSORFORGE_RELEASE_TAG "v63"
+#define SENSORFORGE_RELEASE_NUMBER 67
+#define SENSORFORGE_RELEASE_TAG "v67"
 #define SENSORFORGE_RELEASE_DATE "2026-09-26"
 #define SENSORFORGE_RELEASE_SUMMARY \
-    "Keep Recording Load Test ownership isolated from WebConfig pause recovery and fail fast on external recorder closure."
+    "Restore the qualified XIAO 20 MHz SD clock while retaining the 4 fps and reduced-WebConfig-load stability profile."

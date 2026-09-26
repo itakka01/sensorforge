@@ -1175,20 +1175,37 @@ void logInit()
 }
 
 
-void logClose()
+void logClose(bool persistPending)
 {
     if (!logWriter.file)
         return;
 
-    flushPendingLogBuffer();
-    logStorageFlushWriter(logWriter);
-    logStorageCloseWriter(logWriter);
+    if (storageIoFaultActive())
+        persistPending = false;
+
+    // After EIO the mount may already be poisoned. Do not turn a media fault
+    // into a torn SFLOG1 tail by pushing the RAM queue through that handle.
+    // The RAM queue intentionally remains intact and will be drained after the
+    // recovery remount reopens the writer.
+    if (persistPending) {
+        flushPendingLogBuffer();
+        logStorageFlushWriter(logWriter);
+    }
+
+    logStorageCloseWriter(
+        logWriter,
+        persistPending
+    );
+
     logBytesWritten = 0;
 }
 
 
 void logFlush()
 {
+    if (storageIoFaultActive())
+        return;
+
     flushPendingLogBuffer();
     logStorageFlushWriter(logWriter);
 }
@@ -1198,6 +1215,7 @@ void logService()
 {
     if (
         g_storageLocked ||
+        storageIoFaultActive() ||
         !logWriter.file ||
         logRamBufferUsed == 0
     ) {

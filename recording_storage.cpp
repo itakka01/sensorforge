@@ -2,6 +2,7 @@
 
 #include "board_config.h"
 #include "recording_crypto.h"
+#include "storage_guard.h"
 
 #include <esp_heap_caps.h>
 #include <esp_timer.h>
@@ -69,29 +70,43 @@ static size_t storageFileWrite(
     size_t length
 )
 {
-    if (!storageFrameDiagEnabled || !storageFrameDiagActive)
-        return file.write(buffer, length);
+    bool diagnose =
+        storageFrameDiagEnabled &&
+        storageFrameDiagActive;
 
-    uint64_t startUs = (uint64_t)esp_timer_get_time();
+    uint64_t startUs =
+        diagnose
+        ? (uint64_t)esp_timer_get_time()
+        : 0ULL;
+
+    errno = 0;
     size_t written = file.write(buffer, length);
-    uint32_t elapsedUs = diagElapsedUs(startUs);
+    int writeErrno = errno;
 
-    storageFrameDiag.valid = true;
-    storageFrameDiag.writeCalls++;
-    storageFrameDiag.writeBytes += (uint64_t)written;
-    storageFrameDiag.writeTotalUs += (uint64_t)elapsedUs;
+    if (written != length && writeErrno == EIO)
+        storageMarkIoFault();
 
-    if (elapsedUs > storageFrameDiag.writeMaxUs) {
-        storageFrameDiag.writeMaxUs = elapsedUs;
-        storageFrameDiag.writeMaxBytes =
-            length > 0xFFFFFFFFULL
-            ? 0xFFFFFFFFUL
-            : (uint32_t)length;
+    if (diagnose) {
+        uint32_t elapsedUs = diagElapsedUs(startUs);
+
+        storageFrameDiag.valid = true;
+        storageFrameDiag.writeCalls++;
+        storageFrameDiag.writeBytes += (uint64_t)written;
+        storageFrameDiag.writeTotalUs += (uint64_t)elapsedUs;
+
+        if (elapsedUs > storageFrameDiag.writeMaxUs) {
+            storageFrameDiag.writeMaxUs = elapsedUs;
+            storageFrameDiag.writeMaxBytes =
+                length > 0xFFFFFFFFULL
+                ? 0xFFFFFFFFUL
+                : (uint32_t)length;
+        }
+
+        if (elapsedUs >= DIAG_SLOW_WRITE_US)
+            storageFrameDiag.slowWriteCalls++;
     }
 
-    if (elapsedUs >= DIAG_SLOW_WRITE_US)
-        storageFrameDiag.slowWriteCalls++;
-
+    errno = writeErrno;
     return written;
 }
 
@@ -100,19 +115,33 @@ static bool storageFileSeek(
     uint32_t position
 )
 {
-    if (!storageFrameDiagEnabled || !storageFrameDiagActive)
-        return file.seek(position);
+    bool diagnose =
+        storageFrameDiagEnabled &&
+        storageFrameDiagActive;
 
-    uint64_t startUs = (uint64_t)esp_timer_get_time();
+    uint64_t startUs =
+        diagnose
+        ? (uint64_t)esp_timer_get_time()
+        : 0ULL;
+
+    errno = 0;
     bool ok = file.seek(position);
-    uint32_t elapsedUs = diagElapsedUs(startUs);
+    int seekErrno = errno;
 
-    storageFrameDiag.valid = true;
-    storageFrameDiag.seekCalls++;
-    storageFrameDiag.seekTotalUs += (uint64_t)elapsedUs;
-    if (elapsedUs > storageFrameDiag.seekMaxUs)
-        storageFrameDiag.seekMaxUs = elapsedUs;
+    if (!ok && seekErrno == EIO)
+        storageMarkIoFault();
 
+    if (diagnose) {
+        uint32_t elapsedUs = diagElapsedUs(startUs);
+
+        storageFrameDiag.valid = true;
+        storageFrameDiag.seekCalls++;
+        storageFrameDiag.seekTotalUs += (uint64_t)elapsedUs;
+        if (elapsedUs > storageFrameDiag.seekMaxUs)
+            storageFrameDiag.seekMaxUs = elapsedUs;
+    }
+
+    errno = seekErrno;
     return ok;
 }
 

@@ -5,6 +5,8 @@
 #include "language.h"
 #include "logger.h"
 #include "recorder.h"
+#include "recording_storage.h"
+#include "recording_write_buffer.h"
 #include "storage_guard.h"
 #include "webplayer.h"
 
@@ -13,7 +15,9 @@
 #include <algorithm>
 #include <LittleFS.h>
 #include <esp_arduino_version.h>
+#include <esp_heap_caps.h>
 #include <esp_task_wdt.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2340,15 +2344,15 @@ static String sdMaintenancePage(
         "<p class='muted'>" +
         String(
             de
-            ? "Erweiterte, nicht-destruktive Storage-Diagnose. SensorForge prüft FAT-/Cluster-Geometrie, 4/16/32/64 KiB Blockgrößen, einen längeren 8-MiB-Schreibtest, den direkten Vergleich zwischen wachsender und bereits allokierter Datei sowie einen backend-unabhängigen Bus-Takt-Vergleich. Alle geschriebenen Daten werden vollständig zurückgelesen und verifiziert."
-            : "Extended non-destructive storage diagnostics. SensorForge reports FAT/cluster geometry, tests 4/16/32/64 KiB blocks, runs a longer 8 MiB write test, directly compares file growth against overwriting already allocated clusters, and performs a backend-independent bus-clock comparison. All written data is read back and verified."
+            ? "Erweiterte, nicht-destruktive Storage-Diagnose. SensorForge prüft FAT-/Cluster-Geometrie, 4/16/32/64 KiB Blockgrößen und Allokationskosten, führt zwei 64-MiB-Rohdatei-Endurance-Läufe aus und danach einen dritten 64-MiB-Test durch den echten RecordingWriteBufferedFile -> RecordingStorageFile -> SFENC1-Pfad mit logischem Entschlüsselungs-/Readback-Verify. Anschließend folgt der Bus-Takt-Vergleich."
+            : "Extended non-destructive storage diagnostics. SensorForge reports FAT/cluster geometry, tests 4/16/32/64 KiB blocks and allocation cost, runs two 64 MiB raw-file endurance passes, then runs a third 64 MiB test through the real RecordingWriteBufferedFile -> RecordingStorageFile -> SFENC1 stack with logical decrypt/read-back verification. All written data is verified before the bus-clock comparison."
         ) +
         "</p>"
         "<p class='muted'>" +
         String(
             de
-            ? "Der Lauf kann auf langsamen Karten mehrere Minuten dauern. Der Preallocation-Test überschreibt ausschließlich die zuvor vom Benchmark selbst allokierten Cluster. Für den Bus-Takt-Vergleich wird die SD kontrolliert neu gemountet; danach wird immer die normale Produktions-Mount-Policy wiederhergestellt. Es wird nicht formatiert."
-            : "The run can take several minutes on slow cards. The preallocation test overwrites only clusters allocated by the benchmark itself. The SD is remounted in a controlled way for the bus-clock comparison; the normal production mount policy is always restored afterwards. No formatting is performed."
+            ? "Der Lauf kann auf langsamen Karten deutlich länger dauern. Die Endurance-Dateien sind temporär und physisch maximal etwa 65 MiB groß. Ein echtes EIO wird auf demselben Mount nicht wiederholt. Nur wenn der Produktionstakt über 10 MHz liegt und der SFENC1-Stack-Test dort mit EIO scheitert, darf er nach sauberem Remount einmal bei 10 MHz wiederholt werden; danach wird der Produktionstakt wiederhergestellt. Es wird nicht formatiert."
+            : "The run can take substantially longer on slow cards. Endurance files are temporary and at most about 65 MiB physical size. A real EIO is never retried on the same mount. When the production clock is above 10 MHz, the SFENC1 stack test may additionally repeat once at 10 MHz only after a clean remount when the production-clock run failed with EIO, then restores the production mount. No formatting is performed."
         ) +
         "</p>";
 
@@ -3818,18 +3822,29 @@ static bool sdBenchmarkRunCase(
 
     uint32_t writeTotalStart = micros();
     uint32_t openStart = micros();
+    errno = 0;
     File writeFile =
         reuseAllocatedFile
         ? STORAGE.open(path, "r+")
         : STORAGE.open(path, FILE_WRITE);
+    int openErrno = errno;
     result.writeOpenUs =
         (uint32_t)(micros() - openStart);
 
     if (!writeFile) {
+        if (openErrno == EIO)
+            storageMarkIoFault();
+
         result.error =
-            reuseAllocatedFile
-            ? "cannot open preallocated benchmark file for overwrite"
-            : "cannot create benchmark file";
+            String(
+                reuseAllocatedFile
+                ? "cannot open preallocated benchmark file for overwrite"
+                : "cannot create benchmark file"
+            ) +
+            " | errno=" +
+            String(openErrno) +
+            ":" +
+            String(strerror(openErrno));
         return false;
     }
 
@@ -3861,11 +3876,13 @@ static bool sdBenchmarkRunCase(
             : blockSize;
 
         uint32_t callStart = micros();
+        errno = 0;
         size_t written =
             writeFile.write(
                 buffer,
                 chunk
             );
+        int writeErrno = errno;
         uint32_t callUs =
             (uint32_t)(micros() - callStart);
 
@@ -3878,7 +3895,20 @@ static bool sdBenchmarkRunCase(
         result.bytesWritten += written;
 
         if (written != chunk) {
-            result.error = "short benchmark write";
+            if (writeErrno == EIO)
+                storageMarkIoFault();
+
+            result.error =
+                "short benchmark write | offset=" +
+                String((unsigned long)(result.bytesWritten - written)) +
+                " | written=" +
+                String((unsigned long)written) +
+                "/" +
+                String((unsigned long)chunk) +
+                " | errno=" +
+                String(writeErrno) +
+                ":" +
+                String(strerror(writeErrno));
             break;
         }
 
@@ -3888,10 +3918,12 @@ static bool sdBenchmarkRunCase(
     result.writeDataUs =
         (uint32_t)(micros() - dataStart);
 
-    uint32_t flushStart = micros();
-    writeFile.flush();
-    result.writeFlushUs =
-        (uint32_t)(micros() - flushStart);
+    if (!storageIoFaultActive()) {
+        uint32_t flushStart = micros();
+        writeFile.flush();
+        result.writeFlushUs =
+            (uint32_t)(micros() - flushStart);
+    }
 
     uint32_t closeStart = micros();
     writeFile.close();
@@ -3918,15 +3950,24 @@ static bool sdBenchmarkRunCase(
 
     uint32_t readTotalStart = micros();
     openStart = micros();
+    errno = 0;
     File readFile = STORAGE.open(
         path,
         FILE_READ
     );
+    int readOpenErrno = errno;
     result.readOpenUs =
         (uint32_t)(micros() - openStart);
 
     if (!readFile) {
-        result.error = "cannot reopen benchmark file for read-back";
+        if (readOpenErrno == EIO)
+            storageMarkIoFault();
+
+        result.error =
+            "cannot reopen benchmark file for read-back | errno=" +
+            String(readOpenErrno) +
+            ":" +
+            String(strerror(readOpenErrno));
         return false;
     }
 
@@ -3942,11 +3983,13 @@ static bool sdBenchmarkRunCase(
             : blockSize;
 
         uint32_t callStart = micros();
+        errno = 0;
         size_t readCount =
             readFile.read(
                 buffer,
                 chunk
             );
+        int readErrno = errno;
         uint32_t callUs =
             (uint32_t)(micros() - callStart);
 
@@ -3957,7 +4000,16 @@ static bool sdBenchmarkRunCase(
             readSamples[readSampleCount++] = callUs;
 
         if (readCount == 0) {
-            result.error = "benchmark read incomplete";
+            if (readErrno == EIO)
+                storageMarkIoFault();
+
+            result.error =
+                "benchmark read incomplete | offset=" +
+                String((unsigned long)result.bytesRead) +
+                " | errno=" +
+                String(readErrno) +
+                ":" +
+                String(strerror(readErrno));
             break;
         }
 
@@ -3992,7 +4044,20 @@ static bool sdBenchmarkRunCase(
         }
 
         if (got != chunk) {
-            result.error = "short benchmark read";
+            if (readErrno == EIO)
+                storageMarkIoFault();
+
+            result.error =
+                "short benchmark read | offset=" +
+                String((unsigned long)(result.bytesRead - got)) +
+                " | read=" +
+                String((unsigned long)got) +
+                "/" +
+                String((unsigned long)chunk) +
+                " | errno=" +
+                String(readErrno) +
+                ":" +
+                String(strerror(readErrno));
             break;
         }
 
@@ -4025,6 +4090,738 @@ static bool sdBenchmarkRunCase(
         result.writeComplete &&
         result.readComplete &&
         result.verifyOk;
+}
+
+static String sdBenchmarkUint64Text(uint64_t value)
+{
+    char buffer[32];
+    snprintf(
+        buffer,
+        sizeof(buffer),
+        "%llu",
+        (unsigned long long)value
+    );
+    return String(buffer);
+}
+
+struct SdEnduranceCaseResult {
+    uint64_t bytesWritten;
+    uint64_t bytesRead;
+    uint32_t writeElapsedMs;
+    uint32_t readElapsedMs;
+    uint32_t flushMs;
+    uint32_t writeWorstUs;
+    uint32_t readWorstUs;
+    uint32_t slowWriteCount;
+    bool writeComplete;
+    bool readComplete;
+    bool verifyOk;
+    uint64_t failureOffset;
+    uint64_t verifyMismatchOffset;
+    uint8_t verifyExpected;
+    uint8_t verifyActual;
+    int errorNumber;
+    String error;
+};
+
+static uint8_t sdEndurancePatternByte(
+    uint64_t absoluteOffset,
+    uint32_t seed
+)
+{
+    // Cheap deterministic position-dependent pattern. The endurance test is
+    // storage-bound; avoid turning 256 MiB of fill/verify work into a CPU test.
+    uint32_t x =
+        (uint32_t)absoluteOffset ^
+        (uint32_t)(absoluteOffset >> 32) ^
+        seed;
+
+    x ^= x >> 11;
+    x ^= x >> 19;
+
+    return (uint8_t)(x & 0xFFU);
+}
+
+static void sdEnduranceFillPattern(
+    uint8_t *buffer,
+    size_t length,
+    uint64_t absoluteOffset,
+    uint32_t seed
+)
+{
+    for (size_t i = 0; i < length; ++i) {
+        buffer[i] =
+            sdEndurancePatternByte(
+                absoluteOffset + (uint64_t)i,
+                seed
+            );
+    }
+}
+
+static bool sdBenchmarkRunEnduranceCase(
+    const char *path,
+    const char *openMode,
+    const char *modeLabel,
+    size_t totalSize,
+    size_t blockSize,
+    uint8_t *buffer,
+    uint32_t patternSeed,
+    SdEnduranceCaseResult &result
+)
+{
+    result = {};
+    result.verifyOk = true;
+
+    STORAGE.remove(path);
+
+    errno = 0;
+    File writeFile =
+        STORAGE.open(path, openMode);
+
+    if (!writeFile) {
+        result.errorNumber = errno;
+        if (result.errorNumber == EIO)
+            storageMarkIoFault();
+        result.error =
+            "cannot open endurance file | mode=" +
+            String(modeLabel) +
+            " | errno=" +
+            String(result.errorNumber) +
+            ":" +
+            String(strerror(result.errorNumber));
+        return false;
+    }
+
+    uint32_t writeStartMs = millis();
+
+    while (result.bytesWritten < totalSize) {
+        size_t remaining =
+            totalSize - (size_t)result.bytesWritten;
+        size_t chunk =
+            remaining < blockSize
+            ? remaining
+            : blockSize;
+
+        sdEnduranceFillPattern(
+            buffer,
+            chunk,
+            result.bytesWritten,
+            patternSeed
+        );
+
+        errno = 0;
+        uint32_t callStartUs = micros();
+        size_t written =
+            writeFile.write(buffer, chunk);
+        uint32_t callUs =
+            (uint32_t)(micros() - callStartUs);
+        int writeErrno = errno;
+
+        if (callUs > result.writeWorstUs)
+            result.writeWorstUs = callUs;
+        if (callUs >= 20000UL)
+            result.slowWriteCount++;
+
+        uint64_t callOffset =
+            result.bytesWritten;
+        result.bytesWritten +=
+            (uint64_t)written;
+
+        if (written != chunk) {
+            result.failureOffset = callOffset;
+            result.errorNumber = writeErrno;
+
+            if (writeErrno == EIO)
+                storageMarkIoFault();
+
+            result.error =
+                "endurance write failed | mode=" +
+                String(modeLabel) +
+                " | offset=" +
+                sdBenchmarkUint64Text(callOffset) +
+                " | written=" +
+                String((unsigned long)written) +
+                "/" +
+                String((unsigned long)chunk) +
+                " | errno=" +
+                String(writeErrno) +
+                ":" +
+                String(strerror(writeErrno));
+            break;
+        }
+
+        serviceLongOperation();
+    }
+
+    result.writeElapsedMs =
+        millis() - writeStartMs;
+
+    if (!storageIoFaultActive()) {
+        uint32_t flushStartMs = millis();
+        writeFile.flush();
+        result.flushMs = millis() - flushStartMs;
+    }
+
+    writeFile.close();
+
+    result.writeComplete =
+        result.bytesWritten == totalSize;
+
+    if (!result.writeComplete)
+        return false;
+
+    errno = 0;
+    File readFile =
+        STORAGE.open(path, FILE_READ);
+
+    if (!readFile) {
+        result.errorNumber = errno;
+        if (result.errorNumber == EIO)
+            storageMarkIoFault();
+        result.error =
+            "cannot reopen endurance file for verify | mode=" +
+            String(modeLabel) +
+            " | errno=" +
+            String(result.errorNumber) +
+            ":" +
+            String(strerror(result.errorNumber));
+        return false;
+    }
+
+    uint32_t readStartMs = millis();
+
+    while (result.bytesRead < totalSize) {
+        size_t remaining =
+            totalSize - (size_t)result.bytesRead;
+        size_t chunk =
+            remaining < blockSize
+            ? remaining
+            : blockSize;
+
+        errno = 0;
+        uint32_t callStartUs = micros();
+        size_t got =
+            readFile.read(buffer, chunk);
+        uint32_t callUs =
+            (uint32_t)(micros() - callStartUs);
+        int readErrno = errno;
+
+        if (callUs > result.readWorstUs)
+            result.readWorstUs = callUs;
+
+        if (got == 0) {
+            result.failureOffset =
+                result.bytesRead;
+            result.errorNumber = readErrno;
+
+            if (readErrno == EIO)
+                storageMarkIoFault();
+
+            result.error =
+                "endurance read failed | mode=" +
+                String(modeLabel) +
+                " | offset=" +
+                sdBenchmarkUint64Text(result.bytesRead) +
+                " | errno=" +
+                String(readErrno) +
+                ":" +
+                String(strerror(readErrno));
+            break;
+        }
+
+        for (size_t i = 0; i < got; ++i) {
+            uint8_t expected =
+                sdEndurancePatternByte(
+                    result.bytesRead +
+                        (uint64_t)i,
+                    patternSeed
+                );
+
+            if (buffer[i] != expected) {
+                result.verifyOk = false;
+                result.verifyMismatchOffset =
+                    result.bytesRead +
+                    (uint64_t)i;
+                result.verifyExpected = expected;
+                result.verifyActual = buffer[i];
+                result.error =
+                    "endurance read-back verification mismatch | mode=" +
+                    String(modeLabel);
+                break;
+            }
+        }
+
+        result.bytesRead +=
+            (uint64_t)got;
+
+        if (!result.verifyOk)
+            break;
+
+        if (got != chunk) {
+            if (readErrno == EIO)
+                storageMarkIoFault();
+
+            result.errorNumber = readErrno;
+            result.error =
+                "short endurance read | mode=" +
+                String(modeLabel) +
+                " | offset=" +
+                sdBenchmarkUint64Text(result.bytesRead - got) +
+                " | read=" +
+                String((unsigned long)got) +
+                "/" +
+                String((unsigned long)chunk) +
+                " | errno=" +
+                String(readErrno) +
+                ":" +
+                String(strerror(readErrno));
+            break;
+        }
+
+        serviceLongOperation();
+    }
+
+    result.readElapsedMs =
+        millis() - readStartMs;
+
+    readFile.close();
+
+    result.readComplete =
+        result.bytesRead == totalSize;
+
+    if (!result.readComplete && !result.error.length())
+        result.error = "endurance read incomplete";
+
+    return
+        result.writeComplete &&
+        result.readComplete &&
+        result.verifyOk;
+}
+
+static void sdBenchmarkAppendEnduranceReport(
+    String &report,
+    const SdEnduranceCaseResult &result,
+    const char *modeLabel,
+    size_t totalSize,
+    size_t blockSize
+)
+{
+    report +=
+        "\n--- 64 MiB endurance | " +
+        String(modeLabel) +
+        " ---\n";
+    report +=
+        "write size/block: " +
+        String((unsigned long)(totalSize / (1024U * 1024U))) +
+        " MiB / " +
+        String((unsigned long)(blockSize / 1024U)) +
+        " KiB\n";
+    report +=
+        "write: " +
+        sdBenchmarkUint64Text(result.bytesWritten) +
+        " bytes | " +
+        String(result.writeElapsedMs) +
+        " ms | worst=" +
+        String((double)result.writeWorstUs / 1000.0, 3) +
+        " ms | >=20ms=" +
+        String((unsigned long)result.slowWriteCount) +
+        " | flush=" +
+        String(result.flushMs) +
+        " ms\n";
+    report +=
+        "read: " +
+        sdBenchmarkUint64Text(result.bytesRead) +
+        " bytes | " +
+        String(result.readElapsedMs) +
+        " ms | worst=" +
+        String((double)result.readWorstUs / 1000.0, 3) +
+        " ms\n";
+    report +=
+        "verify: " +
+        String(result.verifyOk && result.readComplete ? "OK" : "FAIL") +
+        "\n";
+
+    if (!result.verifyOk) {
+        report +=
+            "verify mismatch offset=" +
+            sdBenchmarkUint64Text(result.verifyMismatchOffset) +
+            " expected=" +
+            String((unsigned)result.verifyExpected) +
+            " actual=" +
+            String((unsigned)result.verifyActual) +
+            "\n";
+    }
+
+    if (result.error.length()) {
+        report +=
+            "error: " +
+            result.error +
+            "\n";
+    }
+}
+
+
+struct SdSfenc1EnduranceResult {
+    uint64_t logicalBytesWritten;
+    uint64_t logicalBytesRead;
+    uint64_t physicalBytes;
+    uint32_t writeElapsedMs;
+    uint32_t closeElapsedMs;
+    uint32_t readElapsedMs;
+    bool openOk;
+    bool closeOk;
+    bool readOpenOk;
+    bool verifyOk;
+    uint64_t failureOffset;
+    uint64_t verifyMismatchOffset;
+    uint8_t verifyExpected;
+    uint8_t verifyActual;
+    bool ioFault;
+    RecordingWriteBufferStats writeBufferStats;
+    String error;
+};
+
+static bool sdBenchmarkRunSfenc1StackEndurance(
+    const char *path,
+    size_t totalSize,
+    size_t logicalBlockSize,
+    uint8_t *buffer,
+    uint32_t patternSeed,
+    SdSfenc1EnduranceResult &result
+)
+{
+    result = {};
+    result.verifyOk = true;
+
+    STORAGE.remove(path);
+
+    RecordingWriteBufferedFile writer;
+
+    uint32_t writeStartMs = millis();
+
+    if (!writer.openWrite(path, true)) {
+        result.error =
+            "SFENC1 stack open failed: " +
+            String(writer.lastError());
+        result.ioFault = storageIoFaultActive();
+        return false;
+    }
+
+    result.openOk = true;
+    result.writeBufferStats =
+        writer.stats();
+
+    if (!writer.writeBehindEnabled()) {
+        result.error =
+            "SFENC1 stack write-behind unavailable | init=" +
+            String(
+                recordingWriteBufferInitStatusName(
+                    result.writeBufferStats.initStatus
+                )
+            );
+        (void)writer.closeChecked();
+        return false;
+    }
+
+    while (result.logicalBytesWritten < totalSize) {
+        size_t remaining =
+            totalSize - (size_t)result.logicalBytesWritten;
+        size_t chunk =
+            remaining < logicalBlockSize
+            ? remaining
+            : logicalBlockSize;
+
+        sdEnduranceFillPattern(
+            buffer,
+            chunk,
+            result.logicalBytesWritten,
+            patternSeed
+        );
+
+        size_t written =
+            writer.write(buffer, chunk);
+
+        uint64_t callOffset =
+            result.logicalBytesWritten;
+
+        result.logicalBytesWritten +=
+            (uint64_t)written;
+
+        if (written != chunk || writer.failed()) {
+            result.failureOffset = callOffset;
+            result.error =
+                "SFENC1 stack write failed | logical_offset=" +
+                sdBenchmarkUint64Text(callOffset) +
+                " | written=" +
+                String((unsigned long)written) +
+                "/" +
+                String((unsigned long)chunk) +
+                " | detail=" +
+                String(writer.lastError());
+            break;
+        }
+
+        serviceLongOperation();
+    }
+
+    result.writeElapsedMs =
+        millis() - writeStartMs;
+
+    // Snapshot the live queue statistics before close() releases the PSRAM
+    // resources. closeChecked() then drains/finalizes the exact production path.
+    result.writeBufferStats =
+        writer.stats();
+
+    uint32_t closeStartMs = millis();
+    result.closeOk = writer.closeChecked();
+    result.closeElapsedMs =
+        millis() - closeStartMs;
+
+    RecordingWriteBufferStats finalStats =
+        writer.stats();
+
+    // releaseWriteBehind() intentionally zeros only current queue/capacity;
+    // cumulative counters survive and are more complete after final drain.
+    result.writeBufferStats.bytesCommitted =
+        finalStats.bytesCommitted;
+    result.writeBufferStats.drainWriteCalls =
+        finalStats.drainWriteCalls;
+    result.writeBufferStats.drainWriteTotalUs =
+        finalStats.drainWriteTotalUs;
+    result.writeBufferStats.drainWriteMaxUs =
+        finalStats.drainWriteMaxUs;
+    result.writeBufferStats.drainWriteMaxBytes =
+        finalStats.drainWriteMaxBytes;
+    result.writeBufferStats.slowDrainWriteCalls =
+        finalStats.slowDrainWriteCalls;
+    result.writeBufferStats.failed =
+        finalStats.failed;
+
+    result.ioFault =
+        storageIoFaultActive();
+
+    if (!result.closeOk && !result.error.length()) {
+        result.error =
+            "SFENC1 stack close/finalize failed: " +
+            String(writer.lastError());
+    }
+
+    if (
+        result.logicalBytesWritten != totalSize ||
+        !result.closeOk ||
+        result.ioFault
+    ) {
+        return false;
+    }
+
+    File physicalFile =
+        STORAGE.open(path, FILE_READ);
+
+    if (physicalFile) {
+        result.physicalBytes =
+            (uint64_t)physicalFile.size();
+        physicalFile.close();
+    }
+
+    RecordingStorageFile reader;
+
+    if (!reader.openRead(path)) {
+        result.error =
+            "SFENC1 logical verify open failed: " +
+            String(reader.lastError());
+        result.ioFault = storageIoFaultActive();
+        return false;
+    }
+
+    result.readOpenOk = true;
+
+    uint32_t readStartMs = millis();
+
+    while (result.logicalBytesRead < totalSize) {
+        size_t remaining =
+            totalSize - (size_t)result.logicalBytesRead;
+        size_t chunk =
+            remaining < logicalBlockSize
+            ? remaining
+            : logicalBlockSize;
+
+        size_t got =
+            reader.read(buffer, chunk);
+
+        if (got == 0) {
+            result.failureOffset =
+                result.logicalBytesRead;
+            result.error =
+                "SFENC1 logical verify read failed | logical_offset=" +
+                sdBenchmarkUint64Text(result.logicalBytesRead) +
+                " | detail=" +
+                String(reader.lastError());
+            break;
+        }
+
+        for (size_t i = 0; i < got; ++i) {
+            uint8_t expected =
+                sdEndurancePatternByte(
+                    result.logicalBytesRead +
+                        (uint64_t)i,
+                    patternSeed
+                );
+
+            if (buffer[i] != expected) {
+                result.verifyOk = false;
+                result.verifyMismatchOffset =
+                    result.logicalBytesRead +
+                    (uint64_t)i;
+                result.verifyExpected = expected;
+                result.verifyActual = buffer[i];
+                result.error =
+                    "SFENC1 logical read-back verification mismatch";
+                break;
+            }
+        }
+
+        result.logicalBytesRead +=
+            (uint64_t)got;
+
+        if (!result.verifyOk)
+            break;
+
+        if (got != chunk) {
+            result.failureOffset =
+                result.logicalBytesRead - got;
+            result.error =
+                "SFENC1 logical verify short read | logical_offset=" +
+                sdBenchmarkUint64Text(result.failureOffset) +
+                " | read=" +
+                String((unsigned long)got) +
+                "/" +
+                String((unsigned long)chunk);
+            break;
+        }
+
+        serviceLongOperation();
+    }
+
+    result.readElapsedMs =
+        millis() - readStartMs;
+
+    bool readerOk =
+        !reader.failed();
+
+    if (!readerOk && !result.error.length()) {
+        result.error =
+            "SFENC1 logical verify failed: " +
+            String(reader.lastError());
+    }
+
+    reader.close();
+
+    result.ioFault =
+        storageIoFaultActive();
+
+    return
+        result.logicalBytesWritten == totalSize &&
+        result.logicalBytesRead == totalSize &&
+        result.closeOk &&
+        readerOk &&
+        result.verifyOk &&
+        !result.ioFault;
+}
+
+static void sdBenchmarkAppendSfenc1StackReport(
+    String &report,
+    const SdSfenc1EnduranceResult &result,
+    const char *clockLabel,
+    size_t totalSize,
+    size_t logicalBlockSize
+)
+{
+    const RecordingWriteBufferStats &stats =
+        result.writeBufferStats;
+
+    report +=
+        "\n--- SFENC1 production stack endurance | " +
+        String(clockLabel) +
+        " ---\n";
+    report +=
+        "logical size/block: " +
+        String((unsigned long)(totalSize / (1024U * 1024U))) +
+        " MiB / " +
+        String((unsigned long)(logicalBlockSize / 1024U)) +
+        " KiB producer writes\n";
+    report +=
+        "path: RecordingWriteBufferedFile -> PSRAM write-behind -> RecordingStorageFile(encrypted) -> SFENC1 -> SD\n";
+    report +=
+        "write: " +
+        sdBenchmarkUint64Text(result.logicalBytesWritten) +
+        " logical bytes | " +
+        String(result.writeElapsedMs) +
+        " ms | close/finalize=" +
+        String(result.closeElapsedMs) +
+        " ms\n";
+    report +=
+        "physical file: " +
+        sdBenchmarkUint64Text(result.physicalBytes) +
+        " bytes\n";
+    report +=
+        "write-behind: init=" +
+        String(recordingWriteBufferInitStatusName(stats.initStatus)) +
+        " | capacity=" +
+        String((unsigned long)stats.capacity) +
+        " | high_water=" +
+        String((unsigned long)stats.highWater) +
+        " | waits=" +
+        String((unsigned long)stats.producerWaitCount) +
+        "/" +
+        String((double)stats.producerWaitUs / 1000.0, 1) +
+        " ms | committed=" +
+        sdBenchmarkUint64Text(stats.bytesCommitted) +
+        " | drain_calls=" +
+        String((unsigned long)stats.drainWriteCalls) +
+        " | drain_total=" +
+        String((double)stats.drainWriteTotalUs / 1000.0, 1) +
+        " ms | drain_max=" +
+        String((double)stats.drainWriteMaxUs / 1000.0, 1) +
+        " ms@" +
+        String((unsigned long)stats.drainWriteMaxBytes) +
+        " B | >=20ms=" +
+        String((unsigned long)stats.slowDrainWriteCalls) +
+        "\n";
+    report +=
+        "logical read-back: " +
+        sdBenchmarkUint64Text(result.logicalBytesRead) +
+        " bytes | " +
+        String(result.readElapsedMs) +
+        " ms | verify=" +
+        String(
+            result.verifyOk &&
+            result.logicalBytesRead == totalSize
+            ? "OK"
+            : "FAIL"
+        ) +
+        "\n";
+    report +=
+        "storage EIO latch: " +
+        String(result.ioFault ? "ACTIVE" : "clear") +
+        "\n";
+
+    if (!result.verifyOk) {
+        report +=
+            "verify mismatch offset=" +
+            sdBenchmarkUint64Text(result.verifyMismatchOffset) +
+            " expected=" +
+            String((unsigned)result.verifyExpected) +
+            " actual=" +
+            String((unsigned)result.verifyActual) +
+            "\n";
+    }
+
+    if (result.error.length()) {
+        report +=
+            "error: " +
+            result.error +
+            "\n";
+    }
 }
 
 static void sdBenchmarkAppendCaseReport(
@@ -4164,6 +4961,12 @@ static void handleSDBench()
 
     const size_t longTestBlockSize =
         32U * 1024U;
+
+    const size_t enduranceTestSize =
+        64U * 1024U * 1024U;
+
+    const size_t enduranceBlockSize =
+        4U * 1024U;
 
     // Keep 32 KiB first because the historical SensorForge benchmark used
     // that block size. This preserves the cleanest possible A/B comparison.
@@ -4309,10 +5112,11 @@ static void handleSDBench()
             "\n";
     }
 
+    // SFENC1 adds a small physical header/record overhead above the 64 MiB
+    // logical payload. Keep extra room above the configured reserve.
     size_t requiredBenchmarkBytes =
-        longTestSize > testSize
-        ? longTestSize
-        : testSize;
+        enduranceTestSize +
+        2U * 1024U * 1024U;
 
     if (
         !view.benchmarkError.length() &&
@@ -4335,6 +5139,18 @@ static void handleSDBench()
         " MiB @ " +
         String((unsigned long)(longTestBlockSize / 1024U)) +
         " KiB blocks\n";
+    report +=
+        "endurance: two passes of " +
+        String((unsigned long)(enduranceTestSize / (1024U * 1024U))) +
+        " MiB @ " +
+        String((unsigned long)(enduranceBlockSize / 1024U)) +
+        " KiB writes | FILE_WRITE + w+ | full read-back verify\n";
+    report +=
+        "SFENC1 stack endurance: " +
+        String((unsigned long)(enduranceTestSize / (1024U * 1024U))) +
+        " MiB logical @ " +
+        String((unsigned long)(enduranceBlockSize / 1024U)) +
+        " KiB producer writes | real write-behind + encrypted storage + logical decrypt/verify\n";
     uint32_t diagnosticMaxClockHz =
         sdBenchmarkDiagnosticMaxClockHz();
 
@@ -4542,6 +5358,273 @@ static void handleSDBench()
     }
 
     // ---------------------------------------------------------
+    // 64 MiB endurance verification. This intentionally uses the same 4 KiB
+    // physical write granularity that exposed the SFENC1 EIO. The second pass
+    // opens with w+, matching encrypted recording's read/write file mode.
+    // No retry is performed after a short/EIO write.
+    // ---------------------------------------------------------
+
+    if (allCasesOk) {
+        report +=
+            "\n=== 64 MiB / 4 KiB endurance verification ===\n";
+        report +=
+            "purpose: reproduce intermittent physical/VFS write faults beyond the former 8 MiB benchmark window\n";
+        report +=
+            "policy: fail on first short write/read; no automatic retry; full read-back verification\n";
+
+        struct EnduranceMode {
+            const char *openMode;
+            const char *label;
+            uint32_t seed;
+        };
+
+        const EnduranceMode modes[] = {
+            {FILE_WRITE, "FILE_WRITE", 0x64F10001UL},
+            {"w+", "w+ (SFENC1 file mode)", 0x64F10002UL}
+        };
+
+        for (const EnduranceMode &mode : modes) {
+            STORAGE.remove(benchmarkPath);
+
+            SdEnduranceCaseResult enduranceResult;
+            bool enduranceOk =
+                sdBenchmarkRunEnduranceCase(
+                    benchmarkPath,
+                    mode.openMode,
+                    mode.label,
+                    enduranceTestSize,
+                    enduranceBlockSize,
+                    buffer,
+                    mode.seed,
+                    enduranceResult
+                );
+
+            sdBenchmarkAppendEnduranceReport(
+                report,
+                enduranceResult,
+                mode.label,
+                enduranceTestSize,
+                enduranceBlockSize
+            );
+
+            if (!enduranceOk) {
+                allCasesOk = false;
+                view.benchmarkError =
+                    "64 MiB endurance failed in " +
+                    String(mode.label) +
+                    ": " +
+                    enduranceResult.error;
+                break;
+            }
+
+            STORAGE.remove(benchmarkPath);
+            serviceLongOperation();
+        }
+    }
+
+
+    // ---------------------------------------------------------
+    // 64 MiB SFENC1 production-stack endurance. Unlike the raw w+ case above,
+    // this drives the exact buffered encrypted recording storage architecture.
+    // The logger is closed and the global storage gate is held so no unrelated
+    // filesystem writer can perturb the result. A production-clock EIO may be
+    // repeated once at 10 MHz after a clean remount, then production is restored.
+    // ---------------------------------------------------------
+
+    if (allCasesOk) {
+        // Release the raw-benchmark working set first. The production encrypted
+        // writer itself needs internal crypto/task resources; retaining the
+        // 64 KiB raw buffer here would create artificial heap pressure.
+        if (buffer) {
+            free(buffer);
+            buffer = nullptr;
+        }
+        if (writeSamples) {
+            free(writeSamples);
+            writeSamples = nullptr;
+        }
+        if (readSamples) {
+            free(readSamples);
+            readSamples = nullptr;
+        }
+
+        uint8_t *sfenc1Buffer =
+            (uint8_t *)heap_caps_malloc(
+                enduranceBlockSize,
+                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+            );
+
+        if (!sfenc1Buffer) {
+            sfenc1Buffer =
+                (uint8_t *)malloc(enduranceBlockSize);
+        }
+
+        if (!sfenc1Buffer) {
+            allCasesOk = false;
+            view.benchmarkError =
+                "Cannot allocate 4 KiB SFENC1 endurance pattern buffer";
+        }
+
+        const char *sfenc1Path =
+            "/.__sensorforge_sfenc1_endurance.bin";
+        const uint32_t sfenc1Seed =
+            0x65F1C001UL;
+
+        report +=
+            "\n=== 64 MiB SFENC1 production-stack endurance ===\n";
+        report +=
+            "purpose: isolate RecordingWriteBufferedFile + PSRAM drain task + encrypted RecordingStorageFile + SFENC1 from camera/audio/WebConfig load\n";
+        report +=
+            "policy: no media-write retry; full logical decrypt/read-back verify; 10 MHz fallback only when production clock is above 10 MHz and then EIO occurs\n";
+
+        if (allCasesOk) {
+            STORAGE.remove(sfenc1Path);
+
+            logFlush();
+            logClose();
+            g_storageLocked = true;
+
+        SdSfenc1EnduranceResult productionResult;
+        bool productionSfenc1Ok =
+            sdBenchmarkRunSfenc1StackEndurance(
+                sfenc1Path,
+                enduranceTestSize,
+                enduranceBlockSize,
+                sfenc1Buffer,
+                sfenc1Seed,
+                productionResult
+            );
+
+        String productionClockLabel =
+            configuredClockHz > 0
+            ? String((double)configuredClockHz / 1000000.0, 3) + " MHz production"
+            : String("production mount");
+
+        sdBenchmarkAppendSfenc1StackReport(
+            report,
+            productionResult,
+            productionClockLabel.c_str(),
+            enduranceTestSize,
+            enduranceBlockSize
+        );
+
+        bool ranFallback10Mhz = false;
+        bool fallback10MhzOk = false;
+        bool productionMountRestored = true;
+
+        if (
+            !productionSfenc1Ok &&
+            productionResult.ioFault &&
+            configuredClockHz > 10000000UL
+        ) {
+            ranFallback10Mhz = true;
+            report +=
+                "production-clock SFENC1 EIO: remounting cleanly at 10.000 MHz for one controlled A/B repeat\n";
+
+            String tenMhzMountError;
+            bool tenMhzMounted =
+                sdBenchmarkRemountAtClock(
+                    10000000UL,
+                    tenMhzMountError
+                );
+
+            if (tenMhzMounted) {
+                storageClearIoFault();
+                STORAGE.remove(sfenc1Path);
+
+                SdSfenc1EnduranceResult tenMhzResult;
+                fallback10MhzOk =
+                    sdBenchmarkRunSfenc1StackEndurance(
+                        sfenc1Path,
+                        enduranceTestSize,
+                        enduranceBlockSize,
+                        sfenc1Buffer,
+                        sfenc1Seed,
+                        tenMhzResult
+                    );
+
+                sdBenchmarkAppendSfenc1StackReport(
+                    report,
+                    tenMhzResult,
+                    "10.000 MHz fallback",
+                    enduranceTestSize,
+                    enduranceBlockSize
+                );
+            } else {
+                report +=
+                    "10 MHz remount: FAIL | " +
+                    tenMhzMountError +
+                    "\n";
+            }
+
+            // Regardless of the fallback result, return the device to its board
+            // production policy before leaving this diagnostic phase.
+            String restoreError;
+            productionMountRestored =
+                sdBenchmarkRemountAtClock(
+                    configuredClockHz,
+                    restoreError
+                );
+
+            if (productionMountRestored) {
+                storageClearIoFault();
+                report +=
+                    "production mount restore after SFENC1 A/B: OK @ " +
+                    String((double)configuredClockHz / 1000000.0, 3) +
+                    " MHz\n";
+            } else {
+                report +=
+                    "production mount restore after SFENC1 A/B: FAIL | " +
+                    restoreError +
+                    "\n";
+            }
+        }
+
+        if (
+            sdReady &&
+            !storageIoFaultActive()
+        ) {
+            STORAGE.remove(sfenc1Path);
+        }
+
+        g_storageLocked = false;
+
+        if (
+            sdReady &&
+            !storageIoFaultActive() &&
+            productionMountRestored
+        ) {
+            logInit();
+        }
+
+            if (!productionSfenc1Ok) {
+                allCasesOk = false;
+
+                view.benchmarkError =
+                    "SFENC1 production-stack endurance failed at production clock: " +
+                    productionResult.error;
+
+                if (ranFallback10Mhz) {
+                    view.benchmarkError +=
+                        fallback10MhzOk
+                        ? " | 10 MHz fallback=PASS"
+                        : " | 10 MHz fallback=FAIL";
+                }
+
+                if (!productionMountRestored) {
+                    view.benchmarkError +=
+                        " | production mount restore failed";
+                }
+            }
+        }
+
+        if (sfenc1Buffer)
+            free(sfenc1Buffer);
+
+        serviceLongOperation();
+    }
+
+    // ---------------------------------------------------------
     // Generic bus-clock diagnostic sweep. The normal multi-block
     // benchmark above always runs on the production mount. Only after
     // those tests pass do we temporarily close the persistent logger,
@@ -4551,6 +5634,31 @@ static void handleSDBench()
     // ---------------------------------------------------------
 
     bool productionRestoreOk = true;
+
+    if (
+        allCasesOk &&
+        configuredClockHz > 0 &&
+        (!buffer || !writeSamples || !readSamples)
+    ) {
+        buffer =
+            (uint8_t *)malloc(maxBlockSize);
+        writeSamples =
+            (uint32_t *)malloc(
+                maxSamples *
+                sizeof(uint32_t)
+            );
+        readSamples =
+            (uint32_t *)malloc(
+                maxSamples *
+                sizeof(uint32_t)
+            );
+
+        if (!buffer || !writeSamples || !readSamples) {
+            allCasesOk = false;
+            view.benchmarkError =
+                "Cannot reallocate clock-sweep benchmark buffers after SFENC1 endurance";
+        }
+    }
 
     if (
         allCasesOk &&
@@ -4665,6 +5773,17 @@ static void handleSDBench()
                     String(clockCaseOk ? "OK" : "FAIL") +
                     "\n";
 
+                if (storageIoFaultActive()) {
+                    allCasesOk = false;
+                    if (!view.benchmarkError.length()) {
+                        view.benchmarkError =
+                            "Hard EIO during diagnostic clock sweep";
+                    }
+                    report +=
+                        "clock sweep stopped: hard EIO latched\n";
+                    break;
+                }
+
                 STORAGE.remove(benchmarkPath);
                 serviceLongOperation();
             }
@@ -4711,12 +5830,39 @@ static void handleSDBench()
 
             g_storageLocked = false;
 
-            if (productionRestoreOk)
+            if (
+                productionRestoreOk &&
+                !storageIoFaultActive()
+            ) {
                 logInit();
+            }
         }
     }
 
-    if (sdReady)
+    // A hard EIO invalidates assumptions about every open handle on the mount.
+    // Recover only after the benchmark file has been closed. recoverSD() knows
+    // to close the logger without flushing its RAM queue while this latch is set.
+    if (storageIoFaultActive()) {
+        report +=
+            "\nHARD STORAGE I/O FAULT: EIO latched; performing controlled SD remount\n";
+
+        sdReady = false;
+        bool recovered = recoverSD();
+
+        report +=
+            "SD recovery after benchmark EIO: " +
+            String(recovered ? "OK" : "FAIL") +
+            "\n";
+
+        if (!recovered) {
+            if (view.benchmarkError.length())
+                view.benchmarkError += " | SD recovery failed";
+            else
+                view.benchmarkError = "SD recovery failed after benchmark EIO";
+        }
+    }
+
+    if (sdReady && !storageIoFaultActive())
         STORAGE.remove(benchmarkPath);
 
     bool benchmarkFileStillPresent =

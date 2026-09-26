@@ -9,6 +9,13 @@
 // This is a state gate, not a mutex, and does not forcibly close open handles.
 extern volatile bool g_storageLocked;
 
+// Latched when the filesystem/VFS reports a hard physical I/O fault (EIO).
+// This is deliberately separate from g_storageLocked: the current recorder is
+// allowed to close its own handles before recovery remounts the card.
+void storageMarkIoFault();
+bool storageIoFaultActive();
+void storageClearIoFault();
+
 uint64_t storageFreeBytes();
 uint64_t storageReserveBytes();
 bool storageHasRequiredFreeSpace();

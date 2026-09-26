@@ -2,8 +2,10 @@
 
 #include "board_config.h"
 #include "recording_crypto.h"
+#include "storage_guard.h"
 
 #include <esp_system.h>
+#include <errno.h>
 #include <string.h>
 
 namespace {
@@ -126,14 +128,22 @@ static bool writeAll(
     size_t offset = 0;
 
     while (offset < length) {
+        errno = 0;
+
         size_t written =
             file.write(
                 data + offset,
                 length - offset
             );
 
-        if (written == 0)
+        int writeErrno = errno;
+
+        if (written == 0) {
+            if (writeErrno == EIO)
+                storageMarkIoFault();
+            errno = writeErrno;
             return false;
+        }
 
         offset += written;
     }
@@ -150,14 +160,22 @@ static bool readAll(
     size_t offset = 0;
 
     while (offset < length) {
+        errno = 0;
+
         size_t got =
             file.read(
                 data + offset,
                 length - offset
             );
 
-        if (got == 0)
+        int readErrno = errno;
+
+        if (got == 0) {
+            if (readErrno == EIO)
+                storageMarkIoFault();
+            errno = readErrno;
             return false;
+        }
 
         offset += got;
     }
@@ -1574,10 +1592,15 @@ bool logStorageOpenWriter(
     );
 }
 
-void logStorageCloseWriter(LogStorageWriter &writer)
+void logStorageCloseWriter(
+    LogStorageWriter &writer,
+    bool flushBeforeClose
+)
 {
     if (writer.file) {
-        writer.file.flush();
+        if (flushBeforeClose)
+            writer.file.flush();
+
         writer.file.close();
     }
 

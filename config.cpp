@@ -71,7 +71,11 @@ String cfg_camera = "OV2640";
 
 String cfg_resolution = "1024x768";
 
+#if RECORDING_PRODUCTION_FPS_CAP_1024X768 > 0
+int cfg_fps         = RECORDING_PRODUCTION_FPS_CAP_1024X768;
+#else
 int cfg_fps         = 5;
+#endif
 int cfg_quality     = 12;
 #ifdef BOARD_FREENOVE
 int cfg_camera_xclk_mhz = 10;
@@ -636,7 +640,11 @@ static ConfigValues makeDefaultValues()
         "1024x768";
 
     values.fps =
+#if RECORDING_PRODUCTION_FPS_CAP_1024X768 > 0
+        RECORDING_PRODUCTION_FPS_CAP_1024X768;
+#else
         5;
+#endif
 
     values.quality =
         12;
@@ -1248,6 +1256,16 @@ int configRecordingPerformanceMaxFps(
 
     if (maxFps > 30ULL)
         maxFps = 30ULL;
+
+#if RECORDING_PRODUCTION_FPS_CAP_1024X768 > 0
+    if (
+        resolution == "1024x768" &&
+        maxFps > (uint64_t)RECORDING_PRODUCTION_FPS_CAP_1024X768
+    ) {
+        maxFps =
+            (uint64_t)RECORDING_PRODUCTION_FPS_CAP_1024X768;
+    }
+#endif
 
     return
         (int)maxFps;
@@ -4254,6 +4272,22 @@ static void applyValues(
 
     cfg_fps =
         values.fps;
+
+#if RECORDING_PRODUCTION_FPS_CAP_1024X768 > 0
+    if (
+        cfg_resolution == "1024x768" &&
+        cfg_fps > RECORDING_PRODUCTION_FPS_CAP_1024X768
+    ) {
+        Serial.println(
+            "Config: XIAO stability profile clamps 1024x768 fps from " +
+            String(cfg_fps) +
+            " to " +
+            String(RECORDING_PRODUCTION_FPS_CAP_1024X768)
+        );
+        cfg_fps =
+            RECORDING_PRODUCTION_FPS_CAP_1024X768;
+    }
+#endif
 
     cfg_quality =
         values.quality;

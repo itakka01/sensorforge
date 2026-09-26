@@ -1261,7 +1261,7 @@ static String htmlHeader()
         "}"
         "window.sensorForgeKeepalive=ping;"
         "ping(true);"
-        "setInterval(function(){ping(true);},10000);"
+        "setInterval(function(){ping(true);},20000);"
         "document.addEventListener('visibilitychange',function(){if(!document.hidden)ping(true);});"
         "window.addEventListener('focus',function(){ping(true);});"
         "window.addEventListener('pageshow',function(){ping(true);});"
@@ -1334,8 +1334,8 @@ static String htmlHeader()
         "});"
         "sync();"
         "setInterval(render,1000);"
-        "setInterval(sync,10000);"
-        "setInterval(renewPauseLease,10000);"
+        "setInterval(sync,20000);"
+        "setInterval(renewPauseLease,20000);"
         "document.addEventListener('visibilitychange',function(){if(!document.hidden)sync();});"
         "window.addEventListener('focus',sync);"
         "})();"
@@ -3704,6 +3704,9 @@ static void handleConfig()
     html += "const cap=" +
             String((unsigned long)configRecordingPerformanceLimit()) +
             ";";
+    html += "const stabilityCap1024=" +
+            String((int)RECORDING_PRODUCTION_FPS_CAP_1024X768) +
+            ";";
     html +=
         "const px={'160x120':19200,'320x240':76800,'640x480':307200,"
         "'800x600':480000,'1024x768':786432,'1280x1024':1310720,"
@@ -3719,7 +3722,8 @@ static void handleConfig()
         "if(!cap){f.max=30;h.textContent='Für dieses Board ist noch kein Performance-Oberdeckel qualifiziert.';return;}"
         "if(!p){f.max=30;h.textContent='Performance-Limit wird nach Eingabe einer unterstützten Auflösung angezeigt.';return;}"
         "const w=qw(q.value);"
-        "const m=Math.max(0,Math.min(30,Math.floor((cap*100)/(p*w))));"
+        "let m=Math.max(0,Math.min(30,Math.floor((cap*100)/(p*w))));"
+        "if((r.value||'').trim()==='1024x768'&&stabilityCap1024>0)m=Math.min(m,stabilityCap1024);"
         "f.max=Math.max(1,m);"
         "if(m<1){h.textContent='Diese Auflösung/JPEG-Qualität überschreitet bereits bei 1 fps das Board-Limit.';return;}"
         "const load=Math.ceil((p*(Number(f.value)||0)*w)/100);"
@@ -5381,13 +5385,19 @@ static void handleSave()
             uint32_t performanceLoad = 0;
             uint32_t performanceLimit = 0;
 
-            if (!configRecordingPerformanceAllowed(
+            bool performanceAllowed =
+                configRecordingPerformanceAllowed(
                     resolution,
                     fps,
                     quality,
                     performanceLoad,
                     performanceLimit
-                )) {
+                );
+
+            if (
+                fps > performanceMaxFps ||
+                !performanceAllowed
+            ) {
 
                 String message =
                     "Recording-Performance-Limit ueberschritten. "
@@ -16535,7 +16545,7 @@ static void handleRecordingLoadTestStatusPage()
         "</section>"
         "<script>"
         "function rlFmt(ms){var s=Math.floor(ms/1000);var h=Math.floor(s/3600);s-=h*3600;var m=Math.floor(s/60);s-=m*60;return(h?String(h).padStart(2,'0')+':':'')+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');}"
-        "async function rlPoll(){try{var r=await fetch('/recording_load_test_status',{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);var d=await r.json();if(d.result_ready&&!d.active){location.href='/recording_load_test_result';return;}var pct=d.requested_ms?Math.min(100,d.elapsed_ms*100/d.requested_ms):0;document.getElementById('rlPct').textContent=pct.toFixed(1)+'%';document.getElementById('rlBar').style.width=pct+'%';document.getElementById('rlInfo').textContent=rlFmt(d.elapsed_ms)+' / '+rlFmt(d.requested_ms)+' | frames='+d.frames+' | P99='+(d.p99_us/1000).toFixed(1)+' ms | worst='+(d.worst_us/1000).toFixed(1)+' ms | over='+d.over_budget+' | CPU max='+(d.cpu_max_c===null?'--':Number(d.cpu_max_c).toFixed(1))+' C';}catch(e){document.getElementById('rlInfo').textContent=e.message;}setTimeout(rlPoll,5000);}"
+        "async function rlPoll(){try{var r=await fetch('/recording_load_test_status',{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);var d=await r.json();if(d.result_ready&&!d.active){location.href='/recording_load_test_result';return;}var pct=d.requested_ms?Math.min(100,d.elapsed_ms*100/d.requested_ms):0;document.getElementById('rlPct').textContent=pct.toFixed(1)+'%';document.getElementById('rlBar').style.width=pct+'%';document.getElementById('rlInfo').textContent=rlFmt(d.elapsed_ms)+' / '+rlFmt(d.requested_ms)+' | frames='+d.frames+' | P99='+(d.p99_us/1000).toFixed(1)+' ms | worst='+(d.worst_us/1000).toFixed(1)+' ms | over='+d.over_budget+' | CPU max='+(d.cpu_max_c===null?'--':Number(d.cpu_max_c).toFixed(1))+' C';}catch(e){document.getElementById('rlInfo').textContent=e.message;}setTimeout(rlPoll,15000);}"
         "async function rlAbort(){var b=document.getElementById('rlAbort');b.disabled=true;b.textContent='" + htmlJsString(tr(UI_RECORDING_LOAD_ABORTING)) + "';try{await fetch('/recording_load_test_abort',{method:'POST',cache:'no-store'});}catch(e){}setTimeout(rlPoll,500);}"
         "setTimeout(rlPoll,250);"
         "</script>"

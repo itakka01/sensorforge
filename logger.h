@@ -3,7 +3,9 @@
 #include <Arduino.h>
 
 void logInit();
-void logClose();
+// persistPending=false is used only after a latched SD/VFS I/O fault. Buffered
+// RAM log lines are retained for the reopened writer after recovery.
+void logClose(bool persistPending = true);
 void logWrite(const String &msg);
 void logFlush();
 
