@@ -8698,8 +8698,19 @@ static void recordingLoadFinalize(
 
     result.frameCalls =
         ctx.performance.frameCalls;
-    result.framesWritten =
-        recorderGetFrameCount();
+
+    // Preserve the last live snapshot if another subsystem unexpectedly closed
+    // the recorder. A closed RECORDER_NONE cannot report its former counters.
+    bool recorderOpenBeforeFinalize =
+        recorderIsOpen();
+
+    if (recorderOpenBeforeFinalize) {
+        result.framesWritten =
+            recorderGetFrameCount();
+        result.mediaBytesBeforeFinalize =
+            recorderGetBytesWritten();
+    }
+
     result.nearBudgetFrames =
         ctx.performance.nearBudgetFrames;
     result.overBudgetFrames =
@@ -8725,19 +8736,27 @@ static void recordingLoadFinalize(
             );
     }
 
-    result.mediaBytesBeforeFinalize =
-        recorderGetBytesWritten();
-
     result.audioActive =
         audioCaptureIsRunning();
 
     AudioCaptureStats audioBeforeFinalize =
         audioCaptureStats();
 
-    result.audioBufferCapacity =
-        audioBeforeFinalize.bufferCapacity;
-    result.audioBufferHighWater =
-        audioBeforeFinalize.bufferHighWater;
+    if (
+        audioBeforeFinalize.bufferCapacity >
+        result.audioBufferCapacity
+    ) {
+        result.audioBufferCapacity =
+            audioBeforeFinalize.bufferCapacity;
+    }
+
+    if (
+        audioBeforeFinalize.bufferHighWater >
+        result.audioBufferHighWater
+    ) {
+        result.audioBufferHighWater =
+            audioBeforeFinalize.bufferHighWater;
+    }
 
     // Detailed frame instrumentation is only for the active frame loop. Keep
     // finalization timing comparable to production and avoid attributing tail
@@ -8748,7 +8767,39 @@ static void recordingLoadFinalize(
         (uint64_t)esp_timer_get_time();
 
     result.finalized =
-        recorderEnd();
+        recorderOpenBeforeFinalize
+        ? recorderEnd()
+        : false;
+
+    if (!result.finalized && !ctx.error.length()) {
+        String recorderError = recorderGetLastError();
+        ctx.error =
+            recorderError.length()
+            ? String("recorder finalization failed: ") + recorderError
+            : "recorder finalization failed";
+    }
+
+    RecordingWriteBufferStats writeBufferStats = {};
+    if (
+        result.format == "mkv" &&
+        recorderGetWriteBufferStats(writeBufferStats)
+    ) {
+        result.writeBehindEnabled = writeBufferStats.enabled;
+        result.writeBehindFailed = writeBufferStats.failed;
+        result.writeBehindInitStatus =
+            (uint8_t)writeBufferStats.initStatus;
+        result.writeBehindCapacity = writeBufferStats.capacity;
+        result.writeBehindHighWater = writeBufferStats.highWater;
+        result.writeBehindBytesQueued = writeBufferStats.bytesQueued;
+        result.writeBehindBytesCommitted = writeBufferStats.bytesCommitted;
+        result.writeBehindProducerWaitCount = writeBufferStats.producerWaitCount;
+        result.writeBehindProducerWaitUs = writeBufferStats.producerWaitUs;
+        result.writeBehindDrainWriteCalls = writeBufferStats.drainWriteCalls;
+        result.writeBehindDrainWriteTotalUs = writeBufferStats.drainWriteTotalUs;
+        result.writeBehindDrainWriteMaxUs = writeBufferStats.drainWriteMaxUs;
+        result.writeBehindDrainWriteMaxBytes = writeBufferStats.drainWriteMaxBytes;
+        result.writeBehindSlowDrainWriteCalls = writeBufferStats.slowDrainWriteCalls;
+    }
 
     result.finalizeMs =
         (uint32_t)(
@@ -8880,6 +8931,12 @@ static void recordingLoadFinalize(
         String((unsigned long)result.psramMin) +
         " | cpu_max_c=" +
         String(result.cpuTempMaxC, 1) +
+        " | write_behind_init=" +
+        String(
+            recordingWriteBufferInitStatusName(
+                (RecordingWriteBufferInitStatus)result.writeBehindInitStatus
+            )
+        ) +
         " | result=" +
         String(result.completed ? "complete" : "failed");
 
@@ -9218,6 +9275,18 @@ void recordingLoadTestLoop()
         return;
     }
 
+    // The load test deliberately runs with the normal high-level `recording`
+    // flag false. If another subsystem closes its recorder, RECORDER_NONE would
+    // otherwise make recorderIsHealthy() look harmless and the benchmark could
+    // continue counting empty calls for the rest of a long test. Fail fast.
+    if (!recorderIsOpen()) {
+        result.recorderHealthy = false;
+        ctx.error =
+            "recorder unexpectedly closed during load test";
+        recordingLoadFinalize(false, true);
+        return;
+    }
+
     uint32_t elapsedMs =
         (uint32_t)(millis() - ctx.testStartMs);
 
@@ -9281,10 +9350,26 @@ void recordingLoadTestLoop()
         ctx.lastFrameUs =
             nowUs;
 
-        if (!recorderIsHealthy()) {
+        if (!recorderIsOpen()) {
             result.recorderHealthy = false;
             ctx.error =
-                "recorder/storage write failed during load test";
+                "recorder unexpectedly closed during load test";
+            recordingLoadFinalize(false, true);
+            return;
+        }
+
+        if (!recorderIsHealthy()) {
+            result.recorderHealthy = false;
+
+            String recorderError =
+                recorderGetLastError();
+
+            ctx.error =
+                recorderError.length()
+                ? String("recorder/storage write failed during load test: ") +
+                    recorderError
+                : "recorder/storage write failed during load test";
+
             recordingLoadFinalize(false, true);
             return;
         }
@@ -9314,6 +9399,35 @@ void recordingLoadTestLoop()
             result.internalHeapMin = internalNow;
         if (psramNow < result.psramMin)
             result.psramMin = psramNow;
+
+        // Keep a low-frequency last-known-good recorder/audio snapshot. This
+        // costs no extra SD I/O and preserves useful diagnostics if an external
+        // owner ever closes the recorder between loop iterations.
+        if (recorderIsOpen()) {
+            result.framesWritten =
+                recorderGetFrameCount();
+            result.mediaBytesBeforeFinalize =
+                recorderGetBytesWritten();
+        }
+
+        AudioCaptureStats audioNow =
+            audioCaptureStats();
+
+        if (
+            audioNow.bufferCapacity >
+            result.audioBufferCapacity
+        ) {
+            result.audioBufferCapacity =
+                audioNow.bufferCapacity;
+        }
+
+        if (
+            audioNow.bufferHighWater >
+            result.audioBufferHighWater
+        ) {
+            result.audioBufferHighWater =
+                audioNow.bufferHighWater;
+        }
 
         float cpuNow =
             thermalCpuTemperatureC();

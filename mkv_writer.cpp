@@ -6,6 +6,7 @@
 #include "logger.h"
 #include "image_motion.h"
 #include "recording_storage.h"
+#include "recording_write_buffer.h"
 
 #include <FS.h>
 #include <esp_camera.h>
@@ -41,7 +42,8 @@
 // No JPEG decoding/re-encoding.
 // =============================================================
 
-static RecordingStorageFile mkvFile;
+static RecordingWriteBufferedFile mkvFile;
+static RecordingWriteBufferStats lastWriteBufferStats = {};
 static String mkvPath;
 
 static uint32_t mkvFps       = 5;
@@ -1889,6 +1891,7 @@ void mkvStart(
     audioBytesWritten = 0;
     audioLastEndTimeMs = 0;
     finalAudioStats = {};
+    lastWriteBufferStats = {};
 
     mkvAudioFormat.sampleRate =
         (uint32_t)cfg_audio_sample_rate;
@@ -2293,6 +2296,7 @@ bool mkvStartSparseJpeg(
     audioBytesWritten = 0;
     audioLastEndTimeMs = 0;
     finalAudioStats = {};
+    lastWriteBufferStats = {};
     mkvAudioFormat = {0, 0, 0};
 
     recordingStartEpoch = startEpoch;
@@ -2377,11 +2381,13 @@ bool mkvAddSparseJpeg(
 
 bool mkvEnd()
 {
-    if (!mkvFile)
+    if (!mkvFile.isOpen())
         return true;
 
+    const bool storageFailed = mkvFile.failed();
 
     if (
+        storageFailed ||
         writeFailed ||
         !headerWritten ||
         frameCount == 0
@@ -2389,7 +2395,7 @@ bool mkvEnd()
 
         collectAndStopAudioCapture();
 
-        if (writeFailed) {
+        if (storageFailed || writeFailed) {
             Serial.println(
                 "MKV: recording failed - removing incomplete file"
             );
@@ -2400,7 +2406,10 @@ bool mkvEnd()
         }
 
 
-        mkvFile.close();
+        lastWriteBufferStats =
+            mkvFile.stats();
+
+        (void)mkvFile.closeChecked();
 
 
         if (mkvPath.length()) {
@@ -2476,6 +2485,9 @@ bool mkvEnd()
 
     mkvFile.flush();
 
+    lastWriteBufferStats =
+        mkvFile.stats();
+
     if (mkvFile.failed())
         ok = false;
 
@@ -2486,12 +2498,18 @@ bool mkvEnd()
     if (ok) {
 
         if (!mkvSparseMode) {
-            char summary[320];
+            char summary[448];
+
+            double storageBufferPct =
+                lastWriteBufferStats.capacity > 0
+                ? (double)lastWriteBufferStats.highWater * 100.0 /
+                    (double)lastWriteBufferStats.capacity
+                : 0.0;
 
             snprintf(
                 summary,
                 sizeof(summary),
-                "STOP | MKV | frames=%lu | duration=%.1f s | maxJPEG=%.1f KB%s%s | audioBytes=%llu | audioDropped=%llu | audioBuffer=%u/%u",
+                "STOP | MKV | frames=%lu | duration=%.1f s | maxJPEG=%.1f KB%s%s | audioBytes=%llu | audioDropped=%llu | audioBuffer=%u/%u | writeBehind=%s | storageBuffer=%u/%u(%.1f%%) | storageWaits=%lu | storageDrainMax=%.1fms",
                 (unsigned long)frameCount,
                 (double)(durationMs / 1000.0),
                 (double)maxFrameSize / 1024.0,
@@ -2502,7 +2520,13 @@ bool mkvEnd()
                 (unsigned long long)audioBytesWritten,
                 (unsigned long long)finalAudioStats.bytesDropped,
                 (unsigned)finalAudioStats.bufferHighWater,
-                (unsigned)finalAudioStats.bufferCapacity
+                (unsigned)finalAudioStats.bufferCapacity,
+                lastWriteBufferStats.enabled ? "yes" : "no",
+                (unsigned)lastWriteBufferStats.highWater,
+                (unsigned)lastWriteBufferStats.capacity,
+                storageBufferPct,
+                (unsigned long)lastWriteBufferStats.producerWaitCount,
+                (double)lastWriteBufferStats.drainWriteMaxUs / 1000.0
             );
 
             consoleWrite("REC", String(summary));
@@ -2565,19 +2589,45 @@ bool mkvGetLastFrameTiming(MkvFrameTiming &timing)
 }
 
 
-bool mkvIsOpen()
+bool mkvGetWriteBufferStats(RecordingWriteBufferStats &stats)
 {
+    if (mkvFile.isOpen()) {
+        stats = mkvFile.stats();
+    } else {
+        stats = lastWriteBufferStats;
+    }
+
+    // A synchronous fallback still has useful initialization diagnostics.
     return
-        (bool)mkvFile &&
-        !writeFailed;
+        stats.enabled ||
+        stats.initStatus != RECORDING_WRITE_BUFFER_NOT_ATTEMPTED;
 }
 
+
+bool mkvWriteBehindEnabled()
+{
+    return mkvFile.writeBehindEnabled();
+}
+
+
+bool mkvIsOpen()
+{
+    // Open-state and health-state are deliberately separate. A failed writer
+    // still owns an SD handle/resources until mkvEnd() performs cleanup.
+    return mkvFile.isOpen();
+}
 
 bool mkvIsHealthy()
 {
     return
-        (bool)mkvFile &&
+        mkvFile.isOpen() &&
+        !mkvFile.failed() &&
         !writeFailed;
+}
+
+const char *mkvGetLastError()
+{
+    return mkvFile.lastError();
 }
 
 
@@ -2595,7 +2645,7 @@ uint32_t mkvGetFrameCount()
 
 uint64_t mkvGetBytesWritten()
 {
-    if (!mkvFile)
+    if (!mkvFile.isOpen())
         return 0;
 
     // Writers always restore the append position after header/size patches.

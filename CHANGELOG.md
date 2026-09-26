@@ -9,30 +9,97 @@ and identifies the concrete binary compilation time.
 > change sequence beginning with v23. Earlier development history remains in the
 > repository history/project documentation.
 
+## v63 — 2026-09-26
+
+- Isolated explicit Recording Load Test ownership from WebConfig automatic
+  recording-pause recovery. The benchmark intentionally keeps the normal
+  high-level `recording` flag false while owning an open recorder; a resumed
+  browser session must therefore no longer classify that recorder as stale and
+  finalize it. This fixes long tests being silently closed after a WebConfig
+  pause lease expired and was later re-established.
+- Made long Recording Load Tests fail fast if their recorder disappears for any
+  external reason. `RECORDER_NONE` is no longer allowed to look healthy to the
+  benchmark while it continues counting empty `recorderAddFrame()` calls.
+- Preserve low-frequency last-known frame/media counters plus audio buffer
+  capacity/high-water during the benchmark. If an external close ever occurs
+  again, the failure report retains the useful pre-failure measurements instead
+  of collapsing to zero frames/bytes and a zero-capacity audio buffer.
+- No recording format, SFENC1 crypto/storage behavior, write-behind sizing, SD
+  clock policy, audio format or benchmark thresholds changed in this release.
+
+## v62 — 2026-09-26
+
+- Kept normal SFENC1 recording physically sequential: when the underlying file
+  stream is already positioned at the exact next encrypted-chunk offset, the
+  writer no longer issues a redundant `fseek()`. Random-access MKV/AVI patches
+  still seek normally, so encrypted container semantics and the SFENC1 format are
+  unchanged.
+- Extended SFENC1 physical-write failure diagnostics with the C stdio `errno`
+  value/text, stream position before/after the failed write and observed physical
+  file size. Seek failures now report the same low-level errno context. No retry
+  was added: a real filesystem/SD failure remains fatal instead of being masked.
+- Corrected Recording Load Test presentation so Video-/Frame-Timing is rated from
+  its measured frame delivery/budget data. A separate storage/finalization failure
+  no longer forces the timing row red when the measured timing itself is healthy.
+- Kept crypto algorithms, SFENC1 on-disk layout, 4 KiB crypto/I/O slice size,
+  512 KiB write-behind capacity, board SD clocks and traffic-light thresholds
+  unchanged.
+
+## v61 — 2026-09-26
+
+- Fixed failed-MKV cleanup semantics: an underlying storage failure no longer makes
+  the still-open writer look closed. `mkvEnd()` now collects write-behind telemetry,
+  stops audio, closes storage/crypto resources and removes the incomplete `.part`
+  file instead of returning early. Recording-open state and recording-health state
+  are now intentionally separate so storage maintenance cannot race a failed but
+  not-yet-cleaned-up recorder.
+- Preserved useful diagnostics after storage failure. The load test now reports the
+  logical media bytes accumulated before failure and propagates the concrete
+  `RecordingStorageFile` reason instead of only `recorder/storage write failed`.
+  SFENC1 chunk failures include chunk index and physical offset; partial physical
+  writes also report written/expected byte counts.
+- Reserved the 512 KiB PSRAM write-behind ring and 32 KiB drain scratch before
+  opening SFENC1, so large contiguous recording-buffer allocations occur before
+  encryption chunk caches. Initialization now reports the exact fallback reason
+  (`ring_alloc_failed`, `scratch_alloc_failed`, `mutex_alloc_failed`,
+  `task_create_failed`, etc.) together with free/largest internal RAM and PSRAM.
+- Kept the encryption format, load-test traffic-light thresholds, recording clocks
+  and normal synchronous fallback policy unchanged.
+
+## v60 — 2026-09-25
+
+- Added a 512 KiB PSRAM write-behind layer for MKV recording. Time-critical
+  container writes now enqueue logical bytes into PSRAM while a low-priority
+  storage task drains 32 KiB chunks through the unchanged `RecordingStorageFile`
+  path. Plain and SFENC1-encrypted recordings therefore share the same buffering
+  architecture and on-disk formats remain unchanged.
+- Container `seek()`, explicit flush and finalization first drain all queued data
+  before accessing the underlying file, preserving existing Matroska duration/
+  Segment patching and encrypted random-access semantics. Storage errors remain
+  fatal and are propagated back to the recorder; allocation/task failure falls
+  back to the previous synchronous path instead of preventing recording.
+- Added write-behind telemetry: PSRAM capacity/high-water, producer wait count and
+  time, committed/queued bytes, drain-write count, slow drain writes and longest
+  drain transaction. Normal MKV stop logs expose buffer high-water/waits, while
+  the Recording Load Test reports full drain statistics and includes buffer
+  reserve in the storage green/orange/red assessment.
+- Physical SD I/O is no longer attributed to an individual slow frame while MKV
+  write-behind is active because the drain occurs asynchronously. Existing raw
+  per-frame storage diagnostics remain available for synchronous paths such as
+  AVI or a write-behind fallback.
+
 ## v59 — 2026-09-25
 
-- Added benchmark-only physical storage diagnostics below `RecordingStorageFile`.
-  The ten slowest frame calls now report the actual underlying `File::write()`
-  count/bytes/total time, longest individual write and its size, count of writes
-  taking at least 20 ms, plus `File::seek()` count/total/max time. This measures
-  the plain SD path directly and also exposes the real 4 KiB physical SFENC1
-  writes/seeks when recording encryption is enabled.
-- Physical I/O timing is bracketed only around `recorderAddFrame()` while the
-  explicit Recording Load Test has detailed timing enabled. Normal production
-  recording and WebPlayer/storage operations therefore retain the previous
-  no-diagnostics path and do not gain permanent per-write timer overhead.
-- Refined the Recording Load Test frame-timing traffic light so isolated rare
-  stalls are orange instead of automatically red. Red now requires P99 above the
-  frame budget, at least 1% budget overruns, frame delivery below 98%, a recorder
-  failure, or one extreme call above five times the frame budget. Green still
-  requires no overruns, at least 99.5% frame delivery and P99 below 80% of the
-  budget; reduced headroom or isolated overruns remain orange.
-- Updated the bilingual threshold explanation so every timing rule used by the
-  result page is visible, added the calculated frame-delivery percentage to the
-  technical results, and expanded the slow-frame table with a compact Storage-I/O
-  column for diagnosing SD/filesystem busy periods before considering a
-  write-behind architecture change. No recording, MKV, audio, SD clock or
-  encryption behavior was changed in this release.
+- Added Recording Load Test diagnostics for the real Arduino filesystem boundary,
+  measuring physical `File::write()`/`seek()` count, bytes, total time, longest
+  operation and writes taking at least 20 ms for each captured slow frame.
+- Refined the recording timing assessment so isolated rare stalls produce orange
+  rather than automatically forcing red; red remains reserved for P99 beyond the
+  frame budget, at least 1% budget overruns, frame delivery below 98% or an
+  extreme single stall above five frame budgets.
+- Added frame-delivery percentage to the technical report. The diagnostics are
+  enabled only during the explicit load test and do not change production media
+  formatting or recording behavior.
 
 ## v58 — 2026-09-25
 

@@ -5,9 +5,11 @@
 
 #include <esp_heap_caps.h>
 #include <esp_timer.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 
 namespace {
 
@@ -451,6 +453,30 @@ RecordingStorageFile::~RecordingStorageFile()
     close();
 }
 
+void RecordingStorageFile::clearLastError()
+{
+    lastError_[0] = '\0';
+}
+
+void RecordingStorageFile::setLastError(const char *format, ...)
+{
+    if (!format) {
+        lastError_[0] = '\0';
+        return;
+    }
+
+    va_list args;
+    va_start(args, format);
+    vsnprintf(lastError_, sizeof(lastError_), format, args);
+    va_end(args);
+
+    Serial.printf(
+        "RecordingStorage ERROR | %s | %s\n",
+        path_.length() ? path_.c_str() : "<no-path>",
+        lastError_
+    );
+}
+
 bool RecordingStorageFile::allocateCryptoBuffers()
 {
     if (
@@ -536,13 +562,13 @@ bool RecordingStorageFile::allocateCryptoBuffers()
         !cryptoInput_ ||
         !cryptoOutput_
     ) {
-        Serial.printf(
-            "RecordingStorage ERROR | %s | crypto buffer allocation failed | internal_free=%u | dma_free=%u | dma_largest=%u | psram_free=%u\n",
-            path_.length() ? path_.c_str() : "<no-path>",
+        setLastError(
+            "crypto buffer allocation failed | internal_free=%u | dma_free=%u | dma_largest=%u | psram_free=%u | psram_largest=%u",
             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_8BIT),
             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_8BIT),
-            (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+            (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
         );
 
         releaseCryptoBuffers();
@@ -978,12 +1004,12 @@ bool RecordingStorageFile::writeHeader(bool finalized)
             HEADER_AUTH_BYTES,
             header + HEADER_AUTH_BYTES
         )) {
-        logStorageError(path_, "header HMAC failed");
+        setLastError("header HMAC failed");
         return false;
     }
 
     if (!storageFileSeek(file_, 0)) {
-        logStorageError(path_, "header seek failed");
+        setLastError("header seek failed");
         return false;
     }
 
@@ -991,7 +1017,7 @@ bool RecordingStorageFile::writeHeader(bool finalized)
             header,
             sizeof(header)
         ) != sizeof(header)) {
-        logStorageError(path_, "header write failed");
+        setLastError("header write failed");
         return false;
     }
 
@@ -1087,22 +1113,27 @@ bool RecordingStorageFile::openEncryptedWrite()
     writing_ = true;
 
     if (!recordingCryptoEnsureProvisioned()) {
-        Serial.printf(
-            "RecordingStorage ERROR | %s | hardware key unavailable | status=%s\n",
-            path_.length() ? path_.c_str() : "<no-path>",
+        setLastError(
+            "hardware key unavailable | status=%s",
             recordingCryptoKeyStatusName()
         );
         return false;
     }
 
-    if (!recordingCryptoGenerateFileNonce(fileNonce_))
+    if (!recordingCryptoGenerateFileNonce(fileNonce_)) {
+        setLastError("file nonce generation failed");
         return false;
+    }
 
-    if (!recordingCryptoGetKeyId(keyId_))
+    if (!recordingCryptoGetKeyId(keyId_)) {
+        setLastError("storage key id unavailable");
         return false;
+    }
 
-    if (!importFileKeys())
+    if (!importFileKeys()) {
+        setLastError("file key import failed");
         return false;
+    }
 
     if (!allocateCryptoBuffers())
         return false;
@@ -1123,6 +1154,7 @@ bool RecordingStorageFile::openEncryptedWrite()
 bool RecordingStorageFile::openRead(const String &path)
 {
     close();
+    clearLastError();
 
     path_ = path;
 
@@ -1186,6 +1218,7 @@ bool RecordingStorageFile::openWrite(
 )
 {
     close();
+    clearLastError();
 
     path_ = path;
 
@@ -1201,6 +1234,7 @@ bool RecordingStorageFile::openWrite(
     );
 
     if (!file_) {
+        setLastError("filesystem open for write failed");
         path_ = "";
         return false;
     }
@@ -1275,7 +1309,7 @@ bool RecordingStorageFile::loadChunk(uint32_t chunkIndex)
         return false;
 
     if (!storageFileSeek(file_, (uint32_t)physicalOffset)) {
-        logStorageError(path_, "chunk read seek failed");
+        setLastError("chunk read seek failed | chunk=%lu | physical_offset=%llu", (unsigned long)chunkIndex, (unsigned long long)physicalOffset);
         return false;
     }
 
@@ -1294,7 +1328,7 @@ bool RecordingStorageFile::loadChunk(uint32_t chunkIndex)
         );
 
         if (got != take) {
-            logStorageError(path_, "chunk read failed");
+            setLastError("chunk read failed | chunk=%lu | physical_offset=%llu | read=%u | expected=%u", (unsigned long)chunkIndex, (unsigned long long)(physicalOffset + physicalRead), (unsigned)got, (unsigned)take);
             return false;
         }
 
@@ -1315,7 +1349,7 @@ bool RecordingStorageFile::loadChunk(uint32_t chunkIndex)
         ) != 0 ||
         readU32LE(physicalChunk_ + 4) != chunkIndex
     ) {
-        logStorageError(path_, "chunk header invalid");
+        setLastError("chunk header invalid | chunk=%lu", (unsigned long)chunkIndex);
         return false;
     }
 
@@ -1326,7 +1360,7 @@ bool RecordingStorageFile::loadChunk(uint32_t chunkIndex)
         storedPlainLength != expectedPlain ||
         storedPlainLength > CHUNK_BYTES
     ) {
-        logStorageError(path_, "chunk plaintext length mismatch");
+        setLastError("chunk plaintext length mismatch | chunk=%lu | stored=%lu | expected=%lu", (unsigned long)chunkIndex, (unsigned long)storedPlainLength, (unsigned long)expectedPlain);
         return false;
     }
 
@@ -1340,7 +1374,7 @@ bool RecordingStorageFile::loadChunk(uint32_t chunkIndex)
             CHUNK_HEADER_BYTES + CHUNK_BYTES,
             storedTag
         )) {
-        logStorageError(path_, "chunk HMAC verification failed");
+        setLastError("chunk HMAC verification failed | chunk=%lu", (unsigned long)chunkIndex);
         return false;
     }
 
@@ -1350,7 +1384,7 @@ bool RecordingStorageFile::loadChunk(uint32_t chunkIndex)
             physicalChunk_ + CHUNK_HEADER_BYTES,
             plainChunk_
         )) {
-        logStorageError(path_, "chunk decrypt failed");
+        setLastError("chunk decrypt failed | chunk=%lu", (unsigned long)chunkIndex);
         return false;
     }
 
@@ -1440,7 +1474,7 @@ bool RecordingStorageFile::flushCachedChunk()
             plainChunk_,
             physicalChunk_ + CHUNK_HEADER_BYTES
         )) {
-        logStorageError(path_, "chunk encrypt failed");
+        setLastError("chunk encrypt failed | chunk=%lu", (unsigned long)chunkIndex);
         return false;
     }
 
@@ -1454,19 +1488,48 @@ bool RecordingStorageFile::flushCachedChunk()
             CHUNK_HEADER_BYTES + CHUNK_BYTES,
             tag
         )) {
-        logStorageError(path_, "chunk HMAC generation failed");
+        setLastError("chunk HMAC generation failed | chunk=%lu", (unsigned long)chunkIndex);
         return false;
     }
 
     uint64_t physicalOffset =
         physicalOffsetForChunk(chunkIndex);
 
-    if (physicalOffset > 0xFFFFFFFFULL)
+    if (physicalOffset > 0xFFFFFFFFULL) {
+        setLastError(
+            "chunk physical offset exceeds 32-bit seek range | chunk=%lu | physical_offset=%llu",
+            (unsigned long)chunkIndex,
+            (unsigned long long)physicalOffset
+        );
         return false;
+    }
 
-    if (!storageFileSeek(file_, (uint32_t)physicalOffset)) {
-        logStorageError(path_, "chunk write seek failed");
-        return false;
+    // Normal recording reaches chunks in strict append order. Avoid an
+    // unnecessary fseek() when the stdio stream is already positioned at the
+    // exact physical chunk offset. Random-access container patches still take
+    // the seek path below, so SFENC1 semantics remain unchanged.
+    size_t currentPhysicalPosition =
+        file_.position();
+
+    if (
+        currentPhysicalPosition !=
+        (size_t)physicalOffset
+    ) {
+        errno = 0;
+
+        if (!storageFileSeek(file_, (uint32_t)physicalOffset)) {
+            int seekErrno = errno;
+
+            setLastError(
+                "chunk write seek failed | chunk=%lu | offset=%llu | current=%u | errno=%d:%s",
+                (unsigned long)chunkIndex,
+                (unsigned long long)physicalOffset,
+                (unsigned)currentPhysicalPosition,
+                seekErrno,
+                strerror(seekErrno)
+            );
+            return false;
+        }
     }
 
     size_t physicalWritten = 0;
@@ -1484,13 +1547,36 @@ bool RecordingStorageFile::flushCachedChunk()
             take
         );
 
+        size_t positionBefore =
+            file_.position();
+
+        errno = 0;
+
         size_t written = storageFileWrite(file_,
             cryptoInput_,
             take
         );
 
+        int writeErrno = errno;
+
         if (written != take) {
-            logStorageError(path_, "chunk physical write failed");
+            size_t positionAfter =
+                file_.position();
+            size_t physicalSize =
+                file_.size();
+
+            setLastError(
+                "chunk physical write failed | chunk=%lu | offset=%llu | written=%u/%u | errno=%d:%s | pos=%u->%u | size=%u",
+                (unsigned long)chunkIndex,
+                (unsigned long long)(physicalOffset + physicalWritten),
+                (unsigned)written,
+                (unsigned)take,
+                writeErrno,
+                strerror(writeErrno),
+                (unsigned)positionBefore,
+                (unsigned)positionAfter,
+                (unsigned)physicalSize
+            );
             return false;
         }
 
@@ -1624,8 +1710,15 @@ size_t RecordingStorageFile::write(
         if (logicalPosition_ > logicalSize_)
             logicalSize_ = logicalPosition_;
 
-        if (written != length)
+        if (written != length) {
+            setLastError(
+                "plain physical write failed | written=%u | expected=%u | logical_offset=%llu",
+                (unsigned)written,
+                (unsigned)length,
+                (unsigned long long)(logicalPosition_ - written)
+            );
             failed_ = true;
+        }
 
         return written;
     }
@@ -1856,6 +1949,11 @@ void RecordingStorageFile::close()
     (void)closeChecked();
 }
 
+bool RecordingStorageFile::isOpen() const
+{
+    return open_ && (bool)file_;
+}
+
 bool RecordingStorageFile::isDirectory() const
 {
     return directory_;
@@ -1869,6 +1967,11 @@ bool RecordingStorageFile::isEncrypted() const
 bool RecordingStorageFile::failed() const
 {
     return failed_;
+}
+
+const char *RecordingStorageFile::lastError() const
+{
+    return lastError_;
 }
 
 String RecordingStorageFile::path() const

@@ -20,8 +20,8 @@
 // The same release tag is written to the firmware boot log and shown in
 // WebConfig, so a running device can be mapped back to the exact Git tag.
 
-#define SENSORFORGE_RELEASE_NUMBER 59
-#define SENSORFORGE_RELEASE_TAG "v59"
-#define SENSORFORGE_RELEASE_DATE "2026-09-25"
+#define SENSORFORGE_RELEASE_NUMBER 63
+#define SENSORFORGE_RELEASE_TAG "v63"
+#define SENSORFORGE_RELEASE_DATE "2026-09-26"
 #define SENSORFORGE_RELEASE_SUMMARY \
-    "Add physical storage-I/O slow-frame diagnostics and refine recording-load timing ratings."
+    "Keep Recording Load Test ownership isolated from WebConfig pause recovery and fail fast on external recorder closure."

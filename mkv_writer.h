@@ -3,6 +3,8 @@
 #include <Arduino.h>
 #include <time.h>
 
+#include "recording_write_buffer.h"
+
 struct MkvFrameTiming {
     bool valid;
     uint32_t cameraUs;
@@ -23,6 +25,10 @@ void mkvAddFrame();
 // calls do not become permanent per-frame overhead.
 void mkvSetDetailedFrameTimingEnabled(bool enabled);
 bool mkvGetLastFrameTiming(MkvFrameTiming &timing);
+
+// PSRAM write-behind statistics for diagnostics and normal recording summaries.
+bool mkvGetWriteBufferStats(RecordingWriteBufferStats &stats);
+bool mkvWriteBehindEnabled();
 
 // Sparse MJPEG path used by the continuous shooter. JPEGs are supplied from
 // PSRAM and retain their real relative capture timestamps; no camera capture or
@@ -49,6 +55,7 @@ bool mkvEnd();
 
 bool mkvIsOpen();
 bool mkvIsHealthy();
+const char *mkvGetLastError();
 bool mkvHitSizeLimit();
 uint32_t mkvGetFrameCount();
 uint64_t mkvGetBytesWritten();

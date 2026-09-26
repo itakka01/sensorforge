@@ -252,10 +252,15 @@ static void setRecordingAutomationPaused(
         // next main-loop iteration cannot immediately start a replacement.
         if (recording) {
             stopRecording();
-        } else if (recorderIsOpen()) {
+        } else if (
+            recorderIsOpen() &&
+            !recordingLoadTestIsActive()
+        ) {
             // Defensive recovery for a stale recorder handle whose high-level
-            // recording flag was already cleared. Maintenance operations must
-            // never remain blocked by such an orphaned open recorder.
+            // recording flag was already cleared. The explicit Recording Load
+            // Test is different: it deliberately owns the recorder while the
+            // normal high-level `recording` flag stays false, so WebConfig
+            // pause/re-pause activity must never finalize that test container.
             recorderEnd();
         }
 
@@ -16157,11 +16162,15 @@ static RecordingLoadUiLevel recordingLoadTimingLevel(
     const RecordingLoadTestResult &result
 )
 {
+    // Timing is evaluated from the measurements themselves. A storage/finalize
+    // failure is reported by the separate Storage / Finalize rating and must not
+    // retroactively turn otherwise healthy frame timing red.
     if (
-        !result.completed ||
-        !result.recorderHealthy ||
         result.frameCalls == 0 ||
-        result.framesWritten == 0
+        result.framesWritten == 0 ||
+        result.targetFps == 0 ||
+        result.frameBudgetUs == 0 ||
+        result.elapsedMs == 0
     ) {
         return RECORDING_LOAD_RED;
     }
@@ -16274,6 +16283,31 @@ static RecordingLoadUiLevel recordingLoadStorageLevel(
 
     if (result.finalizeMs > 2000UL)
         return RECORDING_LOAD_ORANGE;
+
+    if (result.writeBehindEnabled) {
+        if (
+            result.writeBehindFailed ||
+            result.writeBehindCapacity == 0 ||
+            result.writeBehindBytesCommitted !=
+                result.writeBehindBytesQueued
+        ) {
+            return RECORDING_LOAD_RED;
+        }
+
+        double bufferPct =
+            (double)result.writeBehindHighWater * 100.0 /
+            (double)result.writeBehindCapacity;
+
+        if (bufferPct >= 90.0)
+            return RECORDING_LOAD_RED;
+
+        if (
+            bufferPct >= 50.0 ||
+            result.writeBehindProducerWaitCount > 0
+        ) {
+            return RECORDING_LOAD_ORANGE;
+        }
+    }
 
     return RECORDING_LOAD_GREEN;
 }
@@ -16701,6 +16735,11 @@ static void handleRecordingLoadTestResult()
             ? (double)result.audioBufferHighWater * 100.0 /
                 (double)result.audioBufferCapacity
             : 0.0;
+        double writeBehindPct =
+            result.writeBehindCapacity > 0
+            ? (double)result.writeBehindHighWater * 100.0 /
+                (double)result.writeBehindCapacity
+            : 0.0;
 
         html +=
             "<details open style='margin-top:16px'><summary><b>" +
@@ -16764,6 +16803,60 @@ static void handleRecordingLoadTestResult()
             String((unsigned long)result.finalizeMs) +
             " ms<br>";
 
+        if (result.format == "mkv") {
+            html +=
+                htmlText(UI_RECORDING_LOAD_WRITE_BEHIND) + ": <b>" +
+                htmlText(
+                    result.writeBehindEnabled
+                    ? UI_RECORDING_LOAD_WRITE_BEHIND_ACTIVE
+                    : UI_RECORDING_LOAD_WRITE_BEHIND_FALLBACK
+                ) +
+                "</b>";
+
+            html +=
+                " | init=" +
+                htmlEscape(
+                    recordingWriteBufferInitStatusName(
+                        (RecordingWriteBufferInitStatus)
+                            result.writeBehindInitStatus
+                    )
+                );
+
+            if (result.writeBehindEnabled) {
+                html +=
+                    " | " + htmlText(UI_RECORDING_LOAD_BUFFER) + "=" +
+                    String((unsigned long)result.writeBehindHighWater) +
+                    "/" +
+                    String((unsigned long)result.writeBehindCapacity) +
+                    " (" + String(writeBehindPct, 1) + "%)" +
+                    " | waits=" +
+                    String((unsigned long)result.writeBehindProducerWaitCount) +
+                    "/" +
+                    String((double)result.writeBehindProducerWaitUs / 1000.0, 1) +
+                    " ms" +
+                    " | drain=" +
+                    String((unsigned long)result.writeBehindDrainWriteCalls) +
+                    " writes" +
+                    " / Σ" +
+                    String((double)result.writeBehindDrainWriteTotalUs / 1000.0, 1) +
+                    " ms" +
+                    " / max " +
+                    String((double)result.writeBehindDrainWriteMaxUs / 1000.0, 1) +
+                    " ms@" +
+                    String((unsigned long)result.writeBehindDrainWriteMaxBytes) +
+                    " B" +
+                    " / >=20ms:" +
+                    String((unsigned long)result.writeBehindSlowDrainWriteCalls) +
+                    " | committed=" +
+                    String((unsigned long)(result.writeBehindBytesCommitted / 1024ULL)) +
+                    "/" +
+                    String((unsigned long)(result.writeBehindBytesQueued / 1024ULL)) +
+                    " KiB";
+            }
+
+            html += "<br>";
+        }
+
         if (result.audioRequested) {
             html +=
                 htmlText(UI_AUDIO_ENABLE) + ": <b>" +
@@ -16823,7 +16916,17 @@ static void handleRecordingLoadTestResult()
                 "</b></summary>"
                 "<p class='muted'>" +
                 htmlText(UI_RECORDING_LOAD_SLOW_HELP) +
-                "</p><div style='overflow-x:auto'><table style='border-collapse:collapse;width:100%;font-size:.88em'>"
+                "</p>";
+
+            if (result.writeBehindEnabled) {
+                html +=
+                    "<p class='muted'>" +
+                    htmlText(UI_RECORDING_LOAD_WRITE_BEHIND_ASYNC_NOTE) +
+                    "</p>";
+            }
+
+            html +=
+                "<div style='overflow-x:auto'><table style='border-collapse:collapse;width:100%;font-size:.88em'>"
                 "<tr>"
                 "<th style='text-align:left;padding:4px'>" + htmlText(UI_RECORDING_LOAD_STAGE_CALL) + "</th>"
                 "<th style='text-align:right;padding:4px'>" + htmlText(UI_RECORDING_LOAD_STAGE_TOTAL) + "</th>"

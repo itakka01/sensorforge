@@ -28,6 +28,7 @@ static String activeTempPath;
 
 static bool detailedFrameTimingEnabled = false;
 static RecorderFrameTiming lastFrameTiming = {};
+static String lastRecorderError;
 
 
 // Public global start lock declared in recorder.h.
@@ -189,6 +190,7 @@ bool recorderStart(
     int fps
 )
 {
+    lastRecorderError = "";
     // Central start gates. Storage maintenance and the live camera preview
     // may block NEW recording starts. Check before touching recorder state so
     // an already-running recording is never interrupted by a new gate.
@@ -273,6 +275,12 @@ bool recorderStart(
 
         if (!mkvIsOpen()) {
 
+            const char *mkvError = mkvGetLastError();
+            lastRecorderError =
+                mkvError && mkvError[0]
+                ? String(mkvError)
+                : String("MKV start failed");
+
             Serial.println(
                 "Recorder: MKV start failed"
             );
@@ -311,7 +319,14 @@ void recorderAddFrame()
 
     lastFrameTiming = {};
 
-    if (detailedFrameTimingEnabled)
+    const bool synchronousStorageDiagnostics =
+        detailedFrameTimingEnabled &&
+        !(
+            activeRecorder == RECORDER_MKV &&
+            mkvWriteBehindEnabled()
+        );
+
+    if (synchronousStorageDiagnostics)
         recordingStorageBeginFrameDiagnostics();
 
     switch (activeRecorder) {
@@ -321,6 +336,11 @@ void recorderAddFrame()
 
         case RECORDER_MKV:
             mkvAddFrame();
+            if (!mkvIsHealthy() && !lastRecorderError.length()) {
+                const char *mkvError = mkvGetLastError();
+                if (mkvError && mkvError[0])
+                    lastRecorderError = mkvError;
+            }
             break;
 
         default:
@@ -345,7 +365,10 @@ void recorderAddFrame()
         : (uint32_t)totalUs64;
 
     RecordingStorageFrameDiagnostics storageTiming = {};
-    if (recordingStorageGetFrameDiagnostics(storageTiming)) {
+    if (
+        synchronousStorageDiagnostics &&
+        recordingStorageGetFrameDiagnostics(storageTiming)
+    ) {
         lastFrameTiming.storageIoValid = true;
         lastFrameTiming.storageWriteCalls = storageTiming.writeCalls;
         lastFrameTiming.storageWriteBytes = storageTiming.writeBytes;
@@ -430,11 +453,25 @@ bool recorderEnd()
             break;
     }
 
+    if (!finalized && !lastRecorderError.length()) {
+        if (activeRecorder == RECORDER_MKV) {
+            const char *mkvError = mkvGetLastError();
+            if (mkvError && mkvError[0])
+                lastRecorderError = mkvError;
+        }
+
+        if (!lastRecorderError.length())
+            lastRecorderError = "recorder finalization failed";
+    }
+
     bool promoted = false;
 
     if (finalized) {
         promoted =
             promoteRecording();
+
+        if (!promoted && !lastRecorderError.length())
+            lastRecorderError = "recording promotion/rename failed";
     }
 
     if (
@@ -535,6 +572,32 @@ uint64_t recorderGetBytesWritten()
     }
 }
 
+
+bool recorderGetWriteBufferStats(RecordingWriteBufferStats &stats)
+{
+    stats = {};
+
+    if (
+        activeRecorder == RECORDER_MKV ||
+        activeRecorder == RECORDER_NONE
+    ) {
+        return mkvGetWriteBufferStats(stats);
+    }
+
+    return false;
+}
+
+
+String recorderGetLastError()
+{
+    if (activeRecorder == RECORDER_MKV && !lastRecorderError.length()) {
+        const char *mkvError = mkvGetLastError();
+        if (mkvError && mkvError[0])
+            return String(mkvError);
+    }
+
+    return lastRecorderError;
+}
 
 String recorderGetFormat()
 {

@@ -63,6 +63,21 @@ struct RecordingLoadTestResult {
     uint64_t mediaBytesBeforeFinalize;
     uint32_t finalizeMs;
 
+    bool writeBehindEnabled;
+    bool writeBehindFailed;
+    uint8_t writeBehindInitStatus;
+    size_t writeBehindCapacity;
+    size_t writeBehindHighWater;
+    uint64_t writeBehindBytesQueued;
+    uint64_t writeBehindBytesCommitted;
+    uint32_t writeBehindProducerWaitCount;
+    uint64_t writeBehindProducerWaitUs;
+    uint32_t writeBehindDrainWriteCalls;
+    uint64_t writeBehindDrainWriteTotalUs;
+    uint32_t writeBehindDrainWriteMaxUs;
+    uint32_t writeBehindDrainWriteMaxBytes;
+    uint32_t writeBehindSlowDrainWriteCalls;
+
     uint64_t audioBytesCaptured;
     uint64_t audioBytesDelivered;
     uint64_t audioBytesDropped;

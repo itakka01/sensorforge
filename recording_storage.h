@@ -55,14 +55,19 @@ public:
     bool closeChecked();
     void close();
 
+    bool isOpen() const;
     bool isDirectory() const;
     bool isEncrypted() const;
     bool failed() const;
+    const char *lastError() const;
     String path() const;
 
     explicit operator bool() const;
 
 private:
+    void clearLastError();
+    void setLastError(const char *format, ...);
+
     bool openEncryptedRead();
     bool openEncryptedWrite();
     bool allocateCryptoBuffers();
@@ -126,6 +131,11 @@ private:
     int64_t cachedChunkIndex_ = -1;
     uint32_t cachedPlainLength_ = 0;
     bool cacheDirty_ = false;
+
+    // Fixed-size diagnostic storage: no heap allocation is required when the
+    // storage path is already under memory or I/O pressure. Cleared only when a
+    // new file is opened so the reason survives close/cleanup for diagnostics.
+    char lastError_[224] = {};
 };
 
 // Return the logical plaintext size of either a normal or SFENC1 file without

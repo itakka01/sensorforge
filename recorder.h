@@ -2,6 +2,8 @@
 
 #include <Arduino.h>
 
+#include "recording_write_buffer.h"
+
 struct RecorderFrameTiming {
     bool valid;
     bool stageBreakdownValid;
@@ -47,6 +49,8 @@ bool recorderIsHealthy();
 bool recorderHitSizeLimit();
 uint32_t recorderGetFrameCount();
 uint64_t recorderGetBytesWritten();
+bool recorderGetWriteBufferStats(RecordingWriteBufferStats &stats);
+String recorderGetLastError();
 
 String recorderGetFormat();
 String recorderGetFinalPath();
