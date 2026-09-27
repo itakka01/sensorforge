@@ -1169,10 +1169,7 @@ static String htmlHeader()
     html +=
         "<a href='/sd_maintenance'>" + htmlText(UI_NAV_SD_MAINTENANCE) + "</a>"
         "<a href='/log'>" + htmlText(UI_NAV_LOG_VIEWER) + "</a>"
-        "<a href='/sysinfo'>" + htmlText(UI_NAV_SYSTEM_INFO) + "</a>"
-        "<a href='/board'>" + htmlText(UI_NAV_BOARD_INFO) + "</a>"
-        "<a href='/psram'>" + htmlText(UI_NAV_PSRAM_TEST) + "</a>"
-        "<a href='/firmware_update'>" + htmlText(UI_NAV_FIRMWARE_UPDATE) + "</a>"
+        "<a href='/system'>" + htmlText(UI_NAV_SYSTEM) + "</a>"
         "<a href='/license'>" + htmlText(UI_NAV_LICENSE) + "</a>"
         "<a href='/transport'>" + htmlText(UI_NAV_TRANSPORT) + "</a>"
         "<div class='sep'></div><a class='danger-link' href='/reboot'>" +
@@ -1225,9 +1222,7 @@ static String htmlHeader()
         "</button></div>";
 
     html +=
-        "<div id='moduleClock' class='module-clock invalid' data-time-label='" +
-        htmlText(UI_TIME) +
-        "' data-thermal-label='" +
+        "<div id='moduleClock' class='module-clock invalid' data-thermal-label='" +
         htmlText(UI_THERMAL_PROTECTION) +
         "' data-warning-from='" +
         htmlText(UI_WARNING_FROM) +
@@ -1239,9 +1234,7 @@ static String htmlHeader()
         htmlText(UI_RTC_ENCLOSURE_INDICATOR) +
         "' title='" +
         htmlText(UI_MODULE_TIME_TITLE) +
-        "'>" +
-        htmlText(UI_TIME) +
-        " --.--.---- &middot; --:--:--</div></div></div></nav>";
+        "'>--.--.---- &middot; --:--:--</div></div></div></nav>";
 
     // Central browser-session keepalive. Every normal SensorForge page uses
     // this common header/menu, so an open web UI keeps WiFi alive even if the
@@ -1279,7 +1272,6 @@ static String htmlHeader()
         "var pauseEl=document.getElementById('recordingPauseGlobal');"
         "if(!el)return;"
         "var baseMs=0,syncMs=0,pauseActive=false,cpuText='',rtcText='',thermalState='OK';"
-        "var timeLabel=el.dataset.timeLabel||'Time';"
         "function pad(v){return String(v).padStart(2,'0');}"
         "function tempSuffix(){"
         "var x='';"
@@ -1289,9 +1281,9 @@ static String htmlHeader()
         "}"
         "function render(){"
         "var suffix=tempSuffix();"
-        "if(!baseMs){el.textContent=timeLabel+' --.--.---- · --:--:--'+suffix;el.classList.add('invalid');return;}"
+        "if(!baseMs){el.textContent='--.--.---- · --:--:--'+suffix;el.classList.add('invalid');return;}"
         "var d=new Date(baseMs+(Date.now()-syncMs));"
-        "el.textContent=timeLabel+' '+pad(d.getUTCDate())+'.'+pad(d.getUTCMonth()+1)+'.'+d.getUTCFullYear()+"
+        "el.textContent=pad(d.getUTCDate())+'.'+pad(d.getUTCMonth()+1)+'.'+d.getUTCFullYear()+"
         "' · '+pad(d.getUTCHours())+':'+pad(d.getUTCMinutes())+':'+pad(d.getUTCSeconds())+suffix;"
         "el.classList.remove('invalid');"
         "}"
@@ -11323,8 +11315,8 @@ static void handleFirmwareUploadFinished()
     server.sendHeader(
         "Location",
         webFirmwareUploadSucceeded
-        ? "/firmware_update?notice=upload_ok"
-        : "/firmware_update?notice=upload_failed"
+        ? "/system?notice=upload_ok#firmware"
+        : "/system?notice=upload_failed#firmware"
     );
 
     server.send(
@@ -11335,7 +11327,336 @@ static void handleFirmwareUploadFinished()
 }
 
 
-static void sendFirmwareUpdatePage(
+struct WebPsramQuickTestResult
+{
+    bool skippedRecording = false;
+    bool allocationOk = false;
+    bool patternOk = false;
+    size_t testSize = 1024U * 1024U;
+    size_t freeBefore = 0;
+    size_t freeAfter = 0;
+    uint32_t elapsedMs = 0;
+};
+
+
+static WebPsramQuickTestResult runWebPsramQuickTest(
+    bool blockedByRecording
+)
+{
+    WebPsramQuickTestResult result;
+    result.freeBefore = ESP.getFreePsram();
+
+    if (blockedByRecording) {
+        result.skippedRecording = true;
+        result.freeAfter = result.freeBefore;
+        return result;
+    }
+
+    uint32_t startedMs = millis();
+
+    uint8_t *buffer =
+        (uint8_t *)ps_malloc(
+            result.testSize
+        );
+
+    if (!buffer) {
+        result.elapsedMs = millis() - startedMs;
+        result.freeAfter = ESP.getFreePsram();
+        return result;
+    }
+
+    result.allocationOk = true;
+
+    for (size_t i = 0; i < result.testSize; ++i)
+        buffer[i] = (uint8_t)(i & 0xFFU);
+
+    result.patternOk = true;
+
+    for (size_t i = 0; i < result.testSize; ++i) {
+        if (buffer[i] != (uint8_t)(i & 0xFFU)) {
+            result.patternOk = false;
+            break;
+        }
+    }
+
+    free(buffer);
+
+    result.elapsedMs = millis() - startedMs;
+    result.freeAfter = ESP.getFreePsram();
+    return result;
+}
+
+
+static String systemInfoButton(
+    const String &title,
+    const String &info
+)
+{
+    return
+        "<button type='button' class='sys-info-btn' "
+        "data-title='" + htmlEscape(title) + "' "
+        "data-info='" + htmlEscape(info) + "' "
+        "aria-label='Information' title='Information'>i</button>";
+}
+
+
+static void appendSystemOverviewSections(
+    String &html,
+    const WebPsramQuickTestResult &psramTest
+)
+{
+    const esp_partition_t *runningPartition =
+        esp_ota_get_running_partition();
+
+    const uint64_t sketchBytes =
+        (uint64_t)ESP.getSketchSize();
+
+    const uint64_t appPartitionBytes =
+        runningPartition
+        ? (uint64_t)runningPartition->size
+        : 0ULL;
+
+    const uint32_t firmwarePctX10 =
+        appPartitionBytes > 0
+        ? (uint32_t)((sketchBytes * 1000ULL + appPartitionBytes / 2ULL) / appPartitionBytes)
+        : 0U;
+
+    const size_t internalHeapFree =
+        heap_caps_get_free_size(
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+        );
+
+    const size_t internalHeapMinimum =
+        heap_caps_get_minimum_free_size(
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+        );
+
+    const char *firmwareReserveClass =
+        firmwarePctX10 >= 800U
+        ? "warn"
+        : "ok";
+
+    const char *firmwareReserveText =
+        firmwarePctX10 >= 900U
+        ? "KNAPP"
+        : (firmwarePctX10 >= 800U ? "BEOBACHTEN" : "OK");
+
+    const char *heapReserveClass =
+        internalHeapMinimum < (50U * 1024U)
+        ? "warn"
+        : "ok";
+
+    const char *heapReserveText =
+        internalHeapMinimum < (40U * 1024U)
+        ? "KNAPP"
+        : (internalHeapMinimum < (50U * 1024U) ? "BEOBACHTEN" : "OK");
+
+    const String capacityInfo =
+        "Orientierungswerte für SensorForge, keine harten ESP32-Grenzen.\n\n"
+        "Firmware/App-Partition: unter 80 % = unkritisch, 80–90 % = beobachten, ab 90 % = knapp. "
+        "Der Wert wird aus der tatsächlich laufenden Firmware und ihrer App-Partition ermittelt und passt sich damit auch an andere Partitionstabellen/Boards an.\n\n"
+        "Interner Heap: maßgeblich ist vor allem der niedrigste freie Wert seit Boot. Ab etwa 50 KB = gute Reserve, 40–50 KB = beobachten, unter 40 KB = knapp. "
+        "Kamera, WiFi, Recording und Verschlüsselung können den Heap kurzzeitig stärker belasten.\n\n"
+        "Die Arduino-Compilerangabe „Global variables use …“ ist eine Linker-/Buildangabe und kann von der laufenden Firmware nicht zuverlässig rekonstruiert werden. Sie sollte bei neuen Builds weiterhin kurz mitgeprüft werden.";
+
+    html +=
+        "<section class='settings-section' id='system-info'>"
+        "<div class='sys-section-head'><h3>Systeminformationen</h3>" +
+        systemInfoButton("Speicherreserven", capacityInfo) +
+        "</div>";
+
+#if defined(BOARD_FREENOVE)
+    html +=
+        "Board: <b>Freenove FNK0085 ESP32-S3 WROOM</b><br>"
+        "Storage: <b>SDMMC 1-bit</b><br>";
+#elif defined(BOARD_XIAO)
+    html +=
+        "Board: <b>Seeed XIAO ESP32S3 Sense</b><br>"
+        "Storage: <b>SPI SD</b><br>";
+#endif
+
+    html +=
+        "Flash Size: " +
+        String(ESP.getFlashChipSize() / 1024 / 1024) +
+        " MB<br>"
+        "PSRAM Size: " +
+        String(ESP.getPsramSize() / 1024 / 1024) +
+        " MB<br>"
+        "<br><b>Speicherreserven</b><br>"
+        "Firmware/App: <span class='status-pill " +
+        String(firmwareReserveClass) +
+        "'>" +
+        String(firmwareReserveText) +
+        "</span> <b>" +
+        String(firmwarePctX10 / 10U) +
+        "." +
+        String(firmwarePctX10 % 10U) +
+        "%</b> (" +
+        String((unsigned long)(sketchBytes / 1024ULL)) +
+        " / " +
+        String((unsigned long)(appPartitionBytes / 1024ULL)) +
+        " KB)<br>"
+        "Interner Heap aktuell: <b>" +
+        String((unsigned long)(internalHeapFree / 1024U)) +
+        " KB</b><br>"
+        "Interner Heap Minimum seit Boot: <span class='status-pill " +
+        String(heapReserveClass) +
+        "'>" +
+        String(heapReserveText) +
+        "</span> <b>" +
+        String((unsigned long)(internalHeapMinimum / 1024U)) +
+        " KB</b>"
+        "</section>";
+
+    html +=
+        "<section class='settings-section'>"
+        "<h3>" +
+        htmlText(UI_MOTION_SENSOR_TYPE) +
+        "</h3><p><span class='status-pill ok'>" +
+        htmlText(motionSensorTypeUiId()) +
+        "</span></p>" +
+        htmlText(UI_PRESENCE_INPUT) +
+        ": GPIO" +
+        String((int)PIR_PIN);
+
+    if (radarConfigAvailable()) {
+        html +=
+            "<br>UART: RX=GPIO" +
+            String((int)RADAR_RX_PIN) +
+            " / TX=GPIO" +
+            String((int)RADAR_TX_PIN);
+    } else {
+        html +=
+            "<p class='muted'>" +
+            htmlText(UI_RADAR_CONFIG_PIR_NOTE) +
+            "</p>";
+    }
+
+    html +=
+        "</section>";
+
+    const String rtcInfo =
+        "Die RTC wird automatisch erkannt. Nach erfolgreicher NTP-Synchronisation wird sie automatisch aktualisiert; "
+        "dafür sind keine RTC-Einträge in config.txt nötig. Ohne erkannte RTC verwendet SensorForge die normale System-/NTP-Zeit.";
+
+    html +=
+        "<section class='settings-section'>"
+        "<div class='sys-section-head'><h3>Echtzeituhr (RTC)</h3>" +
+        systemInfoButton("Echtzeituhr (RTC)", rtcInfo) +
+        "</div>";
+
+    if (rtcDetected()) {
+        html +=
+            "<p><span class='status-pill " +
+            String(rtcClockValid() ? "ok" : "warn") +
+            "'>" +
+            String(rtcClockValid() ? "DIAGNOSE OK" : "ERKANNT / ZEIT UNGÜLTIG") +
+            "</span></p>"
+            "Typ: <b>" +
+            htmlEscape(String(rtcTypeName())) +
+            "</b><br>"
+            "I2C-Adresse: <code>0x68</code><br>"
+            "I2C-Pins: SDA=GPIO" +
+            String((int)RTC_SDA_PIN) +
+            " / SCL=GPIO" +
+            String((int)RTC_SCL_PIN) +
+            "<br>"
+            "RTC-Zeit: <b>" +
+            htmlEscape(rtcTimeText()) +
+            "</b><br>"
+            "Oszillator-Status: " +
+            String(rtcOscillatorStopped() ? "OSF gesetzt" : "OK") +
+            "<br>"
+            "Systemzeit beim Boot aus RTC übernommen: " +
+            String(rtcRestoredSystemTime() ? "ja" : "nein") +
+            "<br>"
+            "AT24C32 EEPROM @0x57: " +
+            String(rtcEepromDetected() ? "erkannt" : "nicht erkannt") +
+            "<br>";
+    } else {
+        html +=
+            "<p><span class='status-pill'>OPTIONAL / NICHT ERKANNT</span></p>"
+            "Keine unterstützte externe RTC auf SDA=GPIO" +
+            String((int)RTC_SDA_PIN) +
+            " / SCL=GPIO" +
+            String((int)RTC_SCL_PIN) +
+            " erkannt.";
+    }
+
+    html +=
+        "</section>";
+
+    const String psramInfo =
+        "Der Schnelltest wird beim Öffnen der Systemseite automatisch ausgeführt.";
+
+    html +=
+        "<section class='settings-section' id='psram'>"
+        "<div class='sys-section-head'><h3>PSRAM Schnelltest</h3>" +
+        systemInfoButton("PSRAM Schnelltest", psramInfo) +
+        "</div>";
+
+    if (psramTest.skippedRecording) {
+        html +=
+            "<p><span class='status-pill warn'>NICHT AUSGEFÜHRT</span></p>"
+            "<p class='muted'>Während einer laufenden Aufnahme wird der Test nicht parallel ausgeführt. "
+            "Öffne die Systemseite nach Ende der Aufnahme erneut.</p>";
+    } else if (!psramTest.allocationOk) {
+        html +=
+            "<p><span class='status-pill warn'>PSRAM FEHLER</span></p>"
+            "1 MiB Testpuffer konnte nicht im PSRAM reserviert werden.<br>";
+    } else if (!psramTest.patternOk) {
+        html +=
+            "<p><span class='status-pill warn'>PSRAM FEHLER</span></p>"
+            "Schreib-/Lesemuster stimmt nicht überein.<br>";
+    } else {
+        html +=
+            "<p><span class='status-pill ok'>PSRAM OK</span></p>"
+            "1 MiB Schreib-/Lesetest erfolgreich.<br>";
+    }
+
+    if (!psramTest.skippedRecording) {
+        html +=
+            "Testdauer: " +
+            String((unsigned long)psramTest.elapsedMs) +
+            " ms<br>";
+    }
+
+    html +=
+        "Freies PSRAM vorher: " +
+        String((unsigned long)(psramTest.freeBefore / 1024U)) +
+        " KB<br>"
+        "Freies PSRAM danach: " +
+        String((unsigned long)(psramTest.freeAfter / 1024U)) +
+        " KB"
+        "</section>";
+}
+
+
+static void appendSystemInfoUi(String &html)
+{
+    html +=
+        "<div id='sysInfoBackdrop' class='sys-info-backdrop' role='dialog' aria-modal='true' aria-hidden='true'>"
+        "<div class='sys-info-modal'>"
+        "<div class='sys-info-modal-head'><h3 id='sysInfoTitle'>Information</h3>"
+        "<button type='button' id='sysInfoClose' class='sys-info-close' aria-label='Schließen'>×</button></div>"
+        "<div id='sysInfoBody' class='sys-info-body'></div>"
+        "</div></div>"
+        "<script>"
+        "(function(){"
+        "var b=document.getElementById('sysInfoBackdrop'),t=document.getElementById('sysInfoTitle'),c=document.getElementById('sysInfoBody'),x=document.getElementById('sysInfoClose');"
+        "if(!b||!t||!c||!x)return;"
+        "function closeInfo(){b.classList.remove('open');b.setAttribute('aria-hidden','true');}"
+        "function openInfo(btn){t.textContent=btn.getAttribute('data-title')||'Information';c.textContent=btn.getAttribute('data-info')||'';b.classList.add('open');b.setAttribute('aria-hidden','false');}"
+        "document.querySelectorAll('.sys-info-btn').forEach(function(btn){btn.addEventListener('click',function(){openInfo(btn);});});"
+        "x.addEventListener('click',closeInfo);"
+        "b.addEventListener('click',function(e){if(e.target===b)closeInfo();});"
+        "document.addEventListener('keydown',function(e){if(e.key==='Escape')closeInfo();});"
+        "})();"
+        "</script>";
+}
+
+
+static void sendSystemPage(
     int statusCode,
     const String &forcedError = ""
 )
@@ -11349,18 +11670,40 @@ static void sendFirmwareUpdatePage(
     bool readyValid =
         webFirmwareReadyStateValid();
 
+    WebPsramQuickTestResult psramTest =
+        runWebPsramQuickTest(
+            blockedByRecording
+        );
+
     String html =
         htmlHeader();
 
     html +=
+        "<style>"
+        ".sys-section-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.sys-section-head h3{margin:0}"
+        ".sys-info-btn{display:inline-flex;align-items:center;justify-content:center;width:25px;height:25px;min-width:25px;padding:0;margin:0;border:1px solid #9ca3af;border-radius:50%;background:#fff;color:#334155;font-weight:700;line-height:1;cursor:pointer}"
+        ".sys-info-btn:hover{background:#f1f5f9}.sys-info-backdrop{position:fixed;inset:0;background:rgba(15,23,42,.48);display:none;align-items:center;justify-content:center;padding:18px;z-index:10000}.sys-info-backdrop.open{display:flex}"
+        ".sys-info-modal{width:min(560px,100%);max-height:80vh;overflow:auto;background:#fff;border-radius:12px;padding:18px;box-shadow:0 18px 50px rgba(0,0,0,.25)}.sys-info-modal-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.sys-info-modal-head h3{margin:0}.sys-info-close{font-size:1.35rem;line-height:1;padding:3px 9px;margin:0}.sys-info-body{margin-top:12px;line-height:1.45;white-space:pre-line}"
+        "</style>"
         "<div class='page-title'><div>"
-        "<h2>Firmware Update</h2>"
-        "<p>Neue SensorForge-Firmware sicher über WiFi bereitstellen</p>"
+        "<h2>System</h2>"
+        "<p>Systemstatus, Hardwarediagnose und Firmware</p>"
         "</div></div>";
 
+    appendSystemOverviewSections(
+        html,
+        psramTest
+    );
+
+    const String firmwareInfo =
+        "Die Firmware wird zuerst vollständig hochgeladen und automatisch geprüft. Erst mit „Jetzt installieren“ wird sie für den nächsten Neustart aktiviert. "
+        "Bricht der Upload vorher ab, bleibt die bisherige Firmware aktiv. Installiere möglichst nur Builds, die zuvor auf passender Hardware getestet wurden.";
+
     html +=
-        "<div class='settings-section'>"
-        "<h3>Aktuelle Firmware</h3>"
+        "<section class='settings-section' id='firmware'>"
+        "<div class='sys-section-head'><h3>Firmware Update</h3>" +
+        systemInfoButton("Firmware Update", firmwareInfo) +
+        "</div>"
         "<p><b>Build:</b> " +
         htmlEscape(
             firmwareBuildTimestamp()
@@ -11373,7 +11716,7 @@ static void sendFirmwareUpdatePage(
         htmlEscape(
             firmwareInstallSource()
         ) +
-        "</p></div>";
+        "</p>";
 
     String notice =
         server.arg("notice");
@@ -11387,8 +11730,7 @@ static void sendFirmwareUpdatePage(
         html +=
             "<div class='flash-notice'>"
             "<strong>Firmware erfolgreich hochgeladen und geprüft</strong>"
-            "<span class='muted'>Die neue Firmware liegt sicher im internen Update-Speicher. "
-            "Die aktuell laufende Firmware wurde noch nicht umgeschaltet.</span>"
+            "<span class='muted'>Bereit zur Installation.</span>"
             "</div>";
 
     } else if (
@@ -11415,56 +11757,33 @@ static void sendFirmwareUpdatePage(
             "</div>";
     }
 
-    html +=
-        "<div class='settings-section'>"
-        "<h3>1. Firmware auswählen</h3>"
-        "<p class='muted'>Wähle die kompilierte <code>.bin</code>-Datei. SensorForge prüft automatisch, "
-        "ob das Image vollständig ist, in den internen Update-Speicher passt und zu diesem Gerät gehört. "
-        "Die SD-Karte wird für ein WiFi-Update nicht benötigt.</p>";
-
     if (
         !blockedByRecording &&
         !readyExists
     ) {
         html +=
             "<form id='firmwareUploadForm' method='POST' action='/firmware_upload' enctype='multipart/form-data' "
-            "onsubmit=\"var b=document.getElementById('fwUploadButton');if(b){b.disabled=true;b.textContent='Upload läuft ...';}" 
+            "onsubmit=\"var b=document.getElementById('fwUploadButton');if(b){b.disabled=true;b.textContent='Upload läuft ...';}"
             "var s=document.getElementById('fwUploadState');if(s)s.hidden=false;\">"
-            "<input type='file' name='firmware' accept='.bin,application/octet-stream' required>"
-            "<br><button id='fwUploadButton' class='primary' type='submit'>UPLOAD &amp; PRÜFEN</button>"
+            "<label for='firmwareFile'><b>Firmware-Datei auswählen</b></label><br>"
+            "<input id='firmwareFile' type='file' name='firmware' accept='.bin,application/octet-stream' required>"
+            "<br><button id='fwUploadButton' class='primary' type='submit'>HOCHLADEN &amp; PRÜFEN</button>"
             "<span id='fwUploadState' class='muted' hidden> Bitte Verbindung und Stromversorgung nicht unterbrechen.</span>"
             "</form>";
 
     } else if (readyExists) {
         html +=
-            "<p><span class='status-pill ok'>UPLOAD BEREITS BEREIT</span></p>";
+            "<p><span class='status-pill ok'>FIRMWARE BEREIT</span></p>";
     }
 
-    html +=
-        "</div>";
-
     if (readyExists) {
-        html +=
-            "<div class='settings-section'>"
-            "<h3>2. Prüfung &amp; Installation</h3>";
-
         if (readyValid) {
             html +=
-                "<p><span class='status-pill ok'>IMAGE GÜLTIG</span></p>"
-                "<p>✓ ESP32 Application Image<br>"
-                "✓ Größe: <b>" +
+                "<p>✓ Image geprüft &nbsp; · &nbsp; Größe: <b>" +
                 webFirmwareFormatBytes(
                     webFirmwareReadyBytes
                 ) +
-                "</b><br>"
-                "✓ Interner Update-Speicher: <b>" +
-                webFirmwareFormatBytes(
-                    webFirmwareReadyPartition->size
-                ) +
-                "</b><br>"
-                "✓ Firmware ist mit diesem Gerät kompatibel</p>"
-                "<p class='muted'>Mit <b>JETZT INSTALLIEREN</b> wird die bereits geprüfte Firmware "
-                "für den nächsten Neustart aktiviert. Bis dahin bleibt die aktuell laufende Firmware unverändert.</p>";
+                "</b> &nbsp; · &nbsp; kompatibel mit diesem Gerät</p>";
 
             if (!blockedByRecording) {
                 html +=
@@ -11494,21 +11813,12 @@ static void sendFirmwareUpdatePage(
                 "<button type='submit'>Bereitgestellte Firmware verwerfen</button>"
                 "</form>";
         }
-
-        html +=
-            "</div>";
     }
 
     html +=
-        "<div class='settings-section'>"
-        "<h3>Sicherheitsablauf</h3>"
-        "<p class='muted'>WiFi-Upload → inaktive interne OTA-Partition → vollständige Image- und Geräteprüfung → "
-        "manuelle Bestätigung → neue Boot-Partition freigeben → kontrollierter Neustart.</p>"
-        "<p class='muted'>Bricht der Upload vorher ab, bleibt die bisherige Firmware als Boot-Firmware ausgewählt. "
-        "Auch eine fehlende oder defekte SD-Karte verhindert das WiFi-Update nicht.</p>"
-        "<p><b>Wichtig:</b> Ein technisch gültiges, aber fehlerhaft programmiertes Image kann nach dem Update trotzdem den WiFi-Zugang verlieren. "
-        "Remote daher nur Builds installieren, die vorher auf einem passenden zweiten Gerät getestet wurden.</p>"
-        "</div>";
+        "</section>";
+
+    appendSystemInfoUi(html);
 
     html +=
         htmlFooter();
@@ -11539,14 +11849,14 @@ static void sendFirmwareUpdatePage(
 }
 
 
-static void handleFirmwareUpdate()
+static void handleSystemPage()
 {
     // Entering the firmware page is maintenance activity. Establish the
     // configured automatic pause immediately instead of waiting for the first
     // browser-side heartbeat after the page has rendered.
     maybeAutoPauseRecordingForWebUi();
 
-    sendFirmwareUpdatePage(
+    sendSystemPage(
         200
     );
 }
@@ -11566,7 +11876,7 @@ static void handleFirmwareDiscard()
     }
 
     if (recorderIsOpen()) {
-        sendFirmwareUpdatePage(
+        sendSystemPage(
             409,
             "Recording active - staged firmware cannot be changed."
         );
@@ -11577,7 +11887,7 @@ static void handleFirmwareDiscard()
 
     server.sendHeader(
         "Location",
-        "/firmware_update"
+        "/system#firmware"
     );
 
     server.send(
@@ -11602,7 +11912,7 @@ static void handleFirmwareInstall()
     }
 
     if (recorderIsOpen()) {
-        sendFirmwareUpdatePage(
+        sendSystemPage(
             409,
             "Recording active - firmware installation is temporarily unavailable."
         );
@@ -11611,7 +11921,7 @@ static void handleFirmwareInstall()
 
     if (!webFirmwareReadyStateValid()) {
         webFirmwareClearReadyState();
-        sendFirmwareUpdatePage(
+        sendSystemPage(
             404,
             "No validated WiFi firmware image is staged."
         );
@@ -11632,7 +11942,7 @@ static void handleFirmwareInstall()
         g_recordingStartBlocked =
             previousRecordingBlock;
 
-        sendFirmwareUpdatePage(
+        sendSystemPage(
             500,
             "Could not persist the safe first-boot guard for the firmware update."
         );
@@ -11649,7 +11959,7 @@ static void handleFirmwareInstall()
         g_recordingStartBlocked =
             previousRecordingBlock;
 
-        sendFirmwareUpdatePage(
+        sendSystemPage(
             500,
             "Could not activate the validated firmware image: " +
             webFirmwareEspError(
@@ -12200,8 +12510,80 @@ struct RecordingEntry {
     bool hasSrt;
     bool hasAudio;
     bool motionHint;
+    bool motionHintRuleValid;
+    uint16_t motionHintChangeTenths;
+    uint8_t motionHintRequiredHits;
+    uint8_t motionHintWindowFrames;
     bool corrupt;
 };
+
+
+static bool parseMotionHintRuleFromName(
+    const String &lowerName,
+    uint16_t &changeTenths,
+    uint8_t &requiredHits,
+    uint8_t &windowFrames
+)
+{
+    changeTenths = 0;
+    requiredHits = 0;
+    windowFrames = 0;
+
+    const String suffix = "_motionhint.mkv";
+    if (!lowerName.endsWith(suffix))
+        return false;
+
+    int suffixPos =
+        (int)lowerName.length() -
+        (int)suffix.length();
+
+    int wPos = lowerName.lastIndexOf("_w", suffixPos - 1);
+    if (wPos < 0)
+        return false;
+
+    int hPos = lowerName.lastIndexOf("_h", wPos - 1);
+    if (hPos < 0)
+        return false;
+
+    int cPos = lowerName.lastIndexOf("_c", hPos - 1);
+
+    if (cPos < 0 || hPos <= cPos + 2 || wPos <= hPos + 2)
+        return false;
+
+    String changeText = lowerName.substring(cPos + 2, hPos);
+    String hitsText = lowerName.substring(hPos + 2, wPos);
+    String windowText = lowerName.substring(wPos + 2, suffixPos);
+
+    if (!changeText.length() || !hitsText.length() || !windowText.length())
+        return false;
+
+    for (size_t i = 0; i < changeText.length(); ++i)
+        if (!isDigit(changeText[i]))
+            return false;
+    for (size_t i = 0; i < hitsText.length(); ++i)
+        if (!isDigit(hitsText[i]))
+            return false;
+    for (size_t i = 0; i < windowText.length(); ++i)
+        if (!isDigit(windowText[i]))
+            return false;
+
+    long parsedChange = changeText.toInt();
+    long parsedHits = hitsText.toInt();
+    long parsedWindow = windowText.toInt();
+
+    if (
+        parsedChange < 1 || parsedChange > 1000 ||
+        parsedHits < 1 || parsedHits > 8 ||
+        parsedWindow < parsedHits || parsedWindow > 8
+    ) {
+        return false;
+    }
+
+    changeTenths = (uint16_t)parsedChange;
+    requiredHits = (uint8_t)parsedHits;
+    windowFrames = (uint8_t)parsedWindow;
+    return true;
+}
 
 
 static bool isDateFolderName(const String &name)
@@ -12698,6 +13080,21 @@ static void handleFilesDay()
                         isMkv &&
                         lowerName.endsWith("_motionhint.mkv");
 
+                    entry.motionHintRuleValid = false;
+                    entry.motionHintChangeTenths = 0;
+                    entry.motionHintRequiredHits = 0;
+                    entry.motionHintWindowFrames = 0;
+
+                    if (entry.motionHint) {
+                        entry.motionHintRuleValid =
+                            parseMotionHintRuleFromName(
+                                lowerName,
+                                entry.motionHintChangeTenths,
+                                entry.motionHintRequiredHits,
+                                entry.motionHintWindowFrames
+                            );
+                    }
+
                     entry.corrupt =
                         false;
 
@@ -12884,8 +13281,42 @@ static void handleFilesDay()
                 );
         }
 
+        String motionHintInfo;
+
+        if (entry.motionHint) {
+            if (entry.motionHintRuleValid) {
+                String changeText =
+                    String(
+                        (float)entry.motionHintChangeTenths / 10.0f,
+                        1
+                    );
+                changeText.replace(".", ",");
+
+                motionHintInfo =
+                    "Warum Bewegungsverdacht? In dieser Power-Shooter-Periode "
+                    "gab es mindestens " +
+                    String(entry.motionHintRequiredHits) +
+                    " Treffer im laufenden Prüffenster von maximal " +
+                    String(entry.motionHintWindowFrames) +
+                    " analysierten Bildern. Ein Treffer bedeutet mindestens " +
+                    changeText +
+                    " % Bildänderung. Breite globale Lichtwechsel werden "
+                    "dabei unterdrückt. Die empfindliche Shooter-Speicherschwelle "
+                    "entscheidet separat nur, welche Bilder gespeichert werden. "
+                    "Der Hinweis ist ein Verdacht und kein bestätigter Alarm.";
+            } else {
+                motionHintInfo =
+                    "Warum Bewegungsverdacht? In dieser Power-Shooter-Periode "
+                    "wurde wiederholte deutliche Bildaktivität erkannt. Diese "
+                    "Aufnahme stammt aus einer älteren Version, die die dabei "
+                    "verwendete Prozent- und N-aus-M-Regel noch nicht im "
+                    "Dateinamen gespeichert hat. Der Hinweis ist ein Verdacht "
+                    "und kein bestätigter Alarm.";
+            }
+        }
+
         String row;
-        row.reserve(640);
+        row.reserve(1100);
 
 
         row +=
@@ -12900,6 +13331,30 @@ static void handleFilesDay()
             htmlEscape(entry.fullPath) +
             "' onchange='updateDaySelection(this)'>"
             "</label>";
+
+
+        if (entry.motionHint) {
+            String escapedMotionHintInfo =
+                htmlEscape(motionHintInfo);
+
+            row +=
+                "<span class='mediaMotionHintRight'>"
+                "<span class='mediaMotionHint' title='" +
+                escapedMotionHintInfo +
+                "' aria-label='Bewegungsverdacht'>"
+                "<svg viewBox='0 0 24 24' aria-hidden='true'>"
+                "<path d='M12 3L2.8 20h18.4L12 3z'></path>"
+                "<path d='M12 8v5'></path>"
+                "<circle cx='12' cy='16.5' r='.7'></circle>"
+                "</svg><span>Bewegungsverdacht</span></span>"
+                "<button type='button' class='mediaMotionInfoBtn' "
+                "title='Warum wurde Bewegungsverdacht erkannt?' "
+                "aria-label='Information zum Bewegungsverdacht' "
+                "data-info='" +
+                escapedMotionHintInfo +
+                "' onclick='showMotionHintInfo(this,event)'>i</button>"
+                "</span>";
+        }
 
 
         if (entry.corrupt) {
@@ -12938,19 +13393,6 @@ static void handleFilesDay()
                 "<path d='M16 9c1.3 1.3 1.3 4.7 0 6'></path>"
                 "<path d='M18.5 6.5c3 3 3 8 0 11'></path>"
                 "</svg></span>";
-        }
-
-
-        if (entry.motionHint) {
-            row +=
-                "<span class='mediaMotionHint' "
-                "title='In dieser Power-Shooter-Periode wurde wiederholte deutliche Bildaktivität erkannt. Dies ist ein Hinweis, kein bestätigter Alarm.' "
-                "aria-label='Bewegungsverdacht'>"
-                "<svg viewBox='0 0 24 24' aria-hidden='true'>"
-                "<path d='M12 3L2.8 20h18.4L12 3z'></path>"
-                "<path d='M12 8v5'></path>"
-                "<circle cx='12' cy='16.5' r='.7'></circle>"
-                "</svg><span>Bewegungsverdacht</span></span>";
         }
 
 
@@ -14962,8 +15404,19 @@ static void handleFiles()
         "}"
         ".mediaAudioIcon{display:inline-flex;width:20px;height:20px;align-items:center;justify-content:center;margin-right:5px;vertical-align:middle;color:#1769aa;}"
         ".mediaAudioIcon svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;}"
-        ".mediaMotionHint{display:inline-flex;align-items:center;gap:4px;margin-right:7px;padding:2px 7px;border:1px solid #f0b429;border-radius:999px;background:#fff7e6;color:#8a4b08;font-size:11px;font-weight:700;line-height:1.35;vertical-align:middle;white-space:nowrap;}"
+        ".recording[data-media]::after{content:'';display:block;clear:both;}"
+        ".mediaMotionHintRight{float:right;display:inline-flex;align-items:center;gap:4px;margin:1px 0 1px 12px;white-space:nowrap;}"
+        ".mediaMotionHint{display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border:1px solid #f0b429;border-radius:999px;background:#fff7e6;color:#8a4b08;font-size:11px;font-weight:700;line-height:1.35;vertical-align:middle;white-space:nowrap;}"
         ".mediaMotionHint svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;}"
+        ".mediaMotionInfoBtn{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;min-width:20px;margin:0;padding:0;border:1px solid #d6a244;border-radius:50%;background:#fffaf0;color:#8a4b08;font-size:12px;font-weight:800;line-height:1;cursor:pointer;}"
+        ".mediaMotionInfoBtn:hover{background:#fff1cf;}"
+        ".motionHintInfoBackdrop{position:fixed;inset:0;z-index:1200;display:flex;align-items:center;justify-content:center;padding:18px;background:rgba(15,23,42,.38);}"
+        ".motionHintInfoBackdrop[hidden]{display:none;}"
+        ".motionHintInfoDialog{width:min(520px,100%);padding:18px;border-radius:10px;background:#fff;box-shadow:0 18px 50px rgba(15,23,42,.28);color:#1f2937;}"
+        ".motionHintInfoDialog h3{margin:0 0 10px 0;font-size:18px;}"
+        ".motionHintInfoDialog p{margin:0;line-height:1.5;}"
+        ".motionHintInfoActions{text-align:right;margin-top:16px;}"
+        ".motionHintInfoActions button{width:auto;margin:0;padding:7px 12px;}"
         ".recname{display:inline-block;min-width:150px;}"
         ".recmeta{display:inline-block;min-width:70px;color:#667085;}"
         ".recannotation{display:inline-flex;align-items:center;gap:5px;max-width:min(440px,38vw);margin-left:10px;padding:3px 8px;border:1px solid #cbd5e1;border-radius:999px;background:#f8fafc;color:#475467;font-size:12px;line-height:1.3;vertical-align:middle;white-space:nowrap;overflow:hidden;}"
@@ -14979,6 +15432,12 @@ static void handleFiles()
             ".recannotation{max-width:calc(100vw - 92px);margin:6px 0 2px 47px;}"
         "}"
         "</style>"
+        "<div id='motionHintInfoBackdrop' class='motionHintInfoBackdrop' hidden role='dialog' aria-modal='true' aria-labelledby='motionHintInfoTitle'>"
+        "<div class='motionHintInfoDialog'>"
+        "<h3 id='motionHintInfoTitle'>Bewegungsverdacht</h3>"
+        "<p id='motionHintInfoText'></p>"
+        "<div class='motionHintInfoActions'><button type='button' onclick='closeMotionHintInfo()'>Schließen</button></div>"
+        "</div></div>"
         "<script>"
         "const OPEN_DAY_KEY='recordings.openDay';"
         "const CACHE_PREFIX='recordings.v54.day.';"
@@ -14986,6 +15445,22 @@ static void handleFiles()
         "const BOOT_ID='" +
         String(webBootSessionId, HEX) +
         "';"
+
+        "function showMotionHintInfo(button,event){"
+            "if(event){event.preventDefault();event.stopPropagation();}"
+            "const backdrop=document.getElementById('motionHintInfoBackdrop');"
+            "const text=document.getElementById('motionHintInfoText');"
+            "if(!backdrop||!text)return false;"
+            "text.textContent=button&&button.dataset?button.dataset.info||'':'';"
+            "backdrop.hidden=false;"
+            "return false;"
+        "}"
+        "function closeMotionHintInfo(){"
+            "const backdrop=document.getElementById('motionHintInfoBackdrop');"
+            "if(backdrop)backdrop.hidden=true;"
+        "}"
+        "document.getElementById('motionHintInfoBackdrop').addEventListener('click',function(ev){if(ev.target===this)closeMotionHintInfo();});"
+        "document.addEventListener('keydown',function(ev){if(ev.key==='Escape')closeMotionHintInfo();});"
 
         "let sameBoot=false;"
         "try{"
@@ -18038,7 +18513,9 @@ void webConfigStart()
     server.on("/license_activate", HTTP_POST, handleLicenseActivate);
     server.on("/license_remove", HTTP_POST, handleLicenseRemove);
 
-    server.on("/firmware_update", HTTP_GET, handleFirmwareUpdate);
+    server.on("/system", HTTP_GET, handleSystemPage);
+    // Legacy URL retained for bookmarks; both render the consolidated System page.
+    server.on("/firmware_update", HTTP_GET, handleSystemPage);
     server.on(
         "/firmware_upload",
         HTTP_POST,
@@ -18070,9 +18547,20 @@ void webConfigStart()
 
     webPlayerRegisterRoutes(server);
 
-    server.on("/sysinfo", HTTP_GET, handleSysInfo);
-    server.on("/board", HTTP_GET, handleBoardInfo);
-    server.on("/psram", HTTP_GET, handlePSRAM);
+    // Legacy diagnostic URLs are kept only as redirects so System Info,
+    // Board Info, PSRAM and Firmware Update have one canonical UI page.
+    server.on("/sysinfo", HTTP_GET, []() {
+        server.sendHeader("Location", "/system#system-info");
+        server.send(302, "text/plain; charset=utf-8", "");
+    });
+    server.on("/board", HTTP_GET, []() {
+        server.sendHeader("Location", "/system#system-info");
+        server.send(302, "text/plain; charset=utf-8", "");
+    });
+    server.on("/psram", HTTP_GET, []() {
+        server.sendHeader("Location", "/system#psram");
+        server.send(302, "text/plain; charset=utf-8", "");
+    });
    
 
         server.onNotFound([]() {

@@ -18,9 +18,7 @@ Logdatei auf SD
 Webinterface zur Konfiguration
 SD-Status und SD-Formatierung
 AVI-Dateibrowser und Download
-System-Info
-Board-Info
-PSRAM-Test
+Systemseite mit System-/Board-Info, automatischem PSRAM-Schnelltest und Firmware-Update
 SD-Benchmark
 Reboot-Funktion
 

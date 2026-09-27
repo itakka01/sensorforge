@@ -1,5 +1,47 @@
 # SensorForge Changelog
 
+## v75 — 2026-09-27
+
+- Moved the orange **Bewegungsverdacht** badge to the right side of each recording row so time range, size and action controls remain visually aligned with rows that do not carry a hint.
+- Added a small information button next to the badge. Hover text and the click dialog explain in plain language why the hint was raised, that broad global-light jumps are suppressed, and that the hint is not a confirmed alarm.
+- New motion-hint Sparse-MKV filenames persist the actual hint rule used for that file as a compact internal marker (`c` = change threshold in tenths of a percent, `h` = required hits, `w` = analysis window), while keeping the existing `_motionhint.mkv` suffix for compatibility. The recording list therefore continues to show the correct historical rule even if the Shooter settings are changed later.
+- Existing v68–v74 `_motionhint.mkv` files remain fully compatible. Because those older filenames did not record their exact hint threshold/window, their information dialog gives a truthful general explanation instead of substituting the current configuration.
+- The additional rule metadata lives only in the in-RAM Shooter frame header and final filename. JPEG selection, the configured `shooter_min_change_pct`, Sparse-MKV media contents/timestamps, PSRAM flush behavior, encryption, storage recovery and normal Motion Recording are unchanged.
+
+## v74 — 2026-09-27
+
+- Added a compact **Speicherreserven** status to the consolidated System page so firmware growth and internal-RAM pressure remain visible when builds or boards change.
+- Firmware/App usage is calculated at runtime from the current sketch size and the actually running app partition. The UI uses conservative guidance: below 80% = OK, 80–90% = observe, from 90% = tight. This automatically follows a different app-partition size instead of hard-coding the current XIAO maximum.
+- Added current internal free heap plus the minimum internal free heap observed since boot using the ESP-IDF heap-capabilities API. The minimum is rated >=50 KiB = OK, 40–50 KiB = observe and <40 KiB = tight.
+- The threshold explanation lives behind the existing System-page info button so the main page remains compact. It explicitly notes that Arduino's compile-time `Global variables use ...` linker statistic cannot be reconstructed reliably at runtime and should still be checked briefly after builds.
+- No partition layout, memory allocation policy, recording, Shooter, PSRAM, storage, encryption, RTC/NTP or OTA behavior was changed.
+
+## v73 — 2026-09-27
+
+- Simplified the consolidated **System** page so explanatory text no longer dominates the main UI. RTC, PSRAM and firmware safety explanations are now available through small inline information buttons with one shared lightweight dialog.
+- Moved Board and Storage identity to the top of **Systeminformationen** and removed the separate Boardinformationen card. The legacy `/board` URL now redirects to `#system-info`.
+- The RTC auto-detection/NTP explanation is no longer permanently shown. The info dialog explains that RTC hardware is detected automatically, updated after successful NTP synchronization, and needs no RTC keys in `config.txt`; without RTC, normal system/NTP time is used.
+- The PSRAM section now shows only test state and measurements. Its info dialog states only that the quick test runs automatically when the System page opens; the obsolete wording about there being no separate test button was removed.
+- Combined firmware status, firmware-file selection, upload/validation and staged-image installation into one **Firmware Update** section. Removed the separate numbered `Firmware auswählen`, `Prüfung & Installation` and `Sicherheitsablauf` cards.
+- Shortened the firmware safety explanation and moved it behind the Firmware Update info button: upload and compatibility validation happen first; only explicit installation activates the staged image for the next reboot; an interrupted upload leaves the existing firmware active.
+- No RTC/NTP behavior, PSRAM test algorithm, OTA validation/install logic, recording, Shooter, storage, encryption or transport behavior was changed.
+
+## v72 — 2026-09-27
+
+- Consolidated the former **System Info**, **Board Info**, **PSRAM Test** and **Firmware Update** menu entries into one canonical **System** page. The existing SD Maintenance, Log Viewer, License, Transport, Reboot and Shutdown entries remain separate.
+- The System page now shows system resources/RTC diagnostics, board/storage information, the PSRAM result and the complete existing WiFi firmware update workflow on one page. The firmware upload/validation/install safety path itself is unchanged.
+- The former 1 MiB PSRAM write/read test now runs automatically when the System page is opened. The page displays only the result, elapsed time and free-PSRAM values; no separate start button or menu entry is needed.
+- For safety, the automatic PSRAM allocation test is skipped while a recorder is still open; the System page remains available and reports that the test was not executed during the active recording.
+- Legacy `/sysinfo`, `/board` and `/psram` URLs redirect to the matching section on `/system`; `/firmware_update` remains accepted as a compatibility alias for the consolidated page.
+- No recording, Shooter, Sparse-MKV, storage, encryption, RTC/NTP, transport or firmware OTA validation/install logic was changed.
+
+## v71 — 2026-09-27
+
+- Removed the redundant visible `Zeit:` / `Time:` prefix from the common WebConfig header clock. The header now starts directly with `DD.MM.YYYY · HH:MM:SS`.
+- The displayed value remains the ESP32-S3 module system clock: `/ui_status` formats `time(nullptr)` on the device with the configured timezone. The browser does not substitute its own wall-clock time; it only advances the last device-supplied timestamp between the existing 20-second status synchronizations.
+- Clarified the clock tooltip to `Aktuelle Systemzeit des ESP32-S3-Moduls` / `Current ESP32-S3 module system time`.
+- No RTC/NTP synchronization policy, timezone handling, status polling cadence, recording, Shooter, storage, encryption or transport behavior was changed.
+
 ## v70 — 2026-09-27
 
 - Removed the duplicate Transport mode parameter block and duplicate activate/cancel controls from the general Configuration page. `transport_check_seconds`, `transport_light_confirm_seconds`, `transport_install_delay_seconds`, `transport_max_duration_seconds` and `transport_black_threshold` are now user-editable only on the dedicated **Transportsicherung** page.

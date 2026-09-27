@@ -33,7 +33,7 @@ static const UiTextEntry UI_TEXTS[] = {
     {"AUFNAHME: AN", "RECORDING: ON"}, // UI_RECORDING_SWITCH_ON
     {"AUFNAHME: AUS", "RECORDING: OFF"}, // UI_RECORDING_SWITCH_OFF
     {"AUFNAHME: ...", "RECORDING: ..."}, // UI_RECORDING_SWITCH_PENDING
-    {"Aktuelle Systemzeit des Moduls", "Current module system time"}, // UI_MODULE_TIME_TITLE
+    {"Aktuelle Systemzeit des ESP32-S3-Moduls", "Current ESP32-S3 module system time"}, // UI_MODULE_TIME_TITLE
     {"Zeit", "Time"}, // UI_TIME
     {"Automatische Pause beim Öffnen des Webinterfaces ist aktiv", "Automatic pause when opening the web interface is enabled"}, // UI_AUTO_PAUSE_ENABLED
     {"Automatische Pause beim Öffnen des Webinterfaces ist deaktiviert", "Automatic pause when opening the web interface is disabled"}, // UI_AUTO_PAUSE_DISABLED

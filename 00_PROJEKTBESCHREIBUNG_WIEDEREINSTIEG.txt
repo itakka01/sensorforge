@@ -1,11 +1,102 @@
 SENSORFORGE / ESP32-S3 CAMERA (XIAO + FREENOVE)
 PROJEKTBESCHREIBUNG, RELEASESTAND UND WIEDEREINSTIEGSPROMPT
 Stand: 2026-09-27
-Dokumentrevision: v70 / v67-Stabilitaetsbasis + konfigurierbarer Power-Shooter-Bewegungsverdacht + bereinigte Transport-/Dashboard-UI + offene Langzeitqualifikation
-Aktueller Entwicklungs-/Arbeits-Release: v70 (Produktionsqualifikation fuer XIAO-Langzeitrecording noch offen)
+Dokumentrevision: v75 / v67-Stabilitaetsbasis + konfigurierbarer Power-Shooter-Bewegungsverdacht + aufnahmebezogene Verdachtserklaerung + bereinigte System-/Transport-UI + offene Langzeitqualifikation
+Aktueller Entwicklungs-/Arbeits-Release: v75 (Produktionsqualifikation fuer XIAO-Langzeitrecording noch offen)
 Produktname: SensorForge
 Plattformname: Fabric Node
 Core-Version im Branding: 7.1.0
+
+
+======================================================================
+V75 - BEWEGUNGSVERDACHT RECHTS / AUFNAHMEBEZOGENE INFO
+======================================================================
+
+- Der orange Hinweis `Bewegungsverdacht` steht in der Aufnahmeliste am rechten
+  Rand der jeweiligen Zeile, damit Zeitbereich, Groesse und Bedienfelder links
+  auch bei nicht markierten Dateien sauber untereinander ausgerichtet bleiben.
+- Neben dem Badge gibt es einen kleinen Info-Button; Desktop-Hover zeigt
+  denselben Erklaertext. Die Erklaerung nennt bei neuen Dateien die konkrete
+  Verdachtsregel, z.B. 3 Treffer im laufenden Fenster von maximal 4 analysierten
+  Bildern bei jeweils mindestens 2,0% Bildaenderung. Sie weist ausserdem darauf
+  hin, dass breite globale Lichtwechsel unterdrueckt werden und dass es sich um
+  einen Verdacht, nicht um einen bestaetigten Alarm handelt.
+- Neue Motion-Hint-Sparse-MKVs speichern die beim Ausloesen verwendete Regel als
+  kompakten Dateinamensmarker vor dem weiterhin vorhandenen Suffix
+  `_motionhint.mkv`: `c` = Aenderungsschwelle in Zehntelprozent, `h` = benoetigte
+  Treffer, `w` = Fenstergroesse. Dadurch bleibt die Erklaerung historisch korrekt,
+  auch wenn die Shooter-Konfiguration spaeter geaendert wird.
+- Alte v68..v74 `_motionhint.mkv` bleiben voll kompatibel. Da deren Dateinamen
+  die damalige Regel nicht enthalten, zeigt die Info bewusst nur eine allgemeine
+  Erklaerung und setzt nicht faelschlich die aktuelle Konfiguration ein.
+- Keine Aenderung an `shooter_min_change_pct`, Frame-Auswahl, Sparse-MKV-Inhalt,
+  Bildzeitstempeln, PSRAM-Flush, Encryption, Storage-Recovery oder normalem
+  Motion Recording. Die zusaetzlichen Regelwerte leben nur im RAM-Header des
+  Shooter-Puffers und im finalen Dateinamen.
+
+SYSTEM / SPEICHERRESERVEN, v74:
+
+- Die Systemseite zeigt die laufende Firmwaregroesse relativ zur tatsaechlich
+  aktiven App-Partition. Orientierung: <80% OK, 80..90% beobachten, >=90% knapp.
+- Zusaetzlich werden aktueller interner Heap und Minimum seit Boot angezeigt.
+  Orientierung fuer das Minimum: >=50 KiB OK, 40..50 KiB beobachten, <40 KiB knapp.
+- Diese Werte sind Diagnose-/Orientierungshilfen und aendern keine Laufzeitlogik.
+- Die Arduino-Linkerzeile `Global variables use ...` bleibt eine Build-Ausgabe und
+  kann auf dem laufenden Board nicht verlaesslich rekonstruiert werden.
+
+======================================================================
+V73 - SYSTEMSEITE VEREINFACHT / INFO-DIALOGE
+======================================================================
+
+- Hauptziel: weniger Dauertext und weniger Karten auf der Systemseite. Erklaerungen
+  werden bei Bedarf ueber kleine Info-Buttons eingeblendet.
+- Boardtyp und Storage-Anbindung stehen nun direkt oben in den
+  Systeminformationen; der separate Boardinformationen-Block entfaellt.
+- Der RTC-Hinweis zur automatischen Erkennung, NTP-Aktualisierung und fehlenden
+  Notwendigkeit eigener RTC-Config-Keys liegt hinter einem Info-Button.
+- Der PSRAM-Schnelltest zeigt nur noch Zustand/Messwerte; die Information, dass
+  er beim Oeffnen der Systemseite automatisch laeuft, liegt hinter einem
+  Info-Button. Der alte Hinweis auf einen entfallenen Startknopf wurde entfernt.
+- Firmwarestatus, Dateiauswahl, Upload/Pruefung und Installation sind in einem
+  einzigen Abschnitt Firmware Update zusammengefasst. Der Sicherheitsablauf ist
+  stark gekuerzt und nur noch ueber den Info-Button sichtbar.
+- Keine Aenderung an RTC/NTP, PSRAM-Testalgorithmus, OTA-Pruefung/Installation,
+  Recording, Shooter, Storage, Encryption oder Transport.
+
+======================================================================
+V72 - SYSTEMSEITE KONSOLIDIERT / PSRAM-SCHNELLTEST AUTOMATISCH
+======================================================================
+
+- Die bisherigen Menuepunkte System Info, Board Info, PSRAM Test und Firmware
+  Update sind in einer gemeinsamen Seite **System** zusammengefuehrt.
+- Die Seite zeigt Systemressourcen/RTC, Board-/Storage-Informationen, den
+  PSRAM-Schnelltest und den bestehenden WiFi-Firmware-Updatepfad in dieser
+  Reihenfolge. SD Maintenance, Log Viewer, Lizenz, Transportsicherung, Reboot
+  und Shutdown bleiben eigenstaendige System-Menuepunkte.
+- Der bestehende 1-MiB-PSRAM-Mustertest wird beim Oeffnen der Systemseite
+  automatisch ausgefuehrt; angezeigt werden Ergebnis, Laufzeit sowie freies
+  PSRAM vor/nach dem Test. Ein eigener PSRAM-Menuepunkt/Teststart entfaellt.
+- Ist beim Rendern der Seite noch ein Recorder offen, wird der PSRAM-Test aus
+  Sicherheitsgruenden nicht parallel ausgefuehrt und dies auf der Seite
+  entsprechend angezeigt.
+- Alte URLs /sysinfo, /board und /psram leiten auf die passende Sektion der
+  Systemseite weiter; /firmware_update bleibt als Kompatibilitaetsalias erhalten.
+- Firmware-OTA-Pruefung/Installation, Recording, Shooter, Storage, Encryption,
+  RTC/NTP und Transportlogik bleiben unveraendert.
+
+======================================================================
+V71 - HEADERZEIT ALS ESP32-S3-SYSTEMZEIT KLARER DARGESTELLT
+======================================================================
+
+- Das redundante sichtbare Praefix `Zeit:` / `Time:` im gemeinsamen Header wurde
+  entfernt. Angezeigt wird direkt `DD.MM.YYYY · HH:MM:SS`.
+- Die Quelle bleibt ausdruecklich die ESP32-S3-Systemzeit: `/ui_status` erzeugt
+  `clock` aus `time(nullptr)` auf dem Geraet und formatiert sie mit der
+  konfigurierten Zeitzone. Der Browser ersetzt diesen Wert NICHT durch seine
+  eigene lokale Uhr. Zwischen den bestehenden 20-s-Statusabgleichen wird nur
+  der zuletzt vom Board gelieferte Zeitwert sekundenweise weitergezaehlt.
+- Der Tooltip benennt die Anzeige nun explizit als aktuelle Systemzeit des
+  ESP32-S3-Moduls. RTC/NTP- und Zeitzonenlogik bleiben unveraendert.
 
 ======================================================================
 V70 - TRANSPORT-EINSTELLUNGEN ZENTRALISIERT / DASHBOARD BEREINIGT

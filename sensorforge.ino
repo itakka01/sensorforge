@@ -9786,6 +9786,9 @@ struct ShooterBufferedFrameHeader {
     uint32_t jpegBytes;
     uint16_t width;
     uint16_t height;
+    uint16_t motionHintChangeTenths;
+    uint8_t motionHintRequiredHits;
+    uint8_t motionHintWindowFrames;
     uint8_t flags;
 };
 
@@ -10167,6 +10170,9 @@ static bool continuousShooterBuildMkvPath(
     int64_t firstScheduledWallUs,
     uint64_t firstCaptureMonotonicUs,
     bool motionHint,
+    uint16_t motionHintChangeTenths,
+    uint8_t motionHintRequiredHits,
+    uint8_t motionHintWindowFrames,
     String &finalPath,
     String &tempPath
 )
@@ -10176,6 +10182,14 @@ static bool continuousShooterBuildMkvPath(
 
     String folder;
     String filename;
+
+    bool motionHintRuleValid =
+        motionHint &&
+        motionHintChangeTenths >= 1U &&
+        motionHintChangeTenths <= 1000U &&
+        motionHintRequiredHits >= 1U &&
+        motionHintWindowFrames >= motionHintRequiredHits &&
+        motionHintWindowFrames <= 8U;
 
     if (firstScheduledWallUs >= (int64_t)1609459200 * 1000000LL) {
         time_t slotSeconds = (time_t)(firstScheduledWallUs / 1000000LL);
@@ -10187,7 +10201,7 @@ static bool continuousShooterBuildMkvPath(
 
         char folderBuffer[24];
         char timeBuffer[16];
-        char fileBuffer[48];
+        char fileBuffer[80];
 
         if (
             strftime(folderBuffer, sizeof(folderBuffer), "/%Y%m%d", &localTime) == 0 ||
@@ -10196,28 +10210,56 @@ static bool continuousShooterBuildMkvPath(
             return false;
         }
 
-        snprintf(
-            fileBuffer,
-            sizeof(fileBuffer),
-            motionHint
-                ? "%s_%03u_shooter_motionhint.mkv"
-                : "%s_%03u_shooter.mkv",
-            timeBuffer,
-            (unsigned)slotMs
-        );
+        if (motionHintRuleValid) {
+            snprintf(
+                fileBuffer,
+                sizeof(fileBuffer),
+                "%s_%03u_shooter_c%u_h%u_w%u_motionhint.mkv",
+                timeBuffer,
+                (unsigned)slotMs,
+                (unsigned)motionHintChangeTenths,
+                (unsigned)motionHintRequiredHits,
+                (unsigned)motionHintWindowFrames
+            );
+        } else {
+            snprintf(
+                fileBuffer,
+                sizeof(fileBuffer),
+                motionHint
+                    ? "%s_%03u_shooter_motionhint.mkv"
+                    : "%s_%03u_shooter.mkv",
+                timeBuffer,
+                (unsigned)slotMs
+            );
+        }
+
         folder = String(folderBuffer);
         filename = String(fileBuffer);
     } else {
         folder = "/fallback";
-        char fileBuffer[56];
-        snprintf(
-            fileBuffer,
-            sizeof(fileBuffer),
-            motionHint
-                ? "shooter_%llu_motionhint.mkv"
-                : "shooter_%llu.mkv",
-            (unsigned long long)(firstCaptureMonotonicUs / 1000ULL)
-        );
+        char fileBuffer[88];
+
+        if (motionHintRuleValid) {
+            snprintf(
+                fileBuffer,
+                sizeof(fileBuffer),
+                "shooter_%llu_c%u_h%u_w%u_motionhint.mkv",
+                (unsigned long long)(firstCaptureMonotonicUs / 1000ULL),
+                (unsigned)motionHintChangeTenths,
+                (unsigned)motionHintRequiredHits,
+                (unsigned)motionHintWindowFrames
+            );
+        } else {
+            snprintf(
+                fileBuffer,
+                sizeof(fileBuffer),
+                motionHint
+                    ? "shooter_%llu_motionhint.mkv"
+                    : "shooter_%llu.mkv",
+                (unsigned long long)(firstCaptureMonotonicUs / 1000ULL)
+            );
+        }
+
         filename = String(fileBuffer);
     }
 
@@ -10348,7 +10390,10 @@ static bool continuousShooterWriteSparseMkvSingle(
     size_t jpegBytes,
     uint16_t width,
     uint16_t height,
-    bool motionHint
+    bool motionHint,
+    uint16_t motionHintChangeTenths,
+    uint8_t motionHintRequiredHits,
+    uint8_t motionHintWindowFrames
 )
 {
     if (!jpeg || jpegBytes == 0 || width == 0 || height == 0)
@@ -10371,6 +10416,9 @@ static bool continuousShooterWriteSparseMkvSingle(
             scheduledWallUs,
             captureMonotonicUs,
             motionHint,
+            motionHintChangeTenths,
+            motionHintRequiredHits,
+            motionHintWindowFrames,
             finalPath,
             tempPath
         )) {
@@ -10452,6 +10500,9 @@ static bool continuousShooterWriteSparseMkvFromBuffer(
     }
 
     bool batchMotionHint = false;
+    uint16_t batchMotionHintChangeTenths = 0;
+    uint8_t batchMotionHintRequiredHits = 0;
+    uint8_t batchMotionHintWindowFrames = 0;
     size_t scanOffset = 0;
 
     while (
@@ -10478,8 +10529,25 @@ static bool continuousShooterWriteSparseMkvFromBuffer(
             return false;
         }
 
-        if (header.flags & SHOOTER_BUFFER_FLAG_MOTION_HINT)
+        if (header.flags & SHOOTER_BUFFER_FLAG_MOTION_HINT) {
             batchMotionHint = true;
+
+            if (
+                batchMotionHintChangeTenths == 0 &&
+                header.motionHintChangeTenths >= 1U &&
+                header.motionHintChangeTenths <= 1000U &&
+                header.motionHintRequiredHits >= 1U &&
+                header.motionHintWindowFrames >= header.motionHintRequiredHits &&
+                header.motionHintWindowFrames <= 8U
+            ) {
+                batchMotionHintChangeTenths =
+                    header.motionHintChangeTenths;
+                batchMotionHintRequiredHits =
+                    header.motionHintRequiredHits;
+                batchMotionHintWindowFrames =
+                    header.motionHintWindowFrames;
+            }
+        }
 
         scanOffset += recordBytes;
     }
@@ -10496,6 +10564,9 @@ static bool continuousShooterWriteSparseMkvFromBuffer(
             firstHeader.scheduledWallUs,
             firstHeader.captureMonotonicUs,
             batchMotionHint,
+            batchMotionHintChangeTenths,
+            batchMotionHintRequiredHits,
+            batchMotionHintWindowFrames,
             finalPath,
             tempPath
         )) {
@@ -11043,7 +11114,10 @@ static bool continuousShooterQueueJpeg(
     size_t jpegBytes,
     uint16_t width,
     uint16_t height,
-    bool motionHint
+    bool motionHint,
+    uint16_t motionHintChangeTenths,
+    uint8_t motionHintRequiredHits,
+    uint8_t motionHintWindowFrames
 )
 {
     if (cfg_shooter_flush_seconds <= 0) {
@@ -11055,7 +11129,10 @@ static bool continuousShooterQueueJpeg(
                 jpegBytes,
                 width,
                 height,
-                motionHint
+                motionHint,
+                motionHintChangeTenths,
+                motionHintRequiredHits,
+                motionHintWindowFrames
             );
         }
         return continuousShooterWriteJpeg(
@@ -11075,7 +11152,10 @@ static bool continuousShooterQueueJpeg(
                 jpegBytes,
                 width,
                 height,
-                motionHint
+                motionHint,
+                motionHintChangeTenths,
+                motionHintRequiredHits,
+                motionHintWindowFrames
             );
         }
         return continuousShooterWriteJpeg(
@@ -11092,6 +11172,12 @@ static bool continuousShooterQueueJpeg(
     header.jpegBytes = (uint32_t)jpegBytes;
     header.width = width;
     header.height = height;
+    header.motionHintChangeTenths =
+        motionHint ? motionHintChangeTenths : 0U;
+    header.motionHintRequiredHits =
+        motionHint ? motionHintRequiredHits : 0U;
+    header.motionHintWindowFrames =
+        motionHint ? motionHintWindowFrames : 0U;
     header.flags =
         motionHint
         ? SHOOTER_BUFFER_FLAG_MOTION_HINT
@@ -11111,7 +11197,10 @@ static bool continuousShooterQueueJpeg(
                 jpegBytes,
                 width,
                 height,
-                motionHint
+                motionHint,
+                motionHintChangeTenths,
+                motionHintRequiredHits,
+                motionHintWindowFrames
             );
         }
         return continuousShooterWriteJpeg(
@@ -11510,6 +11599,33 @@ static bool continuousShooterCapture(
             changedPct
         );
 
+    uint16_t motionHintChangeTenths = 0;
+    uint8_t motionHintRequiredHits = 0;
+    uint8_t motionHintWindowFrames = 0;
+
+    if (motionHint) {
+        int changeTenths =
+            (int)(cfg_shooter_motion_hint_change_pct * 10.0f + 0.5f);
+
+        motionHintChangeTenths = (uint16_t)constrain(
+            changeTenths,
+            1,
+            1000
+        );
+
+        motionHintWindowFrames = (uint8_t)constrain(
+            cfg_shooter_motion_hint_window_frames,
+            1,
+            8
+        );
+
+        motionHintRequiredHits = (uint8_t)constrain(
+            cfg_shooter_motion_hint_required_hits,
+            1,
+            (int)motionHintWindowFrames
+        );
+    }
+
     bool tooSimilar =
         analyzed &&
         !forceSave &&
@@ -11553,7 +11669,10 @@ static bool continuousShooterCapture(
         frame->len,
         (uint16_t)frame->width,
         (uint16_t)frame->height,
-        motionHint
+        motionHint,
+        motionHintChangeTenths,
+        motionHintRequiredHits,
+        motionHintWindowFrames
     );
 
     size_t acceptedBytes = frame->len;
