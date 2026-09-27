@@ -702,6 +702,9 @@ static void handleShooterStatus()
         "\",\"interval_ms\":" + String(cfg_shooter_interval_ms) +
         ",\"dark_mean_min\":" + String(cfg_shooter_dark_mean_min) +
         ",\"min_change_pct\":" + String(cfg_shooter_min_change_pct, 1) +
+        ",\"motion_hint_change_pct\":" + String(cfg_shooter_motion_hint_change_pct, 1) +
+        ",\"motion_hint_required_hits\":" + String(cfg_shooter_motion_hint_required_hits) +
+        ",\"motion_hint_window_frames\":" + String(cfg_shooter_motion_hint_window_frames) +
         ",\"force_save_seconds\":" + String(cfg_shooter_force_save_seconds) +
         ",\"flush_seconds\":" + String(cfg_shooter_flush_seconds) +
         ",\"buffered_frames\":" + String(continuousShooterBufferedFrameCount()) +

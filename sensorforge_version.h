@@ -20,8 +20,8 @@
 // The same release tag is written to the firmware boot log and shown in
 // WebConfig, so a running device can be mapped back to the exact Git tag.
 
-#define SENSORFORGE_RELEASE_NUMBER 67
-#define SENSORFORGE_RELEASE_TAG "v67"
-#define SENSORFORGE_RELEASE_DATE "2026-09-26"
+#define SENSORFORGE_RELEASE_NUMBER 70
+#define SENSORFORGE_RELEASE_TAG "v70"
+#define SENSORFORGE_RELEASE_DATE "2026-09-27"
 #define SENSORFORGE_RELEASE_SUMMARY \
-    "Restore the qualified XIAO 20 MHz SD clock while retaining the 4 fps and reduced-WebConfig-load stability profile."
+    "Centralize transport settings on the Transport protection page and simplify normal dashboard arming status."

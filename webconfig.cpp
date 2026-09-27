@@ -2298,17 +2298,24 @@ static void handleRoot()
             tr(UI_ARM_CHECK_CONFIG);
     }
 
+    bool armBannerImportant =
+        armState == RECORDING_NOT_BEFORE_WAITING ||
+        armState == RECORDING_NOT_BEFORE_CLOCK_INVALID ||
+        armState == RECORDING_NOT_BEFORE_INVALID;
+
     html +=
-        "<section id='armingBanner' class='settings-section' style='text-align:center;border:2px solid " +
+        "<section id='armingBanner' class='settings-section' style='text-align:center;border:1px solid " +
         armBannerBorder +
         ";background:" +
         armBannerBackground +
-        ";padding:22px'>"
-        "<div id='armingTitle' style='font-size:1.7rem;font-weight:900;letter-spacing:.04em'>" +
+        ";padding:10px 14px" +
+        String(armBannerImportant ? "" : ";display:none") +
+        "'>"
+        "<div id='armingTitle' style='font-size:1rem;font-weight:700;letter-spacing:.02em'>" +
         htmlEscape(armTitle) +
-        "</div><div id='armingDeadline' style='font-size:1.15rem;font-weight:700;margin-top:8px'>" +
+        "</div><div id='armingDeadline' class='muted' style='font-size:.92rem;margin-top:3px'>" +
         htmlEscape(armDeadlineLine) +
-        "</div><div id='armingCountdown' style='font-size:1.45rem;font-weight:800;margin-top:8px'>" +
+        "</div><div id='armingCountdown' style='font-size:1rem;font-weight:700;margin-top:3px'>" +
         htmlEscape(armCountdownLine) +
         "</div></section>";
 
@@ -2839,25 +2846,22 @@ static void handleRoot()
         "function renderArm(){"
             "if(!armBanner)return;"
             "if(armState==='waiting'){"
-                "armBanner.style.borderColor='#d97706';armBanner.style.background='#fff7e8';"
+                "armBanner.style.display='';armBanner.style.borderColor='#d97706';armBanner.style.background='#fff7e8';"
                 "if(armTitleEl)armTitleEl.textContent=i.cameraArming;"
                 "if(armDeadlineEl)armDeadlineEl.textContent=i.armOn+' '+armDeadlineText;"
                 "if(armCountdownEl)armCountdownEl.textContent=i.armIn+' '+armDuration(armRemaining);"
             "}else if(armState==='clock_invalid'){"
-                "armBanner.style.borderColor='#b42318';armBanner.style.background='#fff1f0';"
+                "armBanner.style.display='';armBanner.style.borderColor='#b42318';armBanner.style.background='#fff1f0';"
                 "if(armTitleEl)armTitleEl.textContent=i.cameraNotArmed;"
                 "if(armDeadlineEl)armDeadlineEl.textContent=i.armScheduled+': '+armDeadlineText;"
                 "if(armCountdownEl)armCountdownEl.textContent=i.armClockInvalid;"
             "}else if(armState==='invalid'){"
-                "armBanner.style.borderColor='#b42318';armBanner.style.background='#fff1f0';"
+                "armBanner.style.display='';armBanner.style.borderColor='#b42318';armBanner.style.background='#fff1f0';"
                 "if(armTitleEl)armTitleEl.textContent=i.cameraNotArmed;"
                 "if(armDeadlineEl)armDeadlineEl.textContent=i.armConfigInvalid;"
                 "if(armCountdownEl)armCountdownEl.textContent=i.armCheckConfig;"
             "}else{"
-                "armBanner.style.borderColor='#087a00';armBanner.style.background='#eef9f0';"
-                "if(armTitleEl)armTitleEl.textContent=i.cameraArmed;"
-                "if(armDeadlineEl)armDeadlineEl.textContent=armState==='reached'?(i.armReleaseTime+': '+armDeadlineText):i.armNoLock;"
-                "if(armCountdownEl)armCountdownEl.textContent=i.armEnabled;"
+                "armBanner.style.display='none';"
             "}"
         "}"
         "function renderSafety(){"
@@ -4216,6 +4220,23 @@ static void handleConfig()
         "shooter_flush_seconds: <input name='shooter_flush_seconds' type='number' min='0' max='3600' step='1' value='" +
         String(cfg_shooter_flush_seconds) +
         "' style='width:100px'> s <small>(0 = kein zeitbasierter Flush; Buffer-full/Shutdown/Reboot flushen weiterhin)</small><br>"
+        "<details style='margin-top:12px;padding:10px;border:1px solid #c7d8ee;border-radius:7px;background:#fff'>"
+        "<summary style='cursor:pointer;font-weight:700'>Erweiterte Shooter-Einstellungen</summary>"
+        "<div style='margin-top:10px'>"
+        "<b>Bewegungsverdacht in der Aufnahmeliste</b><br>"
+        "<small class='muted'>Diese Werte beeinflussen nur den orangefarbenen Hinweis Bewegungsverdacht. Sie verändern weder den eigentlichen Shooter-Speicherfilter noch Aufnahme, Sparse-MKV oder Flush-Verhalten.</small><br><br>"
+        "Verdachtsschwelle: <input name='shooter_motion_hint_change_pct' type='number' min='0.1' max='100' step='0.1' value='" +
+        String(cfg_shooter_motion_hint_change_pct, 1) +
+        "' style='width:90px'> %<br>"
+        "Treffer erforderlich: <input id='cfgShooterMotionHintHits' name='shooter_motion_hint_required_hits' type='number' min='1' max='8' step='1' value='" +
+        String(cfg_shooter_motion_hint_required_hits) +
+        "' style='width:70px'> von "
+        "<input id='cfgShooterMotionHintWindow' name='shooter_motion_hint_window_frames' type='number' min='1' max='8' step='1' value='" +
+        String(cfg_shooter_motion_hint_window_frames) +
+        "' style='width:70px'> Prüfbildern "
+        "<small id='cfgShooterMotionHintHint' class='muted'></small><br>"
+        "<small class='muted'>Standard: 2,0 % und 3 von 4. Die Verdachtsschwelle muss mindestens so hoch wie der normale Shooter-Speicherfilter sein. Maximal 8 Prüfbilder; Treffer müssen kleiner/gleich dem Fenster sein. Große globale Lichtwechsel werden weiterhin separat unterdrückt.</small>"
+        "</div></details>"
         "<small class='muted'>Die tatsächliche Zahl gespeicherter Bilder kann durch Darkness-/Change-Filter niedriger sein. PSRAM-Puffergröße wird automatisch gewählt.</small>"
         "<script>(function(){"
         "const i=document.getElementById('cfgShooterInterval');const h=document.getElementById('cfgShooterRateHint');"
@@ -4224,6 +4245,9 @@ static void handleConfig()
         "const d=document.getElementById('cfgShooterDark');const v=document.getElementById('cfgShooterDarkValue');const sw=document.getElementById('cfgShooterDarkSwatch');"
         "function ud(){let n=Number(d&&d.value);if(!Number.isFinite(n))n=0;n=Math.max(0,Math.min(255,Math.round(n)));if(v)v.textContent=String(n);if(sw)sw.style.backgroundColor='rgb('+n+','+n+','+n+')';}"
         "if(d){d.addEventListener('input',ud);ud();}"
+        "const mh=document.getElementById('cfgShooterMotionHintHits');const mw=document.getElementById('cfgShooterMotionHintWindow');const mt=document.getElementById('cfgShooterMotionHintHint');"
+        "function um(){if(!mh||!mw||!mt)return;const h=Math.round(Number(mh.value));const w=Math.round(Number(mw.value));mt.textContent=(Number.isFinite(h)&&Number.isFinite(w))?('= '+h+' aus '+w+(h>w?' (ungültig)':'')):'';mt.style.color=h>w?'#a00000':'';}"
+        "if(mh)mh.addEventListener('input',um);if(mw)mw.addEventListener('input',um);um();"
         "})();</script>"
         "</div>";
 
@@ -4421,50 +4445,6 @@ static void handleConfig()
     html += "</select> <small>(vollständige Wirkung ab dem nächsten Neustart)</small><br>";
 
 
-    html += "</div><div class='settings-section'><h3>Transportmodus</h3>";
-
-    html +=
-        "<p class='muted'>Vor dem Transport Kamera vollständig schwarz abkleben. "
-        "Im aktiven Transportmodus wecken Radar/PIR das Gerät nicht; es prüft nur per Timer, "
-        "ob die Abdeckung noch vorhanden ist. Nach bestätigtem Licht folgt die Installations-Wartezeit.</p>";
-
-    html += "Status: <span class='status-pill " +
-            String(cfg_transport_mode ? "warn" : "ok") +
-            "'>" +
-            String(cfg_transport_mode ? "AKTIV" : "AUS") +
-            "</span><br><br>";
-
-    html += "transport_check_seconds: <input name='transport_check_seconds' type='number' "
-            "min='10' max='3600' value='" +
-            String(cfg_transport_check_seconds) +
-            "'> <small>(Abstand der Schwarzbild-Prüfungen, Standard 120 s)</small><br>";
-
-    html += "transport_light_confirm_seconds: <input name='transport_light_confirm_seconds' type='number' "
-            "min='0' max='120' value='" +
-            String(cfg_transport_light_confirm_seconds) +
-            "'> <small>(Licht muss über diesen Zeitraum mehrfach bestätigt werden)</small><br>";
-
-    html += "transport_install_delay_seconds: <input name='transport_install_delay_seconds' type='number' "
-            "min='0' max='86400' value='" +
-            String(cfg_transport_install_delay_seconds) +
-            "'> <small>(Zeit für Montage und Verlassen des Bildbereichs; Standard 300 s)</small><br>";
-
-    html += "transport_max_duration_seconds: <input name='transport_max_duration_seconds' type='number' "
-            "min='3600' max='604800' value='" +
-            String(cfg_transport_max_duration_seconds) +
-            "'> <small>(harte Sicherheitsgrenze; Standard 86400 s = 24 h)</small><br>";
-
-    html += "transport_black_threshold: <input name='transport_black_threshold' type='number' "
-            "min='0' max='255' value='" +
-            String(cfg_transport_black_threshold) +
-            "'> <small>(Schwarzgrenze der aktuellen Transport-Config; kleiner = strenger schwarz)</small><br>";
-
-    html +=
-        "<p class='muted'><b>Wichtig:</b> Für die normale Vorbereitung bitte die eigene "
-        "<a href='/transport'>Transportsicherungs-Seite</a> verwenden. Dort wird der Schwarzwert beim Aufruf "
-        "automatisch mit der echten Transport-Messmethode ermittelt und ein Grenzwert mit Reserve vorgeschlagen.</p>";
-
-
     html += "</div><div class='settings-section'><h3>Speicher / SD-Sicherheit</h3>";
 
     html += "min_free_space_mb: <input name='min_free_space_mb' type='number' min='0' value='" +
@@ -4632,32 +4612,6 @@ static void handleConfig()
     html += "</div>";
     html += "<div class='form-actions'><button type='submit'>Speichern</button></div>";
     html += "</form>";
-
-
-    html +=
-        "<section class='settings-section' style='border-left:5px solid #d97706'>"
-        "<h3>Transportmodus starten</h3>"
-        "<p class='muted'>1. Kamera vollständig schwarz abkleben. 2. Falls Zeiten/Schwellwerte geändert wurden, "
-        "zuerst oben speichern. 3. Dann Transportmodus aktivieren. SensorForge startet neu und verwendet "
-        "anschließend ausschließlich Timer-Wake, bis die Abdeckung entfernt wurde.</p>";
-
-    if (!cfg_transport_mode) {
-        html +=
-            "<form method='POST' action='/transport_activate' "
-            "onsubmit=\"return confirm('Kamera ist vollständig schwarz abgeklebt und Transportmodus soll jetzt aktiviert werden?');\">"
-            "<button class='primary' type='submit'>Transportmodus aktivieren</button>"
-            "</form>";
-    } else {
-        html +=
-            "<p><span class='status-pill warn'>Transportmodus ist aktiviert</span></p>"
-            "<form method='POST' action='/transport_cancel' "
-            "onsubmit=\"return confirm('Transportmodus wirklich deaktivieren?');\">"
-            "<button type='submit'>Transportmodus deaktivieren</button>"
-            "</form>";
-    }
-
-    html +=
-        "</section>";
 
 
     html +=
@@ -5056,6 +5010,53 @@ static void handleSave()
         return;
     }
 
+    String shooterMotionHintChangeText =
+        server.hasArg("shooter_motion_hint_change_pct")
+        ? server.arg("shooter_motion_hint_change_pct")
+        : String(cfg_shooter_motion_hint_change_pct, 1);
+
+    shooterMotionHintChangeText.trim();
+
+    char *shooterMotionHintChangeEnd = nullptr;
+    float shooterMotionHintChangePct =
+        strtof(
+            shooterMotionHintChangeText.c_str(),
+            &shooterMotionHintChangeEnd
+        );
+
+    int shooterMotionHintRequiredHits =
+        server.hasArg("shooter_motion_hint_required_hits")
+        ? server.arg("shooter_motion_hint_required_hits").toInt()
+        : cfg_shooter_motion_hint_required_hits;
+
+    int shooterMotionHintWindowFrames =
+        server.hasArg("shooter_motion_hint_window_frames")
+        ? server.arg("shooter_motion_hint_window_frames").toInt()
+        : cfg_shooter_motion_hint_window_frames;
+
+    if (
+        !shooterMotionHintChangeText.length() ||
+        !shooterMotionHintChangeEnd ||
+        *shooterMotionHintChangeEnd != '\0' ||
+        shooterMotionHintChangePct < 0.1f ||
+        shooterMotionHintChangePct > 100.0f ||
+        (
+            shooterMinChangePct > 0.0f &&
+            shooterMotionHintChangePct < shooterMinChangePct
+        ) ||
+        shooterMotionHintWindowFrames < 1 ||
+        shooterMotionHintWindowFrames > 8 ||
+        shooterMotionHintRequiredHits < 1 ||
+        shooterMotionHintRequiredHits > shooterMotionHintWindowFrames
+    ) {
+        server.send(
+            400,
+            "text/plain; charset=utf-8",
+            "Shooter Bewegungsverdacht: Schwelle 0.1..100.0 % und >= Speicherfilter; Treffer/Fenster 1..8 und Treffer <= Fenster"
+        );
+        return;
+    }
+
     int shooterForceSaveSeconds =
         constrain(
             server.arg("shooter_force_save_seconds").toInt(),
@@ -5198,40 +5199,23 @@ static void handleSave()
         : cfg_bootloop_protection;
 
 
+    // Transport settings are owned exclusively by the dedicated
+    // /transport page. A general configuration save preserves the active
+    // values verbatim instead of accepting a second, duplicate edit path.
     int transportCheckSeconds =
-        constrain(
-            server.arg("transport_check_seconds").toInt(),
-            10,
-            3600
-        );
+        cfg_transport_check_seconds;
 
     int transportLightConfirmSeconds =
-        constrain(
-            server.arg("transport_light_confirm_seconds").toInt(),
-            0,
-            120
-        );
+        cfg_transport_light_confirm_seconds;
 
     int transportInstallDelaySeconds =
-        constrain(
-            server.arg("transport_install_delay_seconds").toInt(),
-            0,
-            86400
-        );
+        cfg_transport_install_delay_seconds;
 
     int transportMaxDurationSeconds =
-        constrain(
-            server.arg("transport_max_duration_seconds").toInt(),
-            3600,
-            604800
-        );
+        cfg_transport_max_duration_seconds;
 
     int transportBlackThreshold =
-        constrain(
-            server.arg("transport_black_threshold").toInt(),
-            0,
-            255
-        );
+        cfg_transport_black_threshold;
 
 
     int minFreeSpaceMb =
@@ -5601,6 +5585,18 @@ static void handleSave()
     text += String(shooterMinChangePct, 1);
     text += '\n';
 
+    text += "shooter_motion_hint_change_pct=";
+    text += String(shooterMotionHintChangePct, 1);
+    text += '\n';
+
+    text += "shooter_motion_hint_required_hits=";
+    text += String(shooterMotionHintRequiredHits);
+    text += '\n';
+
+    text += "shooter_motion_hint_window_frames=";
+    text += String(shooterMotionHintWindowFrames);
+    text += '\n';
+
     text += "shooter_force_save_seconds=";
     text += String(shooterForceSaveSeconds);
     text += '\n';
@@ -5890,21 +5886,6 @@ static void handleSave()
             cfg_bootloop_protection =
                 bootloopProtection;
 
-            cfg_transport_check_seconds =
-                transportCheckSeconds;
-
-            cfg_transport_light_confirm_seconds =
-                transportLightConfirmSeconds;
-
-            cfg_transport_install_delay_seconds =
-                transportInstallDelaySeconds;
-
-            cfg_transport_max_duration_seconds =
-                transportMaxDurationSeconds;
-
-            cfg_transport_black_threshold =
-                transportBlackThreshold;
-
             cfg_recording_not_before =
                 recordingNotBefore;
 
@@ -5981,6 +5962,15 @@ static void handleSave()
 
             cfg_shooter_min_change_pct =
                 shooterMinChangePct;
+
+            cfg_shooter_motion_hint_change_pct =
+                shooterMotionHintChangePct;
+
+            cfg_shooter_motion_hint_required_hits =
+                shooterMotionHintRequiredHits;
+
+            cfg_shooter_motion_hint_window_frames =
+                shooterMotionHintWindowFrames;
 
             cfg_shooter_force_save_seconds =
                 shooterForceSaveSeconds;
@@ -6050,21 +6040,6 @@ static void handleSave()
             cfg_bootloop_protection =
                 bootloopProtection;
 
-            cfg_transport_check_seconds =
-                transportCheckSeconds;
-
-            cfg_transport_light_confirm_seconds =
-                transportLightConfirmSeconds;
-
-            cfg_transport_install_delay_seconds =
-                transportInstallDelaySeconds;
-
-            cfg_transport_max_duration_seconds =
-                transportMaxDurationSeconds;
-
-            cfg_transport_black_threshold =
-                transportBlackThreshold;
-
             cfg_recording_not_before =
                 recordingNotBefore;
 
@@ -6141,6 +6116,15 @@ static void handleSave()
 
             cfg_shooter_min_change_pct =
                 shooterMinChangePct;
+
+            cfg_shooter_motion_hint_change_pct =
+                shooterMotionHintChangePct;
+
+            cfg_shooter_motion_hint_required_hits =
+                shooterMotionHintRequiredHits;
+
+            cfg_shooter_motion_hint_window_frames =
+                shooterMotionHintWindowFrames;
 
             cfg_shooter_force_save_seconds =
                 shooterForceSaveSeconds;
@@ -12215,6 +12199,7 @@ struct RecordingEntry {
     bool isJpeg;
     bool hasSrt;
     bool hasAudio;
+    bool motionHint;
     bool corrupt;
 };
 
@@ -12706,6 +12691,13 @@ static void handleFilesDay()
                     entry.hasAudio =
                         false;
 
+                    // Motion-hint Sparse MKVs use a filename marker written at
+                    // finalization time. Reading the marker here costs no extra
+                    // SD I/O and does not change the MKV/container contents.
+                    entry.motionHint =
+                        isMkv &&
+                        lowerName.endsWith("_motionhint.mkv");
+
                     entry.corrupt =
                         false;
 
@@ -12946,6 +12938,19 @@ static void handleFilesDay()
                 "<path d='M16 9c1.3 1.3 1.3 4.7 0 6'></path>"
                 "<path d='M18.5 6.5c3 3 3 8 0 11'></path>"
                 "</svg></span>";
+        }
+
+
+        if (entry.motionHint) {
+            row +=
+                "<span class='mediaMotionHint' "
+                "title='In dieser Power-Shooter-Periode wurde wiederholte deutliche Bildaktivität erkannt. Dies ist ein Hinweis, kein bestätigter Alarm.' "
+                "aria-label='Bewegungsverdacht'>"
+                "<svg viewBox='0 0 24 24' aria-hidden='true'>"
+                "<path d='M12 3L2.8 20h18.4L12 3z'></path>"
+                "<path d='M12 8v5'></path>"
+                "<circle cx='12' cy='16.5' r='.7'></circle>"
+                "</svg><span>Bewegungsverdacht</span></span>";
         }
 
 
@@ -14957,6 +14962,8 @@ static void handleFiles()
         "}"
         ".mediaAudioIcon{display:inline-flex;width:20px;height:20px;align-items:center;justify-content:center;margin-right:5px;vertical-align:middle;color:#1769aa;}"
         ".mediaAudioIcon svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;}"
+        ".mediaMotionHint{display:inline-flex;align-items:center;gap:4px;margin-right:7px;padding:2px 7px;border:1px solid #f0b429;border-radius:999px;background:#fff7e6;color:#8a4b08;font-size:11px;font-weight:700;line-height:1.35;vertical-align:middle;white-space:nowrap;}"
+        ".mediaMotionHint svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;}"
         ".recname{display:inline-block;min-width:150px;}"
         ".recmeta{display:inline-block;min-width:70px;color:#667085;}"
         ".recannotation{display:inline-flex;align-items:center;gap:5px;max-width:min(440px,38vw);margin-left:10px;padding:3px 8px;border:1px solid #cbd5e1;border-radius:999px;background:#f8fafc;color:#475467;font-size:12px;line-height:1.3;vertical-align:middle;white-space:nowrap;overflow:hidden;}"

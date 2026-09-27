@@ -57,6 +57,11 @@ extern String cfg_shooter_storage_format;         // "mkv" (default sparse conta
 extern int cfg_shooter_interval_ms;            // 250..86400000
 extern int cfg_shooter_dark_mean_min;          // 0 disables dark filter, otherwise 1..255
 extern float cfg_shooter_min_change_pct;       // 0 disables, otherwise 0.1..100.0 percent
+// Passive list-only motion hint. Independent from shooter persistence: it does
+// not keep/drop frames and never starts a recording. Default = 2.0%, 3 of 4.
+extern float cfg_shooter_motion_hint_change_pct; // 0.1..100.0 percent
+extern int cfg_shooter_motion_hint_required_hits; // 1..8 and <= window
+extern int cfg_shooter_motion_hint_window_frames; // 1..8
 extern int cfg_shooter_force_save_seconds;     // 0 disables forced keep, otherwise 1..86400
 extern int cfg_shooter_flush_seconds;          // 0 = direct write, otherwise 1..3600
 extern int cfg_recording_segment_seconds; // 0 = unlimited

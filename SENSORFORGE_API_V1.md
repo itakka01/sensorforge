@@ -83,7 +83,8 @@ Important fields include:
 Continuous-shooter configuration summary and runtime telemetry:
 
 - enabled/storage format/interval
-- darkness and minimum-change filters
+- darkness and minimum-change persistence filters
+- passive motion-hint threshold plus required-hits/window settings
 - force-save and flush intervals
 - PSRAM buffer frames/bytes/capacity/fill percentage
 - accepted JPEG count/bytes/average size

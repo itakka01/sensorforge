@@ -1,5 +1,31 @@
 # SensorForge Changelog
 
+## v70 — 2026-09-27
+
+- Removed the duplicate Transport mode parameter block and duplicate activate/cancel controls from the general Configuration page. `transport_check_seconds`, `transport_light_confirm_seconds`, `transport_install_delay_seconds`, `transport_max_duration_seconds` and `transport_black_threshold` are now user-editable only on the dedicated **Transportsicherung** page.
+- A normal Configuration save still preserves the currently active transport values in the canonical config text, but it no longer reads transport values from that form and no longer applies them as a second configuration path. The dedicated Transport save continues to persist the values through `configSaveTransportSettings()`.
+- Simplified the Overview arming-status presentation. In the normal released state the large green `KAMERA SCHARF / Keine zeitliche Aufnahmesperre / Aufnahmeautomatik ist freigegeben` block is hidden completely; the existing compact `Bereit` status remains.
+- Scheduled waiting, invalid RTC and invalid `recording_not_before` states remain visible because they require operator attention, but their arming notice is now rendered as a smaller one-pixel bordered status panel with reduced typography and padding. The recording safety/cooldown warning path is unchanged.
+- No Transport runtime logic, timer-only deep-sleep behavior, threshold calculation, activation/cancel persistence, recording logic, Shooter logic, storage path or encryption path was changed.
+
+## v69 — 2026-09-27
+
+- Added a compact **Erweiterte Shooter-Einstellungen** section below the existing Power-Shooter controls.
+- The passive `Bewegungsverdacht` classifier is now configurable without changing the ultra-sensitive shooter persistence filter: `shooter_motion_hint_change_pct` defaults to 2.0%, `shooter_motion_hint_required_hits` to 3 and `shooter_motion_hint_window_frames` to 4.
+- Confirmation is constrained to 1..8 analyzed frames with `required_hits <= window_frames`; the hint threshold must not be lower than an enabled shooter persistence threshold. Existing v68 behavior remains the default (`2.0% / 3 of 4`).
+- Older configs without the new keys remain valid and automatically use the v68 defaults. A normal WebConfig save writes the new canonical keys.
+- Changing the hint parameters resets only the in-RAM hint vote window on the next Shooter analysis; frame persistence, Sparse-MKV timing, buffering, flush, encryption and normal Motion Recording remain unchanged.
+- `/api/v1/shooter` exposes the three new hint settings additively.
+
+## v68 — 2026-09-27
+
+- Added a passive Power-Shooter **Bewegungsverdacht** classifier for Sparse-MKV periods. The existing shooter persistence filter is unchanged: `shooter_min_change_pct` still decides which JPEGs are retained, so the current very sensitive 0.2% field profile continues to prioritize evidence capture.
+- The new hint uses the already computed shooter 20x15 analysis metrics and therefore adds no second JPEG decode and does not invoke the heavier operational Image Motion engine. A hint is confirmed when at least 3 of the latest 4 analyzed, non-dark shooter frames reach 2.0% changed area.
+- Added a conservative global-light guard: a frame with at least 70% changed area plus a global mean-luma jump of at least 24 is treated as an illumination transition and resets the hint window instead of contributing to a likely-motion indication. Long capture gaps also reset the temporal window so unrelated activity cannot be combined across pauses.
+- Motion-hint state never starts/stops recording, never changes shooter frame acceptance, and never changes Sparse-MKV frame timestamps, flush timing, encryption or PSRAM buffering. The confirmed flag is carried only in the existing RAM shooter queue until finalization.
+- A Sparse MKV containing a confirmed hint is finalized as `HHMMSS_mmm_shooter_motionhint.mkv`; normal shooter files retain the existing `HHMMSS_mmm_shooter.mkv` name. No sidecar file and no additional SD write are introduced. Existing WebPlayer, Sync API, ZIP and delete paths remain extension-based and accept both names.
+- The recordings list recognizes the filename marker and shows an orange **Bewegungsverdacht** badge with wording that explicitly identifies it as a hint rather than a confirmed alarm. Shooter flush logs now include `motion_hint=0|1` for field verification.
+
 ## v67 — 2026-09-26
 
 - Restored the Seeed XIAO ESP32S3 Sense SPI-SD production clock from the temporary v66 10 MHz experiment to the previously qualified 20 MHz setting. `NORMAL` and `MAX` are both 20 MHz, so API-exclusive operation still never changes the card clock behind the recorder's back.

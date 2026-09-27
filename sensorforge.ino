@@ -387,6 +387,16 @@ static uint32_t shooterLastBufferAllocErrorLogMs = 0;
 static uint32_t shooterLastFailureLogMs = 0;
 static bool shooterInitialWarmupDone = false;
 
+// Passive Power-Shooter motion-hint classifier. This never starts recording and
+// never changes which shooter frames are kept. It only tags the sparse MKV that
+// contains a sufficiently persistent image change so the recordings list can
+// draw the operator's attention to that period.
+static uint8_t shooterMotionHintWindowMask = 0;
+static uint8_t shooterMotionHintWindowSamples = 0;
+static bool shooterMotionHintPreviousMeanValid = false;
+static float shooterMotionHintPreviousMean = 0.0f;
+static uint32_t shooterMotionHintLastSampleMs = 0;
+
 // Pure continuous-shooter timer wakes can happen multiple times per second.
 // Keep their light-sleep diagnostics in RAM and fold them into the next
 // shooter flush summary instead of generating one SD-backed log line per wake.
@@ -9776,7 +9786,20 @@ struct ShooterBufferedFrameHeader {
     uint32_t jpegBytes;
     uint16_t width;
     uint16_t height;
+    uint8_t flags;
 };
+
+static const uint8_t SHOOTER_BUFFER_FLAG_MOTION_HINT = 0x01U;
+
+// Keep the ultra-sensitive shooter persistence threshold independent from the
+// operator-facing motion hint. The current 0.2% field setting may keep a frame
+// after only one changed 20x15 block; the hint therefore requires a materially
+// stronger change across a configurable N-of-M analyzed-frame window (default
+// 2.0%, 3 of 4). The global-light guard rejects broad exposure/illumination jumps
+// without invoking a second JPEG
+// decode or the heavier operational Image Motion engine.
+static const float SHOOTER_MOTION_HINT_GLOBAL_CHANGE_PCT = 70.0f;
+static const float SHOOTER_MOTION_HINT_GLOBAL_MEAN_DELTA = 24.0f;
 
 static const uint8_t SHOOTER_LONG_INTERVAL_WARMUP_FRAMES = 3;
 static const uint32_t SHOOTER_LONG_INTERVAL_MS = 5000UL;
@@ -9816,6 +9839,11 @@ static void continuousShooterRefreshScheduleState()
         shooterBufferFlushDue = true;
 
     imageMotionResetShooterReference();
+    shooterMotionHintWindowMask = 0;
+    shooterMotionHintWindowSamples = 0;
+    shooterMotionHintPreviousMeanValid = false;
+    shooterMotionHintPreviousMean = 0.0f;
+    shooterMotionHintLastSampleMs = 0;
 }
 
 
@@ -10138,6 +10166,7 @@ static bool continuousShooterBuildJpegPath(
 static bool continuousShooterBuildMkvPath(
     int64_t firstScheduledWallUs,
     uint64_t firstCaptureMonotonicUs,
+    bool motionHint,
     String &finalPath,
     String &tempPath
 )
@@ -10170,7 +10199,9 @@ static bool continuousShooterBuildMkvPath(
         snprintf(
             fileBuffer,
             sizeof(fileBuffer),
-            "%s_%03u_shooter.mkv",
+            motionHint
+                ? "%s_%03u_shooter_motionhint.mkv"
+                : "%s_%03u_shooter.mkv",
             timeBuffer,
             (unsigned)slotMs
         );
@@ -10182,7 +10213,9 @@ static bool continuousShooterBuildMkvPath(
         snprintf(
             fileBuffer,
             sizeof(fileBuffer),
-            "shooter_%llu.mkv",
+            motionHint
+                ? "shooter_%llu_motionhint.mkv"
+                : "shooter_%llu.mkv",
             (unsigned long long)(firstCaptureMonotonicUs / 1000ULL)
         );
         filename = String(fileBuffer);
@@ -10314,7 +10347,8 @@ static bool continuousShooterWriteSparseMkvSingle(
     const uint8_t *jpeg,
     size_t jpegBytes,
     uint16_t width,
-    uint16_t height
+    uint16_t height,
+    bool motionHint
 )
 {
     if (!jpeg || jpegBytes == 0 || width == 0 || height == 0)
@@ -10336,6 +10370,7 @@ static bool continuousShooterWriteSparseMkvSingle(
     if (!continuousShooterBuildMkvPath(
             scheduledWallUs,
             captureMonotonicUs,
+            motionHint,
             finalPath,
             tempPath
         )) {
@@ -10389,12 +10424,14 @@ static bool continuousShooterWriteSparseMkvFromBuffer(
     size_t &consumedBytes,
     uint32_t &flushedFrames,
     uint64_t &flushedJpegBytes,
-    bool ignoreAlarmPriority
+    bool ignoreAlarmPriority,
+    bool &motionHint
 )
 {
     consumedBytes = 0;
     flushedFrames = 0;
     flushedJpegBytes = 0;
+    motionHint = false;
 
     if (shooterBufferUsed < sizeof(ShooterBufferedFrameHeader))
         return false;
@@ -10414,12 +10451,51 @@ static bool continuousShooterWriteSparseMkvFromBuffer(
         return false;
     }
 
+    bool batchMotionHint = false;
+    size_t scanOffset = 0;
+
+    while (
+        scanOffset + sizeof(ShooterBufferedFrameHeader) <=
+        shooterBufferUsed
+    ) {
+        ShooterBufferedFrameHeader header = {};
+        memcpy(
+            &header,
+            shooterBuffer + scanOffset,
+            sizeof(header)
+        );
+
+        size_t recordBytes =
+            sizeof(header) +
+            (size_t)header.jpegBytes;
+
+        if (
+            header.jpegBytes == 0 ||
+            recordBytes > shooterBufferUsed - scanOffset ||
+            header.width != firstHeader.width ||
+            header.height != firstHeader.height
+        ) {
+            return false;
+        }
+
+        if (header.flags & SHOOTER_BUFFER_FLAG_MOTION_HINT)
+            batchMotionHint = true;
+
+        scanOffset += recordBytes;
+    }
+
+    if (scanOffset != shooterBufferUsed)
+        return false;
+
+    motionHint = batchMotionHint;
+
     String finalPath;
     String tempPath;
 
     if (!continuousShooterBuildMkvPath(
             firstHeader.scheduledWallUs,
             firstHeader.captureMonotonicUs,
+            batchMotionHint,
             finalPath,
             tempPath
         )) {
@@ -10727,6 +10803,7 @@ static bool continuousShooterFlushBuffer(
     size_t offset = 0;
     uint32_t flushedFrames = 0;
     uint64_t flushedJpegBytes = 0;
+    bool flushedMotionHint = false;
     uint32_t startedMs = millis();
     uint32_t originalFirstQueuedMs = shooterBufferFirstQueuedMs;
 
@@ -10735,7 +10812,8 @@ static bool continuousShooterFlushBuffer(
                 offset,
                 flushedFrames,
                 flushedJpegBytes,
-                ignoreAlarmPriority
+                ignoreAlarmPriority,
+                flushedMotionHint
             )) {
             shooterBufferFlushDue = true;
             return false;
@@ -10824,7 +10902,7 @@ static bool continuousShooterFlushBuffer(
             shooterBufferFlushDue = true;
         }
 
-        char flushSummary[448];
+        char flushSummary[480];
 
         uint32_t sleepAverageMs =
             shooterSleepCyclesPending > 0
@@ -10837,13 +10915,14 @@ static bool continuousShooterFlushBuffer(
         snprintf(
             flushSummary,
             sizeof(flushSummary),
-            "Shooter flush | reason=%s | format=%s | frames=%lu | jpeg_bytes=%llu | remaining=%lu | elapsed_ms=%lu | accepted=%lu | rejected_dark=%lu | rejected_similar=%lu | sleep_cycles=%lu | sleep_avg_ms=%lu | sleep_min_ms=%lu | sleep_max_ms=%lu",
+            "Shooter flush | reason=%s | format=%s | frames=%lu | jpeg_bytes=%llu | remaining=%lu | elapsed_ms=%lu | motion_hint=%u | accepted=%lu | rejected_dark=%lu | rejected_similar=%lu | sleep_cycles=%lu | sleep_avg_ms=%lu | sleep_min_ms=%lu | sleep_max_ms=%lu",
             reason ? reason : "unknown",
             cfg_shooter_storage_format.c_str(),
             (unsigned long)flushedFrames,
             (unsigned long long)flushedJpegBytes,
             (unsigned long)shooterBufferUsed,
             (unsigned long)(millis() - startedMs),
+            flushedMotionHint ? 1U : 0U,
             (unsigned long)shooterAcceptedFrames,
             (unsigned long)shooterRejectedDark,
             (unsigned long)shooterRejectedSimilar,
@@ -10963,7 +11042,8 @@ static bool continuousShooterQueueJpeg(
     const uint8_t *jpeg,
     size_t jpegBytes,
     uint16_t width,
-    uint16_t height
+    uint16_t height,
+    bool motionHint
 )
 {
     if (cfg_shooter_flush_seconds <= 0) {
@@ -10974,7 +11054,8 @@ static bool continuousShooterQueueJpeg(
                 jpeg,
                 jpegBytes,
                 width,
-                height
+                height,
+                motionHint
             );
         }
         return continuousShooterWriteJpeg(
@@ -10993,7 +11074,8 @@ static bool continuousShooterQueueJpeg(
                 jpeg,
                 jpegBytes,
                 width,
-                height
+                height,
+                motionHint
             );
         }
         return continuousShooterWriteJpeg(
@@ -11010,6 +11092,10 @@ static bool continuousShooterQueueJpeg(
     header.jpegBytes = (uint32_t)jpegBytes;
     header.width = width;
     header.height = height;
+    header.flags =
+        motionHint
+        ? SHOOTER_BUFFER_FLAG_MOTION_HINT
+        : 0U;
 
     size_t recordBytes =
         sizeof(header) +
@@ -11024,7 +11110,8 @@ static bool continuousShooterQueueJpeg(
                 jpeg,
                 jpegBytes,
                 width,
-                height
+                height,
+                motionHint
             );
         }
         return continuousShooterWriteJpeg(
@@ -11078,6 +11165,157 @@ static bool continuousShooterQueueJpeg(
     }
 
     return true;
+}
+
+
+static void continuousShooterResetMotionHintWindow()
+{
+    shooterMotionHintWindowMask = 0;
+    shooterMotionHintWindowSamples = 0;
+}
+
+
+static uint8_t continuousShooterMotionHintHitCount()
+{
+    uint8_t hits = 0;
+    uint8_t mask = shooterMotionHintWindowMask;
+
+    uint8_t windowFrames = (uint8_t)constrain(
+        cfg_shooter_motion_hint_window_frames,
+        1,
+        8
+    );
+
+    for (uint8_t i = 0; i < windowFrames; ++i) {
+        if (mask & 0x01U)
+            ++hits;
+        mask >>= 1U;
+    }
+
+    return hits;
+}
+
+
+static bool continuousShooterUpdateMotionHint(
+    bool analyzed,
+    bool dark,
+    const ShooterImageMetrics &metrics,
+    float changedPct
+)
+{
+    uint32_t nowMs = millis();
+
+    static float lastChangePct = -1.0f;
+    static int lastRequiredHits = -1;
+    static int lastWindowFrames = -1;
+
+    if (
+        lastChangePct != cfg_shooter_motion_hint_change_pct ||
+        lastRequiredHits != cfg_shooter_motion_hint_required_hits ||
+        lastWindowFrames != cfg_shooter_motion_hint_window_frames
+    ) {
+        continuousShooterResetMotionHintWindow();
+        shooterMotionHintPreviousMeanValid = false;
+        shooterMotionHintPreviousMean = 0.0f;
+        lastChangePct = cfg_shooter_motion_hint_change_pct;
+        lastRequiredHits = cfg_shooter_motion_hint_required_hits;
+        lastWindowFrames = cfg_shooter_motion_hint_window_frames;
+    }
+
+    uint32_t maximumContinuousGapMs =
+        cfg_shooter_interval_ms > 0
+        ? (uint32_t)cfg_shooter_interval_ms * 3UL
+        : 3000UL;
+
+    if (maximumContinuousGapMs < 1000UL)
+        maximumContinuousGapMs = 1000UL;
+
+    if (
+        shooterMotionHintLastSampleMs != 0 &&
+        (uint32_t)(nowMs - shooterMotionHintLastSampleMs) >
+            maximumContinuousGapMs
+    ) {
+        continuousShooterResetMotionHintWindow();
+        shooterMotionHintPreviousMeanValid = false;
+        shooterMotionHintPreviousMean = 0.0f;
+    }
+
+    shooterMotionHintLastSampleMs = nowMs;
+
+    if (!analyzed || dark) {
+        continuousShooterResetMotionHintWindow();
+        shooterMotionHintPreviousMeanValid = false;
+        shooterMotionHintPreviousMean = 0.0f;
+        return false;
+    }
+
+    float meanDelta = 0.0f;
+
+    if (shooterMotionHintPreviousMeanValid) {
+        meanDelta =
+            metrics.globalMean -
+            shooterMotionHintPreviousMean;
+
+        if (meanDelta < 0.0f)
+            meanDelta = -meanDelta;
+    }
+
+    bool globalLightChange =
+        metrics.referenceReady &&
+        shooterMotionHintPreviousMeanValid &&
+        changedPct >= SHOOTER_MOTION_HINT_GLOBAL_CHANGE_PCT &&
+        meanDelta >= SHOOTER_MOTION_HINT_GLOBAL_MEAN_DELTA;
+
+    shooterMotionHintPreviousMean =
+        metrics.globalMean;
+    shooterMotionHintPreviousMeanValid =
+        true;
+
+    if (!metrics.referenceReady || globalLightChange) {
+        continuousShooterResetMotionHintWindow();
+        return false;
+    }
+
+    bool hit =
+        changedPct >=
+        cfg_shooter_motion_hint_change_pct;
+
+    uint8_t windowFrames = (uint8_t)constrain(
+        cfg_shooter_motion_hint_window_frames,
+        1,
+        8
+    );
+
+    uint8_t requiredHits = (uint8_t)constrain(
+        cfg_shooter_motion_hint_required_hits,
+        1,
+        (int)windowFrames
+    );
+
+    uint8_t keepMask =
+        windowFrames >= 8U
+        ? 0xFFU
+        : (uint8_t)((1U << windowFrames) - 1U);
+
+    shooterMotionHintWindowMask =
+        (uint8_t)(
+            ((uint8_t)(shooterMotionHintWindowMask << 1U) |
+             (hit ? 0x01U : 0x00U)) &
+            keepMask
+        );
+
+    if (
+        shooterMotionHintWindowSamples <
+        windowFrames
+    ) {
+        ++shooterMotionHintWindowSamples;
+    }
+
+    return
+        shooterMotionHintWindowSamples >=
+            requiredHits &&
+        continuousShooterMotionHintHitCount() >=
+            requiredHits;
 }
 
 
@@ -11264,6 +11502,14 @@ static bool continuousShooterCapture(
     if (changedPct < 0.0f)
         changedPct = 0.0f;
 
+    bool motionHint =
+        continuousShooterUpdateMotionHint(
+            analyzed,
+            dark,
+            metrics,
+            changedPct
+        );
+
     bool tooSimilar =
         analyzed &&
         !forceSave &&
@@ -11306,7 +11552,8 @@ static bool continuousShooterCapture(
         frame->buf,
         frame->len,
         (uint16_t)frame->width,
-        (uint16_t)frame->height
+        (uint16_t)frame->height,
+        motionHint
     );
 
     size_t acceptedBytes = frame->len;

@@ -1,11 +1,30 @@
 SENSORFORGE / ESP32-S3 CAMERA (XIAO + FREENOVE)
 PROJEKTBESCHREIBUNG, RELEASESTAND UND WIEDEREINSTIEGSPROMPT
-Stand: 2026-09-26
-Dokumentrevision: v67 / eingefrorener Arbeitsstand + Audio/MKV + Recording Load Test + Write-Behind + SFENC1-/SD-Endurance + offene Langzeitqualifikation
-Aktueller Entwicklungs-/Arbeits-Release: v67 (Produktionsqualifikation fuer XIAO-Langzeitrecording noch offen)
+Stand: 2026-09-27
+Dokumentrevision: v70 / v67-Stabilitaetsbasis + konfigurierbarer Power-Shooter-Bewegungsverdacht + bereinigte Transport-/Dashboard-UI + offene Langzeitqualifikation
+Aktueller Entwicklungs-/Arbeits-Release: v70 (Produktionsqualifikation fuer XIAO-Langzeitrecording noch offen)
 Produktname: SensorForge
 Plattformname: Fabric Node
 Core-Version im Branding: 7.1.0
+
+======================================================================
+V70 - TRANSPORT-EINSTELLUNGEN ZENTRALISIERT / DASHBOARD BEREINIGT
+======================================================================
+
+- Transportparameter werden im Webinterface nur noch unter **Transportsicherung**
+  bearbeitet. Der doppelte Transport-Block inklusive Aktivieren/Deaktivieren in
+  der allgemeinen Konfiguration wurde entfernt. Die dedizierte Transportseite
+  persistiert weiterhin ueber
+  `configSaveTransportSettings()`. Ein allgemeiner Config-Save behaelt die aktuell
+  aktiven Transportwerte unveraendert bei.
+- Der grosse normale Freigabehinweis auf der Uebersicht (`KAMERA SCHARF`, keine
+  Zeitsperre, Aufnahmeautomatik freigegeben) wird im normalen freigegebenen Zustand
+  nicht mehr angezeigt. Die kompakte `Bereit`-Anzeige reicht dort aus.
+- Nur relevante Zeitfreigabe-/Fehlerzustaende bleiben sichtbar; diese Anzeige ist
+  nun deutlich kleiner und dezenter. Die separate Aufnahme-Sicherheitspause bleibt
+  unveraendert.
+- Keine Aenderung an Transport-Laufzeitlogik, Deep-Sleep/Wake, Shooter, Recording,
+  Storage, Encryption oder Recovery.
 
 ======================================================================
 ZWECK DIESES DOKUMENTS
@@ -86,6 +105,54 @@ Der aktuelle Quellstand besteht im Kern aus:
 - sensorforge_license.py fuer PC-seitige Lizenzcode-Erzeugung
 - den dazugehoerigen bestehenden Headern und Modulen fuer Recorder, Logger,
   Radar, RTC, Thermal, Storage Guard und WebPlayer
+
+
+======================================================================
+AKTUELLER ARBEITSSTAND 2026-09-27 - v69
+======================================================================
+
+- v69 baut direkt auf v68 auf und aendert ausschliesslich die Konfiguration/
+  Bedienung des passiven Power-Shooter-Bewegungsverdachts.
+- Der eigentliche Shooter-Speicherfilter bleibt separat und unveraendert.
+- Neue persistente, rueckwaertskompatible Parameter:
+    shooter_motion_hint_change_pct=2.0
+    shooter_motion_hint_required_hits=3
+    shooter_motion_hint_window_frames=4
+- Gueltig: Schwelle 0.1..100.0 Prozent und nicht kleiner als ein aktivierter
+  shooter_min_change_pct-Speicherfilter; Fenster 1..8, Treffer 1..Fenster.
+- WebConfig zeigt die Parameter unter Power Shooter -> Erweiterte
+  Shooter-Einstellungen. Default bleibt exakt der v68-Stand 2.0 Prozent /
+  3 aus 4 analysierten Frames.
+- Parameterwechsel setzt nur das RAM-Votingfenster zurueck; Speicherung,
+  Sparse-MKV, Flush, SFENC1 und normales Motion Recording bleiben unberuehrt.
+- /api/v1/shooter liefert die drei Werte additiv.
+
+
+======================================================================
+AKTUELLER ARBEITSSTAND 2026-09-27 - v68
+======================================================================
+
+- v68 baut direkt auf dem vollstaendig eingesehenen v67-Quellstand auf.
+- Der Power-Shooter-Speicherfilter bleibt unveraendert. Insbesondere entscheidet
+  shooter_min_change_pct weiterhin allein, welche Frames gespeichert werden;
+  ein Feldwert von 0.2 Prozent bleibt damit bewusst sehr empfindlich.
+- Neu ist ausschliesslich ein passiver Hinweis "Bewegungsverdacht" fuer
+  Sparse-MKV-Perioden. Er startet/stoppt keine Aufnahme und veraendert weder
+  Shooter-Timing noch Frameannahme, PSRAM-Flush, MKV-Timestamps oder Encryption.
+- Der Hinweis verwendet die bereits vorhandenen Shooter-Analysemesswerte ohne
+  zweiten JPEG-Decode: mindestens 3 Treffer in den letzten 4 gueltigen
+  Analyseframes bei jeweils mindestens 2.0 Prozent veraenderter Rasterflaeche.
+- Breite Helligkeitswechsel werden konservativ ausgefiltert, wenn mindestens
+  70 Prozent der Rasterflaeche wechseln UND der globale Helligkeitsmittelwert
+  um mindestens 24 springt. Laengere Capture-Pausen setzen das Zeitfenster
+  ebenfalls zurueck.
+- Ein bestaetigter Hinweis wird ohne Sidecar und ohne zusaetzlichen SD-Write im
+  finalen Dateinamen persistiert: *_shooter_motionhint.mkv. Die Aufnahmeliste
+  zeigt dafuer ein oranges "Bewegungsverdacht"-Badge. Normale Dateien behalten
+  exakt das bestehende *_shooter.mkv-Schema.
+- Shooter-Flush-Logs enthalten zur Feldkontrolle motion_hint=0|1.
+- Die offene v67-Langzeit-EIO-Qualifikation bleibt technisch unveraendert offen;
+  v68 aendert weder SD-Takt noch SFENC1/Write-Behind/Recovery-Pfade.
 
 
 ======================================================================
@@ -6498,11 +6565,11 @@ WEITERE PRIORITAETEN:
 - XIAO camera default OV2640 vs reale OV3660-Hardware bewusst spaeter entscheiden
 
 
-PAUSE-/UEBERGABESTAND 2026-09-26:
+PAUSE-/UEBERGABESTAND 2026-09-27:
 
 Die Arbeit an der XIAO-Recording-Langzeitqualifikation ist bewusst PAUSIERT.
 Nicht automatisch weiterpatchen. Bei Wiederaufnahme zuerst diesen Dokumentblock
-und den dann aktuellen Quellcode lesen. Aktueller Arbeitsrelease v67.
+und den dann aktuellen Quellcode lesen. Aktueller Arbeitsrelease v69.
 
 Der wichtigste offene technische Befund ist der sporadische errno=5/EIO im
 kombinierten Langzeitpfad trotz positiver isolierter 64-MiB-Storage-/SFENC1-

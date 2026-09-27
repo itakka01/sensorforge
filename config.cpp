@@ -112,6 +112,9 @@ String cfg_shooter_storage_format = "mkv";
 int cfg_shooter_interval_ms = 60000;
 int cfg_shooter_dark_mean_min = 20;
 float cfg_shooter_min_change_pct = 1.0f;
+float cfg_shooter_motion_hint_change_pct = 2.0f;
+int cfg_shooter_motion_hint_required_hits = 3;
+int cfg_shooter_motion_hint_window_frames = 4;
 int cfg_shooter_force_save_seconds = 60;
 int cfg_shooter_flush_seconds = 300;
 int cfg_recording_segment_seconds = 30;
@@ -468,6 +471,9 @@ struct ConfigValues {
     int shooterIntervalMs;
     int shooterDarkMeanMin;
     float shooterMinChangePct;
+    float shooterMotionHintChangePct;
+    int shooterMotionHintRequiredHits;
+    int shooterMotionHintWindowFrames;
     int shooterForceSaveSeconds;
     int shooterFlushSeconds;
     int recordingSegmentSeconds;
@@ -562,6 +568,9 @@ struct ConfigSeen {
     bool shooterDarkMeanMin;
     bool shooterMinChangePct;
     bool shooterSimilarityThreshold; // legacy alias
+    bool shooterMotionHintChangePct;
+    bool shooterMotionHintRequiredHits;
+    bool shooterMotionHintWindowFrames;
     bool shooterForceSaveSeconds;
     bool shooterFlushSeconds;
     bool recordingSegmentSeconds;
@@ -740,6 +749,15 @@ static ConfigValues makeDefaultValues()
 
     values.shooterMinChangePct =
         1.0f;
+
+    values.shooterMotionHintChangePct =
+        2.0f;
+
+    values.shooterMotionHintRequiredHits =
+        3;
+
+    values.shooterMotionHintWindowFrames =
+        4;
 
     values.shooterForceSaveSeconds =
         60;
@@ -949,6 +967,9 @@ static bool serializeConfigValues(
     APPEND_CONFIG_VALUE("shooter_interval_ms", String(values.shooterIntervalMs));
     APPEND_CONFIG_VALUE("shooter_dark_mean_min", String(values.shooterDarkMeanMin));
     APPEND_CONFIG_VALUE("shooter_min_change_pct", String(values.shooterMinChangePct, 1));
+    APPEND_CONFIG_VALUE("shooter_motion_hint_change_pct", String(values.shooterMotionHintChangePct, 1));
+    APPEND_CONFIG_VALUE("shooter_motion_hint_required_hits", String(values.shooterMotionHintRequiredHits));
+    APPEND_CONFIG_VALUE("shooter_motion_hint_window_frames", String(values.shooterMotionHintWindowFrames));
     APPEND_CONFIG_VALUE("shooter_force_save_seconds", String(values.shooterForceSaveSeconds));
     APPEND_CONFIG_VALUE("shooter_flush_seconds", String(values.shooterFlushSeconds));
 
@@ -2245,6 +2266,44 @@ static bool validateValues(
     }
 
     if (
+        values.shooterMotionHintChangePct < 0.1f ||
+        values.shooterMotionHintChangePct > 100.0f
+    ) {
+        error =
+            "shooter_motion_hint_change_pct out of range (0.1..100.0)";
+        return false;
+    }
+
+    if (
+        values.shooterMinChangePct > 0.0f &&
+        values.shooterMotionHintChangePct <
+            values.shooterMinChangePct
+    ) {
+        error =
+            "shooter_motion_hint_change_pct must be >= shooter_min_change_pct";
+        return false;
+    }
+
+    if (
+        values.shooterMotionHintWindowFrames < 1 ||
+        values.shooterMotionHintWindowFrames > 8
+    ) {
+        error =
+            "shooter_motion_hint_window_frames out of range (1..8)";
+        return false;
+    }
+
+    if (
+        values.shooterMotionHintRequiredHits < 1 ||
+        values.shooterMotionHintRequiredHits >
+            values.shooterMotionHintWindowFrames
+    ) {
+        error =
+            "shooter_motion_hint_required_hits must be 1..window_frames";
+        return false;
+    }
+
+    if (
         values.shooterForceSaveSeconds < 0 ||
         values.shooterForceSaveSeconds > 86400
     ) {
@@ -3265,6 +3324,19 @@ static bool parseConfigText(
                     if (values.shooterMinChangePct < 0.1f)
                         values.shooterMinChangePct = 0.1f;
                 }
+
+            } else if (key == "shooter_motion_hint_change_pct") {
+                float decimalValue = 0.0f;
+                if (!markOnce(seen.shooterMotionHintChangePct, key, error) || !parseFloatStrict(value, decimalValue)) { if (!error.length()) error = "invalid shooter_motion_hint_change_pct"; return false; }
+                values.shooterMotionHintChangePct = decimalValue;
+
+            } else if (key == "shooter_motion_hint_required_hits") {
+                if (!markOnce(seen.shooterMotionHintRequiredHits, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid shooter_motion_hint_required_hits"; return false; }
+                values.shooterMotionHintRequiredHits = (int)numericValue;
+
+            } else if (key == "shooter_motion_hint_window_frames") {
+                if (!markOnce(seen.shooterMotionHintWindowFrames, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid shooter_motion_hint_window_frames"; return false; }
+                values.shooterMotionHintWindowFrames = (int)numericValue;
 
             } else if (key == "shooter_force_save_seconds") {
                 if (!markOnce(seen.shooterForceSaveSeconds, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid shooter_force_save_seconds"; return false; }
@@ -4369,6 +4441,9 @@ static void applyValues(
     cfg_shooter_interval_ms = values.shooterIntervalMs;
     cfg_shooter_dark_mean_min = values.shooterDarkMeanMin;
     cfg_shooter_min_change_pct = values.shooterMinChangePct;
+    cfg_shooter_motion_hint_change_pct = values.shooterMotionHintChangePct;
+    cfg_shooter_motion_hint_required_hits = values.shooterMotionHintRequiredHits;
+    cfg_shooter_motion_hint_window_frames = values.shooterMotionHintWindowFrames;
     cfg_shooter_force_save_seconds = values.shooterForceSaveSeconds;
     cfg_shooter_flush_seconds = values.shooterFlushSeconds;
 
@@ -5429,6 +5504,12 @@ config_loaded:
         String(cfg_shooter_dark_mean_min) +
         " min_change_pct=" +
         String(cfg_shooter_min_change_pct, 1) +
+        " motion_hint=" +
+        String(cfg_shooter_motion_hint_change_pct, 1) +
+        "%/" +
+        String(cfg_shooter_motion_hint_required_hits) +
+        "of" +
+        String(cfg_shooter_motion_hint_window_frames) +
         " force_save_s=" +
         String(cfg_shooter_force_save_seconds) +
         " flush_s=" +
