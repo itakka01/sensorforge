@@ -8,6 +8,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <string.h>
+#include <math.h>
+#include <limits.h>
 
 namespace {
 
@@ -33,6 +35,10 @@ static uint64_t statBytesCaptured = 0;
 static uint64_t statBytesDelivered = 0;
 static uint64_t statBytesDropped = 0;
 static size_t statBufferHighWater = 0;
+static uint64_t statSignalSamples16 = 0;
+static uint64_t statSignalSquareSum16 = 0;
+static int32_t statSignalPeakAbs16 = 0;
+static volatile bool signalMetricsEnabled = false;
 
 static const size_t AUDIO_RING_MIN_BYTES = 256U * 1024U;
 static const size_t AUDIO_RING_MAX_BYTES = 1024U * 1024U;
@@ -137,6 +143,9 @@ static void resetStats()
     statBytesDelivered = 0;
     statBytesDropped = 0;
     statBufferHighWater = 0;
+    statSignalSamples16 = 0;
+    statSignalSquareSum16 = 0;
+    statSignalPeakAbs16 = 0;
     portEXIT_CRITICAL(&statsMux);
 }
 
@@ -226,8 +235,44 @@ static void captureTask(void *)
             continue;
         }
 
+        uint64_t localSignalSamples16 = 0;
+        uint64_t localSignalSquareSum16 = 0;
+        int32_t localSignalPeakAbs16 = 0;
+
+        if (
+            signalMetricsEnabled &&
+            activeFormat.bitsPerSample == 16
+        ) {
+            size_t aligned = got & ~(size_t)1U;
+
+            for (size_t i = 0; i < aligned; i += 2U) {
+                int16_t sample =
+                    (int16_t)(
+                        (uint16_t)captureScratch[i] |
+                        ((uint16_t)captureScratch[i + 1U] << 8)
+                    );
+
+                int32_t magnitude =
+                    sample == INT16_MIN
+                    ? 32768
+                    : abs((int)sample);
+
+                if (magnitude > localSignalPeakAbs16)
+                    localSignalPeakAbs16 = magnitude;
+
+                int32_t sample32 = sample;
+                localSignalSquareSum16 +=
+                    (uint64_t)(sample32 * sample32);
+                localSignalSamples16++;
+            }
+        }
+
         portENTER_CRITICAL(&statsMux);
         statBytesCaptured += (uint64_t)got;
+        statSignalSamples16 += localSignalSamples16;
+        statSignalSquareSum16 += localSignalSquareSum16;
+        if (localSignalPeakAbs16 > statSignalPeakAbs16)
+            statSignalPeakAbs16 = localSignalPeakAbs16;
         portEXIT_CRITICAL(&statsMux);
 
         size_t stored = ringWrite(captureScratch, got);
@@ -817,15 +862,30 @@ AudioFormat audioCaptureActiveFormat()
 AudioCaptureStats audioCaptureStats()
 {
     AudioCaptureStats stats = {};
+    uint64_t squareSum16 = 0;
 
     portENTER_CRITICAL(&statsMux);
     stats.bytesCaptured = statBytesCaptured;
     stats.bytesDelivered = statBytesDelivered;
     stats.bytesDropped = statBytesDropped;
     stats.bufferHighWater = statBufferHighWater;
+    stats.signalSamples16 = statSignalSamples16;
+    stats.signalPeakAbs16 = statSignalPeakAbs16;
+    squareSum16 = statSignalSquareSum16;
     portEXIT_CRITICAL(&statsMux);
 
     stats.bufferCapacity = ringCapacity;
+
+    if (stats.signalSamples16 > 0) {
+        stats.signalRms16 =
+            sqrtf(
+                (float)(
+                    (double)squareSum16 /
+                    (double)stats.signalSamples16
+                )
+            );
+    }
+
     return stats;
 }
 
@@ -833,4 +893,10 @@ AudioCaptureStats audioCaptureStats()
 size_t audioCaptureBufferedBytes()
 {
     return ringAvailableUnsafe();
+}
+
+
+void audioCaptureSetSignalMetricsEnabled(bool enabled)
+{
+    signalMetricsEnabled = enabled;
 }

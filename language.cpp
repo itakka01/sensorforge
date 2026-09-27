@@ -353,11 +353,8 @@ static const UiTextEntry UI_TEXTS[] = {
     {"Standard-I2S-Mikrofon", "Standard I2S microphone"}, // UI_AUDIO_BACKEND_I2S
     {"Externe GPIO-Zuordnung", "External GPIO assignment"}, // UI_AUDIO_EXTERNAL_PINS
     {"I2S Slot", "I2S slot"}, // UI_AUDIO_I2S_SLOT
-    {"Änderungen an Audioquelle, Backend oder GPIOs zuerst speichern. Der WAV-Test verwendet die gespeicherte Hardwarekonfiguration; die Formatwerte im Formular können dagegen direkt getestet werden.", "Save changes to audio source, backend or GPIOs first. The WAV test uses the saved hardware configuration; format values in the form can still be tested directly."}, // UI_AUDIO_SAVE_HARDWARE_NOTE
-    {"10 s WAV-Audiotest aufnehmen", "Record 10 s WAV audio test"}, // UI_AUDIO_TEST
-    {"Testet Mikrofon, PSRAM-Puffer und den normalen SensorForge-Speicherpfad. Bei aktivierter Aufnahmeverschlüsselung wird auch die WAV-Datei verschlüsselt gespeichert und transparent heruntergeladen.", "Tests microphone, PSRAM buffering and the normal SensorForge storage path. When recording encryption is enabled, the WAV file is also stored encrypted and downloaded transparently."}, // UI_AUDIO_TEST_HELP
+    {"Änderungen an Audioquelle, Backend, GPIOs oder Format zuerst speichern. Der Systemtest verwendet ausschließlich die gespeicherte Audiokonfiguration.", "Save changes to audio source, backend, GPIOs, or format first. The System test uses only the saved audio configuration."}, // UI_AUDIO_SAVE_HARDWARE_NOTE
     {"Für die aktuell gespeicherte Audioquelle ist kein Eingang verfügbar.", "No input is available for the currently saved audio source."}, // UI_AUDIO_NO_INPUT
-    {"Audio verwendet dieselbe recording_encryption-Policy wie Video und Shooter-Medien; es gibt keinen separaten unverschlüsselten Audio-Sonderpfad.", "Audio uses the same recording_encryption policy as video and shooter media; there is no separate unencrypted audio path."}, // UI_AUDIO_ENCRYPTION_NOTE
     {"empfohlen", "recommended"}, // UI_AUDIO_RECOMMENDED
     {"Audio", "Audio"}, // UI_AUDIO_ENABLE
     {"an", "on"}, // UI_AUDIO_ON
@@ -367,48 +364,33 @@ static const UiTextEntry UI_TEXTS[] = {
     {"Erweiterte Audioeinstellungen", "Advanced audio settings"}, // UI_AUDIO_ADVANCED_TITLE
     {"Diese Werte sind für erfahrene Benutzer und externe Mikrofonhardware gedacht. Der User-Modus verwendet den Board-Standard.", "These values are intended for experienced users and external microphone hardware. User mode uses the board default."}, // UI_AUDIO_ADVANCED_HELP
     {"Schließen", "Close"}, // UI_AUDIO_CLOSE
-    {"10-Sekunden-Audiotest läuft", "10-second audio test running"}, // UI_AUDIO_TEST_RUNNING
-    {"Mikrofon, PSRAM-Puffer und Speicherpfad werden geprüft. Die Seite wechselt nach Abschluss automatisch zum Ergebnis.", "Microphone, PSRAM buffering and the storage path are being tested. The page changes to the result automatically when finished."}, // UI_AUDIO_TEST_RUNNING_HELP
-    {"Die Bewegung des Balkens zeigt Aktivität, keinen künstlichen Prozentwert.", "The moving bar indicates activity, not an artificial percentage."}, // UI_AUDIO_PROGRESS_NOTE
-    {"Audio-Belastungstest", "Audio load test"}, // UI_AUDIO_BENCHMARK
-    {"Prüft bewusst nur den Audio-Capture-Pfad ohne SD-Schreiblast. Für die Produktionsqualifikation zusätzlich eine echte MKV-Aufnahme mit Kamera + Audio + SD und gegebenenfalls Verschlüsselung testen.", "Deliberately tests only the audio capture path without SD write load. For production qualification, also test a real MKV recording with camera + audio + SD and encryption when enabled."}, // UI_AUDIO_BENCHMARK_HELP
-    {"Audio-Belastungstest läuft", "Audio load test running"}, // UI_AUDIO_BENCHMARK_RUNNING
-    {"Der Audio-Capture-Pfad wird 10 Sekunden belastet und vermessen. Es wird dabei keine Benchmark-Audiodatei auf SD geschrieben.", "The audio capture path is stressed and measured for 10 seconds. No benchmark audio file is written to SD."}, // UI_AUDIO_BENCHMARK_RUNNING_HELP
     {"Bei Audio = an verwendet SensorForge für normale Aufnahmen automatisch MKV. AVI bleibt vorerst video-only.", "When Audio = on, SensorForge automatically uses MKV for normal recordings. AVI remains video-only for now."}, // UI_AUDIO_MKV_REQUIRED
-    {"AUDIO CAPTURE GOOD", "AUDIO CAPTURE GOOD"}, // UI_AUDIO_LOAD_GOOD
-    {"AUDIO CAPTURE PRÜFEN", "CHECK AUDIO CAPTURE"}, // UI_AUDIO_LOAD_CHECK
-    {"AUDIO CAPTURE NICHT EMPFOHLEN", "AUDIO CAPTURE NOT RECOMMENDED"}, // UI_AUDIO_LOAD_NOT_RECOMMENDED
-    {"Bewertet nur Mikrofon, Capture-Task und PSRAM-Puffer. Kamera, MKV, SD und Verschlüsselung sind in diesem Test nicht gleichzeitig aktiv.", "Rates only microphone, capture task and PSRAM buffering. Camera, MKV, SD and encryption are not active simultaneously in this test."}, // UI_AUDIO_LOAD_SCOPE
-    {"Datenrate", "Data delivery"}, // UI_AUDIO_LOAD_DELIVERY
-    {"Verlorene Audiodaten", "Dropped audio"}, // UI_AUDIO_LOAD_DROPS
-    {"PSRAM-Puffer", "PSRAM buffer"}, // UI_AUDIO_LOAD_BUFFER
-    {"Drain-Timing", "Drain timing"}, // UI_AUDIO_LOAD_DRAIN
-    {"Interner Heap", "Internal heap"}, // UI_AUDIO_LOAD_HEAP
-    {"Freies PSRAM", "Free PSRAM"}, // UI_AUDIO_LOAD_PSRAM
-    {"Technische Messwerte", "Technical measurements"}, // UI_AUDIO_LOAD_TECH_DETAILS
     {"GRÜN", "GREEN"}, // UI_AUDIO_LOAD_GREEN
     {"ORANGE", "ORANGE"}, // UI_AUDIO_LOAD_ORANGE
     {"ROT", "RED"}, // UI_AUDIO_LOAD_RED
-    {"Recording Load Test", "Recording load test"}, // UI_RECORDING_LOAD_TITLE
-    {"Misst den echten gespeicherten Medienpfad mit Kamera, aktuellem Container, Audio falls aktiviert, SD und optionaler Verschlüsselung. Bewegungs-/Eventlogik und automatische Segmentrotation steuern den Test bewusst nicht; der temporäre Testcontainer läuft für die gewählte Dauer durch und wird danach gelöscht. Reale Segment-Finalisierungszeiten werden zusätzlich im normalen Aufnahme-Log erfasst.", "Measures the real saved media path with camera, current container, audio when enabled, SD and optional encryption. Motion/event logic and automatic segment rotation deliberately do not control the test; the temporary test container runs for the selected duration and is then removed. Real segment finalization times are additionally captured in the normal recording log."}, // UI_RECORDING_LOAD_HELP
+    {"Systemtest", "System test"}, // UI_RECORDING_LOAD_TITLE
+    {"Prüft SensorForge unter realer Aufnahmelast mit den aktuell gespeicherten Einstellungen. Kamera, Aufnahme, SD, Speicher, Temperatur, Audio falls aktiviert und Verschlüsselung falls aktiviert werden gemeinsam geprüft.", "Checks SensorForge under real recording load using the currently saved settings. Camera, recording, SD, memory, temperature, audio when enabled, and encryption when enabled are tested together."}, // UI_RECORDING_LOAD_HELP
     {"Testdauer", "Test duration"}, // UI_RECORDING_LOAD_DURATION
-    {"Recording Load Test starten", "Start recording load test"}, // UI_RECORDING_LOAD_BUTTON
+    {"Systemtest starten", "Start system test"}, // UI_RECORDING_LOAD_BUTTON
     {"Verwendet ausschließlich die aktuell gespeicherten Einstellungen. Änderungen im Formular daher zuerst speichern. 30 s ist der schnelle Standardtest; 5 bis 60 Minuten eignen sich für Langzeit-, Temperatur- und seltene Latenzspitzen.", "Uses only the currently saved settings. Save form changes first. 30 s is the quick standard test; 5 to 60 minutes are intended for sustained load, thermal behavior and rare latency spikes."}, // UI_RECORDING_LOAD_SAVED_NOTE
-    {"Recording Load Test läuft", "Recording load test running"}, // UI_RECORDING_LOAD_RUNNING
+    {"Systemtest läuft", "System test running"}, // UI_RECORDING_LOAD_RUNNING
     {"Kamera, Recorder, Audio, SD und gegebenenfalls Verschlüsselung werden gemeinsam belastet. Die Seite wechselt nach Abschluss automatisch zum Ergebnis.", "Camera, recorder, audio, SD and encryption when enabled are stressed together. The page changes to the result automatically when finished."}, // UI_RECORDING_LOAD_RUNNING_HELP
-    {"Recording Load Test fehlgeschlagen", "Recording load test failed"}, // UI_RECORDING_LOAD_FAILED
-    {"RECORDING LOAD GOOD", "RECORDING LOAD GOOD"}, // UI_RECORDING_LOAD_GOOD
-    {"RECORDING LOAD PRÜFEN", "CHECK RECORDING LOAD"}, // UI_RECORDING_LOAD_CHECK
-    {"RECORDING LOAD NICHT EMPFOHLEN", "RECORDING LOAD NOT RECOMMENDED"}, // UI_RECORDING_LOAD_NOT_RECOMMENDED
+    {"Systemtest fehlgeschlagen", "System test failed"}, // UI_RECORDING_LOAD_FAILED
+    {"SYSTEMTEST GUT", "SYSTEM TEST GOOD"}, // UI_RECORDING_LOAD_GOOD
+    {"SYSTEMTEST PRÜFEN", "CHECK SYSTEM TEST"}, // UI_RECORDING_LOAD_CHECK
+    {"SYSTEMTEST NICHT BESTANDEN", "SYSTEM TEST FAILED"}, // UI_RECORDING_LOAD_NOT_RECOMMENDED
     {"Die Gesamtampel entspricht immer der schlechtesten Einzelbewertung. Es wird kein Mittelwert verwendet, der einen kritischen Engpass verdecken könnte.", "The overall rating always follows the worst individual rating. No average score is used that could hide a critical bottleneck."}, // UI_RECORDING_LOAD_SCOPE
     {"Video-/Frame-Timing", "Video/frame timing"}, // UI_RECORDING_LOAD_TIMING
-    {"Audio-Capture", "Audio capture"}, // UI_RECORDING_LOAD_AUDIO
+    {"Audio", "Audio"}, // UI_RECORDING_LOAD_AUDIO
+    {"Mikrofonsignal", "Microphone signal"}, // UI_RECORDING_LOAD_AUDIO_SIGNAL
+    {"Signal erkannt", "Signal detected"}, // UI_RECORDING_LOAD_AUDIO_SIGNAL_DETECTED
+    {"Kein Mikrofonsignal erkannt. Es wurden Audiodaten übertragen, aber kein auswertbares 16-Bit-Signal gemessen.", "No microphone signal detected. Audio bytes were transferred, but no usable 16-bit signal was measured."}, // UI_RECORDING_LOAD_AUDIO_SIGNAL_MISSING
     {"Storage / Finalize", "Storage / finalize"}, // UI_RECORDING_LOAD_STORAGE
     {"Heap / PSRAM", "Heap / PSRAM"}, // UI_RECORDING_LOAD_MEMORY
     {"Temperatur", "Temperature"}, // UI_RECORDING_LOAD_THERMAL
     {"Technische Messwerte", "Technical measurements"}, // UI_RECORDING_LOAD_TECH_DETAILS
     {"Verschlüsselung", "Encryption"}, // UI_RECORDING_LOAD_ENCRYPTION
-    {"Timing: Grün ohne Budgetüberschreitung, mindestens 99,5 % Frame-Lieferquote und P99 unter 80 % des Framebudgets. Orange bei einzelnen Budgetüberschreitungen unter 1 %, 98–99,5 % Frame-Lieferquote, P99 ab 80 % oder einem einzelnen Aufruf über Budget. Rot bei P99 über dem Budget, mindestens 1 % Budgetüberschreitungen, unter 98 % Frame-Lieferquote oder einem extremen Einzelhänger über dem Fünffachen des Framebudgets. Audio: Grün ohne Drops und unter 50 % Puffer, Orange bei einzelnen Drops/50–90 %, Rot ab 1 % Drops oder 90 % Puffer. Storage: Finalisierung Grün bis 2 s, Orange bis 5 s, darüber Rot; beim MKV-PSRAM-Write-Behind zusätzlich Grün unter 50 % High-Water ohne Producer-Wartezeit, Orange ab 50 % oder bei Wartezeit, Rot ab 90 % oder bei Pufferfehler. Interner Heap: Grün ab 64 KiB, Orange 32–64 KiB, darunter Rot; PSRAM: Grün ab 512 KiB, Orange 256–512 KiB, darunter Rot. Temperatur folgt den Firmware-Sicherheitsgrenzen 70 °C Warnung / 80 °C Notprogramm.", "Timing: Green with no budget overrun, at least 99.5% frame delivery and P99 below 80% of the frame budget. Orange for isolated overruns below 1%, 98–99.5% frame delivery, P99 from 80%, or a single call above budget. Red when P99 exceeds budget, at least 1% of calls exceed budget, frame delivery falls below 98%, or one extreme stall exceeds five times the frame budget. Audio: green with no drops and below 50% buffer, orange for isolated drops/50–90%, red from 1% drops or 90% buffer. Storage: finalize is green up to 2 s, orange up to 5 s and red above; for MKV PSRAM write-behind, green also requires below 50% high-water with no producer wait, orange starts at 50% or any producer wait, and red starts at 90% or a buffer failure. Internal heap: green from 64 KiB, orange 32–64 KiB, red below; PSRAM: green from 512 KiB, orange 256–512 KiB, red below. Temperature follows the firmware safety limits of 70 °C warning / 80 °C emergency."}, // UI_RECORDING_LOAD_THRESHOLDS_NOTE
+    {"Timing: Grün ohne Budgetüberschreitung, mindestens 99,5 % Frame-Lieferquote und P99 unter 80 % des Framebudgets. Orange bei einzelnen Budgetüberschreitungen unter 1 %, 98–99,5 % Frame-Lieferquote, P99 ab 80 % oder einem einzelnen Aufruf über Budget. Rot bei P99 über dem Budget, mindestens 1 % Budgetüberschreitungen, unter 98 % Frame-Lieferquote oder einem extremen Einzelhänger über dem Fünffachen des Framebudgets. Audio: Grün mit erkanntem Mikrofonsignal, ohne Drops und unter 50 % Puffer; Orange bei einzelnen Drops/50–90 %; Rot bei fehlendem Mikrofonsignal, ab 1 % Drops oder 90 % Puffer. Storage: Finalisierung Grün bis 2 s, Orange bis 5 s, darüber Rot; beim MKV-PSRAM-Write-Behind zusätzlich Grün unter 50 % High-Water ohne Producer-Wartezeit, Orange ab 50 % oder bei Wartezeit, Rot ab 90 % oder bei Pufferfehler. Interner Heap: Grün ab 64 KiB, Orange 32–64 KiB, darunter Rot; PSRAM: Grün ab 512 KiB, Orange 256–512 KiB, darunter Rot. Temperatur folgt den Firmware-Sicherheitsgrenzen 70 °C Warnung / 80 °C Notprogramm.", "Timing: Green with no budget overrun, at least 99.5% frame delivery and P99 below 80% of the frame budget. Orange for isolated overruns below 1%, 98–99.5% frame delivery, P99 from 80%, or a single call above budget. Red when P99 exceeds budget, at least 1% of calls exceed budget, frame delivery falls below 98%, or one extreme stall exceeds five times the frame budget. Audio: green with a detected microphone signal, no drops and below 50% buffer; orange for isolated drops/50–90%; red when no microphone signal is detected, from 1% drops, or at 90% buffer. Storage: finalize is green up to 2 s, orange up to 5 s and red above; for MKV PSRAM write-behind, green also requires below 50% high-water with no producer wait, orange starts at 50% or any producer wait, and red starts at 90% or a buffer failure. Internal heap: green from 64 KiB, orange 32–64 KiB, red below; PSRAM: green from 512 KiB, orange 256–512 KiB, red below. Temperature follows the firmware safety limits of 70 °C warning / 80 °C emergency."}, // UI_RECORDING_LOAD_THRESHOLDS_NOTE
     {"Verstrichen", "Elapsed"}, // UI_RECORDING_LOAD_ELAPSED
     {"Frames", "Frames"}, // UI_RECORDING_LOAD_FRAMES
     {"Frame-Lieferquote", "Frame delivery"}, // UI_RECORDING_LOAD_FRAME_DELIVERY
@@ -429,7 +411,7 @@ static const UiTextEntry UI_TEXTS[] = {
     {"PSRAM vor/min/nach", "PSRAM before/min/after"}, // UI_RECORDING_LOAD_PSRAM_STATS
     {"CPU-Temperatur Start/Max/Ende", "CPU temperature start/max/end"}, // UI_RECORDING_LOAD_CPU_STATS
     {"Lange Tests laufen unabhängig von der geöffneten Browserseite im normalen Firmware-Loop weiter. 5, 15, 30 und 60 Minuten sind verfügbar. Über 60 Minuten wird bewusst nicht als einzelner Test angeboten, da der MKV-Writer Dateien unter 4 GiB hält; längere Endurance-Tests sollten segmentiert werden.", "Long tests continue in the normal firmware loop independently of the open browser page. 5, 15, 30 and 60 minutes are available. More than 60 minutes is deliberately not offered as one test because the MKV writer keeps files below 4 GiB; longer endurance tests should be segmented."}, // UI_RECORDING_LOAD_LONG_NOTE
-    {"Recording Load Test läuft", "Recording Load Test running"}, // UI_RECORDING_LOAD_STATUS_TITLE
+    {"Systemtest läuft", "System test running"}, // UI_RECORDING_LOAD_STATUS_TITLE
     {"Fortschritt", "Progress"}, // UI_RECORDING_LOAD_PROGRESS
     {"Test abbrechen", "Abort test"}, // UI_RECORDING_LOAD_ABORT
     {"Abbruch angefordert ...", "Abort requested ..."}, // UI_RECORDING_LOAD_ABORTING

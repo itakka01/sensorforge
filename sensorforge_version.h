@@ -20,8 +20,8 @@
 // The same release tag is written to the firmware boot log and shown in
 // WebConfig, so a running device can be mapped back to the exact Git tag.
 
-#define SENSORFORGE_RELEASE_NUMBER 75
-#define SENSORFORGE_RELEASE_TAG "v75"
-#define SENSORFORGE_RELEASE_DATE "2026-09-27"
+#define SENSORFORGE_RELEASE_NUMBER 83
+#define SENSORFORGE_RELEASE_TAG "v83"
+#define SENSORFORGE_RELEASE_DATE "2026-09-28"
 #define SENSORFORGE_RELEASE_SUMMARY \
-    "Right-align Power-Shooter motion hints and explain each hint with its recorded trigger rule."
+    "Simplify general configuration layout with clearer audio, timezone, network, LED and debug controls."

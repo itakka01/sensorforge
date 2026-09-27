@@ -1,5 +1,82 @@
 # SensorForge Changelog
 
+## v83 — 2026-09-28
+
+- Reordered the general Configuration page so the complete **Audio / Mikrofon** block now sits directly before **Sleep / Stromsparen** instead of between recording/media settings. Audio enable, advanced audio modal and all existing save/validation semantics are unchanged.
+- Simplified the Bootloop/undervoltage help text by removing the redundant normal-shutdown sentence.
+- Reworded the LED control for non-technical users as **Aktiviert - Status-LED verwenden** / **Deaktiviert - Status-LED bleibt aus** without changing `led_enabled`.
+- Replaced the free-text POSIX timezone field with an alphabetically grouped dropdown of 33 common worldwide regions. The stored values remain the existing POSIX TZ strings, including DST rules where applicable. Existing custom/legacy timezone strings that are not in the list are preserved as a selected compatibility option rather than overwritten.
+- Reworked WLAN, Hotspot and Web-access fields into clearer labelled grids with user-facing names and password placeholders while retaining the same config keys and password-preservation behavior. The web recording auto-pause wording now uses normal German umlauts and no longer exposes the raw config key as the primary label.
+- Reworded Debug as **Debug-Ausgaben** with understandable dropdown choices and an info dialog explaining that extra technical diagnostics/log writes are intended for fault analysis, not normal operation.
+- No config schema, runtime network logic, NTP/time handling, audio backend, sleep logic, bootloop protection, logging implementation or password storage behavior was changed.
+
+## v82 — 2026-09-28
+
+- Consolidated the user-facing diagnostics into one **Systemtest** on the **System** page. The existing production-path Recording Load Test remains the underlying engine and still exercises the real camera -> recorder/container -> SD path, including embedded audio and SD encryption when enabled, plus memory and thermal telemetry.
+- Removed the separate 10-second WAV audio-test and capture-only Audio load-test buttons from the normal Audio configuration UI. Their historical POST routes remain as compatibility redirects to the Systemtest so stale pages/bookmarks do not create a second test workflow.
+- Added diagnostic-only 16-bit microphone signal measurement (peak/RMS) to `audio_capture`. It is enabled only while the explicit Systemtest is active, so normal recordings incur no permanent per-sample analysis overhead. A requested audio test now fails if bytes are flowing but the measured PCM signal is digital silence.
+- Moved Systemtest duration/start/status/last-result controls from general Configuration to System. Test status and result pages now return to the System page.
+- Kept the underlying recording-load state machine, temporary-media cleanup, SD-reserve protection, thermal emergency handling, MKV/write-behind diagnostics and long-test durations unchanged.
+
+## v81 — 2026-09-28
+
+- Simplified the general Config page: config-storage behavior, factory reset details and recording-mode explanations now live behind concise info buttons.
+- Removed the obsolete SFSEC1 explanatory paragraph from the visible Config page.
+- Promoted the automatic recording trigger into a dedicated highlighted control with a clear info explanation and a direct button to Image Motion settings.
+- Moved recording/log SD encryption completely from the general Config page to SD Maintenance.
+- Added a dedicated encryption save path that preserves all unrelated config keys and retains the existing one-time ESP32-S3 eFuse provisioning behavior on first activation.
+- General Config saves now preserve recording_encryption unchanged so unrelated settings cannot disable encryption accidentally.
+
+## v80 — 2026-09-28
+
+- Simplified **SD Wartung** for normal users without changing the underlying storage/recovery/benchmark/format logic. The page header now carries the existing **SD BEREIT** and **SD GEMOUNTET** status pills so card state is visible immediately.
+- Condensed the storage-reserve policy wording to **Aktion bei unterschrittener Speicherreserve** and removed the redundant two-line explanation.
+- Reworked **SD Benchmark** as the single canonical benchmark name. The normal page now shows only a short purpose statement; the full test description is behind an info button. Existing benchmark scope remains unchanged, including verified raw endurance, production recording/SFENC1 stack testing and bus-clock checks. Detailed performance measurements are collapsed under **Messwerte anzeigen**.
+- Moved **SD Recovery** to the bottom of the page and labelled it explicitly **SD Recovery (Notfall)**. The visible text now states that it should only be used when a card is no longer detected/mounted correctly. Technical read-only/mount-retry details are behind an info button; post-run diagnostics remain available in a collapsed technical-details section.
+- Removed the redundant **Destruktive SD-Wartung** banner and permanent **Config-Schutz** explanation from the normal page. The existing internal config-protection implementation is unchanged.
+- Moved the explanatory texts for **SD Wipe**, **SD Format** and **Secure Erase** behind inline info buttons. Destructive confirmation dialogs, progress handling, config protection, reboot behavior and backend capability checks are unchanged.
+- Simplified destructive-operation confirmation wording so normal users are not exposed to internal config-storage terminology.
+
+## v79 — 2026-09-27
+
+- Removed the complete Power Shooter tuning block from the general Configuration page and added a dedicated **Power Shooter** menu entry under **System**. The new page owns storage format, interval, darkness threshold, minimum-change filter, force-save, flush interval and the existing advanced motion-hint rule.
+- Added `configSaveShooterSettings()` as a dedicated narrow persistence path. It patches only Shooter-specific keys in the active `config.txt`, validates the complete resulting config and keeps the in-RAM Shooter values coherent. Shooter enable/disable remains intentionally owned by the normal Recording mode so `Motion`, `Shooter` and combined operation still have one mode selector.
+- General Configuration saves no longer read Shooter tuning from the browser form; they preserve the currently active Shooter values verbatim. This removes the duplicate edit path and prevents unrelated Configuration saves from overwriting settings changed on the dedicated Shooter page.
+- Moved `min_free_space_mb` and `disk_full_action` from general Configuration to a new **Speicher / SD-Sicherheit** section at the top of **SD Wartung**.
+- Added `configSaveStorageSafety()` as the dedicated persistence path for those two storage-policy keys. The SD Maintenance page now saves the reserve and full-card action directly while preserving all unrelated config keys/comments.
+- General Configuration saves now preserve the current SD-safety values rather than accepting a second edit path. Existing rollover/stop runtime semantics, storage guard behavior, Shooter capture/flush logic and recording mode behavior are unchanged.
+
+## v78 — 2026-09-27
+
+- Added user-facing camera-load guidance to the normal Camera page. `1024x768` now shows an amber **Erhöhte Systemlast** warning; `1280x1024`, `1600x1200` and `2048x1536` show a stronger **Hohe Systemlast** warning. The existing backend performance validator remains unchanged and authoritative at save time.
+- Simplified the live-camera area: removed the redundant **Live-Vorschau & Sensor-Ausschnitt** heading and the permanent technical Advanced-settings explanation. The label now reads only **Live-Vorschau**, with its safety explanation behind the adjacent info button.
+- Moved the display-only preview zoom controls (`- / + / Fit / 100%` and keyboard shortcuts) directly below the live image so they are visually associated with viewing the image rather than persistent camera configuration.
+- Expanded beginner help on **Erweiterte Kameraeinstellungen** with info buttons for FPS, JPEG quality, camera XCLK, Auto Exposure and AE level. FPS help explicitly explains frames per second and warns that more than 4 fps causes substantially higher system load and is not recommended on smaller boards.
+- Replaced the raw weighted performance-score text on the Advanced page with a simpler qualified maximum-FPS statement plus an amber warning when the selected value exceeds 4 fps.
+- Added **Standardwerte einsetzen** on the Advanced Camera page. It only fills the form; nothing is persisted until the user presses the existing save button. Defaults follow the existing firmware policy (quality 12, Auto Exposure on, AE level -1, board-default XCLK, and a performance-safe default FPS for the currently selected resolution).
+- No camera save semantics, config validation, Preview gate, OV3660 crop, recording, Shooter, storage, encryption or transport runtime behavior was changed.
+
+## v77 — 2026-09-27
+
+- Simplified the Transport save confirmation to the single operator-facing message **Transportwerte gespeichert.** The implementation/persistence location is no longer exposed in the normal UI.
+- Moved the detailed automatic Transport black-reference measurement explanation behind a small info button. The active measurement progress dialog remains visible while the measurement is actually running.
+- Made manual Shutdown reload-safe: the shutdown status page resets the browser address to `/` shortly after it loads without issuing a new request. The visible shutdown page remains on screen while the board enters Deep Sleep, but the next user reload after power/reset opens the normal start page instead of `/shutting_down`.
+- Simplified the main Camera page. Camera model is now a dropdown (OV2640/OV3660, while preserving an existing legacy value if present), resolution is a dropdown containing exactly the eight resolutions accepted by the existing config validator, and rotation remains in the normal camera settings. Free-text camera model/resolution entry is removed from the normal UI.
+- Added a dedicated **Erweiterte Kameraeinstellungen** page for FPS, JPEG quality, camera XCLK, Auto Exposure and AE level. Both normal and advanced pages continue to use the existing `configSaveCameraSettings()` path, complete config validation and internal/SD persistence policy; hidden fields preserve the settings owned by the other page.
+- Moved the Live Preview safety explanation behind an info button. The preview gate itself is unchanged: Detection and Recording remain disabled while the Camera preview is active.
+- Camera model handling was not functionally reinterpreted: board-specific builds still select their pin map from the board definition, and runtime sensor capabilities/PID checks remain authoritative for OV3660-only features such as raw sensor crop.
+- No recording, Shooter, Sparse-MKV, encryption, storage, transport runtime, camera-crop or OTA behavior was removed.
+
+## v76 — 2026-09-27
+
+- Consolidated the complete camera-facing configuration on the canonical **Kamera** page (`/preview`). Camera model, resolution, recording FPS, JPEG quality, XCLK, Auto Exposure, AE level and rotation now live together with the existing Live Preview and OV3660 sensor-crop controls.
+- Removed the visible Camera section from the general Configuration page. The general save form still carries the current camera values as hidden fields so saving unrelated settings cannot reset, delete or silently revert any camera setting.
+- Added a dedicated camera-settings persistence path that patches only the non-crop camera keys in the existing active `config.txt`, validates the complete resulting configuration through the normal validator and writes it through the existing internal/SD synchronization policy. Unrelated config keys, comments and future keys are preserved.
+- The existing OV3660 live Crop Apply/Save path is unchanged and remains separate because it can be tested directly on the active sensor before persistence. Crop/zoom is nevertheless on the same Camera page, so all camera controls now have one UI home.
+- Camera-save success keeps the in-RAM camera config coherent to prevent a later general config save before reboot from restoring stale camera values. Sensor settings that require camera reinitialization still become fully active after reboot, matching the previous configuration semantics.
+- When a saved non-FPS sensor setting differs from the currently initialized camera, Live Preview/Crop is deliberately paused until reboot and the Camera page shows a restart notice. This prevents old sensor output from being mistaken for the newly saved configuration or being used for a crop test under mismatched geometry.
+- The top navigation **Kamera** entry is now a direct link to the consolidated Camera page instead of a one-item dropdown. Existing `/preview`, `/snapshot`, crop, recording-priority and preview-gate behavior remain intact.
+
 ## v75 — 2026-09-27
 
 - Moved the orange **Bewegungsverdacht** badge to the right side of each recording row so time range, size and action controls remain visually aligned with rows that do not carry a hint.

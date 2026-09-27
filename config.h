@@ -294,6 +294,55 @@ ConfigSaveResult configSaveCameraCrop(
     String &error
 );
 
+// Persist the non-crop camera settings while preserving every unrelated config
+// key/comment. The Camera page uses this dedicated path so camera settings no
+// longer need to be edited through the general configuration form.
+ConfigSaveResult configSaveCameraSettings(
+    const String &camera,
+    const String &resolution,
+    int fps,
+    int quality,
+    int cameraXclkMhz,
+    int cameraAutoExposure,
+    int cameraAeLevel,
+    int rotation,
+    bool writeToSd,
+    String &error
+);
+
+// Persist only Power Shooter tuning while preserving every unrelated config
+// key/comment. Shooter enable/disable remains owned by the normal Recording mode.
+ConfigSaveResult configSaveShooterSettings(
+    const String &storageFormat,
+    int intervalMs,
+    int darkMeanMin,
+    float minChangePct,
+    float motionHintChangePct,
+    int motionHintRequiredHits,
+    int motionHintWindowFrames,
+    int forceSaveSeconds,
+    int flushSeconds,
+    bool writeToSd,
+    String &error
+);
+
+// Persist only the SD reserve/full-disk policy while preserving every unrelated
+// config key/comment. Used by the dedicated SD Maintenance page.
+ConfigSaveResult configSaveStorageSafety(
+    int minFreeSpaceMb,
+    const String &diskFullAction,
+    bool writeToSd,
+    String &error
+);
+
+// Persist only the recording/log encryption policy while preserving every
+// unrelated config key/comment. The SD Maintenance page owns this setting.
+ConfigSaveResult configSaveRecordingEncryption(
+    int enabled,
+    bool writeToSd,
+    String &error
+);
+
 // Persist only the WebConfig UI language while preserving the complete active
 // config text. The language setting is intentionally UI-only; API/config/log
 // field names remain language-neutral.

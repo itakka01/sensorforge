@@ -3,7 +3,6 @@
 #include "web_sd_maintenance.h"
 #include "config.h"
 #include "audio_capture.h"
-#include "audio_wav.h"
 #include "recording_load_test.h"
 #include "language.h"
 #include "board_config.h"
@@ -408,6 +407,12 @@ static const uint32_t IMAGE_MOTION_PREVIEW_ANALYSIS_INTERVAL_MS = 500UL;
 // restores the persisted cfg_camera_crop_* values automatically.
 static bool cameraPreviewCropTemporary = false;
 
+// Non-crop camera settings are persisted immediately but sensor parameters are
+// intentionally not hot-reinitialized. Once such a value changes, suppress the
+// preview until reboot so the UI cannot present old sensor output as if it were
+// already using the newly saved settings.
+static bool cameraSettingsRestartRequired = false;
+
 
 static bool restoreSavedCameraCrop()
 {
@@ -545,6 +550,80 @@ static String htmlEscape(const String &value)
     }
 
     return out;
+}
+
+
+static String pageInfoButton(
+    const String &title,
+    const String &info
+)
+{
+    return
+        "<button type='button' class='page-info-btn' aria-label='Information' "
+        "data-title='" + htmlEscape(title) + "' data-info='" + htmlEscape(info) + "'>i</button>";
+}
+
+
+struct ConfigTimezoneOption {
+    const char *label;
+    const char *value;
+};
+
+
+static const ConfigTimezoneOption CONFIG_TIMEZONE_OPTIONS[] = {
+    {"Afrika - Johannesburg", "SAST-2"},
+    {"Afrika - Nairobi", "EAT-3"},
+    {"Amerika - Alaska", "AKST9AKDT,M3.2.0,M11.1.0"},
+    {"Amerika - Arizona", "MST7"},
+    {"Amerika - Buenos Aires", "ART3"},
+    {"Amerika - Chicago / Central", "CST6CDT,M3.2.0,M11.1.0"},
+    {"Amerika - Denver / Mountain", "MST7MDT,M3.2.0,M11.1.0"},
+    {"Amerika - Honolulu", "HST10"},
+    {"Amerika - Los Angeles / Pacific", "PST8PDT,M3.2.0,M11.1.0"},
+    {"Amerika - Mexiko-Stadt", "CST6"},
+    {"Amerika - New York / Toronto / Eastern", "EST5EDT,M3.2.0,M11.1.0"},
+    {"Amerika - São Paulo", "BRT3"},
+    {"Asien - Bangkok", "ICT-7"},
+    {"Asien - Dubai", "GST-4"},
+    {"Asien - Hongkong", "HKT-8"},
+    {"Asien - Indien / Kolkata", "IST-5:30"},
+    {"Asien - Jakarta", "WIB-7"},
+    {"Asien - Seoul", "KST-9"},
+    {"Asien - Shanghai / Peking", "CST-8"},
+    {"Asien - Singapur", "SGT-8"},
+    {"Asien - Tokio", "JST-9"},
+    {"Australien - Adelaide", "ACST-9:30ACDT,M10.1.0,M4.1.0/3"},
+    {"Australien - Brisbane", "AEST-10"},
+    {"Australien - Perth", "AWST-8"},
+    {"Australien - Sydney / Melbourne", "AEST-10AEDT,M10.1.0,M4.1.0/3"},
+    {"Europa - Athen / Helsinki / Bukarest", "EET-2EEST,M3.5.0/3,M10.5.0/4"},
+    {"Europa - Istanbul", "TRT-3"},
+    {"Europa - London / Dublin / Lissabon", "GMT0BST,M3.5.0/1,M10.5.0"},
+    {"Europa - Moskau", "MSK-3"},
+    {"Europa - Reykjavík", "GMT0"},
+    {"Europa - Wien / Berlin / Zürich / Paris / Rom / Madrid", "CET-1CEST,M3.5.0,M10.5.0/3"},
+    {"Neuseeland - Auckland", "NZST-12NZDT,M9.5.0,M4.1.0/3"},
+    {"UTC", "UTC0"}
+};
+
+
+static void appendPageInfoUi(String &html)
+{
+    html +=
+        "<style>"
+        ".page-info-btn{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;min-width:24px;padding:0;margin:0 0 0 6px;border:1px solid #9ca3af;border-radius:50%;background:#fff;color:#334155;font-weight:700;line-height:1;cursor:pointer;vertical-align:middle}"
+        ".page-info-btn:hover{background:#f1f5f9}.page-info-backdrop{position:fixed;inset:0;background:rgba(15,23,42,.48);display:none;align-items:center;justify-content:center;padding:18px;z-index:10000}.page-info-backdrop.open{display:flex}"
+        ".page-info-modal{width:min(560px,100%);max-height:80vh;overflow:auto;background:#fff;border-radius:12px;padding:18px;box-shadow:0 18px 50px rgba(0,0,0,.25)}.page-info-modal-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.page-info-modal-head h3{margin:0}.page-info-close{font-size:1.35rem;line-height:1;padding:3px 9px;margin:0}.page-info-body{margin-top:12px;line-height:1.45;white-space:pre-line}"
+        "</style>"
+        "<div id='pageInfoBackdrop' class='page-info-backdrop' role='dialog' aria-modal='true' aria-hidden='true'>"
+        "<div class='page-info-modal'><div class='page-info-modal-head'><h3 id='pageInfoTitle'>Information</h3>"
+        "<button type='button' id='pageInfoClose' class='page-info-close' aria-label='Schließen'>×</button></div>"
+        "<div id='pageInfoBody' class='page-info-body'></div></div></div>"
+        "<script>(function(){var b=document.getElementById('pageInfoBackdrop'),t=document.getElementById('pageInfoTitle'),c=document.getElementById('pageInfoBody'),x=document.getElementById('pageInfoClose');"
+        "if(!b||!t||!c||!x)return;function closeInfo(){b.classList.remove('open');b.setAttribute('aria-hidden','true');}"
+        "function openInfo(btn){t.textContent=btn.getAttribute('data-title')||'Information';c.textContent=btn.getAttribute('data-info')||'';b.classList.add('open');b.setAttribute('aria-hidden','false');}"
+        "document.querySelectorAll('.page-info-btn').forEach(function(btn){btn.addEventListener('click',function(){openInfo(btn);});});"
+        "x.addEventListener('click',closeInfo);b.addEventListener('click',function(e){if(e.target===b)closeInfo();});document.addEventListener('keydown',function(e){if(e.key==='Escape')closeInfo();});})();</script>";
 }
 
 
@@ -1118,11 +1197,9 @@ static String htmlHeader()
         "</a></div></details>";
 
     html +=
-        "<details class='navdrop' id='navCamera'><summary data-nav='camera'>" +
+        "<a class='navitem' data-nav='camera' href='/preview'>" +
         htmlText(UI_NAV_CAMERA) +
-        "</summary><div class='dropdown'><a href='/preview'>" +
-        htmlText(UI_NAV_LIVE_PREVIEW) +
-        "</a></div></details>";
+        "</a>";
 
     html +=
         "<details class='navdrop' id='navSensor'><summary data-nav='sensor'>" +
@@ -1167,9 +1244,10 @@ static String htmlHeader()
         "</summary><div class='dropdown'>";
 
     html +=
+        "<a href='/system'>" + htmlText(UI_NAV_SYSTEM) + "</a>"
+        "<a href='/shooter'>Power Shooter</a>"
         "<a href='/sd_maintenance'>" + htmlText(UI_NAV_SD_MAINTENANCE) + "</a>"
         "<a href='/log'>" + htmlText(UI_NAV_LOG_VIEWER) + "</a>"
-        "<a href='/system'>" + htmlText(UI_NAV_SYSTEM) + "</a>"
         "<a href='/license'>" + htmlText(UI_NAV_LICENSE) + "</a>"
         "<a href='/transport'>" + htmlText(UI_NAV_TRANSPORT) + "</a>"
         "<div class='sep'></div><a class='danger-link' href='/reboot'>" +
@@ -1348,9 +1426,9 @@ static String htmlFooter()
         "var p=location.pathname;"
         "var group='';"
         "if(p==='/')group='home';"
-        "else if(p==='/config'||p==='/save'||p==='/audio_test_record'||p==='/audio_benchmark'||p.indexOf('/recording_load_test')===0)group='config';"
+        "else if(p==='/config'||p==='/save')group='config';"
         "else if(p.indexOf('/files')===0||p==='/file'||p==='/play')group='recordings';"
-        "else if(p==='/preview'||p==='/snapshot')group='camera';else if(p==='/image_motion')group='sensor';"
+        "else if(p==='/preview'||p==='/snapshot'||p==='/camera_advanced')group='camera';else if(p==='/image_motion')group='sensor';"
         "else if(p.indexOf('/radar_')===0)group='sensor';"
         "else group='system';"
         "var active=document.querySelector('[data-nav=\"'+group+'\"]');"
@@ -2967,7 +3045,7 @@ static void handleRoot()
         "<a class='button primary' href='/files'>" +
         htmlText(UI_NAV_RECORDINGS) +
         "</a><a class='button' href='/preview'>" +
-        htmlText(UI_NAV_LIVE_PREVIEW) +
+        htmlText(UI_NAV_CAMERA) +
         "</a>";
 
     if (radarConfigAvailable()) {
@@ -3479,6 +3557,175 @@ static void handleConfigFactoryReset()
 }
 
 
+static void handleShooterPage()
+{
+    String notice = server.arg("notice");
+    String html = htmlHeader();
+
+    html +=
+        "<div class='page-title'><div>"
+        "<h2>Power Shooter / Dauershooter</h2>"
+        "<p>Aufnahmeintervall, Filter und Bewegungsverdacht</p>"
+        "</div></div>";
+
+    if (notice == "saved") {
+        html +=
+            "<div class='flash-notice'><strong>Power-Shooter-Einstellungen gespeichert.</strong></div>"
+            "<script>history.replaceState(null,'','/shooter');</script>";
+    }
+
+    html +=
+        "<section class='settings-section'>"
+        "<p class='muted'>Ein- und Ausschalten des Power Shooters erfolgt weiterhin über den Recording-Modus unter Konfiguration &gt; Aufnahme. Diese Seite enthält ausschließlich seine eigenen Parameter.</p>"
+        "<form method='POST' action='/shooter_save'>"
+        "<label><b>Speicherformat</b></label><br>"
+        "<select name='shooter_storage_format'>"
+        "<option value='mkv'" + String(cfg_shooter_storage_format == "mkv" ? " selected" : "") + ">MKV - Sparse MKV, empfohlen</option>"
+        "<option value='jpg'" + String(cfg_shooter_storage_format == "jpg" ? " selected" : "") + ">JPG - einzelne JPEG-Dateien</option>"
+        "</select><br><br>"
+        "<label for='cfgShooterInterval'><b>Prüfintervall</b></label><br>"
+        "<input id='cfgShooterInterval' name='shooter_interval_ms' type='number' min='250' max='86400000' step='1' value='" +
+        String(cfg_shooter_interval_ms) +
+        "' style='width:120px'> ms <small id='cfgShooterRateHint' class='muted'></small><br>"
+        "<small class='muted'>250 ms = 4 fps · 500 ms = 2 fps · 1000 ms = 1 fps · 2000 ms = 0,5 fps. Filter können die Zahl tatsächlich gespeicherter Bilder reduzieren.</small><br><br>"
+        "<label for='cfgShooterDark'><b>Dunkelgrenze / Mindesthelligkeit</b></label><br>"
+        "<div style='display:flex;align-items:center;gap:10px;flex-wrap:wrap'>"
+        "<input id='cfgShooterDark' name='shooter_dark_mean_min' type='range' min='0' max='255' step='1' value='" +
+        String(cfg_shooter_dark_mean_min) +
+        "' style='width:260px;max-width:70vw'>"
+        "<span id='cfgShooterDarkValue' style='display:inline-block;min-width:34px;font-weight:600'>" +
+        String(cfg_shooter_dark_mean_min) +
+        "</span>"
+        "<span id='cfgShooterDarkSwatch' title='Helligkeitswert' style='display:inline-block;width:28px;height:28px;border:1px solid #667085;border-radius:4px;vertical-align:middle'></span>"
+        "</div>"
+        "<small class='muted'>0 = Darkness-Filter praktisch aus. Zu dunkle Bilder werden verworfen.</small><br><br>"
+        "<label><b>Mindeständerung zum Speichern</b></label><br>"
+        "<input name='shooter_min_change_pct' type='number' min='0' max='100' step='0.1' value='" +
+        String(cfg_shooter_min_change_pct, 1) +
+        "' style='width:90px'> % <small class='muted'>0 = Filter aus; Vergleich gegen das letzte akzeptierte Bild</small><br><br>"
+        "<label><b>Force-Save</b></label><br>"
+        "<input name='shooter_force_save_seconds' type='number' min='0' max='86400' step='1' value='" +
+        String(cfg_shooter_force_save_seconds) +
+        "' style='width:100px'> s <small class='muted'>0 = aus; umgeht den Änderungsfilter, nicht die Dunkelgrenze</small><br><br>"
+        "<label><b>Flush-Intervall</b></label><br>"
+        "<input name='shooter_flush_seconds' type='number' min='0' max='3600' step='1' value='" +
+        String(cfg_shooter_flush_seconds) +
+        "' style='width:100px'> s <small class='muted'>0 = kein zeitbasierter Flush; Buffer-full/Shutdown/Reboot flushen weiterhin</small>"
+        "<details style='margin-top:16px;padding:10px;border:1px solid #c7d8ee;border-radius:7px;background:#fff'>"
+        "<summary style='cursor:pointer;font-weight:700'>Erweiterte Shooter-Einstellungen</summary>"
+        "<div style='margin-top:10px'>"
+        "<b>Bewegungsverdacht in der Aufnahmeliste</b><br>"
+        "<small class='muted'>Diese Werte beeinflussen nur den orangefarbenen Hinweis Bewegungsverdacht. Sie verändern weder den eigentlichen Speicherfilter noch Aufnahme, Sparse-MKV oder Flush-Verhalten.</small><br><br>"
+        "Verdachtsschwelle: <input name='shooter_motion_hint_change_pct' type='number' min='0.1' max='100' step='0.1' value='" +
+        String(cfg_shooter_motion_hint_change_pct, 1) +
+        "' style='width:90px'> %<br>"
+        "Treffer erforderlich: <input id='cfgShooterMotionHintHits' name='shooter_motion_hint_required_hits' type='number' min='1' max='8' step='1' value='" +
+        String(cfg_shooter_motion_hint_required_hits) +
+        "' style='width:70px'> von "
+        "<input id='cfgShooterMotionHintWindow' name='shooter_motion_hint_window_frames' type='number' min='1' max='8' step='1' value='" +
+        String(cfg_shooter_motion_hint_window_frames) +
+        "' style='width:70px'> Prüfbildern <small id='cfgShooterMotionHintHint' class='muted'></small><br>"
+        "<small class='muted'>Standard: 2,0 % und 3 von 4. Die Verdachtsschwelle muss mindestens so hoch wie der normale Shooter-Speicherfilter sein.</small>"
+        "</div></details>"
+        "<p class='muted'>Die PSRAM-Puffergröße wird automatisch gewählt.</p>"
+        "<button class='primary' type='submit'>Power-Shooter-Einstellungen speichern</button>"
+        "</form></section>"
+        "<script>(function(){"
+        "const i=document.getElementById('cfgShooterInterval');const h=document.getElementById('cfgShooterRateHint');"
+        "function u(){const ms=Number(i&&i.value);if(!h)return;if(!Number.isFinite(ms)||ms<=0){h.textContent='';return;}const fps=1000/ms;h.textContent='≈ '+fps.toLocaleString('de-DE',{maximumFractionDigits:2})+' fps';}"
+        "if(i){i.addEventListener('input',u);u();}"
+        "const d=document.getElementById('cfgShooterDark');const v=document.getElementById('cfgShooterDarkValue');const sw=document.getElementById('cfgShooterDarkSwatch');"
+        "function ud(){let n=Number(d&&d.value);if(!Number.isFinite(n))n=0;n=Math.max(0,Math.min(255,Math.round(n)));if(v)v.textContent=String(n);if(sw)sw.style.backgroundColor='rgb('+n+','+n+','+n+')';}"
+        "if(d){d.addEventListener('input',ud);ud();}"
+        "const mh=document.getElementById('cfgShooterMotionHintHits');const mw=document.getElementById('cfgShooterMotionHintWindow');const mt=document.getElementById('cfgShooterMotionHintHint');"
+        "function um(){if(!mh||!mw||!mt)return;const hh=Math.round(Number(mh.value));const w=Math.round(Number(mw.value));mt.textContent=(Number.isFinite(hh)&&Number.isFinite(w))?('= '+hh+' aus '+w+(hh>w?' (ungültig)':'')):'';mt.style.color=hh>w?'#a00000':'';}"
+        "if(mh)mh.addEventListener('input',um);if(mw)mw.addEventListener('input',um);um();"
+        "})();</script>";
+
+    html += htmlFooter();
+    server.send(200, "text/html; charset=utf-8", html);
+}
+
+
+static void handleShooterSave()
+{
+    if (rejectWhileRecording("shooter settings save"))
+        return;
+
+    String storageFormat = server.arg("shooter_storage_format");
+    storageFormat.trim();
+    storageFormat.toLowerCase();
+
+    int intervalMs = server.arg("shooter_interval_ms").toInt();
+    int darkMeanMin = server.arg("shooter_dark_mean_min").toInt();
+
+    String minChangeText = server.arg("shooter_min_change_pct");
+    minChangeText.trim();
+    char *minChangeEnd = nullptr;
+    float minChangePct = strtof(minChangeText.c_str(), &minChangeEnd);
+
+    String hintChangeText = server.arg("shooter_motion_hint_change_pct");
+    hintChangeText.trim();
+    char *hintChangeEnd = nullptr;
+    float hintChangePct = strtof(hintChangeText.c_str(), &hintChangeEnd);
+
+    if (
+        !minChangeText.length() || !minChangeEnd || *minChangeEnd != '\0' ||
+        !hintChangeText.length() || !hintChangeEnd || *hintChangeEnd != '\0'
+    ) {
+        server.send(400, "text/plain; charset=utf-8", "Ungültiger Prozentwert");
+        return;
+    }
+
+    int requiredHits = server.arg("shooter_motion_hint_required_hits").toInt();
+    int windowFrames = server.arg("shooter_motion_hint_window_frames").toInt();
+    int forceSaveSeconds = server.arg("shooter_force_save_seconds").toInt();
+    int flushSeconds = server.arg("shooter_flush_seconds").toInt();
+
+    configRefreshSdStatus();
+    bool writeToSd = configSdAvailable() && configSdPresent();
+
+    String error;
+    ConfigSaveResult result = configSaveShooterSettings(
+        storageFormat,
+        intervalMs,
+        darkMeanMin,
+        minChangePct,
+        hintChangePct,
+        requiredHits,
+        windowFrames,
+        forceSaveSeconds,
+        flushSeconds,
+        writeToSd,
+        error
+    );
+
+    if (
+        result != CONFIG_SAVE_BOTH &&
+        result != CONFIG_SAVE_INTERNAL_ONLY
+    ) {
+        server.send(
+            400,
+            "text/plain; charset=utf-8",
+            error.length() ? error : String("Power-Shooter-Einstellungen konnten nicht gespeichert werden")
+        );
+        return;
+    }
+
+    logWrite(
+        "Shooter settings saved | format=" + cfg_shooter_storage_format +
+        " interval_ms=" + String(cfg_shooter_interval_ms) +
+        " min_change_pct=" + String(cfg_shooter_min_change_pct, 1) +
+        " motion_hint=" + String(cfg_shooter_motion_hint_change_pct, 1) +
+        "%/" + String(cfg_shooter_motion_hint_required_hits) +
+        "of" + String(cfg_shooter_motion_hint_window_frames)
+    );
+
+    server.sendHeader("Location", "/shooter?notice=saved");
+    server.send(303, "text/plain; charset=utf-8", "");
+}
+
+
 static void handleConfig()
 {
     // SD contents may have changed since boot (wipe/card swap).
@@ -3490,7 +3737,18 @@ static void handleConfig()
         server.arg("notice");
 
     html += "<div class='page-title'><div><h2>Konfiguration</h2>"
-            "<p>Geräteeinstellungen, Aufnahme, WLAN und Speicher.</p></div></div>";
+            "<p>Geräteeinstellungen, Aufnahme und WLAN.</p></div></div>";
+
+    html +=
+        "<style>"
+        ".config-field-grid{display:grid;grid-template-columns:minmax(190px,240px) minmax(220px,1fr);gap:8px 16px;align-items:center}"
+        ".config-field-grid .config-label{font-weight:600}"
+        ".config-field-grid input,.config-field-grid select{width:100%;max-width:430px;margin:0}"
+        ".config-field-grid .config-control{min-width:0}"
+        ".config-field-grid .config-note{grid-column:2;color:var(--muted);font-size:.86rem;margin-top:-4px;margin-bottom:4px}"
+        ".config-label-inline{display:flex;align-items:center;gap:4px;flex-wrap:wrap}"
+        "@media(max-width:720px){.config-field-grid{grid-template-columns:1fr;gap:4px}.config-field-grid .config-note{grid-column:1;margin-top:-2px;margin-bottom:8px}.config-field-grid input,.config-field-grid select{max-width:none}}"
+        "</style>";
 
     html += "<p style='padding:10px;background:#f7f7f7;border-radius:6px;'>"
             "<b>Release:</b> " +
@@ -3605,23 +3863,26 @@ static void handleConfig()
 
     if (sdSyncEnabled) {
         html +=
-            "<p><span class='status-pill ok'>INTERN + SD</span></p>"
-            "<p class='muted'>Auf der SD-Karte ist <code>/config.txt</code> vorhanden. "
-            "Damit ist die SD-Synchronisierung aktiv: normale Saves und Uploads aktualisieren "
-            "die interne Kopie und die SD-Datei.</p>";
+            "<p style='display:flex;align-items:center;gap:6px;flex-wrap:wrap'>"
+            "<span class='status-pill ok'>INTERN + SD</span>" +
+            pageInfoButton(
+                "Konfigurationsspeicher",
+                "SensorForge speichert Einstellungen intern und zusätzlich in der bereits vorhandenen config.txt auf der SD-Karte. Beide Kopien werden bei normalen Änderungen gemeinsam aktualisiert."
+            ) +
+            "</p>";
     } else {
         html +=
-            "<p><span class='status-pill warn'>INTERNAL ONLY</span></p>"
-            "<p class='muted'>Auf der SD-Karte ist keine <code>/config.txt</code> vorhanden. "
-            "Damit arbeitet SensorForge ausschließlich mit der internen LittleFS-Konfiguration. "
-            "Normale Saves, Uploads und SD-Wartung erzeugen keine SD-config.txt.</p>";
+            "<p style='display:flex;align-items:center;gap:6px;flex-wrap:wrap'>"
+            "<span class='status-pill warn'>NUR INTERN</span>" +
+            pageInfoButton(
+                "Konfigurationsspeicher",
+                "SensorForge speichert die Einstellungen derzeit nur im internen Speicher des Geräts. Auf der SD-Karte gibt es keine config.txt. Das ist ein gültiger Betriebsmodus. Eine SD-config.txt wird nur angelegt, wenn du die interne config.txt hier ausdrücklich auf die SD-Karte kopierst."
+            ) +
+            "</p>";
     }
 
     html +=
         "<p><a class='button' href='/config_download'>Interne config.txt herunterladen</a></p>"
-        "<p class='muted'>" +
-        htmlEscape(String(tr(UI_CONFIG_SECRETS_DOWNLOAD_NOTE))) +
-        "</p>"
         "<form method='POST' action='/config_upload' enctype='multipart/form-data' "
         "onsubmit=\"return confirm('Ausgewählte Konfigurationsdatei validieren und speichern? Die neuen Werte werden nach einem Neustart vollständig aktiv.');\">"
         "<input type='file' name='config_file' accept='.txt,text/plain' required> "
@@ -3650,15 +3911,18 @@ static void handleConfig()
     String factoryDefaultSsid =
         configDefaultHostname();
 
+    String factoryResetInfo =
+        "Alle Konfigurationswerte werden durch die aktuellen Firmware-Standardwerte ersetzt und SensorForge startet neu. "
+        "Eine bereits vorhandene SD-config.txt wird ebenfalls aktualisiert; fehlt sie, wird keine neue angelegt. "
+        "Aufnahmen, Lizenz, vorhandene Hardware-Kryptoschlüssel und Firmware bleiben erhalten. "
+        "Der Standard-Hotspot nach dem Neustart heißt " + factoryDefaultSsid + " und ist offen ohne Passwort.";
+
     html +=
         "<hr style='margin:22px 0;border:0;border-top:1px solid #ddd'>"
-        "<h4>Werkseinstellungen</h4>"
-        "<p class='muted'>Setzt <b>alle Konfigurationswerte</b> auf die aktuellen Firmware-Standards zurück und startet das Gerät neu. "
-        "Die interne config.txt wird immer ersetzt; eine bereits vorhandene SD-config.txt wird ebenfalls ersetzt. "
-        "Eine neue SD-config.txt wird nicht automatisch erzeugt.</p>"
-        "<p class='muted'>Factory-Hotspot nach dem Neustart: <code>" +
-        htmlEscape(factoryDefaultSsid) +
-        "</code>, offen ohne Passwort, ohne WiFi-Timeout. Aufnahmen, Lizenz, Kryptoschlüssel und Firmware bleiben erhalten.</p>"
+        "<div style='display:flex;align-items:center;gap:6px'><h4 style='margin:0'>Werkseinstellungen</h4>" +
+        pageInfoButton("Werkseinstellungen", factoryResetInfo) +
+        "</div>"
+        "<p class='muted'>Setzt alle Einstellungen auf Werkseinstellungen zurück und startet SensorForge neu.</p>"
         "<form method='POST' action='/config_factory_reset' "
         "onsubmit=\"return confirm('Wirklich ALLE Konfigurationswerte auf Werkseinstellungen zurücksetzen? Eine vorhandene SD-config.txt wird ebenfalls überschrieben. Das Gerät startet anschließend neu.');\">"
         "<button class='danger' type='submit'>Alle Konfigurationswerte auf Werkseinstellungen</button>"
@@ -3669,182 +3933,58 @@ static void handleConfig()
 
     html += "<form id='configForm' method='POST' action='/save'>";
 
-    html += "<div class='settings-section'><h3>Kamera</h3>";
-    html += "camera: <input name='camera' value='" +
-            htmlEscape(cfg_camera) + "'><br>";
-
-    html += "resolution: <input id='cfgResolution' name='resolution' value='" +
-            htmlEscape(cfg_resolution) + "'><br>";
-
-    int recordingPerformanceMaxFps =
-        configRecordingPerformanceMaxFps(
-            cfg_resolution,
-            cfg_quality
-        );
-
-    if (recordingPerformanceMaxFps < 1)
-        recordingPerformanceMaxFps = 30;
-
-    html += "fps: <input id='cfgFps' name='fps' type='number' min='1' max='" +
-            String(recordingPerformanceMaxFps) + "' value='" +
-            String(cfg_fps) + "'><br>";
-
-    html += "quality: <input id='cfgQuality' name='quality' type='number' min='0' max='63' value='" +
-            String(cfg_quality) + "'>"
-            " <small>(kleiner = bessere JPEG-Qualität und meist größere Dateien; Referenzwert: 12)</small><br>";
-
+    // Camera settings have their own canonical UI on /preview. Keep the
+    // currently active values as hidden fields here so saving unrelated general
+    // configuration can never reset or drop camera settings.
     html +=
-        "<small id='recordingPerformanceHint' class='muted'></small><br>";
+        "<input type='hidden' name='camera' value='" + htmlEscape(cfg_camera) + "'>"
+        "<input type='hidden' name='resolution' value='" + htmlEscape(cfg_resolution) + "'>"
+        "<input type='hidden' name='fps' value='" + String(cfg_fps) + "'>"
+        "<input type='hidden' name='quality' value='" + String(cfg_quality) + "'>"
+        "<input type='hidden' name='camera_xclk_mhz' value='" + String(cfg_camera_xclk_mhz) + "'>"
+        "<input type='hidden' name='camera_auto_exposure' value='" + String(cfg_camera_auto_exposure) + "'>"
+        "<input type='hidden' name='camera_ae_level' value='" + String(cfg_camera_ae_level) + "'>"
+        "<input type='hidden' name='camera_crop_zoom' value='" + htmlEscape(cfg_camera_crop_zoom) + "'>"
+        "<input type='hidden' name='camera_crop_x' value='" + String(cfg_camera_crop_x) + "'>"
+        "<input type='hidden' name='camera_crop_y' value='" + String(cfg_camera_crop_y) + "'>"
+        "<input type='hidden' name='rotation' value='" + String(cfg_rotation) + "'>";
 
-    html += "<script>(function(){";
-    html += "const cap=" +
-            String((unsigned long)configRecordingPerformanceLimit()) +
-            ";";
-    html += "const stabilityCap1024=" +
-            String((int)RECORDING_PRODUCTION_FPS_CAP_1024X768) +
-            ";";
-    html +=
-        "const px={'160x120':19200,'320x240':76800,'640x480':307200,"
-        "'800x600':480000,'1024x768':786432,'1280x1024':1310720,"
-        "'1600x1200':1920000,'2048x1536':3145728};"
-        "const r=document.getElementById('cfgResolution');"
-        "const f=document.getElementById('cfgFps');"
-        "const q=document.getElementById('cfgQuality');"
-        "const h=document.getElementById('recordingPerformanceHint');"
-        "function qw(v){v=Math.max(0,Math.min(63,Number(v)||0));"
-        "if(v>=12)return 100;return Math.min(160,100+(12-v)*5);}"
-        "function update(){"
-        "const p=px[(r.value||'').trim()];"
-        "if(!cap){f.max=30;h.textContent='Für dieses Board ist noch kein Performance-Oberdeckel qualifiziert.';return;}"
-        "if(!p){f.max=30;h.textContent='Performance-Limit wird nach Eingabe einer unterstützten Auflösung angezeigt.';return;}"
-        "const w=qw(q.value);"
-        "let m=Math.max(0,Math.min(30,Math.floor((cap*100)/(p*w))));"
-        "if((r.value||'').trim()==='1024x768'&&stabilityCap1024>0)m=Math.min(m,stabilityCap1024);"
-        "f.max=Math.max(1,m);"
-        "if(m<1){h.textContent='Diese Auflösung/JPEG-Qualität überschreitet bereits bei 1 fps das Board-Limit.';return;}"
-        "const load=Math.ceil((p*(Number(f.value)||0)*w)/100);"
-        "h.textContent='Board-Leistungsgrenze: max. '+m+' fps für diese Auflösung/Qualität. '+"
-        "'Aktueller Lastwert: '+load.toLocaleString('de-DE')+' / '+cap.toLocaleString('de-DE')+'.';"
-        "}"
-        "r.addEventListener('input',update);q.addEventListener('input',update);f.addEventListener('input',update);update();"
-        "})();</script>";
+    html += "<div class='settings-section'><h3>Aufnahme</h3>";
 
-    html += "camera_xclk_mhz: <select name='camera_xclk_mhz'>";
-    html += "<option value='10'" +
-            String(cfg_camera_xclk_mhz == 10 ? " selected" : "") +
-            ">10 MHz</option>";
-    html += "<option value='16'" +
-            String(cfg_camera_xclk_mhz == 16 ? " selected" : "") +
-            ">16 MHz</option>";
-    html += "<option value='20'" +
-            String(cfg_camera_xclk_mhz == 20 ? " selected" : "") +
-            ">20 MHz</option>";
-    html += "</select> <small>(Kamera-XCLK; Änderung wird nach Neustart wirksam)</small><br>";
+    String recordingModeInfo =
+        "Hier legst du fest, welche automatische Aufnahmefunktion aktiv ist. Im Kombimodus läuft der Power Shooter zusätzlich zur normalen Alarm-/Motionaufnahme. Wenn eine Alarm-/Motionaufnahme startet, hat sie Vorrang.";
 
-    html += "camera_auto_exposure: <select name='camera_auto_exposure'>";
-
-    html += "<option value='1'" +
-            String(cfg_camera_auto_exposure ? " selected" : "") +
-            ">1 - Auto Exposure an</option>";
-
-    html += "<option value='0'" +
-            String(!cfg_camera_auto_exposure ? " selected" : "") +
-            ">0 - Auto Exposure aus</option>";
-
-    html += "</select><br>";
-
-    html += "camera_ae_level: <input name='camera_ae_level' type='number' "
-            "min='-2' max='2' value='" +
-            String(cfg_camera_ae_level) +
-            "'> <small>(-2..2; negativer = dunkleres AE-Ziel)</small><br>";
-
-    html +=
-        "<div style='margin:14px 0;padding:14px;border:1px solid #d8dee6;border-radius:8px;background:#f8fbff'>"
-        "<b>OV3660 Sensor-Crop</b><br>"
-        "<span class='muted'>Verwendet einen kleineren Sensor-Ausschnitt bei gleicher JPEG-Ausgabeauflösung. "
-        "1.0x entspricht exakt dem bisherigen Vollbild. Die Position wird als 3x3-Raster gespeichert.</span><br><br>";
-
-    html += "camera_crop_zoom: <select name='camera_crop_zoom'>";
-    html += "<option value='1.0'" +
-            String(cfg_camera_crop_zoom == "1.0" ? " selected" : "") +
-            ">1.0x - volles Sichtfeld</option>";
-    html += "<option value='1.5'" +
-            String(cfg_camera_crop_zoom == "1.5" ? " selected" : "") +
-            ">1.5x - engerer Ausschnitt</option>";
-    html += "<option value='2.0'" +
-            String(cfg_camera_crop_zoom == "2.0" ? " selected" : "") +
-            ">2.0x - enger Ausschnitt</option>";
-    html += "</select><br>";
-
-    html += "camera_crop_x: <select name='camera_crop_x'>";
-    html += "<option value='0'" +
-            String(cfg_camera_crop_x == 0 ? " selected" : "") +
-            ">links</option>";
-    html += "<option value='1'" +
-            String(cfg_camera_crop_x == 1 ? " selected" : "") +
-            ">Mitte</option>";
-    html += "<option value='2'" +
-            String(cfg_camera_crop_x == 2 ? " selected" : "") +
-            ">rechts</option>";
-    html += "</select><br>";
-
-    html += "camera_crop_y: <select name='camera_crop_y'>";
-    html += "<option value='0'" +
-            String(cfg_camera_crop_y == 0 ? " selected" : "") +
-            ">oben</option>";
-    html += "<option value='1'" +
-            String(cfg_camera_crop_y == 1 ? " selected" : "") +
-            ">Mitte</option>";
-    html += "<option value='2'" +
-            String(cfg_camera_crop_y == 2 ? " selected" : "") +
-            ">unten</option>";
-    html += "</select><br>";
-
-    html +=
-        "<small class='muted'>Live einstellen: <a href='/preview'>Live Preview öffnen</a>. "
-        "Sensor-Crop wird nur bei tatsächlich erkanntem OV3660 angewendet; "
-        "für 1.5x/2.0x sind 4:3-Ausgaben bis 1024x768 vorgesehen.</small>"
-        "</div>";
-
-    html += "rotation: <select name='rotation'>";
-
-    html += "<option value='0'" +
-            String(cfg_rotation == 0 ? " selected" : "") +
-            ">0°</option>";
-
-    html += "<option value='180'" +
-            String(cfg_rotation == 180 ? " selected" : "") +
-            ">180°</option>";
-
-    html += "</select><br>";
-
-
-    html += "</div><div class='settings-section'><h3>Aufnahme</h3>";
+    String recordingTriggerInfo =
+        "Hier legst du fest, wodurch eine automatische Alarm-/Motionaufnahme ausgelöst wird.\n\n"
+        "Sensor direkt: Ein angeschlossener Radar-/PIR-Sensor startet die Aufnahme sofort.\n"
+        "Sensor + Bildbestätigung: Der Sensor meldet zuerst Bewegung; anschließend muss die Bildanalyse die Bewegung bestätigen.\n"
+        "Nur Bildbewegung: Die Kamera-Bildanalyse entscheidet selbst, ob eine Aufnahme startet.";
 
     html +=
         "<div style='margin:0 0 18px 0;padding:14px;border:1px solid #d8dee6;border-radius:8px;background:#f8fbff'>"
-        "<b>Recording-Modus</b><br>"
-        "<select name='recording_mode' style='min-width:320px;max-width:100%'>"
+        "<div style='display:flex;align-items:center;gap:6px;flex-wrap:wrap'><b>Recording-Modus</b>" +
+        pageInfoButton("Recording-Modus", recordingModeInfo) +
+        "</div>"
+        "<select name='recording_mode' style='min-width:320px;max-width:100%;margin-top:8px'>"
         "<option value='off'" + String(!cfg_motion_recording_enabled && !cfg_shooter_enabled ? " selected" : "") + ">Aus - keine automatische Aufnahme</option>"
         "<option value='motion'" + String(cfg_motion_recording_enabled && !cfg_shooter_enabled ? " selected" : "") + ">Normal Recording - Motion/Alarm</option>"
         "<option value='shooter'" + String(!cfg_motion_recording_enabled && cfg_shooter_enabled ? " selected" : "") + ">Power Shooter standalone</option>"
         "<option value='motion_shooter'" + String(cfg_motion_recording_enabled && cfg_shooter_enabled ? " selected" : "") + ">Normal Recording + Power Shooter</option>"
-        "</select><br>"
-        "<small class='muted'>Der Modus steuert intern motion_recording_enabled und shooter_enabled. Im Kombimodus läuft der Power Shooter zusätzlich; ein Alarm-/Motionvideo hat weiterhin Vorrang.</small><br><br>"
-        "<b>" + htmlText(UI_RECORDING_TRIGGER_MODE) + "</b><br>"
-        "<select name='motion_recording_decision' style='min-width:320px;max-width:100%'>"
+        "</select>"
+        "</div>";
+
+    html +=
+        "<div style='margin:0 0 18px 0;padding:15px;border:2px solid #7aa7d9;border-radius:9px;background:#f5f9ff'>"
+        "<div style='display:flex;align-items:center;gap:6px;flex-wrap:wrap'><b style='font-size:1.05rem'>Automatischer Aufnahmeauslöser</b>" +
+        pageInfoButton("Automatischer Aufnahmeauslöser", recordingTriggerInfo) +
+        "</div>"
+        "<select name='motion_recording_decision' style='min-width:320px;max-width:100%;margin-top:10px;padding:8px;font-weight:600'>"
         "<option value='direct'" + String(cfg_motion_recording_decision == "direct" ? " selected" : "") + ">" + htmlText(UI_RECORDING_TRIGGER_DIRECT) + "</option>"
         "<option value='image_verify'" + String(cfg_motion_recording_decision == "image_verify" ? " selected" : "") + ">" + htmlText(UI_RECORDING_TRIGGER_VERIFY) + "</option>"
         "<option value='image_only'" + String(cfg_motion_recording_decision == "image_only" ? " selected" : "") + ">" + htmlText(UI_RECORDING_TRIGGER_IMAGE_ONLY) + "</option>"
-        "</select><br>"
-        "<small class='muted'>" + htmlText(UI_RECORDING_TRIGGER_HELP) + "</small>";
-
-    html +=
-        "<div style='margin-top:8px'><a href='/image_motion'>" +
-        htmlText(UI_RECORDING_TRIGGER_IMAGE_SETTINGS) +
-        "</a></div>";
-
-    html += "</div>";
+        "</select>"
+        "<div style='margin-top:10px'><a class='button' href='/image_motion'>Bildbewegung konfigurieren</a></div>"
+        "</div>";
 
     html += "recording_format: <select id='cfgRecordingFormat' name='recording_format' onchange='sfAudioUi()'>";
 
@@ -3869,379 +4009,6 @@ static void handleConfig()
             ">0 - aus</option>";
 
     html += "</select><br>";
-
-    html +=
-        htmlText(UI_RECORDING_ENCRYPTION) +
-        ": <select name='recording_encryption'>";
-
-    html +=
-        "<option value='0'" +
-        String(!cfg_recording_encryption ? " selected" : "") +
-        ">" +
-        htmlText(UI_RECORDING_ENCRYPTION_DISABLED) +
-        "</option>";
-
-    html +=
-        "<option value='1'" +
-        String(cfg_recording_encryption ? " selected" : "") +
-        ">" +
-        htmlText(UI_RECORDING_ENCRYPTION_ENABLED) +
-        "</option>";
-
-    html += "</select><br>";
-
-    html +=
-        "<small class='muted'>" +
-        htmlText(UI_RECORDING_ENCRYPTION_HELP) +
-        "</small><br>";
-
-    recordingCryptoBegin();
-
-    if (recordingCryptoReady()) {
-        html +=
-            "<small style='color:#267326'>" +
-            htmlText(UI_RECORDING_ENCRYPTION_KEY_READY) +
-            " (eFuse KEY" +
-            String(recordingCryptoKeySlot()) +
-            ")</small><br>";
-    } else {
-        RecordingCryptoKeyStatus keyStatus =
-            recordingCryptoKeyStatus();
-
-        if (
-            keyStatus == RECORDING_CRYPTO_KEY_UNPROVISIONED ||
-            keyStatus == RECORDING_CRYPTO_KEY_PROVISION_PENDING
-        ) {
-            html +=
-                "<small style='color:#9a5a00'>" +
-                htmlText(UI_RECORDING_ENCRYPTION_KEY_UNINITIALIZED) +
-                "</small><br>";
-        } else {
-            html +=
-                "<small style='color:#a00000'>" +
-                htmlText(UI_RECORDING_ENCRYPTION_PROVISION_FAILED) +
-                ": " +
-                htmlEscape(
-                    String(recordingCryptoKeyStatusName())
-                ) +
-                "</small><br>";
-        }
-    }
-
-    AudioCaptureCapabilities audioCaps =
-        audioCaptureCapabilities();
-
-    html +=
-        "<div style='margin-top:18px;padding:14px;border:1px solid #8fb5c9;border-radius:8px;background:#f7fbfd'>"
-        "<b>" +
-        htmlText(UI_AUDIO_TITLE) +
-        "</b><br>"
-        "<span class='muted'>" +
-        htmlText(UI_AUDIO_SIMPLE_HELP) +
-        "</span><br><br>";
-
-    html +=
-        htmlText(UI_AUDIO_ENABLE) +
-        ": <select id='cfgAudioEnabled' name='audio_enabled' onchange='sfAudioUi()'>";
-    html += "<option value='0'" +
-            String(!cfg_audio_enabled ? " selected" : "") +
-            ">0 - " + htmlText(UI_AUDIO_OFF) + "</option>";
-    html += "<option value='1'" +
-            String(cfg_audio_enabled ? " selected" : "") +
-            ">1 - " + htmlText(UI_AUDIO_ON) + "</option>";
-    html += "</select><br>";
-
-    html +=
-        "<small class='muted'>" +
-        htmlText(UI_AUDIO_MKV_REQUIRED) +
-        "</small><br><br>";
-
-    html +=
-        "<button type='button' onclick=\"sfAudioAdvancedOpen()\">" +
-        htmlText(UI_AUDIO_ADVANCED_SETTINGS) +
-        "</button> ";
-
-    if (audioCaps.available) {
-        html +=
-            "<button type='submit' formaction='/audio_test_record' formmethod='post' "
-            "onclick=\"return sfAudioProgressSubmit(this,'test')\">" +
-            htmlText(UI_AUDIO_TEST) +
-            "</button> "
-            "<button type='submit' formaction='/audio_benchmark' formmethod='post' "
-            "onclick=\"return sfAudioProgressSubmit(this,'benchmark')\">" +
-            htmlText(UI_AUDIO_BENCHMARK) +
-            "</button><br>"
-            "<small class='muted'>" +
-            htmlText(UI_AUDIO_TEST_HELP) +
-            "</small><br>"
-            "<small class='muted'>" +
-            htmlText(UI_AUDIO_BENCHMARK_HELP) +
-            "</small>";
-    } else {
-        html +=
-            "<br><small style='color:#9a5a00'>" +
-            htmlText(UI_AUDIO_NO_INPUT) +
-            "</small>";
-    }
-
-    html +=
-        "<div style='margin-top:14px;padding:12px;border:1px solid #c8d0da;border-radius:7px;background:#fff'>"
-        "<b>" + htmlText(UI_RECORDING_LOAD_TITLE) + "</b><br>"
-        "<small class='muted'>" + htmlText(UI_RECORDING_LOAD_HELP) + "</small><br><br>"
-        + htmlText(UI_RECORDING_LOAD_DURATION) +
-        ": <select id='sfRecordingLoadSeconds'>"
-        "<option value='30' selected>30 s</option>"
-        "<option value='60'>60 s</option>"
-        "<option value='300'>5 min</option>"
-        "<option value='900'>15 min</option>"
-        "<option value='1800'>30 min</option>"
-        "<option value='3600'>60 min</option>"
-        "</select> "
-        "<button type='button' onclick=\"return sfRecordingLoadTestSubmit()\">" +
-        htmlText(UI_RECORDING_LOAD_BUTTON) +
-        "</button><br>"
-        "<small class='muted'>" + htmlText(UI_RECORDING_LOAD_SAVED_NOTE) + "</small><br>"
-        "<small class='muted'>" + htmlText(UI_RECORDING_LOAD_LONG_NOTE) + "</small>"
-        "</div>";
-
-    if (recordingLoadTestIsActive()) {
-        html +=
-            "<p><a href='/recording_load_test_status_page'><button type='button'>" +
-            htmlText(UI_RECORDING_LOAD_OPEN_STATUS) +
-            "</button></a></p>";
-    } else if (recordingLoadTestHasResult()) {
-        html +=
-            "<p><a href='/recording_load_test_result'><button type='button'>" +
-            htmlText(UI_RECORDING_LOAD_LAST_RESULT) +
-            "</button></a></p>";
-    }
-
-    html +=
-        "<br><small class='muted'>" +
-        htmlText(UI_AUDIO_ENCRYPTION_NOTE) +
-        "</small>";
-
-    html +=
-        "<div id='sfAudioAdvancedModal' style='display:none;position:fixed;z-index:12000;inset:0;background:rgba(0,0,0,.48);padding:18px;overflow:auto'>"
-        "<div style='max-width:720px;margin:5vh auto;background:#fff;border-radius:10px;padding:18px;box-shadow:0 10px 36px rgba(0,0,0,.3)'>"
-        "<div style='display:flex;justify-content:space-between;align-items:center;gap:12px'>"
-        "<h3 style='margin:0'>" + htmlText(UI_AUDIO_ADVANCED_TITLE) + "</h3>"
-        "<button type='button' onclick=\"sfAudioAdvancedClose()\">&times;</button>"
-        "</div><p class='muted'>" + htmlText(UI_AUDIO_ADVANCED_HELP) + "</p>";
-
-#if BOARD_HAS_INTEGRATED_MIC
-    String boardAudioName = BOARD_INTEGRATED_MIC_NAME;
-#else
-    String boardAudioName = tr(UI_NOT_DETECTED);
-#endif
-
-    html +=
-        "<p class='muted'>" +
-        htmlText(UI_AUDIO_SOURCE_BOARD_DEFAULT) +
-        ": <b>" + htmlEscape(boardAudioName) + "</b><br>" +
-        htmlText(UI_AUDIO_SOURCE) +
-        " (" + htmlText(UI_STATUS_ACTIVE) + "): <b>" +
-        htmlEscape(String(audioCaptureBackendName())) +
-        "</b></p>";
-
-    html +=
-        htmlText(UI_AUDIO_EXPERT_MODE) +
-        ": <select id='cfgAudioExpertMode' name='audio_expert_mode' onchange='sfAudioUi()'>"
-        "<option value='0'" +
-        String(!cfg_audio_expert_mode ? " selected" : "") +
-        ">0 - User</option>"
-        "<option value='1'" +
-        String(cfg_audio_expert_mode ? " selected" : "") +
-        ">1 - Expert</option>"
-        "</select><br>";
-
-    html +=
-        htmlText(UI_AUDIO_SOURCE) +
-        ": <select id='cfgAudioSource' name='audio_source' onchange='sfAudioUi()'>"
-        "<option value='board_default'" +
-        String(cfg_audio_source == "board_default" ? " selected" : "") +
-        ">" + htmlText(UI_AUDIO_SOURCE_BOARD_DEFAULT) + "</option>"
-        "<option value='external'" +
-        String(cfg_audio_source == "external" ? " selected" : "") +
-        ">" + htmlText(UI_AUDIO_SOURCE_EXTERNAL) + "</option>"
-        "</select><br>";
-
-    html +=
-        "audio_sample_rate: <input name='audio_sample_rate' type='number' min='8000' max='96000' step='1000' value='" +
-        String(cfg_audio_sample_rate) +
-        "' style='width:110px'> Hz<br>";
-
-    html += "audio_bits_per_sample: <select name='audio_bits_per_sample'>";
-    html += "<option value='16'" + String(cfg_audio_bits_per_sample == 16 ? " selected" : "") + ">16 bit</option>";
-    html += "<option value='24'" + String(cfg_audio_bits_per_sample == 24 ? " selected" : "") + ">24 bit</option>";
-    html += "<option value='32'" + String(cfg_audio_bits_per_sample == 32 ? " selected" : "") + ">32 bit</option>";
-    html += "</select><br>";
-
-    html += "audio_channels: <select name='audio_channels'>";
-    html += "<option value='1'" + String(cfg_audio_channels == 1 ? " selected" : "") + ">1 - mono</option>";
-    html += "<option value='2'" + String(cfg_audio_channels == 2 ? " selected" : "") + ">2 - stereo</option>";
-    html += "</select><br>";
-
-    html +=
-        "<div id='cfgAudioExpertPanel' style='margin-top:12px;padding:12px;border:1px dashed #78909c;border-radius:6px'>"
-        "<b>" + htmlText(UI_AUDIO_EXTERNAL_PINS) + "</b><br>"
-        "<small class='muted'>" + htmlText(UI_AUDIO_EXPERT_HELP) + "</small><br>"
-        "<small style='color:#9a5a00'>" + htmlText(UI_AUDIO_GPIO_WARNING) + "</small><br><br>" +
-        htmlText(UI_AUDIO_BACKEND) +
-        ": <select id='cfgAudioBackend' name='audio_backend' onchange='sfAudioUi()'>"
-        "<option value='pdm'" +
-        String(cfg_audio_backend == "pdm" ? " selected" : "") +
-        ">" + htmlText(UI_AUDIO_BACKEND_PDM) + "</option>"
-        "<option value='i2s'" +
-        String(cfg_audio_backend == "i2s" ? " selected" : "") +
-        ">" + htmlText(UI_AUDIO_BACKEND_I2S) + "</option>"
-        "</select><br>";
-
-    html +=
-        "<div id='cfgAudioPdmPanel' style='margin-top:8px'>"
-        "audio_pdm_clk_pin: <input name='audio_pdm_clk_pin' type='number' min='-1' max='48' value='" +
-        String(cfg_audio_pdm_clk_pin) +
-        "' style='width:80px'><br>"
-        "audio_pdm_data_pin: <input name='audio_pdm_data_pin' type='number' min='-1' max='48' value='" +
-        String(cfg_audio_pdm_data_pin) +
-        "' style='width:80px'><br>"
-        "</div>";
-
-    html +=
-        "<div id='cfgAudioI2sPanel' style='margin-top:8px'>"
-        "audio_i2s_bclk_pin: <input name='audio_i2s_bclk_pin' type='number' min='-1' max='48' value='" +
-        String(cfg_audio_i2s_bclk_pin) +
-        "' style='width:80px'><br>"
-        "audio_i2s_ws_pin: <input name='audio_i2s_ws_pin' type='number' min='-1' max='48' value='" +
-        String(cfg_audio_i2s_ws_pin) +
-        "' style='width:80px'><br>"
-        "audio_i2s_data_pin: <input name='audio_i2s_data_pin' type='number' min='-1' max='48' value='" +
-        String(cfg_audio_i2s_data_pin) +
-        "' style='width:80px'><br>"
-        "audio_i2s_mclk_pin: <input name='audio_i2s_mclk_pin' type='number' min='-1' max='48' value='" +
-        String(cfg_audio_i2s_mclk_pin) +
-        "' style='width:80px'> <small class='muted'>-1 = unused</small><br>" +
-        htmlText(UI_AUDIO_I2S_SLOT) +
-        ": <select name='audio_i2s_slot'>"
-        "<option value='left'" + String(cfg_audio_i2s_slot == "left" ? " selected" : "") + ">left</option>"
-        "<option value='right'" + String(cfg_audio_i2s_slot == "right" ? " selected" : "") + ">right</option>"
-        "<option value='stereo'" + String(cfg_audio_i2s_slot == "stereo" ? " selected" : "") + ">stereo</option>"
-        "</select><br>"
-        "</div>"
-        "<small class='muted'>" + htmlText(UI_AUDIO_SAVE_HARDWARE_NOTE) + "</small>"
-        "</div>";
-
-    if (audioCaps.available) {
-        html +=
-            "<p class='muted'>Backend: " +
-            String((unsigned long)audioCaps.minSampleRate) + ".." +
-            String((unsigned long)audioCaps.maxSampleRate) + " Hz; " +
-            htmlText(UI_AUDIO_RECOMMENDED) + " " +
-            String((unsigned long)audioCaps.recommendedSampleRate) +
-            " Hz.</p>";
-    }
-
-    html +=
-        "<div style='margin-top:16px;text-align:right'>"
-        "<button type='button' onclick=\"sfAudioAdvancedClose()\">" +
-        htmlText(UI_AUDIO_CLOSE) +
-        "</button>"
-        "</div></div></div>";
-
-    html +=
-        "<div id='sfAudioProgressModal' style='display:none;position:fixed;z-index:13000;inset:0;background:rgba(0,0,0,.56);padding:18px'>"
-        "<div style='max-width:520px;margin:18vh auto;background:#fff;border-radius:10px;padding:20px;box-shadow:0 10px 36px rgba(0,0,0,.35)'>"
-        "<h3 id='sfAudioProgressTitle' style='margin-top:0'>" + htmlText(UI_AUDIO_TEST_RUNNING) + "</h3>"
-        "<p id='sfAudioProgressText' class='muted'>" + htmlText(UI_AUDIO_TEST_RUNNING_HELP) + "</p>"
-        "<div style='height:8px;background:#d7dde3;border-radius:999px;overflow:hidden;position:relative;margin:20px 0'>"
-        "<span style='position:absolute;top:0;width:18%;height:100%;border-radius:999px;background:#c62828;animation:sfAudioSlide 1.2s ease-in-out infinite alternate'></span>"
-        "</div>"
-        "<small class='muted'>" + htmlText(UI_AUDIO_PROGRESS_NOTE) + "</small>"
-        "</div></div>"
-        "<style>@keyframes sfAudioSlide{from{left:0}to{left:82%}}</style>"
-        "<script>"
-        "function sfAudioAdvancedOpen(){var m=document.getElementById('sfAudioAdvancedModal');if(m)m.style.display='block';}"
-        "function sfAudioAdvancedClose(){var m=document.getElementById('sfAudioAdvancedModal');if(m)m.style.display='none';}"
-        "function sfAudioProgressStart(kind){"
-        "var m=document.getElementById('sfAudioProgressModal');var t=document.getElementById('sfAudioProgressTitle');var p=document.getElementById('sfAudioProgressText');"
-        "if(kind==='recording'){if(t)t.textContent='" + htmlJsString(tr(UI_RECORDING_LOAD_RUNNING)) + "';if(p)p.textContent='" + htmlJsString(tr(UI_RECORDING_LOAD_RUNNING_HELP)) + "';}"
-        "else if(kind==='benchmark'){if(t)t.textContent='" + htmlJsString(tr(UI_AUDIO_BENCHMARK_RUNNING)) + "';if(p)p.textContent='" + htmlJsString(tr(UI_AUDIO_BENCHMARK_RUNNING_HELP)) + "';}"
-        "else{if(t)t.textContent='" + htmlJsString(tr(UI_AUDIO_TEST_RUNNING)) + "';if(p)p.textContent='" + htmlJsString(tr(UI_AUDIO_TEST_RUNNING_HELP)) + "';}"
-        "if(m)m.style.display='block';return true;}"
-        "function sfAudioProgressSubmit(btn,kind){sfAudioProgressStart(kind);setTimeout(function(){var f=btn&&btn.form;if(!f)return;f.action=btn.formAction;f.method='post';f.submit();},80);return false;}"
-        "function sfRecordingLoadTestSubmit(){sfAudioProgressStart('recording');setTimeout(function(){var seconds=document.getElementById('sfRecordingLoadSeconds');var f=document.createElement('form');f.method='post';f.action='/recording_load_test';var i=document.createElement('input');i.type='hidden';i.name='seconds';i.value=seconds?seconds.value:'30';f.appendChild(i);document.body.appendChild(f);f.submit();},80);return false;}"
-        "function sfAudioUi(){"
-        "var a=document.getElementById('cfgAudioEnabled');var r=document.getElementById('cfgRecordingFormat');var e=document.getElementById('cfgAudioExpertMode');var s=document.getElementById('cfgAudioSource');var p=document.getElementById('cfgAudioExpertPanel');var b=document.getElementById('cfgAudioBackend');var pp=document.getElementById('cfgAudioPdmPanel');var ip=document.getElementById('cfgAudioI2sPanel');"
-        "if(a&&r&&a.value==='1')r.value='mkv';"
-        "if(!e||!s||!p||!b||!pp||!ip)return;var expert=e.value==='1';if(!expert&&s.value==='external')s.value='board_default';p.style.display=expert?'block':'none';var external=expert&&s.value==='external';b.disabled=!external;pp.style.display=external&&b.value==='pdm'?'block':'none';ip.style.display=external&&b.value==='i2s'?'block':'none';}"
-        "sfAudioUi();"
-        "</script>"
-        "</div>";
-
-    html +=
-        "<div style='margin-top:18px;padding:14px;border:1px solid #9cc7ff;border-radius:8px;background:#f5f9ff'>"
-        "<b>Power Shooter / Dauershooter</b><br>"
-        "<span class='muted'>Aktivierung erfolgt oben über den Recording-Modus. Hier werden nur die Shooter-Parameter eingestellt. Alarm-/Motionvideo hat im Kombimodus Vorrang. "
-        "Bei geöffnetem Webinterface wird der Shooter durch die Web-Autopause vorübergehend pausiert und danach automatisch fortgesetzt.</span><br><br>"
-        "shooter_storage_format: <select name='shooter_storage_format'>"
-        "<option value='mkv'" + String(cfg_shooter_storage_format == "mkv" ? " selected" : "") + ">MKV - Sparse MKV, empfohlen</option>"
-        "<option value='jpg'" + String(cfg_shooter_storage_format == "jpg" ? " selected" : "") + ">JPG - einzelne JPEG-Dateien</option>"
-        "</select><br>"
-        "shooter_interval_ms: <input id='cfgShooterInterval' name='shooter_interval_ms' type='number' min='250' max='86400000' step='1' value='" +
-        String(cfg_shooter_interval_ms) +
-        "' style='width:120px'> ms "
-        "<small id='cfgShooterRateHint' class='muted'></small><br>"
-        "<small class='muted'>Beispiele: 250 ms = 4 fps · 500 ms = 2 fps · 1000 ms = 1 fps · 2000 ms = 0,5 fps. Es sind Prüfslots; Filter können weniger Bilder speichern.</small><br><br>"
-        "<label for='cfgShooterDark'><b>Dunkelgrenze / Mindesthelligkeit</b></label><br>"
-        "<div style='display:flex;align-items:center;gap:10px;flex-wrap:wrap'>"
-        "<input id='cfgShooterDark' name='shooter_dark_mean_min' type='range' min='0' max='255' step='1' value='" +
-        String(cfg_shooter_dark_mean_min) +
-        "' style='width:260px;max-width:70vw'>"
-        "<span id='cfgShooterDarkValue' style='display:inline-block;min-width:34px;font-weight:600'>" +
-        String(cfg_shooter_dark_mean_min) +
-        "</span>"
-        "<span id='cfgShooterDarkSwatch' title='Helligkeitswert' style='display:inline-block;width:28px;height:28px;border:1px solid #667085;border-radius:4px;vertical-align:middle'></span>"
-        "</div>"
-        "<small class='muted'>0 = Darkness-Filter praktisch aus. Bilder mit mittlerer Helligkeit unter diesem Wert werden verworfen; das Kästchen zeigt den gewählten Grauwert.</small><br>"
-        "shooter_min_change_pct: <input name='shooter_min_change_pct' type='number' min='0' max='100' step='0.1' value='" +
-        String(cfg_shooter_min_change_pct, 1) +
-        "' style='width:90px'> % <small>(0 = Similarity-Filter aus; Vergleich gegen letztes akzeptiertes Bild)</small><br>"
-        "shooter_force_save_seconds: <input name='shooter_force_save_seconds' type='number' min='0' max='86400' step='1' value='" +
-        String(cfg_shooter_force_save_seconds) +
-        "' style='width:100px'> s <small>(0 = kein Force-Save; umgeht Similarity, nicht Darkness)</small><br>"
-        "shooter_flush_seconds: <input name='shooter_flush_seconds' type='number' min='0' max='3600' step='1' value='" +
-        String(cfg_shooter_flush_seconds) +
-        "' style='width:100px'> s <small>(0 = kein zeitbasierter Flush; Buffer-full/Shutdown/Reboot flushen weiterhin)</small><br>"
-        "<details style='margin-top:12px;padding:10px;border:1px solid #c7d8ee;border-radius:7px;background:#fff'>"
-        "<summary style='cursor:pointer;font-weight:700'>Erweiterte Shooter-Einstellungen</summary>"
-        "<div style='margin-top:10px'>"
-        "<b>Bewegungsverdacht in der Aufnahmeliste</b><br>"
-        "<small class='muted'>Diese Werte beeinflussen nur den orangefarbenen Hinweis Bewegungsverdacht. Sie verändern weder den eigentlichen Shooter-Speicherfilter noch Aufnahme, Sparse-MKV oder Flush-Verhalten.</small><br><br>"
-        "Verdachtsschwelle: <input name='shooter_motion_hint_change_pct' type='number' min='0.1' max='100' step='0.1' value='" +
-        String(cfg_shooter_motion_hint_change_pct, 1) +
-        "' style='width:90px'> %<br>"
-        "Treffer erforderlich: <input id='cfgShooterMotionHintHits' name='shooter_motion_hint_required_hits' type='number' min='1' max='8' step='1' value='" +
-        String(cfg_shooter_motion_hint_required_hits) +
-        "' style='width:70px'> von "
-        "<input id='cfgShooterMotionHintWindow' name='shooter_motion_hint_window_frames' type='number' min='1' max='8' step='1' value='" +
-        String(cfg_shooter_motion_hint_window_frames) +
-        "' style='width:70px'> Prüfbildern "
-        "<small id='cfgShooterMotionHintHint' class='muted'></small><br>"
-        "<small class='muted'>Standard: 2,0 % und 3 von 4. Die Verdachtsschwelle muss mindestens so hoch wie der normale Shooter-Speicherfilter sein. Maximal 8 Prüfbilder; Treffer müssen kleiner/gleich dem Fenster sein. Große globale Lichtwechsel werden weiterhin separat unterdrückt.</small>"
-        "</div></details>"
-        "<small class='muted'>Die tatsächliche Zahl gespeicherter Bilder kann durch Darkness-/Change-Filter niedriger sein. PSRAM-Puffergröße wird automatisch gewählt.</small>"
-        "<script>(function(){"
-        "const i=document.getElementById('cfgShooterInterval');const h=document.getElementById('cfgShooterRateHint');"
-        "function u(){const ms=Number(i&&i.value);if(!h)return;if(!Number.isFinite(ms)||ms<=0){h.textContent='';return;}const fps=1000/ms;h.textContent='≈ '+fps.toLocaleString('de-DE',{maximumFractionDigits:2})+' fps';}"
-        "if(i){i.addEventListener('input',u);u();}"
-        "const d=document.getElementById('cfgShooterDark');const v=document.getElementById('cfgShooterDarkValue');const sw=document.getElementById('cfgShooterDarkSwatch');"
-        "function ud(){let n=Number(d&&d.value);if(!Number.isFinite(n))n=0;n=Math.max(0,Math.min(255,Math.round(n)));if(v)v.textContent=String(n);if(sw)sw.style.backgroundColor='rgb('+n+','+n+','+n+')';}"
-        "if(d){d.addEventListener('input',ud);ud();}"
-        "const mh=document.getElementById('cfgShooterMotionHintHits');const mw=document.getElementById('cfgShooterMotionHintWindow');const mt=document.getElementById('cfgShooterMotionHintHint');"
-        "function um(){if(!mh||!mw||!mt)return;const h=Math.round(Number(mh.value));const w=Math.round(Number(mw.value));mt.textContent=(Number.isFinite(h)&&Number.isFinite(w))?('= '+h+' aus '+w+(h>w?' (ungültig)':'')):'';mt.style.color=h>w?'#a00000':'';}"
-        "if(mh)mh.addEventListener('input',um);if(mw)mw.addEventListener('input',um);um();"
-        "})();</script>"
-        "</div>";
 
     html += "post_record_ms: <input name='post_record_ms' type='number' min='0' value='" +
             String(cfg_post_ms) + "'><br>";
@@ -4397,6 +4164,185 @@ static void handleConfig()
         "</script>";
 
 
+    html += "</div><div class='settings-section'><h3>Audio / Mikrofon</h3>";
+
+    AudioCaptureCapabilities audioCaps =
+        audioCaptureCapabilities();
+
+    html +=
+        "<div style='padding:14px;border:1px solid #8fb5c9;border-radius:8px;background:#f7fbfd'>"
+        "<span class='muted'>" +
+        htmlText(UI_AUDIO_SIMPLE_HELP) +
+        "</span><br><br>";
+
+    html +=
+        htmlText(UI_AUDIO_ENABLE) +
+        ": <select id='cfgAudioEnabled' name='audio_enabled' onchange='sfAudioUi()'>";
+    html += "<option value='0'" +
+            String(!cfg_audio_enabled ? " selected" : "") +
+            ">0 - " + htmlText(UI_AUDIO_OFF) + "</option>";
+    html += "<option value='1'" +
+            String(cfg_audio_enabled ? " selected" : "") +
+            ">1 - " + htmlText(UI_AUDIO_ON) + "</option>";
+    html += "</select><br>";
+
+    html +=
+        "<small class='muted'>" +
+        htmlText(UI_AUDIO_MKV_REQUIRED) +
+        "</small><br><br>";
+
+    html +=
+        "<button type='button' onclick=\"sfAudioAdvancedOpen()\">" +
+        htmlText(UI_AUDIO_ADVANCED_SETTINGS) +
+        "</button> ";
+
+    if (!audioCaps.available) {
+        html +=
+            "<br><small style='color:#9a5a00'>" +
+            htmlText(UI_AUDIO_NO_INPUT) +
+            "</small>";
+    }
+
+    html +=
+        "<div id='sfAudioAdvancedModal' style='display:none;position:fixed;z-index:12000;inset:0;background:rgba(0,0,0,.48);padding:18px;overflow:auto'>"
+        "<div style='max-width:720px;margin:5vh auto;background:#fff;border-radius:10px;padding:18px;box-shadow:0 10px 36px rgba(0,0,0,.3)'>"
+        "<div style='display:flex;justify-content:space-between;align-items:center;gap:12px'>"
+        "<h3 style='margin:0'>" + htmlText(UI_AUDIO_ADVANCED_TITLE) + "</h3>"
+        "<button type='button' onclick=\"sfAudioAdvancedClose()\">&times;</button>"
+        "</div><p class='muted'>" + htmlText(UI_AUDIO_ADVANCED_HELP) + "</p>";
+
+#if BOARD_HAS_INTEGRATED_MIC
+    String boardAudioName = BOARD_INTEGRATED_MIC_NAME;
+#else
+    String boardAudioName = tr(UI_NOT_DETECTED);
+#endif
+
+    html +=
+        "<p class='muted'>" +
+        htmlText(UI_AUDIO_SOURCE_BOARD_DEFAULT) +
+        ": <b>" + htmlEscape(boardAudioName) + "</b><br>" +
+        htmlText(UI_AUDIO_SOURCE) +
+        " (" + htmlText(UI_STATUS_ACTIVE) + "): <b>" +
+        htmlEscape(String(audioCaptureBackendName())) +
+        "</b></p>";
+
+    html +=
+        htmlText(UI_AUDIO_EXPERT_MODE) +
+        ": <select id='cfgAudioExpertMode' name='audio_expert_mode' onchange='sfAudioUi()'>"
+        "<option value='0'" +
+        String(!cfg_audio_expert_mode ? " selected" : "") +
+        ">0 - User</option>"
+        "<option value='1'" +
+        String(cfg_audio_expert_mode ? " selected" : "") +
+        ">1 - Expert</option>"
+        "</select><br>";
+
+    html +=
+        htmlText(UI_AUDIO_SOURCE) +
+        ": <select id='cfgAudioSource' name='audio_source' onchange='sfAudioUi()'>"
+        "<option value='board_default'" +
+        String(cfg_audio_source == "board_default" ? " selected" : "") +
+        ">" + htmlText(UI_AUDIO_SOURCE_BOARD_DEFAULT) + "</option>"
+        "<option value='external'" +
+        String(cfg_audio_source == "external" ? " selected" : "") +
+        ">" + htmlText(UI_AUDIO_SOURCE_EXTERNAL) + "</option>"
+        "</select><br>";
+
+    html +=
+        "audio_sample_rate: <input name='audio_sample_rate' type='number' min='8000' max='96000' step='1000' value='" +
+        String(cfg_audio_sample_rate) +
+        "' style='width:110px'> Hz<br>";
+
+    html += "audio_bits_per_sample: <select name='audio_bits_per_sample'>";
+    html += "<option value='16'" + String(cfg_audio_bits_per_sample == 16 ? " selected" : "") + ">16 bit</option>";
+    html += "<option value='24'" + String(cfg_audio_bits_per_sample == 24 ? " selected" : "") + ">24 bit</option>";
+    html += "<option value='32'" + String(cfg_audio_bits_per_sample == 32 ? " selected" : "") + ">32 bit</option>";
+    html += "</select><br>";
+
+    html += "audio_channels: <select name='audio_channels'>";
+    html += "<option value='1'" + String(cfg_audio_channels == 1 ? " selected" : "") + ">1 - mono</option>";
+    html += "<option value='2'" + String(cfg_audio_channels == 2 ? " selected" : "") + ">2 - stereo</option>";
+    html += "</select><br>";
+
+    html +=
+        "<div id='cfgAudioExpertPanel' style='margin-top:12px;padding:12px;border:1px dashed #78909c;border-radius:6px'>"
+        "<b>" + htmlText(UI_AUDIO_EXTERNAL_PINS) + "</b><br>"
+        "<small class='muted'>" + htmlText(UI_AUDIO_EXPERT_HELP) + "</small><br>"
+        "<small style='color:#9a5a00'>" + htmlText(UI_AUDIO_GPIO_WARNING) + "</small><br><br>" +
+        htmlText(UI_AUDIO_BACKEND) +
+        ": <select id='cfgAudioBackend' name='audio_backend' onchange='sfAudioUi()'>"
+        "<option value='pdm'" +
+        String(cfg_audio_backend == "pdm" ? " selected" : "") +
+        ">" + htmlText(UI_AUDIO_BACKEND_PDM) + "</option>"
+        "<option value='i2s'" +
+        String(cfg_audio_backend == "i2s" ? " selected" : "") +
+        ">" + htmlText(UI_AUDIO_BACKEND_I2S) + "</option>"
+        "</select><br>";
+
+    html +=
+        "<div id='cfgAudioPdmPanel' style='margin-top:8px'>"
+        "audio_pdm_clk_pin: <input name='audio_pdm_clk_pin' type='number' min='-1' max='48' value='" +
+        String(cfg_audio_pdm_clk_pin) +
+        "' style='width:80px'><br>"
+        "audio_pdm_data_pin: <input name='audio_pdm_data_pin' type='number' min='-1' max='48' value='" +
+        String(cfg_audio_pdm_data_pin) +
+        "' style='width:80px'><br>"
+        "</div>";
+
+    html +=
+        "<div id='cfgAudioI2sPanel' style='margin-top:8px'>"
+        "audio_i2s_bclk_pin: <input name='audio_i2s_bclk_pin' type='number' min='-1' max='48' value='" +
+        String(cfg_audio_i2s_bclk_pin) +
+        "' style='width:80px'><br>"
+        "audio_i2s_ws_pin: <input name='audio_i2s_ws_pin' type='number' min='-1' max='48' value='" +
+        String(cfg_audio_i2s_ws_pin) +
+        "' style='width:80px'><br>"
+        "audio_i2s_data_pin: <input name='audio_i2s_data_pin' type='number' min='-1' max='48' value='" +
+        String(cfg_audio_i2s_data_pin) +
+        "' style='width:80px'><br>"
+        "audio_i2s_mclk_pin: <input name='audio_i2s_mclk_pin' type='number' min='-1' max='48' value='" +
+        String(cfg_audio_i2s_mclk_pin) +
+        "' style='width:80px'> <small class='muted'>-1 = unused</small><br>" +
+        htmlText(UI_AUDIO_I2S_SLOT) +
+        ": <select name='audio_i2s_slot'>"
+        "<option value='left'" + String(cfg_audio_i2s_slot == "left" ? " selected" : "") + ">left</option>"
+        "<option value='right'" + String(cfg_audio_i2s_slot == "right" ? " selected" : "") + ">right</option>"
+        "<option value='stereo'" + String(cfg_audio_i2s_slot == "stereo" ? " selected" : "") + ">stereo</option>"
+        "</select><br>"
+        "</div>"
+        "<small class='muted'>" + htmlText(UI_AUDIO_SAVE_HARDWARE_NOTE) + "</small>"
+        "</div>";
+
+    if (audioCaps.available) {
+        html +=
+            "<p class='muted'>Backend: " +
+            String((unsigned long)audioCaps.minSampleRate) + ".." +
+            String((unsigned long)audioCaps.maxSampleRate) + " Hz; " +
+            htmlText(UI_AUDIO_RECOMMENDED) + " " +
+            String((unsigned long)audioCaps.recommendedSampleRate) +
+            " Hz.</p>";
+    }
+
+    html +=
+        "<div style='margin-top:16px;text-align:right'>"
+        "<button type='button' onclick=\"sfAudioAdvancedClose()\">" +
+        htmlText(UI_AUDIO_CLOSE) +
+        "</button>"
+        "</div></div></div>";
+
+    html +=
+        "<script>"
+        "function sfAudioAdvancedOpen(){var m=document.getElementById('sfAudioAdvancedModal');if(m)m.style.display='block';}"
+        "function sfAudioAdvancedClose(){var m=document.getElementById('sfAudioAdvancedModal');if(m)m.style.display='none';}"
+        "function sfAudioUi(){"
+        "var a=document.getElementById('cfgAudioEnabled');var r=document.getElementById('cfgRecordingFormat');var e=document.getElementById('cfgAudioExpertMode');var s=document.getElementById('cfgAudioSource');var p=document.getElementById('cfgAudioExpertPanel');var b=document.getElementById('cfgAudioBackend');var pp=document.getElementById('cfgAudioPdmPanel');var ip=document.getElementById('cfgAudioI2sPanel');"
+        "if(a&&r&&a.value==='1')r.value='mkv';"
+        "if(!e||!s||!p||!b||!pp||!ip)return;var expert=e.value==='1';if(!expert&&s.value==='external')s.value='board_default';p.style.display=expert?'block':'none';var external=expert&&s.value==='external';b.disabled=!external;pp.style.display=external&&b.value==='pdm'?'block':'none';ip.style.display=external&&b.value==='i2s'?'block':'none';}"
+        "sfAudioUi();"
+        "</script>"
+        "</div>";
+
+
     html += "</div><div class='settings-section'><h3>Sleep / Stromsparen</h3>";
 
     html += "sleep_mode: <select name='sleep_mode'>";
@@ -4424,8 +4370,7 @@ static void handleConfig()
         "<b>Bootloop-/Unterspannungsschutz</b><br>"
         "<span class='muted'>Schützt SensorForge vor wiederholten kurzen Neustarts, "
         "z. B. wenn ein fast leerer oder instabiler Akku beim Hochfahren immer wieder einbricht. "
-        "Nach mehreren unvollständigen Starts legt das Gerät automatisch eine längere Deep-Sleep-Pause ein. "
-        "Normales Ausschalten nach stabilem Betrieb wird nicht als Fehler gewertet.</span><br>";
+        "Nach mehreren unvollständigen Starts legt das Gerät automatisch eine längere Deep-Sleep-Pause ein.</span><br>";
 
     html += "bootloop_protection: <select name='bootloop_protection'>";
     html += "<option value='1'" +
@@ -4437,181 +4382,184 @@ static void handleConfig()
     html += "</select> <small>(vollständige Wirkung ab dem nächsten Neustart)</small><br>";
 
 
-    html += "</div><div class='settings-section'><h3>Speicher / SD-Sicherheit</h3>";
-
-    html += "min_free_space_mb: <input name='min_free_space_mb' type='number' min='0' value='" +
-            String(cfg_min_free_space_mb) + "'><br>";
-
-    html += "disk_full_action: <select name='disk_full_action'>";
-
-    html += "<option value='rollover'" +
-            String(cfg_disk_full_action == "rollover" ? " selected" : "") +
-            ">rollover - älteste Aufnahmen löschen</option>";
-
-    html += "<option value='stop'" +
-            String(cfg_disk_full_action == "stop" ? " selected" : "") +
-            ">stop - Aufnahme stoppen</option>";
-
-    html += "</select><br>";
-
-
     html += "</div><div class='settings-section'><h3>LED</h3>";
 
-    html += "led_enabled: <select name='led_enabled'>";
-    html += "<option value='1'" +
-            String(cfg_led_enabled ? " selected" : "") +
-            ">1 - an</option>";
+    html +=
+        "<div class='config-field-grid'>"
+        "<div class='config-label'>Status-LED</div>"
+        "<div class='config-control'><select id='cfgLedEnabled' name='led_enabled'>"
+        "<option value='1'" + String(cfg_led_enabled ? " selected" : "") + ">Aktiviert - Status-LED verwenden</option>"
+        "<option value='0'" + String(!cfg_led_enabled ? " selected" : "") + ">Deaktiviert - Status-LED bleibt aus</option>"
+        "</select></div>"
+        "</div>";
 
-    html += "<option value='0'" +
-            String(!cfg_led_enabled ? " selected" : "") +
-            ">0 - aus</option>";
-    html += "</select><br>";
 
+    html += "</div><div class='settings-section'><h3>WLAN / Zeit</h3>";
 
-    html += "</div><div class='settings-section'><h3>WLAN / NTP</h3>";
+    String timezoneInfo =
+        "Die Zeitzone bestimmt die lokale Uhrzeit in SensorForge, zum Beispiel für Zeitstempel und geplante Aufnahmefreigaben. "
+        "Wähle die Region, die deinem Standort entspricht. Die technischen POSIX-Zeitzonenwerte werden intern automatisch gesetzt.";
 
-    html += "hostname: <input name='hostname' value='" +
-            htmlEscape(cfg_hostname) + "'>"
-            " <small>(auch Hotspot-SSID)</small><br>";
+    html += "<div class='config-field-grid'>";
 
-    html += "timezone: <input name='timezone' maxlength='127' value='" +
-            htmlEscape(cfg_timezone) + "'>"
-            " <small>POSIX TZ, z.B. Österreich: "
-            "CET-1CEST,M3.5.0,M10.5.0/3; UTC: UTC0</small><br>";
+    html +=
+        "<div class='config-label'>Gerätename / Hotspot-Name</div>"
+        "<div class='config-control'><input name='hostname' maxlength='63' autocomplete='off' value='" +
+        htmlEscape(cfg_hostname) + "'></div>";
 
-    html += "wifi_on_system_start: <select name='wifi_on_system_start'>";
+    html +=
+        "<div class='config-label'><span class='config-label-inline'>Zeitzone" +
+        pageInfoButton("Zeitzone", timezoneInfo) +
+        "</span></div><div class='config-control'><select name='timezone'>";
 
-    html += "<option value='off'" +
-            String(cfg_wifi_on_system_start == "off" ? " selected" : "") +
-            ">off - WLAN beim Systemstart aus</option>";
+    bool timezoneListed = false;
+    for (const ConfigTimezoneOption &option : CONFIG_TIMEZONE_OPTIONS) {
+        bool selected =
+            cfg_timezone == option.value;
 
-    html += "<option value='on'" +
-            String(cfg_wifi_on_system_start == "on" ? " selected" : "") +
-            ">on - WLAN beim Systemstart ein</option>";
+        if (selected)
+            timezoneListed = true;
 
-    html += "<option value='on_missing_time'" +
-            String(cfg_wifi_on_system_start == "on_missing_time" ? " selected" : "") +
-            ">on_missing_time - nur einschalten, wenn Uhrzeit fehlt</option>";
+        html +=
+            "<option value='" + htmlEscape(String(option.value)) + "'" +
+            String(selected ? " selected" : "") + ">" +
+            htmlEscape(String(option.label)) +
+            "</option>";
+    }
 
-    html += "</select><br>";
+    if (!timezoneListed) {
+        html +=
+            "<option value='" + htmlEscape(cfg_timezone) + "' selected>"
+            "Bestehende benutzerdefinierte Zeitzone</option>";
+    }
 
-    html += "wifi_timeout_sec: <input name='wifi_timeout_sec' type='number' min='0' max='86400' value='" +
-            String(cfg_wifi_timeout_sec) + "'>"
-            " <small>(0 = automatische Abschaltung aus)</small><br>";
+    html += "</select></div>";
 
-    html += "wifi_ssid: <input name='wifi_ssid' value='" +
-            htmlEscape(cfg_wifi_ssid) + "'><br>";
+    html +=
+        "<div class='config-label'>WLAN beim Systemstart</div>"
+        "<div class='config-control'><select name='wifi_on_system_start'>"
+        "<option value='off'" + String(cfg_wifi_on_system_start == "off" ? " selected" : "") + ">Aus</option>"
+        "<option value='on'" + String(cfg_wifi_on_system_start == "on" ? " selected" : "") + ">Ein</option>"
+        "<option value='on_missing_time'" + String(cfg_wifi_on_system_start == "on_missing_time" ? " selected" : "") + ">Nur einschalten, wenn die Uhrzeit fehlt</option>"
+        "</select></div>";
 
-    // Passwort absichtlich nicht im HTML zurücksenden.
-    // Leeres Feld bedeutet: bestehendes Passwort behalten.
-    html += "wifi_pass: <input type='password' name='wifi_pass' "
-            "value='' placeholder='leer = unverändert'><br>";
+    html +=
+        "<div class='config-label'>WLAN automatisch ausschalten</div>"
+        "<div class='config-control'><input name='wifi_timeout_sec' type='number' min='0' max='86400' value='" +
+        String(cfg_wifi_timeout_sec) + "'></div>"
+        "<div class='config-note'>Sekunden; 0 = automatische Abschaltung deaktiviert.</div>";
+
+    html +=
+        "<div class='config-label'>WLAN-Netzwerk (SSID)</div>"
+        "<div class='config-control'><input name='wifi_ssid' autocomplete='off' value='" +
+        htmlEscape(cfg_wifi_ssid) + "' placeholder='Name des WLAN-Netzwerks'></div>";
+
+    html +=
+        "<div class='config-label'>WLAN-Passwort</div>"
+        "<div class='config-control'><input type='password' name='wifi_pass' autocomplete='new-password' value='' "
+        "placeholder='Leer lassen = bestehendes Passwort behalten'></div>";
+
+    html += "</div>";
 
 
     html += "</div><div class='settings-section'><h3>Hotspot / Access Point</h3>";
 
-    html += "hotspot_enabled: <select name='hotspot_enabled'>";
-    html += "<option value='1'" +
-            String(cfg_hotspot_enabled ? " selected" : "") +
-            ">1 - beim Systemstart automatisch an</option>";
-    html += "<option value='0'" +
-            String(!cfg_hotspot_enabled ? " selected" : "") +
-            ">0 - beim Systemstart aus</option>";
-    html += "</select><br>";
-
-    // Hotspot password is never sent back to the browser. Empty is a valid
-    // runtime value and means an open AP. In the form, an empty field still
-    // means "keep current" so an already-open default remains open on save.
-    html += "hotspot_password: <input type='password' name='hotspot_password' "
-            "minlength='8' maxlength='63' value='' "
-            "placeholder='leer = unverändert'>"
-            " <small>(aktuell: ";
+    html += "<div class='config-field-grid'>";
 
     html +=
-        cfg_hotspot_password.length()
-        ? "passwortgeschützt"
-        : "offen / kein Passwort";
+        "<div class='config-label'>Hotspot beim Systemstart</div>"
+        "<div class='config-control'><select name='hotspot_enabled'>"
+        "<option value='1'" + String(cfg_hotspot_enabled ? " selected" : "") + ">Aktiviert - Hotspot automatisch starten</option>"
+        "<option value='0'" + String(!cfg_hotspot_enabled ? " selected" : "") + ">Deaktiviert - Hotspot nicht automatisch starten</option>"
+        "</select></div>";
 
     html +=
-        "; neues Passwort: 8..63 Zeichen)</small><br>";
+        "<div class='config-label'>Hotspot-Passwort</div>"
+        "<div class='config-control'><input type='password' name='hotspot_password' minlength='8' maxlength='63' "
+        "autocomplete='new-password' value='' placeholder='Leer lassen = bestehende Einstellung behalten'></div>"
+        "<div class='config-note'>Aktuell: " +
+        String(cfg_hotspot_password.length() ? "passwortgeschützt" : "offen / kein Passwort") +
+        ". Neues Passwort: 8 bis 63 Zeichen.</div>";
 
-    html += "hotspot_hidden: <select name='hotspot_hidden'>";
-    html += "<option value='0'" +
-            String(!cfg_hotspot_hidden ? " selected" : "") +
-            ">0 - SSID sichtbar</option>";
-    html += "<option value='1'" +
-            String(cfg_hotspot_hidden ? " selected" : "") +
-            ">1 - SSID versteckt</option>";
-    html += "</select><br>";
+    html +=
+        "<div class='config-label'>Hotspot-Name sichtbar</div>"
+        "<div class='config-control'><select name='hotspot_hidden'>"
+        "<option value='0'" + String(!cfg_hotspot_hidden ? " selected" : "") + ">Ja - Netzwerkname wird angezeigt</option>"
+        "<option value='1'" + String(cfg_hotspot_hidden ? " selected" : "") + ">Nein - Netzwerkname wird versteckt</option>"
+        "</select></div>";
+
+    html += "</div>";
 
 
     html += "</div><div class='settings-section'><h3>Webinterface / Zugriffsschutz</h3>";
 
-    html += "web_language: <select name='web_language'>";
-    html += "<option value='de'" +
-            String(cfg_web_language == "de" ? " selected" : "") +
-            ">de - Deutsch</option>";
-    html += "<option value='en'" +
-            String(cfg_web_language == "en" ? " selected" : "") +
-            ">en - English</option>";
-    html += "</select><br>";
+    html += "<div class='config-field-grid'>";
 
-    html += "web_recording_auto_pause: <select name='web_recording_auto_pause'>";
-    html += "<option value='1'" +
-            String(cfg_web_recording_auto_pause ? " selected" : "") +
-            ">1 - Aufnahme beim Oeffnen automatisch pausieren</option>";
-    html += "<option value='0'" +
-            String(!cfg_web_recording_auto_pause ? " selected" : "") +
-            ">0 - Aufnahmezustand beim Oeffnen nicht veraendern</option>";
-    html += "</select><br>";
+    html +=
+        "<div class='config-label'>Sprache</div>"
+        "<div class='config-control'><select name='web_language'>"
+        "<option value='de'" + String(cfg_web_language == "de" ? " selected" : "") + ">Deutsch</option>"
+        "<option value='en'" + String(cfg_web_language == "en" ? " selected" : "") + ">English</option>"
+        "</select></div>";
 
-    html += "web_auth_enabled: <select name='web_auth_enabled'>";
-    html += "<option value='1'" +
-            String(cfg_web_auth_enabled ? " selected" : "") +
-            ">1 - Login erforderlich</option>";
-    html += "<option value='0'" +
-            String(!cfg_web_auth_enabled ? " selected" : "") +
-            ">0 - ohne Login</option>";
-    html += "</select><br>";
+    html +=
+        "<div class='config-label'>Aufnahme beim Öffnen des Webinterfaces</div>"
+        "<div class='config-control'><select name='web_recording_auto_pause'>"
+        "<option value='1'" + String(cfg_web_recording_auto_pause ? " selected" : "") + ">Automatisch pausieren</option>"
+        "<option value='0'" + String(!cfg_web_recording_auto_pause ? " selected" : "") + ">Aufnahmezustand unverändert lassen</option>"
+        "</select></div>";
 
-    html += "web_username: <input name='web_username' maxlength='32' value='" +
-            htmlEscape(cfg_web_username) +
-            "'> <small>(1..32 Zeichen, kein Doppelpunkt)</small><br>";
+    html +=
+        "<div class='config-label'>Web-Login</div>"
+        "<div class='config-control'><select name='web_auth_enabled'>"
+        "<option value='1'" + String(cfg_web_auth_enabled ? " selected" : "") + ">Aktiviert - Login erforderlich</option>"
+        "<option value='0'" + String(!cfg_web_auth_enabled ? " selected" : "") + ">Deaktiviert - Zugriff ohne Login</option>"
+        "</select></div>";
 
-    // Web-Passwort nie an den Browser zuruecksenden.
-    // Leeres Feld bedeutet: bestehendes Passwort behalten.
-    html += "web_password: <input type='password' name='web_password' "
-            "minlength='8' maxlength='63' value='' "
-            "placeholder='leer = unverändert'>"
-            " <small>(8..63 Zeichen)</small><br>";
+    html +=
+        "<div class='config-label'>Benutzername</div>"
+        "<div class='config-control'><input name='web_username' maxlength='32' autocomplete='username' value='" +
+        htmlEscape(cfg_web_username) + "'></div>"
+        "<div class='config-note'>1 bis 32 Zeichen; kein Doppelpunkt.</div>";
+
+    html +=
+        "<div class='config-label'>Neues Web-Passwort</div>"
+        "<div class='config-control'><input type='password' name='web_password' minlength='8' maxlength='63' "
+        "autocomplete='new-password' value='' placeholder='Leer lassen = bestehendes Passwort behalten'></div>"
+        "<div class='config-note'>8 bis 63 Zeichen.</div>";
+
+    html += "</div>";
 
 
     html += "</div><div class='settings-section'><h3>Debug / Log</h3>";
 
-    html += "debug_enabled: <select name='debug_enabled'>";
-    html += "<option value='1'" +
-            String(cfg_debug_enabled ? " selected" : "") +
-            ">1 - an</option>";
+    String debugInfo =
+        "Debug aktiviert zusätzliche technische Diagnosemeldungen in Konsole und Log. Das hilft bei einer gezielten Fehleranalyse, erzeugt aber deutlich mehr Diagnoseausgaben und kann zusätzliche Log-Schreibvorgänge verursachen. Für den normalen Betrieb sollte Debug ausgeschaltet bleiben.";
 
-    html += "<option value='0'" +
-            String(!cfg_debug_enabled ? " selected" : "") +
-            ">0 - aus</option>";
-    html += "</select><br>";
+    html += "<div class='config-field-grid'>";
 
-    html += "log_file: <input name='log_file' value='" +
-            htmlEscape(cfg_log_file) + "'><br>";
+    html +=
+        "<div class='config-label'><span class='config-label-inline'>Debug-Ausgaben" +
+        pageInfoButton("Debug-Ausgaben", debugInfo) +
+        "</span></div>"
+        "<div class='config-control'><select name='debug_enabled'>"
+        "<option value='0'" + String(!cfg_debug_enabled ? " selected" : "") + ">Aus - für Normalbetrieb empfohlen</option>"
+        "<option value='1'" + String(cfg_debug_enabled ? " selected" : "") + ">An - nur zur Fehleranalyse</option>"
+        "</select></div>";
+
+    html +=
+        "<div class='config-label'>Logdatei</div>"
+        "<div class='config-control'><input name='log_file' value='" +
+        htmlEscape(cfg_log_file) + "'></div>";
+
+    html += "</div>";
 
     html += "</div>";
     html += "<div class='form-actions'><button type='submit'>Speichern</button></div>";
     html += "</form>";
 
 
-    html +=
-        configSdAvailable() && configSdPresent()
-        ? "<p class='muted'>Speicherziel für normale Saves: <b>interner Flash + vorhandene SD-config.txt</b>.</p>"
-        : "<p class='muted'>Speicherziel für normale Saves: <b>nur interner Flash</b>. Eine fehlende SD-config.txt wird nicht automatisch erzeugt.</p>";
-
-
+    appendPageInfoUi(html);
     html += htmlFooter();
 
     server.send(200, "text/html; charset=utf-8", html);
@@ -4789,10 +4737,10 @@ static void handleSave()
         ? 1
         : 0;
 
+    // SD encryption is owned by the dedicated SD Maintenance page. A general
+    // config save must preserve its current value unchanged.
     int recordingEncryption =
-        server.arg("recording_encryption").toInt()
-        ? 1
-        : 0;
+        cfg_recording_encryption;
 
     int audioEnabled =
         server.hasArg("audio_enabled")
@@ -4934,134 +4882,36 @@ static void handleSave()
         return;
     }
 
+    // Power Shooter tuning is owned exclusively by the dedicated /shooter
+    // page. A general configuration save preserves the currently active values
+    // instead of accepting a second edit path. Shooter enable/disable itself
+    // remains part of the Recording mode above.
     String shooterStorageFormat =
-        server.arg("shooter_storage_format");
-
-    shooterStorageFormat.trim();
-    shooterStorageFormat.toLowerCase();
-
-    if (
-        shooterStorageFormat != "mkv" &&
-        shooterStorageFormat != "jpg"
-    ) {
-        server.send(
-            400,
-            "text/plain; charset=utf-8",
-            "Ungueltiger shooter_storage_format Wert"
-        );
-        return;
-    }
+        cfg_shooter_storage_format;
 
     int shooterIntervalMs =
-        server.arg("shooter_interval_ms").toInt();
-
-    if (
-        shooterIntervalMs < 250 ||
-        shooterIntervalMs > 86400000
-    ) {
-        server.send(
-            400,
-            "text/plain; charset=utf-8",
-            "shooter_interval_ms muss zwischen 250 und 86400000 liegen"
-        );
-        return;
-    }
+        cfg_shooter_interval_ms;
 
     int shooterDarkMeanMin =
-        constrain(
-            server.arg("shooter_dark_mean_min").toInt(),
-            0,
-            255
-        );
+        cfg_shooter_dark_mean_min;
 
-    String shooterMinChangeText =
-        server.arg("shooter_min_change_pct");
-
-    shooterMinChangeText.trim();
-
-    char *shooterMinChangeEnd = nullptr;
     float shooterMinChangePct =
-        strtof(
-            shooterMinChangeText.c_str(),
-            &shooterMinChangeEnd
-        );
+        cfg_shooter_min_change_pct;
 
-    if (
-        !shooterMinChangeText.length() ||
-        !shooterMinChangeEnd ||
-        *shooterMinChangeEnd != '\0' ||
-        shooterMinChangePct < 0.0f ||
-        shooterMinChangePct > 100.0f ||
-        (shooterMinChangePct > 0.0f && shooterMinChangePct < 0.1f)
-    ) {
-        server.send(
-            400,
-            "text/plain; charset=utf-8",
-            "shooter_min_change_pct muss 0 oder 0.1..100.0 sein"
-        );
-        return;
-    }
-
-    String shooterMotionHintChangeText =
-        server.hasArg("shooter_motion_hint_change_pct")
-        ? server.arg("shooter_motion_hint_change_pct")
-        : String(cfg_shooter_motion_hint_change_pct, 1);
-
-    shooterMotionHintChangeText.trim();
-
-    char *shooterMotionHintChangeEnd = nullptr;
     float shooterMotionHintChangePct =
-        strtof(
-            shooterMotionHintChangeText.c_str(),
-            &shooterMotionHintChangeEnd
-        );
+        cfg_shooter_motion_hint_change_pct;
 
     int shooterMotionHintRequiredHits =
-        server.hasArg("shooter_motion_hint_required_hits")
-        ? server.arg("shooter_motion_hint_required_hits").toInt()
-        : cfg_shooter_motion_hint_required_hits;
+        cfg_shooter_motion_hint_required_hits;
 
     int shooterMotionHintWindowFrames =
-        server.hasArg("shooter_motion_hint_window_frames")
-        ? server.arg("shooter_motion_hint_window_frames").toInt()
-        : cfg_shooter_motion_hint_window_frames;
-
-    if (
-        !shooterMotionHintChangeText.length() ||
-        !shooterMotionHintChangeEnd ||
-        *shooterMotionHintChangeEnd != '\0' ||
-        shooterMotionHintChangePct < 0.1f ||
-        shooterMotionHintChangePct > 100.0f ||
-        (
-            shooterMinChangePct > 0.0f &&
-            shooterMotionHintChangePct < shooterMinChangePct
-        ) ||
-        shooterMotionHintWindowFrames < 1 ||
-        shooterMotionHintWindowFrames > 8 ||
-        shooterMotionHintRequiredHits < 1 ||
-        shooterMotionHintRequiredHits > shooterMotionHintWindowFrames
-    ) {
-        server.send(
-            400,
-            "text/plain; charset=utf-8",
-            "Shooter Bewegungsverdacht: Schwelle 0.1..100.0 % und >= Speicherfilter; Treffer/Fenster 1..8 und Treffer <= Fenster"
-        );
-        return;
-    }
+        cfg_shooter_motion_hint_window_frames;
 
     int shooterForceSaveSeconds =
-        constrain(
-            server.arg("shooter_force_save_seconds").toInt(),
-            0,
-            86400
-        );
+        cfg_shooter_force_save_seconds;
 
     int shooterFlushSeconds =
-        constrain(
-            server.arg("shooter_flush_seconds").toInt(),
-            0,
-            3600
-        );
+        cfg_shooter_flush_seconds;
 
 
     String recordingNotBefore = "off";
@@ -5210,25 +5060,13 @@ static void handleSave()
         cfg_transport_black_threshold;
 
 
+    // SD reserve/full-disk policy is owned exclusively by SD Maintenance.
+    // Preserve it verbatim during unrelated general configuration saves.
     int minFreeSpaceMb =
-        server.arg("min_free_space_mb").toInt();
-
-    if (minFreeSpaceMb < 0)
-        minFreeSpaceMb = 0;
-
+        cfg_min_free_space_mb;
 
     String diskFullAction =
-        server.arg("disk_full_action");
-
-    diskFullAction.trim();
-    diskFullAction.toLowerCase();
-
-    if (
-        diskFullAction != "rollover" &&
-        diskFullAction != "stop"
-    ) {
-        diskFullAction = "rollover";
-    }
+        cfg_disk_full_action;
 
 
     String wifiOnSystemStart =
@@ -5795,35 +5633,6 @@ static void handleSave()
         );
 
         return;
-    }
-
-
-    // First-time recording encryption provisions the board-bound eFuse HMAC
-    // root before the setting is persisted. This is intentionally one-time and
-    // irreversible. Existing provisioned boards only perform a read/verify here.
-    if (
-        recordingEncryption &&
-        !recordingCryptoReady()
-    ) {
-        if (recorderIsOpen()) {
-            server.send(
-                409,
-                "text/plain; charset=utf-8",
-                tr(UI_RECORDING_ENCRYPTION_RECORDING_ACTIVE)
-            );
-            return;
-        }
-
-        if (!recordingCryptoEnsureProvisioned()) {
-            server.send(
-                500,
-                "text/plain; charset=utf-8",
-                String(tr(UI_RECORDING_ENCRYPTION_PROVISION_FAILED)) +
-                ": " +
-                recordingCryptoKeyStatusName()
-            );
-            return;
-        }
     }
 
 
@@ -6400,16 +6209,18 @@ static void handleTransportPage()
     if (justSaved) {
         html +=
             "<section class='settings-section' style='border-left:5px solid #087a00;background:#f3fbf2'>"
-            "<b>Transportwerte gespeichert.</b> Die Werte sind jetzt in der persistenten config.txt hinterlegt."
+            "<b>Transportwerte gespeichert.</b>"
             "</section>";
     }
 
     html +=
         "<section class='settings-section'>"
-        "<h3>Aktuelle Schwarzmessung</h3>"
-        "<p class='muted'>Beim Öffnen dieser Seite werden automatisch 10 Messframes mit exakt derselben "
-        "160x120-Graustufen-Methode wie beim späteren Transport-Wake aufgenommen. Eine laufende Aufnahme "
-        "wird vorher sauber beendet und die Aufnahmeautomatik während der Transportvorbereitung pausiert.</p>"
+        "<div style='display:flex;align-items:center;gap:6px;flex-wrap:wrap'><h3 style='margin:0'>Aktuelle Schwarzmessung</h3>" +
+        pageInfoButton(
+            "Aktuelle Schwarzmessung",
+            "Beim Öffnen dieser Seite werden automatisch 10 Messframes mit derselben 160x120-Graustufen-Methode wie beim späteren Transport-Wake aufgenommen. Eine laufende Aufnahme wird vorher sauber beendet und die Aufnahmeautomatik während der Transportvorbereitung pausiert."
+        ) +
+        "</div>"
         "<div class='dashboard-grid'>"
         "<div class='dash-card'><div class='card-label'>Durchschnittliche Helligkeit</div>"
         "<div id='transportReferenceMean' class='card-value'>--</div>"
@@ -6600,6 +6411,7 @@ static void handleTransportPage()
         "})();"
         "</script>";
 
+    appendPageInfoUi(html);
     html += htmlFooter();
 
     server.sendHeader("Cache-Control", "no-store");
@@ -6952,8 +6764,156 @@ static void handleSimulateMotion()
 
 
 // -------------------------------------------------------------
-// LIVE PREVIEW
+// CAMERA SETTINGS + LIVE PREVIEW
 // -------------------------------------------------------------
+
+
+static void handleCameraSettingsSave()
+{
+    if (rejectWhileRecording("camera settings save"))
+        return;
+
+    // Leaving/submitting the Camera page must never accidentally persist a
+    // temporary unsaved live crop. Restore the saved crop before changing the
+    // persistent non-crop camera settings.
+    stopCameraPreview();
+
+    String camera = server.arg("camera");
+    String resolution = server.arg("resolution");
+    String returnTo = server.arg("return_to");
+    String xclkText = server.arg("camera_xclk_mhz");
+    String autoExposureText = server.arg("camera_auto_exposure");
+    String rotationText = server.arg("rotation");
+
+    camera.trim();
+    resolution.trim();
+    xclkText.trim();
+    autoExposureText.trim();
+    rotationText.trim();
+    returnTo.trim();
+
+    if (returnTo != "advanced")
+        returnTo = "main";
+
+    if (
+        xclkText != "10" &&
+        xclkText != "16" &&
+        xclkText != "20"
+    ) {
+        server.send(400, "text/plain; charset=utf-8", "Ungueltiger camera_xclk_mhz Wert");
+        return;
+    }
+
+    if (autoExposureText != "0" && autoExposureText != "1") {
+        server.send(400, "text/plain; charset=utf-8", "Ungueltiger camera_auto_exposure Wert");
+        return;
+    }
+
+    if (rotationText != "0" && rotationText != "180") {
+        server.send(400, "text/plain; charset=utf-8", "Ungueltiger rotation Wert");
+        return;
+    }
+
+    int fps = server.arg("fps").toInt();
+    int quality = server.arg("quality").toInt();
+    int cameraXclkMhz = xclkText.toInt();
+    int cameraAutoExposure = autoExposureText.toInt();
+    int cameraAeLevel = server.arg("camera_ae_level").toInt();
+    int rotation = rotationText.toInt();
+
+    bool restartRequired =
+        camera != cfg_camera ||
+        resolution != cfg_resolution ||
+        quality != cfg_quality ||
+        cameraXclkMhz != cfg_camera_xclk_mhz ||
+        cameraAutoExposure != cfg_camera_auto_exposure ||
+        cameraAeLevel != cfg_camera_ae_level ||
+        rotation != cfg_rotation;
+
+    configRefreshSdStatus();
+
+    bool writeToSd =
+        configSdAvailable() &&
+        configSdPresent();
+
+    String error;
+    ConfigSaveResult result =
+        configSaveCameraSettings(
+            camera,
+            resolution,
+            fps,
+            quality,
+            cameraXclkMhz,
+            cameraAutoExposure,
+            cameraAeLevel,
+            rotation,
+            writeToSd,
+            error
+        );
+
+    if (
+        result != CONFIG_SAVE_BOTH &&
+        result != CONFIG_SAVE_INTERNAL_ONLY
+    ) {
+        server.send(
+            400,
+            "text/plain; charset=utf-8",
+            error.length()
+            ? error
+            : String("camera settings save failed")
+        );
+        return;
+    }
+
+    if (restartRequired)
+        cameraSettingsRestartRequired = true;
+
+    String storageText =
+        result == CONFIG_SAVE_BOTH
+        ? "SD + interner Shadow"
+        : "interner Shadow";
+
+    consoleWrite(
+        "CAMERA",
+        "Settings saved | camera=" + camera +
+        " resolution=" + resolution +
+        " fps=" + String(fps) +
+        " quality=" + String(quality) +
+        " xclk=" + String(cameraXclkMhz) +
+        " auto_exposure=" + String(cameraAutoExposure) +
+        " ae_level=" + String(cameraAeLevel) +
+        " rotation=" + String(rotation) +
+        " | " + storageText
+    );
+
+    logWrite(
+        "Camera settings saved | camera=" + camera +
+        " resolution=" + resolution +
+        " fps=" + String(fps) +
+        " quality=" + String(quality) +
+        " xclk=" + String(cameraXclkMhz) +
+        " auto_exposure=" + String(cameraAutoExposure) +
+        " ae_level=" + String(cameraAeLevel) +
+        " rotation=" + String(rotation)
+    );
+
+    String redirectBase =
+        returnTo == "advanced"
+        ? "/camera_advanced"
+        : "/preview";
+
+    server.sendHeader(
+        "Location",
+        redirectBase +
+        (
+            result == CONFIG_SAVE_BOTH
+            ? "?notice=camera_saved_both"
+            : "?notice=camera_saved_internal"
+        )
+    );
+
+    server.send(303, "text/plain; charset=utf-8", "");
+}
 
 
 static bool parseCameraCropRequest(
@@ -7840,7 +7800,142 @@ static void handlePreview()
 {
     String html = htmlHeader();
 
-    html += "<h2>Live Kamera-Vorschau</h2>";
+    html += "<h2>Kamera</h2>";
+
+    String cameraNotice = server.arg("notice");
+    if (
+        cameraNotice == "camera_saved_both" ||
+        cameraNotice == "camera_saved_internal"
+    ) {
+        html +=
+            "<div id='cameraSaveNotice' class='flash-notice'>"
+            "<strong>Kameraeinstellungen gespeichert</strong>"
+            "<span class='muted'>" +
+            String(
+                cameraNotice == "camera_saved_both"
+                ? "Interne config.txt und vorhandene SD-config.txt wurden aktualisiert. "
+                : "Die interne config.txt wurde aktualisiert. "
+            ) +
+            "Änderungen an Sensor, Auflösung, JPEG-Qualität, XCLK, Belichtung oder Rotation "
+            "werden nach einem Neustart vollständig aktiv.</span>"
+            "</div>"
+            "<script>history.replaceState(null,'','/preview');</script>";
+    }
+
+    bool cameraSaveBlocked = recorderIsOpen();
+
+    html += R"HTML(
+<style>
+.camera-settings-grid{
+    display:grid;
+    grid-template-columns:minmax(190px,240px) minmax(180px,1fr);
+    gap:10px 16px;
+    align-items:center;
+}
+.camera-settings-grid label{font-weight:700;margin:0}
+.camera-settings-grid input,.camera-settings-grid select{margin:0;max-width:360px}
+.camera-settings-note{margin-top:12px;color:var(--muted);font-size:.88rem;line-height:1.45}
+.camera-label-info{display:flex;align-items:center;gap:3px;flex-wrap:wrap}
+.camera-resolution-warning{display:none;margin-top:7px;padding:8px 10px;border-radius:7px;font-size:.86rem;line-height:1.4}
+.camera-resolution-warning.warn{display:block;background:#fff7e8;color:#92400e;border:1px solid #f3c978}
+.camera-resolution-warning.danger{display:block;background:#fff1f1;color:#991b1b;border:1px solid #f0aaaa}
+.camera-preview-title{display:flex;align-items:center;gap:2px;margin:16px 0 8px;font-size:1.02rem}
+@media(max-width:720px){
+    .camera-settings-grid{grid-template-columns:1fr;gap:5px}
+    .camera-settings-grid input,.camera-settings-grid select{width:100%;max-width:none;margin-bottom:7px}
+}
+</style>
+<section class='settings-section' id='camera-settings'>
+<h3>Kameraeinstellungen</h3>
+<form method='POST' action='/camera_settings_save'>
+<input type='hidden' name='return_to' value='main'>
+)HTML";
+
+    html +=
+        "<input type='hidden' name='fps' value='" + String(cfg_fps) + "'>"
+        "<input type='hidden' name='quality' value='" + String(cfg_quality) + "'>"
+        "<input type='hidden' name='camera_xclk_mhz' value='" + String(cfg_camera_xclk_mhz) + "'>"
+        "<input type='hidden' name='camera_auto_exposure' value='" + String(cfg_camera_auto_exposure) + "'>"
+        "<input type='hidden' name='camera_ae_level' value='" + String(cfg_camera_ae_level) + "'>";
+
+    const String cameraModelInfo =
+        "Der Eintrag legt den konfigurierten Kamerasensortyp fest. Auf den unterstützten Boards wird die Pinbelegung durch das Board bestimmt; der tatsächlich erkannte Sensor wird zur Laufzeit über seine Sensor-ID geprüft. Die Auswahlliste verhindert Tippfehler in der Konfiguration.";
+
+    html +=
+        "<div class='camera-settings-grid'>"
+        "<div class='camera-label-info'><label for='cameraCfgModel'>Kameramodell</label>" +
+        pageInfoButton("Kameramodell", cameraModelInfo) +
+        "</div><select id='cameraCfgModel' name='camera'>";
+
+    if (cfg_camera != "OV2640" && cfg_camera != "OV3660") {
+        html +=
+            "<option value='" + htmlEscape(cfg_camera) + "' selected>" +
+            htmlEscape(cfg_camera) + " (bisheriger Wert)</option>";
+    }
+
+    html +=
+        "<option value='OV2640'" + String(cfg_camera == "OV2640" ? " selected" : "") + ">OV2640</option>"
+        "<option value='OV3660'" + String(cfg_camera == "OV3660" ? " selected" : "") + ">OV3660</option>"
+        "</select>"
+        "<label for='cameraCfgResolution'>Auflösung</label>"
+        "<div><select id='cameraCfgResolution' name='resolution'>";
+
+    const char *cameraResolutions[] = {
+        "160x120", "320x240", "640x480", "800x600",
+        "1024x768", "1280x1024", "1600x1200", "2048x1536"
+    };
+    for (const char *resolutionOption : cameraResolutions) {
+        html +=
+            "<option value='" + String(resolutionOption) + "'" +
+            String(cfg_resolution == resolutionOption ? " selected" : "") +
+            ">" + String(resolutionOption) + "</option>";
+    }
+
+    html +=
+        "</select><div id='cameraResolutionLoadHint' class='camera-resolution-warning'></div></div>"
+        "<label for='cameraCfgRotation'>Rotation</label>"
+        "<select id='cameraCfgRotation' name='rotation'>"
+        "<option value='0'" + String(cfg_rotation == 0 ? " selected" : "") + ">0°</option>"
+        "<option value='180'" + String(cfg_rotation == 180 ? " selected" : "") + ">180°</option>"
+        "</select>"
+        "</div>";
+
+    html +=
+        "<button class='primary' type='submit'" +
+        String(cameraSaveBlocked ? " disabled" : "") +
+        ">Kameraeinstellungen speichern</button>"
+        " <a class='button' href='/camera_advanced'>Erweiterte Einstellungen</a>";
+
+    if (cameraSaveBlocked) {
+        html +=
+            " <small class='muted'>Während einer laufenden Aufnahme können Kameraeinstellungen nicht gespeichert werden.</small>";
+    }
+
+    html += R"HTML(
+</form>
+</section>
+<script>
+(function(){
+const r=document.getElementById('cameraCfgResolution');
+const h=document.getElementById('cameraResolutionLoadHint');
+if(!r||!h)return;
+function updateResolutionWarning(){
+    const v=r.value;
+    h.className='camera-resolution-warning';
+    h.textContent='';
+    if(v==='1024x768'){
+        h.classList.add('warn');
+        h.textContent='Erhöhte Systemlast: 1024×768 benötigt deutlich mehr Kamera-, Speicher- und SD-Leistung. Auf kleineren Boards sind 640×480 oder 800×600 meist die robustere Wahl; bei XGA möglichst höchstens 4 fps verwenden.';
+    }else if(v==='1280x1024'||v==='1600x1200'||v==='2048x1536'){
+        h.classList.add('danger');
+        h.textContent='Hohe Systemlast: Diese Auflösung erhöht Kamera-, RAM- und SD-Last stark. Auf kleineren Boards nur gezielt verwenden und die Bildrate niedrig halten.';
+    }
+}
+r.addEventListener('change',updateResolutionWarning);
+updateResolutionWarning();
+})();
+</script>
+)HTML";
 
     if (recorderIsOpen()) {
 
@@ -7853,6 +7948,18 @@ static void handlePreview()
             "<strong>Aufnahme läuft</strong>"
             "<span class='muted'>Die Live-Vorschau ist während einer laufenden "
             "Aufnahme nicht verfügbar.</span>"
+            "</div>";
+
+    } else if (cameraSettingsRestartRequired) {
+
+        stopCameraPreview();
+        html +=
+            "<div class='flash-notice' style='border-left-color:#d97706;background:#fff7e8'>"
+            "<strong style='color:#92400e'>Neustart erforderlich</strong>"
+            "<span class='muted'>Die neuen Kamera-Sensorwerte sind gespeichert. "
+            "Die Live-Vorschau bleibt bis zum Neustart pausiert, damit aktive und "
+            "gespeicherte Kameraeinstellungen nicht verwechselt werden.</span>"
+            "<div style='margin-top:10px'><a class='button' href='/reboot'>Zum Neustart</a></div>"
             "</div>";
 
     } else if (!esp_camera_sensor_get()) {
@@ -7885,14 +7992,6 @@ static void handlePreview()
         bool cropAvailable =
             cropSensorAvailable &&
             cropResolutionAvailable;
-
-
-        html += R"HTML(
-<div class='flash-notice' style='border-left-color:var(--accent);background:#eef4ff'>
-    <strong style='color:#1d4ed8'>Live-Vorschau aktiv</strong>
-    <span class='muted'>Detection und Recording sind deaktiviert, solange diese Kameraansicht aktiv ist.</span>
-</div>
-)HTML";
 
 
         html +=
@@ -7988,6 +8087,13 @@ static void handlePreview()
             "</div>"
             "</section>";
 
+        html +=
+            "<div class='camera-preview-title'><strong>Live-Vorschau</strong>" +
+            pageInfoButton(
+                "Live-Vorschau",
+                "Solange diese Kameraansicht geöffnet ist, pausiert SensorForge automatische Detection und Recording. So kann die Kamera sicher für die Vorschau verwendet werden. Beim Verlassen der Seite wird die normale Automatik wieder freigegeben."
+            ) +
+            "</div>";
 
         html += R"HTML(
 <style>
@@ -8131,6 +8237,14 @@ static void handlePreview()
 }
 </style>
 
+<div id='camViewer' class='camera-viewer fit'>
+    <div class='camera-stage-holder'>
+        <div id='camStage' class='camera-stage'>
+            <img id='cam' alt='Live camera preview'>
+        </div>
+    </div>
+</div>
+
 <div class='camera-zoom-controls' aria-label='Bildzoom'>
     <button id='camZoomOutBtn' type='button' title='Zoom out (-)'>-</button>
     <span id='camZoomLabel' class='camera-zoom-label'>Fit</span>
@@ -8138,14 +8252,6 @@ static void handlePreview()
     <button id='camZoomFitBtn' type='button' title='Fit to window (F)'>Fit</button>
     <button id='camZoom100Btn' type='button' title='100% (0)'>100%</button>
     <span class='camera-zoom-hint'>Tastatur: - / + / F / 0</span>
-</div>
-
-<div id='camViewer' class='camera-viewer fit'>
-    <div class='camera-stage-holder'>
-        <div id='camStage' class='camera-stage'>
-            <img id='cam' alt='Live camera preview'>
-        </div>
-    </div>
 </div>
 
 <script>
@@ -8476,6 +8582,7 @@ nextFrame();
     }
 
     html += "<br><a href='/'><button>Back</button></a>";
+    appendPageInfoUi(html);
     html += htmlFooter();
 
     server.sendHeader(
@@ -8488,6 +8595,191 @@ nextFrame();
         "text/html; charset=utf-8",
         html
     );
+}
+
+
+static void handleCameraAdvanced()
+{
+    // This page changes persistent camera parameters only and does not need the
+    // live-preview gate. Restore any temporary preview/crop state immediately.
+    stopCameraPreview();
+
+    String html = htmlHeader();
+    html +=
+        "<div class='page-title'><div><h2>Erweiterte Kameraeinstellungen</h2>"
+        "<p>Technische Parameter für Bildrate, JPEG und Sensorbetrieb</p></div></div>";
+
+    String cameraNotice = server.arg("notice");
+    if (
+        cameraNotice == "camera_saved_both" ||
+        cameraNotice == "camera_saved_internal"
+    ) {
+        html +=
+            "<div class='flash-notice'><strong>Kameraeinstellungen gespeichert</strong>"
+            "<span class='muted'>Die erweiterten Werte wurden gespeichert. Sensorbezogene Änderungen werden nach einem Neustart vollständig aktiv.</span></div>"
+            "<script>history.replaceState(null,'','/camera_advanced');</script>";
+    }
+
+    int cameraPerformanceMaxFps =
+        configRecordingPerformanceMaxFps(
+            cfg_resolution,
+            cfg_quality
+        );
+    if (cameraPerformanceMaxFps < 1)
+        cameraPerformanceMaxFps = 30;
+
+#if RECORDING_PRODUCTION_FPS_CAP_1024X768 > 0
+    int cameraAdvancedDefaultFps = RECORDING_PRODUCTION_FPS_CAP_1024X768;
+#else
+    int cameraAdvancedDefaultFps = 5;
+#endif
+
+    int cameraAdvancedDefaultMaxFps =
+        configRecordingPerformanceMaxFps(
+            cfg_resolution,
+            12
+        );
+    if (cameraAdvancedDefaultMaxFps > 0 && cameraAdvancedDefaultFps > cameraAdvancedDefaultMaxFps)
+        cameraAdvancedDefaultFps = cameraAdvancedDefaultMaxFps;
+    if (cameraAdvancedDefaultFps < 1)
+        cameraAdvancedDefaultFps = 1;
+
+#if defined(BOARD_FREENOVE)
+    const int cameraAdvancedDefaultXclk = 10;
+#else
+    const int cameraAdvancedDefaultXclk = 20;
+#endif
+
+    bool cameraSaveBlocked = recorderIsOpen();
+
+    html += R"HTML(
+<style>
+.camera-settings-grid{display:grid;grid-template-columns:minmax(190px,240px) minmax(180px,1fr);gap:10px 16px;align-items:center}
+.camera-settings-grid label{font-weight:700;margin:0}.camera-settings-grid input,.camera-settings-grid select{margin:0;max-width:360px}
+.camera-label-info{display:flex;align-items:center;gap:3px;flex-wrap:wrap}
+.camera-settings-note{margin-top:12px;color:var(--muted);font-size:.88rem;line-height:1.45}
+.camera-settings-note.warn{padding:8px 10px;border-radius:7px;background:#fff7e8;color:#92400e;border:1px solid #f3c978}
+.camera-settings-note.danger{padding:8px 10px;border-radius:7px;background:#fff1f1;color:#991b1b;border:1px solid #f0aaaa}
+@media(max-width:720px){.camera-settings-grid{grid-template-columns:1fr;gap:5px}.camera-settings-grid input,.camera-settings-grid select{width:100%;max-width:none;margin-bottom:7px}}
+</style>
+<section class='settings-section'>
+<form method='POST' action='/camera_settings_save'>
+<input type='hidden' name='return_to' value='advanced'>
+)HTML";
+
+    html +=
+        "<input type='hidden' name='camera' value='" + htmlEscape(cfg_camera) + "'>"
+        "<input type='hidden' name='resolution' value='" + htmlEscape(cfg_resolution) + "'>"
+        "<input type='hidden' name='rotation' value='" + String(cfg_rotation) + "'>"
+        "<div class='camera-settings-grid'>";
+
+    html +=
+        "<div class='camera-label-info'><label for='cameraCfgFps'>FPS</label>" +
+        pageInfoButton(
+            "FPS – Bilder pro Sekunde",
+            "FPS gibt an, wie viele Kamerabilder pro Sekunde verarbeitet werden. Mehr FPS macht Bewegungen flüssiger, erhöht aber Kamera-, CPU-, Speicher- und SD-Last. Für SensorForge sind bis 4 fps die konservative Wahl bei größeren Auflösungen. Mehr als 4 fps erhöht die Systemlast deutlich und wird auf kleineren Boards ausdrücklich nicht empfohlen."
+        ) +
+        "</div>"
+        "<input id='cameraCfgFps' name='fps' type='number' min='1' max='" + String(cameraPerformanceMaxFps) + "' value='" + String(cfg_fps) + "' required>";
+
+    html +=
+        "<div class='camera-label-info'><label for='cameraCfgQuality'>JPEG-Qualität</label>" +
+        pageInfoButton(
+            "JPEG-Qualität",
+            "Dieser Wert steuert die JPEG-Kompression. Kleinere Zahlen bedeuten höhere Bildqualität, aber größere Dateien und mehr Speicher-/SD-Last. Der SensorForge-Referenzwert ist 12. Ohne konkreten Grund sollte dieser Wert nicht deutlich kleiner gewählt werden."
+        ) +
+        "</div>"
+        "<input id='cameraCfgQuality' name='quality' type='number' min='0' max='63' value='" + String(cfg_quality) + "' required>";
+
+    html +=
+        "<div class='camera-label-info'><label for='cameraCfgXclk'>Kamera-XCLK</label>" +
+        pageInfoButton(
+            "Kamera-XCLK",
+            "XCLK ist der Takt, mit dem das Board den Kamerasensor versorgt. Er beeinflusst Timing, Leistungsaufnahme und Stabilität des Sensors. Unterstützt werden 10, 16 und 20 MHz. Wenn kein gezielter Hardwaretest durchgeführt wird, sollte der Standardwert des Boards beibehalten werden."
+        ) +
+        "</div>"
+        "<select id='cameraCfgXclk' name='camera_xclk_mhz'>"
+        "<option value='10'" + String(cfg_camera_xclk_mhz == 10 ? " selected" : "") + ">10 MHz</option>"
+        "<option value='16'" + String(cfg_camera_xclk_mhz == 16 ? " selected" : "") + ">16 MHz</option>"
+        "<option value='20'" + String(cfg_camera_xclk_mhz == 20 ? " selected" : "") + ">20 MHz</option>"
+        "</select>";
+
+    html +=
+        "<div class='camera-label-info'><label for='cameraCfgAutoExposure'>Auto Exposure</label>" +
+        pageInfoButton(
+            "Auto Exposure",
+            "Bei Auto Exposure passt die Kamera ihre Belichtung automatisch an wechselnde Helligkeit an. Für normale Überwachungs- und Dauershooter-Anwendungen sollte diese Funktion in der Regel eingeschaltet bleiben. Ausschalten ist nur für gezielte manuelle Kameratests sinnvoll."
+        ) +
+        "</div>"
+        "<select id='cameraCfgAutoExposure' name='camera_auto_exposure'>"
+        "<option value='1'" + String(cfg_camera_auto_exposure ? " selected" : "") + ">An</option>"
+        "<option value='0'" + String(!cfg_camera_auto_exposure ? " selected" : "") + ">Aus</option>"
+        "</select>";
+
+    html +=
+        "<div class='camera-label-info'><label for='cameraCfgAeLevel'>AE-Level</label>" +
+        pageInfoButton(
+            "AE-Level",
+            "AE-Level verschiebt das Helligkeitsziel der automatischen Belichtung. -2 erzeugt ein dunkleres Zielbild, 0 ist neutral und +2 ein helleres Zielbild. Der Wert ist vor allem relevant, wenn Auto Exposure eingeschaltet ist. Zu helle Zielwerte können Bewegungsunschärfe oder ausgewaschene Bereiche begünstigen."
+        ) +
+        "</div>"
+        "<input id='cameraCfgAeLevel' name='camera_ae_level' type='number' min='-2' max='2' value='" + String(cfg_camera_ae_level) + "' required>"
+        "</div>"
+        "<div id='cameraPerformanceHint' class='camera-settings-note'></div>";
+
+    html +=
+        "<button class='primary' type='submit'" + String(cameraSaveBlocked ? " disabled" : "") + ">Erweiterte Einstellungen speichern</button>"
+        " <button id='cameraDefaultsBtn' type='button'" + String(cameraSaveBlocked ? " disabled" : "") + ">Standardwerte einsetzen</button>"
+        " <a class='button' href='/preview'>Zurück zur Kamera</a>";
+
+    if (cameraSaveBlocked) {
+        html +=
+            " <small class='muted'>Während einer laufenden Aufnahme können Kameraeinstellungen nicht gespeichert werden.</small>";
+    }
+
+    html += R"HTML(
+</form>
+</section>
+<script>
+(function(){
+const cap=)HTML";
+    html += String((unsigned long)configRecordingPerformanceLimit());
+    html += ";const stabilityCap1024=";
+    html += String((int)RECORDING_PRODUCTION_FPS_CAP_1024X768);
+    html += ";const resolution='" + htmlJsString(cfg_resolution) + "';";
+    html += "const defaults={fps:" + String(cameraAdvancedDefaultFps) +
+        ",quality:12,xclk:'" + String(cameraAdvancedDefaultXclk) +
+        "',autoExposure:'1',aeLevel:'-1'};";
+    html += R"HTML(
+const px={'160x120':19200,'320x240':76800,'640x480':307200,'800x600':480000,'1024x768':786432,'1280x1024':1310720,'1600x1200':1920000,'2048x1536':3145728};
+const f=document.getElementById('cameraCfgFps'),q=document.getElementById('cameraCfgQuality'),h=document.getElementById('cameraPerformanceHint');
+const xclk=document.getElementById('cameraCfgXclk'),ae=document.getElementById('cameraCfgAutoExposure'),ael=document.getElementById('cameraCfgAeLevel'),defaultsBtn=document.getElementById('cameraDefaultsBtn');
+function qw(v){v=Math.max(0,Math.min(63,Number(v)||0));if(v>=12)return 100;return Math.min(160,100+(12-v)*5)}
+function update(){
+    h.className='camera-settings-note';
+    const p=px[resolution];
+    if(!cap||!p){h.textContent='Für diese Kombination ist kein Performance-Limit verfügbar.';return}
+    const w=qw(q.value);
+    let m=Math.max(0,Math.min(30,Math.floor((cap*100)/(p*w))));
+    if(resolution==='1024x768'&&stabilityCap1024>0)m=Math.min(m,stabilityCap1024);
+    f.max=Math.max(1,m);
+    if(m<1){h.classList.add('danger');h.textContent='Diese Auflösung/JPEG-Qualität überschreitet bereits bei 1 fps das zulässige Board-Limit.';return}
+    const current=Math.max(1,Number(f.value)||1);
+    let text='Für die aktuelle Auflösung und JPEG-Qualität sind technisch bis zu '+m+' fps zugelassen.';
+    if(current>4){h.classList.add('warn');text='Hohe Systemlast: Mehr als 4 fps wird auf kleineren Boards ausdrücklich nicht empfohlen. '+text}
+    h.textContent=text;
+}
+q.addEventListener('input',update);f.addEventListener('input',update);
+if(defaultsBtn)defaultsBtn.addEventListener('click',function(){f.value=String(defaults.fps);q.value=String(defaults.quality);xclk.value=defaults.xclk;ae.value=defaults.autoExposure;ael.value=defaults.aeLevel;update()});
+update();
+})();
+</script>
+)HTML";
+
+    appendPageInfoUi(html);
+    html += htmlFooter();
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "text/html; charset=utf-8", html);
 }
 
 
@@ -11629,6 +11921,45 @@ static void appendSystemOverviewSections(
         String((unsigned long)(psramTest.freeAfter / 1024U)) +
         " KB"
         "</section>";
+
+    const String systemTestInfo =
+        "Der Systemtest verwendet die aktuell gespeicherten Einstellungen und belastet den echten Aufnahmeweg: Kamera, Recorder/Container, SD-Karte, internen Speicher, PSRAM und Temperatur. "
+        "Wenn Audio aktiviert ist, werden Mikrofon, Audiopuffer und das eingebettete Audiosignal automatisch mitgeprüft. Ist SD-Verschlüsselung aktiviert, läuft auch der Test verschlüsselt. "
+        "Die temporäre Testaufnahme wird nach Abschluss wieder gelöscht. Für einen aussagekräftigen Audiotest während des Tests kurz sprechen oder ein Geräusch in Mikrofon-Nähe erzeugen.";
+
+    html +=
+        "<section class='settings-section' id='system-test'>"
+        "<div class='sys-section-head'><h3>Systemtest</h3>" +
+        systemInfoButton("Systemtest", systemTestInfo) +
+        "</div>"
+        "<p class='muted'>Prüft SensorForge unter realer Aufnahmelast mit den aktuell gespeicherten Einstellungen.</p>";
+
+    if (recordingLoadTestIsActive()) {
+        html +=
+            "<p><span class='status-pill warn'>TEST LÄUFT</span></p>"
+            "<p><a class='button primary' href='/recording_load_test_status_page'>Status öffnen</a></p>";
+    } else {
+        html +=
+            "<form method='POST' action='/recording_load_test'>"
+            "<label for='systemTestSeconds'><b>Testdauer</b></label><br>"
+            "<select id='systemTestSeconds' name='seconds'>"
+            "<option value='30' selected>30 Sekunden</option>"
+            "<option value='60'>1 Minute</option>"
+            "<option value='300'>5 Minuten</option>"
+            "<option value='900'>15 Minuten</option>"
+            "<option value='1800'>30 Minuten</option>"
+            "<option value='3600'>60 Minuten</option>"
+            "</select> "
+            "<button class='primary' type='submit'>SYSTEMTEST STARTEN</button>"
+            "</form>";
+
+        if (recordingLoadTestHasResult()) {
+            html +=
+                "<p><a class='button' href='/recording_load_test_result'>Letztes Ergebnis anzeigen</a></p>";
+        }
+    }
+
+    html += "</section>";
 }
 
 
@@ -12386,7 +12717,8 @@ static void handleShuttingDown()
             ? "Die Verbindung wird gleich beendet. Danach bleibt das Board ausgeschaltet, bis die Stromversorgung neu angelegt oder RESET gedrückt wird."
             : "The connection will close shortly. The board then remains off until power is reapplied or RESET is pressed."
         ) +
-        "</p><div class='countdown'>OFF</div></div>";
+        "</p><div class='countdown'>OFF</div></div>"
+        "<script>setTimeout(function(){try{history.replaceState(null,'','/');}catch(e){}},1000);</script>";
 
     html +=
         htmlFooter();
@@ -16028,576 +16360,22 @@ static AudioFormat audioPostedFormat()
 }
 
 
-static void handleAudioTestRecord()
+static void handleLegacyAudioTestRedirect()
 {
-    if (rejectWhileRecording("audio test"))
-        return;
-
-    if (!sdReady) {
-        server.send(
-            503,
-            "text/plain; charset=utf-8",
-            "SD storage is not available"
-        );
-        return;
-    }
-
-    if (g_storageLocked) {
-        server.send(
-            409,
-            "text/plain; charset=utf-8",
-            "Storage maintenance is already active"
-        );
-        return;
-    }
-
-    // Hardware routing is intentionally persistent and explicit. Do not
-    // silently test a different microphone when the operator changed Expert
-    // fields in the form but has not saved them yet.
-    if (audioPostedHardwareDiffers()) {
-        server.send(
-            409,
-            "text/plain; charset=utf-8",
-            tr(UI_AUDIO_SAVE_HARDWARE_NOTE)
-        );
-        return;
-    }
-
-    AudioFormat format = audioPostedFormat();
-
-    String formatError;
-
-    if (!audioCaptureFormatSupported(format, formatError)) {
-        server.send(
-            400,
-            "text/plain; charset=utf-8",
-            "Unsupported audio format: " + formatError
-        );
-        return;
-    }
-
-    // The diagnostic owns storage for the short capture so no new recording can
-    // start while the WAV writer and microphone exercise the storage path.
-    bool previousRecordingBlock = g_recordingStartBlocked;
-    g_recordingStartBlocked = true;
-    g_storageLocked = true;
-
-    AudioWavResult result = {};
-    String error;
-    const String testPath = "/audio_test.wav";
-
-    bool ok = audioWavRecordTest(
-        testPath,
-        10000UL,
-        format,
-        cfg_recording_encryption != 0,
-        result,
-        error,
-        serviceWebLongOperation
+    // v82 consolidates all user-facing diagnostics into the Systemtest. Keep
+    // the historical POST routes as harmless redirects for stale browser pages
+    // or bookmarks instead of leaving a second diagnostic workflow alive.
+    server.sendHeader(
+        "Location",
+        "/system#system-test",
+        true
     );
-
-    g_storageLocked = false;
-    g_recordingStartBlocked = previousRecordingBlock;
-
-    String html = htmlHeader();
-    html += "<h2>Audio diagnostic</h2>";
-
-    if (!ok) {
-        html +=
-            "<section class='settings-section' style='border-left:5px solid #b91c1c'>"
-            "<h3>Test failed</h3><p>" +
-            htmlEscape(error) +
-            "</p></section>";
-    } else {
-        html +=
-            "<section class='settings-section' style='border-left:5px solid #15803d'>"
-            "<h3>10 s WAV test completed</h3>"
-            "<p><span class='status-pill ok'>AUDIO OK</span></p>";
-
-        html += "Backend: <b>" +
-                htmlEscape(String(audioCaptureBackendName())) +
-                "</b><br>";
-        html += "Format: <b>" +
-                String((unsigned long)format.sampleRate) +
-                " Hz / " +
-                String((unsigned int)format.bitsPerSample) +
-                " bit / " +
-                String((unsigned int)format.channels) +
-                (format.channels == 1 ? " channel" : " channels") +
-                "</b><br>";
-        html += "PCM: " +
-                String((unsigned long)result.pcmBytes) +
-                " bytes<br>";
-        html += "Capture time: " +
-                String((unsigned long)result.captureMs) +
-                " ms<br>";
-        html += "Dropped audio: <b>" +
-                String((unsigned long)result.droppedBytes) +
-                " bytes</b><br>";
-        html += "PSRAM buffer high-water: " +
-                String((unsigned long)result.bufferHighWater) +
-                " / " +
-                String((unsigned long)result.bufferCapacity) +
-                " bytes<br>";
-
-        if (format.bitsPerSample == 16) {
-            html += "Signal peak: " +
-                    String((long)result.peakAbs16) +
-                    " / 32768<br>";
-            html += "Signal RMS: " +
-                    String(result.rms16, 1) +
-                    " / 32768<br>";
-        }
-
-        html +=
-            "<p><a class='button primary' href='/file?path=%2Faudio_test.wav'>"
-            "WAV herunterladen</a></p>"
-            "<p class='muted'>" +
-            htmlText(UI_AUDIO_TEST_HELP) +
-            " " +
-            htmlText(UI_AUDIO_ENCRYPTION_NOTE) +
-            "</p>"
-            "</section>";
-    }
-
-    html += "<p><a href='/config'><button>Back to Config</button></a></p>";
-    html += htmlFooter();
-
-    server.sendHeader("Cache-Control", "no-store");
-    server.send(200, "text/html; charset=utf-8", html);
+    server.send(
+        303,
+        "text/plain; charset=utf-8",
+        "Audio diagnostics moved to Systemtest"
+    );
 }
-
-
-static void handleAudioBenchmark()
-{
-    if (rejectWhileRecording("audio benchmark"))
-        return;
-
-    if (g_storageLocked) {
-        server.send(
-            409,
-            "text/plain; charset=utf-8",
-            "Storage maintenance is already active"
-        );
-        return;
-    }
-
-    if (audioPostedHardwareDiffers()) {
-        server.send(
-            409,
-            "text/plain; charset=utf-8",
-            tr(UI_AUDIO_SAVE_HARDWARE_NOTE)
-        );
-        return;
-    }
-
-    AudioFormat format = audioPostedFormat();
-    String formatError;
-
-    if (!audioCaptureFormatSupported(format, formatError)) {
-        server.send(
-            400,
-            "text/plain; charset=utf-8",
-            "Unsupported audio format: " + formatError
-        );
-        return;
-    }
-
-    static const uint32_t BENCHMARK_DURATION_MS = 10000UL;
-    static const size_t BENCHMARK_READ_BYTES = 8U * 1024U;
-
-    uint32_t internalBefore =
-        (uint32_t)heap_caps_get_free_size(
-            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
-        );
-    uint32_t psramBefore =
-        (uint32_t)heap_caps_get_free_size(
-            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
-        );
-
-    uint8_t *buffer =
-        (uint8_t *)heap_caps_malloc(
-            BENCHMARK_READ_BYTES,
-            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
-        );
-
-    if (!buffer) {
-        server.send(
-            500,
-            "text/plain; charset=utf-8",
-            "Audio benchmark buffer allocation failed"
-        );
-        return;
-    }
-
-    uint32_t internalMin =
-        (uint32_t)heap_caps_get_free_size(
-            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
-        );
-    uint32_t psramMin =
-        (uint32_t)heap_caps_get_free_size(
-            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
-        );
-
-    bool previousRecordingBlock = g_recordingStartBlocked;
-    g_recordingStartBlocked = true;
-
-    String error;
-    bool started = audioCaptureStart(format, error);
-
-    uint64_t deliveredBytes = 0;
-    uint32_t emptyReads = 0;
-    uint32_t maxDrainGapMs = 0;
-    uint32_t benchmarkStartMs = millis();
-    uint32_t lastDrainMs = benchmarkStartMs;
-
-    if (started) {
-        while (
-            (uint32_t)(millis() - benchmarkStartMs) <
-                BENCHMARK_DURATION_MS
-        ) {
-            size_t got =
-                audioCaptureRead(
-                    buffer,
-                    BENCHMARK_READ_BYTES,
-                    50UL
-                );
-
-            uint32_t now = millis();
-            uint32_t gap = now - lastDrainMs;
-            if (gap > maxDrainGapMs)
-                maxDrainGapMs = gap;
-            lastDrainMs = now;
-
-            if (got)
-                deliveredBytes += (uint64_t)got;
-            else
-                emptyReads++;
-
-            uint32_t internalNow =
-                (uint32_t)heap_caps_get_free_size(
-                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
-                );
-            uint32_t psramNow =
-                (uint32_t)heap_caps_get_free_size(
-                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
-                );
-
-            if (internalNow < internalMin)
-                internalMin = internalNow;
-            if (psramNow < psramMin)
-                psramMin = psramNow;
-
-            serviceWebLongOperation();
-        }
-    }
-
-    uint32_t elapsedMs =
-        started
-        ? (uint32_t)(millis() - benchmarkStartMs)
-        : 0;
-
-    AudioCaptureStats stats = {};
-    if (started)
-        stats = audioCaptureStats();
-
-    if (started)
-        audioCaptureStop();
-
-    g_recordingStartBlocked = previousRecordingBlock;
-
-    free(buffer);
-
-    uint32_t internalAfter =
-        (uint32_t)heap_caps_get_free_size(
-            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
-        );
-    uint32_t psramAfter =
-        (uint32_t)heap_caps_get_free_size(
-            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
-        );
-
-    String html = htmlHeader();
-    html += "<h2>" + htmlText(UI_AUDIO_BENCHMARK) + "</h2>";
-
-    if (!started) {
-        html +=
-            "<section class='settings-section' style='border-left:5px solid #b91c1c'>"
-            "<h3>Test failed</h3><p>" +
-            htmlEscape(error) +
-            "</p></section>";
-    } else {
-        uint64_t bytesPerSecond =
-            (uint64_t)format.sampleRate *
-            (uint64_t)format.channels *
-            (uint64_t)(format.bitsPerSample / 8U);
-
-        uint64_t expectedBytes =
-            elapsedMs > 0
-            ? (bytesPerSecond * (uint64_t)elapsedMs) / 1000ULL
-            : 0;
-
-        float deliveredPct =
-            expectedBytes > 0
-            ? (100.0f * (float)deliveredBytes / (float)expectedBytes)
-            : 0.0f;
-
-        float highWaterPct =
-            stats.bufferCapacity > 0
-            ? (100.0f * (float)stats.bufferHighWater / (float)stats.bufferCapacity)
-            : 0.0f;
-
-        float droppedPct =
-            stats.bytesCaptured > 0
-            ? (100.0f * (float)stats.bytesDropped / (float)stats.bytesCaptured)
-            : 0.0f;
-
-        enum AudioLoadLevel {
-            AUDIO_LOAD_GREEN = 0,
-            AUDIO_LOAD_ORANGE = 1,
-            AUDIO_LOAD_RED = 2
-        };
-
-        static const float AUDIO_DELIVERY_GREEN_MIN_PCT = 98.0f;
-        static const float AUDIO_DELIVERY_RED_BELOW_PCT = 95.0f;
-        static const float AUDIO_DROPS_RED_FROM_PCT = 1.0f;
-        static const float AUDIO_BUFFER_ORANGE_FROM_PCT = 50.0f;
-        static const float AUDIO_BUFFER_RED_FROM_PCT = 90.0f;
-        static const uint32_t AUDIO_DRAIN_ORANGE_ABOVE_MS = 500UL;
-        static const uint32_t AUDIO_DRAIN_RED_ABOVE_MS = 2000UL;
-        static const uint32_t AUDIO_HEAP_ORANGE_BELOW_BYTES = 64UL * 1024UL;
-        static const uint32_t AUDIO_HEAP_RED_BELOW_BYTES = 32UL * 1024UL;
-        static const uint32_t AUDIO_PSRAM_ORANGE_BELOW_BYTES = 512UL * 1024UL;
-        static const uint32_t AUDIO_PSRAM_RED_BELOW_BYTES = 256UL * 1024UL;
-
-        auto maxLevel = [](int a, int b) -> int {
-            return a > b ? a : b;
-        };
-
-        int deliveryLevel =
-            deliveredPct < AUDIO_DELIVERY_RED_BELOW_PCT
-            ? AUDIO_LOAD_RED
-            : deliveredPct < AUDIO_DELIVERY_GREEN_MIN_PCT
-              ? AUDIO_LOAD_ORANGE
-              : AUDIO_LOAD_GREEN;
-
-        int dropsLevel =
-            droppedPct >= AUDIO_DROPS_RED_FROM_PCT
-            ? AUDIO_LOAD_RED
-            : stats.bytesDropped > 0
-              ? AUDIO_LOAD_ORANGE
-              : AUDIO_LOAD_GREEN;
-
-        int bufferLevel =
-            highWaterPct >= AUDIO_BUFFER_RED_FROM_PCT
-            ? AUDIO_LOAD_RED
-            : highWaterPct >= AUDIO_BUFFER_ORANGE_FROM_PCT
-              ? AUDIO_LOAD_ORANGE
-              : AUDIO_LOAD_GREEN;
-
-        int drainLevel =
-            maxDrainGapMs > AUDIO_DRAIN_RED_ABOVE_MS
-            ? AUDIO_LOAD_RED
-            : maxDrainGapMs > AUDIO_DRAIN_ORANGE_ABOVE_MS
-              ? AUDIO_LOAD_ORANGE
-              : AUDIO_LOAD_GREEN;
-
-        int heapLevel =
-            internalMin < AUDIO_HEAP_RED_BELOW_BYTES
-            ? AUDIO_LOAD_RED
-            : internalMin < AUDIO_HEAP_ORANGE_BELOW_BYTES
-              ? AUDIO_LOAD_ORANGE
-              : AUDIO_LOAD_GREEN;
-
-        int psramLevel =
-            psramMin < AUDIO_PSRAM_RED_BELOW_BYTES
-            ? AUDIO_LOAD_RED
-            : psramMin < AUDIO_PSRAM_ORANGE_BELOW_BYTES
-              ? AUDIO_LOAD_ORANGE
-              : AUDIO_LOAD_GREEN;
-
-        int overallLevel = AUDIO_LOAD_GREEN;
-        overallLevel = maxLevel(overallLevel, deliveryLevel);
-        overallLevel = maxLevel(overallLevel, dropsLevel);
-        overallLevel = maxLevel(overallLevel, bufferLevel);
-        overallLevel = maxLevel(overallLevel, drainLevel);
-        overallLevel = maxLevel(overallLevel, heapLevel);
-        overallLevel = maxLevel(overallLevel, psramLevel);
-
-        auto levelClass = [](int level) -> const char * {
-            return
-                level == AUDIO_LOAD_RED
-                ? "danger"
-                : level == AUDIO_LOAD_ORANGE
-                  ? "warn"
-                  : "ok";
-        };
-
-        auto levelTextId = [](int level) -> UiTextId {
-            return
-                level == AUDIO_LOAD_RED
-                ? UI_AUDIO_LOAD_RED
-                : level == AUDIO_LOAD_ORANGE
-                  ? UI_AUDIO_LOAD_ORANGE
-                  : UI_AUDIO_LOAD_GREEN;
-        };
-
-        auto levelPill = [&](int level) -> String {
-            return
-                "<span class='status-pill " +
-                String(levelClass(level)) +
-                "'>" +
-                htmlText(levelTextId(level)) +
-                "</span>";
-        };
-
-        const char *border =
-            overallLevel == AUDIO_LOAD_RED
-            ? "#b91c1c"
-            : overallLevel == AUDIO_LOAD_ORANGE
-              ? "#c47a00"
-              : "#15803d";
-
-        UiTextId verdictId =
-            overallLevel == AUDIO_LOAD_RED
-            ? UI_AUDIO_LOAD_NOT_RECOMMENDED
-            : overallLevel == AUDIO_LOAD_ORANGE
-              ? UI_AUDIO_LOAD_CHECK
-              : UI_AUDIO_LOAD_GOOD;
-
-        html +=
-            "<section class='settings-section' style='border-left:5px solid " +
-            String(border) +
-            "'><h3>10 s capture-only result</h3>"
-            "<p>" + levelPill(overallLevel) +
-            " <b>" + htmlText(verdictId) + "</b></p>"
-            "<p class='muted'>" + htmlText(UI_AUDIO_LOAD_SCOPE) + "</p>";
-
-        html +=
-            "<div style='line-height:1.9'>" +
-            levelPill(deliveryLevel) + " <b>" +
-            htmlText(UI_AUDIO_LOAD_DELIVERY) +
-            ":</b> " + String(deliveredPct, 1) +
-            "% <small class='muted'>(" + htmlText(UI_AUDIO_LOAD_GREEN) +
-            " &ge; " + String(AUDIO_DELIVERY_GREEN_MIN_PCT, 0) +
-            "%, " + htmlText(UI_AUDIO_LOAD_ORANGE) + " " +
-            String(AUDIO_DELIVERY_RED_BELOW_PCT, 0) + "..&lt;" +
-            String(AUDIO_DELIVERY_GREEN_MIN_PCT, 0) +
-            "%, " + htmlText(UI_AUDIO_LOAD_RED) + " &lt;" +
-            String(AUDIO_DELIVERY_RED_BELOW_PCT, 0) + "%)</small><br>" +
-
-            levelPill(dropsLevel) + " <b>" +
-            htmlText(UI_AUDIO_LOAD_DROPS) +
-            ":</b> " + String((unsigned long)stats.bytesDropped) +
-            " B (" + String(droppedPct, 3) +
-            "%) <small class='muted'>(" + htmlText(UI_AUDIO_LOAD_GREEN) +
-            " = 0, " + htmlText(UI_AUDIO_LOAD_ORANGE) +
-            " &gt;0..&lt;" + String(AUDIO_DROPS_RED_FROM_PCT, 0) +
-            "%, " + htmlText(UI_AUDIO_LOAD_RED) + " &ge;" +
-            String(AUDIO_DROPS_RED_FROM_PCT, 0) + "%)</small><br>" +
-
-            levelPill(bufferLevel) + " <b>" +
-            htmlText(UI_AUDIO_LOAD_BUFFER) +
-            ":</b> " + String(highWaterPct, 1) +
-            "% <small class='muted'>(" + htmlText(UI_AUDIO_LOAD_GREEN) +
-            " &lt;" + String(AUDIO_BUFFER_ORANGE_FROM_PCT, 0) +
-            "%, " + htmlText(UI_AUDIO_LOAD_ORANGE) + " " +
-            String(AUDIO_BUFFER_ORANGE_FROM_PCT, 0) + "..&lt;" +
-            String(AUDIO_BUFFER_RED_FROM_PCT, 0) +
-            "%, " + htmlText(UI_AUDIO_LOAD_RED) + " &ge;" +
-            String(AUDIO_BUFFER_RED_FROM_PCT, 0) + "%)</small><br>" +
-
-            levelPill(drainLevel) + " <b>" +
-            htmlText(UI_AUDIO_LOAD_DRAIN) +
-            ":</b> " + String((unsigned long)maxDrainGapMs) +
-            " ms <small class='muted'>(" + htmlText(UI_AUDIO_LOAD_GREEN) +
-            " &le;" + String((unsigned long)AUDIO_DRAIN_ORANGE_ABOVE_MS) +
-            " ms, " + htmlText(UI_AUDIO_LOAD_ORANGE) + " &gt;" +
-            String((unsigned long)AUDIO_DRAIN_ORANGE_ABOVE_MS) + ".." +
-            String((unsigned long)AUDIO_DRAIN_RED_ABOVE_MS) +
-            " ms, " + htmlText(UI_AUDIO_LOAD_RED) + " &gt;" +
-            String((unsigned long)AUDIO_DRAIN_RED_ABOVE_MS) + " ms)</small><br>" +
-
-            levelPill(heapLevel) + " <b>" +
-            htmlText(UI_AUDIO_LOAD_HEAP) +
-            ":</b> " + String((double)internalMin / 1024.0, 1) +
-            " KiB min <small class='muted'>(" + htmlText(UI_AUDIO_LOAD_GREEN) +
-            " &ge;" + String((unsigned long)(AUDIO_HEAP_ORANGE_BELOW_BYTES / 1024UL)) +
-            " KiB, " + htmlText(UI_AUDIO_LOAD_ORANGE) + " " +
-            String((unsigned long)(AUDIO_HEAP_RED_BELOW_BYTES / 1024UL)) + "..&lt;" +
-            String((unsigned long)(AUDIO_HEAP_ORANGE_BELOW_BYTES / 1024UL)) +
-            " KiB, " + htmlText(UI_AUDIO_LOAD_RED) + " &lt;" +
-            String((unsigned long)(AUDIO_HEAP_RED_BELOW_BYTES / 1024UL)) + " KiB)</small><br>" +
-
-            levelPill(psramLevel) + " <b>" +
-            htmlText(UI_AUDIO_LOAD_PSRAM) +
-            ":</b> " + String((double)psramMin / 1024.0, 1) +
-            " KiB min <small class='muted'>(" + htmlText(UI_AUDIO_LOAD_GREEN) +
-            " &ge;" + String((unsigned long)(AUDIO_PSRAM_ORANGE_BELOW_BYTES / 1024UL)) +
-            " KiB, " + htmlText(UI_AUDIO_LOAD_ORANGE) + " " +
-            String((unsigned long)(AUDIO_PSRAM_RED_BELOW_BYTES / 1024UL)) + "..&lt;" +
-            String((unsigned long)(AUDIO_PSRAM_ORANGE_BELOW_BYTES / 1024UL)) +
-            " KiB, " + htmlText(UI_AUDIO_LOAD_RED) + " &lt;" +
-            String((unsigned long)(AUDIO_PSRAM_RED_BELOW_BYTES / 1024UL)) + " KiB)</small>" +
-            "</div>";
-
-        html +=
-            "<details style='margin-top:14px'><summary>" +
-            htmlText(UI_AUDIO_LOAD_TECH_DETAILS) +
-            "</summary><div style='margin-top:10px'>";
-
-        html += "Backend: <b>" +
-                htmlEscape(String(audioCaptureBackendName())) +
-                "</b><br>";
-        html += "Format: <b>" +
-                String((unsigned long)format.sampleRate) + " Hz / " +
-                String((unsigned int)format.bitsPerSample) + " bit / " +
-                String((unsigned int)format.channels) +
-                (format.channels == 1 ? " channel" : " channels") +
-                "</b><br>";
-        html += "Nominal PCM rate: <b>" +
-                String((double)bytesPerSecond / 1024.0, 1) +
-                " KiB/s</b><br>";
-        html += "Elapsed: " + String((unsigned long)elapsedMs) + " ms<br>";
-        html += "Captured: " +
-                String((unsigned long)stats.bytesCaptured) + " bytes<br>";
-        html += "Delivered/drained: " +
-                String((unsigned long)deliveredBytes) + " bytes (" +
-                String(deliveredPct, 1) + "% of nominal)<br>";
-        html += "Dropped: <b>" +
-                String((unsigned long)stats.bytesDropped) +
-                " bytes</b><br>";
-        html += "PSRAM ring high-water: " +
-                String((unsigned long)stats.bufferHighWater) + " / " +
-                String((unsigned long)stats.bufferCapacity) + " bytes (" +
-                String(highWaterPct, 1) + "%)<br>";
-        html += "Max drain-loop gap: " +
-                String((unsigned long)maxDrainGapMs) + " ms<br>";
-        html += "Empty reads: " +
-                String((unsigned long)emptyReads) + "<br><br>";
-
-        html += "Internal heap free before/min/after: <b>" +
-                String((unsigned long)internalBefore) + " / " +
-                String((unsigned long)internalMin) + " / " +
-                String((unsigned long)internalAfter) + " B</b><br>";
-        html += "PSRAM free before/min/after: <b>" +
-                String((unsigned long)psramBefore) + " / " +
-                String((unsigned long)psramMin) + " / " +
-                String((unsigned long)psramAfter) + " B</b><br>";
-
-        html +=
-            "</div></details><p class='muted'>" +
-            htmlText(UI_AUDIO_BENCHMARK_HELP) +
-            "</p></section>";
-    }
-
-    html += "<p><a href='/config'><button>Back to Config</button></a></p>";
-    html += htmlFooter();
-
-    server.sendHeader("Cache-Control", "no-store");
-    server.send(200, "text/html; charset=utf-8", html);
-}
-
 
 
 enum RecordingLoadUiLevel : uint8_t {
@@ -16724,7 +16502,9 @@ static RecordingLoadUiLevel recordingLoadAudioLevel(
 
     if (
         !result.audioActive ||
-        result.audioBytesCaptured == 0
+        result.audioBytesCaptured == 0 ||
+        result.audioSignalSamples16 == 0 ||
+        result.audioSignalPeakAbs16 == 0
     ) {
         return RECORDING_LOAD_RED;
     }
@@ -16921,9 +16701,7 @@ static void handleRecordingLoadTestStart()
             "<section class='settings-section' style='border-left:5px solid #b91c1c'>"
             "<h3>" + htmlText(UI_RECORDING_LOAD_FAILED) + "</h3><p>" +
             htmlEscape(error) +
-            "</p></section><p><a href='/config'><button>" +
-            htmlText(UI_NAV_CONFIGURATION) +
-            "</button></a></p>" +
+            "</p></section><p><a href='/system#system-test'><button>System</button></a></p>" +
             htmlFooter();
 
         server.sendHeader("Cache-Control", "no-store");
@@ -17007,8 +16785,8 @@ static void handleRecordingLoadTestStatusPage()
             return;
         }
 
-        server.sendHeader("Location", "/config", true);
-        server.send(303, "text/plain", "No recording load test active");
+        server.sendHeader("Location", "/system#system-test", true);
+        server.send(303, "text/plain", "No system test active");
         return;
     }
 
@@ -17031,7 +16809,7 @@ static void handleRecordingLoadTestStatusPage()
         "async function rlAbort(){var b=document.getElementById('rlAbort');b.disabled=true;b.textContent='" + htmlJsString(tr(UI_RECORDING_LOAD_ABORTING)) + "';try{await fetch('/recording_load_test_abort',{method:'POST',cache:'no-store'});}catch(e){}setTimeout(rlPoll,500);}"
         "setTimeout(rlPoll,250);"
         "</script>"
-        "<p><a href='/config'><button>" + htmlText(UI_NAV_CONFIGURATION) + "</button></a></p>" +
+        "<p><a href='/system#system-test'><button>System</button></a></p>" +
         htmlFooter();
 
     server.sendHeader("Cache-Control", "no-store");
@@ -17073,8 +16851,8 @@ static void handleRecordingLoadTestResult()
             active,
             resultReady
         )) {
-        server.sendHeader("Location", "/config", true);
-        server.send(303, "text/plain", "No recording load test result");
+        server.sendHeader("Location", "/system#system-test", true);
+        server.send(303, "text/plain", "No system test result");
         return;
     }
 
@@ -17181,6 +16959,27 @@ static void handleRecordingLoadTestResult()
             recordingLoadPill(thermalLevel) +
             " <b>" + htmlText(UI_RECORDING_LOAD_THERMAL) + "</b>"
             "</div>";
+
+        if (result.audioRequested) {
+            if (
+                result.audioSignalSamples16 > 0 &&
+                result.audioSignalPeakAbs16 > 0
+            ) {
+                html +=
+                    "<p><b>" + htmlText(UI_RECORDING_LOAD_AUDIO_SIGNAL) +
+                    ":</b> " + htmlText(UI_RECORDING_LOAD_AUDIO_SIGNAL_DETECTED) +
+                    " <span class='muted'>(Peak " +
+                    String((long)result.audioSignalPeakAbs16) +
+                    " / 32768, RMS " +
+                    String(result.audioSignalRms16, 1) +
+                    ")</span></p>";
+            } else {
+                html +=
+                    "<p><span class='status-pill danger'>" + htmlText(UI_NOT_DETECTED) + "</span> " +
+                    htmlText(UI_RECORDING_LOAD_AUDIO_SIGNAL_MISSING) +
+                    "</p>";
+            }
+        }
 
         double budgetMs =
             (double)result.frameBudgetUs /
@@ -17365,7 +17164,10 @@ static void handleRecordingLoadTestResult()
                 String((unsigned long)result.audioBufferCapacity) +
                 " (" +
                 String(audioBufferPct, 1) +
-                "%)<br>";
+                "%) | " + htmlText(UI_RECORDING_LOAD_AUDIO_SIGNAL) +
+                " peak=" + String((long)result.audioSignalPeakAbs16) +
+                "/32768, RMS=" + String(result.audioSignalRms16, 1) +
+                "<br>";
         } else {
             html +=
                 htmlText(UI_AUDIO_ENABLE) + ": <b>" +
@@ -17501,9 +17303,7 @@ static void handleRecordingLoadTestResult()
     }
 
     html +=
-        "<p><a href='/config'><button>" +
-        htmlText(UI_NAV_CONFIGURATION) +
-        "</button></a></p>";
+        "<p><a href='/system#system-test'><button>System</button></a></p>";
     html += htmlFooter();
 
     server.sendHeader("Cache-Control", "no-store");
@@ -18451,8 +18251,10 @@ void webConfigStart()
         server.on("/", HTTP_GET, handleRoot);
         server.on("/config", HTTP_GET, handleConfig);
         server.on("/save", HTTP_POST, handleSave);
-        server.on("/audio_test_record", HTTP_POST, handleAudioTestRecord);
-        server.on("/audio_benchmark", HTTP_POST, handleAudioBenchmark);
+        server.on("/shooter", HTTP_GET, handleShooterPage);
+        server.on("/shooter_save", HTTP_POST, handleShooterSave);
+        server.on("/audio_test_record", HTTP_POST, handleLegacyAudioTestRedirect);
+        server.on("/audio_benchmark", HTTP_POST, handleLegacyAudioTestRedirect);
         server.on("/recording_load_test", HTTP_POST, handleRecordingLoadTestStart);
         server.on("/recording_load_test_status_page", HTTP_GET, handleRecordingLoadTestStatusPage);
         server.on("/recording_load_test_status", HTTP_GET, handleRecordingLoadTestStatusJson);
@@ -18504,6 +18306,8 @@ void webConfigStart()
     );
 
     server.on("/preview", HTTP_GET, handlePreview);
+    server.on("/camera_advanced", HTTP_GET, handleCameraAdvanced);
+    server.on("/camera_settings_save", HTTP_POST, handleCameraSettingsSave);
     server.on("/snapshot", HTTP_GET, handleSnapshot);
     server.on("/preview_stop", HTTP_POST, handlePreviewStop);
     server.on("/camera_crop_apply", HTTP_POST, handleCameraCropApply);

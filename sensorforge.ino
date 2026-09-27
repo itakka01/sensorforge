@@ -8837,6 +8837,16 @@ static void recordingLoadFinalize(
     AudioCaptureStats audioAfterFinalize =
         audioCaptureStats();
 
+    // Capture the diagnostic signal metrics before disabling the temporary
+    // Systemtest instrumentation. The normal recording path never enables it.
+    result.audioSignalSamples16 =
+        audioAfterFinalize.signalSamples16;
+    result.audioSignalPeakAbs16 =
+        audioAfterFinalize.signalPeakAbs16;
+    result.audioSignalRms16 =
+        audioAfterFinalize.signalRms16;
+    audioCaptureSetSignalMetricsEnabled(false);
+
     bool audioStatsChanged =
         audioAfterFinalize.bytesCaptured !=
             ctx.audioStatsBaseline.bytesCaptured ||
@@ -8871,6 +8881,9 @@ static void recordingLoadFinalize(
         result.audioBytesDropped = 0;
         result.audioBufferHighWater = 0;
         result.audioBufferCapacity = 0;
+        result.audioSignalSamples16 = 0;
+        result.audioSignalPeakAbs16 = 0;
+        result.audioSignalRms16 = 0.0f;
     }
 
     result.internalHeapAfter =
@@ -8972,6 +8985,10 @@ static void recordingLoadFinalize(
         String(result.audioActive ? "yes" : "no") +
         " | audio_drop=" +
         String((unsigned long)result.audioBytesDropped) +
+        " | audio_peak=" +
+        String((long)result.audioSignalPeakAbs16) +
+        " | audio_rms=" +
+        String(result.audioSignalRms16, 1) +
         " | heap_min=" +
         String((unsigned long)result.internalHeapMin) +
         " | psram_min=" +
@@ -9092,6 +9109,11 @@ bool recordingLoadTestStart(
 
     RecordingLoadTestContext fresh = {};
     recordingLoadTestContext = fresh;
+
+    // Signal metrics are diagnostic-only. Normal recordings keep them disabled
+    // so the consolidated Systemtest is the only path that adds per-sample
+    // peak/RMS work.
+    audioCaptureSetSignalMetricsEnabled(false);
 
     RecordingLoadTestContext &ctx =
         recordingLoadTestContext;
@@ -9260,11 +9282,15 @@ bool recordingLoadTestStart(
 
     recorderSetDetailedFrameTimingEnabled(true);
 
+    if (result.audioRequested)
+        audioCaptureSetSignalMetricsEnabled(true);
+
     if (!recorderStart(
             ctx.testPath,
             cfg_fps
         )) {
         recorderSetDetailedFrameTimingEnabled(false);
+        audioCaptureSetSignalMetricsEnabled(false);
 
         error =
             "recorder could not start the load-test file";

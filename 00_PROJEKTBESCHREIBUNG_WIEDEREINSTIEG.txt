@@ -1,12 +1,72 @@
 SENSORFORGE / ESP32-S3 CAMERA (XIAO + FREENOVE)
 PROJEKTBESCHREIBUNG, RELEASESTAND UND WIEDEREINSTIEGSPROMPT
-Stand: 2026-09-27
-Dokumentrevision: v75 / v67-Stabilitaetsbasis + konfigurierbarer Power-Shooter-Bewegungsverdacht + aufnahmebezogene Verdachtserklaerung + bereinigte System-/Transport-UI + offene Langzeitqualifikation
-Aktueller Entwicklungs-/Arbeits-Release: v75 (Produktionsqualifikation fuer XIAO-Langzeitrecording noch offen)
+Stand: 2026-09-28
+Dokumentrevision: v83 / v67-Stabilitaetsbasis + Power-Shooter-Bewegungsverdacht + laienfreundliche System-/Transport-/Kamera-UI + offene Langzeitqualifikation
+Aktueller Entwicklungs-/Arbeits-Release: v83 (Produktionsqualifikation fuer XIAO-Langzeitrecording noch offen)
 Produktname: SensorForge
 Plattformname: Fabric Node
 Core-Version im Branding: 7.1.0
 
+
+
+======================================================================
+V78 - KAMERA-UI WEITER VEREINFACHT / LASTWARNUNGEN / HILFETEXTE
+======================================================================
+
+- Normale Kamera-Seite warnt bei grossen Aufloesungen ohne sie zu sperren:
+  1024x768 = erhoehte Systemlast; 1280x1024 und groesser = hohe Systemlast.
+  Die bestehende technische Performance-Validierung beim Speichern bleibt
+  unveraendert die verbindliche Schutzschicht.
+- Redundante Ueberschrift `Live-Vorschau & Sensor-Ausschnitt` und der dauerhafte
+  Hinweis auf die Advanced-Seite entfallen. `Live-Vorschau` steht direkt ueber
+  dem Bild; die Information zur Pause von Detection/Recording liegt im
+  unmittelbar danebenstehenden Info-Button.
+- Die reinen Anzeige-Zoomfunktionen - / + / Fit / 100% samt Tastaturhinweis
+  stehen nun direkt unter dem Livebild und sind damit klar von persistenten
+  Kameraeinstellungen getrennt.
+- Erweiterte Kameraeinstellungen besitzen laienverstaendliche Info-Buttons fuer
+  FPS, JPEG-Qualitaet, XCLK, Auto Exposure und AE-Level. FPS erklaert Bilder pro
+  Sekunde und warnt explizit vor >4 fps auf kleineren Boards.
+- Der bisherige rohe Performance-Score wurde durch eine verstaendlichere Anzeige
+  des fuer Aufloesung/Qualitaet qualifizierten Maximal-FPS ersetzt; >4 fps wird
+  zusaetzlich sichtbar als hohe Systemlast markiert.
+- Neuer Button `Standardwerte einsetzen` fuellt nur das Formular und speichert
+  nichts automatisch. Verwendet werden die bestehenden Firmware-Defaults bzw.
+  ein fuer die aktuelle Aufloesung geklemmter sicherer Default-FPS.
+- Keine Aenderung an Camera-Config-Save, Preview-Gate, Crop, Recording, Shooter,
+  Storage, Encryption oder Transport-Runtime.
+
+======================================================================
+V77 - TRANSPORT-/KAMERA-UI VEREINFACHT / SHUTDOWN RELOAD-SICHER
+======================================================================
+
+- Transportsicherung zeigt nach Save nur noch `Transportwerte gespeichert.`.
+  Die technische Information zum automatischen 10-Frame-Schwarzreferenztest
+  liegt hinter einem Info-Button; der echte Messfortschritt bleibt waehrend der
+  laufenden Messung sichtbar.
+- Die Shutdown-Seite setzt nach dem Laden nur ihre Browser-Adresse auf `/`
+  zurueck, ohne einen neuen HTTP-Request zu erzeugen. So bleibt die sichtbare
+  Shutdown-Bestaetigung stehen, aber der naechste Reload nach Power/RESET landet
+  auf der Startseite statt erneut auf `/shutting_down`.
+- Kamera-Hauptseite fuer Normalbenutzer reduziert: Kameramodell als Dropdown,
+  Aufloesung als Dropdown und Rotation. Die bestehenden Live-Preview- und
+  OV3660-Crop-Funktionen bleiben auf derselben Seite.
+- Dropdown Kameramodell bietet OV2640/OV3660; ein vorhandener unbekannter
+  Legacy-Wert wird nur zur Rueckwaertskompatibilitaet weiterhin als aktuelle
+  Auswahl angezeigt. Die Board-Pinbelegung bleibt board-spezifisch; physische
+  Sensorfunktionen werden weiterhin ueber erkannte Sensor-ID/Treiberfaehigkeiten
+  entschieden.
+- Aufloesungs-Dropdown bildet exakt die bereits validierten Werte ab:
+  160x120, 320x240, 640x480, 800x600, 1024x768, 1280x1024, 1600x1200,
+  2048x1536. Performance-Validierung bleibt unveraendert aktiv.
+- Neue Unterseite `Erweiterte Kameraeinstellungen`: FPS, JPEG-Qualitaet, XCLK,
+  Auto Exposure und AE-Level. Beide Kamera-Seiten speichern weiterhin ueber
+  denselben bestehenden Camera-Config-Pfad; die jeweils andere Parametergruppe
+  wird als aktueller Hidden-Wert mitgefuehrt und nicht geloescht/zurueckgesetzt.
+- Der Hinweis, dass Detection/Recording waehrend Live Preview deaktiviert sind,
+  liegt hinter einem Info-Button. Die Preview-Sperrlogik selbst ist unveraendert.
+- Keine Funktionalitaet an Recording, Shooter, Sparse MKV, Encryption, Storage,
+  Transport-Runtime, Crop oder OTA entfernt.
 
 ======================================================================
 V75 - BEWEGUNGSVERDACHT RECHTS / AUFNAHMEBEZOGENE INFO
@@ -6686,4 +6746,130 @@ Originalnamen mitsenden; keine unveraenderten Dateien in Update-ZIPs aufnehmen.
 
 
 
+
+
+
+======================================================================
+V76 - KAMERA-SEITE KONSOLIDIERT (2026-09-27)
+======================================================================
+
+- Alle benutzerseitigen Kameraeinstellungen liegen nun unter dem Menüpunkt
+  Kamera / `/preview`: Kameramodell, Auflösung, FPS, JPEG-Qualität, XCLK,
+  Auto Exposure, AE-Level und Rotation.
+- Live-Vorschau und der bestehende OV3660 Sensor-Crop bleiben auf derselben
+  Seite; der Crop-Test-/Save-Pfad wurde funktional nicht verändert.
+- Die allgemeine Konfigurationsseite zeigt keine Kameraeinstellungen mehr.
+  Sie führt die aktuell gültigen Kamerawerte nur hidden mit, damit ein Save
+  anderer Einstellungen Kamera-Keys niemals verliert oder zurücksetzt.
+- Der neue Kamera-Save patcht ausschließlich die Kamera-Keys in der aktiven
+  config.txt, validiert danach die komplette Config und verwendet den
+  bestehenden Internal-/SD-Synchronisationspfad. Unabhängige Einstellungen
+  werden nicht neu aufgebaut oder verändert.
+- Sensorparameter, die eine Reinitialisierung benötigen, sind wie bisher erst
+  nach Neustart vollständig aktiv.
+  Wenn solche Werte geändert wurden, wird die Live-Vorschau bis zum Neustart
+  bewusst pausiert, damit nicht alte Sensorbilder als neue Einstellung erscheinen
+  oder Crop-Geometrie mit noch alter Sensorinitialisierung getestet wird.
+- Keine Änderung an Kamera-Preview-Gate, Recording-Priorität, Motion/Image
+  Motion, Sparse Shooter, Storage, Encryption oder Recovery.
+
+
+======================================================================
+V79 UI-/CONFIG-ZUSTAENDIGKEITEN - 2026-09-27
+======================================================================
+
+Power Shooter:
+- eigene WebConfig-Seite /shooter unter dem System-Menue
+- dort liegen ausschliesslich die Shooter-spezifischen Parameter:
+  storage format, interval, darkness, minimum change, force-save, flush und
+  Bewegungsverdacht-Regel
+- Ein/Aus bleibt bewusst im zentralen Recording-Modus der allgemeinen
+  Konfiguration, damit Off / Motion / Shooter / Motion+Shooter weiterhin einen
+  einzigen Modusschalter besitzen
+- eigener configSaveShooterSettings()-Pfad patcht nur Shooter-Keys; normale
+  Config-Saves bewahren diese Werte unveraendert
+
+SD-Sicherheit:
+- min_free_space_mb und disk_full_action sind aus der allgemeinen Konfiguration
+  entfernt und liegen jetzt unter SD Wartung
+- eigener configSaveStorageSafety()-Pfad patcht nur diese beiden Keys
+- normale Config-Saves bewahren die aktiven SD-Sicherheitswerte unveraendert
+
+Keine Aenderung an Shooter-Capture/Filter/PSRAM-Flush/Sparse-MKV, Storage-Guard,
+Rollover-/Stop-Semantik oder normalem Recording-Modus.
+
+
+======================================================================
+V80 - SD-WARTUNG UI-VEREINFACHUNG (2026-09-28)
+======================================================================
+
+- SD-Wartung wurde ausschließlich auf UI-/Bedienebene vereinfacht; Storage-,
+  Recovery-, Benchmark-, Format-, Secure-Erase- und Config-Schutz-Logik bleibt
+  funktional unverändert.
+- SD BEREIT / SD GEMOUNTET stehen im Seitenkopf.
+- Speicherreserve verwendet die kompakte Formulierung
+  "Aktion bei unterschrittener Speicherreserve".
+- Der vollständige bisherige erweiterte Benchmark heißt in der UI nur noch
+  "SD Benchmark". Grundbeschreibung sichtbar, technische Details per Info-Button;
+  Messwerte werden eingeklappt dargestellt.
+- SD Recovery ist nach unten verschoben und klar als Notfallfunktion markiert.
+  Technische Recovery-Details liegen hinter Info/Details.
+- Der separate Block "Destruktive SD-Wartung" und der permanente Config-Schutz-
+  Erklärungstext wurden entfernt; der Config-Schutz selbst bleibt aktiv.
+- Wipe-, Format- und Secure-Erase-Erklärungen liegen hinter Info-Buttons.
+
+
+======================================================================
+V81 - CONFIG UI / SD-VERSCHLUESSELUNG
+======================================================================
+
+- Allgemeine Konfiguration weiter vereinfacht.
+- Hinweise zu Config-Speicher, Werkseinstellungen, Recording-Modus und Aufnahmeausloeser liegen hinter Info-Buttons.
+- Der automatische Aufnahmeausloeser ist als eigener hervorgehobener Bedienblock sichtbar.
+- SD-Verschluesselung fuer neue AVI/MKV-Aufnahmen und SFLOG1 wurde aus der allgemeinen Konfiguration nach SD-Wartung verschoben.
+- Erster Aktivierungspfad mit boardgebundenem ESP32-S3-eFuse-HMAC-Key bleibt unveraendert erhalten.
+- Allgemeine Config-Saves behalten recording_encryption unveraendert bei.
+
+
+======================================================================
+V82 - ZENTRALER SYSTEMTEST / AUDIO-TESTKONSOLIDIERUNG
+======================================================================
+
+- Benutzerseitig gibt es nur noch einen zentralen Systemtest unter System.
+- Der vorhandene Recording Load Test bleibt intern die Test-Engine und prueft
+  weiterhin den realen Kamera-/Recorder-/Container-/SD-Pfad inklusive Audio
+  und Verschluesselung, sofern diese aktiviert sind.
+- Separate WAV-Audiotest- und Audio-Belastungstest-Buttons wurden aus der
+  normalen Audio-Konfiguration entfernt. Alte HTTP-Routen leiten auf den
+  Systemtest um.
+- Waehrend des Systemtests werden fuer 16-Bit-Audio zusaetzlich Peak und RMS
+  direkt im Capture-Task erfasst. Diese Messung ist ausserhalb des expliziten
+  Systemtests deaktiviert und verursacht daher keinen permanenten Produktions-
+  Overhead. Digitales Nullsignal wird im Audio-Teil des Systemtests als Fehler
+  bewertet.
+- Testdauer, Status und letztes Ergebnis liegen unter System.
+
+======================================================================
+V83 - CONFIG-SEITE VEREINFACHT / ZEITZONE / WLAN / DEBUG
+======================================================================
+
+- Der komplette Audio-/Mikrofonblock liegt nun direkt vor Sleep/Stromsparen und
+  nicht mehr mitten in den Aufnahmeparametern. Audio-Funktion, Advanced-Modal,
+  Persistenz und Validierung bleiben unveraendert.
+- Bootloop-/Unterspannungsschutz: verwirrenden Zusatzsatz zum normalen Ausschalten
+  entfernt; Schutzlogik selbst unveraendert.
+- LED-Auswahl laienverstaendlich formuliert: Status-LED verwenden bzw. deaktivieren.
+- Zeitzone ist kein freies POSIX-Texteingabefeld mehr. Die UI bietet 33 verbreitete,
+  alphabetisch gruppierte Regionen; intern werden weiterhin die bestehenden POSIX-
+  TZ-Strings gespeichert. Nicht gelistete bestehende Legacy-/Custom-Werte bleiben
+  als ausgewaehlte Kompatibilitaetsoption erhalten und werden nicht still ersetzt.
+- WLAN, Hotspot und Webzugriff verwenden klarere Benutzerbeschriftungen und ein
+  responsives Feldraster; Passwortfelder behalten weiterhin die bisherige Semantik
+  'leer = bestehenden Wert nicht veraendern'.
+- web_recording_auto_pause wird sichtbar als 'Aufnahme beim Oeffnen des Webinterfaces'
+  mit normalen Benutzeroptionen dargestellt; der gespeicherte Key bleibt gleich.
+- Debug-Ausgaben besitzen verstaendliche An/Aus-Texte und einen Info-Dialog; Debug
+  bleibt fuer den Normalbetrieb standardmaessig nicht empfohlen.
+- Keine Aenderung an Config-Schema, WLAN/NTP-Runtime, Audio-Backend, Sleep, Bootloop-
+  Schutz, Logging-Implementierung oder Secret-/Passwortspeicherung.
 

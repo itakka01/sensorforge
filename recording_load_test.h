@@ -83,6 +83,9 @@ struct RecordingLoadTestResult {
     uint64_t audioBytesDropped;
     size_t audioBufferCapacity;
     size_t audioBufferHighWater;
+    uint64_t audioSignalSamples16;
+    int32_t audioSignalPeakAbs16;
+    float audioSignalRms16;
 
     uint32_t internalHeapBefore;
     uint32_t internalHeapMin;

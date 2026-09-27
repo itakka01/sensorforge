@@ -6480,6 +6480,509 @@ ConfigSaveResult configSaveCameraCrop(
 
 
 
+ConfigSaveResult configSaveCameraSettings(
+    const String &camera,
+    const String &resolution,
+    int fps,
+    int quality,
+    int cameraXclkMhz,
+    int cameraAutoExposure,
+    int cameraAeLevel,
+    int rotation,
+    bool writeToSd,
+    String &error
+)
+{
+    error = "";
+
+    String normalizedCamera = camera;
+    String normalizedResolution = resolution;
+    normalizedCamera.trim();
+    normalizedResolution.trim();
+
+    if (!normalizedCamera.length()) {
+        error = "camera is empty";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (!isSupportedResolution(normalizedResolution)) {
+        error = "invalid resolution";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (fps < 1 || fps > 30) {
+        error = "fps out of range";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (quality < 0 || quality > 63) {
+        error = "quality out of range";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        cameraXclkMhz != 10 &&
+        cameraXclkMhz != 16 &&
+        cameraXclkMhz != 20
+    ) {
+        error = "camera_xclk_mhz must be 10, 16 or 20";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (cameraAutoExposure != 0 && cameraAutoExposure != 1) {
+        error = "camera_auto_exposure must be 0 or 1";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (cameraAeLevel < -2 || cameraAeLevel > 2) {
+        error = "camera_ae_level out of range (-2..2)";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (rotation != 0 && rotation != 180) {
+        error = "rotation must be 0 or 180";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    uint32_t performanceLoad = 0;
+    uint32_t performanceLimit = 0;
+    if (!configRecordingPerformanceAllowed(
+            normalizedResolution,
+            fps,
+            quality,
+            performanceLoad,
+            performanceLimit
+        )) {
+        int maxFps =
+            configRecordingPerformanceMaxFps(
+                normalizedResolution,
+                quality
+            );
+
+        error =
+            "recording performance limit exceeded: " +
+            normalizedResolution +
+            " @ " +
+            String(fps) +
+            " fps, quality=" +
+            String(quality) +
+            ", score=" +
+            String((unsigned long)performanceLoad) +
+            ", board_limit=" +
+            String((unsigned long)performanceLimit) +
+            ", max_fps=" +
+            String(maxFps);
+
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String text;
+    bool sourceRead = false;
+
+    // Preserve the complete active config including comments and future keys.
+    if (
+        activeConfigSource == CONFIG_SOURCE_SD &&
+        sdAvailableState &&
+        STORAGE.exists("/config.txt")
+    ) {
+        sourceRead =
+            readTextFile(
+                STORAGE,
+                "/config.txt",
+                text
+            );
+    }
+
+    if (
+        !sourceRead &&
+        internalAvailableState &&
+        LittleFS.exists("/config.txt")
+    ) {
+        sourceRead =
+            readTextFile(
+                LittleFS,
+                "/config.txt",
+                text
+            );
+    }
+
+    if (
+        !sourceRead &&
+        sdAvailableState &&
+        STORAGE.exists("/config.txt")
+    ) {
+        sourceRead =
+            readTextFile(
+                STORAGE,
+                "/config.txt",
+                text
+            );
+    }
+
+    if (!sourceRead) {
+        error = "no persistent config.txt available for camera save";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        !replaceOrAppendConfigKey(text, "camera", normalizedCamera) ||
+        !replaceOrAppendConfigKey(text, "resolution", normalizedResolution) ||
+        !replaceOrAppendConfigKey(text, "fps", String(fps)) ||
+        !replaceOrAppendConfigKey(text, "quality", String(quality)) ||
+        !replaceOrAppendConfigKey(text, "camera_xclk_mhz", String(cameraXclkMhz)) ||
+        !replaceOrAppendConfigKey(text, "camera_auto_exposure", String(cameraAutoExposure)) ||
+        !replaceOrAppendConfigKey(text, "camera_ae_level", String(cameraAeLevel)) ||
+        !replaceOrAppendConfigKey(text, "rotation", String(rotation))
+    ) {
+        error = "could not patch camera setting keys";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String validationError;
+    if (!configValidateText(text, validationError)) {
+        error = "patched config invalid: " + validationError;
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    ConfigSaveResult result =
+        configSaveText(
+            text,
+            writeToSd,
+            error
+        );
+
+    if (
+        result == CONFIG_SAVE_BOTH ||
+        result == CONFIG_SAVE_INTERNAL_ONLY
+    ) {
+        // Keep the in-RAM config coherent so a later general config save before
+        // reboot cannot overwrite the newly persisted camera values. Sensor
+        // hardware that needs reinitialization still takes full effect on reboot.
+        cfg_camera = normalizedCamera;
+        cfg_resolution = normalizedResolution;
+        cfg_fps = fps;
+        cfg_quality = quality;
+        cfg_camera_xclk_mhz = cameraXclkMhz;
+        cfg_camera_auto_exposure = cameraAutoExposure;
+        cfg_camera_ae_level = cameraAeLevel;
+        cfg_rotation = rotation;
+    }
+
+    return result;
+}
+
+
+
+ConfigSaveResult configSaveShooterSettings(
+    const String &storageFormat,
+    int intervalMs,
+    int darkMeanMin,
+    float minChangePct,
+    float motionHintChangePct,
+    int motionHintRequiredHits,
+    int motionHintWindowFrames,
+    int forceSaveSeconds,
+    int flushSeconds,
+    bool writeToSd,
+    String &error
+)
+{
+    error = "";
+
+    String normalizedStorageFormat = storageFormat;
+    normalizedStorageFormat.trim();
+    normalizedStorageFormat.toLowerCase();
+
+    if (
+        normalizedStorageFormat != "mkv" &&
+        normalizedStorageFormat != "jpg"
+    ) {
+        error = "shooter_storage_format must be mkv or jpg";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (intervalMs < 250 || intervalMs > 86400000) {
+        error = "shooter_interval_ms out of range (250..86400000)";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (darkMeanMin < 0 || darkMeanMin > 255) {
+        error = "shooter_dark_mean_min out of range (0..255)";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        minChangePct < 0.0f ||
+        minChangePct > 100.0f ||
+        (minChangePct > 0.0f && minChangePct < 0.1f)
+    ) {
+        error = "shooter_min_change_pct must be 0 or 0.1..100.0";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        motionHintChangePct < 0.1f ||
+        motionHintChangePct > 100.0f ||
+        (minChangePct > 0.0f && motionHintChangePct < minChangePct)
+    ) {
+        error = "shooter_motion_hint_change_pct must be 0.1..100.0 and >= shooter_min_change_pct";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        motionHintWindowFrames < 1 ||
+        motionHintWindowFrames > 8 ||
+        motionHintRequiredHits < 1 ||
+        motionHintRequiredHits > motionHintWindowFrames
+    ) {
+        error = "shooter motion hint hits/window invalid";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (forceSaveSeconds < 0 || forceSaveSeconds > 86400) {
+        error = "shooter_force_save_seconds out of range (0..86400)";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (flushSeconds < 0 || flushSeconds > 3600) {
+        error = "shooter_flush_seconds out of range (0..3600)";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String text;
+    bool sourceRead = false;
+
+    if (
+        activeConfigSource == CONFIG_SOURCE_SD &&
+        sdAvailableState &&
+        STORAGE.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    }
+
+    if (
+        !sourceRead &&
+        internalAvailableState &&
+        LittleFS.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(LittleFS, "/config.txt", text);
+    }
+
+    if (
+        !sourceRead &&
+        sdAvailableState &&
+        STORAGE.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    }
+
+    if (!sourceRead) {
+        error = "no persistent config.txt available for shooter save";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        !replaceOrAppendConfigKey(text, "shooter_storage_format", normalizedStorageFormat) ||
+        !replaceOrAppendConfigKey(text, "shooter_interval_ms", String(intervalMs)) ||
+        !replaceOrAppendConfigKey(text, "shooter_dark_mean_min", String(darkMeanMin)) ||
+        !replaceOrAppendConfigKey(text, "shooter_min_change_pct", String(minChangePct, 1)) ||
+        !replaceOrAppendConfigKey(text, "shooter_motion_hint_change_pct", String(motionHintChangePct, 1)) ||
+        !replaceOrAppendConfigKey(text, "shooter_motion_hint_required_hits", String(motionHintRequiredHits)) ||
+        !replaceOrAppendConfigKey(text, "shooter_motion_hint_window_frames", String(motionHintWindowFrames)) ||
+        !replaceOrAppendConfigKey(text, "shooter_force_save_seconds", String(forceSaveSeconds)) ||
+        !replaceOrAppendConfigKey(text, "shooter_flush_seconds", String(flushSeconds))
+    ) {
+        error = "could not patch shooter setting keys";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String validationError;
+    if (!configValidateText(text, validationError)) {
+        error = "patched config invalid: " + validationError;
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    ConfigSaveResult result = configSaveText(text, writeToSd, error);
+
+    if (
+        result == CONFIG_SAVE_BOTH ||
+        result == CONFIG_SAVE_INTERNAL_ONLY
+    ) {
+        cfg_shooter_storage_format = normalizedStorageFormat;
+        cfg_shooter_interval_ms = intervalMs;
+        cfg_shooter_dark_mean_min = darkMeanMin;
+        cfg_shooter_min_change_pct = minChangePct;
+        cfg_shooter_motion_hint_change_pct = motionHintChangePct;
+        cfg_shooter_motion_hint_required_hits = motionHintRequiredHits;
+        cfg_shooter_motion_hint_window_frames = motionHintWindowFrames;
+        cfg_shooter_force_save_seconds = forceSaveSeconds;
+        cfg_shooter_flush_seconds = flushSeconds;
+    }
+
+    return result;
+}
+
+
+ConfigSaveResult configSaveStorageSafety(
+    int minFreeSpaceMb,
+    const String &diskFullAction,
+    bool writeToSd,
+    String &error
+)
+{
+    error = "";
+
+    if (minFreeSpaceMb < 0 || minFreeSpaceMb > 1024 * 1024) {
+        error = "min_free_space_mb out of range";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String normalizedAction = diskFullAction;
+    normalizedAction.trim();
+    normalizedAction.toLowerCase();
+
+    if (
+        normalizedAction != "rollover" &&
+        normalizedAction != "stop"
+    ) {
+        error = "disk_full_action must be rollover or stop";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String text;
+    bool sourceRead = false;
+
+    if (
+        activeConfigSource == CONFIG_SOURCE_SD &&
+        sdAvailableState &&
+        STORAGE.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    }
+
+    if (
+        !sourceRead &&
+        internalAvailableState &&
+        LittleFS.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(LittleFS, "/config.txt", text);
+    }
+
+    if (
+        !sourceRead &&
+        sdAvailableState &&
+        STORAGE.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    }
+
+    if (!sourceRead) {
+        error = "no persistent config.txt available for storage safety save";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        !replaceOrAppendConfigKey(text, "min_free_space_mb", String(minFreeSpaceMb)) ||
+        !replaceOrAppendConfigKey(text, "disk_full_action", normalizedAction)
+    ) {
+        error = "could not patch storage safety keys";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String validationError;
+    if (!configValidateText(text, validationError)) {
+        error = "patched config invalid: " + validationError;
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    ConfigSaveResult result = configSaveText(text, writeToSd, error);
+
+    if (
+        result == CONFIG_SAVE_BOTH ||
+        result == CONFIG_SAVE_INTERNAL_ONLY
+    ) {
+        cfg_min_free_space_mb = minFreeSpaceMb;
+        cfg_disk_full_action = normalizedAction;
+    }
+
+    return result;
+}
+
+
+ConfigSaveResult configSaveRecordingEncryption(
+    int enabled,
+    bool writeToSd,
+    String &error
+)
+{
+    error = "";
+
+    if (enabled != 0 && enabled != 1) {
+        error = "recording_encryption must be 0 or 1";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String text;
+    bool sourceRead = false;
+
+    if (
+        activeConfigSource == CONFIG_SOURCE_SD &&
+        sdAvailableState &&
+        STORAGE.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    }
+
+    if (
+        !sourceRead &&
+        internalAvailableState &&
+        LittleFS.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(LittleFS, "/config.txt", text);
+    }
+
+    if (
+        !sourceRead &&
+        sdAvailableState &&
+        STORAGE.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    }
+
+    if (!sourceRead) {
+        error = "no persistent config.txt available for encryption save";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (!replaceOrAppendConfigKey(
+            text,
+            "recording_encryption",
+            String(enabled)
+        )) {
+        error = "could not patch recording_encryption";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String validationError;
+    if (!configValidateText(text, validationError)) {
+        error = "patched config invalid: " + validationError;
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    ConfigSaveResult result =
+        configSaveText(text, writeToSd, error);
+
+    if (
+        result == CONFIG_SAVE_BOTH ||
+        result == CONFIG_SAVE_INTERNAL_ONLY
+    ) {
+        cfg_recording_encryption = enabled;
+    }
+
+    return result;
+}
+
+
 ConfigSaveResult configSaveWebLanguage(
     const String &languageCode,
     bool writeToSd,

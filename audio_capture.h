@@ -67,6 +67,14 @@ struct AudioCaptureStats {
     uint64_t bytesDropped;
     size_t bufferCapacity;
     size_t bufferHighWater;
+
+    // Optional 16-bit PCM signal metrics. Disabled during normal production
+    // capture so they add no permanent per-sample overhead. The explicit
+    // Systemtest enables them temporarily to verify that the microphone is
+    // delivering a real signal in addition to merely transporting bytes.
+    uint64_t signalSamples16;
+    int32_t signalPeakAbs16;
+    float signalRms16;
 };
 
 // Resolve the persisted runtime config into one concrete audio input.
@@ -126,3 +134,7 @@ bool audioCaptureIsRunning();
 AudioFormat audioCaptureActiveFormat();
 AudioCaptureStats audioCaptureStats();
 size_t audioCaptureBufferedBytes();
+
+// Enables lightweight 16-bit peak/RMS collection for the next/active capture.
+// Keep disabled in normal operation; the explicit Systemtest owns this flag.
+void audioCaptureSetSignalMetricsEnabled(bool enabled);

@@ -6,6 +6,7 @@
 #include "logger.h"
 #include "recorder.h"
 #include "recording_storage.h"
+#include "recording_crypto.h"
 #include "recording_write_buffer.h"
 #include "storage_guard.h"
 #include "webplayer.h"
@@ -98,6 +99,36 @@ static String translatedHtml(UiTextId id)
     return escapeHtml(String(tr(id)));
 }
 
+static String sdInfoButton(
+    const String &title,
+    const String &info
+)
+{
+    return
+        "<button type='button' class='sd-info-btn' aria-label='Information' "
+        "data-title='" + escapeHtml(title) + "' data-info='" + escapeHtml(info) + "'>i</button>";
+}
+
+static void appendSdInfoUi(String &html)
+{
+    html +=
+        "<style>"
+        ".sd-section-head{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.sd-section-head h3{margin:0}"
+        ".sd-info-btn{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;min-width:24px;padding:0;margin:0;border:1px solid #9ca3af;border-radius:50%;background:#fff;color:#334155;font-weight:700;line-height:1;cursor:pointer;vertical-align:middle}"
+        ".sd-info-btn:hover{background:#f1f5f9}.sd-info-backdrop{position:fixed;inset:0;background:rgba(15,23,42,.48);display:none;align-items:center;justify-content:center;padding:18px;z-index:10000}.sd-info-backdrop.open{display:flex}"
+        ".sd-info-modal{width:min(600px,100%);max-height:80vh;overflow:auto;background:#fff;border-radius:12px;padding:18px;box-shadow:0 18px 50px rgba(0,0,0,.25)}.sd-info-modal-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.sd-info-modal-head h3{margin:0}.sd-info-close{font-size:1.35rem;line-height:1;padding:3px 9px;margin:0}.sd-info-body{margin-top:12px;line-height:1.45;white-space:pre-line}"
+        "</style>"
+        "<div id='sdInfoBackdrop' class='sd-info-backdrop' role='dialog' aria-modal='true' aria-hidden='true'>"
+        "<div class='sd-info-modal'><div class='sd-info-modal-head'><h3 id='sdInfoTitle'>Information</h3>"
+        "<button type='button' id='sdInfoClose' class='sd-info-close' aria-label='Schließen'>×</button></div>"
+        "<div id='sdInfoBody' class='sd-info-body'></div></div></div>"
+        "<script>(function(){var b=document.getElementById('sdInfoBackdrop'),t=document.getElementById('sdInfoTitle'),c=document.getElementById('sdInfoBody'),x=document.getElementById('sdInfoClose');"
+        "if(!b||!t||!c||!x)return;function closeInfo(){b.classList.remove('open');b.setAttribute('aria-hidden','true');}"
+        "function openInfo(btn){t.textContent=btn.getAttribute('data-title')||'Information';c.textContent=btn.getAttribute('data-info')||'';b.classList.add('open');b.setAttribute('aria-hidden','false');}"
+        "document.querySelectorAll('.sd-info-btn').forEach(function(btn){btn.addEventListener('click',function(){openInfo(btn);});});"
+        "x.addEventListener('click',closeInfo);b.addEventListener('click',function(e){if(e.target===b)closeInfo();});document.addEventListener('keydown',function(e){if(e.key==='Escape')closeInfo();});})();</script>";
+}
+
 static void serviceLongOperation()
 {
     esp_task_wdt_reset();
@@ -183,13 +214,13 @@ static String sdBenchmarkRatingTitle(
 {
     switch (rating) {
         case SD_BENCH_RATING_GREEN:
-            return de ? "GRÜN – STORAGE GUT" : "GREEN – STORAGE GOOD";
+            return de ? "GRÜN – SD GUT" : "GREEN – SD GOOD";
         case SD_BENCH_RATING_ORANGE:
-            return de ? "ORANGE – STORAGE PRÜFEN" : "ORANGE – CHECK STORAGE";
+            return de ? "ORANGE – SD PRÜFEN" : "ORANGE – CHECK SD";
         case SD_BENCH_RATING_RED:
-            return de ? "ROT – STORAGE NICHT EMPFOHLEN" : "RED – STORAGE NOT RECOMMENDED";
+            return de ? "ROT – SD NICHT EMPFOHLEN" : "RED – SD NOT RECOMMENDED";
         default:
-            return de ? "STORAGE NICHT BEWERTET" : "STORAGE NOT RATED";
+            return de ? "SD NICHT BEWERTET" : "SD NOT RATED";
     }
 }
 
@@ -240,6 +271,132 @@ static SdBenchmarkRating sdBenchmarkEvaluateRating(
 static String sdMaintenancePage(
     const SdMaintenanceViewState &view
 );
+
+static void handleSDStorageSafetySave()
+{
+    if (rejectWhileRecording("SD safety settings save"))
+        return;
+
+    int minFreeSpaceMb =
+        webServer().arg("min_free_space_mb").toInt();
+
+    String diskFullAction =
+        webServer().arg("disk_full_action");
+
+    diskFullAction.trim();
+    diskFullAction.toLowerCase();
+
+    configRefreshSdStatus();
+    bool writeToSd =
+        configSdAvailable() &&
+        configSdPresent();
+
+    String error;
+    ConfigSaveResult result =
+        configSaveStorageSafety(
+            minFreeSpaceMb,
+            diskFullAction,
+            writeToSd,
+            error
+        );
+
+    if (
+        result != CONFIG_SAVE_BOTH &&
+        result != CONFIG_SAVE_INTERNAL_ONLY
+    ) {
+        webServer().send(
+            400,
+            "text/plain; charset=utf-8",
+            error.length()
+            ? error
+            : String("SD safety settings save failed")
+        );
+        return;
+    }
+
+    logWrite(
+        "SD safety settings saved | min_free_space_mb=" +
+        String(cfg_min_free_space_mb) +
+        " | disk_full_action=" +
+        cfg_disk_full_action
+    );
+
+    webServer().sendHeader(
+        "Location",
+        "/sd_maintenance?notice=storage_saved#storage-safety"
+    );
+    webServer().send(
+        303,
+        "text/plain; charset=utf-8",
+        ""
+    );
+}
+
+
+static void handleSDEncryptionSave()
+{
+    if (rejectWhileRecording("SD encryption settings save"))
+        return;
+
+    int enabled =
+        webServer().arg("recording_encryption").toInt()
+        ? 1
+        : 0;
+
+    recordingCryptoBegin();
+
+    // First activation provisions the board-bound eFuse HMAC root exactly as
+    // the former general Config page did. Existing keys are only verified.
+    if (enabled && !recordingCryptoReady()) {
+        if (!recordingCryptoEnsureProvisioned()) {
+            webServer().send(
+                500,
+                "text/plain; charset=utf-8",
+                "Hardware-Schlüssel konnte nicht eingerichtet werden: " +
+                String(recordingCryptoKeyStatusName())
+            );
+            return;
+        }
+    }
+
+    configRefreshSdStatus();
+    bool writeToSd =
+        configSdAvailable() &&
+        configSdPresent();
+
+    String error;
+    ConfigSaveResult result =
+        configSaveRecordingEncryption(
+            enabled,
+            writeToSd,
+            error
+        );
+
+    if (
+        result != CONFIG_SAVE_BOTH &&
+        result != CONFIG_SAVE_INTERNAL_ONLY
+    ) {
+        webServer().send(
+            400,
+            "text/plain; charset=utf-8",
+            error.length()
+            ? error
+            : String("SD encryption settings save failed")
+        );
+        return;
+    }
+
+    webServer().sendHeader(
+        "Location",
+        "/sd_maintenance?notice=encryption_saved#encryption"
+    );
+    webServer().send(
+        303,
+        "text/plain; charset=utf-8",
+        ""
+    );
+}
+
 
 static void handleSDRecoveryRun()
 {
@@ -2175,23 +2332,107 @@ static String sdMaintenancePage(
         "<p>" +
         String(
             de
-            ? "Status, Recovery, Benchmark und Wartung der SD-Karte"
-            : "SD card status, recovery, benchmark and maintenance"
+            ? "Status, Speicherreserve, Benchmark und Wartung der SD-Karte"
+            : "SD card status, storage reserve, benchmark and maintenance"
         ) +
-        "</p></div></div>";
+        "</p></div>"
+        "<div style='display:flex;align-items:center;gap:8px;flex-wrap:wrap'>"
+        "<span class='status-pill " + String(sdReady ? "ok" : "danger") + "'>" +
+        String(sdReady ? (de ? "SD BEREIT" : "SD READY") : (de ? "SD NICHT BEREIT" : "SD NOT READY")) +
+        "</span>"
+        "<span class='status-pill " + String(sdReady ? "ok" : "danger") + "'>" +
+        String(sdReady ? (de ? "SD GEMOUNTET" : "SD MOUNTED") : (de ? "SD NICHT GEMOUNTET" : "SD NOT MOUNTED")) +
+        "</span>"
+        "</div></div>";
+
+    if (webServer().arg("notice") == "storage_saved") {
+        html +=
+            "<div class='flash-notice'><strong>SD-Sicherheit gespeichert.</strong></div>"
+            "<script>history.replaceState(null,'','/sd_maintenance#storage-safety');</script>";
+    } else if (webServer().arg("notice") == "encryption_saved") {
+        html +=
+            "<div class='flash-notice'><strong>SD-Verschlüsselung gespeichert.</strong></div>"
+            "<script>history.replaceState(null,'','/sd_maintenance#encryption');</script>";
+    }
+
+    html +=
+        "<section id='storage-safety' class='settings-section'>"
+        "<h3>Speicher / SD-Sicherheit</h3>"
+        "<form method='POST' action='/sd_storage_safety_save'>"
+        "<label><b>Freier Speicher reservieren</b></label><br>"
+        "<input name='min_free_space_mb' type='number' min='0' max='1048576' value='" +
+        String(cfg_min_free_space_mb) +
+        "' style='width:120px'> MB<br><br>"
+        "<label><b>Aktion bei unterschrittener Speicherreserve</b></label><br>"
+        "<select name='disk_full_action'>"
+        "<option value='rollover'" + String(cfg_disk_full_action == "rollover" ? " selected" : "") + ">Älteste Aufnahmen löschen (Rollover)</option>"
+        "<option value='stop'" + String(cfg_disk_full_action == "stop" ? " selected" : "") + ">Aufnahme stoppen</option>"
+        "</select><br><br>"
+        "<button class='primary' type='submit'>SD-Sicherheit speichern</button>"
+        "</form></section>";
+
+    recordingCryptoBegin();
+
+    String encryptionInfo =
+        de
+        ? "Wenn aktiviert, werden neue AVI/MKV-Aufnahmen und die System-Logdatei gerätegebunden verschlüsselt. WebPlayer, Downloads und Log Viewer entschlüsseln automatisch. Bereits vorhandene Video-Dateien bleiben unverändert lesbar. Eine vorhandene Klartext-Logdatei wird beim Wechsel auf Verschlüsselung in das geschützte SFLOG1-Format migriert. Beim ersten Aktivieren richtet SensorForge einmalig einen Hardware-Schlüssel in einem freien ESP32-S3-eFuse-Keyblock ein. Dieser Schlüssel gehört dauerhaft zu diesem Board."
+        : "When enabled, new AVI/MKV recordings and the system log are encrypted and bound to this device. WebPlayer, downloads and Log Viewer decrypt transparently. Existing video files remain readable unchanged. A plaintext log is migrated to protected SFLOG1 when encryption is enabled. On first activation SensorForge provisions a hardware key once in a free ESP32-S3 eFuse key block; that key permanently belongs to this board.";
+
+    html +=
+        "<section id='encryption' class='settings-section'>"
+        "<div class='sd-section-head'><h3>" +
+        String(de ? "SD-Verschlüsselung" : "SD encryption") +
+        "</h3>" +
+        sdInfoButton(
+            de ? "SD-Verschlüsselung" : "SD encryption",
+            encryptionInfo
+        ) +
+        "</div>"
+        "<form method='POST' action='/sd_encryption_save'>"
+        "<label><b>" + String(de ? "Aufnahmen und Logdatei" : "Recordings and log file") + "</b></label><br>"
+        "<select name='recording_encryption'>"
+        "<option value='0'" + String(!cfg_recording_encryption ? " selected" : "") + ">" +
+        String(de ? "Aus - unverschlüsselt" : "Off - unencrypted") + "</option>"
+        "<option value='1'" + String(cfg_recording_encryption ? " selected" : "") + ">" +
+        String(de ? "An - verschlüsselt" : "On - encrypted") + "</option>"
+        "</select><br><br>";
+
+    if (recordingCryptoReady()) {
+        html +=
+            "<span class='status-pill ok'>" +
+            String(de ? "Hardware-Schlüssel bereit" : "Hardware key ready") +
+            " · eFuse KEY" + String(recordingCryptoKeySlot()) +
+            "</span><br><br>";
+    } else {
+        RecordingCryptoKeyStatus keyStatus =
+            recordingCryptoKeyStatus();
+
+        if (
+            keyStatus == RECORDING_CRYPTO_KEY_UNPROVISIONED ||
+            keyStatus == RECORDING_CRYPTO_KEY_PROVISION_PENDING
+        ) {
+            html +=
+                "<span class='status-pill warn'>" +
+                String(de ? "Hardware-Schlüssel noch nicht eingerichtet" : "Hardware key not yet provisioned") +
+                "</span><br><br>";
+        } else {
+            html +=
+                "<span class='status-pill danger'>" +
+                String(de ? "Hardware-Schlüssel Fehler" : "Hardware key error") +
+                ": " + escapeHtml(String(recordingCryptoKeyStatusName())) +
+                "</span><br><br>";
+        }
+    }
+
+    html +=
+        "<button class='primary' type='submit'>" +
+        String(de ? "Verschlüsselung speichern" : "Save encryption") +
+        "</button>"
+        "</form></section>";
 
     html +=
         "<section id='status' class='settings-section'>"
         "<h3>SD Status</h3>"
-        "<p><span class='status-pill " +
-        String(sdReady ? "ok" : "danger") +
-        "'>" +
-        String(
-            sdReady
-            ? (de ? "SD BEREIT" : "SD READY")
-            : (de ? "SD NICHT VERFÜGBAR" : "SD UNAVAILABLE")
-        ) +
-        "</span></p>"
         "<div class='dashboard-grid'>"
         "<div class='dash-card'><div class='card-label'>Total</div><div class='card-value'>" +
         String((unsigned long)(total / 1024ULL / 1024ULL)) +
@@ -2207,152 +2448,24 @@ static String sdMaintenancePage(
         String(de ? "SD STATUS AKTUALISIEREN" : "REFRESH SD STATUS") +
         "</a></p></section>";
 
-    html +=
-        "<section id='recovery' class='settings-section'>"
-        "<h3>" + translatedHtml(UI_NAV_SD_RECOVERY) + "</h3>"
-        "<p class='muted'>" +
-        String(
-#if defined(STORAGE_SPI)
-            de
-            ? "Nicht-destruktive Wiederbelebung und Diagnose der SPI-SD. Es werden keine RAW-Schreiboperationen ausgeführt."
-            : "Non-destructive SPI SD recovery and diagnostics. No raw-sector writes are performed."
-#else
-            de
-            ? "Recovery des SD-Dateisystems über den normalen Storage-Recovery-Pfad. Es wird weder formatiert noch gewiped; nach erfolgreichem Mount kann die bestehende Recovery unvollständige temporäre Aufnahmedateien bereinigen."
-            : "SD filesystem recovery through the normal storage recovery path. It does not format or wipe the card; after a successful mount the existing recovery may clean up incomplete temporary recording files."
-#endif
-        ) +
-        "</p>";
-
-    if (view.recoveryAttempted) {
-        html +=
-            "<p><span class='status-pill " +
-            String(
-                view.recoveryNotRequired || view.recoverySuccess
-                ? "ok"
-                : "danger"
-            ) +
-            "'>" +
-            String(
-                view.recoveryNotRequired
-                ? (de ? "RECOVERY NICHT ERFORDERLICH" : "RECOVERY NOT REQUIRED")
-                : (
-                    view.recoverySuccess
-                    ? (de ? "RECOVERY ERFOLGREICH" : "RECOVERY SUCCESSFUL")
-                    : (de ? "RECOVERY NICHT ERFOLGREICH" : "RECOVERY NOT SUCCESSFUL")
-                )
-            ) +
-            "</span></p>";
-
-        if (
-            view.recoverySuccess &&
-            view.recoveryMountedFrequencyHz > 0
-        ) {
-            html +=
-                "<p class='muted'>" +
-                String(de ? "Gemounteter SPI-Takt: " : "Mounted SPI clock: ") +
-                String(
-                    (double)view.recoveryMountedFrequencyHz /
-                    1000000.0,
-                    3
-                ) +
-                " MHz</p>";
-        }
-
-#if defined(STORAGE_SPI)
-        if (!view.recoveryNotRequired) {
-            html +=
-                "<p class='muted'>RAW controller: <b>" +
-                String(view.recoveryRawCardReady ? "READY" : "NO READY") +
-                "</b> &middot; Sector 0: <b>" +
-                String(view.recoverySector0Readable ? "READABLE" : "NOT READABLE") +
-                "</b></p>";
-        }
-#endif
-
-        if (view.recoveryReport.length()) {
-            html +=
-                "<pre style='white-space:pre-wrap;word-break:break-word;max-height:420px;overflow:auto;padding:12px;"
-                "border:1px solid var(--border);border-radius:10px;background:var(--surface-2)'>" +
-                escapeHtml(view.recoveryReport) +
-                "</pre>";
-        }
-    }
-
-    html +=
-        "<p><span class='status-pill " +
-        String(sdReady ? "ok" : "danger") +
-        "'>" +
-        String(
-            sdReady
-            ? (de ? "SD GEMOUNTET" : "SD MOUNTED")
-            : (de ? "SD NICHT VERFÜGBAR" : "SD UNAVAILABLE")
-        ) +
-        "</span></p>"
-        "<p class='muted'>" +
-        String(
-            sdReady
-            ? (
-                de
-                ? "Der Recovery-Button bleibt bewusst sichtbar. Bei einer betriebsbereiten SD bestätigt er den Zustand, ohne die aktive Karte unnötig neu zu mounten."
-                : "The recovery button remains visible. With an operational SD it confirms the state without unnecessarily remounting the active card."
-            )
-            : (
-#if defined(STORAGE_SPI)
-                de
-                ? "Die Recovery übernimmt exklusiv den SPI-Bus, prüft den Controller und Sektor 0 read-only und versucht anschließend den Filesystem-Mount mit mehreren SPI-Takten."
-                : "Recovery takes exclusive ownership of the SPI bus, checks the controller and sector 0 read-only, then retries the filesystem mount at several SPI clocks."
-#else
-                de
-                ? "Die Recovery versucht die SD über den bestehenden robusten Mount-/Retry-Pfad wieder in Betrieb zu nehmen. Format und Wipe werden dabei nicht ausgeführt."
-                : "Recovery attempts to restore the SD through the existing robust mount/retry path. Format and wipe are not performed."
-#endif
-            )
-        ) +
-        "</p>";
-
-    if (recording) {
-        html +=
-            "<button class='primary' type='button' disabled>" +
-            String(de ? "SD RECOVERY – AUFNAHME AKTIV" : "SD RECOVERY – RECORDING ACTIVE") +
-            "</button>";
-    } else {
-        html +=
-            "<form method='POST' action='/sd_recovery_run#recovery' "
-            "onsubmit=\"this.querySelector('button').disabled=true;this.querySelector('button').textContent='" +
-            String(de ? "Recovery wird geprüft..." : "Checking recovery...") +
-            "';\">"
-            "<button class='primary' type='submit'>" +
-            String(
-#if defined(STORAGE_SPI)
-                "READ-ONLY SD RECOVERY"
-#else
-                de
-                ? "SD RECOVERY STARTEN"
-                : "START SD RECOVERY"
-#endif
-            ) +
-            "</button></form>";
-    }
-
-    html +=
-        "</section>";
+    String benchmarkInfo =
+        de
+        ? "Der SD Benchmark prüft die Speicherkarte und den kompletten SensorForge-Schreibpfad auf Geschwindigkeit, Verzögerungen und Datenfehler. Dazu werden mehrere temporäre Testdateien geschrieben, gelesen und verifiziert. Auch der verschlüsselte Recording-Pfad und die verfügbaren SD-Bustakte werden geprüft. Vorhandene Aufnahmen werden nicht verändert und die Karte wird nicht formatiert. Auf langsamen Karten kann der Test mehrere Minuten dauern."
+        : "The SD benchmark checks the card and the complete SensorForge storage path for speed, latency and data errors. It writes, reads and verifies several temporary test files, including the encrypted recording path and available SD bus clocks. Existing recordings are not modified and the card is not formatted. The test may take several minutes on slow cards.";
 
     html +=
         "<section id='benchmark' class='settings-section'>"
-        "<h3>" + translatedHtml(UI_NAV_SD_BENCHMARK) + "</h3>"
-        "<p class='muted'>" +
-        String(
-            de
-            ? "Erweiterte, nicht-destruktive Storage-Diagnose. SensorForge prüft FAT-/Cluster-Geometrie, 4/16/32/64 KiB Blockgrößen und Allokationskosten, führt zwei 64-MiB-Rohdatei-Endurance-Läufe aus und danach einen dritten 64-MiB-Test durch den echten RecordingWriteBufferedFile -> RecordingStorageFile -> SFENC1-Pfad mit logischem Entschlüsselungs-/Readback-Verify. Anschließend folgt der Bus-Takt-Vergleich."
-            : "Extended non-destructive storage diagnostics. SensorForge reports FAT/cluster geometry, tests 4/16/32/64 KiB blocks and allocation cost, runs two 64 MiB raw-file endurance passes, then runs a third 64 MiB test through the real RecordingWriteBufferedFile -> RecordingStorageFile -> SFENC1 stack with logical decrypt/read-back verification. All written data is verified before the bus-clock comparison."
+        "<div class='sd-section-head'><h3>" + translatedHtml(UI_NAV_SD_BENCHMARK) + "</h3>" +
+        sdInfoButton(
+            de ? "SD Benchmark" : "SD benchmark",
+            benchmarkInfo
         ) +
-        "</p>"
+        "</div>"
         "<p class='muted'>" +
         String(
             de
-            ? "Der Lauf kann auf langsamen Karten deutlich länger dauern. Die Endurance-Dateien sind temporär und physisch maximal etwa 65 MiB groß. Ein echtes EIO wird auf demselben Mount nicht wiederholt. Nur wenn der Produktionstakt über 10 MHz liegt und der SFENC1-Stack-Test dort mit EIO scheitert, darf er nach sauberem Remount einmal bei 10 MHz wiederholt werden; danach wird der Produktionstakt wiederhergestellt. Es wird nicht formatiert."
-            : "The run can take substantially longer on slow cards. Endurance files are temporary and at most about 65 MiB physical size. A real EIO is never retried on the same mount. When the production clock is above 10 MHz, the SFENC1 stack test may additionally repeat once at 10 MHz only after a clean remount when the production-clock run failed with EIO, then restores the production mount. No formatting is performed."
+            ? "Prüft, ob SD-Karte und Speicherpfad zuverlässig genug für Aufnahmen arbeiten."
+            : "Checks whether the SD card and storage path are reliable enough for recordings."
         ) +
         "</p>";
 
@@ -2393,8 +2506,8 @@ static String sdMaintenancePage(
                 "<span class='muted'>" +
                 String(
                     de
-                    ? "Die gemessene Storage-Strecke ist für den normalen SensorForge-Betrieb gut geeignet. Keine Maßnahme erforderlich."
-                    : "The measured storage path is suitable for normal SensorForge operation. No action is required."
+                    ? "Die SD-Karte ist für den normalen SensorForge-Betrieb gut geeignet. Keine Maßnahme erforderlich."
+                    : "The SD card is suitable for normal SensorForge operation. No action is required."
                 ) +
                 "</span>";
         } else if (rating == SD_BENCH_RATING_ORANGE) {
@@ -2402,8 +2515,8 @@ static String sdMaintenancePage(
                 "<span class='muted'>" +
                 String(
                     de
-                    ? "Die Storage-Strecke ist nutzbar, sollte aber vor produktivem Einsatz geprüft bzw. optimiert werden."
-                    : "The storage path is usable but should be checked or optimized before production use."
+                    ? "Die SD-Karte ist nutzbar, sollte aber vor produktivem Einsatz geprüft bzw. optimiert werden."
+                    : "The SD card is usable but should be checked or optimized before production use."
                 ) +
                 "</span>";
         } else {
@@ -2411,8 +2524,8 @@ static String sdMaintenancePage(
                 "<span class='muted'>" +
                 String(
                     de
-                    ? "Die gemessene Storage-Strecke ist für zuverlässige Aufnahmen derzeit nicht empfohlen. Ursache beheben und Benchmark wiederholen."
-                    : "The measured storage path is currently not recommended for reliable recording. Resolve the cause and rerun the benchmark."
+                    ? "Die SD-Karte ist für zuverlässige Aufnahmen derzeit nicht empfohlen. Ursache beheben und Benchmark wiederholen."
+                    : "The SD card is currently not recommended for reliable recording. Resolve the cause and rerun the benchmark."
                 ) +
                 "</span>";
         }
@@ -2448,7 +2561,10 @@ static String sdMaintenancePage(
 
         if (view.benchmarkReferenceWriteMBps > 0.0f) {
             html +=
-                "<div class='dashboard-grid'>"
+                "<details style='margin-top:12px'><summary><b>" +
+                String(de ? "Messwerte anzeigen" : "Show measurements") +
+                "</b></summary>"
+                "<div class='dashboard-grid' style='margin-top:10px'>"
                 "<div class='dash-card'><div class='card-label'>32 KiB Write</div><div class='card-value'>" +
                 String(view.benchmarkReferenceWriteMBps, 2) +
                 " MB/s</div></div>"
@@ -2467,7 +2583,7 @@ static String sdMaintenancePage(
                 "<div class='dash-card'><div class='card-label'>Verify</div><div class='card-value'>" +
                 String(view.benchmarkReferenceVerifyOk ? "OK" : "FAIL") +
                 "</div></div>"
-                "</div>";
+                "</div></details>";
         }
 
         html +=
@@ -2553,42 +2669,38 @@ static String sdMaintenancePage(
         html +=
             "<form id='sdBenchmarkForm' method='POST' action='/sd_benchmark_run#benchmark' "
             "onsubmit=\"this.querySelector('button').disabled=true;this.querySelector('button').textContent='" +
-            String(de ? "SD DIAGNOSE LÄUFT..." : "SD DIAGNOSTICS RUNNING...") +
+            String(de ? "SD BENCHMARK LÄUFT..." : "SD BENCHMARK RUNNING...") +
             "';showSdBusy('benchmark');\">"
             "<button id='sdBenchmarkButton' type='submit'>" +
-            String(de ? "ERWEITERTEN SD BENCHMARK STARTEN" : "START EXTENDED SD BENCHMARK") +
+            String(de ? "SD BENCHMARK STARTEN" : "START SD BENCHMARK") +
             "</button></form>";
     }
 
     html +=
-        "</section>"
-        "<div class='page-title' style='margin-top:28px'><div>"
-        "<h2>" +
-        String(de ? "Destruktive SD-Wartung" : "Destructive SD maintenance") +
-        "</h2><p>" +
-        String(
-            de
-            ? "Wipe, Format und Secure Erase"
-            : "Wipe, format and secure erase"
-        ) +
-        "</p></div></div>";
+        "</section>";
 
-    html +=
-        "<div class='flash-notice' style='border-left-color:var(--accent);background:#eef4ff'>"
-        "<strong style='color:#174ea6'>Config-Schutz</strong>"
-        "<span class='muted'>Vor jedem Vorgang wird die gültige interne LittleFS-<code>/config.txt</code> geprüft. "
-        "War vor dem Vorgang eine SD-<code>/config.txt</code> vorhanden, wird sie danach aus der internen Kopie wiederhergestellt. "
-        "War keine SD-config.txt vorhanden, bleibt SensorForge bewusst im Internal-only-Modus und es wird keine neue Datei erzeugt. "
-        "Ist die interne Config nicht gültig, wird die Operation vollständig abgebrochen.</span>"
-        "</div>";
+    String wipeInfo =
+        de
+        ? "Löscht Dateien und Ordner über das vorhandene FAT-Dateisystem. Das Dateisystem selbst wird nicht neu erzeugt."
+        : "Deletes files and folders through the existing FAT filesystem. The filesystem itself is not recreated.";
+
+    String formatInfo =
+        de
+        ? "Erzeugt das FAT-Dateisystem als FAT32 mit 32-KiB-Clustern neu. Alte Daten können trotz Formatierung forensisch teilweise rekonstruierbar bleiben. Nach erfolgreicher Formatierung wird SensorForge automatisch neu gestartet."
+        : "Recreates the FAT filesystem as FAT32 with 32 KiB clusters. Old data may still be partially recoverable after formatting. SensorForge restarts automatically after a successful format.";
+
+    String secureEraseInfo =
+        de
+        ? "Löscht zunächst alle Dateien, überschreibt danach den logisch freien Datenbereich mit Nullen und formatiert anschließend neu. Das kann je nach Kartengröße sehr lange dauern. Während des Überschreibens werden Datenmenge und Fortschritt live angezeigt. Ein Abbruch stoppt nur das weitere Überschreiben; die Formatierung wird danach trotzdem ausgeführt. Nach erfolgreichem Abschluss wird SensorForge automatisch neu gestartet.\n\nWichtig: Wegen Wear-Leveling und internen Reserveblöcken einer SD-Karte ist keine forensische Garantie für physisch nicht mehr auslesbare NAND-Zellen möglich."
+        : "First deletes all files, then overwrites the logically free data area with zeros and finally reformats the card. This can take a long time depending on card size. Progress is shown live. Aborting only stops further overwriting; formatting still follows. SensorForge restarts automatically after successful completion.\n\nImportant: Wear levelling and reserved internal blocks mean that no forensic guarantee can be made that every physical NAND cell is no longer readable.";
 
     html +=
         "<section class='settings-section'>"
         "<span class='status-pill warn'>WIPE</span>"
-        "<h3 style='margin-top:12px'>SD Wipe</h3>"
-        "<p class='muted'>Löscht Dateien und Ordner über das vorhandene FAT-Dateisystem. "
-        "Das Dateisystem selbst wird nicht neu erzeugt.</p>"
-        "<form id='sdWipeForm' method='POST' action='/sdformat_do'>"
+        "<div class='sd-section-head' style='margin-top:12px'><h3>SD Wipe</h3>" +
+        sdInfoButton("SD Wipe", wipeInfo) +
+        "</div>"
+        "<form id='sdWipeForm' method='POST' action='/sdformat_do' style='margin-top:12px'>"
         "<button id='sdWipeButton' class='danger' type='submit'>SD WIPE STARTEN</button>"
         "</form>"
         "</section>";
@@ -2596,14 +2708,13 @@ static String sdMaintenancePage(
     html +=
         "<section id='format' class='settings-section'>"
         "<span class='status-pill danger'>FORMAT</span>"
-        "<h3 style='margin-top:12px'>SD Format</h3>"
-        "<p class='muted'>Erzeugt das FAT-Dateisystem als FAT32 mit 32-KiB-Clustern neu. "
-        "Alte Daten können trotz Formatierung forensisch teilweise rekonstruierbar bleiben. "
-        "Nach erfolgreicher Formatierung wird SensorForge automatisch neu gestartet.</p>";
+        "<div class='sd-section-head' style='margin-top:12px'><h3>SD Format</h3>" +
+        sdInfoButton("SD Format", formatInfo) +
+        "</div>";
 
     if (sdFormatBackendSupported()) {
         html +=
-            "<form id='sdRealFormatForm' method='POST' action='/sd_format_do'>"
+            "<form id='sdRealFormatForm' method='POST' action='/sd_format_do' style='margin-top:12px'>"
             "<button id='sdRealFormatButton' class='danger' type='submit'>SD FORMAT STARTEN</button>"
             "</form>";
     } else {
@@ -2617,23 +2728,134 @@ static String sdMaintenancePage(
     html +=
         "<section class='settings-section' style='border-color:#e0a8a3'>"
         "<span class='status-pill danger'>SECURE ERASE</span>"
-        "<h3 style='margin-top:12px'>Secure Erase &ndash; Logical Overwrite + Format</h3>"
-        "<p class='muted'>Löscht zunächst alle Dateien, überschreibt danach den logisch freien "
-        "Datenbereich mit Nullen und formatiert anschließend neu. Das kann je nach Kartengröße "
-        "sehr lange dauern. Während des Überschreibens werden Datenmenge und Fortschritt live angezeigt. "
-        "Ein Abbruch stoppt nur das weitere Überschreiben; die Formatierung wird danach trotzdem ausgeführt. "
-        "Nach erfolgreichem Abschluss wird SensorForge automatisch neu gestartet.</p>"
-        "<p class='muted'><b>Wichtig:</b> Wegen Wear-Leveling und internen Reserveblöcken einer SD-Karte "
-        "ist keine forensische Garantie für physisch nicht mehr auslesbare NAND-Zellen möglich.</p>";
+        "<div class='sd-section-head' style='margin-top:12px'><h3>Secure Erase</h3>" +
+        sdInfoButton("Secure Erase", secureEraseInfo) +
+        "</div>";
 
     if (sdFormatBackendSupported()) {
         html +=
-            "<form id='sdSecureForm' method='POST' action='/sd_secure_erase_do'>"
+            "<form id='sdSecureForm' method='POST' action='/sd_secure_erase_do' style='margin-top:12px'>"
             "<button id='sdSecureButton' class='danger' type='submit'>SECURE ERASE STARTEN</button>"
             "</form>";
     } else {
         html +=
             "<p class='status-pill danger'>Auf diesem Storage-Backend nicht unterstützt</p>";
+    }
+
+    String recoveryInfo =
+        String(
+#if defined(STORAGE_SPI)
+            de
+            ? "Nicht-destruktive Notfallfunktion für eine SD-Karte, die nicht mehr korrekt erkannt oder gemountet wird. SensorForge prüft Controller und Sektor 0 nur lesend und versucht anschließend, das Dateisystem über den robusten Mount-/Retry-Pfad mit mehreren SPI-Takten wieder einzubinden. Es wird weder formatiert noch gewiped. Bei einer bereits betriebsbereiten Karte wird nur bestätigt, dass keine Recovery erforderlich ist."
+            : "Non-destructive emergency function for an SD card that is no longer detected or mounted correctly. SensorForge checks the controller and sector 0 read-only and then retries the filesystem mount through the robust mount/retry path at multiple SPI clocks. No format or wipe is performed. If the card is already operational, the function only confirms that recovery is not required."
+#else
+            de
+            ? "Nicht-destruktive Notfallfunktion für eine SD-Karte, die nicht mehr korrekt erkannt oder gemountet wird. SensorForge versucht, das Dateisystem über den normalen robusten Recovery-Pfad wieder einzubinden. Es wird weder formatiert noch gewiped. Nach erfolgreichem Mount kann die bestehende Recovery unvollständige temporäre Aufnahmedateien bereinigen."
+            : "Non-destructive emergency function for an SD card that is no longer detected or mounted correctly. SensorForge retries the filesystem through the normal robust recovery path. No format or wipe is performed. After a successful mount, the existing recovery may clean up incomplete temporary recording files."
+#endif
+        );
+
+    html +=
+        "</section>"
+        "<section id='recovery' class='settings-section' style='margin-top:28px;border-color:#d9dee7'>"
+        "<div class='sd-section-head'><h3>" +
+        String(de ? "SD Recovery (Notfall)" : "SD Recovery (Emergency)") +
+        "</h3>" +
+        sdInfoButton(
+            de ? "SD Recovery – Notfallfunktion" : "SD Recovery – emergency function",
+            recoveryInfo
+        ) +
+        "</div>"
+        "<p class='muted'>" +
+        String(
+            de
+            ? "Nur verwenden, wenn die SD-Karte nicht mehr korrekt erkannt oder gemountet wird."
+            : "Use only if the SD card is no longer detected or mounted correctly."
+        ) +
+        "</p>";
+
+    if (view.recoveryAttempted) {
+        html +=
+            "<p><span class='status-pill " +
+            String(
+                view.recoveryNotRequired || view.recoverySuccess
+                ? "ok"
+                : "danger"
+            ) +
+            "'>" +
+            String(
+                view.recoveryNotRequired
+                ? (de ? "RECOVERY NICHT ERFORDERLICH" : "RECOVERY NOT REQUIRED")
+                : (
+                    view.recoverySuccess
+                    ? (de ? "RECOVERY ERFOLGREICH" : "RECOVERY SUCCESSFUL")
+                    : (de ? "RECOVERY NICHT ERFOLGREICH" : "RECOVERY NOT SUCCESSFUL")
+                )
+            ) +
+            "</span></p>";
+
+        String recoveryDetails;
+
+        if (
+            view.recoverySuccess &&
+            view.recoveryMountedFrequencyHz > 0
+        ) {
+            recoveryDetails +=
+                String(de ? "Gemounteter SPI-Takt: " : "Mounted SPI clock: ") +
+                String(
+                    (double)view.recoveryMountedFrequencyHz /
+                    1000000.0,
+                    3
+                ) +
+                " MHz\n";
+        }
+
+#if defined(STORAGE_SPI)
+        if (!view.recoveryNotRequired) {
+            recoveryDetails +=
+                "RAW controller: " +
+                String(view.recoveryRawCardReady ? "READY" : "NO READY") +
+                " · Sector 0: " +
+                String(view.recoverySector0Readable ? "READABLE" : "NOT READABLE") +
+                "\n";
+        }
+#endif
+
+        if (view.recoveryReport.length()) {
+            recoveryDetails += view.recoveryReport;
+        }
+
+        if (recoveryDetails.length()) {
+            html +=
+                "<details style='margin-top:12px'><summary><b>" +
+                String(de ? "Technische Recovery-Details" : "Technical recovery details") +
+                "</b></summary>"
+                "<pre style='white-space:pre-wrap;word-break:break-word;max-height:420px;overflow:auto;padding:12px;"
+                "border:1px solid var(--border);border-radius:10px;background:var(--surface-2);margin-top:10px'>" +
+                escapeHtml(recoveryDetails) +
+                "</pre></details>";
+        }
+    } else if (sdReady) {
+        html +=
+            "<p><span class='status-pill ok'>" +
+            String(de ? "AKTUELL NICHT ERFORDERLICH" : "CURRENTLY NOT REQUIRED") +
+            "</span></p>";
+    }
+
+    if (recording) {
+        html +=
+            "<button class='primary' type='button' disabled>" +
+            String(de ? "SD RECOVERY – AUFNAHME AKTIV" : "SD RECOVERY – RECORDING ACTIVE") +
+            "</button>";
+    } else {
+        html +=
+            "<form method='POST' action='/sd_recovery_run#recovery' "
+            "onsubmit=\"this.querySelector('button').disabled=true;this.querySelector('button').textContent='" +
+            String(de ? "Recovery wird geprüft..." : "Checking recovery...") +
+            "';\">"
+            "<button class='primary' type='submit'>" +
+            String(de ? "SD RECOVERY STARTEN" : "START SD RECOVERY") +
+            "</button></form>";
     }
 
     html +=
@@ -2720,10 +2942,10 @@ static String sdMaintenancePage(
             "if(abort){abort.hidden=true;abort.disabled=false;abort.textContent='ÜBERSCHREIBEN ABBRECHEN & FORMATIEREN';}"
             "if(icon){icon.textContent='⚠';icon.style.color='';}"
             "if(kind==='benchmark'){"
-                "pill.textContent='SD DIAGNOSTIC';"
+                "pill.textContent='SD BENCHMARK';"
                 "if(icon){icon.textContent='●';icon.style.color='var(--danger)';}"
-                "title.textContent='" + String(de ? "SD-Diagnose läuft" : "SD diagnostics in progress") + "';"
-                "text.textContent='" + String(de ? "SensorForge prüft Schreib- und Leserate, Latenzen, Datenintegrität und Bus-Takte." : "SensorForge is testing write/read throughput, latency, data integrity and bus clocks.") + "';"
+                "title.textContent='" + String(de ? "SD Benchmark läuft" : "SD benchmark in progress") + "';"
+                "text.textContent='" + String(de ? "SensorForge prüft die SD-Karte und den kompletten Speicherpfad." : "SensorForge is checking the SD card and the complete storage path.") + "';"
                 "note.textContent='" + String(de ? "Bitte diese Seite geöffnet lassen und SD-Karte sowie Stromversorgung nicht unterbrechen." : "Keep this page open and do not interrupt the SD card or power supply.") + "';"
                 "if(metrics)metrics.textContent='" + String(de ? "Mehrere verifizierte Testläufe werden ausgeführt …" : "Running multiple verified test passes …") + "';"
                 "sdSetBenchmarkDot();"
@@ -2771,7 +2993,7 @@ static String sdMaintenancePage(
                 "if(abort)abort.hidden=true;"
             "}else if(s.stage==='restore'){"
                 "title.textContent=s.hadSdConfig?'Konfiguration wird wiederhergestellt':'Config-Policy wird abgeschlossen';"
-                "text.textContent=s.hadSdConfig?'Die vorher vorhandene config.txt wird aus dem internen Flash auf die SD-Karte zurückkopiert und geprüft.':'Vor dem Secure Erase war keine SD-config.txt vorhanden. Internal-only bleibt erhalten; es wird keine config.txt auf SD erzeugt.';"
+                "text.textContent=s.hadSdConfig?'Die geschützte SensorForge-Konfiguration wird wiederhergestellt und geprüft.':'Die SensorForge-Konfiguration bleibt im bisherigen Modus erhalten.';"
                 "note.textContent='SensorForge startet danach automatisch neu.';"
                 "if(abort)abort.hidden=true;"
             "}"
@@ -2823,11 +3045,13 @@ static String sdMaintenancePage(
             "fetch('/sd_secure_abort',{method:'POST',cache:'no-store'}).catch(function(){});"
         "});}"
         "armSdForm('sdWipeForm','sdWipeButton','WIPE LÄUFT...',"
-            "'SD Wipe wirklich starten? Alle SD-Dateien werden gelöscht. Eine vorher vorhandene SD-config.txt wird wiederhergestellt; Internal-only bleibt Internal-only.','');"
+            "'SD Wipe wirklich starten? Alle Dateien auf der SD-Karte werden gelöscht.','');"
         "armSdForm('sdRealFormatForm','sdRealFormatButton','FORMATIERUNG LÄUFT...',"
-            "'SD wirklich neu formatieren? Alle SD-Daten gehen verloren. Eine vorher vorhandene SD-config.txt wird wiederhergestellt; Internal-only bleibt Internal-only.','format');"
+            "'SD wirklich formatieren? Alle Daten auf der SD-Karte gehen verloren.','format');"
         "armSecureErase();"
         "</script>";
+
+    appendSdInfoUi(html);
 
     html +=
         pageFooter();
@@ -5960,6 +6184,8 @@ void webSdMaintenanceRegisterRoutes(
 
     server.on("/sd_recovery_run", HTTP_POST, handleSDRecoveryRun);
     server.on("/sd_maintenance", HTTP_GET, handleSDMaintenance);
+    server.on("/sd_storage_safety_save", HTTP_POST, handleSDStorageSafetySave);
+    server.on("/sd_encryption_save", HTTP_POST, handleSDEncryptionSave);
     server.on("/sdformat", HTTP_GET, handleSDFormat);
     server.on("/sdformat_do", HTTP_POST, handleSDFormatDo);
     server.on("/sd_format_do", HTTP_POST, handleSDRealFormatDo);
