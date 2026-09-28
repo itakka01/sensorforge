@@ -1,11 +1,521 @@
 SENSORFORGE / ESP32-S3 CAMERA (XIAO + FREENOVE)
 PROJEKTBESCHREIBUNG, RELEASESTAND UND WIEDEREINSTIEGSPROMPT
 Stand: 2026-09-28
-Dokumentrevision: v83 / v67-Stabilitaetsbasis + Power-Shooter-Bewegungsverdacht + laienfreundliche System-/Transport-/Kamera-UI + offene Langzeitqualifikation
+Dokumentrevision: v83 + offene v84-Aufgabe RTSP/Netzwerk-Streamer / v67-Stabilitaetsbasis + Power-Shooter-Bewegungsverdacht + laienfreundliche System-/Transport-/Kamera-UI + offene Langzeitqualifikation
 Aktueller Entwicklungs-/Arbeits-Release: v83 (Produktionsqualifikation fuer XIAO-Langzeitrecording noch offen)
 Produktname: SensorForge
 Plattformname: Fabric Node
 Core-Version im Branding: 7.1.0
+
+
+
+======================================================================
+OFFENE V84-AUFGABE - RTSP / NETZWERK-STREAMER (WIEDEREINSTIEG VERBINDLICH)
+======================================================================
+
+STATUS / AUSGANGSPUNKT:
+
+- Letzter bestaetigter/freigegebener Arbeitsstand bleibt v83.
+- Die RTSP-/Streamer-Arbeit wurde nach v83 begonnen, aber im Chat unterbrochen,
+  bevor ein vollstaendig gepruefter und freigegebener v84-Release erzeugt wurde.
+- Ein eventuell vorhandener lokaler/temporarer v84-Arbeitsordner ist deshalb NICHT
+  automatisch als autoritative Basis zu behandeln.
+- Beim Wiedereinstieg fuer die eigentliche Implementierung zuerst den aktuellen,
+  vollstaendigen v83-Quellstand bzw. einen vom Benutzer danach ausdruecklich
+  bestaetigten neueren Stand verwenden und ALLE betroffenen Dateien erneut lesen.
+- Bestehende produktive SensorForge-Funktionalitaet hat absolute Prioritaet.
+  Streaming darf den Normalbetrieb nicht veraendern, wenn der Streamer-Modus
+  nicht bewusst aktiviert wurde.
+
+ZIEL:
+
+SensorForge soll optional als eigenstaendiger Netzwerk-Kamera-Streamer arbeiten
+koennen. Der Benutzer soll bewusst zwischen zwei Betriebsarten waehlen koennen:
+
+  1. Normalbetrieb / SensorForge
+     - bisheriges Motion Recording
+     - Power Shooter
+     - Image Motion / Sensor-Ausloesung
+     - SD-Aufzeichnung / Verschluesselung
+     - Sleep-/Wake-Automatik
+     - alle bestehenden Aufnahme-, Diagnose- und Recovery-Pfade
+
+  2. Netzwerk-Streamer
+     - Kamera dient ausschliesslich dem Streaming
+     - RTSP/MJPEG als primaerer Stream
+     - HTTP-MJPEG als einfacher Browser-/Integrationsstream
+     - JPEG Snapshot bleibt verfuegbar
+     - Audio kann optional ueber RTSP mitgesendet werden, wenn Audio in der
+       bestehenden SensorForge-Audiokonfiguration aktiviert UND tatsaechlich
+       verfuegbar ist
+     - keine automatische Aufnahme, kein Power Shooter und keine normale
+       Recording-/Sleep-Automatik waehrend dieses Betriebsmodus
+
+WICHTIGSTE RUECKWAERTSKOMPATIBILITAETSREGEL:
+
+- Fehlen die neuen Streamer-Config-Keys in einer bestehenden config.txt, MUSS
+  SensorForge exakt im bisherigen Normalbetrieb starten.
+- Der sichere Default fuer alle neuen Streamer-Optionen ist AUS.
+- Ein Firmwareupdate eines bereits eingesetzten Geraets darf Streaming niemals
+  automatisch aktivieren.
+- Bestehende v83-Konfigurationen muessen ohne Migration oder manuelle Nacharbeit
+  weiterlaufen.
+- Bestehende Config-Keys duerfen fuer die Streamer-Funktion NICHT umgedeutet werden.
+- Neue Streamer-Keys additiv und mit klaren Defaults einfuehren.
+
+EMPFOHLENE KONFIGURATION / BETRIEBSMODUS:
+
+Die genaue Benennung ist beim Implementieren gegen den aktuellen Config-Code zu
+pruefen. Inhaltlich werden mindestens folgende Einstellungen benoetigt:
+
+  operating_mode = normal | streamer
+
+oder gleichwertig ein eindeutiger persistenter Streamer-Modus. Zusaetzlich:
+
+  streamer_rtsp_enabled = 0|1
+  streamer_http_mjpeg_enabled = 0|1
+
+Audio NICHT mit einer zweiten Mikrofonkonfiguration duplizieren. Stattdessen gilt:
+
+  - cfg_audio_enabled bzw. die aktuell gueltige Audio-Konfiguration bleibt die
+    einzige Quelle der Audioentscheidung.
+  - Ist Audio in SensorForge deaktiviert, darf der Streamer keinen Audiotrack
+    anbieten.
+  - Ist Audio aktiviert, aber die konfigurierte Quelle/Hardware nicht verfuegbar,
+    muss Video weiter streamen koennen und die UI klar anzeigen, dass Audio nicht
+    verfuegbar ist.
+  - Keine zweite Sample-Rate-, Pin-, Backend- oder Mikrofonkonfiguration auf der
+    Streamer-Seite einfuehren.
+
+MODUSWECHSEL:
+
+- Wechsel Normalbetrieb <-> Streamer soll persistent gespeichert werden und einen
+  Neustart erfordern.
+- Kein komplexes Hot-Switching der Kamera-/Recorder-Ownership im laufenden Betrieb
+  fuer die erste Version bauen.
+- Grund: Beim Boot kann eindeutig entschieden werden, ob Kamera/Audio dem normalen
+  Recordingpfad oder dem Streamer gehoeren. Das reduziert Race Conditions und
+  Seiteneffekte auf bereits produktive Installationen.
+- UI muss nach dem Speichern klar auf den erforderlichen Neustart hinweisen.
+
+STREAMER-MODUS - WAS DEAKTIVIERT WERDEN MUSS:
+
+Wenn Streamer-Modus aktiv ist, duerfen insbesondere folgende produktiven Pfade
+NICHT parallel arbeiten:
+
+- Motion Recording / Ereignisaufnahme
+- Power Shooter / Dauershooter
+- automatische Recording-Startlogik
+- Image-Motion-Ausloesung fuer Aufnahmen
+- Radar/PIR-getriggerte Recording-Entscheidungen
+- automatische Segmentrotation fuer normale Aufnahmen
+- Recording Load Test als normaler Aufnahmebesitzer, solange Streaming aktiv ist
+- normale Sleep-/Wake-Aufnahmeautomatik
+- Funktionen, die die Kamera waehrend eines Streams deinitialisieren oder fuer
+  einen Recordingstart uebernehmen wollen
+
+Dabei nicht einfach Config-Werte dauerhaft auf 0 zurueckschreiben. Die normale
+Konfiguration muss erhalten bleiben, damit nach Rueckwechsel in den Normalbetrieb
+alle bisherigen Einstellungen wieder gelten.
+
+ZUSAETZLICHER FAIL-SAFE:
+
+- Auch wenn UI oder Automatik im Streamer-Modus bereits deaktiviert sind, muss der
+  zentrale Recording-Startpfad zusaetzlich hart pruefen, ob Streamer-Modus aktiv
+  ist, und dann einen Recordingstart ablehnen.
+- Dasselbe Prinzip fuer Shooter-Start/Flush soweit erforderlich gegen den aktuellen
+  Code pruefen.
+- Direkte/API-seitige Aufrufe duerfen die exklusive Kamera-Ownership des Streamers
+  nicht umgehen.
+
+WAS IM STREAMER-MODUS WEITER AKTIV BLEIBEN SOLL:
+
+- Webinterface / WebConfig
+- Firmware Update / OTA
+- Systeminformationen
+- Temperatur-/Thermalschutz
+- Reboot / Shutdown
+- Lizenz-/Serviceinformationen
+- normale Netzwerk-/Zeitfunktionen, soweit sie fuer den Streamer benoetigt werden
+- SD-Wartung nur soweit sie nicht mit einem aktiven Stream kollidiert; bei
+  exklusiven/destruktiven Wartungsoperationen Streaming sicher stoppen oder die
+  Aktion ablehnen, analog zu bestehenden Storage-/Recording-Gates
+
+KAMERA-OWNERSHIP / FRAMEPIPELINE:
+
+- Der ESP32-S3-Kamerasensor darf im Streamer-Modus nur EINEN klaren Frame-Besitzer
+  bzw. zentralen Capture-Pfad haben.
+- Nicht fuer RTSP und HTTP jeweils separat esp_camera_fb_get() in konkurrierenden
+  Loops aufrufen.
+- Ein aufgenommener JPEG-Frame soll nach Moeglichkeit fuer alle aktuell bedienten
+  Stream-Ausgaenge geteilt werden:
+
+      Kamera -> JPEG Frame -> RTSP/RTP
+                         -> HTTP-MJPEG
+                         -> optional Snapshot
+
+- Kameraeinstellungen werden NICHT auf der Streamer-Seite dupliziert.
+- Aufloesung, FPS, JPEG-Qualitaet, XCLK, Exposure, AE-Level, Rotation und Crop
+  bleiben unter den bestehenden Kamera-/Advanced-Kameraeinstellungen.
+- Der Streamer verwendet die dort persistent gespeicherten Werte.
+- Bereits bestehende Performance-Grenzen/Clamps fuer XIAO und andere Boards
+  weiterhin respektieren.
+
+RTSP VIDEO - VERBINDLICHES FORMATZIEL:
+
+- Primaerer RTSP-Videostream: MJPEG/JPEG ueber RTP.
+- Kein Software-H.264 fuer die erste Version einfuehren.
+- Die Kamera liefert bereits JPEG; dadurch bleibt CPU-/RAM-Last im Vergleich zu
+  Software-Transcoding beherrschbar.
+- JPEG fuer RTP nicht proprietaer in beliebige UDP-Pakete schneiden.
+- RTP/JPEG standardkonform gemaess RFC 2435 packetisieren:
+    - RTP Header korrekt setzen
+    - 90-kHz Video-Timestamp verwenden
+    - Fragment Offset korrekt je JPEG-Fragment
+    - JPEG Type / Q / Width / Height gemaess Format
+    - Quantisierungstabellen behandeln, wenn fuer den konkreten JPEG-Frame noetig
+    - Marker-Bit am letzten RTP-Paket eines Frames setzen
+    - Sequenznummer pro RTP-Paket fortlaufend
+- SDP des RTSP-Streams muss die Video-Session so beschreiben, dass Standardclients
+  wie VLC/ffmpeg/NVR sie ohne SensorForge-Sonderwissen oeffnen koennen.
+
+RTSP PROTOKOLL / TRANSPORT:
+
+Mindestens folgende RTSP-Methoden fuer einen brauchbaren ersten Release sauber
+behandeln:
+
+- OPTIONS
+- DESCRIBE
+- SETUP
+- PLAY
+- TEARDOWN
+- GET_PARAMETER bzw. Keepalive sinnvoll beantworten, falls Client dies nutzt
+
+Fuer den ersten stabilen Release bevorzugt:
+
+- RTP interleaved over RTSP/TCP unterstuetzen, da dies durch Firewalls/NAT im
+  lokalen Netz einfacher und weniger fehleranfaellig ist.
+- UDP-RTP kann spaeter bzw. nur dann ergaenzt werden, wenn es sauber und ohne
+  zusaetzliche Instabilitaet implementierbar ist.
+- Keine proprietaere RTSP-Abart erzeugen, die nur mit einem einzelnen Player
+  funktioniert.
+
+RTSP URL / PORT:
+
+Bevorzugte Benutzeradresse:
+
+  rtsp://<hostname>:554/stream
+
+Beispiel:
+
+  rtsp://printer51.local:554/stream
+
+Port 554 ist der Standard, sofern er auf dem ESP32-Stack ohne Konflikt sauber
+verwendet werden kann. Falls der aktuelle Netzwerkstack/Portbelegung einen anderen
+Port erfordert, dies klar in UI und Dokumentation anzeigen und NICHT still aendern.
+
+HTTP-MJPEG:
+
+- Zusaetzlich einen einfachen HTTP-MJPEG-Stream anbieten, z.B.:
+
+  http://<hostname>/stream
+
+- Content-Type als multipart/x-mixed-replace mit sauberem Boundary verwenden.
+- Jeder Part enthaelt genau einen JPEG-Frame mit korrekter Content-Length.
+- HTTP-MJPEG ist fuer Browser, Home-Automation und einfache Integrationen gedacht.
+- Derselbe Capture-Frame soll nach Moeglichkeit fuer RTSP und HTTP verwendet werden.
+- Bestehender Einzel-Snapshot bleibt erhalten, z.B. /snapshot bzw. bestehende
+  API-Snapshot-Route. Bestehende Route nicht ohne zwingenden Grund umbenennen.
+
+CLIENT-LIMIT / LASTSCHUTZ:
+
+Fuer die erste Version bewusst konservativ:
+
+- maximal 1 aktiver RTSP-Client
+- maximal 1 aktiver HTTP-MJPEG-Client
+- weitere Verbindungen mit verstaendlicher Busy-/Service-Unavailable-Antwort
+  ablehnen statt unkontrolliert weitere Framekopien/Socketpuffer zu erzeugen
+- spaetere Erweiterung erst nach Hardwaremessungen
+- RTSP und HTTP duerfen gleichzeitig laufen, sofern sie denselben Frame teilen und
+  die gemessene Last dies auf Zielhardware zulaesst
+
+AUDIO IM RTSP-STREAM:
+
+Audio ist ausdruecklich optional, soll aber bereits in dieser Streamingfunktion
+vorgesehen/implementiert werden.
+
+Aktivierungsregel:
+
+- Audio-Track nur anbieten, wenn die bestehende SensorForge-Audioeinstellung
+  aktiviert ist UND der Audio-Capture-Pfad gestartet werden kann.
+- Kein Audio-Schalter, der eine deaktivierte globale Audio-Konfiguration heimlich
+  uebersteuert.
+- UI darf im Streamer-Bereich anzeigen:
+    `Audio: aktiv - wird im RTSP-Stream mitgesendet`
+  oder
+    `Audio: aus - Audio ist in den Audioeinstellungen deaktiviert`
+  oder
+    `Audio: aktiviert, aber Eingang nicht verfuegbar`
+
+Technisches Ziel fuer erste Version:
+
+- vorhandenen SensorForge-PCM-Capturepfad wiederverwenden
+- kein MP3/AAC/Opus-Encoding fuer die erste Version einfuehren
+- RTSP/RTP-Audio als unkomprimiertes L16/PCM anbieten, passend zur tatsaechlich
+  unterstuetzten Audioformatierung
+- fuer den bewaehrten XIAO-Onboard-PDM-Pfad ist 16 kHz / 16 bit / mono der
+  relevante Ausgangspunkt; aktuelle Audio-Abstraktion vor Implementierung pruefen
+- SDP muss Samplingrate/Kanaele korrekt angeben
+- RTP-Audio-Timestamps aus Sampleanzahl ableiten, nicht aus ungeeigneten Video-
+  Timern
+- Video und Audio sollen dieselbe Stream-Sessionzeitbasis sinnvoll starten; Drift
+  nicht durch periodisches hartes Resync erzeugen
+- Audiofehler duerfen den Videostream nicht zwingend beenden. Analog zum Recorder:
+  Video soll weiterlaufen koennen, wenn nur der Audio-Capturepfad ausfaellt.
+
+AUDIO / MEHRERE CONSUMER:
+
+- Vor Implementierung audio_capture.cpp/.h lesen und Ownership des bestehenden
+  Capture-Tasks/PSRAM-Rings verstehen.
+- Nicht parallel einen zweiten unabhaengigen PDM/I2S-Treiber fuer RTSP initialisieren,
+  wenn der bestehende Capturepfad wiederverwendet werden kann.
+- Streamer-Modus besitzt den Audio-Capture exklusiv, weil normales Recording in
+  diesem Modus deaktiviert ist.
+- Auf korrekten Start/Stop und Freigabe des Audio-Capturepfads bei RTSP-Client-
+  Disconnect, Streamer-Shutdown und Reboot achten.
+
+WEBCONFIG / BEDIENUNG:
+
+Eine eigene, klar abgegrenzte Streamer-Seite vorsehen. Keine Streamer-Parameter
+zwischen allgemeinen Kamera-/Recordingeinstellungen verstreuen.
+
+Die Seite soll fuer normale Benutzer mindestens zeigen:
+
+- Betriebsmodus: SensorForge / Netzwerk-Streamer
+- RTSP: aktiviert/deaktiviert
+- HTTP-MJPEG: aktiviert/deaktiviert
+- RTSP-Adresse kopierbar/lesbar
+- HTTP-Stream-Adresse kopierbar/lesbar
+- Audio-Status abgeleitet aus der bestehenden Audio-Konfiguration
+- aktueller Streamer-Status:
+    - bereit
+    - RTSP Client verbunden
+    - HTTP Client verbunden
+    - Audio aktiv/nicht verfuegbar
+- Hinweis, dass Recording, Power Shooter und Sleep-Automatik im Streamer-Modus
+  nicht aktiv sind
+- Hinweis auf erforderlichen Neustart nach Moduswechsel
+
+Kamera- und Audio-Fachparameter NICHT auf dieser Seite duplizieren. Stattdessen
+Links/Buttons zu den bestehenden Kamera- bzw. Audioeinstellungen verwenden.
+
+OVERVIEW / HEADER IM STREAMER-MODUS:
+
+- Die normale Uebersicht darf im aktiven Streamer-Modus NICHT `Bereit`,
+  `Kamera scharf`, Recording-Pause oder aehnliche Recording-Zustaende suggerieren.
+- Stattdessen klarer Status `STREAMER` / `Netzwerk-Streamer aktiv`.
+- Globalen Recording-Pause-Schalter im Streamer-Modus ausblenden oder durch einen
+  reinen Streamer-Status ersetzen.
+- Normalmodus-UI darf dadurch nicht veraendert werden.
+
+WEBCONFIG LIVE PREVIEW IM STREAMER-MODUS:
+
+Der aktuelle Preview-Pfad verwendet selbst esp_camera_fb_get() und besitzt ein Gate,
+das Recording waehrend Preview verhindert. Im Streamer-Modus muss entschieden werden,
+wie Preview ohne konkurrierenden Kamerazugriff funktioniert:
+
+Bevorzugt:
+
+- Kamera-Seite zeigt im Streamer-Modus den bestehenden Stream oder nutzt einen
+  Snapshot aus der zentralen Streamer-Framequelle.
+- NICHT parallel zur Streamer-Engine einen zweiten unabhaengigen Capture-Loop starten.
+- Bestehende Crop-Testfunktion sorgfaeltig pruefen: temporare Sensor-Crop-Aenderungen
+  waehrend aktivem RTSP koennen laufende Clients beeinflussen. Fuer erste Version
+  ggf. Stream fuer Crop-Test bewusst pausieren/neu starten oder Crop-Test im aktiven
+  Streamer-Modus sperren und Neustart nach persistentem Crop verlangen.
+- Bestehenden Normalmodus-Preview-Pfad unveraendert lassen.
+
+mDNS / DISCOVERY:
+
+- Bestehenden .local-Hostname weiterverwenden.
+- Streamer soll wenn moeglich `_rtsp._tcp` per mDNS/Zeroconf publizieren.
+- Dabei Port und ggf. Pfad als Serviceinformation bekanntmachen, soweit die verwendete
+  ESP32-mDNS-API dies sauber erlaubt.
+- Bestehende Web-/Hostname-Discovery nicht brechen.
+
+INTEGRATION API:
+
+Im aktuellen Integration-API-Vertrag ist RTSP bereits als Capability vorgesehen und
+bisher false. Bei implementiertem Streamer:
+
+- `rtsp` nur dann als supported/capable melden, wenn die Firmware den RTSP-Streamer
+  wirklich enthaelt.
+- Zusaetzlich aktuellen Betriebsmodus und ggf. Streamer-Status additiv in `/device`
+  bzw. `/state` aufnehmen, ohne bestehende API-Felder umzudeuten.
+- Alte Sync-Clients duerfen nicht von neuen Feldern abhaengen.
+- Bestehende API-Version nicht ohne Not brechen; additive Felder bevorzugen.
+
+SLEEP / POWER:
+
+- Im aktiven Streamer-Modus kein normaler Light-/Deep-Sleep, solange Streaming
+  bereitgestellt werden soll.
+- Streamer ist ein dauerhaft erreichbarer Netzwerkmodus und benoetigt aktive Kamera
+  und WiFi-Verbindung.
+- Bestehende Sleep-Konfiguration NICHT loeschen oder ueberschreiben; sie gilt wieder
+  nach Rueckkehr in den Normalbetrieb.
+- Transport-Deep-Sleep und Thermal-Emergency als Sicherheitsfaelle separat gegen den
+  aktuellen Code pruefen. Thermalschutz hat weiterhin Vorrang vor Streaming.
+
+SD / STORAGE:
+
+- Streaming selbst soll keine Aufnahmedateien und keine neuen Sidecar-Dateien auf
+  SD erzeugen.
+- HTTP/RTSP-Streaming soll nicht unnoetig in den kritischen RecordingStorage-/SFENC1-
+  Pfad eingreifen.
+- Dadurch bleibt der offene Langzeit-EIO-Randfall des Recordings technisch getrennt
+  vom Streamer.
+- SD-Verschluesselung hat auf den Live-Stream selbst keine Bedeutung; sie bleibt nur
+  fuer persistierte Medien/Logs relevant.
+
+THERMAL / LAST:
+
+- Bestehenden Thermal-Safety-Code NICHT umgehen.
+- Wenn Thermal Emergency eintritt, muss der Streamer kontrolliert stoppen bzw. der
+  vorhandene Sicherheits-/Cooldownpfad Vorrang haben.
+- Streamer-Telemetrie sollte mindestens aktuelle FPS, verbundene Clients und ggf.
+  gesendete Bytes/Frames bereitstellen, ohne permanent hohe Diagnosekosten zu erzeugen.
+- Auf XIAO mit 1024x768 weiterhin konservativen 4-fps-Zielbetrieb respektieren, bis
+  echte Streaming-Hardwaretests hoehere Raten qualifizieren.
+
+NICHT FUER DIE ERSTE VERSION:
+
+Folgende Erweiterungen bewusst NICHT gleichzeitig mit dem ersten stabilen Streamer
+implementieren:
+
+- Software-H.264-Encoding
+- WebRTC
+- HLS
+- RTMP
+- SRT
+- ONVIF Device/Media Services
+- beliebig viele parallele Clients
+- Transcoding oder skalierte Zweitstreams
+
+ONVIF ist eine sinnvolle spaetere Erweiterung fuer NVR-Autodiscovery, aber erst nach
+einem stabil qualifizierten RTSP/MJPEG-Kern.
+
+MODUL-/CODESTRUKTUR:
+
+- Streamer moeglichst in eigene neue .cpp/.h-Dateien auslagern, statt webconfig.cpp
+  oder sensorforge.ino mit kompletter RTSP-Implementierung aufzublaehen.
+- Keine neue externe RTSP-Library blind einfuehren. Wenn eine Library verwendet
+  werden soll, vorher deren Speicherbedarf, Lizenz, Arduino-ESP32-Kompatibilitaet,
+  RFC-Konformitaet und Wechselwirkungen pruefen.
+- Bevorzugt eine kleine kontrollierte Implementierung mit klarer Ownership und
+  begrenztem Featureumfang.
+- sensorforge.ino soll nur Modusentscheidung, Init/Loop/Stop-Hooks und bestehende
+  Sicherheitsgates integrieren.
+- WebConfig soll nur UI/Config/Status integrieren, nicht die RTP-Packetisierung.
+
+EMPFOHLENE MODULSCHNITTSTELLE, NUR ALS ZIELBILD - VOR CODING AN AKTUELLEN CODE ANPASSEN:
+
+  bool streamerModeEnabled();
+  bool streamerBegin(String &error);
+  void streamerLoop();
+  void streamerStop();
+  bool streamerRtspClientConnected();
+  bool streamerHttpClientConnected();
+  bool streamerAudioActive();
+
+Funktionsnamen sind NICHT verbindlich; der aktuelle Code ist autoritativ.
+
+FEHLERBEHANDLUNG:
+
+- Fehlgeschlagener RTSP-Client darf Streamer nicht dauerhaft blockieren.
+- Socket Disconnects sauber erkennen und Ressourcen freigeben.
+- Kamera-FB immer garantiert mit esp_camera_fb_return() freigeben.
+- Keine Framepuffer-Leaks bei Clientabbruch mitten im Senden.
+- Slow Clients duerfen den gesamten Firmwareloop nicht sekundenlang blockieren.
+- Sendeschleifen begrenzen/yield bzw. vorhandene Watchdog-/Loop-Policy beachten.
+- Kein unendliches Warten auf TCP writes.
+- Audio-Ring darf bei langsamem Client nicht unbegrenzt wachsen; lieber Pakete/Daten
+  kontrolliert verwerfen und diagnostizieren als Systemstabilitaet verlieren.
+
+TEST-/QUALIFIKATIONSPLAN FUER V84:
+
+Vor Freigabe mindestens getrennt pruefen:
+
+A. REGRESSION NORMALMODUS
+- neue Streamer-Keys fehlen -> Boot exakt Normalmodus
+- Motion Recording unveraendert
+- Power Shooter unveraendert
+- Image Motion unveraendert
+- Kamera-Preview/Crop unveraendert
+- Audio-MKV-Aufnahme unveraendert
+- SD Encryption/SFENC1 unveraendert
+- Sleep/Wake unveraendert
+- Transport, OTA, SD Maintenance, Systemtest unveraendert
+
+B. STREAMER VIDEO
+- RTSP aus VLC/ffplay/ffmpeg oeffnen
+- DESCRIBE/SETUP/PLAY/TEARDOWN mehrfach hintereinander
+- Client hart schliessen und neu verbinden
+- 10/30/60 Minuten Lauf ohne Heapverlust
+- 1024x768 / 4 fps als XIAO-Referenz
+- HTTP-MJPEG alleine
+- RTSP alleine
+- RTSP + HTTP gleichzeitig
+- zweiter RTSP-/HTTP-Client wird kontrolliert abgelehnt
+
+C. AUDIO
+- Audio global AUS -> SDP/RTSP nur Video
+- Audio global AN + Eingang verfuegbar -> Audio-Track vorhanden
+- Audio global AN + Eingang nicht verfuegbar -> Video bleibt nutzbar, klare Meldung
+- Sprache/Geraeusch in VLC/ffplay hoerbar
+- keine kontinuierlich steigenden Audio-Drops oder Ring-High-Water-Werte
+- Client Disconnect gibt Audioressourcen sauber frei
+
+D. MODUSWECHSEL
+- Normal -> Streamer speichern -> Reboot -> nur Streamer
+- Streamer -> Normal speichern -> Reboot -> alte Recording-/Shooter-/Sleep-Werte
+  wieder unveraendert aktiv
+- Power-Loss nach Save darf Config nicht beschaedigen
+
+E. THERMAL / STABILITAET
+- Thermalschutz bleibt aktiv
+- Streamer reagiert kontrolliert auf Thermal Emergency
+- Heap/PSRAM Minimum beobachten
+- keine Watchdog-Resets
+- keine Kamera-FB-Leaks
+
+F. BUILD-/FLASH-RESERVE
+- nach Implementierung Arduino-Linkerwerte dokumentieren
+- App-Partition weiter beobachten; Orientierung aus v74: <80% OK, 80..90%
+  beobachten, >=90% knapp
+- globale/statische RAM-Nutzung und realen Minimum-Heap getrennt bewerten
+
+RELEASE-/DOKUMENTATIONSREGEL:
+
+- Erst wenn der Streamer vollstaendig implementiert, statisch/kompilatorisch geprueft
+  und als zusammenhaengender Stand paketiert ist, Release auf v84 setzen.
+- Ohne echten Arduino-Build nicht behaupten, dass der Sketch kompiliert.
+- Ohne Hardwaretest nicht behaupten, dass VLC/NVR/Audio real funktionieren.
+- CHANGELOG, sensorforge_version.h, Projektbeschreibung und API-Dokumentation gemeinsam
+  aktualisieren.
+- Deltapaket enthaelt nur tatsaechlich geaenderte/neue Projektdateien.
+
+KERNPRINZIP FUER DIE IMPLEMENTIERUNG:
+
+  streamer_mode AUS oder Key fehlt
+      => SensorForge muss sich wie v83 verhalten.
+
+  streamer_mode AN
+      => Kamera/Audio gehoeren exklusiv dem Streamer; Recording/Shooter/Sleep-
+         Aufnahmeautomatik bleiben deaktiviert, ohne ihre gespeicherten Einstellungen
+         zu zerstoeren.
+
+Dieses Prinzip ist wichtiger als zusaetzliche Streaming-Features. Erst Stabilitaet und
+Rueckwaertskompatibilitaet, danach Erweiterungen wie ONVIF oder weitere Clients.
 
 
 
