@@ -58,6 +58,8 @@ static String lastError;
 
 static uint32_t videoTimestamp = 0;
 static uint64_t audioSamplesSent = 0;
+static uint64_t audioBytesSent = 0;
+static uint32_t audioPacketsSent = 0;
 static uint32_t lastFrameDueMs = 0;
 static uint32_t statsStartedMs = 0;
 static uint32_t framesCaptured = 0;
@@ -443,11 +445,16 @@ static bool startAudioIfNeeded()
     }
 
     audioSamplesSent = 0;
+    audioBytesSent = 0;
+    audioPacketsSent = 0;
     for (uint8_t i = 0; i < RTSP_CLIENT_SLOTS; ++i) {
         if (rtspSlotConnected(rtspClients[i]) && rtspClients[i].playing && rtspClients[i].audioSetup)
             rtspClients[i].audioTimestampBase = esp_random();
     }
     audioActive = true;
+    logWrite("RTSP audio capture started | rate=" + String(format.sampleRate) +
+             " | bits=" + String(format.bitsPerSample) +
+             " | channels=" + String(format.channels));
     return true;
 }
 
@@ -508,6 +515,8 @@ static void serviceAudio()
                 continue;
             }
             ++slot.audioSequence;
+            ++audioPacketsSent;
+            audioBytesSent += payload;
         }
 
         size_t samples = payload / frameBytes;
@@ -568,7 +577,9 @@ static String makeSdp()
     sdp += "o=- 0 0 IN IP4 0.0.0.0\r\n";
     sdp += "s=SensorForge Network Streamer\r\n";
     sdp += "t=0 0\r\n";
+    sdp += "c=IN IP4 " + WiFi.localIP().toString() + "\r\n";
     sdp += "a=control:*\r\n";
+    sdp += "a=sendonly\r\n";
     sdp += "m=video 0 RTP/AVP 26\r\n";
     sdp += "a=rtpmap:26 JPEG/90000\r\n";
     sdp += "a=control:trackID=0\r\n";
@@ -659,6 +670,8 @@ static void handleRtspRequest(uint8_t slotIndex, const String &request)
             }
             slot.audioChannel = channel;
             slot.audioSetup = true;
+            logWrite("RTSP audio SETUP accepted | client=" + String((unsigned)slotIndex + 1U) +
+                     " | channel=" + String(channel));
         } else {
             slot.videoChannel = channel;
             slot.videoSetup = true;
@@ -685,9 +698,15 @@ static void handleRtspRequest(uint8_t slotIndex, const String &request)
 
         logWrite("RTSP PLAY accepted | client=" + String((unsigned)slotIndex + 1U) +
                  " | video=1 | audio=" + String(slot.audioSetup ? 1 : 0));
-        rtspReply(slot, 200, "OK", cseq,
-                  "RTP-Info: url=" + rtspBaseUrl() + "/trackID=0;seq=" +
-                  String(slot.videoSequence) + ";rtptime=" + String(videoTimestamp) + "\r\n");
+        String rtpInfo = "RTP-Info: url=" + rtspBaseUrl() + "/trackID=0;seq=" +
+                         String(slot.videoSequence) + ";rtptime=" + String(videoTimestamp);
+        if (slot.audioSetup) {
+            rtpInfo += ",url=" + rtspBaseUrl() + "/trackID=1;seq=" +
+                       String(slot.audioSequence) + ";rtptime=" +
+                       String(slot.audioTimestampBase);
+        }
+        rtpInfo += "\r\n";
+        rtspReply(slot, 200, "OK", cseq, rtpInfo);
         return;
     }
 
@@ -1007,6 +1026,8 @@ static void handleStreamerStatus()
         ",\"http_clients\":" + String((unsigned)streamerHttpClientCount()) +
         ",\"audio_available\":" + (streamerAudioAvailable() ? "true" : "false") +
         ",\"audio_active\":" + (audioActive ? "true" : "false") +
+        ",\"audio_packets\":" + String(audioPacketsSent) +
+        ",\"audio_bytes\":" + String((unsigned long long)audioBytesSent) +
         ",\"frames\":" + String(framesCaptured) +
         ",\"fps\":" + String(streamerMeasuredFps(), 2) +
         ",\"bytes_sent\":" + String((unsigned long long)bytesSent) + "}";

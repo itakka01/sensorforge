@@ -1,3 +1,11 @@
+## v84 candidate - RTSP audio compatibility/diagnostics
+
+- RTSP SDP now includes a session-level `c=IN IP4 ...` connection line and `a=sendonly`.
+- PLAY `RTP-Info` now includes the negotiated audio track when audio was SETUP.
+- Added RTSP audio diagnostics for accepted audio SETUP and successful audio-capture start.
+- `/streamer_status` now exposes `audio_packets` and `audio_bytes` so RTP audio delivery can be verified independently of player output.
+- No change to the existing SensorForge audio source/configuration; RTSP continues to reuse the normal audio-capture path.
+
 ## v84 candidate - zwei parallele RTSP-Clients
 
 - RTSP-Streamer von einem auf maximal zwei gleichzeitige RTSP/TCP-Clients erweitert.
