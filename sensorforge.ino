@@ -50,6 +50,7 @@
 #include "log_storage.h"
 #include "image_motion.h"
 #include "motion_diagnostics.h"
+#include "streamer.h"
 
 
 // =============================================================
@@ -7846,6 +7847,11 @@ bool startRecording() {
     if (recording)
         return true;
 
+    // Streamer mode owns camera/audio exclusively. This is a defense-in-depth
+    // gate for direct/API callers in addition to skipping normal automation.
+    if (streamerModeEnabled())
+        return false;
+
     const bool cameraInitializedAtEntry =
         cameraInitialized;
 
@@ -9094,6 +9100,11 @@ bool recordingLoadTestStart(
     String &error
 )
 {
+    if (streamerModeEnabled()) {
+        error = "recording load test is unavailable in streamer mode";
+        return false;
+    }
+
     error = "";
 
     if (recordingLoadTestContext.active) {
@@ -12632,6 +12643,11 @@ static void enterThermalEmergencySleep(
     }
 
 
+    // Stop live streaming before the radio/camera are taken down. Thermal
+    // safety has priority over persistent streamer availability.
+    if (streamerModeEnabled())
+        streamerStop();
+
     // WiFi/WebConfig and the camera are the largest avoidable heat sources.
     // The helper also stops the web server cleanly.
     if (webConfigStarted) {
@@ -13914,6 +13930,10 @@ void startWebConfig()
             cfg_hostname +
             ".local"
         );
+
+        if (streamerModeEnabled() && cfg_streamer_rtsp_enabled) {
+            MDNS.addService("rtsp", "tcp", 554);
+        }
     }
 
 
@@ -15020,7 +15040,8 @@ void setup() {
     // only AFTER SD mount/config/logger/recovery have completed.
     // ---------------------------------------------------------
 
-    radarBegin();
+    if (!streamerModeEnabled())
+        radarBegin();
 
 
     // ---------------------------------------------------------
@@ -15088,6 +15109,7 @@ void setup() {
     // hotspot_enabled controls automatic AP startup. A magnet wake remains
     // an explicit manual request and therefore overrides this setting.
     if (
+        streamerModeEnabled() ||
         cfg_hotspot_enabled ||
         wokeByMagnet
     ) {
@@ -15107,6 +15129,45 @@ void setup() {
                     : "Magnet wake | WiFi/WebConfig start failed"
             );
         }
+    }
+
+
+    // ---------------------------------------------------------
+    // Dedicated network-streamer mode
+    // ---------------------------------------------------------
+
+    if (streamerModeEnabled()) {
+        if (!webConfigStarted) {
+            logWrite("STREAMER startup failed | WiFi/WebConfig unavailable");
+            Serial.println("STREAMER: WiFi/WebConfig unavailable");
+            return;
+        }
+
+        if (!cameraInitialized) {
+            if (!initCamera(cfg_camera, cfg_resolution, cfg_quality)) {
+                logWrite("STREAMER startup failed | camera init failed");
+                Serial.println("STREAMER: camera init failed");
+                return;
+            }
+        }
+
+        String streamerError;
+        if (!streamerBegin(streamerError)) {
+            logWrite("STREAMER startup failed | " + streamerError);
+            Serial.println("STREAMER startup failed: " + streamerError);
+            return;
+        }
+
+        consoleWrite(
+            "STREAMER",
+            "Network streamer active | RTSP=" + streamerRtspUrl() +
+            " | HTTP=" + streamerHttpUrl()
+        );
+
+        // Do not initialize radar/motion automation, shooter scheduling or
+        // sleep/wake recording logic in this boot mode. The normal persisted
+        // settings remain untouched for the next normal-mode boot.
+        return;
     }
 
 
@@ -15337,6 +15398,18 @@ void loop() {
 
     // Non-blocking recording/fault LED state.
     updateStatusLed();
+
+    if (streamerModeEnabled()) {
+        // Streamer mode deliberately bypasses all recording, shooter and sleep
+        // automation. WebConfig, reboot/OTA handling and thermal protection stay
+        // alive; streamerLoop owns the camera frame cadence.
+        thermalMonitorLoop();
+        if (webConfigStarted)
+            webConfigLoop();
+        streamerLoop();
+        delay(1);
+        return;
+    }
 
     // Reed contact / test pushbutton.
     // Active only while the ESP32 is awake.

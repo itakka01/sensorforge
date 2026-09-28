@@ -15,6 +15,22 @@ OFFENE V84-AUFGABE - RTSP / NETZWERK-STREAMER (WIEDEREINSTIEG VERBINDLICH)
 
 STATUS / AUSGANGSPUNKT:
 
+IMPLEMENTIERUNGSSTAND 2026-09-28, V84-KANDIDAT (NOCH NICHT FREIGEGEBEN):
+
+- Die im Folgenden beschriebene Streamer-Funktion wurde im aktuellen Arbeitsbaum als
+  isoliertes `streamer.cpp/.h`-Modul umgesetzt: RTSP/RTP-JPEG ueber TCP, optionales
+  L16-Audio ueber den bestehenden Audio-Capture, HTTP-MJPEG, Streamer-Webseite und
+  additive Config/API-Felder.
+- HTTP-MJPEG laeuft bewusst auf einem separaten nicht-blockierenden Port 81; die
+  bestehende WebConfig-Route `/stream` leitet dorthin weiter. Dadurch blockiert ein
+  langer Browserstream nicht den synchronen WebConfig-Server bzw. Thermal/RTSP/OTA.
+- Die neue Konfiguration defaultet auf `operating_mode=normal` sowie beide Streamer-
+  Ausgaenge AUS. Alte v83-config.txt ohne diese Keys starten daher unveraendert normal.
+- `sensorforge_version.h` bleibt absichtlich auf v83, bis ein echter Arduino-ESP32-
+  Build sowie die unten geforderten Hardware-/VLC-/ffmpeg-Tests erfolgt sind. Der
+  vorliegende Stand ist ein Implementierungs-/Review-Kandidat, kein freigegebener v84.
+
+
 - Letzter bestaetigter/freigegebener Arbeitsstand bleibt v83.
 - Die RTSP-/Streamer-Arbeit wurde nach v83 begonnen, aber im Chat unterbrochen,
   bevor ein vollstaendig gepruefter und freigegebener v84-Release erzeugt wurde.

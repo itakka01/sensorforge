@@ -52,11 +52,16 @@ Important fields:
 - `camera_pid`
 - `config_source`
 - `network_mode`
+- `operating_mode`
+- `streamer_rtsp_enabled`
+- `streamer_http_mjpeg_enabled`
 - `capabilities`
 
-Capabilities currently advertise local snapshot, motion state, image-motion
-state, motion recording, continuous shooter, shooter flush, storage/sensor
-status and media browsing. `rtsp` and `mqtt` are explicitly false in API 1.0.
+Capabilities advertise local snapshot, motion state, image-motion state, motion
+recording, continuous shooter, shooter flush, storage/sensor status, media
+browsing and RTSP support. `rtsp` describes firmware capability; the additive
+`streamer_rtsp_enabled` field describes the current persisted configuration.
+`mqtt` remains false in API 1.0.
 
 ### GET /api/v1/state
 
@@ -76,6 +81,7 @@ Important fields include:
 - recording safety cooldown
 - shooter enable state
 - API-exclusive state
+- operating mode and streamer ready/client/audio state
 - configured sleep mode/delay
 
 ### GET /api/v1/shooter

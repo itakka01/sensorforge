@@ -134,6 +134,10 @@ int cfg_image_motion_global_mean_delta = 24;
 int cfg_image_motion_global_change_pct = 70;
 String cfg_image_motion_roi_mask = imageMotionDefaultRoiMask();
 
+String cfg_operating_mode = "normal";
+int cfg_streamer_rtsp_enabled = 0;
+int cfg_streamer_http_mjpeg_enabled = 0;
+
 String cfg_sleep_mode = "off";
 int cfg_sleep_delay_ms = 2000;
 int cfg_bootloop_protection = 1;
@@ -494,6 +498,10 @@ struct ConfigValues {
     int postMs;
     int ledEnabled;
 
+    String operatingMode;
+    int streamerRtspEnabled;
+    int streamerHttpMjpegEnabled;
+
     String sleepMode;
     int sleepDelayMs;
     int bootloopProtection;
@@ -591,6 +599,10 @@ struct ConfigSeen {
     bool imageMotionRoiMask;
     bool postMs;
     bool ledEnabled;
+
+    bool operatingMode;
+    bool streamerRtspEnabled;
+    bool streamerHttpMjpegEnabled;
 
     bool sleepMode;
     bool sleepDelayMs;
@@ -816,6 +828,15 @@ static ConfigValues makeDefaultValues()
     values.ledEnabled =
         1;
 
+    values.operatingMode =
+        "normal";
+
+    values.streamerRtspEnabled =
+        0;
+
+    values.streamerHttpMjpegEnabled =
+        0;
+
     values.sleepMode =
         "off";
 
@@ -992,6 +1013,10 @@ static bool serializeConfigValues(
 
     APPEND_CONFIG_VALUE("post_record_ms", String(values.postMs));
     APPEND_CONFIG_VALUE("led_enabled", String(values.ledEnabled));
+
+    APPEND_CONFIG_VALUE("operating_mode", values.operatingMode);
+    APPEND_CONFIG_VALUE("streamer_rtsp_enabled", String(values.streamerRtspEnabled));
+    APPEND_CONFIG_VALUE("streamer_http_mjpeg_enabled", String(values.streamerHttpMjpegEnabled));
 
     APPEND_CONFIG_VALUE("sleep_mode", values.sleepMode);
     APPEND_CONFIG_VALUE("sleep_delay_ms", String(values.sleepDelayMs));
@@ -1749,6 +1774,9 @@ static bool validateValues(
     values.diskFullAction.trim();
     values.diskFullAction.toLowerCase();
 
+    values.operatingMode.trim();
+    values.operatingMode.toLowerCase();
+
     values.sleepMode.trim();
     values.sleepMode.toLowerCase();
 
@@ -2459,6 +2487,36 @@ static bool validateValues(
         error =
             "led_enabled must be 0 or 1";
 
+        return false;
+    }
+
+
+    if (
+        values.operatingMode != "normal" &&
+        values.operatingMode != "streamer"
+    ) {
+
+        error =
+            "operating_mode must be normal or streamer";
+
+        return false;
+    }
+
+
+    if (
+        values.streamerRtspEnabled != 0 &&
+        values.streamerRtspEnabled != 1
+    ) {
+        error = "streamer_rtsp_enabled must be 0 or 1";
+        return false;
+    }
+
+
+    if (
+        values.streamerHttpMjpegEnabled != 0 &&
+        values.streamerHttpMjpegEnabled != 1
+    ) {
+        error = "streamer_http_mjpeg_enabled must be 0 or 1";
         return false;
     }
 
@@ -3559,6 +3617,43 @@ static bool parseConfigText(
                     (int)numericValue;
 
             } else if (
+                key == "operating_mode"
+            ) {
+
+                if (!markOnce(seen.operatingMode, key, error))
+                    return false;
+
+                values.operatingMode = value;
+
+            } else if (
+                key == "streamer_rtsp_enabled"
+            ) {
+
+                if (
+                    !markOnce(seen.streamerRtspEnabled, key, error) ||
+                    !parseIntegerStrict(value, numericValue)
+                ) {
+                    if (!error.length()) error = "invalid streamer_rtsp_enabled";
+                    return false;
+                }
+
+                values.streamerRtspEnabled = (int)numericValue;
+
+            } else if (
+                key == "streamer_http_mjpeg_enabled"
+            ) {
+
+                if (
+                    !markOnce(seen.streamerHttpMjpegEnabled, key, error) ||
+                    !parseIntegerStrict(value, numericValue)
+                ) {
+                    if (!error.length()) error = "invalid streamer_http_mjpeg_enabled";
+                    return false;
+                }
+
+                values.streamerHttpMjpegEnabled = (int)numericValue;
+
+            } else if (
                 key == "sleep_mode"
             ) {
 
@@ -4478,6 +4573,15 @@ static void applyValues(
 
     cfg_led_enabled =
         values.ledEnabled;
+
+    cfg_operating_mode =
+        values.operatingMode;
+
+    cfg_streamer_rtsp_enabled =
+        values.streamerRtspEnabled;
+
+    cfg_streamer_http_mjpeg_enabled =
+        values.streamerHttpMjpegEnabled;
 
     cfg_sleep_mode =
         values.sleepMode;
@@ -7199,6 +7303,64 @@ ConfigSaveResult configSaveImageMotion(
     }
 
     return result;
+}
+
+
+ConfigSaveResult configSaveStreamerSettings(
+    const String &operatingModeInput,
+    int rtspEnabled,
+    int httpMjpegEnabled,
+    bool writeToSd,
+    String &error
+)
+{
+    String operatingMode = operatingModeInput;
+    operatingMode.trim();
+    operatingMode.toLowerCase();
+
+    if (operatingMode != "normal" && operatingMode != "streamer") {
+        error = "operating_mode must be normal or streamer";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if ((rtspEnabled != 0 && rtspEnabled != 1) ||
+        (httpMjpegEnabled != 0 && httpMjpegEnabled != 1)) {
+        error = "streamer enable flags must be 0 or 1";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String text;
+    if (!configReadInternalText(text, error))
+        return CONFIG_SAVE_INTERNAL_FAILED;
+
+    auto setKey = [&](const char *key, const String &value) {
+        String prefix = String(key) + "=";
+        int start = 0;
+        while (start < (int)text.length()) {
+            int end = text.indexOf('\n', start);
+            if (end < 0) end = text.length();
+            String line = text.substring(start, end);
+            String trimmed = line;
+            trimmed.trim();
+            if (trimmed.startsWith(prefix)) {
+                String replacement = prefix + value;
+                text = text.substring(0, start) + replacement + text.substring(end);
+                return;
+            }
+            start = end + 1;
+        }
+        if (text.length() && !text.endsWith("\n")) text += '\n';
+        text += prefix + value + "\n";
+    };
+
+    setKey("operating_mode", operatingMode);
+    setKey("streamer_rtsp_enabled", String(rtspEnabled));
+    setKey("streamer_http_mjpeg_enabled", String(httpMjpegEnabled));
+
+    // Operating-mode and streamer transport changes are reboot-only by design.
+    // Do NOT alter runtime globals here: hot-switching camera/audio ownership
+    // would bypass the boot-time initialization/teardown boundaries.
+    return configSaveText(text, writeToSd, error);
 }
 
 

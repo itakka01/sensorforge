@@ -1,4 +1,44 @@
+## v84 candidate - zwei parallele RTSP-Clients
+
+- RTSP-Streamer von einem auf maximal zwei gleichzeitige RTSP/TCP-Clients erweitert.
+- Beide RTSP-Sessions verwenden denselben zentral aufgenommenen JPEG-Frame; Kamera-Capture und JPEG-Erzeugung werden nicht dupliziert.
+- RTSP-Session, RTP-Sequenznummern, SSRCs und Interleaved-Kanäle werden pro Client getrennt verwaltet.
+- Optionaler PCM/L16-Audio-Capture bleibt ein gemeinsamer SensorForge-Capturepfad und wird an beide aktiven RTSP-Sessions verteilt; kein zweiter PDM/I2S-Treiber wird gestartet.
+- Status/API-Telemetrie liefert `rtsp_clients`; Übersicht zeigt RTSP-Clients und HTTP-Clients jeweils als `x/2`.
+- Ein dritter RTSP-Client wird weiterhin kontrolliert mit `453 Not Enough Bandwidth` abgewiesen.
+- Weiterhin Kandidatenstand: kein behaupteter Hardware-/Langzeittest und kein Release-Sprung auf v84.
+
+
+
+### v84 candidate – Streamer-Livetelemetrie
+- Streamer-Dashboard aktualisiert Frames, FPS, gesendete Bytes und aktive Stream-Clients alle 2 Sekunden über den bereits vorhandenen leichten `/streamer_status`-Endpunkt.
+- Polling pausiert bei verborgenem Browser-Tab und startet beim Zurückkehren sofort wieder.
+- `/streamer_status` meldet zusätzlich die tatsächliche Anzahl paralleler HTTP-MJPEG-Clients.
+
+## v84 candidate - HTTP-MJPEG Refresh-Reconnect
+
+- HTTP-MJPEG behandelt einen neuen Stream-Connect vom selben Remote-Host als Browser-Refresh und ersetzt die vorherige Verbindung sofort, statt den Reload wegen eines kurzzeitig noch als verbunden geltenden TCP-Sockets mit `503 busy` abzuweisen.
+- Das konservative Limit bleibt bestehen: ein HTTP-MJPEG-Client von einem anderen Host wird weiterhin abgewiesen, solange bereits ein Stream aktiv ist.
+- Die Dashboard-Anzeige trennt Web-Oberflächen und Stream-Clients jetzt deutlicher und erklärt, dass eine Web-Oberfläche keinen Stream-Client-Platz belegt.
+
 # SensorForge Changelog
+
+## v84 candidate — 2026-09-28 (not yet released)
+
+- Added an additive `operating_mode=normal|streamer` configuration with safe legacy defaults (`normal`, RTSP off, HTTP-MJPEG off). Existing v83 configs therefore continue in normal SensorForge mode without migration.
+- Added isolated `streamer.cpp/.h` runtime ownership for a shared JPEG camera pipeline. Normal recording, Power Shooter, recording load test and recording/sleep automation are bypassed in streamer mode without overwriting their persisted settings.
+- Added RTSP on TCP port 554 with OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN and GET_PARAMETER, one-client limit, RTP interleaving over RTSP/TCP, and RFC 2435 JPEG packetization using parsed frame dimensions, sampling and quantization tables.
+- Added optional RTSP L16/PCM audio by reusing the existing SensorForge `audio_capture` backend and the existing global audio configuration. Audio start failure does not prevent video streaming.
+- Added a dedicated non-blocking HTTP-MJPEG server on port 81 with a one-client limit. WebConfig `/stream` redirects to the dedicated stream endpoint.
+- Integrated Streamer selection into the general Configuration page as the central **Betriebsmodus** alongside the existing recording modes. Streamer-specific RTSP/HTTP addresses and transport switches appear only when that mode is selected; the old `/streamer` page is now a compatibility redirect. Active Streamer mode shows a dedicated dashboard status box with URLs, client state, audio state, FPS/frame/byte telemetry and links back to Configuration/Camera. Shared-frame snapshots, status URLs and additive integration-API fields remain available.
+- Clarified the Streamer transport UI: the camera/audio reuse explanation now lives behind the standard info button; RTSP is labelled as the recommended VLC/ffmpeg/NVR output and HTTP-MJPEG as the browser/integration output. Both may run together. Streamer mode now requires at least one output, with client-side guidance plus server-side validation; when a user newly selects Streamer with neither output checked, RTSP is preselected.
+- Expanded Streamer transport guidance for normal users: each transport now explains typical software/use cases, its own URL is shown directly below that transport only while selected, and a dedicated **Welche Stream-Art brauche ich?** info dialog explains RTSP versus HTTP-MJPEG, typical VLC/ffmpeg/NVR/Frigate/Shinobi/Home-Assistant usage, simultaneous operation and the current one-client-per-transport qualification limit.
+- Changing the central Betriebsmodus or Streamer transport selection now automatically enters the existing delayed reboot chain after a successful config save. The browser is redirected to the normal restart/reconnect page, so the persisted mode takes effect without a separate manual reboot step; config saves remain blocked during an active recording.
+- Clarified browser compatibility in the Streamer UI: RTSP is explicitly marked as not directly playable in Chrome/Firefox and as the optional-audio path, while HTTP-MJPEG is marked as directly browser-playable video without audio.
+- Added lightweight live dashboard telemetry: visible WebConfig browser sessions are counted from the existing heartbeat (45 s expiry), streamer clients remain a separate count, and current/minimum internal heap plus free PSRAM are shown as system-resource indicators. The common header now also shows a low-overhead **Systemlast** estimate beside time/temperatures. It is derived from per-core FreeRTOS idle-hook ticks, sampled once per second; the displayed value is the mean of Core 0/1 and the tooltip exposes both core values. No extra sampling task or faster WebConfig polling was introduced.
+- Existing camera settings remain authoritative; no duplicate resolution/FPS/JPEG/XCLK/exposure/audio backend configuration was introduced. Active streamer mode blocks live crop mutation to avoid changing a sensor underneath connected stream clients.
+- Thermal emergency still has priority and explicitly stops the streamer before WiFi/camera shutdown.
+- This is an implementation candidate only. No Arduino-ESP32 build or hardware/VLC/ffmpeg endurance test was available in this workspace, so `sensorforge_version.h` intentionally remains at the last confirmed v83 release until those qualification steps are completed.
 
 ## v83 — 2026-09-28
 
@@ -857,3 +897,19 @@ and identifies the concrete binary compilation time.
 
 - Added media icons and recording start/end time ranges in lists.
 - Reworked day-ZIP logical-size/decryption preflight.
+
+### v84 candidate - Systemlastanzeige als Farbbalken
+- Die permanente Systemlastanzeige im Header wurde von reinem Prozenttext auf einen kompakten visuellen Balken erweitert.
+- Skala: links gruen, mittig orange, rechts rot; eine weisse Marke zeigt die aktuelle gemessene Last, der Prozentwert bleibt daneben sichtbar.
+- Die bestehende FreeRTOS-Idle-Messung, Messrate und Status-Polling-Intervalle bleiben unveraendert; die Darstellung erzeugt keine zusaetzliche Firmware-Messlast.
+
+### v84 candidate - system load / multi HTTP / RTSP diagnostics
+- Systemlast-Messung korrigiert: ESP-IDF-Idle-Hooks laufen nicht exakt einmal pro Scheduler-Tick. Eine kurze Boot-Referenzkalibrierung ermittelt nun die reale Idle-Callback-Rate pro Core; die Anzeige vergleicht laufende Idle-Rate gegen diese Referenz und kann dadurch unter Last ausschlagen.
+- HTTP-MJPEG unterstützt nun zwei echte parallele Viewer, die denselben zentral aufgenommenen JPEG-Frame erhalten. Ein dritter Viewer bekommt sauber HTTP 503 statt einen bestehenden Stream zu verdrängen.
+- Dashboard zeigt HTTP-Viewer als 0/2, 1/2 oder 2/2 und zählt Stream-Verbindungen entsprechend.
+- RTSP protokolliert OPTIONS/DESCRIBE/SETUP/PLAY sowie abgelehnte SETUP-Transportheader, damit VLC-Probleme eindeutig zwischen UDP-Anforderung, fehlenden interleaved-Kanälen und späterem PLAY-Problem unterschieden werden können.
+
+### v84 candidate - Arduino-ESP32 3.3.12 WiFiClient const compile fix
+- RTSP-Slot-Verbindungspruefung an Arduino-ESP32 3.3.12 angepasst: `NetworkClient::connected()` und `operator bool()` sind dort nicht `const`.
+- `rtspSlotConnected()` und alle betroffenen lokalen RTSP-Slot-Referenzen verwenden deshalb keine `const`-Qualifizierung mehr.
+- Keine Aenderung an Streamer-Limits, RTP/RTSP-Verhalten oder Kamera-/Audio-Ownership.

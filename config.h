@@ -88,6 +88,11 @@ extern int cfg_image_motion_global_mean_delta;
 extern int cfg_image_motion_global_change_pct;
 extern String cfg_image_motion_roi_mask; // 20x15 compact bit mask, 76 hex chars
 
+// Operating mode / network streamer
+extern String cfg_operating_mode;              // "normal" or "streamer"
+extern int cfg_streamer_rtsp_enabled;           // 0/1
+extern int cfg_streamer_http_mjpeg_enabled;     // 0/1
+
 // Sleep / power management
 extern String cfg_sleep_mode;         // "off", "light_sleep", "deep_sleep"
 extern int cfg_sleep_delay_ms;        // 0..60000 ms idle delay before sleep
@@ -364,6 +369,16 @@ ConfigSaveResult configSaveImageMotion(
     int globalMeanDelta,
     int globalChangePct,
     const String &roiMask,
+    bool writeToSd,
+    String &error
+);
+
+// Persist only the additive streamer mode/transport keys while preserving the
+// complete active config text. Runtime ownership changes are reboot-only.
+ConfigSaveResult configSaveStreamerSettings(
+    const String &operatingMode,
+    int rtspEnabled,
+    int httpMjpegEnabled,
     bool writeToSd,
     String &error
 );

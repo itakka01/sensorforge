@@ -16,6 +16,7 @@
 #include <esp_heap_caps.h>
 #include <esp_sleep.h>
 #include <esp_task_wdt.h>
+#include <esp_freertos_hooks.h>
 #include <esp_ota_ops.h>
 #include <esp_err.h>
 #include <vector>
@@ -39,6 +40,7 @@
 #include "recording_storage.h"
 #include "image_motion.h"
 #include "motion_diagnostics.h"
+#include "streamer.h"
 
 
 // High-level recording state from the main firmware loop.
@@ -95,6 +97,97 @@ static bool webRoutesRegistered = false;
 // lightweight heartbeat every 10 seconds, including background tabs,
 // so an open browser session is not mistaken for inactivity.
 static uint32_t webLastActivityMs = 0;
+
+// Lightweight dual-core CPU load estimate. ESP-IDF can invoke an idle hook
+// once per FreeRTOS tick while a core is idle. Counting those idle ticks and
+// comparing them with elapsed scheduler ticks yields a low-overhead load
+// indicator without enabling the considerably heavier per-task runtime stats.
+// The value is intentionally presented as "Systemlast" rather than as a
+// laboratory-grade CPU profiler measurement.
+static volatile uint32_t systemLoadIdleTicksCore0 = 0;
+static volatile uint32_t systemLoadIdleTicksCore1 = 0;
+static uint32_t systemLoadLastIdleTicksCore0 = 0;
+static uint32_t systemLoadLastIdleTicksCore1 = 0;
+static TickType_t systemLoadLastTick = 0;
+static float systemLoadCore0Pct = 0.0f;
+static float systemLoadCore1Pct = 0.0f;
+static bool systemLoadHooksRegistered = false;
+static bool systemLoadValid = false;
+
+static bool systemLoadIdleHookCore0()
+{
+    ++systemLoadIdleTicksCore0;
+    return true; // one callback per tick while this core remains idle
+}
+
+static bool systemLoadIdleHookCore1()
+{
+    ++systemLoadIdleTicksCore1;
+    return true; // one callback per tick while this core remains idle
+}
+
+static void systemLoadEnsureHooks()
+{
+    if (systemLoadHooksRegistered)
+        return;
+
+    const esp_err_t core0 =
+        esp_register_freertos_idle_hook_for_cpu(systemLoadIdleHookCore0, 0);
+    const esp_err_t core1 =
+        esp_register_freertos_idle_hook_for_cpu(systemLoadIdleHookCore1, 1);
+
+    if (core0 == ESP_OK && core1 == ESP_OK) {
+        systemLoadHooksRegistered = true;
+        systemLoadLastIdleTicksCore0 = systemLoadIdleTicksCore0;
+        systemLoadLastIdleTicksCore1 = systemLoadIdleTicksCore1;
+        systemLoadLastTick = xTaskGetTickCount();
+        return;
+    }
+
+    // Do not leave a half-installed sampler behind if only one core accepted
+    // its hook. A later WebConfig start may then retry cleanly.
+    if (core0 == ESP_OK)
+        esp_deregister_freertos_idle_hook_for_cpu(systemLoadIdleHookCore0, 0);
+    if (core1 == ESP_OK)
+        esp_deregister_freertos_idle_hook_for_cpu(systemLoadIdleHookCore1, 1);
+}
+
+static void systemLoadUpdate()
+{
+    if (!systemLoadHooksRegistered) {
+        systemLoadEnsureHooks();
+        return;
+    }
+
+    const TickType_t nowTick = xTaskGetTickCount();
+    const uint32_t elapsedTicks =
+        (uint32_t)(nowTick - systemLoadLastTick);
+
+    // One-second windows are long enough to suppress scheduler jitter while
+    // keeping the indicator responsive. This function itself is essentially
+    // just a few counter reads and floating-point operations once per second.
+    if (elapsedTicks < (uint32_t)configTICK_RATE_HZ)
+        return;
+
+    const uint32_t idle0 = systemLoadIdleTicksCore0;
+    const uint32_t idle1 = systemLoadIdleTicksCore1;
+    const uint32_t idleDelta0 = idle0 - systemLoadLastIdleTicksCore0;
+    const uint32_t idleDelta1 = idle1 - systemLoadLastIdleTicksCore1;
+
+    auto loadFromIdle = [elapsedTicks](uint32_t idleTicks) -> float {
+        float idlePct = 100.0f * (float)idleTicks / (float)elapsedTicks;
+        if (idlePct < 0.0f) idlePct = 0.0f;
+        if (idlePct > 100.0f) idlePct = 100.0f;
+        return 100.0f - idlePct;
+    };
+
+    systemLoadCore0Pct = loadFromIdle(idleDelta0);
+    systemLoadCore1Pct = loadFromIdle(idleDelta1);
+    systemLoadValid = true;
+    systemLoadLastIdleTicksCore0 = idle0;
+    systemLoadLastIdleTicksCore1 = idle1;
+    systemLoadLastTick = nowTick;
+}
 
 // Radar configuration is a synchronous UART maintenance operation. Keep WiFi
 // alive explicitly while it runs and for a short grace period afterwards so a
@@ -220,6 +313,64 @@ static const uint32_t RECORDING_PAUSE_TRANSPORT_TIMEOUT_MS = 120000UL;
 // lease timeout. API traffic does not touch this state.
 static uint32_t recordingUiSessionLastSeenMs = 0;
 static bool recordingAutoPauseSuppressedForUiSession = false;
+
+// Lightweight browser-session counter for the dashboard. Each visible browser
+// tab sends a random session id through the existing /activity heartbeat.
+// Sessions expire automatically, so this remains diagnostic-only state.
+static const uint8_t WEB_UI_SESSION_SLOTS = 12;
+static const uint32_t WEB_UI_SESSION_TIMEOUT_MS = 45000UL;
+struct WebUiSessionSlot {
+    uint32_t idHash;
+    uint32_t lastSeenMs;
+};
+static WebUiSessionSlot webUiSessions[WEB_UI_SESSION_SLOTS] = {};
+
+static uint32_t webUiSessionHash(const String &id)
+{
+    uint32_t hash = 2166136261UL;
+    for (size_t i = 0; i < id.length(); ++i) {
+        hash ^= (uint8_t)id[i];
+        hash *= 16777619UL;
+    }
+    return hash ? hash : 1UL;
+}
+
+static void noteWebUiSession(const String &id)
+{
+    if (!id.length()) return;
+    const uint32_t now = millis();
+    const uint32_t hash = webUiSessionHash(id);
+    int freeSlot = -1;
+    int oldestSlot = 0;
+    uint32_t oldestAge = 0;
+
+    for (uint8_t i = 0; i < WEB_UI_SESSION_SLOTS; ++i) {
+        if (webUiSessions[i].idHash == hash) {
+            webUiSessions[i].lastSeenMs = now;
+            return;
+        }
+        const uint32_t age = (uint32_t)(now - webUiSessions[i].lastSeenMs);
+        if ((webUiSessions[i].idHash == 0 || age >= WEB_UI_SESSION_TIMEOUT_MS) && freeSlot < 0)
+            freeSlot = i;
+        if (age >= oldestAge) { oldestAge = age; oldestSlot = i; }
+    }
+
+    const int slot = freeSlot >= 0 ? freeSlot : oldestSlot;
+    webUiSessions[slot].idHash = hash;
+    webUiSessions[slot].lastSeenMs = now;
+}
+
+static uint8_t activeWebUiSessionCount()
+{
+    const uint32_t now = millis();
+    uint8_t count = 0;
+    for (uint8_t i = 0; i < WEB_UI_SESSION_SLOTS; ++i) {
+        if (webUiSessions[i].idHash &&
+            (uint32_t)(now - webUiSessions[i].lastSeenMs) < WEB_UI_SESSION_TIMEOUT_MS)
+            ++count;
+    }
+    return count;
+}
 
 static void setRecordingAutomationPaused(
     bool paused,
@@ -993,6 +1144,15 @@ static String htmlHeader()
         ".module-clock.invalid{color:#aeb8c5;font-weight:600;}"
         ".module-clock.thermal-warning{color:#fbbf24;}"
         ".module-clock.thermal-emergency{color:#fca5a5;}"
+        ".system-load-meter{display:flex;align-items:center;gap:6px;width:100%;max-width:190px;}"
+        ".system-load-track{position:relative;flex:1;height:6px;border-radius:999px;overflow:visible;"
+        "background:linear-gradient(90deg,#22c55e 0%,#84cc16 45%,#f59e0b 70%,#ef4444 100%);"
+        "box-shadow:inset 0 0 0 1px rgba(255,255,255,.18);}"
+        ".system-load-marker{position:absolute;top:-3px;width:2px;height:12px;background:#fff;"
+        "border-radius:2px;box-shadow:0 0 0 1px rgba(0,0,0,.35);left:0%;transition:left .25s ease;}"
+        ".system-load-value{min-width:31px;text-align:right;color:#f8fafc;font-size:.67rem;"
+        "font-weight:800;font-variant-numeric:tabular-nums;}"
+        ".system-load-meter.invalid{opacity:.42;}"
         ".module-recording-switch{display:inline-block;padding:4px 9px;margin:0;border:0;border-radius:999px;"
         "font-size:.68rem;font-weight:800;letter-spacing:.05em;white-space:nowrap;cursor:pointer;}"
         ".module-recording-switch.on{background:#dcfce7;color:#166534;}"
@@ -1146,6 +1306,7 @@ static String htmlHeader()
         ".module-meta{width:100%;margin-left:0;padding:3px 2px 5px;align-items:flex-end;}"
         ".module-actions{width:100%;justify-content:flex-end;}"
         ".module-clock{width:100%;text-align:right;font-size:.82rem;white-space:normal;line-height:1.25;}"
+        ".system-load-meter{max-width:170px;}"
         ".recording-control{align-items:stretch;flex-direction:column;}"
         ".recording-control-actions{text-align:left;}"
         ".recording-control-actions button{width:100%;min-width:0;}"
@@ -1278,6 +1439,7 @@ static String htmlHeader()
         String(cfg_web_language == "en" ? " selected" : "") +
         ">EN</option></select></form>";
 
+    if (!streamerModeEnabled()) {
     html +=
         "<button id='recordingPauseGlobal' class='module-recording-switch " +
         String(recordingAutomationPaused ? "off" : "on") +
@@ -1299,6 +1461,10 @@ static String htmlHeader()
         ) +
         "</button></div>";
 
+    } else {
+        html += "<span class='status-pill warn'>STREAMER</span></div>";
+    }
+
     html +=
         "<div id='moduleClock' class='module-clock invalid' data-thermal-label='" +
         htmlText(UI_THERMAL_PROTECTION) +
@@ -1312,7 +1478,10 @@ static String htmlHeader()
         htmlText(UI_RTC_ENCLOSURE_INDICATOR) +
         "' title='" +
         htmlText(UI_MODULE_TIME_TITLE) +
-        "'>--.--.---- &middot; --:--:--</div></div></div></nav>";
+        "'>--.--.---- &middot; --:--:--</div>"
+        "<div id='systemLoadMeter' class='system-load-meter invalid' title='Systemlast aus FreeRTOS-Idle-Zeit; Details im Zeit/Temperatur-Tooltip'>"
+        "<div class='system-load-track'><span id='systemLoadMarker' class='system-load-marker'></span></div>"
+        "<span id='systemLoadValue' class='system-load-value'>--%</span></div></div></div></nav>";
 
     // Central browser-session keepalive. Every normal SensorForge page uses
     // this common header/menu, so an open web UI keeps WiFi alive even if the
@@ -1323,11 +1492,12 @@ static String htmlHeader()
         "if(window.__sensorForgeKeepalive)return;"
         "window.__sensorForgeKeepalive=true;"
         "var lastPing=0;"
+        "var sid='';try{sid=sessionStorage.getItem('sensorforge_ui_sid')||'';if(!sid){sid=(window.crypto&&crypto.randomUUID)?crypto.randomUUID():(Date.now().toString(36)+Math.random().toString(36).slice(2));sessionStorage.setItem('sensorforge_ui_sid',sid);}}catch(e){sid=Date.now().toString(36)+Math.random().toString(36).slice(2);}"
         "function ping(force){"
         "var now=Date.now();"
         "if(!force&&now-lastPing<5000)return;"
         "lastPing=now;"
-        "fetch('/activity?t='+now,{cache:'no-store',credentials:'same-origin',keepalive:true})"
+        "fetch('/activity?t='+now+'&sid='+encodeURIComponent(sid),{cache:'no-store',credentials:'same-origin',keepalive:true})"
         ".catch(function(){});"
         "}"
         "window.sensorForgeKeepalive=ping;"
@@ -1349,7 +1519,7 @@ static String htmlHeader()
         "var el=document.getElementById('moduleClock');"
         "var pauseEl=document.getElementById('recordingPauseGlobal');"
         "if(!el)return;"
-        "var baseMs=0,syncMs=0,pauseActive=false,cpuText='',rtcText='',thermalState='OK';"
+        "var baseMs=0,syncMs=0,pauseActive=false,cpuText='',rtcText='',loadText='',thermalState='OK';"
         "function pad(v){return String(v).padStart(2,'0');}"
         "function tempSuffix(){"
         "var x='';"
@@ -1377,15 +1547,23 @@ static String htmlHeader()
         "pauseEl.title=(s&&s.web_recording_auto_pause)?pauseEl.dataset.autoOn:pauseEl.dataset.autoOff;}"
         "if(pauseActive)renewPauseLease();"
         "cpuText=(s&&s.cpu_temp_valid)?Number(s.cpu_temp_c).toFixed(1):'';"
-        "rtcText=(s&&s.rtc_temp_valid)?Number(s.rtc_temp_c).toFixed(1):'';"
+        "rtcText=(s&&s.rtc_temp_valid)?Number(s.rtc_temp_c).toFixed(1):'';loadText=(s&&s.system_load_valid)?(Number(s.system_load_pct).toFixed(0)+' %'):'';"
+        "var lm=document.getElementById('systemLoadMeter'),lmk=document.getElementById('systemLoadMarker'),lv=document.getElementById('systemLoadValue');"
+        "if(lm&&lmk&&lv){var valid=!!(s&&s.system_load_valid);lm.classList.toggle('invalid',!valid);if(valid){var lp=Math.max(0,Math.min(100,Number(s.system_load_pct)||0));lmk.style.left='calc('+lp+'% - 1px)';lv.textContent=Math.round(lp)+'%';}else{lmk.style.left='0%';lv.textContent='--%';}}"
         "thermalState=(s&&s.thermal_state)||'OK';"
+        "var ws=document.getElementById('webSessionCount');if(ws&&s)ws.textContent=String(s.web_ui_sessions||0);"
+        "var hf=document.getElementById('heapFreeKb');if(hf&&s)hf.textContent=String(s.heap_free_kb||0)+' KB';"
+        "var hm=document.getElementById('heapMinKb');if(hm&&s)hm.textContent=String(s.heap_min_kb||0)+' KB';"
+        "var pf=document.getElementById('psramFreeKb');if(pf&&s)pf.textContent=String(s.psram_free_kb||0)+' KB';"
+        "var sc=document.getElementById('streamClientCount');if(sc&&s)sc.textContent=String((Number(s.stream_rtsp_clients)||0)+(Number(s.stream_http_clients)||0));"
+        "var sf=document.getElementById('streamLiveFps');if(sf&&s)sf.textContent=Number(s.stream_fps||0).toFixed(2);"
         "el.classList.toggle('thermal-warning',thermalState==='WARNING');"
         "el.classList.toggle('thermal-emergency',thermalState==='EMERGENCY');"
         "if(s){el.title=el.dataset.thermalLabel+': CPU '+el.dataset.warningFrom+' '+Number(s.thermal_warning_c).toFixed(0)+"
         "' °C, '+el.dataset.emergencyFrom+' '+Number(s.thermal_emergency_c).toFixed(0)+' °C, '+el.dataset.recoveryBelow+' '+"
         "Number(s.thermal_recovery_c).toFixed(0)+' °C; '+el.dataset.rtcLabel+' '+el.dataset.warningFrom+' '+"
         "Number(s.thermal_rtc_warning_c).toFixed(0)+' °C, '+el.dataset.emergencyFrom+' '+Number(s.thermal_rtc_emergency_c).toFixed(0)+"
-        "' °C, '+el.dataset.recoveryBelow+' '+Number(s.thermal_rtc_recovery_c).toFixed(0)+' °C';}"
+        "' °C, '+el.dataset.recoveryBelow+' '+Number(s.thermal_rtc_recovery_c).toFixed(0)+' °C'+((s.system_load_valid)?('; Load Core 0 '+Number(s.system_load_core0_pct).toFixed(0)+' %, Core 1 '+Number(s.system_load_core1_pct).toFixed(0)+' %'):'');}"
         "if(!s||!s.clock_valid||!s.clock){baseMs=0;render();return;}"
         "var m=/^(\\d{2})\\.(\\d{2})\\.(\\d{4}) (\\d{2}):(\\d{2}):(\\d{2})$/.exec(s.clock);"
         "if(!m){baseMs=0;render();return;}"
@@ -1603,6 +1781,30 @@ static void handleUiStatus()
         String(SENSORFORGE_THERMAL_RTC_EMERGENCY_C, 1) +
         ",\"thermal_rtc_recovery_c\":" +
         String(SENSORFORGE_THERMAL_RTC_RECOVERY_C, 1) +
+        ",\"system_load_valid\":" +
+        (systemLoadValid ? "true" : "false") +
+        ",\"system_load_core0_pct\":" +
+        String(systemLoadValid ? systemLoadCore0Pct : 0.0f, 1) +
+        ",\"system_load_core1_pct\":" +
+        String(systemLoadValid ? systemLoadCore1Pct : 0.0f, 1) +
+        ",\"system_load_pct\":" +
+        String(systemLoadValid ? (systemLoadCore0Pct + systemLoadCore1Pct) * 0.5f : 0.0f, 1) +
+        ",\"web_ui_sessions\":" +
+        String((unsigned)activeWebUiSessionCount()) +
+        ",\"heap_free_kb\":" +
+        String((unsigned long)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024U)) +
+        ",\"heap_min_kb\":" +
+        String((unsigned long)(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024U)) +
+        ",\"psram_free_kb\":" +
+        String((unsigned long)(ESP.getFreePsram() / 1024U)) +
+        ",\"stream_rtsp_client\":" +
+        (streamerRtspClientConnected() ? "true" : "false") +
+        ",\"stream_rtsp_clients\":" + String((unsigned)streamerRtspClientCount()) +
+        ",\"stream_http_client\":" +
+        (streamerHttpClientConnected() ? "true" : "false") +
+        ",\"stream_http_clients\":" + String((unsigned)streamerHttpClientCount()) +
+        ",\"stream_fps\":" +
+        String(streamerMeasuredFps(), 2) +
         "}";
 
     server.sendHeader(
@@ -2055,6 +2257,46 @@ static void handleRoot()
     // Keep SD/config state fresh for the dashboard as well.
     configRefreshSdStatus();
 
+    if (streamerModeEnabled()) {
+        String html = htmlHeader();
+        html += "<div class='page-title'><div><h2>" + htmlText(UI_DASH_OVERVIEW) +
+                "</h2><p>" + htmlEscape(cfg_hostname) +
+                " &middot; " SENSORFORGE_PLATFORM_LITERAL " &middot; Core v" SENSORFORGE_CORE_VERSION_LITERAL
+                "</p></div><span class='status-pill warn'>STREAMER</span></div>";
+        html += "<section class='settings-section'><h3>Netzwerk-Streamer</h3>"
+                "<p><strong>Status:</strong> " + String(streamerReady() ? "bereit" : "nicht gestartet") + "</p>"
+                "<p>Kamera und optionales Audio gehören in diesem Betriebsmodus exklusiv dem Netzwerk-Streamer. "
+                "Motion Recording, Power Shooter und die normale Aufnahme-Sleep-Automatik sind deaktiviert.</p>";
+        html += "<p><strong>RTSP:</strong> <code>" + htmlEscape(streamerRtspUrl()) + "</code><br>"
+                "<strong>HTTP-MJPEG:</strong> <code>" + htmlEscape(streamerHttpUrl()) + "</code></p>";
+        html += "<p><strong>RTSP-Clients:</strong> " + String((unsigned)streamerRtspClientCount()) + "/2" +
+                " · <strong>HTTP-Clients:</strong> " + String((unsigned)streamerHttpClientCount()) + "/2" +
+                "<br><strong>Audio:</strong> " + htmlEscape(streamerAudioStatus()) + "</p>";
+        html += "<p><strong>Aktive Verbindungen:</strong> Web-Oberflächen: <span id='webSessionCount'>" + String((unsigned)activeWebUiSessionCount()) +
+                "</span> · Streaming: <span id='streamClientCount'>" +
+                String((unsigned)(streamerRtspClientCount() + streamerHttpClientCount())) +
+                "</span><br><span class='muted'>Web-Oberflächen und Stream-Clients werden getrennt gezählt; eine geöffnete Web-Oberfläche belegt keinen Stream-Platz.</span></p>";
+        html += "<p><strong>Frames:</strong> " + String(streamerFramesCaptured()) +
+                " · <strong>FPS:</strong> <span id='streamLiveFps'>" + String(streamerMeasuredFps(), 2) + "</span>" +
+                " · <strong>Gesendet:</strong> " + String((unsigned long long)streamerBytesSent()) + " Byte</p>";
+        html += "<p><strong>Systemressourcen:</strong> interner Heap <span id='heapFreeKb'>" +
+                String((unsigned long)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024U)) +
+                " KB</span> frei (Minimum seit Boot <span id='heapMinKb'>" +
+                String((unsigned long)(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024U)) +
+                " KB</span>) · PSRAM <span id='psramFreeKb'>" +
+                String((unsigned long)(ESP.getFreePsram() / 1024U)) + " KB</span> frei</p>";
+        if (streamerLastError().length()) {
+            html += "<div class='flash-notice error'><strong>Streamer-Fehler</strong><span>" +
+                    htmlEscape(streamerLastError()) + "</span></div>";
+        }
+        html += "<p><a class='button' href='/config#operating-mode'>Betriebsmodus konfigurieren</a> "
+                "<a class='button' href='/preview'>Kameraeinstellungen</a></p></section>";
+        html += htmlFooter();
+        server.sendHeader("Cache-Control", "no-store");
+        server.send(200, "text/html; charset=utf-8", html);
+        return;
+    }
+
     bool recordingActive =
         recording;
 
@@ -2316,6 +2558,21 @@ static void handleRoot()
 
     html +=
         "</div>";
+
+    html +=
+        "<section class='settings-section'><h3>Systemstatus</h3>"
+        "<p><strong>Aktive Web-Oberflächen:</strong> <span id='webSessionCount'>" +
+        String((unsigned)activeWebUiSessionCount()) +
+        "</span></p>"
+        "<p><strong>Systemressourcen:</strong> interner Heap <span id='heapFreeKb'>" +
+        String((unsigned long)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024U)) +
+        " KB</span> frei (Minimum seit Boot <span id='heapMinKb'>" +
+        String((unsigned long)(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024U)) +
+        " KB</span>) · PSRAM <span id='psramFreeKb'>" +
+        String((unsigned long)(ESP.getFreePsram() / 1024U)) +
+        " KB</span> frei</p>"
+        "<p class='muted'>Eine globale CPU-Auslastung in Prozent wird nicht geschätzt. Temperatur und Speicherreserven sind die belastbaren laufenden Systemindikatoren; im Streamer-Modus kommen Clientzahl und FPS hinzu.</p>"
+        "</section>";
 
     String armBannerBorder = "#087a00";
     String armBannerBackground = "#eef9f0";
@@ -3788,6 +4045,11 @@ static void handleConfig()
                 "<strong>Interne config.txt auf SD kopiert</strong>"
                 "<span class='muted'>SD-Synchronisierung ist wieder aktiv. Solange /config.txt auf der SD vorhanden ist, "
                 "werden zukünftige Konfigurationsänderungen intern und auf SD gespeichert.</span>";
+        } else if (configNotice == "streamer_reboot") {
+            html +=
+                "<strong>Betriebsmodus gespeichert</strong>"
+                "<span class='muted'>Die Änderung am Netzwerk-Streamer wird erst nach einem Neustart aktiv. "
+                "Bis dahin läuft der aktuell gestartete Betriebsmodus unverändert weiter.</span>";
         } else {
             html +=
                 "<strong>Konfiguration aktualisiert</strong>";
@@ -3951,8 +4213,34 @@ static void handleConfig()
 
     html += "<div class='settings-section'><h3>Aufnahme</h3>";
 
-    String recordingModeInfo =
-        "Hier legst du fest, welche automatische Aufnahmefunktion aktiv ist. Im Kombimodus läuft der Power Shooter zusätzlich zur normalen Alarm-/Motionaufnahme. Wenn eine Alarm-/Motionaufnahme startet, hat sie Vorrang.";
+    String operatingModeInfo =
+        "Hier legst du den zentralen Betriebsmodus von SensorForge fest. Die Aufnahmevarianten arbeiten wie bisher. "
+        "Im Netzwerk-Streamer-Modus gehören Kamera und optionales Audio exklusiv dem Streamer; automatische Aufnahme, Power Shooter und normale Aufnahme-Sleep-Automatik bleiben inaktiv. "
+        "Ein Wechsel zum oder vom Netzwerk-Streamer wird gespeichert und erst nach einem Neustart wirksam.";
+
+    String pendingOperatingMode =
+        server.arg("pending_mode");
+    pendingOperatingMode.trim();
+    pendingOperatingMode.toLowerCase();
+
+    const bool hasPendingOperatingMode =
+        pendingOperatingMode == "normal" ||
+        pendingOperatingMode == "streamer";
+
+    const bool configuredStreamerMode =
+        hasPendingOperatingMode
+        ? pendingOperatingMode == "streamer"
+        : cfg_operating_mode == "streamer";
+
+    const int displayedStreamerRtspEnabled =
+        server.hasArg("pending_rtsp")
+        ? (server.arg("pending_rtsp").toInt() ? 1 : 0)
+        : cfg_streamer_rtsp_enabled;
+
+    const int displayedStreamerHttpEnabled =
+        server.hasArg("pending_http")
+        ? (server.arg("pending_http").toInt() ? 1 : 0)
+        : cfg_streamer_http_mjpeg_enabled;
 
     String recordingTriggerInfo =
         "Hier legst du fest, wodurch eine automatische Alarm-/Motionaufnahme ausgelöst wird.\n\n"
@@ -3960,18 +4248,63 @@ static void handleConfig()
         "Sensor + Bildbestätigung: Der Sensor meldet zuerst Bewegung; anschließend muss die Bildanalyse die Bewegung bestätigen.\n"
         "Nur Bildbewegung: Die Kamera-Bildanalyse entscheidet selbst, ob eine Aufnahme startet.";
 
+    String streamerSettingsInfo =
+        "Der Netzwerk-Streamer verwendet die bereits vorhandenen Kamera- und Audioeinstellungen von SensorForge. "
+        "Auflösung, Bildrate, JPEG-Qualität und Audioquelle werden deshalb nicht ein zweites Mal hier eingestellt. "
+        "Diese Parameter bleiben auf den Kamera- bzw. Audioseiten konfigurierbar.";
+
+    String streamerTransportInfo =
+        "RTSP ist die bevorzugte Wahl für klassische Video- und Überwachungsprogramme. "
+        "Typische Anwendungen sind VLC, ffmpeg sowie NVR-/Überwachungssysteme wie Frigate oder Shinobi. RTSP wird von normalen Webbrowsern wie Chrome nicht direkt abgespielt; optionales SensorForge-Audio wird über RTSP übertragen.\n\n"
+        "HTTP-MJPEG ist besonders einfach für Webbrowser, Home Assistant, Dashboards und eigene HTTP-Integrationen. Der Link kann direkt in Chrome/Firefox geöffnet werden und liefert Video ohne Audio. "
+        "Es ist unkompliziert einzubinden, aber bei dauerhaftem Betrieb meist weniger effizient als RTSP.\n\n"
+        "Beide Stream-Arten dürfen gleichzeitig aktiviert sein. SensorForge verwendet dafür denselben Kameraframe. "
+        "Für den ersten stabilen Stand ist pro Stream-Art maximal ein gleichzeitig verbundener Client vorgesehen.";
+
     html +=
-        "<div style='margin:0 0 18px 0;padding:14px;border:1px solid #d8dee6;border-radius:8px;background:#f8fbff'>"
-        "<div style='display:flex;align-items:center;gap:6px;flex-wrap:wrap'><b>Recording-Modus</b>" +
-        pageInfoButton("Recording-Modus", recordingModeInfo) +
+        "<div id='operating-mode' style='margin:0 0 18px 0;padding:14px;border:1px solid #d8dee6;border-radius:8px;background:#f8fbff'>"
+        "<div style='display:flex;align-items:center;gap:6px;flex-wrap:wrap'><b>Betriebsmodus</b>" +
+        pageInfoButton("Betriebsmodus", operatingModeInfo) +
         "</div>"
-        "<select name='recording_mode' style='min-width:320px;max-width:100%;margin-top:8px'>"
-        "<option value='off'" + String(!cfg_motion_recording_enabled && !cfg_shooter_enabled ? " selected" : "") + ">Aus - keine automatische Aufnahme</option>"
-        "<option value='motion'" + String(cfg_motion_recording_enabled && !cfg_shooter_enabled ? " selected" : "") + ">Normal Recording - Motion/Alarm</option>"
-        "<option value='shooter'" + String(!cfg_motion_recording_enabled && cfg_shooter_enabled ? " selected" : "") + ">Power Shooter standalone</option>"
-        "<option value='motion_shooter'" + String(cfg_motion_recording_enabled && cfg_shooter_enabled ? " selected" : "") + ">Normal Recording + Power Shooter</option>"
+        "<select id='cfgOperatingMode' name='operating_mode_ui' style='min-width:320px;max-width:100%;margin-top:8px'>"
+        "<option value='off'" + String(!configuredStreamerMode && !cfg_motion_recording_enabled && !cfg_shooter_enabled ? " selected" : "") + ">Aus - keine automatische Aufnahme</option>"
+        "<option value='motion'" + String(!configuredStreamerMode && cfg_motion_recording_enabled && !cfg_shooter_enabled ? " selected" : "") + ">Normal Recording - Motion/Alarm</option>"
+        "<option value='shooter'" + String(!configuredStreamerMode && !cfg_motion_recording_enabled && cfg_shooter_enabled ? " selected" : "") + ">Power Shooter standalone</option>"
+        "<option value='motion_shooter'" + String(!configuredStreamerMode && cfg_motion_recording_enabled && cfg_shooter_enabled ? " selected" : "") + ">Normal Recording + Power Shooter</option>"
+        "<option value='streamer'" + String(configuredStreamerMode ? " selected" : "") + ">Netzwerk-Streamer</option>"
         "</select>"
-        "</div>";
+        "<div id='cfgStreamerOptions' style='margin-top:14px;padding:14px;border:1px solid #8fb5c9;border-radius:8px;background:#f7fbfd'>"
+        "<div style='display:flex;align-items:center;gap:6px;flex-wrap:wrap'><b>Netzwerk-Streamer</b>" +
+        pageInfoButton("Netzwerk-Streamer", streamerSettingsInfo) +
+        "</div>"
+        "<div style='display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:8px 0 12px 0'><span class='muted'>Wähle mindestens eine Ausgabe. Beide können gleichzeitig verwendet werden.</span>" +
+        pageInfoButton("Welche Stream-Art brauche ich?", streamerTransportInfo) +
+        "</div>"
+        "<div style='padding:10px 12px;border:1px solid #d6e1e8;border-radius:7px;background:#fff;margin-bottom:8px'>"
+        "<label style='display:block'><input id='cfgStreamerRtsp' type='checkbox' name='streamer_rtsp_enabled' value='1'" + String(displayedStreamerRtspEnabled ? " checked" : "") + "> <strong>RTSP-Stream</strong></label>"
+        "<div class='muted' style='margin:4px 0 0 24px'>Für VLC, ffmpeg, NVR und Überwachungssoftware wie Frigate oder Shinobi. <strong>Empfohlen für Videoüberwachung und dauerhafte Integration.</strong> Nicht direkt in Chrome/Firefox abspielbar; optional mit Audio.</div>"
+        "<div id='cfgStreamerRtspDetails' style='margin:7px 0 0 24px" + String(displayedStreamerRtspEnabled ? "" : ";display:none") + "'><strong>Adresse:</strong> <code>" + htmlEscape(streamerRtspUrl()) + "</code></div>"
+        "</div>"
+        "<div style='padding:10px 12px;border:1px solid #d6e1e8;border-radius:7px;background:#fff'>"
+        "<label style='display:block'><input id='cfgStreamerHttp' type='checkbox' name='streamer_http_mjpeg_enabled' value='1'" + String(displayedStreamerHttpEnabled ? " checked" : "") + "> <strong>Browser-Stream (HTTP-MJPEG)</strong></label>"
+        "<div class='muted' style='margin:4px 0 0 24px'>Für Webbrowser, Home Assistant, einfache Dashboards und eigene Integrationen. <strong>Direkt in Chrome/Firefox nutzbar; Video ohne Audio.</strong> Einfach zu verwenden, aber weniger effizient als RTSP.</div>"
+        "<div id='cfgStreamerHttpDetails' style='margin:7px 0 0 24px" + String(displayedStreamerHttpEnabled ? "" : ";display:none") + "'><strong>Adresse:</strong> <code>" + htmlEscape(streamerHttpUrl()) + "</code></div>"
+        "</div>"
+        "<div id='cfgStreamerTransportWarning' class='flash-notice error' style='display:none;margin-top:10px'><strong>Keine Stream-Ausgabe gewählt</strong><span>Aktiviere RTSP oder Browser-Stream. Beide dürfen auch gleichzeitig aktiv sein.</span></div>"
+        "<p><strong>Audio:</strong> " + htmlEscape(streamerAudioStatus()) + "</p>"
+        "<p class='muted'>Im Streamer-Modus sind Recording, Power Shooter und die normale Aufnahme-Sleep-Automatik nicht aktiv. "
+        "Der Wechsel zum oder vom Streamer wird erst nach einem Neustart wirksam.</p>"
+        "<a class='button' href='/preview'>Kameraeinstellungen</a>"
+        "</div>"
+        "</div>"
+        "<script>(function(){"
+        "var m=document.getElementById('cfgOperatingMode'),p=document.getElementById('cfgStreamerOptions'),r=document.getElementById('cfgStreamerRtsp'),h=document.getElementById('cfgStreamerHttp'),rd=document.getElementById('cfgStreamerRtspDetails'),hd=document.getElementById('cfgStreamerHttpDetails'),w=document.getElementById('cfgStreamerTransportWarning'),f=document.getElementById('configForm');"
+        "function transportDetails(){if(rd)rd.style.display=r.checked?'block':'none';if(hd)hd.style.display=h.checked?'block':'none';}"
+        "function valid(){var ok=r.checked||h.checked;if(w)w.style.display=(m.value==='streamer'&&!ok)?'block':'none';transportDetails();return ok;}"
+        "function sync(ev){p.style.display=m.value==='streamer'?'block':'none';if(m.value==='streamer'&&ev&&!r.checked&&!h.checked)r.checked=true;valid();}"
+        "m.addEventListener('change',function(){sync(true);});r.addEventListener('change',valid);h.addEventListener('change',valid);"
+        "f.addEventListener('submit',function(ev){if(m.value==='streamer'&&!valid()){ev.preventDefault();w.scrollIntoView({behavior:'smooth',block:'center'});}});"
+        "sync(false);})();</script>";
 
     html +=
         "<div style='margin:0 0 18px 0;padding:15px;border:2px solid #7aa7d9;border-radius:9px;background:#f5f9ff'>"
@@ -4842,27 +5175,48 @@ static void handleSave()
     if (audioEnabled)
         recordingFormat = "mkv";
 
-    String recordingMode =
-        server.arg("recording_mode");
+    const bool hasOperatingModeUi =
+        server.hasArg("operating_mode_ui");
 
-    recordingMode.trim();
-    recordingMode.toLowerCase();
+    String operatingModeSelection =
+        hasOperatingModeUi
+        ? server.arg("operating_mode_ui")
+        : server.arg("recording_mode");
 
-    int motionRecordingEnabled = 0;
-    int shooterEnabled = 0;
+    operatingModeSelection.trim();
+    operatingModeSelection.toLowerCase();
 
-    if (recordingMode == "off") {
-        // Both remain disabled.
-    } else if (recordingMode == "motion") {
+    String operatingMode =
+        hasOperatingModeUi
+        ? String("normal")
+        : cfg_operating_mode;
+
+    int motionRecordingEnabled =
+        cfg_motion_recording_enabled;
+
+    int shooterEnabled =
+        cfg_shooter_enabled;
+
+    if (operatingModeSelection == "streamer") {
+        // Streamer ownership is reboot-only. Preserve the user's normal-mode
+        // recording/shooter choices so they return unchanged when switching
+        // back from streamer mode later.
+        operatingMode =
+            "streamer";
+    } else if (operatingModeSelection == "off") {
+        motionRecordingEnabled = 0;
+        shooterEnabled = 0;
+    } else if (operatingModeSelection == "motion") {
         motionRecordingEnabled = 1;
-    } else if (recordingMode == "shooter") {
+        shooterEnabled = 0;
+    } else if (operatingModeSelection == "shooter") {
+        motionRecordingEnabled = 0;
         shooterEnabled = 1;
-    } else if (recordingMode == "motion_shooter") {
+    } else if (operatingModeSelection == "motion_shooter") {
         motionRecordingEnabled = 1;
         shooterEnabled = 1;
-    } else if (!recordingMode.length()) {
-        // Backward-compatible fallback for an old browser page that may still
-        // submit the pre-v31 fields after the firmware has just been updated.
+    } else if (!operatingModeSelection.length()) {
+        // Backward-compatible fallback for a stale pre-v31 browser page.
         motionRecordingEnabled =
             server.hasArg("motion_recording_enabled") &&
             server.arg("motion_recording_enabled").toInt()
@@ -4877,15 +5231,48 @@ static void handleSave()
         server.send(
             400,
             "text/plain; charset=utf-8",
-            "Ungueltiger recording_mode Wert"
+            "Ungueltiger Betriebsmodus"
         );
         return;
     }
 
+    int streamerRtspEnabled =
+        hasOperatingModeUi
+        ? (server.hasArg("streamer_rtsp_enabled") ? 1 : 0)
+        : cfg_streamer_rtsp_enabled;
+
+    int streamerHttpMjpegEnabled =
+        hasOperatingModeUi
+        ? (server.hasArg("streamer_http_mjpeg_enabled") ? 1 : 0)
+        : cfg_streamer_http_mjpeg_enabled;
+
+    if (hasOperatingModeUi && operatingMode == "streamer" &&
+        !streamerRtspEnabled && !streamerHttpMjpegEnabled) {
+        server.send(
+            400,
+            "text/plain; charset=utf-8",
+            "Im Netzwerk-Streamer-Modus muss mindestens eine Stream-Ausgabe aktiviert sein: RTSP oder HTTP-MJPEG."
+        );
+        return;
+    }
+
+    const bool streamerRebootRequired =
+        hasOperatingModeUi &&
+        (
+            operatingMode != cfg_operating_mode ||
+            (
+                cfg_operating_mode == "streamer" &&
+                (
+                    streamerRtspEnabled != cfg_streamer_rtsp_enabled ||
+                    streamerHttpMjpegEnabled != cfg_streamer_http_mjpeg_enabled
+                )
+            )
+        );
+
     // Power Shooter tuning is owned exclusively by the dedicated /shooter
     // page. A general configuration save preserves the currently active values
     // instead of accepting a second edit path. Shooter enable/disable itself
-    // remains part of the Recording mode above.
+    // remains part of the normal recording choices in the Betriebsmodus above.
     String shooterStorageFormat =
         cfg_shooter_storage_format;
 
@@ -5514,6 +5901,21 @@ static void handleSave()
     text += String(bootloopProtection);
     text += '\n';
 
+    // Operating-mode ownership is reboot-only. General Config persists the
+    // requested mode and streamer transports, but deliberately does not change
+    // cfg_operating_mode / streamer runtime ownership in the live process.
+    text += "operating_mode=";
+    text += operatingMode;
+    text += '\n';
+
+    text += "streamer_rtsp_enabled=";
+    text += String(streamerRtspEnabled);
+    text += '\n';
+
+    text += "streamer_http_mjpeg_enabled=";
+    text += String(streamerHttpMjpegEnabled);
+    text += '\n';
+
     // transport_mode is an operational flag controlled by the dedicated
     // activate/cancel actions. A general settings save preserves its state.
     text += "transport_mode=";
@@ -5798,10 +6200,23 @@ static void handleSave()
             );
             tzset();
 
-            server.sendHeader(
-                "Location",
-                "/?notice=config_saved_both"
-            );
+            if (streamerRebootRequired) {
+                // Mode/stream transport ownership changes are reboot-only. The
+                // configuration has already been persisted at this point, so
+                // use the existing delayed reboot chain instead of leaving the
+                // operator on a manual "restart required" notice.
+                rebootScheduled = true;
+                rebootAtMs = millis() + 3000UL;
+                server.sendHeader(
+                    "Location",
+                    "/rebooting?reason=operating_mode"
+                );
+            } else {
+                server.sendHeader(
+                    "Location",
+                    "/?notice=config_saved_both"
+                );
+            }
 
             server.send(
                 303,
@@ -5952,10 +6367,23 @@ static void handleSave()
             );
             tzset();
 
-            server.sendHeader(
-                "Location",
-                "/?notice=config_saved_internal"
-            );
+            if (streamerRebootRequired) {
+                // Mode/stream transport ownership changes are reboot-only. The
+                // configuration has already been persisted at this point, so
+                // use the existing delayed reboot chain instead of leaving the
+                // operator on a manual "restart required" notice.
+                rebootScheduled = true;
+                rebootAtMs = millis() + 3000UL;
+                server.sendHeader(
+                    "Location",
+                    "/rebooting?reason=operating_mode"
+                );
+            } else {
+                server.sendHeader(
+                    "Location",
+                    "/?notice=config_saved_internal"
+                );
+            }
 
             server.send(
                 303,
@@ -6046,6 +6474,11 @@ static bool transportPauseRecordingForOperation(
 
 static void handleTransportMeasure()
 {
+    if (streamerModeEnabled()) {
+        server.send(409, "text/plain; charset=utf-8", "Transport camera measurement is unavailable while streamer mode owns the camera");
+        return;
+    }
+
     if (!transportPauseRecordingForOperation("transport calibration"))
         return;
 
@@ -6715,6 +7148,55 @@ static void handleTransportCancel()
 
 
 // -------------------------------------------------------------
+// NETWORK STREAMER
+// -------------------------------------------------------------
+
+static bool streamerConfigWriteToSd()
+{
+    configRefreshSdStatus();
+    return configSdAvailable() && configSdPresent();
+}
+
+static void handleStreamerPage()
+{
+    // Compatibility alias: streamer configuration now lives in the general
+    // Configuration page under the central Betriebsmodus selector.
+    server.sendHeader("Location", "/config#operating-mode");
+    server.send(303, "text/plain; charset=utf-8", "");
+}
+
+static void handleStreamerSave()
+{
+    // Compatibility path for a stale browser tab from the first streamer
+    // candidate. Persist the submitted values, then return to the canonical UI.
+    if (recorderIsOpen()) {
+        server.send(409, "text/plain; charset=utf-8", "Recording is active");
+        return;
+    }
+
+    String mode = server.arg("operating_mode");
+    int rtsp = server.hasArg("rtsp") ? 1 : 0;
+    int http = server.hasArg("http") ? 1 : 0;
+    String error;
+    ConfigSaveResult result = configSaveStreamerSettings(
+        mode,
+        rtsp,
+        http,
+        streamerConfigWriteToSd(),
+        error
+    );
+
+    if (result != CONFIG_SAVE_BOTH && result != CONFIG_SAVE_INTERNAL_ONLY) {
+        server.send(500, "text/plain; charset=utf-8", error.length() ? error : "Streamer settings could not be saved");
+        return;
+    }
+
+    server.sendHeader("Location", "/config#operating-mode");
+    server.send(303, "text/plain; charset=utf-8", "");
+}
+
+
+// -------------------------------------------------------------
 // PIR SIMULATION
 // -------------------------------------------------------------
 
@@ -6981,6 +7463,11 @@ static bool parseCameraCropRequest(
 
 static void handleCameraCropApply()
 {
+    if (streamerModeEnabled()) {
+        server.send(409, "text/plain; charset=utf-8", "Crop changes require leaving streamer mode and rebooting");
+        return;
+    }
+
     if (rejectWhileRecording("camera crop"))
         return;
 
@@ -7067,6 +7554,11 @@ static void handleCameraCropApply()
 
 static void handleCameraCropSave()
 {
+    if (streamerModeEnabled()) {
+        server.send(409, "text/plain; charset=utf-8", "Crop changes require leaving streamer mode and rebooting");
+        return;
+    }
+
     if (rejectWhileRecording("camera crop save"))
         return;
 
@@ -7301,6 +7793,11 @@ static void handleImageMotionSave()
 
 static void handleImageMotionTest()
 {
+    if (streamerModeEnabled()) {
+        server.send(409, "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"streamer mode owns the camera\"}");
+        return;
+    }
+
     if (recorderIsOpen()) {
         server.send(
             409,
@@ -8785,6 +9282,11 @@ update();
 
 static void handleSnapshot()
 {
+    if (streamerModeEnabled()) {
+        streamerSendSnapshot(server);
+        return;
+    }
+
     // An already-running recording always wins. Normally this cannot happen
     // because the preview gate blocks new starts, but keep the guard for races
     // and direct /snapshot requests.
@@ -12451,6 +12953,9 @@ static void handleRebooting()
     bool afterFirmwareUpdate =
         reason == "firmware_update";
 
+    bool afterOperatingModeChange =
+        reason == "operating_mode";
+
     html +=
         "<div class='operation-card'>"
         "<span class='status-pill warn'>SYSTEM RESTART</span>";
@@ -12480,6 +12985,12 @@ static void handleRebooting()
             "<h2 style='margin-top:16px'>Firmware wird installiert</h2>"
             "<p class='muted'>Das validierte WiFi-Image wurde für den bestehenden SD-Auto-Updater freigegeben. "
             "SensorForge startet jetzt neu, prüft das Image beim Boot erneut und schreibt es anschließend in die inaktive OTA-Partition.</p>";
+
+    } else if (afterOperatingModeChange) {
+        html +=
+            "<h2 style='margin-top:16px'>Betriebsmodus gespeichert</h2>"
+            "<p class='muted'>Die neue Betriebsart und die gewählten Stream-Ausgaben wurden gespeichert. "
+            "SensorForge startet jetzt automatisch neu, damit Kamera-, Audio- und Recording-Ownership sauber im neuen Modus initialisiert werden.</p>";
 
     } else {
         html +=
@@ -18183,6 +18694,8 @@ static void handlePSRAM()
 
 void webConfigStart()
 {
+    systemLoadEnsureHooks();
+
     if (webActive)
         return;
 
@@ -18233,6 +18746,8 @@ void webConfigStart()
             // normal WebConfig pages and the standalone player. It therefore
             // owns automatic maintenance-pause recovery as well as WiFi liveness.
             maybeAutoPauseRecordingForWebUi();
+            if (server.hasArg("sid"))
+                noteWebUiSession(server.arg("sid"));
 
             server.send(
                 204,
@@ -18251,6 +18766,8 @@ void webConfigStart()
         server.on("/", HTTP_GET, handleRoot);
         server.on("/config", HTTP_GET, handleConfig);
         server.on("/save", HTTP_POST, handleSave);
+        server.on("/streamer", HTTP_GET, handleStreamerPage);
+        server.on("/streamer_save", HTTP_POST, handleStreamerSave);
         server.on("/shooter", HTTP_GET, handleShooterPage);
         server.on("/shooter_save", HTTP_POST, handleShooterSave);
         server.on("/audio_test_record", HTTP_POST, handleLegacyAudioTestRedirect);
@@ -18348,6 +18865,7 @@ void webConfigStart()
     // Stateless SensorForge Sync API v1. Existing WebConfig/file routes remain
     // unchanged; the API adds browser/Python/app access on the same server.
     syncApiRegisterRoutes(server);
+    streamerRegisterWebRoutes(server);
 
     webPlayerRegisterRoutes(server);
 
@@ -18502,6 +19020,8 @@ bool webConfigInactiveFor(
 
 void webConfigLoop()
 {
+    systemLoadUpdate();
+
     if (
         shutdownScheduled &&
         (int32_t)(

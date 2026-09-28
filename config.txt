@@ -188,6 +188,10 @@ post_record_ms=3000
 ############################################################
 
 # off, light_sleep or deep_sleep
+operating_mode=normal
+streamer_rtsp_enabled=0
+streamer_http_mjpeg_enabled=0
+
 sleep_mode=light_sleep
 
 # Idle delay before sleep in milliseconds

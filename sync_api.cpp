@@ -12,6 +12,7 @@
 #include "webplayer.h"
 #include "recording_storage.h"
 #include "image_motion.h"
+#include "streamer.h"
 
 #include <Arduino.h>
 #include <FS.h>
@@ -610,7 +611,10 @@ static void handleDevice()
         ",\"camera_pid\":" + String((unsigned)detectedPid) +
         ",\"config_source\":\"" + jsonEscape(String(configSourceName())) +
         "\",\"network_mode\":\"" + String(networkModeApiName()) +
-        "\",\"capabilities\":{" +
+        "\",\"operating_mode\":\"" + jsonEscape(cfg_operating_mode) +
+        "\",\"streamer_rtsp_enabled\":" + String(cfg_streamer_rtsp_enabled ? "true" : "false") +
+        ",\"streamer_http_mjpeg_enabled\":" + String(cfg_streamer_http_mjpeg_enabled ? "true" : "false") +
+        ",\"capabilities\":{" +
             "\"camera_snapshot\":true," +
             "\"motion_state\":true," +
             "\"image_motion_state\":true," +
@@ -620,7 +624,7 @@ static void handleDevice()
             "\"storage_status\":true," +
             "\"sensor_status\":true," +
             "\"media_browser\":true," +
-            "\"rtsp\":false," +
+            "\"rtsp\":true," +
             "\"mqtt\":false" +
         "}}";
 
@@ -666,6 +670,12 @@ static void handleIntegrationState()
             String(recordingSafetyCooldownRemainingSeconds()) +
         ",\"shooter_enabled\":" + String(cfg_shooter_enabled ? "true" : "false") +
         ",\"exclusive_active\":" + String(syncExclusiveActiveState ? "true" : "false") +
+        ",\"operating_mode\":\"" + jsonEscape(cfg_operating_mode) +
+        "\",\"streamer_ready\":" + String(streamerReady() ? "true" : "false") +
+        ",\"streamer_rtsp_client\":" + String(streamerRtspClientConnected() ? "true" : "false") +
+        ",\"streamer_http_client\":" + String(streamerHttpClientConnected() ? "true" : "false") +
+        ",\"streamer_audio_available\":" + String(streamerAudioAvailable() ? "true" : "false") +
+        ",\"streamer_audio_active\":" + String(streamerAudioActive() ? "true" : "false") +
         ",\"sleep_mode\":\"" + jsonEscape(cfg_sleep_mode) +
         "\",\"sleep_delay_ms\":" + String(cfg_sleep_delay_ms) +
         "}";
@@ -974,6 +984,12 @@ static void handleCameraSnapshot()
         return;
 
     touchExclusiveLease();
+
+    if (streamerModeEnabled()) {
+        sendApiVersionHeader();
+        streamerSendSnapshot(server());
+        return;
+    }
 
     if (recording || recorderIsOpen()) {
         sendBusy("recording_active");
