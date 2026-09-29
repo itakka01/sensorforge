@@ -15385,6 +15385,52 @@ void setup() {
 
 
 // =============================================================
+// STREAMER NETWORK SELF-HEALING
+// =============================================================
+
+static void serviceStreamerNetworkRecovery()
+{
+    if (!streamerModeEnabled())
+        return;
+
+    String reason;
+    if (!streamerTakeNetworkRecoveryRequest(reason))
+        return;
+
+    logWrite("STREAMER network recovery | full AP/WebConfig restart | reason=" + reason);
+
+    // The main firmware owns AP, mDNS and WebConfig lifecycle. Stop only these
+    // network-facing services and the streamer transport; keep camera power and
+    // all persisted configuration untouched.
+    streamerStop();
+
+    if (webConfigStarted) {
+        webConfigStop();
+        webConfigStarted = false;
+    }
+
+    MDNS.end();
+    WiFi.softAPdisconnect(true);
+    WiFi.disconnect(true, false);
+    WiFi.mode(WIFI_OFF);
+    delay(100);
+
+    startWebConfig();
+    if (!webConfigStarted) {
+        streamerNoteNetworkRecoveryResult(false, "AP/WebConfig restart failed");
+        return;
+    }
+
+    String streamerError;
+    if (!streamerBegin(streamerError)) {
+        streamerNoteNetworkRecoveryResult(false, streamerError);
+        return;
+    }
+
+    streamerNoteNetworkRecoveryResult(true, "");
+}
+
+// =============================================================
 // LOOP
 // =============================================================
 
@@ -15407,6 +15453,7 @@ void loop() {
         if (webConfigStarted)
             webConfigLoop();
         streamerLoop();
+        serviceStreamerNetworkRecovery();
         delay(1);
         return;
     }

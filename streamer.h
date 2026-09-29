@@ -13,6 +13,11 @@ bool streamerModeEnabled();
 // Camera/WiFi must already be initialized by the main firmware.
 bool streamerBegin(String &error);
 void streamerLoop();
+// Main firmware performs the actual AP/WebConfig restart because it owns that
+// lifecycle. The streamer only requests recovery after repeated health-check
+// failures and receives the result here.
+bool streamerTakeNetworkRecoveryRequest(String &reason);
+void streamerNoteNetworkRecoveryResult(bool success, const String &error);
 void streamerStop();
 
 // Register WebConfig routes owned by the streamer (/stream and status JSON).
@@ -40,3 +45,4 @@ float streamerMeasuredFps();
 // URLs shown by WebConfig/API. They intentionally follow the existing hostname.
 String streamerRtspUrl();
 String streamerHttpUrl();
+String streamerHttpViewerUrl();

@@ -153,6 +153,14 @@ int cfg_min_free_space_mb = 100;
 String cfg_disk_full_action = "rollover";
 
 String cfg_hostname  = makeDefaultHostnameFromBranding();
+String cfg_camera_display_name = "";
+String cfg_camera_location = "";
+String cfg_camera_gps_lat = "";
+String cfg_camera_gps_lon = "";
+String cfg_camera_responsible = "";
+String cfg_camera_email = "";
+String cfg_camera_overlay_text = "";
+String cfg_camera_description = "";
 String cfg_timezone = "CET-1CEST,M3.5.0,M10.5.0/3";
 String cfg_wifi_on_system_start = "off";
 int cfg_wifi_timeout_sec = 0;
@@ -521,6 +529,14 @@ struct ConfigValues {
     String wifiOnSystemStart;
     int wifiTimeoutSec;
     String hostname;
+    String cameraDisplayName;
+    String cameraLocation;
+    String cameraGpsLat;
+    String cameraGpsLon;
+    String cameraResponsible;
+    String cameraEmail;
+    String cameraOverlayText;
+    String cameraDescription;
     String timezone;
     String wifiSsid;
     String wifiPass;
@@ -623,6 +639,14 @@ struct ConfigSeen {
     bool wifiOnSystemStart;
     bool wifiTimeoutSec;
     bool hostname;
+    bool cameraDisplayName;
+    bool cameraLocation;
+    bool cameraGpsLat;
+    bool cameraGpsLon;
+    bool cameraResponsible;
+    bool cameraEmail;
+    bool cameraOverlayText;
+    bool cameraDescription;
     bool timezone;
     bool wifiSsid;
     bool wifiPass;
@@ -885,6 +909,15 @@ static ConfigValues makeDefaultValues()
     values.hostname =
         makeDefaultHostnameFromBranding();
 
+    values.cameraDisplayName = "";
+    values.cameraLocation = "";
+    values.cameraGpsLat = "";
+    values.cameraGpsLon = "";
+    values.cameraResponsible = "";
+    values.cameraEmail = "";
+    values.cameraOverlayText = "";
+    values.cameraDescription = "";
+
     values.timezone =
         "CET-1CEST,M3.5.0,M10.5.0/3";
 
@@ -1035,6 +1068,14 @@ static bool serializeConfigValues(
     APPEND_CONFIG_VALUE("wifi_on_system_start", values.wifiOnSystemStart);
     APPEND_CONFIG_VALUE("wifi_timeout_sec", String(values.wifiTimeoutSec));
     APPEND_CONFIG_VALUE("hostname", values.hostname);
+    APPEND_CONFIG_VALUE("camera_display_name", values.cameraDisplayName);
+    APPEND_CONFIG_VALUE("camera_location", values.cameraLocation);
+    APPEND_CONFIG_VALUE("camera_gps_lat", values.cameraGpsLat);
+    APPEND_CONFIG_VALUE("camera_gps_lon", values.cameraGpsLon);
+    APPEND_CONFIG_VALUE("camera_responsible", values.cameraResponsible);
+    APPEND_CONFIG_VALUE("camera_email", values.cameraEmail);
+    APPEND_CONFIG_VALUE("camera_overlay_text", values.cameraOverlayText);
+    APPEND_CONFIG_VALUE("camera_description", values.cameraDescription);
     APPEND_CONFIG_VALUE("timezone", values.timezone);
     APPEND_CONFIG_VALUE("wifi_ssid", values.wifiSsid);
     APPEND_CONFIG_VALUE("wifi_pass", values.wifiPass);
@@ -2782,6 +2823,36 @@ static bool validateValues(
     }
 
 
+    if (values.cameraDisplayName.length() > 80 ||
+        values.cameraLocation.length() > 120 ||
+        values.cameraGpsLat.length() > 24 ||
+        values.cameraGpsLon.length() > 24 ||
+        values.cameraResponsible.length() > 80 ||
+        values.cameraEmail.length() > 120 ||
+        values.cameraOverlayText.length() > 120 ||
+        values.cameraDescription.length() > 160) {
+        error = "camera metadata value too long";
+        return false;
+    }
+
+    if (values.cameraEmail.length() &&
+        (values.cameraEmail.indexOf('@') <= 0 || values.cameraEmail.indexOf(' ') >= 0)) {
+        error = "invalid camera_email";
+        return false;
+    }
+
+    auto validCoordinate = [](const String &v, double minV, double maxV) -> bool {
+        if (!v.length()) return true;
+        char *end = nullptr;
+        double n = strtod(v.c_str(), &end);
+        return end && end != v.c_str() && *end == '\0' && n >= minV && n <= maxV;
+    };
+    if (!validCoordinate(values.cameraGpsLat, -90.0, 90.0) ||
+        !validCoordinate(values.cameraGpsLon, -180.0, 180.0)) {
+        error = "invalid camera GPS coordinates";
+        return false;
+    }
+
     if (
         !values.hostname.length() ||
         values.hostname.length() > 63
@@ -4009,6 +4080,30 @@ static bool parseConfigText(
                 values.hostname =
                     value;
 
+            } else if (key == "camera_display_name") {
+                if (!markOnce(seen.cameraDisplayName, key, error)) return false;
+                values.cameraDisplayName = value;
+            } else if (key == "camera_location") {
+                if (!markOnce(seen.cameraLocation, key, error)) return false;
+                values.cameraLocation = value;
+            } else if (key == "camera_gps_lat") {
+                if (!markOnce(seen.cameraGpsLat, key, error)) return false;
+                values.cameraGpsLat = value;
+            } else if (key == "camera_gps_lon") {
+                if (!markOnce(seen.cameraGpsLon, key, error)) return false;
+                values.cameraGpsLon = value;
+            } else if (key == "camera_responsible") {
+                if (!markOnce(seen.cameraResponsible, key, error)) return false;
+                values.cameraResponsible = value;
+            } else if (key == "camera_email") {
+                if (!markOnce(seen.cameraEmail, key, error)) return false;
+                values.cameraEmail = value;
+            } else if (key == "camera_overlay_text") {
+                if (!markOnce(seen.cameraOverlayText, key, error)) return false;
+                values.cameraOverlayText = value;
+            } else if (key == "camera_description") {
+                if (!markOnce(seen.cameraDescription, key, error)) return false;
+                values.cameraDescription = value;
             } else if (
                 key == "timezone"
             ) {
@@ -4624,6 +4719,15 @@ static void applyValues(
 
     cfg_hostname =
         values.hostname;
+
+    cfg_camera_display_name = values.cameraDisplayName;
+    cfg_camera_location = values.cameraLocation;
+    cfg_camera_gps_lat = values.cameraGpsLat;
+    cfg_camera_gps_lon = values.cameraGpsLon;
+    cfg_camera_responsible = values.cameraResponsible;
+    cfg_camera_email = values.cameraEmail;
+    cfg_camera_overlay_text = values.cameraOverlayText;
+    cfg_camera_description = values.cameraDescription;
 
     cfg_timezone =
         values.timezone;

@@ -686,6 +686,22 @@ uint32_t webConfigMotionRemainingMs()
 // HTML / URL Helpers
 // -------------------------------------------------------------
 
+static String ffmpegDrawtextEscape(const String &value)
+{
+    String out;
+    out.reserve(value.length() + 16);
+    for (size_t i = 0; i < value.length(); ++i) {
+        char c = value[i];
+        if (c == '\\') out += "\\\\";
+        else if (c == '\'') out += "\\'";
+        else if (c == ':') out += "\\:";
+        else if (c == '%') out += "\\%";
+        else if (c == '\r' || c == '\n') out += ' ';
+        else out += c;
+    }
+    return out;
+}
+
 static String htmlEscape(const String &value)
 {
     String out;
@@ -1148,15 +1164,17 @@ static String htmlHeader()
         ".module-clock.invalid{color:#aeb8c5;font-weight:600;}"
         ".module-clock.thermal-warning{color:#fbbf24;}"
         ".module-clock.thermal-emergency{color:#fca5a5;}"
-        ".system-load-meter{display:flex;align-items:center;gap:6px;width:100%;max-width:190px;}"
-        ".system-load-track{position:relative;flex:1;height:6px;border-radius:999px;overflow:visible;"
+        ".system-meters{display:grid;gap:4px;width:100%;max-width:230px}"
+        ".system-meter{display:grid;grid-template-columns:38px minmax(80px,1fr) 54px;align-items:center;gap:6px;width:100%}"
+        ".system-meter-label{font-size:.72rem;font-weight:800;color:#dbe4ef;text-transform:uppercase;letter-spacing:.03em}"
+        ".system-load-track,.thermal-load-track{position:relative;height:6px;border-radius:999px;overflow:visible;"
         "background:linear-gradient(90deg,#22c55e 0%,#84cc16 45%,#f59e0b 70%,#ef4444 100%);"
         "box-shadow:inset 0 0 0 1px rgba(255,255,255,.18);}"
-        ".system-load-marker{position:absolute;top:-3px;width:2px;height:12px;background:#fff;"
+        ".system-load-marker,.thermal-load-marker{position:absolute;top:-3px;width:2px;height:12px;background:#fff;"
         "border-radius:2px;box-shadow:0 0 0 1px rgba(0,0,0,.35);left:0%;transition:left .25s ease;}"
-        ".system-load-value{min-width:31px;text-align:right;color:#f8fafc;font-size:.67rem;"
+        ".system-load-value,.thermal-load-value{min-width:48px;text-align:right;color:#f8fafc;font-size:.67rem;"
         "font-weight:800;font-variant-numeric:tabular-nums;}"
-        ".system-load-meter.invalid{opacity:.42;}"
+        ".system-meter.invalid{opacity:.42;}"
         ".module-recording-switch{display:inline-block;padding:4px 9px;margin:0;border:0;border-radius:999px;"
         "font-size:.68rem;font-weight:800;letter-spacing:.05em;white-space:nowrap;cursor:pointer;}"
         ".module-recording-switch.on{background:#dcfce7;color:#166534;}"
@@ -1310,7 +1328,7 @@ static String htmlHeader()
         ".module-meta{width:100%;margin-left:0;padding:3px 2px 5px;align-items:flex-end;}"
         ".module-actions{width:100%;justify-content:flex-end;}"
         ".module-clock{width:100%;text-align:right;font-size:.82rem;white-space:normal;line-height:1.25;}"
-        ".system-load-meter{max-width:170px;}"
+        ".system-meters{max-width:210px;}"
         ".recording-control{align-items:stretch;flex-direction:column;}"
         ".recording-control-actions{text-align:left;}"
         ".recording-control-actions button{width:100%;min-width:0;}"
@@ -1483,9 +1501,12 @@ static String htmlHeader()
         "' title='" +
         htmlText(UI_MODULE_TIME_TITLE) +
         "'>--.--.---- &middot; --:--:--</div>"
-        "<div id='systemLoadMeter' class='system-load-meter invalid' title='Systemlast aus FreeRTOS-Idle-Zeit; Details im Zeit/Temperatur-Tooltip'>"
-        "<div class='system-load-track'><span id='systemLoadMarker' class='system-load-marker'></span></div>"
-        "<span id='systemLoadValue' class='system-load-value'>--%</span></div></div></div></nav>";
+        "<div class='system-meters'>"
+        "<div id='thermalLoadMeter' class='system-meter invalid' title='CPU-Temperatur relativ zu den konfigurierten Thermal-Grenzen'>"
+        "<span class='system-meter-label'>Temp</span><div id='thermalLoadTrack' class='thermal-load-track'><span id='thermalLoadMarker' class='thermal-load-marker'></span></div><span id='thermalLoadValue' class='thermal-load-value'>-- °C</span></div>"
+        "<div id='systemLoadMeter' class='system-meter invalid' title='Systemlast aus FreeRTOS-Idle-Zeit; Details im Zeit/Temperatur-Tooltip'>"
+        "<span class='system-meter-label'>CPU</span><div class='system-load-track'><span id='systemLoadMarker' class='system-load-marker'></span></div><span id='systemLoadValue' class='system-load-value'>--%</span></div>"
+        "</div></div></div></nav>";
 
     // Central browser-session keepalive. Every normal SensorForge page uses
     // this common header/menu, so an open web UI keeps WiFi alive even if the
@@ -1525,18 +1546,11 @@ static String htmlHeader()
         "if(!el)return;"
         "var baseMs=0,syncMs=0,pauseActive=false,cpuText='',rtcText='',loadText='',thermalState='OK';"
         "function pad(v){return String(v).padStart(2,'0');}"
-        "function tempSuffix(){"
-        "var x='';"
-        "if(cpuText)x+=' · CPU '+cpuText+' °C';"
-        "if(rtcText)x+=' · RTC '+rtcText+' °C';"
-        "return x;"
-        "}"
         "function render(){"
-        "var suffix=tempSuffix();"
-        "if(!baseMs){el.textContent='--.--.---- · --:--:--'+suffix;el.classList.add('invalid');return;}"
+        "if(!baseMs){el.textContent='--.--.---- · --:--:--';el.classList.add('invalid');return;}"
         "var d=new Date(baseMs+(Date.now()-syncMs));"
         "el.textContent=pad(d.getUTCDate())+'.'+pad(d.getUTCMonth()+1)+'.'+d.getUTCFullYear()+"
-        "' · '+pad(d.getUTCHours())+':'+pad(d.getUTCMinutes())+':'+pad(d.getUTCSeconds())+suffix;"
+        "' · '+pad(d.getUTCHours())+':'+pad(d.getUTCMinutes())+':'+pad(d.getUTCSeconds());"
         "el.classList.remove('invalid');"
         "}"
         "function renewPauseLease(){"
@@ -1552,14 +1566,14 @@ static String htmlHeader()
         "if(pauseActive)renewPauseLease();"
         "cpuText=(s&&s.cpu_temp_valid)?Number(s.cpu_temp_c).toFixed(1):'';"
         "rtcText=(s&&s.rtc_temp_valid)?Number(s.rtc_temp_c).toFixed(1):'';loadText=(s&&s.system_load_valid)?(Number(s.system_load_pct).toFixed(0)+' %'):'';"
-        "var lm=document.getElementById('systemLoadMeter'),lmk=document.getElementById('systemLoadMarker'),lv=document.getElementById('systemLoadValue');"
+        "var tm=document.getElementById('thermalLoadMeter'),tt=document.getElementById('thermalLoadTrack'),tmk=document.getElementById('thermalLoadMarker'),tv=document.getElementById('thermalLoadValue');if(tm&&tt&&tmk&&tv){var tvalid=!!(s&&s.cpu_temp_valid);tm.classList.toggle('invalid',!tvalid);if(tvalid){var tc=Number(s.cpu_temp_c)||0,tw=Math.max(1,Number(s.thermal_warning_c)||70),te=Math.max(tw+1,Number(s.thermal_emergency_c)||80),tmax=Math.max(100,te+20),tp=Math.max(0,Math.min(100,(tc/tmax)*100)),wp=Math.max(0,Math.min(100,(tw/tmax)*100)),ep=Math.max(wp,Math.min(100,(te/tmax)*100));tt.style.background='linear-gradient(90deg,#22c55e 0%,#22c55e '+wp+'%,#f59e0b '+wp+'%,#f59e0b '+ep+'%,#ef4444 '+ep+'%,#ef4444 100%)';tmk.style.left='calc('+tp+'% - 1px)';tv.textContent=tc.toFixed(1)+' °C';tm.title='CPU-Temperatur: Warnung ab '+tw.toFixed(0)+' °C, Notfall ab '+te.toFixed(0)+' °C';}else{tmk.style.left='0%';tv.textContent='-- °C';}}var lm=document.getElementById('systemLoadMeter'),lmk=document.getElementById('systemLoadMarker'),lv=document.getElementById('systemLoadValue');"
         "if(lm&&lmk&&lv){var valid=!!(s&&s.system_load_valid);lm.classList.toggle('invalid',!valid);if(valid){var lp=Math.max(0,Math.min(100,Number(s.system_load_pct)||0));lmk.style.left='calc('+lp+'% - 1px)';lv.textContent=Math.round(lp)+'%';}else{lmk.style.left='0%';lv.textContent='--%';}}"
         "thermalState=(s&&s.thermal_state)||'OK';"
         "var ws=document.getElementById('webSessionCount');if(ws&&s)ws.textContent=String(s.web_ui_sessions||0);"
         "var hf=document.getElementById('heapFreeKb');if(hf&&s)hf.textContent=String(s.heap_free_kb||0)+' KB';"
         "var hm=document.getElementById('heapMinKb');if(hm&&s)hm.textContent=String(s.heap_min_kb||0)+' KB';"
         "var pf=document.getElementById('psramFreeKb');if(pf&&s)pf.textContent=String(s.psram_free_kb||0)+' KB';"
-        "var sc=document.getElementById('streamClientCount');if(sc&&s)sc.textContent=String((Number(s.stream_rtsp_clients)||0)+(Number(s.stream_http_clients)||0));"
+        "var sc=document.getElementById('streamClientCount');if(sc&&s)sc.textContent=String((Number(s.stream_rtsp_clients)||0)+(Number(s.stream_http_clients)||0));var src=document.getElementById('streamRtspCount');if(src&&s)src.textContent=String(Number(s.stream_rtsp_clients)||0)+'/2';var shc=document.getElementById('streamHttpCount');if(shc&&s)shc.textContent=String(Number(s.stream_http_clients)||0)+'/2';"
         "var sf=document.getElementById('streamLiveFps');if(sf&&s)sf.textContent=Number(s.stream_fps||0).toFixed(2);"
         "el.classList.toggle('thermal-warning',thermalState==='WARNING');"
         "el.classList.toggle('thermal-emergency',thermalState==='EMERGENCY');"
@@ -2272,14 +2286,17 @@ static void handleRoot()
                 "<p>Kamera und optionales Audio gehören in diesem Betriebsmodus exklusiv dem Netzwerk-Streamer. "
                 "Motion Recording, Power Shooter und die normale Aufnahme-Sleep-Automatik sind deaktiviert.</p>";
         html += "<p><strong>RTSP:</strong> <code>" + htmlEscape(streamerRtspUrl()) + "</code><br>"
-                "<strong>HTTP-MJPEG:</strong> <code>" + htmlEscape(streamerHttpUrl()) + "</code></p>";
+                "<strong>HTTP-MJPEG (blank):</strong> <code>" + htmlEscape(streamerHttpUrl()) + "</code><br>"
+                "<strong>Web-Viewer (+ Infos):</strong> <a href='" + htmlEscape(streamerHttpViewerUrl()) + "' target='_blank' rel='noopener'><code>" + htmlEscape(streamerHttpViewerUrl()) + "</code></a></p>";
         html += "<p><strong>RTSP-Clients:</strong> " + String((unsigned)streamerRtspClientCount()) + "/2" +
                 " · <strong>HTTP-Clients:</strong> " + String((unsigned)streamerHttpClientCount()) + "/2" +
                 "<br><strong>Audio:</strong> " + htmlEscape(streamerAudioStatus()) + "</p>";
-        html += "<p><strong>Aktive Verbindungen:</strong> Web-Oberflächen: <span id='webSessionCount'>" + String((unsigned)activeWebUiSessionCount()) +
-                "</span> · Streaming: <span id='streamClientCount'>" +
+        html += "<div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:10px;margin:12px 0'>"
+                "<div style='border:1px solid #d7e2e8;border-radius:8px;padding:10px 12px;background:#fbfdfe'><strong>Web-Oberflächen / Systemwartung</strong><br><span id='webSessionCount'>" + String((unsigned)activeWebUiSessionCount()) +
+                "</span> aktiv</div>"
+                "<div style='border:1px solid #d7e2e8;border-radius:8px;padding:10px 12px;background:#fbfdfe'><strong>Streaming-Verbindungen</strong><br><span id='streamClientCount'>" +
                 String((unsigned)(streamerRtspClientCount() + streamerHttpClientCount())) +
-                "</span><br><span class='muted'>Web-Oberflächen und Stream-Clients werden getrennt gezählt; eine geöffnete Web-Oberfläche belegt keinen Stream-Platz.</span></p>";
+                "</span> aktiv (max. 4)<br><span class='muted'>RTSP <span id='streamRtspCount'>" + String((unsigned)streamerRtspClientCount()) + "/2</span> · HTTP <span id='streamHttpCount'>" + String((unsigned)streamerHttpClientCount()) + "/2</span></span></div></div>";
         html += "<p><strong>Frames:</strong> <span id='streamLiveFrames'>" + String(streamerFramesCaptured()) + "</span>" +
                 " · <strong>FPS:</strong> <span id='streamLiveFps'>" + String(streamerMeasuredFps(), 2) + "</span>" +
                 " · <strong>Gesendet:</strong> <span id='streamLiveBytes'>" + String((unsigned long long)streamerBytesSent()) + "</span> Byte</p>";
@@ -2294,7 +2311,18 @@ static void handleRoot()
                 "<p><strong>Frames:</strong> <span id='diagFrames'>" + String(streamerFramesCaptured()) + "</span> · "
                 "<strong>FPS:</strong> <span id='diagFps'>" + String(streamerMeasuredFps(), 2) + "</span> · "
                 "<strong>Gesendet gesamt:</strong> <span id='diagBytes'>" + String((unsigned long long)streamerBytesSent()) + "</span> Byte</p>"
-                "<p class='muted' style='margin-bottom:0'>Audio-RTP-Pakete und Audio-Bytes müssen bei einem RTSP-Client mit aktivem Audio kontinuierlich steigen. Bleiben sie bei 0, wird aktuell kein Audio über RTSP übertragen.</p>"
+                "<p><strong>Self-Healing:</strong> Kamera <span id='diagCameraRecoveries'>0</span> · "
+                "Audio <span id='diagAudioRecoveries'>0</span> · Netzwerk <span id='diagNetworkRecoveries'>0</span> Recoveries<br>"
+                "<strong>Socket-Stalls:</strong> <span id='diagSocketStalls'>0</span> · "
+                "fehlgeschlagene Kamera-Recovery-Versuche <span id='diagRecoveryFailures'>0</span><br>"
+                "<strong>Letzter erfolgreicher Frame:</strong> vor <span id='diagLastFrameAge'>0</span> ms · "
+                "<strong>aktuelle Capture-Fehler:</strong> <span id='diagCaptureFailures'>0</span><br>"
+                "<strong>Speichertrend:</strong> <span id='diagMemoryWarning'>unauffällig</span> · "
+                "<strong>Reset-Ursache:</strong> <span id='diagResetReason'>–</span><br>"
+                "<strong>Langzeit gesamt:</strong> Kamera <span id='diagPersistCamera'>0</span> · Audio <span id='diagPersistAudio'>0</span> · Netzwerk <span id='diagPersistNetwork'>0</span> · Socket-Stalls <span id='diagPersistSocket'>0</span><br>"
+                "<span class='muted'>Letzter Recovery-Grund: <span id='diagRecoveryReason'>–</span><br>"
+                "Vorheriger kontrollierter Streamer-Neustart: <span id='diagPreviousReset'>–</span></span></p>"
+                "<p class='muted' style='margin-bottom:0'>Die Health-Checks laufen langsam und ereignisorientiert. Ein einzelner Client- oder Audiofehler wird lokal behandelt; Netzwerk/Kamera werden erst nach bestätigtem Stall neu initialisiert. Ein Board-Neustart ist nur die letzte Eskalationsstufe.</p>"
                 "</div>";
         html += "<p><strong>Systemressourcen:</strong> interner Heap <span id='heapFreeKb'>" +
                 String((unsigned long)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024U)) +
@@ -2306,8 +2334,7 @@ static void handleRoot()
             html += "<div class='flash-notice error'><strong>Streamer-Fehler</strong><span>" +
                     htmlEscape(streamerLastError()) + "</span></div>";
         }
-        html += "<p><a class='button' href='/config#operating-mode'>Betriebsmodus konfigurieren</a> "
-                "<a class='button' href='/preview'>Kameraeinstellungen</a></p></section>";
+        html += "</section>";
         html += "<script>(function(){"
                 "var b=document.getElementById('streamDiagToggle'),p=document.getElementById('streamDiagPanel');"
                 "if(!b||!p)return;"
@@ -2318,8 +2345,13 @@ static void handleRoot()
                 "var ast=s.audio_active?'aktiv':(s.audio_available?'verfügbar, aber nicht aktiv':'nicht verfügbar');set('diagAudioState',ast);"
                 "set('diagAudioPackets',String(Number(s.audio_packets)||0));set('diagAudioBytes',String(Number(s.audio_bytes)||0));"
                 "set('diagFrames',String(Number(s.frames)||0));set('diagFps',Number(s.fps||0).toFixed(2));set('diagBytes',String(Number(s.bytes_sent)||0));"
+                "set('diagCameraRecoveries',String(Number(s.camera_recoveries)||0));set('diagAudioRecoveries',String(Number(s.audio_recoveries)||0));set('diagNetworkRecoveries',String(Number(s.network_recoveries)||0));"
+                "set('diagSocketStalls',String(Number(s.socket_stalls)||0));set('diagRecoveryFailures',String(Number(s.camera_recovery_failures)||0));"
+                "set('diagLastFrameAge',String(Number(s.last_frame_age_ms)||0));set('diagCaptureFailures',String(Number(s.capture_failures)||0));set('diagRecoveryReason',s.last_recovery_reason||'–');"
+                "set('diagMemoryWarning',s.memory_warning?'auffällig':'unauffällig');set('diagResetReason',s.reset_reason||'–');set('diagPreviousReset',s.previous_controlled_reset||'–');"
+                "set('diagPersistCamera',String(Number(s.persistent_camera_recoveries)||0));set('diagPersistAudio',String(Number(s.persistent_audio_recoveries)||0));set('diagPersistNetwork',String(Number(s.persistent_network_recoveries)||0));set('diagPersistSocket',String(Number(s.persistent_socket_stalls)||0));"
                 "set('streamLiveFrames',String(Number(s.frames)||0));set('streamLiveFps',Number(s.fps||0).toFixed(2));set('streamLiveBytes',String(Number(s.bytes_sent)||0));"
-                "var sc=document.getElementById('streamClientCount');if(sc)sc.textContent=String((Number(s.rtsp_clients)||0)+(Number(s.http_clients)||0));"
+                "var sc=document.getElementById('streamClientCount');if(sc)sc.textContent=String((Number(s.rtsp_clients)||0)+(Number(s.http_clients)||0));var src=document.getElementById('streamRtspCount');if(src)src.textContent=String(Number(s.rtsp_clients)||0)+'/2';var shc=document.getElementById('streamHttpCount');if(shc)shc.textContent=String(Number(s.http_clients)||0)+'/2';"
                 "}"
                 "function poll(){if(document.hidden)return;fetch('/streamer_status?t='+Date.now(),{cache:'no-store',credentials:'same-origin'}).then(function(r){if(!r.ok)throw new Error();return r.json();}).then(apply).catch(function(){});}"
                 "b.addEventListener('click',function(){var show=p.style.display==='none';p.style.display=show?'block':'none';b.setAttribute('aria-expanded',show?'true':'false');b.textContent=show?'Streamer-Status / Diagnose ausblenden':'Streamer-Status / Diagnose';if(show)poll();});"
@@ -4027,8 +4059,7 @@ static void handleConfig()
     String configNotice =
         server.arg("notice");
 
-    html += "<div class='page-title'><div><h2>Konfiguration</h2>"
-            "<p>Geräteeinstellungen, Aufnahme und WLAN.</p></div></div>";
+    html += "<div class='page-title'><div><h2>Konfiguration</h2></div></div>";
 
     html +=
         "<style>"
@@ -4038,6 +4069,13 @@ static void handleConfig()
         ".config-field-grid .config-control{min-width:0}"
         ".config-field-grid .config-note{grid-column:2;color:var(--muted);font-size:.86rem;margin-top:-4px;margin-bottom:4px}"
         ".config-label-inline{display:flex;align-items:center;gap:4px;flex-wrap:wrap}"
+        ".stream-toggle{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:8px;border:1px solid #d6e1e8;background:#fff;cursor:pointer;transition:.15s ease}"
+        ".stream-toggle:hover{border-color:#9db4c3;background:#fbfdff}"
+        ".stream-toggle input{width:20px;height:20px;margin:0;flex:0 0 auto}"
+        ".stream-toggle-title{font-weight:700;flex:1;min-width:170px}"
+        ".stream-toggle-state{display:inline-flex;align-items:center;justify-content:center;min-width:74px;padding:4px 9px;border-radius:999px;font-size:.78rem;font-weight:800;letter-spacing:.03em;border:1px solid transparent}"
+        ".stream-toggle-state.on{background:#e8f7ed;color:#176b35;border-color:#9bd0aa}"
+        ".stream-toggle-state.off{background:#fff0f0;color:#a22b2b;border-color:#e6adad}"
         "@media(max-width:720px){.config-field-grid{grid-template-columns:1fr;gap:4px}.config-field-grid .config-note{grid-column:1;margin-top:-2px;margin-bottom:8px}.config-field-grid input,.config-field-grid select{max-width:none}}"
         "</style>";
 
@@ -4045,15 +4083,16 @@ static void handleConfig()
             "<b>Release:</b> " +
             htmlEscape(String(SENSORFORGE_RELEASE_TAG)) +
             " (" + htmlEscape(String(SENSORFORGE_RELEASE_DATE)) + ")" +
+            " &middot; <span class='muted'>git-tag: " +
+            htmlEscape(String(SENSORFORGE_RELEASE_TAG)) +
+            "</span>" +
             "<br><b>Firmware Build:</b> " +
             htmlEscape(firmwareBuildTimestamp()) +
             "<br><b>Installiert:</b> " +
             htmlEscape(firmwareInstallTimestamp()) +
             "<br><b>Quelle:</b> " +
             htmlEscape(firmwareInstallSource()) +
-            "<br><span class='muted'>Git-Tag für diesen Programstand: " +
-            htmlEscape(String(SENSORFORGE_RELEASE_TAG)) +
-            "</span></p>";
+            "</p>";
 
     if (configNotice.length()) {
         html +=
@@ -4096,8 +4135,6 @@ static void handleConfig()
 
     html += "<p><b>Config source:</b> " +
             htmlEscape(String(configSourceName())) +
-            "<br><b>SD config:</b> " +
-            htmlEscape(String(configSdStatusName())) +
             "<br><b>Internal shadow:</b> " +
             String(
                 configInternalValid()
@@ -4245,6 +4282,71 @@ static void handleConfig()
         "<input type='hidden' name='camera_crop_y' value='" + String(cfg_camera_crop_y) + "'>"
         "<input type='hidden' name='rotation' value='" + String(cfg_rotation) + "'>";
 
+    String cameraNameInfo =
+        "Ein kurzer, gut lesbarer Name für diese Kamera, zum Beispiel 'Kamera Küche'. "
+        "Dieser Name wird zugleich als Text im erweiterten Streamingbild verwendet. Intern bleiben die bisherigen Felder kompatibel, werden beim Speichern aber automatisch synchronisiert.";
+    String cameraLocationInfo =
+        "Freie Standortangabe für Menschen, zum Beispiel 'Küche, Erdgeschoss' oder 'Lagerhalle Nord'. "
+        "Das Feld beeinflusst weder Netzwerk noch Kamera.";
+    String cameraGpsInfo =
+        "GPS-Koordinaten im Dezimalgrad-Format (WGS84). Beispiel: 47.123456 und 11.123456. "
+        "Breitengrad: -90 bis +90, Längengrad: -180 bis +180. Negative Werte stehen für Süd bzw. West. Beide Felder können leer bleiben.";
+    String cameraResponsibleInfo =
+        "Optionaler Ansprechpartner oder organisatorisch Verantwortlicher für diese Kamera bzw. Installation.";
+    String cameraEmailInfo =
+        "Optionale Kontaktadresse zur Kamera oder zum verantwortlichen Betreiber. Sie wird nur als Metadatum gespeichert und nicht automatisch für Benachrichtigungen verwendet.";
+    String cameraDescriptionInfo =
+        "Optionale kurze Notiz zur Installation, zum Sichtbereich oder zum Einsatzzweck. Für spätere Dokumentation und Integrationen gedacht.";
+
+    String cameraMetadataInfo =
+        "Optionale Angaben zur eindeutigen Beschreibung der Kamera. Sie ändern weder Capture noch Stream und erzeugen keine zusätzliche Bildverarbeitung.";
+
+    html +=
+        "<div class='settings-section'><div style='display:flex;align-items:center;gap:7px;flex-wrap:wrap'><h3 style='margin:0'>Gerät / Kamera</h3>" +
+        pageInfoButton("Gerät / Kamera", cameraMetadataInfo) +
+        "</div>"
+        "<div style='display:grid;gap:12px;margin-top:14px'>"
+
+        "<div style='border:1px solid #e1e5ea;border-radius:10px;padding:12px 14px;background:#fafbfc'>"
+        "<div style='display:flex;align-items:center;gap:7px;margin-bottom:7px'><strong>Kameraname / Text im Streamingbild</strong>" +
+        pageInfoButton("Kameraname", cameraNameInfo) +
+        "</div><input style='width:100%;box-sizing:border-box' name='camera_display_name' maxlength='80' value='" + htmlEscape(cfg_camera_display_name) + "' placeholder='z. B. Kamera Küche'>"
+        "</div>"
+
+        "<div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px'>"
+        "<div style='border:1px solid #e1e5ea;border-radius:10px;padding:12px 14px'>"
+        "<div style='display:flex;align-items:center;gap:7px;margin-bottom:7px'><strong>Ort / Standort</strong>" +
+        pageInfoButton("Ort / Standort", cameraLocationInfo) +
+        "</div><input style='width:100%;box-sizing:border-box' name='camera_location' maxlength='120' value='" + htmlEscape(cfg_camera_location) + "' placeholder='z. B. Küche, Erdgeschoss'></div>"
+
+        "<div style='border:1px solid #e1e5ea;border-radius:10px;padding:12px 14px'>"
+        "<div style='display:flex;align-items:center;gap:7px;margin-bottom:7px'><strong>Verantwortlicher</strong>" +
+        pageInfoButton("Verantwortlicher", cameraResponsibleInfo) +
+        "</div><input style='width:100%;box-sizing:border-box' name='camera_responsible' maxlength='80' value='" + htmlEscape(cfg_camera_responsible) + "' placeholder='z. B. Haustechnik / Max Mustermann'></div>"
+        "</div>"
+
+        "<div style='border:1px solid #e1e5ea;border-radius:10px;padding:12px 14px'>"
+        "<div style='display:flex;align-items:center;gap:7px;margin-bottom:8px'><strong>GPS-Koordinaten</strong>" +
+        pageInfoButton("GPS-Koordinaten", cameraGpsInfo) +
+        "</div>"
+        "<div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px'>"
+        "<div><div class='muted' style='margin-bottom:5px'>Breitengrad (Latitude)</div><input style='width:100%;box-sizing:border-box' name='camera_gps_lat' maxlength='24' inputmode='decimal' value='" + htmlEscape(cfg_camera_gps_lat) + "' placeholder='47.123456'></div>"
+        "<div><div class='muted' style='margin-bottom:5px'>Längengrad (Longitude)</div><input style='width:100%;box-sizing:border-box' name='camera_gps_lon' maxlength='24' inputmode='decimal' value='" + htmlEscape(cfg_camera_gps_lon) + "' placeholder='11.123456'></div>"
+        "</div></div>"
+
+        "<div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px'>"
+        "<div style='border:1px solid #e1e5ea;border-radius:10px;padding:12px 14px'>"
+        "<div style='display:flex;align-items:center;gap:7px;margin-bottom:7px'><strong>E-Mail</strong>" +
+        pageInfoButton("E-Mail", cameraEmailInfo) +
+        "</div><input style='width:100%;box-sizing:border-box' name='camera_email' type='email' maxlength='120' value='" + htmlEscape(cfg_camera_email) + "' placeholder='kamera@example.com'></div>"
+
+        "<div style='border:1px solid #e1e5ea;border-radius:10px;padding:12px 14px'>"
+        "<div style='display:flex;align-items:center;gap:7px;margin-bottom:7px'><strong>Beschreibung / Notiz</strong>" +
+        pageInfoButton("Beschreibung / Notiz", cameraDescriptionInfo) +
+        "</div><input style='width:100%;box-sizing:border-box' name='camera_description' maxlength='160' value='" + htmlEscape(cfg_camera_description) + "' placeholder='z. B. Blick auf Eingang und Küchenbereich'></div>"
+        "</div>"
+        "</div></div>";
+
     html += "<div class='settings-section'><h3>Aufnahme</h3>";
 
     String operatingModeInfo =
@@ -4287,13 +4389,26 @@ static void handleConfig()
         "Auflösung, Bildrate, JPEG-Qualität und Audioquelle werden deshalb nicht ein zweites Mal hier eingestellt. "
         "Diese Parameter bleiben auf den Kamera- bzw. Audioseiten konfigurierbar.";
 
+    const String streamerRtspCommandUrl = streamerRtspUrl();
+    const String streamerHttpCommandUrl = streamerHttpUrl();
+    const String streamerHttpViewerCommandUrl = streamerHttpViewerUrl();
+    const String rtspOverlayLabel = cfg_camera_overlay_text.length() ? cfg_camera_overlay_text : (cfg_camera_display_name.length() ? cfg_camera_display_name : String("SensorForge"));
+    const String rtspOverlayFilter = "drawtext=text='" + ffmpegDrawtextEscape(rtspOverlayLabel) + "':x=18:y=18:fontsize=24:fontcolor=white:box=1:boxcolor=black@0.55,drawtext=text='%{localtime\\:%d.%m.%Y %H\\:%M\\:%S}':x=18:y=h-th-18:fontsize=22:fontcolor=white:box=1:boxcolor=black@0.55";
+    const String streamerFfplayOverlayCommand = "ffplay -rtsp_transport tcp -vf \"" + rtspOverlayFilter + "\" \"" + streamerRtspCommandUrl + "\"";
+    const String streamerFfplayCommand = "ffplay -rtsp_transport tcp \"" + streamerRtspCommandUrl + "\"";
+    const String streamerVlcCommand = "vlc \"" + streamerRtspCommandUrl + "\"";
+    const String streamerMpvCommand = "mpv --demuxer-lavf-o=rtsp_transport=tcp \"" + streamerRtspCommandUrl + "\"";
+    const String streamerHttpFfplayCommand = "ffplay \"" + streamerHttpCommandUrl + "\"";
+    const String streamerHttpVlcCommand = "vlc \"" + streamerHttpCommandUrl + "\"";
+    const String streamerHttpMpvCommand = "mpv \"" + streamerHttpCommandUrl + "\"";
+
     String streamerTransportInfo =
         "RTSP ist die bevorzugte Wahl für klassische Video- und Überwachungsprogramme. "
         "Typische Anwendungen sind VLC, ffmpeg sowie NVR-/Überwachungssysteme wie Frigate oder Shinobi. RTSP wird von normalen Webbrowsern wie Chrome nicht direkt abgespielt; optionales SensorForge-Audio wird über RTSP übertragen.\n\n"
         "HTTP-MJPEG ist besonders einfach für Webbrowser, Home Assistant, Dashboards und eigene HTTP-Integrationen. Der Link kann direkt in Chrome/Firefox geöffnet werden und liefert Video ohne Audio. "
         "Es ist unkompliziert einzubinden, aber bei dauerhaftem Betrieb meist weniger effizient als RTSP.\n\n"
         "Beide Stream-Arten dürfen gleichzeitig aktiviert sein. SensorForge verwendet dafür denselben Kameraframe. "
-        "Für den ersten stabilen Stand ist pro Stream-Art maximal ein gleichzeitig verbundener Client vorgesehen.";
+        "Pro Stream-Art sind aktuell maximal zwei gleichzeitig verbundene Clients vorgesehen; alle Clients teilen denselben Kameraframe.";
 
     html +=
         "<div id='operating-mode' style='margin:0 0 18px 0;padding:14px;border:1px solid #d8dee6;border-radius:8px;background:#f8fbff'>"
@@ -4314,15 +4429,39 @@ static void handleConfig()
         "<div style='display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:8px 0 12px 0'><span class='muted'>Wähle mindestens eine Ausgabe. Beide können gleichzeitig verwendet werden.</span>" +
         pageInfoButton("Welche Stream-Art brauche ich?", streamerTransportInfo) +
         "</div>"
-        "<div style='padding:10px 12px;border:1px solid #d6e1e8;border-radius:7px;background:#fff;margin-bottom:8px'>"
-        "<label style='display:block'><input id='cfgStreamerRtsp' type='checkbox' name='streamer_rtsp_enabled' value='1'" + String(displayedStreamerRtspEnabled ? " checked" : "") + "> <strong>RTSP-Stream</strong></label>"
+        "<div style='padding:10px 12px;border:1px solid #d6e1e8;border-radius:9px;background:#fff;margin-bottom:10px'>"
+        "<label class='stream-toggle' for='cfgStreamerRtsp'><input id='cfgStreamerRtsp' type='checkbox' name='streamer_rtsp_enabled' value='1'" + String(displayedStreamerRtspEnabled ? " checked" : "") + "><span class='stream-toggle-title'>RTSP-Stream</span><span id='cfgStreamerRtspState' class='stream-toggle-state " + String(displayedStreamerRtspEnabled ? "on" : "off") + "'>" + String(displayedStreamerRtspEnabled ? "AKTIV" : "INAKTIV") + "</span></label>"
         "<div class='muted' style='margin:4px 0 0 24px'>Für VLC, ffmpeg, NVR und Überwachungssoftware wie Frigate oder Shinobi. <strong>Empfohlen für Videoüberwachung und dauerhafte Integration.</strong> Nicht direkt in Chrome/Firefox abspielbar; optional mit Audio.</div>"
-        "<div id='cfgStreamerRtspDetails' style='margin:7px 0 0 24px" + String(displayedStreamerRtspEnabled ? "" : ";display:none") + "'><strong>Adresse:</strong> <code>" + htmlEscape(streamerRtspUrl()) + "</code></div>"
+        "<div id='cfgStreamerRtspDetails' style='margin:7px 0 0 24px" + String(displayedStreamerRtspEnabled ? "" : ";display:none") + "'>"
+        "<div><strong>Adresse:</strong> <code>" + htmlEscape(streamerRtspCommandUrl) + "</code></div>"
+        "<div style='margin-top:10px'><strong>Stream öffnen:</strong></div>"
+        "<div class='muted' style='margin:3px 0 7px 0'>Die folgenden Befehle können direkt in einem Terminal verwendet werden.</div>"
+        "<div style='display:grid;gap:7px;max-width:900px'>"
+        "<div style='display:flex;gap:7px;align-items:center;flex-wrap:wrap'><span style='min-width:55px'><strong>ffplay</strong></span><code style='flex:1;min-width:240px;overflow-wrap:anywhere'>" + htmlEscape(streamerFfplayCommand) + "</code><button type='button' class='button cfgStreamerCopyCmd' data-copy='" + htmlEscape(streamerFfplayCommand) + "'>Kopieren</button></div>"
+        "<div style='display:flex;gap:7px;align-items:center;flex-wrap:wrap'><span style='min-width:55px'><strong>VLC</strong></span><code style='flex:1;min-width:240px;overflow-wrap:anywhere'>" + htmlEscape(streamerVlcCommand) + "</code><button type='button' class='button cfgStreamerCopyCmd' data-copy='" + htmlEscape(streamerVlcCommand) + "'>Kopieren</button></div>"
+        "<div style='display:flex;gap:7px;align-items:center;flex-wrap:wrap'><span style='min-width:55px'><strong>mpv</strong></span><code style='flex:1;min-width:240px;overflow-wrap:anywhere'>" + htmlEscape(streamerMpvCommand) + "</code><button type='button' class='button cfgStreamerCopyCmd' data-copy='" + htmlEscape(streamerMpvCommand) + "'>Kopieren</button></div>"
+        "<div style='display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin-top:7px'><span style='min-width:110px'><strong>ffplay + Overlay</strong></span><code style='flex:1;min-width:240px;overflow-wrap:anywhere'>" + htmlEscape(streamerFfplayOverlayCommand) + "</code><button type='button' class='button cfgStreamerCopyCmd' data-copy='" + htmlEscape(streamerFfplayOverlayCommand) + "'>Kopieren</button></div>"
+        "<div class='muted' style='margin-top:6px'>Das RTSP-Overlay wird ausschließlich vom Player-PC erzeugt (ffplay/FFmpeg drawtext); SensorForge verändert oder rekodiert keine JPEG-Frames.</div>"
         "</div>"
-        "<div style='padding:10px 12px;border:1px solid #d6e1e8;border-radius:7px;background:#fff'>"
-        "<label style='display:block'><input id='cfgStreamerHttp' type='checkbox' name='streamer_http_mjpeg_enabled' value='1'" + String(displayedStreamerHttpEnabled ? " checked" : "") + "> <strong>Browser-Stream (HTTP-MJPEG)</strong></label>"
+        "<div class='muted' style='margin-top:7px'>SensorForge überträgt RTSP als RTP über TCP. Bei ffplay und mpv wird TCP deshalb ausdrücklich vorgegeben. VLC wird mit der normalen RTSP-Adresse gestartet, da nicht jede VLC-Version dieselbe TCP-Kommandozeilenoption unterstützt.</div>"
+        "</div>"
+        "</div>"
+        "<div style='padding:10px 12px;border:1px solid #d6e1e8;border-radius:9px;background:#fff'>"
+        "<label class='stream-toggle' for='cfgStreamerHttp'><input id='cfgStreamerHttp' type='checkbox' name='streamer_http_mjpeg_enabled' value='1'" + String(displayedStreamerHttpEnabled ? " checked" : "") + "><span class='stream-toggle-title'>Browser-Stream (HTTP-MJPEG)</span><span id='cfgStreamerHttpState' class='stream-toggle-state " + String(displayedStreamerHttpEnabled ? "on" : "off") + "'>" + String(displayedStreamerHttpEnabled ? "AKTIV" : "INAKTIV") + "</span></label>"
         "<div class='muted' style='margin:4px 0 0 24px'>Für Webbrowser, Home Assistant, einfache Dashboards und eigene Integrationen. <strong>Direkt in Chrome/Firefox nutzbar; Video ohne Audio.</strong> Einfach zu verwenden, aber weniger effizient als RTSP.</div>"
-        "<div id='cfgStreamerHttpDetails' style='margin:7px 0 0 24px" + String(displayedStreamerHttpEnabled ? "" : ";display:none") + "'><strong>Adresse:</strong> <code>" + htmlEscape(streamerHttpUrl()) + "</code></div>"
+        "<div id='cfgStreamerHttpDetails' style='margin:7px 0 0 24px" + String(displayedStreamerHttpEnabled ? "" : ";display:none") + "'>"
+        "<div><strong>Adresse:</strong> <code>" + htmlEscape(streamerHttpCommandUrl) + "</code></div>"
+        "<div style='margin-top:10px'><strong>Stream öffnen:</strong></div>"
+        "<div class='muted' style='margin:3px 0 7px 0'>Die URL kann direkt im Browser geöffnet oder mit einem der folgenden Programme verwendet werden.</div>"
+        "<div style='display:grid;gap:7px;max-width:900px'>"
+        "<div style='display:flex;gap:7px;align-items:center;flex-wrap:wrap'><span style='min-width:105px'><strong>Browser blank</strong></span><code style='flex:1;min-width:240px;overflow-wrap:anywhere'>" + htmlEscape(streamerHttpCommandUrl) + "</code><button type='button' class='button cfgStreamerCopyCmd' data-copy='" + htmlEscape(streamerHttpCommandUrl) + "'>Kopieren</button><a class='button' href='" + htmlEscape(streamerHttpCommandUrl) + "' target='_blank' rel='noopener'>Öffnen</a></div>"
+        "<div style='display:flex;gap:7px;align-items:center;flex-wrap:wrap'><span style='min-width:105px'><strong>Browser + Info</strong></span><code style='flex:1;min-width:240px;overflow-wrap:anywhere'>" + htmlEscape(streamerHttpViewerCommandUrl) + "</code><button type='button' class='button cfgStreamerCopyCmd' data-copy='" + htmlEscape(streamerHttpViewerCommandUrl) + "'>Kopieren</button><a class='button' href='" + htmlEscape(streamerHttpViewerCommandUrl) + "' target='_blank' rel='noopener'>Öffnen</a></div>"
+        "<div style='display:flex;gap:7px;align-items:center;flex-wrap:wrap'><span style='min-width:55px'><strong>ffplay</strong></span><code style='flex:1;min-width:240px;overflow-wrap:anywhere'>" + htmlEscape(streamerHttpFfplayCommand) + "</code><button type='button' class='button cfgStreamerCopyCmd' data-copy='" + htmlEscape(streamerHttpFfplayCommand) + "'>Kopieren</button></div>"
+        "<div style='display:flex;gap:7px;align-items:center;flex-wrap:wrap'><span style='min-width:55px'><strong>VLC</strong></span><code style='flex:1;min-width:240px;overflow-wrap:anywhere'>" + htmlEscape(streamerHttpVlcCommand) + "</code><button type='button' class='button cfgStreamerCopyCmd' data-copy='" + htmlEscape(streamerHttpVlcCommand) + "'>Kopieren</button></div>"
+        "<div style='display:flex;gap:7px;align-items:center;flex-wrap:wrap'><span style='min-width:55px'><strong>mpv</strong></span><code style='flex:1;min-width:240px;overflow-wrap:anywhere'>" + htmlEscape(streamerHttpMpvCommand) + "</code><button type='button' class='button cfgStreamerCopyCmd' data-copy='" + htmlEscape(streamerHttpMpvCommand) + "'>Kopieren</button></div>"
+        "</div>"
+        "<div class='muted' style='margin-top:7px'>HTTP-MJPEG enthält nur Video. Für Audio verwende den RTSP-Stream.</div>"
+        "</div>"
         "</div>"
         "<div id='cfgStreamerTransportWarning' class='flash-notice error' style='display:none;margin-top:10px'><strong>Keine Stream-Ausgabe gewählt</strong><span>Aktiviere RTSP oder Browser-Stream. Beide dürfen auch gleichzeitig aktiv sein.</span></div>"
         "<p><strong>Audio:</strong> " + htmlEscape(streamerAudioStatus()) + "</p>"
@@ -4332,8 +4471,10 @@ static void handleConfig()
         "</div>"
         "</div>"
         "<script>(function(){"
-        "var m=document.getElementById('cfgOperatingMode'),p=document.getElementById('cfgStreamerOptions'),r=document.getElementById('cfgStreamerRtsp'),h=document.getElementById('cfgStreamerHttp'),rd=document.getElementById('cfgStreamerRtspDetails'),hd=document.getElementById('cfgStreamerHttpDetails'),w=document.getElementById('cfgStreamerTransportWarning'),f=document.getElementById('configForm');"
-        "function transportDetails(){if(rd)rd.style.display=r.checked?'block':'none';if(hd)hd.style.display=h.checked?'block':'none';}"
+        "var m=document.getElementById('cfgOperatingMode'),p=document.getElementById('cfgStreamerOptions'),r=document.getElementById('cfgStreamerRtsp'),h=document.getElementById('cfgStreamerHttp'),rs=document.getElementById('cfgStreamerRtspState'),hs=document.getElementById('cfgStreamerHttpState'),rd=document.getElementById('cfgStreamerRtspDetails'),hd=document.getElementById('cfgStreamerHttpDetails'),w=document.getElementById('cfgStreamerTransportWarning'),f=document.getElementById('configForm');"
+        "function setState(el,on){if(!el)return;el.textContent=on?'AKTIV':'INAKTIV';el.classList.toggle('on',on);el.classList.toggle('off',!on);}function transportDetails(){if(rd)rd.style.display=r.checked?'block':'none';if(hd)hd.style.display=h.checked?'block':'none';setState(rs,r.checked);setState(hs,h.checked);}"
+        "function copyText(v){if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(v).catch(function(){});return;}var t=document.createElement('textarea');t.value=v;t.setAttribute('readonly','');t.style.position='fixed';t.style.opacity='0';document.body.appendChild(t);t.select();try{document.execCommand('copy');}catch(x){}document.body.removeChild(t);}"
+        "document.querySelectorAll('.cfgStreamerCopyCmd').forEach(function(b){b.addEventListener('click',function(){copyText(b.getAttribute('data-copy')||'');var old=b.textContent;b.textContent='Kopiert';setTimeout(function(){b.textContent=old;},1200);});});"
         "function valid(){var ok=r.checked||h.checked;if(w)w.style.display=(m.value==='streamer'&&!ok)?'block':'none';transportDetails();return ok;}"
         "function sync(ev){p.style.display=m.value==='streamer'?'block':'none';if(m.value==='streamer'&&ev&&!r.checked&&!h.checked)r.checked=true;valid();}"
         "m.addEventListener('change',function(){sync(true);});r.addEventListener('change',valid);h.addEventListener('change',valid);"
@@ -5695,6 +5836,42 @@ static void handleSave()
     }
 
 
+    String cameraDisplayName = server.arg("camera_display_name");
+    String cameraLocation = server.arg("camera_location");
+    String cameraGpsLat = server.arg("camera_gps_lat");
+    String cameraGpsLon = server.arg("camera_gps_lon");
+    String cameraResponsible = server.arg("camera_responsible");
+    String cameraEmail = server.arg("camera_email");
+    // One user-facing camera name drives both legacy internal fields.
+    String cameraOverlayText = cameraDisplayName;
+    String cameraDescription = server.arg("camera_description");
+    cameraDisplayName.trim(); cameraLocation.trim(); cameraGpsLat.trim(); cameraGpsLon.trim();
+    cameraResponsible.trim(); cameraEmail.trim(); cameraOverlayText.trim(); cameraDescription.trim();
+
+    if (cameraDisplayName.length() > 80 || cameraLocation.length() > 120 ||
+        cameraGpsLat.length() > 24 || cameraGpsLon.length() > 24 ||
+        cameraResponsible.length() > 80 || cameraEmail.length() > 120 ||
+        cameraOverlayText.length() > 120 || cameraDescription.length() > 160) {
+        server.send(400, "text/plain; charset=utf-8", "Geräte-/Kamerametadaten sind zu lang");
+        return;
+    }
+
+    if (cameraEmail.length() && (cameraEmail.indexOf('@') <= 0 || cameraEmail.indexOf(' ') >= 0)) {
+        server.send(400, "text/plain; charset=utf-8", "Ungültige E-Mail-Adresse");
+        return;
+    }
+
+    auto validCoord = [](const String &v, double minV, double maxV) -> bool {
+        if (!v.length()) return true;
+        char *end = nullptr;
+        double n = strtod(v.c_str(), &end);
+        return end && end != v.c_str() && *end == '\0' && n >= minV && n <= maxV;
+    };
+    if (!validCoord(cameraGpsLat, -90.0, 90.0) || !validCoord(cameraGpsLon, -180.0, 180.0)) {
+        server.send(400, "text/plain; charset=utf-8", "Ungültige GPS-Koordinaten");
+        return;
+    }
+
     String hostname =
         server.arg("hostname");
 
@@ -5736,7 +5913,7 @@ static void handleSave()
     String text;
 
     text.reserve(
-        3600
+        4700
     );
 
 
@@ -6036,6 +6213,15 @@ static void handleSave()
     text += hostname;
     text += '\n';
 
+    text += "camera_display_name="; text += cameraDisplayName; text += '\n';
+    text += "camera_location="; text += cameraLocation; text += '\n';
+    text += "camera_gps_lat="; text += cameraGpsLat; text += '\n';
+    text += "camera_gps_lon="; text += cameraGpsLon; text += '\n';
+    text += "camera_responsible="; text += cameraResponsible; text += '\n';
+    text += "camera_email="; text += cameraEmail; text += '\n';
+    text += "camera_overlay_text="; text += cameraOverlayText; text += '\n';
+    text += "camera_description="; text += cameraDescription; text += '\n';
+
     text += "timezone=";
     text += timezone;
     text += '\n';
@@ -6254,6 +6440,15 @@ static void handleSave()
             cfg_motion_recording_enabled =
                 motionRecordingEnabled;
 
+            cfg_camera_display_name = cameraDisplayName;
+            cfg_camera_location = cameraLocation;
+            cfg_camera_gps_lat = cameraGpsLat;
+            cfg_camera_gps_lon = cameraGpsLon;
+            cfg_camera_responsible = cameraResponsible;
+            cfg_camera_email = cameraEmail;
+            cfg_camera_overlay_text = cameraOverlayText;
+            cfg_camera_description = cameraDescription;
+
             cfg_timezone =
                 timezone;
 
@@ -6420,6 +6615,15 @@ static void handleSave()
 
             cfg_motion_recording_enabled =
                 motionRecordingEnabled;
+
+            cfg_camera_display_name = cameraDisplayName;
+            cfg_camera_location = cameraLocation;
+            cfg_camera_gps_lat = cameraGpsLat;
+            cfg_camera_gps_lon = cameraGpsLon;
+            cfg_camera_responsible = cameraResponsible;
+            cfg_camera_email = cameraEmail;
+            cfg_camera_overlay_text = cameraOverlayText;
+            cfg_camera_description = cameraDescription;
 
             cfg_timezone =
                 timezone;

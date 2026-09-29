@@ -8,8 +8,15 @@
 #include <esp_camera.h>
 #include <esp_system.h>
 #include <esp_timer.h>
+#include <Preferences.h>
 #include <algorithm>
 #include <esp_heap_caps.h>
+#include <time.h>
+
+// Camera lifecycle is owned by the main firmware. The streamer requests a
+// controlled reinitialization only while operating_mode=streamer.
+extern bool cameraInitialized;
+extern bool initCamera(const String &model, const String &resolution, int quality);
 
 namespace {
 
@@ -20,6 +27,22 @@ static const uint8_t RTP_PT_L16 = 96;
 static const size_t RTP_PACKET_BYTES = 1400;
 static const uint32_t CLIENT_STALL_TIMEOUT_MS = 250;
 static const uint32_t RTSP_IDLE_TIMEOUT_MS = 30000;
+// Application-level self-healing. The existing 30 s task watchdog remains the
+// final protection for a hard task/deadlock stall.
+static const uint8_t CAMERA_CAPTURE_FAILURES_BEFORE_RECOVERY = 3;
+static const uint32_t STREAM_FRAME_STALL_MS = 15000;
+static const uint32_t CAMERA_RECOVERY_RETRY_MS = 5000;
+static const uint8_t CAMERA_RECOVERY_FAILURES_BEFORE_REBOOT = 3;
+// Low-overhead long-run health checks. These are deliberately slow and only
+// inspect already available counters/state.
+static const uint32_t NETWORK_HEALTH_INTERVAL_MS = 5000;
+static const uint8_t NETWORK_BAD_CHECKS_BEFORE_RECOVERY = 3;
+static const uint32_t AUDIO_HEALTH_INTERVAL_MS = 2000;
+static const uint32_t AUDIO_PROGRESS_STALL_MS = 8000;
+static const uint32_t AUDIO_RECOVERY_RETRY_MS = 10000;
+static const uint32_t MEMORY_HEALTH_INTERVAL_MS = 60000;
+static const uint8_t MEMORY_CRITICAL_CHECKS_BEFORE_REBOOT = 3;
+static const uint32_t HEALTH_PERSIST_INTERVAL_MS = 6UL * 60UL * 60UL * 1000UL;
 
 static WiFiServer rtspServer(RTSP_PORT);
 static WiFiServer httpServer(HTTP_MJPEG_PORT);
@@ -70,6 +93,115 @@ static uint32_t snapshotLastMs = 0;
 static uint8_t *snapshotBuffer = nullptr;
 static size_t snapshotCapacity = 0;
 static size_t snapshotBytes = 0;
+
+static uint32_t lastSuccessfulFrameMs = 0;
+static uint32_t nextCameraRecoveryAllowedMs = 0;
+static uint32_t cameraRecoveryCount = 0;
+static uint32_t cameraRecoveryFailureCount = 0;
+static uint32_t consecutiveCaptureFailures = 0;
+static String lastRecoveryReason;
+
+static uint32_t socketStallCount = 0;
+static uint32_t audioRecoveryCount = 0;
+static uint32_t audioRecoveryFailureCount = 0;
+static uint32_t networkRecoveryCount = 0;
+static uint32_t networkRecoveryFailureCount = 0;
+static uint32_t lastAudioHealthMs = 0;
+static uint32_t lastAudioProgressMs = 0;
+static uint64_t lastAudioCapturedBytes = 0;
+static uint32_t nextAudioRecoveryAllowedMs = 0;
+static uint32_t lastNetworkHealthMs = 0;
+static uint8_t networkBadChecks = 0;
+static bool networkRecoveryRequested = false;
+static String networkRecoveryReason;
+static uint32_t nextNetworkRecoveryAllowedMs = 0;
+static uint32_t lastMemoryHealthMs = 0;
+static uint32_t bootInternalHeap = 0;
+static uint32_t bootPsramFree = 0;
+static uint32_t currentInternalHeap = 0;
+static uint32_t currentPsramFree = 0;
+static uint8_t memoryCriticalChecks = 0;
+static bool memoryTrendWarning = false;
+static uint32_t heapHistory[6] = {};
+static uint8_t heapHistoryCount = 0;
+static uint8_t heapHistoryPos = 0;
+
+static Preferences healthPrefs;
+static bool healthPrefsOpen = false;
+static bool healthPrefsLoaded = false;
+static bool healthPrefsDirty = false;
+static uint32_t lastHealthPersistMs = 0;
+static uint32_t persistedCameraRecoveries = 0;
+static uint32_t persistedAudioRecoveries = 0;
+static uint32_t persistedNetworkRecoveries = 0;
+static uint32_t persistedSocketStalls = 0;
+static String previousControlledResetReason;
+
+static const char *resetReasonName(esp_reset_reason_t reason)
+{
+    switch (reason) {
+        case ESP_RST_POWERON: return "power-on";
+        case ESP_RST_EXT: return "external";
+        case ESP_RST_SW: return "software";
+        case ESP_RST_PANIC: return "panic";
+        case ESP_RST_INT_WDT: return "interrupt-watchdog";
+        case ESP_RST_TASK_WDT: return "task-watchdog";
+        case ESP_RST_WDT: return "watchdog";
+        case ESP_RST_DEEPSLEEP: return "deep-sleep";
+        case ESP_RST_BROWNOUT: return "brownout";
+        case ESP_RST_SDIO: return "sdio";
+        default: return "unknown";
+    }
+}
+
+static void openHealthPrefsIfNeeded()
+{
+    if (healthPrefsOpen)
+        return;
+    healthPrefsOpen = healthPrefs.begin("sfstrhealth", false);
+    if (!healthPrefsOpen)
+        return;
+
+    if (!healthPrefsLoaded) {
+        persistedCameraRecoveries = healthPrefs.getUInt("cam_rec", 0);
+        persistedAudioRecoveries = healthPrefs.getUInt("aud_rec", 0);
+        persistedNetworkRecoveries = healthPrefs.getUInt("net_rec", 0);
+        persistedSocketStalls = healthPrefs.getUInt("sock_stall", 0);
+        previousControlledResetReason = healthPrefs.getString("reset_reason", "");
+        if (previousControlledResetReason.length())
+            healthPrefs.remove("reset_reason");
+        healthPrefsLoaded = true;
+    }
+}
+
+static void persistHealthCounters(bool force)
+{
+    openHealthPrefsIfNeeded();
+    if (!healthPrefsOpen || !healthPrefsDirty)
+        return;
+    const uint32_t now = millis();
+    if (!force && (uint32_t)(now - lastHealthPersistMs) < HEALTH_PERSIST_INTERVAL_MS)
+        return;
+
+    healthPrefs.putUInt("cam_rec", persistedCameraRecoveries);
+    healthPrefs.putUInt("aud_rec", persistedAudioRecoveries);
+    healthPrefs.putUInt("net_rec", persistedNetworkRecoveries);
+    healthPrefs.putUInt("sock_stall", persistedSocketStalls);
+    lastHealthPersistMs = now;
+    healthPrefsDirty = false;
+}
+
+static void persistControlledResetReason(const String &reason)
+{
+    openHealthPrefsIfNeeded();
+    if (healthPrefsOpen) {
+        healthPrefs.putString("reset_reason", reason);
+        healthPrefs.putUInt("cam_rec", persistedCameraRecoveries);
+        healthPrefs.putUInt("aud_rec", persistedAudioRecoveries);
+        healthPrefs.putUInt("net_rec", persistedNetworkRecoveries);
+        healthPrefs.putUInt("sock_stall", persistedSocketStalls);
+    }
+}
 
 struct ParsedJpeg {
     const uint8_t *scan;
@@ -176,8 +308,12 @@ static bool writeAll(WiFiClient &client, const uint8_t *data, size_t len)
             continue;
         }
 
-        if ((uint32_t)(millis() - lastProgress) >= CLIENT_STALL_TIMEOUT_MS)
+        if ((uint32_t)(millis() - lastProgress) >= CLIENT_STALL_TIMEOUT_MS) {
+            ++socketStallCount;
+            ++persistedSocketStalls;
+            healthPrefsDirty = true;
             return false;
+        }
 
         delay(0);
     }
@@ -872,6 +1008,276 @@ static void cacheSnapshot(const uint8_t *jpeg, size_t len)
 }
 
 
+static bool anyActiveStreamClient()
+{
+    for (uint8_t i = 0; i < RTSP_CLIENT_SLOTS; ++i) {
+        RtspClientSlot &slot = rtspClients[i];
+        if (rtspSlotConnected(slot) && slot.playing && slot.videoSetup)
+            return true;
+    }
+    for (uint8_t i = 0; i < HTTP_CLIENT_SLOTS; ++i) {
+        if (httpClients[i].streaming && httpClients[i].client && httpClients[i].client.connected())
+            return true;
+    }
+    return false;
+}
+
+static bool recoverStreamerCamera(const String &reason)
+{
+    const uint32_t now = millis();
+    if ((int32_t)(now - nextCameraRecoveryAllowedMs) < 0)
+        return false;
+
+    nextCameraRecoveryAllowedMs = now + CAMERA_RECOVERY_RETRY_MS;
+    lastRecoveryReason = reason;
+
+    logWrite(
+        "STREAMER recovery | camera reinit requested | reason=" + reason +
+        " | capture_failures=" + String(consecutiveCaptureFailures)
+    );
+
+    // Stale RTP/HTTP sessions are not kept across a camera-driver reset.
+    // Standard clients/NVRs can reconnect after the local recovery.
+    closeAllRtspClients();
+    closeAllHttpClients();
+
+    if (audioCaptureIsRunning())
+        audioCaptureStop();
+    audioActive = false;
+
+    if (cameraInitialized) {
+        esp_camera_deinit();
+        cameraInitialized = false;
+    }
+
+    delay(100);
+
+    const bool ok = initCamera(cfg_camera, cfg_resolution, cfg_quality);
+    if (ok) {
+        ++cameraRecoveryCount;
+        ++persistedCameraRecoveries;
+        healthPrefsDirty = true;
+        cameraRecoveryFailureCount = 0;
+        consecutiveCaptureFailures = 0;
+        lastFrameDueMs = 0;
+        snapshotBytes = 0;
+        snapshotLastMs = 0;
+        lastSuccessfulFrameMs = millis();
+        lastError = "";
+        logWrite(
+            "STREAMER recovery successful | camera_recoveries=" +
+            String(cameraRecoveryCount)
+        );
+        return true;
+    }
+
+    ++cameraRecoveryFailureCount;
+    lastError = "camera recovery failed";
+    logWrite(
+        "STREAMER recovery failed | attempt=" +
+        String(cameraRecoveryFailureCount) + "/" +
+        String(CAMERA_RECOVERY_FAILURES_BEFORE_REBOOT)
+    );
+
+    if (cameraRecoveryFailureCount >= CAMERA_RECOVERY_FAILURES_BEFORE_REBOOT) {
+        logWrite(
+            "STREAMER recovery escalation | reboot after repeated camera recovery failures"
+        );
+        persistControlledResetReason("streamer camera recovery failed repeatedly");
+        persistHealthCounters(true);
+        delay(100);
+        ESP.restart();
+    }
+
+    return false;
+}
+
+static bool restartStreamerAudioCapture()
+{
+    const uint32_t now = millis();
+    if ((int32_t)(now - nextAudioRecoveryAllowedMs) < 0)
+        return false;
+    nextAudioRecoveryAllowedMs = now + AUDIO_RECOVERY_RETRY_MS;
+
+    if (!anyRtspAudioConsumer())
+        return true;
+
+    AudioFormat format;
+    String error;
+    if (!configuredAudioFormat(format, error)) {
+        lastError = "RTSP audio recovery unavailable: " + error;
+        ++audioRecoveryFailureCount;
+        return false;
+    }
+
+    // Preserve RTP sequence/timestamp continuity as far as possible: only the
+    // capture backend/ring is restarted. Video and RTSP sessions stay alive.
+    audioCaptureStop();
+    audioActive = false;
+    for (uint8_t i = 0; i < RTSP_CLIENT_SLOTS; ++i) {
+        RtspClientSlot &slot = rtspClients[i];
+        if (rtspSlotConnected(slot) && slot.playing && slot.audioSetup)
+            slot.audioTimestampBase += (uint32_t)audioSamplesSent;
+    }
+    audioSamplesSent = 0;
+
+    if (!audioCaptureStart(format, error)) {
+        lastError = "RTSP audio recovery failed: " + error;
+        ++audioRecoveryFailureCount;
+        logWrite("STREAMER audio recovery failed | " + error);
+        return false;
+    }
+
+    audioActive = true;
+    lastAudioProgressMs = now;
+    lastAudioCapturedBytes = audioCaptureStats().bytesCaptured;
+    ++audioRecoveryCount;
+    audioRecoveryFailureCount = 0;
+    ++persistedAudioRecoveries;
+    healthPrefsDirty = true;
+    lastRecoveryReason = "audio capture restarted after stalled input";
+    logWrite("STREAMER audio recovery successful | count=" + String(audioRecoveryCount));
+    return true;
+}
+
+static void serviceAudioHealth()
+{
+    const uint32_t now = millis();
+    if ((uint32_t)(now - lastAudioHealthMs) < AUDIO_HEALTH_INTERVAL_MS)
+        return;
+    lastAudioHealthMs = now;
+
+    if (!anyRtspAudioConsumer()) {
+        lastAudioProgressMs = now;
+        lastAudioCapturedBytes = 0;
+        return;
+    }
+
+    if (!audioActive) {
+        restartStreamerAudioCapture();
+        return;
+    }
+
+    const AudioCaptureStats stats = audioCaptureStats();
+    if (stats.bytesCaptured != lastAudioCapturedBytes) {
+        lastAudioCapturedBytes = stats.bytesCaptured;
+        lastAudioProgressMs = now;
+        return;
+    }
+
+    if (lastAudioProgressMs == 0)
+        lastAudioProgressMs = now;
+    if ((uint32_t)(now - lastAudioProgressMs) >= AUDIO_PROGRESS_STALL_MS)
+        restartStreamerAudioCapture();
+}
+
+static void serviceNetworkHealth()
+{
+    const uint32_t now = millis();
+    if ((uint32_t)(now - lastNetworkHealthMs) < NETWORK_HEALTH_INTERVAL_MS)
+        return;
+    lastNetworkHealthMs = now;
+
+    const wifi_mode_t mode = WiFi.getMode();
+    const bool apMode = (mode == WIFI_AP || mode == WIFI_AP_STA);
+    const IPAddress apIp = WiFi.softAPIP();
+    const bool apIpValid = apIp[0] != 0 || apIp[1] != 0 || apIp[2] != 0 || apIp[3] != 0;
+
+    if (apMode && apIpValid) {
+        networkBadChecks = 0;
+        return;
+    }
+
+    if (networkBadChecks < 255)
+        ++networkBadChecks;
+    if (networkBadChecks >= NETWORK_BAD_CHECKS_BEFORE_RECOVERY && !networkRecoveryRequested) {
+        networkRecoveryRequested = true;
+        networkRecoveryReason = !apMode ? "WiFi AP mode lost" : "WiFi AP address unavailable";
+        lastRecoveryReason = networkRecoveryReason;
+        logWrite("STREAMER network recovery requested | reason=" + networkRecoveryReason);
+    }
+}
+
+static void serviceMemoryHealth()
+{
+    const uint32_t now = millis();
+    if ((uint32_t)(now - lastMemoryHealthMs) < MEMORY_HEALTH_INTERVAL_MS)
+        return;
+    lastMemoryHealthMs = now;
+
+    currentInternalHeap = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    currentPsramFree = ESP.getFreePsram();
+
+    heapHistory[heapHistoryPos] = currentInternalHeap;
+    heapHistoryPos = (uint8_t)((heapHistoryPos + 1U) % 6U);
+    if (heapHistoryCount < 6)
+        ++heapHistoryCount;
+
+    memoryTrendWarning = false;
+    if (heapHistoryCount == 6 && bootInternalHeap > 0) {
+        uint32_t oldest = heapHistory[heapHistoryPos];
+        uint32_t newest = currentInternalHeap;
+        uint8_t fallingSteps = 0;
+        uint32_t prev = oldest;
+        for (uint8_t n = 1; n < 6; ++n) {
+            uint8_t idx = (uint8_t)((heapHistoryPos + n) % 6U);
+            uint32_t v = heapHistory[idx];
+            if (v < prev)
+                ++fallingSteps;
+            prev = v;
+        }
+        memoryTrendWarning = fallingSteps >= 4 && newest < oldest &&
+                             newest < (bootInternalHeap * 60U) / 100U;
+    }
+
+    const uint32_t criticalThreshold = std::min<uint32_t>(24000U, bootInternalHeap / 4U);
+    if (currentInternalHeap > 0 && currentInternalHeap < criticalThreshold) {
+        if (memoryCriticalChecks < 255)
+            ++memoryCriticalChecks;
+    } else {
+        memoryCriticalChecks = 0;
+    }
+
+    if (memoryTrendWarning) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            logWrite("STREAMER memory trend warning | heap=" + String(currentInternalHeap) +
+                     " | boot_heap=" + String(bootInternalHeap));
+        }
+    }
+
+    if (memoryCriticalChecks >= MEMORY_CRITICAL_CHECKS_BEFORE_REBOOT) {
+        logWrite("STREAMER memory critical | controlled reboot | heap=" + String(currentInternalHeap));
+        persistControlledResetReason("streamer critical internal heap");
+        persistHealthCounters(true);
+        delay(100);
+        ESP.restart();
+    }
+}
+
+static void serviceStreamerHealth()
+{
+    if (!started)
+        return;
+
+    serviceAudioHealth();
+    serviceNetworkHealth();
+    serviceMemoryHealth();
+    persistHealthCounters(false);
+
+    if (consecutiveCaptureFailures >= CAMERA_CAPTURE_FAILURES_BEFORE_RECOVERY) {
+        recoverStreamerCamera("repeated camera capture failure");
+        return;
+    }
+
+    if (anyActiveStreamClient() && lastSuccessfulFrameMs != 0) {
+        const uint32_t age = millis() - lastSuccessfulFrameMs;
+        if (age >= STREAM_FRAME_STALL_MS)
+            recoverStreamerCamera("no successful frame for " + String(age) + " ms");
+    }
+}
+
 static void captureAndDistributeFrame()
 {
     bool needRtsp = false;
@@ -908,10 +1314,13 @@ static void captureAndDistributeFrame()
 
     camera_fb_t *frame = esp_camera_fb_get();
     if (!frame) {
+        ++consecutiveCaptureFailures;
         lastError = "camera frame unavailable";
         return;
     }
 
+    consecutiveCaptureFailures = 0;
+    lastSuccessfulFrameMs = millis();
     ++framesCaptured;
 
     if (frame->format != PIXFORMAT_JPEG) {
@@ -1018,6 +1427,87 @@ static void serviceHttpControl()
     }
 }
 
+static String viewerHtmlEscape(const String &value)
+{
+    String out;
+    out.reserve(value.length() + 16);
+    for (size_t i = 0; i < value.length(); ++i) {
+        char c = value[i];
+        if (c == '&') out += F("&amp;");
+        else if (c == '<') out += F("&lt;");
+        else if (c == '>') out += F("&gt;");
+        else if (c == '"') out += F("&quot;");
+        else if (c == '\'') out += F("&#39;");
+        else out += c;
+    }
+    return out;
+}
+
+static String viewerInitialLocalMs()
+{
+    time_t now = time(nullptr);
+    if (now < 1600000000)
+        return "0";
+
+    struct tm localTm;
+    localtime_r(&now, &localTm);
+
+    // Build a browser-side UTC timestamp from the device's already-localized
+    // civil time. JS then formats with getUTC*(), so the viewer follows the
+    // SensorForge timezone instead of the browser PC timezone.
+    String js = "Date.UTC(";
+    js += String(localTm.tm_year + 1900);
+    js += ',';
+    js += String(localTm.tm_mon);
+    js += ',';
+    js += String(localTm.tm_mday);
+    js += ',';
+    js += String(localTm.tm_hour);
+    js += ',';
+    js += String(localTm.tm_min);
+    js += ',';
+    js += String(localTm.tm_sec);
+    js += ")";
+    return js;
+}
+
+static void handleHttpViewer()
+{
+    if (!streamerModeEnabled() || !cfg_streamer_http_mjpeg_enabled) {
+        webServer->send(404, "text/plain; charset=utf-8", "HTTP-MJPEG viewer is disabled");
+        return;
+    }
+
+    const String title = cfg_camera_display_name.length()
+        ? cfg_camera_display_name
+        : String("SensorForge");
+    const String overlay = cfg_camera_overlay_text.length()
+        ? cfg_camera_overlay_text
+        : title;
+    const String streamUrl = streamerHttpUrl();
+    const String initialLocalMs = viewerInitialLocalMs();
+
+    String html;
+    html.reserve(5200);
+    html += F("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
+    html += "<title>" + viewerHtmlEscape(title) + "</title>";
+    html += F("<style>body{margin:0;background:#101214;color:#eee;font-family:Arial,sans-serif}.wrap{max-width:1200px;margin:auto;padding:14px}.stage{position:relative;background:#000;border-radius:8px;overflow:hidden}.stage img{display:block;width:100%;height:auto}.ov{position:absolute;left:14px;bottom:14px;background:rgba(0,0,0,.58);color:#fff;padding:8px 11px;border-radius:6px;text-shadow:0 1px 2px #000;max-width:85%}.ov .name{font-size:1.08rem;font-weight:700}.ov .time{margin-top:3px;font-family:monospace;font-size:.95rem}.meta{margin-top:12px;background:#1b1f22;border-radius:8px;padding:12px 14px;line-height:1.55}.meta b{display:inline-block;min-width:145px}.muted{color:#b9c0c5}@media(max-width:600px){.wrap{padding:0}.stage{border-radius:0}.meta{margin:8px;border-radius:7px}.ov{left:8px;bottom:8px}}</style></head><body><div class='wrap'><div class='stage'>");
+    html += "<img src='" + viewerHtmlEscape(streamUrl) + "' alt='HTTP-MJPEG stream'>";
+    html += "<div class='ov'><div class='name'>" + viewerHtmlEscape(overlay) + "</div><div id='sfClock' class='time'>--</div></div></div>";
+    html += F("<div class='meta'>");
+    if (cfg_camera_display_name.length()) html += "<div><b>Kamera:</b> " + viewerHtmlEscape(cfg_camera_display_name) + "</div>";
+    if (cfg_camera_location.length()) html += "<div><b>Ort:</b> " + viewerHtmlEscape(cfg_camera_location) + "</div>";
+    if (cfg_camera_gps_lat.length() && cfg_camera_gps_lon.length()) html += "<div><b>GPS:</b> " + viewerHtmlEscape(cfg_camera_gps_lat) + ", " + viewerHtmlEscape(cfg_camera_gps_lon) + "</div>";
+    if (cfg_camera_responsible.length()) html += "<div><b>Verantwortlich:</b> " + viewerHtmlEscape(cfg_camera_responsible) + "</div>";
+    if (cfg_camera_email.length()) html += "<div><b>E-Mail:</b> " + viewerHtmlEscape(cfg_camera_email) + "</div>";
+    if (cfg_camera_description.length()) html += "<div><b>Beschreibung:</b> " + viewerHtmlEscape(cfg_camera_description) + "</div>";
+    html += "</div>";
+    html += "<script>(function(){var base=" + initialLocalMs + ",t0=Date.now(),el=document.getElementById('sfClock');function p(n){return n<10?'0'+n:n;}function tick(){if(!base){el.textContent='Zeit nicht verfügbar';return;}var d=new Date(base+(Date.now()-t0));el.textContent=p(d.getUTCDate())+'.'+p(d.getUTCMonth()+1)+'.'+d.getUTCFullYear()+' '+p(d.getUTCHours())+':'+p(d.getUTCMinutes())+':'+p(d.getUTCSeconds());}tick();setInterval(tick,1000);}());</script></div></body></html>";
+
+    webServer->sendHeader("Cache-Control", "no-store");
+    webServer->send(200, "text/html; charset=utf-8", html);
+}
+
 static void handleHttpStreamRedirect()
 {
     if (!streamerModeEnabled() || !cfg_streamer_http_mjpeg_enabled) {
@@ -1042,6 +1532,25 @@ static void handleStreamerStatus()
         ",\"audio_active\":" + (audioActive ? "true" : "false") +
         ",\"audio_packets\":" + String(audioPacketsSent) +
         ",\"audio_bytes\":" + String((unsigned long long)audioBytesSent) +
+        ",\"audio_recoveries\":" + String(audioRecoveryCount) +
+        ",\"audio_recovery_failures\":" + String(audioRecoveryFailureCount) +
+        ",\"socket_stalls\":" + String(socketStallCount) +
+        ",\"network_recoveries\":" + String(networkRecoveryCount) +
+        ",\"network_recovery_failures\":" + String(networkRecoveryFailureCount) +
+        ",\"memory_warning\":" + (memoryTrendWarning ? "true" : "false") +
+        ",\"heap_free\":" + String(currentInternalHeap) +
+        ",\"psram_free\":" + String(currentPsramFree) +
+        ",\"reset_reason\":\"" + String(resetReasonName(esp_reset_reason())) + "\"" +
+        ",\"previous_controlled_reset\":\"" + previousControlledResetReason + "\"" +
+        ",\"persistent_camera_recoveries\":" + String(persistedCameraRecoveries) +
+        ",\"persistent_audio_recoveries\":" + String(persistedAudioRecoveries) +
+        ",\"persistent_network_recoveries\":" + String(persistedNetworkRecoveries) +
+        ",\"persistent_socket_stalls\":" + String(persistedSocketStalls) +
+        ",\"camera_recoveries\":" + String(cameraRecoveryCount) +
+        ",\"camera_recovery_failures\":" + String(cameraRecoveryFailureCount) +
+        ",\"capture_failures\":" + String(consecutiveCaptureFailures) +
+        ",\"last_frame_age_ms\":" + String(lastSuccessfulFrameMs ? (uint32_t)(millis() - lastSuccessfulFrameMs) : 0U) +
+        ",\"last_recovery_reason\":\"" + lastRecoveryReason + "\"" +
         ",\"frames\":" + String(framesCaptured) +
         ",\"fps\":" + String(streamerMeasuredFps(), 2) +
         ",\"bytes_sent\":" + String((unsigned long long)bytesSent) + "}";
@@ -1074,8 +1583,34 @@ bool streamerBegin(String &error)
     if (cfg_streamer_http_mjpeg_enabled)
         httpServer.begin();
 
-    statsStartedMs = millis();
+    openHealthPrefsIfNeeded();
+    if (statsStartedMs == 0)
+        statsStartedMs = millis();
     lastFrameDueMs = 0;
+    lastSuccessfulFrameMs = millis();
+    nextCameraRecoveryAllowedMs = 0;
+    cameraRecoveryFailureCount = 0;
+    consecutiveCaptureFailures = 0;
+    lastRecoveryReason = "";
+    lastAudioHealthMs = millis();
+    lastAudioProgressMs = millis();
+    lastAudioCapturedBytes = 0;
+    nextAudioRecoveryAllowedMs = 0;
+    lastNetworkHealthMs = millis();
+    networkBadChecks = 0;
+    networkRecoveryRequested = false;
+    networkRecoveryReason = "";
+    nextNetworkRecoveryAllowedMs = 0;
+    lastMemoryHealthMs = millis();
+    bootInternalHeap = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    bootPsramFree = ESP.getFreePsram();
+    currentInternalHeap = bootInternalHeap;
+    currentPsramFree = bootPsramFree;
+    memoryCriticalChecks = 0;
+    memoryTrendWarning = false;
+    memset(heapHistory, 0, sizeof(heapHistory));
+    heapHistoryCount = 0;
+    heapHistoryPos = 0;
     videoTimestamp = esp_random();
     started = true;
 
@@ -1096,10 +1631,56 @@ void streamerLoop()
     serviceHttpControl();
     serviceAudio();
     captureAndDistributeFrame();
+    serviceStreamerHealth();
 
     for (uint8_t i = 0; i < HTTP_CLIENT_SLOTS; ++i) {
         if (httpClients[i].client && !httpClients[i].client.connected())
             closeHttpClientSlot(i);
+    }
+}
+
+bool streamerTakeNetworkRecoveryRequest(String &reason)
+{
+    if (!networkRecoveryRequested)
+        return false;
+    if (nextNetworkRecoveryAllowedMs != 0 &&
+        (int32_t)(millis() - nextNetworkRecoveryAllowedMs) < 0)
+        return false;
+    reason = networkRecoveryReason;
+    networkRecoveryRequested = false;
+    networkBadChecks = 0;
+    return true;
+}
+
+void streamerNoteNetworkRecoveryResult(bool success, const String &error)
+{
+    if (success) {
+        ++networkRecoveryCount;
+        ++persistedNetworkRecoveries;
+        healthPrefsDirty = true;
+        networkRecoveryFailureCount = 0;
+        nextNetworkRecoveryAllowedMs = 0;
+        lastRecoveryReason = "network stack restarted";
+        logWrite("STREAMER network recovery successful | count=" + String(networkRecoveryCount));
+        return;
+    }
+
+    ++networkRecoveryFailureCount;
+    lastRecoveryReason = "network recovery failed: " + error;
+    logWrite("STREAMER network recovery failed | " + error);
+    if (networkRecoveryFailureCount < 2) {
+        networkRecoveryRequested = true;
+        networkRecoveryReason = "retry after failed network recovery";
+        nextNetworkRecoveryAllowedMs = millis() + 5000UL;
+    }
+    // A failed AP/WebConfig restart leaves the device unreachable. Reboot is
+    // safer than spinning in a fast retry loop, but only after two confirmed
+    // failed full-stack recovery attempts.
+    if (networkRecoveryFailureCount >= 2) {
+        persistControlledResetReason("streamer network recovery failed repeatedly");
+        persistHealthCounters(true);
+        delay(100);
+        ESP.restart();
     }
 }
 
@@ -1112,6 +1693,7 @@ void streamerStop()
     if (started && cfg_streamer_http_mjpeg_enabled)
         httpServer.end();
     started = false;
+    persistHealthCounters(false);
     snapshotBytes = 0;
     if (snapshotBuffer) {
         free(snapshotBuffer);
@@ -1124,6 +1706,7 @@ void streamerRegisterWebRoutes(WebServer &server)
 {
     webServer = &server;
     server.on("/stream", HTTP_GET, handleHttpStreamRedirect);
+    server.on("/stream_view", HTTP_GET, handleHttpViewer);
     server.on("/streamer_status", HTTP_GET, handleStreamerStatus);
 }
 
@@ -1230,4 +1813,9 @@ String streamerRtspUrl()
 String streamerHttpUrl()
 {
     return "http://" + cfg_hostname + ".local:" + String(HTTP_MJPEG_PORT) + "/stream";
+}
+
+String streamerHttpViewerUrl()
+{
+    return "http://" + cfg_hostname + ".local/stream_view";
 }

@@ -1,9 +1,80 @@
+## v84 candidate - UI cleanup: header, viewer and connections
 
-## v84 candidate - RTSP active-session timeout fix
+- Removed duplicate CPU temperature text from the date/time header; temperature remains on the dedicated TEMP meter.
+- Removed the explanatory MJPEG viewer sentence about browser-side overlay rendering.
+- Simplified the streamer overview by removing the web-vs-stream client explanation and separating web/system-maintenance sessions from streaming connections in two clear status cards.
+- Streaming connection card shows total active connections plus RTSP and HTTP counts against their existing 2-client limits.
+- No capture, RTSP, HTTP-MJPEG, thermal, CPU-load calculation, configuration or recovery logic changed.
 
-- Fixed a 30-second RTSP freeze/disconnect regression: the existing 30 s RTSP idle timeout was incorrectly applied to active PLAY sessions even when RTP/JPEG/audio was streaming normally. VLC/ffplay do not necessarily send RTSP keepalives within that interval.
-- The 30 s timeout now applies only while a client is still in RTSP setup/control state. Active PLAY sessions rely on the TCP connection state and the existing bounded socket-write stall detection.
-- Added explicit log reasons for RTSP request-buffer overflow and pre-PLAY setup/control timeout.
+## v84 UI polish – Config clarity / dual health meters
+
+- Config header simplified; release line now includes `git-tag`, redundant SD-config status line removed.
+- Camera metadata explanatory text moved behind an info button; redundant camera-name hint removed.
+- RTSP and HTTP-MJPEG enable switches now use clearer equal-weight cards with live AKTIV/INAKTIV status chips; underlying checkbox/save behavior is unchanged.
+- Global header now shows two compact live meters: CPU temperature using the existing Thermal Guard thresholds, and CPU/system load using the existing load telemetry. No new polling or sensor reads were added.
+- No changes to capture, RTSP/HTTP streaming, config schema, save semantics, recovery logic or thermal protection.
+
+## v84 candidate - Kamera-Metadaten UI vereinfacht
+
+- Anzeigename und Text im Streamingbild sind in der Konfiguration zu einem einzigen benutzerseitigen Feld `Kameraname / Text im Streamingbild` zusammengefasst.
+- Beim Speichern werden `camera_display_name` und `camera_overlay_text` intern automatisch auf denselben Wert synchronisiert; bestehendes Config-Schema bleibt kompatibel.
+- Metadatenbereich optisch als kompakte, responsive Eingabekarten überarbeitet.
+- Info-Popups für Kameraname, Standort, GPS-Format/Wertebereiche, Verantwortlichen, E-Mail und Beschreibung ergänzt.
+- GPS bleibt optional und verwendet Dezimalgrad (WGS84); keine Änderung am Kamera-/Streamer-Capturepfad und keine zusätzliche Bildverarbeitung.
+
+## v84 candidate – Kamera-Metadaten und lastfreier Stream-Overlay-Viewer (2026-09-29)
+
+- Neue optionale, rückwärtskompatible Config-Keys: `camera_display_name`, `camera_location`, `camera_gps_lat`, `camera_gps_lon`, `camera_responsible`, `camera_email`, `camera_overlay_text`, `camera_description`.
+- Fehlende neue Keys bleiben leer; bestehende Konfigurationen benötigen keine Migration.
+- HTTP-MJPEG bleibt als unveränderter Blank-Stream auf Port 81 bestehen.
+- Neuer `/stream_view`-Webviewer zeigt denselben MJPEG-Stream mit Browser-seitigem Datum/Uhrzeit-Overlay und frei konfigurierbarem Text. Keine JPEG-Dekodierung oder -Rekodierung auf dem ESP32.
+- Der Viewer zeigt vorhandene Standort-/Kontaktmetadaten unter dem Bild an und verwendet die SensorForge-Zeitzone für die initiale Uhrzeit; die Sekundentakt-Aktualisierung läuft ausschließlich im Browser.
+- RTSP bleibt byte-/capture-seitig unverändert. Zusätzlich wird in der Konfiguration ein optionaler `ffplay + Overlay`-Befehl angeboten; `drawtext` läuft auf dem Client-PC.
+- HTTP-Konfiguration zeigt gleichberechtigt `Browser blank` und `Browser + Info` mit Kopieren-/Öffnen-Funktionen.
+- Keine zusätzlichen Kamera-Captures, keine zusätzlichen Encode-Schritte und keine schnellen Hintergrund-Pollings hinzugefügt.
+
+## v84 candidate - HTTP-MJPEG Bedienung gleichberechtigt zu RTSP
+
+- Browser-Stream-Konfiguration optisch und funktional an den RTSP-Block angeglichen.
+- HTTP-MJPEG zeigt jetzt dieselbe "Stream öffnen"-Struktur mit kopierbaren Aufrufen für Browser-URL, ffplay, VLC und mpv.
+- Direkter Browser-Button "Öffnen" ergänzt; HTTP-Hinweis stellt klar, dass dieser Pfad nur Video und kein Audio führt.
+- Keine Änderung am Streamer-Protokoll, Capture-Pfad, Client-Limit oder Self-Healing.
+
+## v84 candidate - Hauptseite vereinfacht
+- Die Direktbuttons `Betriebsmodus konfigurieren` und `Kameraeinstellungen` wurden von der Hauptseite entfernt.
+- Konfiguration erfolgt damit konsistent über die Hauptnavigation/Menüs.
+- Keine Änderung an den zugrunde liegenden Seiten oder Funktionen.
+
+## v84 candidate - low-overhead streamer hardening / self-healing
+
+- Streamer health supervision remains deliberately low-frequency and local-first: no fast polling loops, no periodic reboot policy.
+- Existing 250 ms bounded socket-write protection is retained and now counted diagnostically; a stalled client is closed without disturbing other clients or the board.
+- RTSP audio gets an independent 2 s health check. If active capture stops making progress for 8 s, only the audio capture backend/ring is restarted; video and RTSP sessions remain alive. Audio recovery never forces a board reboot.
+- Streamer AP health is checked every 5 s. Only three consecutive invalid AP checks (~15 s) request a full AP/mDNS/WebConfig/streamer transport restart. The main firmware owns that lifecycle so the streamer does not duplicate WiFi setup logic.
+- Internal heap/PSRAM are sampled only once per minute. A six-minute falling-heap pattern is reported as a warning, not treated as a reset condition. A controlled reboot is reserved for critically low internal heap sustained over three one-minute checks.
+- Rare recovery counters are persisted to NVS at most every six hours, plus immediately before a controlled recovery reboot. This avoids continuous flash wear while preserving useful long-term field diagnostics.
+- The previous controlled streamer reboot reason is retained for the next boot; the hardware reset reason (including brownout/watchdog/software reset) is exposed in Streamer-Status / Diagnose.
+- Streamer diagnosis now shows camera/audio/network recoveries, socket stalls, memory-trend warning, reset reason, and previous controlled reset reason.
+- Existing thermal protection and the firmware's 30 s ESP task watchdog remain authoritative final safety layers.
+
+## v84 candidate - Streamer self-healing watchdog
+
+- Added application-level streamer health monitoring for unattended long-term operation.
+- Three consecutive camera capture failures or a 15 s frame stall with active stream clients trigger a controlled local camera recovery.
+- Recovery closes stale RTSP/HTTP sessions, stops streamer audio capture, reinitializes the camera with the persisted SensorForge camera configuration, and lets clients reconnect cleanly.
+- Failed camera recovery is retried after 5 s; after three failed recovery attempts SensorForge escalates to a controlled ESP restart.
+- Existing 30 s ESP task watchdog remains the final protection for hard task/deadlock stalls.
+- `/streamer_status` and the visible dashboard diagnostics now expose camera recovery count, failed recovery attempts, current capture failures, last-frame age, and the last recovery reason.
+- No normal recording-mode behavior or persisted configuration schema changed.
+
+## v84 Streamer UI – RTSP-Aufrufbefehle (2026-09-29)
+
+- RTSP-Konfiguration zeigt jetzt direkt nutzbare Terminal-Befehle für ffplay, VLC und mpv.
+- ffplay und mpv erzwingen RTSP/RTP über TCP passend zum SensorForge-Streamer.
+- VLC verwendet bewusst den portablen normalen RTSP-Aufruf, da `--rtsp-tcp` nicht in allen VLC-Versionen verfügbar ist.
+- Jeder Befehl besitzt einen Kopieren-Button; die URL wird aus dem aktuellen SensorForge-Hostname erzeugt.
+- Keine Änderung am Streaming-Backend, an RTSP/RTP, Audio, Kamera oder Persistenz.
+
 ## v84 candidate - RTSP audio compatibility/diagnostics
 
 - RTSP SDP now includes a session-level `c=IN IP4 ...` connection line and `a=sendonly`.
@@ -927,3 +998,18 @@ and identifies the concrete binary compilation time.
 - RTSP-Slot-Verbindungspruefung an Arduino-ESP32 3.3.12 angepasst: `NetworkClient::connected()` und `operator bool()` sind dort nicht `const`.
 - `rtspSlotConnected()` und alle betroffenen lokalen RTSP-Slot-Referenzen verwenden deshalb keine `const`-Qualifizierung mehr.
 - Keine Aenderung an Streamer-Limits, RTP/RTSP-Verhalten oder Kamera-/Audio-Ownership.
+
+### v84 Streamer candidate - sichtbarer Streamer-Status auf der Übersicht
+- Die Streamer-Übersicht besitzt jetzt einen direkt sichtbaren Button `Streamer-Status / Diagnose`.
+- Der aufklappbare Bereich zeigt RTSP-/HTTP-Clientzahlen, Frames, FPS, Gesamtbytes sowie Audio-Status, Audio-RTP-Pakete und Audio-Bytes.
+- Die Werte werden über den bestehenden `/streamer_status`-Endpunkt alle 2 Sekunden aktualisiert, solange die Seite sichtbar ist.
+- Audio-Diagnose ist damit ohne manuelles Aufrufen eines versteckten API-Endpunkts verfügbar.
+
+### v84 candidate - Mikrofon-Hörtest wiederhergestellt
+- Die kurze WAV-Mikrofonprobe ist wieder direkt in der Audio-/Mikrofon-Konfiguration verfügbar.
+- `Mikrofon 10 Sekunden testen` verwendet den bestehenden `audioWavRecordTest()`-/Audio-Capture-/PSRAM-Pfad und die aktuell gespeicherte Audiokonfiguration.
+- Nach erfolgreicher Aufnahme erscheint direkt ein Browser-Audioplayer; die temporäre WAV-Datei kann zusätzlich heruntergeladen werden und wird beim nächsten Test überschrieben.
+- Die Diagnose-WAV ist bewusst temporär und unverschlüsselt; normale Aufnahme-, MKV- und SFENC1-Pfade bleiben unverändert.
+- Aufnahme, Storage-Wartung, bereits aktiver Audio-Capture und Netzwerk-Streamer blockieren den Test, um Ownership-Konflikte zu vermeiden.
+- Der zentrale Systemtest bleibt erhalten; nur der kurze Hörtest wurde wiederhergestellt. Der historische Audio-Benchmark bleibt auf den Systemtest umgeleitet.
+- Neue sichtbare Texte sind in Deutsch und Englisch vorhanden.

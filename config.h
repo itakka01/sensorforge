@@ -117,6 +117,17 @@ extern String cfg_disk_full_action;   // "rollover" or "stop"
 
 // WiFi / NTP / local time
 extern String cfg_hostname;
+
+// General device / camera metadata (optional, backward-compatible)
+extern String cfg_camera_display_name;
+extern String cfg_camera_location;
+extern String cfg_camera_gps_lat;
+extern String cfg_camera_gps_lon;
+extern String cfg_camera_responsible;
+extern String cfg_camera_email;
+extern String cfg_camera_overlay_text;
+extern String cfg_camera_description;
+
 extern String cfg_timezone;             // POSIX TZ string, e.g. CET-1CEST,M3.5.0,M10.5.0/3
 extern String cfg_wifi_on_system_start; // "off", "on", "on_missing_time"
 extern int cfg_wifi_timeout_sec;       // 0 = auto-off disabled; firmware default is 0
