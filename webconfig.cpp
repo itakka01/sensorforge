@@ -3,6 +3,7 @@
 #include "web_sd_maintenance.h"
 #include "config.h"
 #include "audio_capture.h"
+#include "audio_wav.h"
 #include "recording_load_test.h"
 #include "language.h"
 #include "board_config.h"
@@ -41,6 +42,9 @@
 #include "image_motion.h"
 #include "motion_diagnostics.h"
 #include "streamer.h"
+
+static const char *AUDIO_MIC_TEST_PATH = "/sensorforge_audio_test.wav";
+static const uint32_t AUDIO_MIC_TEST_DURATION_MS = 10000UL;
 
 
 // High-level recording state from the main firmware loop.
@@ -2276,9 +2280,22 @@ static void handleRoot()
                 "</span> · Streaming: <span id='streamClientCount'>" +
                 String((unsigned)(streamerRtspClientCount() + streamerHttpClientCount())) +
                 "</span><br><span class='muted'>Web-Oberflächen und Stream-Clients werden getrennt gezählt; eine geöffnete Web-Oberfläche belegt keinen Stream-Platz.</span></p>";
-        html += "<p><strong>Frames:</strong> " + String(streamerFramesCaptured()) +
+        html += "<p><strong>Frames:</strong> <span id='streamLiveFrames'>" + String(streamerFramesCaptured()) + "</span>" +
                 " · <strong>FPS:</strong> <span id='streamLiveFps'>" + String(streamerMeasuredFps(), 2) + "</span>" +
-                " · <strong>Gesendet:</strong> " + String((unsigned long long)streamerBytesSent()) + " Byte</p>";
+                " · <strong>Gesendet:</strong> <span id='streamLiveBytes'>" + String((unsigned long long)streamerBytesSent()) + "</span> Byte</p>";
+        html += "<p><button class='button' type='button' id='streamDiagToggle' aria-expanded='false' aria-controls='streamDiagPanel'>Streamer-Status / Diagnose</button></p>";
+        html += "<div id='streamDiagPanel' style='display:none;border:1px solid #8fb5c9;border-radius:8px;padding:12px;margin:8px 0 14px;background:#f7fbfd'>"
+                "<p style='margin-top:0'><strong>Live-Streamerstatus</strong><br><span class='muted'>Aktualisierung alle 2 Sekunden, solange diese Seite sichtbar ist.</span></p>"
+                "<p><strong>RTSP:</strong> <span id='diagRtspClients'>" + String((unsigned)streamerRtspClientCount()) + "/2</span> · "
+                "<strong>HTTP-MJPEG:</strong> <span id='diagHttpClients'>" + String((unsigned)streamerHttpClientCount()) + "/2</span></p>"
+                "<p><strong>Audio:</strong> <span id='diagAudioState'>" + htmlEscape(streamerAudioStatus()) + "</span><br>"
+                "<strong>Audio-RTP-Pakete:</strong> <span id='diagAudioPackets'>0</span> · "
+                "<strong>Audio gesendet:</strong> <span id='diagAudioBytes'>0</span> Byte</p>"
+                "<p><strong>Frames:</strong> <span id='diagFrames'>" + String(streamerFramesCaptured()) + "</span> · "
+                "<strong>FPS:</strong> <span id='diagFps'>" + String(streamerMeasuredFps(), 2) + "</span> · "
+                "<strong>Gesendet gesamt:</strong> <span id='diagBytes'>" + String((unsigned long long)streamerBytesSent()) + "</span> Byte</p>"
+                "<p class='muted' style='margin-bottom:0'>Audio-RTP-Pakete und Audio-Bytes müssen bei einem RTSP-Client mit aktivem Audio kontinuierlich steigen. Bleiben sie bei 0, wird aktuell kein Audio über RTSP übertragen.</p>"
+                "</div>";
         html += "<p><strong>Systemressourcen:</strong> interner Heap <span id='heapFreeKb'>" +
                 String((unsigned long)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024U)) +
                 " KB</span> frei (Minimum seit Boot <span id='heapMinKb'>" +
@@ -2291,6 +2308,23 @@ static void handleRoot()
         }
         html += "<p><a class='button' href='/config#operating-mode'>Betriebsmodus konfigurieren</a> "
                 "<a class='button' href='/preview'>Kameraeinstellungen</a></p></section>";
+        html += "<script>(function(){"
+                "var b=document.getElementById('streamDiagToggle'),p=document.getElementById('streamDiagPanel');"
+                "if(!b||!p)return;"
+                "function set(id,v){var e=document.getElementById(id);if(e)e.textContent=v;}"
+                "function apply(s){if(!s)return;"
+                "set('diagRtspClients',String(Number(s.rtsp_clients)||0)+'/2');"
+                "set('diagHttpClients',String(Number(s.http_clients)||0)+'/2');"
+                "var ast=s.audio_active?'aktiv':(s.audio_available?'verfügbar, aber nicht aktiv':'nicht verfügbar');set('diagAudioState',ast);"
+                "set('diagAudioPackets',String(Number(s.audio_packets)||0));set('diagAudioBytes',String(Number(s.audio_bytes)||0));"
+                "set('diagFrames',String(Number(s.frames)||0));set('diagFps',Number(s.fps||0).toFixed(2));set('diagBytes',String(Number(s.bytes_sent)||0));"
+                "set('streamLiveFrames',String(Number(s.frames)||0));set('streamLiveFps',Number(s.fps||0).toFixed(2));set('streamLiveBytes',String(Number(s.bytes_sent)||0));"
+                "var sc=document.getElementById('streamClientCount');if(sc)sc.textContent=String((Number(s.rtsp_clients)||0)+(Number(s.http_clients)||0));"
+                "}"
+                "function poll(){if(document.hidden)return;fetch('/streamer_status?t='+Date.now(),{cache:'no-store',credentials:'same-origin'}).then(function(r){if(!r.ok)throw new Error();return r.json();}).then(apply).catch(function(){});}"
+                "b.addEventListener('click',function(){var show=p.style.display==='none';p.style.display=show?'block':'none';b.setAttribute('aria-expanded',show?'true':'false');b.textContent=show?'Streamer-Status / Diagnose ausblenden':'Streamer-Status / Diagnose';if(show)poll();});"
+                "setInterval(poll,2000);document.addEventListener('visibilitychange',function(){if(!document.hidden)poll();});poll();"
+                "})();</script>";
         html += htmlFooter();
         server.sendHeader("Cache-Control", "no-store");
         server.send(200, "text/html; charset=utf-8", html);
@@ -4529,6 +4563,36 @@ static void handleConfig()
         htmlText(UI_AUDIO_ADVANCED_SETTINGS) +
         "</button> ";
 
+    bool audioMicTestAllowed =
+        audioCaps.available &&
+        !streamerModeEnabled();
+
+    html +=
+        "<button id='sfAudioMicTestBtn' type='button' onclick=\"sfAudioMicTest()\"" +
+        String(audioMicTestAllowed ? "" : " disabled") +
+        ">" + htmlText(UI_AUDIO_MIC_TEST_BUTTON) + "</button>";
+
+    html +=
+        "<div id='sfAudioMicTestPanel' style='margin-top:10px;padding:10px;border:1px solid #cfd8dc;border-radius:6px;background:#fff'>"
+        "<small class='muted'>" + htmlText(UI_AUDIO_MIC_TEST_HELP) + "</small>";
+
+    if (streamerModeEnabled()) {
+        html +=
+            "<br><small style='color:#9a5a00'>" +
+            htmlText(UI_AUDIO_MIC_TEST_STREAMER_BLOCKED) +
+            "</small>";
+    }
+
+    html +=
+        "<div id='sfAudioMicTestStatus' style='margin-top:8px'>" +
+        htmlText(UI_AUDIO_MIC_TEST_READY) +
+        "</div>"
+        "<div id='sfAudioMicTestPlayback' style='display:none;margin-top:8px'>"
+        "<audio id='sfAudioMicTestAudio' controls preload='none' style='width:100%;max-width:520px'></audio><br>"
+        "<a id='sfAudioMicTestDownload' href='/audio_test_play?download=1'>" +
+        htmlText(UI_AUDIO_MIC_TEST_DOWNLOAD) +
+        "</a></div></div>";
+
     if (!audioCaps.available) {
         html +=
             "<br><small style='color:#9a5a00'>" +
@@ -4671,6 +4735,12 @@ static void handleConfig()
         "var a=document.getElementById('cfgAudioEnabled');var r=document.getElementById('cfgRecordingFormat');var e=document.getElementById('cfgAudioExpertMode');var s=document.getElementById('cfgAudioSource');var p=document.getElementById('cfgAudioExpertPanel');var b=document.getElementById('cfgAudioBackend');var pp=document.getElementById('cfgAudioPdmPanel');var ip=document.getElementById('cfgAudioI2sPanel');"
         "if(a&&r&&a.value==='1')r.value='mkv';"
         "if(!e||!s||!p||!b||!pp||!ip)return;var expert=e.value==='1';if(!expert&&s.value==='external')s.value='board_default';p.style.display=expert?'block':'none';var external=expert&&s.value==='external';b.disabled=!external;pp.style.display=external&&b.value==='pdm'?'block':'none';ip.style.display=external&&b.value==='i2s'?'block':'none';}"
+        "async function sfAudioMicTest(){"
+        "var b=document.getElementById('sfAudioMicTestBtn'),st=document.getElementById('sfAudioMicTestStatus'),pb=document.getElementById('sfAudioMicTestPlayback'),au=document.getElementById('sfAudioMicTestAudio');"
+        "if(!b||!st||!pb||!au)return;b.disabled=true;pb.style.display='none';au.pause();au.removeAttribute('src');"
+        "st.textContent='" + htmlText(UI_AUDIO_MIC_TEST_RECORDING) + "';"
+        "try{var r=await fetch('/audio_test_record',{method:'POST',credentials:'same-origin'});var t=await r.text();if(!r.ok)throw new Error(t||('HTTP '+r.status));var j=JSON.parse(t);au.src='/audio_test_play?t='+Date.now();var dl=document.getElementById('sfAudioMicTestDownload');if(dl)dl.href='/audio_test_play?download=1&t='+Date.now();pb.style.display='block';st.textContent='" + htmlText(UI_AUDIO_MIC_TEST_DONE) + " '+(j.capture_ms||0)+' ms · Peak '+(j.peak||0)+' · RMS '+Number(j.rms||0).toFixed(1);}"
+        "catch(e){st.textContent='" + htmlText(UI_AUDIO_MIC_TEST_FAILED) + " '+e.message;}finally{b.disabled=false;}}"
         "sfAudioUi();"
         "</script>"
         "</div>";
@@ -16871,21 +16941,118 @@ static AudioFormat audioPostedFormat()
 }
 
 
-static void handleLegacyAudioTestRedirect()
+static void audioMicTestService()
 {
-    // v82 consolidates all user-facing diagnostics into the Systemtest. Keep
-    // the historical POST routes as harmless redirects for stale browser pages
-    // or bookmarks instead of leaving a second diagnostic workflow alive.
-    server.sendHeader(
-        "Location",
-        "/system#system-test",
-        true
+    delay(1);
+}
+
+
+static void handleAudioTestRecord()
+{
+    if (streamerModeEnabled()) {
+        server.send(409, "text/plain; charset=utf-8", "Mikrofontest ist im Netzwerk-Streamer-Modus nicht verfügbar.");
+        return;
+    }
+
+    if (!sdReady) {
+        server.send(503, "text/plain; charset=utf-8", "SD-Karte ist nicht verfügbar.");
+        return;
+    }
+
+    if (storageIoFaultActive()) {
+        server.send(503, "text/plain; charset=utf-8", "SD/Storage ist wegen eines I/O-Fehlers gesperrt.");
+        return;
+    }
+
+    if (g_storageLocked || recording || recorderIsOpen()) {
+        server.send(409, "text/plain; charset=utf-8", "Mikrofontest ist während Aufnahme oder Storage-Wartung nicht möglich.");
+        return;
+    }
+
+    if (audioCaptureIsRunning()) {
+        server.send(409, "text/plain; charset=utf-8", "Audio-Capture wird bereits verwendet.");
+        return;
+    }
+
+    AudioCaptureCapabilities caps = audioCaptureCapabilities();
+    if (!caps.available) {
+        server.send(503, "text/plain; charset=utf-8", "Für die gespeicherte Audiokonfiguration ist kein Mikrofoneingang verfügbar.");
+        return;
+    }
+
+    AudioFormat format = {};
+    format.sampleRate = (uint32_t)cfg_audio_sample_rate;
+    format.bitsPerSample = (uint16_t)cfg_audio_bits_per_sample;
+    format.channels = (uint8_t)cfg_audio_channels;
+
+    AudioWavResult result = {};
+    String error;
+
+    g_storageLocked = true;
+    bool ok = audioWavRecordTest(
+        AUDIO_MIC_TEST_PATH,
+        AUDIO_MIC_TEST_DURATION_MS,
+        format,
+        false,
+        result,
+        error,
+        audioMicTestService
     );
-    server.send(
-        303,
-        "text/plain; charset=utf-8",
-        "Audio diagnostics moved to Systemtest"
-    );
+    g_storageLocked = false;
+
+    if (!ok) {
+        server.send(500, "text/plain; charset=utf-8", error.length() ? error : "Mikrofontest fehlgeschlagen.");
+        return;
+    }
+
+    String json;
+    json.reserve(220);
+    json += "{\"ok\":true,\"capture_ms\":";
+    json += String((unsigned long)result.captureMs);
+    json += ",\"pcm_bytes\":";
+    json += String((unsigned long)result.pcmBytes);
+    json += ",\"peak\":";
+    json += String((long)result.peakAbs16);
+    json += ",\"rms\":";
+    json += String(result.rms16, 1);
+    json += ",\"dropped_bytes\":";
+    json += String((unsigned long)result.droppedBytes);
+    json += "}";
+
+    server.send(200, "application/json; charset=utf-8", json);
+}
+
+
+static void handleAudioTestPlay()
+{
+    if (!sdReady || g_storageLocked) {
+        server.send(503, "text/plain; charset=utf-8", "Audio-Testdatei ist momentan nicht verfügbar.");
+        return;
+    }
+
+    File f = STORAGE.open(AUDIO_MIC_TEST_PATH, FILE_READ);
+    if (!f || f.isDirectory()) {
+        if (f)
+            f.close();
+        server.send(404, "text/plain; charset=utf-8", "Noch keine Mikrofon-Testaufnahme vorhanden.");
+        return;
+    }
+
+    server.sendHeader("Cache-Control", "no-store");
+    if (server.hasArg("download") && server.arg("download") == "1")
+        server.sendHeader("Content-Disposition", "attachment; filename=SensorForge_microphone_test.wav");
+    else
+        server.sendHeader("Content-Disposition", "inline; filename=SensorForge_microphone_test.wav");
+
+    server.streamFile(f, "audio/wav");
+    f.close();
+}
+
+
+static void handleLegacyAudioBenchmarkRedirect()
+{
+    server.sendHeader("Location", "/system#system-test", true);
+    server.send(303, "text/plain; charset=utf-8", "Audio benchmark moved to Systemtest");
 }
 
 
@@ -18770,8 +18937,9 @@ void webConfigStart()
         server.on("/streamer_save", HTTP_POST, handleStreamerSave);
         server.on("/shooter", HTTP_GET, handleShooterPage);
         server.on("/shooter_save", HTTP_POST, handleShooterSave);
-        server.on("/audio_test_record", HTTP_POST, handleLegacyAudioTestRedirect);
-        server.on("/audio_benchmark", HTTP_POST, handleLegacyAudioTestRedirect);
+        server.on("/audio_test_record", HTTP_POST, handleAudioTestRecord);
+        server.on("/audio_test_play", HTTP_GET, handleAudioTestPlay);
+        server.on("/audio_benchmark", HTTP_POST, handleLegacyAudioBenchmarkRedirect);
         server.on("/recording_load_test", HTTP_POST, handleRecordingLoadTestStart);
         server.on("/recording_load_test_status_page", HTTP_GET, handleRecordingLoadTestStatusPage);
         server.on("/recording_load_test_status", HTTP_GET, handleRecordingLoadTestStatusJson);

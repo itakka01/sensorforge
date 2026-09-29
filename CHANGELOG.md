@@ -1,3 +1,9 @@
+
+## v84 candidate - RTSP active-session timeout fix
+
+- Fixed a 30-second RTSP freeze/disconnect regression: the existing 30 s RTSP idle timeout was incorrectly applied to active PLAY sessions even when RTP/JPEG/audio was streaming normally. VLC/ffplay do not necessarily send RTSP keepalives within that interval.
+- The 30 s timeout now applies only while a client is still in RTSP setup/control state. Active PLAY sessions rely on the TCP connection state and the existing bounded socket-write stall detection.
+- Added explicit log reasons for RTSP request-buffer overflow and pre-PLAY setup/control timeout.
 ## v84 candidate - RTSP audio compatibility/diagnostics
 
 - RTSP SDP now includes a session-level `c=IN IP4 ...` connection line and `a=sendonly`.

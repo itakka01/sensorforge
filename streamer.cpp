@@ -775,8 +775,22 @@ static void serviceRtspSlot(uint8_t slotIndex)
         }
     }
 
-    if (slot.rx.length() >= 4096 ||
+    if (slot.rx.length() >= 4096) {
+        logWrite("RTSP client closed | client=" + String((unsigned)slotIndex + 1U) +
+                 " | reason=request buffer overflow");
+        closeRtspClientSlot(slotIndex);
+        return;
+    }
+
+    // The 30 s timeout is only a handshake/control timeout. Once PLAY is active,
+    // long periods without inbound RTSP commands are normal: VLC/ffplay may simply
+    // receive interleaved RTP without sending GET_PARAMETER keepalives. The live
+    // TCP socket and bounded writeAll() stall detection are the authoritative
+    // liveness checks for an active stream.
+    if (!slot.playing &&
         (uint32_t)(millis() - slot.lastActivityMs) > RTSP_IDLE_TIMEOUT_MS) {
+        logWrite("RTSP client closed | client=" + String((unsigned)slotIndex + 1U) +
+                 " | reason=setup/control timeout");
         closeRtspClientSlot(slotIndex);
     }
 }

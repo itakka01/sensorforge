@@ -365,6 +365,14 @@ static const UiTextEntry UI_TEXTS[] = {
     {"Diese Werte sind für erfahrene Benutzer und externe Mikrofonhardware gedacht. Der User-Modus verwendet den Board-Standard.", "These values are intended for experienced users and external microphone hardware. User mode uses the board default."}, // UI_AUDIO_ADVANCED_HELP
     {"Schließen", "Close"}, // UI_AUDIO_CLOSE
     {"Bei Audio = an verwendet SensorForge für normale Aufnahmen automatisch MKV. AVI bleibt vorerst video-only.", "When Audio = on, SensorForge automatically uses MKV for normal recordings. AVI remains video-only for now."}, // UI_AUDIO_MKV_REQUIRED
+    {"Mikrofon 10 Sekunden testen", "Test microphone for 10 seconds"}, // UI_AUDIO_MIC_TEST_BUTTON
+    {"Nimmt mit den aktuell gespeicherten Audioeinstellungen etwa 10 Sekunden auf. Danach kann die Testaufnahme direkt im Browser angehört werden. Die temporäre WAV-Datei wird beim nächsten Test überschrieben.", "Records about 10 seconds using the currently saved audio settings. The test recording can then be played directly in the browser. The temporary WAV file is overwritten by the next test."}, // UI_AUDIO_MIC_TEST_HELP
+    {"Im Netzwerk-Streamer-Modus besitzt der Streamer den Audio-Capture. Für den Mikrofontest bitte in einen normalen Betriebsmodus wechseln.", "In Network Streamer mode the streamer owns audio capture. Switch to a normal operating mode for the microphone test."}, // UI_AUDIO_MIC_TEST_STREAMER_BLOCKED
+    {"Bereit für Mikrofontest.", "Ready for microphone test."}, // UI_AUDIO_MIC_TEST_READY
+    {"Aufnahme läuft – bitte etwa 10 Sekunden warten …", "Recording – please wait about 10 seconds …"}, // UI_AUDIO_MIC_TEST_RECORDING
+    {"Testaufnahme fertig.", "Test recording complete."}, // UI_AUDIO_MIC_TEST_DONE
+    {"Mikrofontest fehlgeschlagen:", "Microphone test failed:"}, // UI_AUDIO_MIC_TEST_FAILED
+    {"WAV herunterladen", "Download WAV"}, // UI_AUDIO_MIC_TEST_DOWNLOAD
     {"GRÜN", "GREEN"}, // UI_AUDIO_LOAD_GREEN
     {"ORANGE", "ORANGE"}, // UI_AUDIO_LOAD_ORANGE
     {"ROT", "RED"}, // UI_AUDIO_LOAD_RED
