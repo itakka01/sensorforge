@@ -1,31 +1,267 @@
 SENSORFORGE / ESP32-S3 CAMERA (XIAO + FREENOVE)
 PROJEKTBESCHREIBUNG, RELEASESTAND UND WIEDEREINSTIEGSPROMPT
-Stand: 2026-09-29
-Dokumentrevision: v83 + v84-Kandidat RTSP/Netzwerk-Streamer + Thermal-/WiFi-Tuning 2026-09-29 / v67-Stabilitaetsbasis + offene Langzeitqualifikation
+Stand: 2026-09-30
+Dokumentrevision: v83 + v84-Kandidat RTSP/Netzwerk-Streamer + Thermal-/WiFi-Tuning + vorlaeufig abgeschlossene Streamer-Feldqualifikation
+
+WICHTIGER BUILD-FIX 2026-09-30:
+- Nach dem AP/STA-Netzwerkumbau enthielt `webconfig.cpp` noch eine Alt-Referenz auf
+  `BOARD_WIFI_TX_POWER_MIN_X10`. Diese Konstante gehoert nicht mehr zur generischen
+  WiFi-TX-Policy. Die UI verwendet wieder `boardWifiTxPowerSafeMinimumX10()` und
+  `SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10`.
+- Dieser Fix aendert keine Laufzeitlogik; er beseitigt ausschliesslich den gemeldeten
+  Arduino-ESP32/GCC-14-Compilefehler im WiFi-TX-Abschnitt.
+
+
+======================================================================
+V84-KANDIDAT - AUDIO-DRAIN BUILD-FIX 2026-09-29
+======================================================================
+
+- `streamer.cpp` verwendet fuer die drei Audio-Backlog-Schwellen explizit
+  `std::max<size_t>(...)`. Damit ist die GCC-14-Template-Aufloesung bei
+  gemischten `size_t`-/`uint32_t`-Operanden eindeutig.
+- Keine Aenderung am Laufzeitverhalten des Audio-Realtime-Drains.
 Aktueller Entwicklungs-/Arbeits-Release: v83 (Produktionsqualifikation fuer XIAO-Langzeitrecording noch offen)
 Produktname: SensorForge
 Plattformname: Fabric Node
 Core-Version im Branding: 7.1.0
 
+======================================================================
+V84-KANDIDAT 2026-09-30 - NETZWERKMODUS AP ODER EXTERNES WLAN
+======================================================================
 
+- `hotspot_enabled` ist ab diesem Stand die verbindliche Auswahl des laufenden
+  Service-Netzwerks:
+    * `hotspot_enabled=1` -> SensorForge stellt wie bisher den eigenen Hotspot/AP
+      bereit.
+    * `hotspot_enabled=0` -> SensorForge verbindet sich dauerhaft bzw. bis zum
+      normalen Timeout mit `wifi_ssid`/`wifi_pass` als STA im vorhandenen WLAN.
+- Diese Auswahl gilt fuer WebConfig und den Netzwerk-Streamer. Der Streamer ist
+  damit nicht mehr auf den Hotspot-Modus beschraenkt und kann RTSP/HTTP ueber
+  das konfigurierte Infrastruktur-WLAN bereitstellen.
+- Normalbetrieb: `wifi_timeout_sec=0` bedeutet weiterhin keine automatische
+  Abschaltung; bei einem Wert >0 wird WebConfig/WiFi nach der bestehenden
+  Inaktivitaetslogik wieder abgeschaltet.
+- Streamer-Modus: der gespeicherte WiFi-Timeout wird nicht geloescht oder
+  veraendert, aber bewusst nicht angewendet. RTSP/HTTP muessen in diesem Modus
+  dauerhaft erreichbar bleiben. Nach Rueckkehr in den Normalmodus gilt der
+  gespeicherte Timeout wieder.
+- Magnet-/Service-Wakeup startet jeweils den vom Benutzer ausgewaehlten
+  Netzwerkmodus erneut; kein separater AP-Zwang wird eingefuehrt.
+- Streamer-Network-Health und Recovery pruefen jetzt passend zur Konfiguration
+  entweder AP+AP-IP oder STA+WL_CONNECTED+STA-IP.
+- SDP verwendet die IP des tatsaechlich aktiven Interfaces; die sichtbaren
+  Hostname-URLs `*.local` bleiben unveraendert.
+- Kein automatischer Wechsel auf Hotspot bei fehlgeschlagenem STA-Connect. Eine
+  falsche SSID/ein nicht erreichbares WLAN fuehrt deshalb bewusst nicht still
+  zu einer anderen Betriebsart.
+- RTSP/Audio/HTTP-MJPEG, RTCP, Thermal- und WiFi-TX-Power-Logik wurden durch
+  diesen Umbau nicht funktional veraendert.
+- Fuer diesen Netzwerkumbau wurde in dieser Umgebung kein echter Arduino-Build
+  und kein Hardwaretest ausgefuehrt; diese Qualifikation bleibt vor Freigabe
+  des vollstaendigen v84-Releases erforderlich.
+
+
+======================================================================
+V84 STREAMER-FELDQUALIFIKATION 2026-09-30 - VORLAEUFIG PRODUKTIONSREIF
+======================================================================
+
+- Der Netzwerk-Streamer wird nach den aktuellen XIAO-Hardwaretests vom Benutzer
+  vorlaeufig als produktionsreif betrachtet. Das Thema RTSP-/HTTP-Livestreaming
+  inklusive L16-Audio ist damit vorerst abgeschlossen; keine weiteren Eingriffe
+  ohne neuen reproduzierbaren Befund.
+- Erfolgreich getestet wurde die maximale derzeit vorgesehene Clientlast mit
+  2x RTSP + 2x HTTP-MJPEG gleichzeitig sowie aktivem 16-kHz/16-bit/Mono-Audio.
+- Unter diesem Lastfall blieben beide RTSP-Videostreams nach den RTCP-/Audio-
+  Korrekturen nahezu aktuell und liefen untereinander praktisch gleichauf. Der
+  zuvor beobachtete anwachsende RTSP-Lag bis in den Minutenbereich gilt damit
+  im aktuellen Teststand als behoben.
+- Relevanter Feldstatus unter 2x RTSP + 2x HTTP:
+    * reale Streamer-FPS ca. 2.8 fps bei Ziel 4 fps
+    * RTSP Frame-Sendezeit ca. 75 ms im Mittel, ca. 85 ms Maximum
+    * beide RTSP-Clients laut Diagnose unauffaellig, keine ausgelassenen Frames
+    * RTCP Sender Reports fuer Video und Audio liefen auf beiden Clients
+    * Audio-Ring ca. 18.5/256 KiB, High-Water ca. 21.9 KiB
+    * Capture-Drops 0 Byte
+    * bewusster Live-Abwurf vorhanden (im beobachteten Lauf ca. 120 KiB)
+    * keine Socket-Stalls, keine Kamera-/Audio-/Netzwerk-Recoveries
+    * interner Heap ca. 76 KiB frei, Minimum seit Boot ca. 70 KiB
+    * PSRAM ca. 7.5 MiB frei
+    * CPU-Temperatur ca. 72.2 C bei Thermal-Stufe 0
+- Der zuletzt getestete Audio-Feinschliff verwendet eine konservative Live-Reserve
+  von ca. 220 ms, normale Korrektur erst oberhalb ca. 500 ms sowie eine 3-s-
+  Start-Gnadenzeit. Im Feld blieb der Startknackser vereinzelt bestehen; deshalb
+  wird dieser Feinschliff nicht als vollstaendige Klick-Eliminierung bewertet.
+- Audioqualitaet: Das fruehere laute periodische Krachen durch vollen 256-KiB-
+  Audio-Ring und Capture-Drops ist behoben. Bei 2x RTSP treten im laufenden
+  Betrieb nur noch seltene, tolerierbare Klick-/Knackartefakte auf. Bei maximaler
+  Last 2x RTSP + 2x HTTP sind diese etwas haeufiger, bleiben laut Feldtest aber
+  tolerierbar. Direkt beim Oeffnen eines RTSP-Streams kann vereinzelt ein deutlicher
+  Startknackser auftreten. Dieses bekannte Restartefakt wird fuer den aktuellen
+  Produktionsstand akzeptiert.
+- Ursache des verbleibenden Restklickens ist nach aktueller Diagnose nicht der
+  Mikrofon-Capture: Capture-Drops bleiben 0. Unter hoher Last wird stattdessen
+  bewusst altes PCM verworfen, um Echtzeit und Ringstabilitaet zu erhalten.
+  Weitere kosmetische Verfahren wie PCM-Fade/Crossfade an Abwurfstellen sind
+  moegliche spaetere Verbesserungen, aber KEINE offene Produktionsanforderung.
+- Thermal/WiFi-Feldbefund: Eine reduzierte WiFi-TX-Power zeigte einen klaren
+  positiven Temperatureffekt. Mit angepasster Sendeleistung lag der beobachtete
+  Dauerbetrieb mit Streaming/Audio deutlich unter der 80-C-Notfallgrenze. Die
+  TX-Power bleibt benutzerkonfigurierbar und board-sicher begrenzt.
+- Die formale Release-ID bleibt weiterhin v83 / Worktree v84-candidate, bis der
+  komplette v84-Stand als Release paketiert, dokumentiert und getaggt wird. Die
+  Aussage 'vorlaeufig produktionsreif' bezieht sich hier auf den getesteten
+  Streamer-Funktionspfad, nicht auf die weiterhin separat offene Langzeit-
+  qualifikation des Recording-/Storage-Pfads.
+
+======================================================================
+V84-KANDIDAT 2026-09-30 - SANFTER AUDIO-LIVE-ABWURF / ZWEITER DRAIN-PASS
+======================================================================
+
+- Feldtest nach dem Realtime-Drain: 2x RTSP + 1x HTTP liefen stabil und nahezu
+  live; der Audio-Ring lag nur noch bei ca. 15 KiB (High-Water ca. 37 KiB),
+  Capture-Drops waren 0. Das fruehere laute Krachen war verschwunden.
+- Verbleibend war ein leises periodisches Klicken bei zwei RTSP-Clients sowie
+  ein deutlich wachsender Zaehler fuer bewussten Live-Abwurf.
+- Der bewusste Live-Abwurf erfolgt deshalb nicht mehr als grosser Sprung bis zur
+  kleinen Zielreserve. Ab moderatem Rueckstau werden pro Audio-Service-Pass nur
+  kleine, begrenzte Mengen alter kompletter PCM-Samples verworfen (typisch ca.
+  40 ms; bei echtem >1-s-Rueckstau maximal ca. 120 ms pro Pass). Die RTP-
+  Samplezeit wird exakt um die verworfenen Samples fortgeschrieben.
+- Die Zielreserve wurde leicht auf ca. 60 ms entspannt, um ein Pendeln direkt an
+  der Korrekturschwelle zu reduzieren.
+- `serviceAudio()` laeuft nun zweimal pro Firmwareloop: vor und nach dem seriellen
+  Video-Fan-out. Hintergrund: Bei 2x RTSP + 1x HTTP fiel der reale Videotakt im
+  Feld auf etwa 2,4 fps; nur ein Audio-Service-Pass pro Loop war damit fuer den
+  kontinuierlichen 16-kHz-PCM-Strom zu selten.
+- Die Diagnose zaehlt die in beiden Passes gemeinsam abgearbeiteten Audiopakete.
+- Video/RTP-JPEG, RTCP, HTTP-MJPEG, WiFi/TX-Power, Kamera und Thermal wurden durch
+  diese Aenderung nicht umgebaut.
+- Hardwaretest offen: 2x RTSP (+ optional HTTP) auf Restklicken, Live-Abwurf-Rate,
+  Audio-Ring/High-Water, Capture-Drops und A/V-Synchronitaet beobachten.
+
+
+======================================================================
+V84-KANDIDAT 2026-09-29 - RTSP-AUDIO REALTIME-DRAIN / RING-UEBERLAUFSCHUTZ
+======================================================================
+
+- Hardwarediagnose mit zwei RTSP-Clients zeigte den Audio-PSRAM-Ring bei
+  256/256 KiB, High-Water 256 KiB und bereits >170 KiB Capture-Drops. Das
+  korrelierte direkt mit periodischem Klicken und spaeter lautem Krachen.
+- Ursache: Der bisherige Streamer las pro Hauptloop maximal 960 PCM-Bytes.
+  16 kHz / 16 bit / mono erzeugt dagegen rund 32 KiB/s; bei serieller Video-
+  ausgabe an zwei RTSP-Clients war der Audio-Drain daher systematisch zu klein.
+- L16 wird nun in kurzen ca. 20-ms-Bloecken packetisiert. `serviceAudio()` kann
+  pro Aufruf mehrere Bloecke abarbeiten und erhoeht sein begrenztes Arbeitsbudget
+  bei wachsendem Ringrueckstau.
+- Im Normalbetrieb bleibt nur eine kleine Live-Reserve im Ring. Falls durch einen
+  aussergewoehnlichen Stall bereits mehr als etwa eine Sekunde altes PCM wartet,
+  werden nur die aeltesten kompletten Samples bis zur Live-Reserve verworfen.
+  Die gemeinsame RTP-Samplezeit wird um genau diese Samples weitergefuehrt, damit
+  kein minutenlanger Audioaltbestand abgespielt wird.
+- Diagnose trennt jetzt Capture-Drops von bewusstem Live-Abwurf und zeigt die
+  Drain-Paketanzahl. RTCP, Video, HTTP-MJPEG, WiFi und Thermal bleiben unveraendert.
+- Hardwarequalifikation offen: 1x/2x RTSP Audio auf Knacken, Ringbelegung, Drops
+  und A/V-Synchronitaet pruefen.
+
+
+======================================================================
+V84-KANDIDAT 2026-09-29 - RTCP SENDER REPORTS / A-V-ZEITREFERENZ
+======================================================================
+
+- Der RTSP/TCP-Streamer sendet nun pro aktivem RTSP-Client und pro Track periodische
+  RTCP Sender Reports als RFC3550-Compound-Paket inklusive SDES/CNAME.
+- Video-RTP (90 kHz) und L16-Audio-RTP (Audio-Samplerate) werden damit auf dieselbe
+  NTP-Wandzeit referenziert. Ziel ist, Standardclients eine saubere gemeinsame
+  A/V-Zeitbasis zu geben und anwachsende Player-/Jitterpuffer zu vermeiden.
+- RTCP verwendet jeweils den direkt auf RTP folgenden interleaved TCP-Kanal:
+  Video RTP/RTCP sowie Audio RTP/RTCP entsprechend dem ausgehandelten SETUP.
+- Paket- und Payload-Octet-Counter werden pro Client/Track separat geführt.
+- Die bestehende Streamer-Diagnose zeigt pro RTSP-Client die Anzahl gesendeter
+  Video- und Audio-RTCP-Sender-Reports sowie Audio-Ringbelegung, Kapazitaet,
+  High-Water und verworfene Audio-Bytes.
+- HTTP-MJPEG, Kamera-Capture, Recording und Netzwerk-Betriebsart wurden dadurch
+  nicht verändert. Hardware-/VLC-/ffmpeg-Qualifikation bleibt offen.
 
 ======================================================================
 OFFENE V84-AUFGABE - RTSP / NETZWERK-STREAMER (WIEDEREINSTIEG VERBINDLICH)
+
+AKTUELLER V84-KANDIDAT 2026-09-29 - GEMEINSAMER PCM-BLOCK / PLAY-A/V-ZEITBASIS:
+
+- Feldbefund nach Trennung des RTP-Audiozustands: Mit zwei RTSP-Clients ist Sprache wieder verstaendlich, jedoch tritt ein rhythmisches Klicken auf. Mit nur einem RTSP-Client ist Audio wieder sauber. Zusaetzlich wurde bei einem Stream ein A/V-Versatz von ca. 4 s beobachtet.
+- Multi-Client-Audio verwendet nun eine einzige monotone Sampleposition fuer den gemeinsam aus dem PSRAM-Ring gelesenen PCM-Block. Diese Position wird pro Nutzdatenblock genau EINMAL fortgeschrieben, nachdem derselbe unveraenderte L16-Nutzdatenblock allen aktiven RTSP-Clients angeboten wurde.
+- Jeder Client speichert bei seinem eigenen PLAY die aktuelle gemeinsame Sampleposition als `audioSampleOrigin`. Sein RTP-Audiotimestamp ergibt sich aus `audioTimestampBase + (sharedSamplePosition - audioSampleOrigin)`. Sequenznummer, SSRC, Timestamp-Basis und Session-Ursprung bleiben client-lokal; nur PCM-Daten und deren echte Sampleposition sind gemeinsam.
+- Separater gefundener A/V-Startfehler: `RTP-Info` meldete fuer Video bisher den Timestamp des zuletzt aufgenommenen JPEG. Im Streamer-Leerlauf wird der Snapshot nur alle 5 s aktualisiert; beim PLAY konnte der angekuendigte Video-Start deshalb mehrere Sekunden alt sein. Das passt zum beobachteten ca. 4-s-Versatz.
+- Fix: Bei PLAY wird ein frischer monotone 90-kHz-Videozeitpunkt als `videoPlayTimestamp` genommen und genau dieser in RTP-Info angekuendigt. Audio- und Video-Sessionursprung werden damit beide am realen PLAY-Zeitpunkt etabliert.
+- Keine Aenderung an HTTP-MJPEG, Kamera-Capture, WiFi/TX-Power, Thermal, Recording oder persistenter Konfiguration.
+- Hardwaretest offen: zuerst 1x RTSP + Audio, danach 2x RTSP + Audio; rhythmisches Klicken sowie A/V-Versatz nach 1/10/30 min beobachten.
+
+AKTUELLER V84-KANDIDAT 2026-09-29 - MULTI-CLIENT AUDIO RTP-STATE VOLLSTAENDIG GETRENNT:
+
+- Feldbefund: Mit genau einem RTSP-Client war L16-Audio verstaendlich, mit zwei parallelen RTSP-Clients trat dagegen nur noch Rauschen auf. Der gemeinsame Audio-Capture selbst ist damit nicht der primaere Verdaechtige.
+- Die zuvor eingefuehrte `audioSampleOrigin`-Loesung liess weiterhin einen globalen `audioSamplesSent`-Zaehler als gemeinsame RTP-Zeitquelle bestehen. Das war fuer strikt getrennte RTSP-Sessions unnoetige Kopplung.
+- Fix: Jeder `RtspClientSlot` besitzt nun seinen eigenen `audioSamplesSent`-Zaehler. Sequenznummer, SSRC, Timestamp-Basis und Sample-Fortschritt sind damit vollstaendig client-lokal.
+- Nur der PCM-Capture und der unveraenderte PCM-Nutzdatenblock werden gemeinsam genutzt. Die L16-Byteorder-Konvertierung erfolgt einmal vor dem Fan-out und mutiert keinen client-spezifischen Buffer.
+- Bei Audio-Recovery wird pro Client nur dessen eigener bereits erfolgreich gesendeter Sample-Fortschritt in die Timestamp-Basis uebernommen.
+- Keine Aenderung an RTSP-Video, HTTP-MJPEG, Kamera, WiFi, Thermal oder persistenter Konfiguration.
+- Hardwaretest offen: erst 1x RTSP + Audio, danach 2x RTSP + Audio. Dabei Audioqualitaet beider Clients und A/V-Drift getrennt pruefen.
+
+AKTUELLER V84-KANDIDAT 2026-09-29 - MULTI-CLIENT RTSP AUDIO-ZEITBASIS:
+
+- Feldtest mit zwei RTSP-Clients zeigte trotz unauffaelliger Server-Sendediagnose stark anwachsende RTSP-Verzoegerungen bis in den Minutenbereich; HTTP-MJPEG blieb dagegen nahezu aktuell.
+- Ursache im Code: `audioSamplesSent` war ein globaler Capture-Zaehler, waehrend jeder RTSP-Client einen eigenen `audioTimestampBase` erhielt. Ein spaeter gestarteter Client bekam dadurch im ersten Audio-RTP-Paket zusaetzlich die bereits vor seinem PLAY fuer andere Clients aufgelaufene Samplezahl. Bei 16 kHz entsprechen 9,6 Mio. Samples bereits 600 Sekunden Zeitversatz.
+- Fix: Jeder RTSP-Client besitzt nun einen eigenen `audioSampleOrigin`. Beim PLAY wird der aktuelle globale Capture-Samplezaehler als Ursprung gespeichert. Der gesendete Audio-RTP-Timestamp lautet pro Client `audioTimestampBase + (audioSamplesSent - audioSampleOrigin)`. RTP-Info und erstes Audiopaket beginnen damit konsistent auf derselben Client-Zeitachse.
+- Der Audio-Capture selbst bleibt gemeinsam und exklusiv im Streamer; kein zweiter PDM/I2S-Pfad wird eingefuehrt.
+- Bei Audio-Capture-Recovery wird die bis dahin pro Client vergangene Samplezahl in dessen Timestamp-Basis uebernommen und der Client-Ursprung nach Reset des globalen Zaehler auf 0 gesetzt.
+- Die zuvor eingefuehrte adaptive RTSP-Frame-Ausduennung ist fuer die weitere Qualifikation deaktiviert. Sie hatte den beobachteten Player-Lag nicht verlaesslich reduziert und kann Timestamp-Probleme verschleiern. Die monotone reale 90-kHz-Videozeitbasis bleibt bestehen.
+- Bestehende Diagnose zeigt weiterhin pro RTSP-Client Verbindung und reale Frame-Sendezeit/Transportlast; sie behauptet keine aktive Aufhol-Ausduennung mehr.
+- Hardwaretest offen: 2x RTSP mit Audio plus 1x HTTP-MJPEG mindestens 20-30 Minuten beobachten und A/V-Latenz beider RTSP-Clients vergleichen.
+
 ======================================================================
 
 STATUS / AUSGANGSPUNKT:
+
+AKTUELLER V84-KANDIDAT 2026-09-29 - RTSP LIVE-LATENZ / DIAGNOSE:
+
+- Nach Feldbeobachtung mit zwei parallelen RTSP-Clients und einem HTTP-MJPEG-Client zeigte HTTP weiterhin nahezu Echtzeit, waehrend RTSP nach laengerem Lauf Sekunden bis fast eine Minute Verzoegerung aufbauen konnte.
+- Ursache im bisherigen Sender-Timing: RTP/JPEG verwendete einen starren Timestamp-Fortschritt `90000/fps`. Wenn reale Multi-Client-TCP-Auslieferung zeitweise langsamer als die konfigurierte Bildrate war, konnte der Empfaenger dies als wachsenden Timing-/Jitterversatz interpretieren.
+- RTP/JPEG verwendet deshalb nun eine echte monotone 90-kHz-Zeitbasis aus `esp_timer_get_time()`. Alle Clients desselben Kameraframes erhalten denselben realzeitbezogenen RTP-Timestamp.
+- Die pro Client bestehende Frame-Ausduennung bleibt als Lastschutz erhalten, trennt einen langsamen Client nicht und verwirft nur ganze zukuenftige Frames. Sie reagiert nun etwas frueher; Recovery zur Vollrate bleibt bewusst langsamer.
+- Die bestehende Einstiegsseiten-Diagnose hinter `Streamer-Status / Diagnose` zeigt pro RTSP-Client anschaulich Verbindung, letzte Frame-Sendezeit, relative Sendelast zum Framebudget, Divider 1/x, ausgelassene Frames und Anzahl der Regelungswechsel. Gruen = unauffaellig, Orange = Ausduennung aktiv, Rot = erhoehte Transportlast.
+- Es wird bewusst kein exakter TCP-Pufferstand in Byte behauptet, da dieser ueber den verwendeten Arduino-ESP32-NetworkClient nicht portabel als Belegungswert bereitsteht. `Socket-Stalls` bleiben der harte Fehler-/Stallzaehler.
+- HTTP-MJPEG bleibt unveraendert. Kein zusaetzlicher Diagnose-Endpunkt fuer den Benutzer; die vorhandene Seite nutzt weiter `/streamer_status` intern.
+- Echte Arduino-Build- und Langzeit-Hardwaretests dieses Kandidaten sind noch offen.
+
+IMPLEMENTIERUNGSSTAND 2026-09-29, RTSP-LIVE-LATENZ (V84-KANDIDAT, NOCH NICHT FREIGEGEBEN):
+
+- RTSP/TCP-Video besitzt nun pro Client eine adaptive Lag-Entlastung. Ein langsamer Viewer wird bei steigender Sendelast nicht vorschnell getrennt, sondern erhaelt zunaechst jeden zweiten Video-Frame; bei anhaltendem Rueckstau kann die Ausduennung schrittweise auf jeden dritten bzw. vierten Frame steigen.
+- Die Ausduennung gilt nur fuer den betroffenen RTSP-Client. Ein zweiter gesunder Viewer bleibt bei voller Framefolge.
+- Sobald die gemessene Frame-Sendezeit ueber mehrere erfolgreiche Frames wieder deutlich unter dem Framebudget liegt, wird die Ausduennung schrittweise zurueckgenommen, bis wieder jeder Frame gesendet wird. Dadurch soll vorhandener TCP-Rueckstau kontrolliert abfliessen und der Client graduell zur Live-Zeit zurueckkehren, statt nach einem harten Sprung oder erzwungenen Reconnect.
+- Es werden ausschliesslich komplette zukuenftige Frames ausgelassen. Ein bereits begonnener RTP/JPEG-Frame wird nicht absichtlich mitten im RTSP/TCP-Interleaving abgebrochen. Echte Socket-/Write-Fehler verwenden weiterhin den bestehenden sicheren Cleanup-Pfad.
+- `/streamer_status` zeigt fuer beide RTSP-Slots den aktuellen Frame-Divider, die Zahl ausgelassener Frames und die letzte gemessene Frame-Sendezeit, damit die Regelung im Feld beobachtbar bleibt.
+- Keine Aenderung an Kamera-Capture-FPS, RTP/JPEG-Format, Audioformat, WiFi-Betriebsart oder persistenter Config. Arduino-Build sowie Zwei-Client-Langzeittest/Delay-Messung sind noch offen.
 
 IMPLEMENTIERUNGSSTAND 2026-09-29, THERMAL-/WIFI-TUNING (V84-KANDIDAT, NOCH NICHT FREIGEGEBEN):
 
 - Streamer-Thermal-Throttling wurde konservativ um 1 °C vorgezogen: Stufe 1 ab 77 °C, Stufe 2 ab 78 °C; der Thermal-Emergency-Pfad bleibt bei 80 °C.
 - Die board-spezifische Thermal-Emergency-Grenze liegt nun in `board_config.h`, damit spätere Hardwarequalifikation je Board zentral erfolgen kann.
 - WiFi-TX-Power ist additiv über `wifi_tx_power_dbm` konfigurierbar. Fehlt der Key, bleibt der Board-Default 20.0 dBm und damit das bisherige Verhalten erhalten.
-- `board_config.h` definiert pro Board die diskreten zulässigen dBm-Stufen sowie Minimum, Maximum und Default.
+- `board_config.h` definiert pro Board die diskreten hardwaregültigen dBm-Stufen und den Default. Zusätzlich steht am Anfang von `board_config.h` eine generelle SensorForge-Reichweitensicherheitsgrenze von 8.5 dBm. Sie ist ausdrücklich KEINE boardspezifische Funkgrenze.
+- Der effektive Minimalwert wird generisch aus der jeweiligen Board-Tabelle bestimmt: SensorForge verwendet die erste dort gelistete gültige Stufe, die mindestens 8.5 dBm beträgt. Unterstützt ein zukünftiges Board 8.5 dBm nicht, wird automatisch die nächsthöhere Board-Stufe verwendet. Bereits gespeicherte Zwischen-/Altwerte werden beim Einlesen ebenfalls auf die nächsthöhere gültige Board-Stufe normalisiert; liegt kein höherer Wert vor, wird die höchste sichere Board-Stufe verwendet. Niedrigere hardwaregültige Stufen dürfen in einer Board-Tabelle dokumentiert bleiben, werden aber nicht als Benutzerwert angeboten oder angewendet.
+- Die UI warnt bei niedrigen freigegebenen Stufen bis 11 dBm vor geringer Reichweitenreserve.
 - Die konfigurierte TX-Power wird gleichermaßen im STA-Betrieb (externes WLAN) und AP-Betrieb (lokaler Hotspot) als maximale Sendeleistung angewendet. Die bestehende AP/STA-Betriebslogik wird dadurch NICHT geändert.
 - Bei einer realen Verbindung mit einem externen WLAN wird der RSSI-Wert erfasst. Die Konfigurationsseite zeigt die letzte Messung dieser Laufzeit auf einer Grün-Gelb-Rot-Skala und gibt eine konservative TX-Power-Empfehlung aus. Es erfolgt ausdrücklich KEINE automatische Änderung.
 - Für diese Änderungen sind noch echter Arduino-Build, Reichweiten-/Paketverlusttest und Temperatur-A/B-Test erforderlich; keine Hardwarequalifikation behaupten.
 
 IMPLEMENTIERUNGSSTAND 2026-09-28, V84-KANDIDAT (NOCH NICHT FREIGEGEBEN):
+
+AKTUELLER NACHTRAG 2026-09-30 - RTSP/AUDIO-LIVE-FEINSCHLIFF:
+- RTSP L16 Audio nutzt den inzwischen bewaehrten Zwei-Pass-Drain mit RTCP-Synchronisation.
+- Fuer den finalen Feinschliff wird eine konservative Live-Reserve von ca. 220 ms akzeptiert; normale Korrektur beginnt erst oberhalb ca. 500 ms.
+- Die ersten 3 s nach Audio-Start/Recovery werden nicht per Live-Abwurf korrigiert, um Startklicks zu vermeiden.
+- Harte Schutzkorrektur bei echtem Rueckstau > ca. 1 s bleibt erhalten; Capture-Drops sollen 0 bleiben.
+- Die kompakte RTSP-/HTTP-/Audio-Anzeige auf der Streamer-Uebersicht wird nun per bestehendem Live-Status aktualisiert und kann nicht mehr gegen die Diagnose veralten.
+- Dieser Feinschliff aendert weder Video/HTTP-Pipeline noch RTCP, WiFi, Thermal-Schutz oder Recordingpfade.
+
 
 - Die im Folgenden beschriebene Streamer-Funktion wurde im aktuellen Arbeitsbaum als
   isoliertes `streamer.cpp/.h`-Modul umgesetzt: RTSP/RTP-JPEG ueber TCP, optionales

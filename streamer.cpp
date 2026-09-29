@@ -12,6 +12,7 @@
 #include <Preferences.h>
 #include <algorithm>
 #include <esp_heap_caps.h>
+#include <sys/time.h>
 
 // Camera lifecycle is owned by the main firmware. The streamer requests a
 // controlled reinitialization only while operating_mode=streamer.
@@ -26,6 +27,16 @@ static const uint8_t RTP_PT_JPEG = 26;
 static const uint8_t RTP_PT_L16 = 96;
 static const size_t RTP_PACKET_BYTES = 1400;
 static const uint32_t CLIENT_STALL_TIMEOUT_MS = 250;
+// Per-client live-latency control. A client that starts consuming most of the
+// frame interval is not disconnected. Instead SensorForge gradually thins only
+// that client's future video frames so the existing TCP backlog can drain.
+// Level 1 sends every second frame, level 2 every third, level 3 every fourth.
+// Recovery is intentionally slower than escalation to avoid oscillation.
+static const uint8_t RTSP_LAG_MAX_DIVIDER = 4;
+static const uint8_t RTSP_LAG_SLOW_SAMPLES_TO_STEP_UP = 2;
+static const uint8_t RTSP_LAG_HEALTHY_SAMPLES_TO_STEP_DOWN = 16;
+static const uint8_t RTSP_LAG_ENTER_PERCENT = 60;
+static const uint8_t RTSP_LAG_RECOVER_PERCENT = 40;
 static const uint32_t RTSP_IDLE_TIMEOUT_MS = 30000;
 // Application-level self-healing. The existing 30 s task watchdog remains the
 // final protection for a hard task/deadlock stall.
@@ -40,6 +51,22 @@ static const uint8_t NETWORK_BAD_CHECKS_BEFORE_RECOVERY = 3;
 static const uint32_t AUDIO_HEALTH_INTERVAL_MS = 2000;
 static const uint32_t AUDIO_PROGRESS_STALL_MS = 8000;
 static const uint32_t AUDIO_RECOVERY_RETRY_MS = 10000;
+// RTSP audio is a live stream, not an archival queue. Capture produces about
+// 32 KiB/s at the XIAO default (16 kHz / 16 bit / mono), so serviceAudio()
+// must drain multiple short packets per firmware loop. Keep a small jitter
+// reserve, but never allow seconds of stale PCM to accumulate in PSRAM.
+static const uint32_t AUDIO_RTP_PACKET_TARGET_MS = 20;
+static const uint32_t AUDIO_TARGET_BACKLOG_MS = 220;
+static const uint32_t AUDIO_HIGH_BACKLOG_MS = 350;
+static const uint32_t AUDIO_SOFT_TRIM_BACKLOG_MS = 500;
+static const uint32_t AUDIO_STALE_BACKLOG_MS = 1000;
+static const uint32_t AUDIO_SOFT_TRIM_STEP_MS = 20;
+static const uint32_t AUDIO_STALE_TRIM_STEP_MS = 80;
+static const uint32_t AUDIO_START_GRACE_MS = 3000;
+static const uint32_t AUDIO_DRAIN_BUDGET_NORMAL_MS = 35;
+static const uint32_t AUDIO_DRAIN_BUDGET_HIGH_MS = 80;
+static const uint32_t AUDIO_DRAIN_BUDGET_STALE_MS = 120;
+static const uint8_t AUDIO_DRAIN_MAX_PACKETS_PER_CALL = 32;
 static const uint32_t MEMORY_HEALTH_INTERVAL_MS = 60000;
 static const uint8_t MEMORY_CRITICAL_CHECKS_BEFORE_REBOOT = 3;
 static const uint32_t HEALTH_PERSIST_INTERVAL_MS = 6UL * 60UL * 60UL * 1000UL;
@@ -77,6 +104,34 @@ struct RtspClientSlot {
     uint32_t videoSsrc = 0;
     uint32_t audioSsrc = 0;
     uint32_t audioTimestampBase = 0;
+    // RTP A/V session origin. Both tracks are anchored at the same PLAY instant.
+    // Audio payload is captured once and fanned out, while each RTSP client keeps
+    // its own RTP sequence/SSRC/timestamp base.
+    int64_t playStartedUs = 0;
+    uint32_t videoPlayTimestamp = 0;
+    uint64_t audioSampleOrigin = 0;
+    uint64_t audioSamplesSent = 0;
+    // RTCP sender-report state is strictly per client and per media track.
+    uint32_t videoRtpPacketsSent = 0;
+    uint32_t videoRtpOctetsSent = 0;
+    uint32_t audioRtpPacketsSent = 0;
+    uint32_t audioRtpOctetsSent = 0;
+    uint32_t lastVideoRtpTimestamp = 0;
+    uint32_t lastAudioRtpTimestamp = 0;
+    uint32_t lastRtcpVideoMs = 0;
+    uint32_t lastRtcpAudioMs = 0;
+    uint32_t videoRtcpReportsSent = 0;
+    uint32_t audioRtcpReportsSent = 0;
+    // Adaptive live-latency state. Divider 1 = every frame, 2 = every second
+    // frame, etc. This state is strictly per client so one slow viewer does not
+    // force the other RTSP viewer to lose frames.
+    uint8_t videoFrameDivider = 1;
+    uint8_t videoFramePhase = 0;
+    uint8_t videoSlowSamples = 0;
+    uint8_t videoHealthySamples = 0;
+    uint32_t videoLastSendUs = 0;
+    uint32_t videoFramesSkipped = 0;
+    uint32_t videoAdaptiveChanges = 0;
 };
 static RtspClientSlot rtspClients[RTSP_CLIENT_SLOTS];
 static const uint8_t HTTP_CLIENT_SLOTS = 2;
@@ -91,13 +146,22 @@ static WebServer *webServer = nullptr;
 
 static bool started = false;
 static bool audioActive = false;
+static uint32_t audioStartedMs = 0;
 static bool audioAdvertised = false;
 static String lastError;
 
 static uint32_t videoTimestamp = 0;
-static uint64_t audioSamplesSent = 0;
+static uint32_t videoTimestampBase = 0;
+static int64_t videoClockStartUs = 0;
 static uint64_t audioBytesSent = 0;
 static uint32_t audioPacketsSent = 0;
+// Monotonic sample position of PCM blocks consumed from the shared capture ring.
+// Every active RTSP client sees the same block/sample position; clients differ
+// only in their RTP transport state and per-session origin.
+static uint64_t audioSamplesDistributed = 0;
+static uint64_t audioLiveDiscardBytes = 0;
+static uint32_t audioDrainPacketsLast = 0;
+static uint32_t audioDrainPacketsMax = 0;
 static uint32_t lastFrameDueMs = 0;
 static uint32_t statsStartedMs = 0;
 static uint32_t framesCaptured = 0;
@@ -271,6 +335,9 @@ struct ParsedJpeg {
     size_t quantBytes;
 };
 
+static uint32_t effectiveStreamerFps();
+static uint32_t videoTimestampForNow();
+
 static bool rtspSlotConnected(RtspClientSlot &slot)
 {
     return slot.client && slot.client.connected();
@@ -299,7 +366,7 @@ static void closeRtspClientSlot(uint8_t index)
     if (audioActive && !anyRtspAudioConsumer()) {
         audioCaptureStop();
         audioActive = false;
-        audioSamplesSent = 0;
+        audioStartedMs = 0;
     }
 }
 
@@ -522,6 +589,192 @@ static bool sendInterleaved(RtspClientSlot &slot, uint8_t channel, const uint8_t
            writeAll(slot.client, packet, len);
 }
 
+
+static void currentNtpTimestamp(uint32_t &seconds, uint32_t &fraction)
+{
+    timeval tv = {};
+    gettimeofday(&tv, nullptr);
+    // NTP epoch starts 1900-01-01, Unix epoch 1970-01-01.
+    const uint64_t ntpSeconds = (uint64_t)tv.tv_sec + 2208988800ULL;
+    seconds = (uint32_t)ntpSeconds;
+    fraction = (uint32_t)(((uint64_t)tv.tv_usec << 32) / 1000000ULL);
+}
+
+static bool sendRtcpSenderReport(RtspClientSlot &slot, bool audio)
+{
+    if (!rtspSlotConnected(slot) || !slot.playing)
+        return false;
+
+    const bool trackReady = audio ? slot.audioSetup : slot.videoSetup;
+    if (!trackReady)
+        return true;
+
+    // RFC3550 compound RTCP: Sender Report followed by one SDES CNAME chunk.
+    // This gives standard clients a common NTP wall-clock reference for the
+    // otherwise independent 90-kHz video and audio sample clocks.
+    uint8_t packet[128] = {};
+    size_t o = 0;
+
+    const uint32_t ssrc = audio ? slot.audioSsrc : slot.videoSsrc;
+    const uint32_t rtpTimestamp = audio
+        ? (slot.audioTimestampBase + (uint32_t)(((uint64_t)std::max<int64_t>(0, esp_timer_get_time() - slot.playStartedUs) *
+                                                (uint64_t)std::max(1, cfg_audio_sample_rate)) / 1000000ULL))
+        : videoTimestampForNow();
+    const uint32_t packetCount = audio ? slot.audioRtpPacketsSent : slot.videoRtpPacketsSent;
+    const uint32_t octetCount = audio ? slot.audioRtpOctetsSent : slot.videoRtpOctetsSent;
+
+    uint32_t ntpSec = 0, ntpFrac = 0;
+    currentNtpTimestamp(ntpSec, ntpFrac);
+
+    // Sender Report, 28 bytes.
+    packet[o++] = 0x80; // V=2, P=0, RC=0
+    packet[o++] = 200;  // SR
+    packet[o++] = 0;
+    packet[o++] = 6;    // 28 bytes => 7 32-bit words => length field 6
+    const uint32_t srWords[6] = {ssrc, ntpSec, ntpFrac, rtpTimestamp, packetCount, octetCount};
+    for (uint32_t word : srWords) {
+        packet[o++] = (uint8_t)(word >> 24);
+        packet[o++] = (uint8_t)(word >> 16);
+        packet[o++] = (uint8_t)(word >> 8);
+        packet[o++] = (uint8_t)word;
+    }
+
+    // SDES with one CNAME item. Keep the name short and deterministic.
+    String cname = String("sensorforge-") + String(slot.session, HEX) + "@" + cfg_hostname;
+    if (cname.length() > 63)
+        cname.remove(63);
+    const size_t sdesStart = o;
+    packet[o++] = 0x81; // V=2, SC=1
+    packet[o++] = 202;  // SDES
+    packet[o++] = 0;    // length filled after padding
+    packet[o++] = 0;
+    packet[o++] = (uint8_t)(ssrc >> 24);
+    packet[o++] = (uint8_t)(ssrc >> 16);
+    packet[o++] = (uint8_t)(ssrc >> 8);
+    packet[o++] = (uint8_t)ssrc;
+    packet[o++] = 1; // CNAME
+    packet[o++] = (uint8_t)cname.length();
+    memcpy(packet + o, cname.c_str(), cname.length());
+    o += cname.length();
+    packet[o++] = 0; // END item
+    while ((o - sdesStart) & 3U)
+        packet[o++] = 0;
+    const uint16_t sdesWordsMinusOne = (uint16_t)(((o - sdesStart) / 4U) - 1U);
+    packet[sdesStart + 2] = (uint8_t)(sdesWordsMinusOne >> 8);
+    packet[sdesStart + 3] = (uint8_t)sdesWordsMinusOne;
+
+    const uint8_t rtcpChannel = (uint8_t)((audio ? slot.audioChannel : slot.videoChannel) + 1U);
+    return sendInterleaved(slot, rtcpChannel, packet, o);
+}
+
+static void serviceRtcpSenderReports()
+{
+    const uint32_t now = millis();
+    for (uint8_t i = 0; i < RTSP_CLIENT_SLOTS; ++i) {
+        RtspClientSlot &slot = rtspClients[i];
+        if (!rtspSlotConnected(slot) || !slot.playing)
+            continue;
+
+        if (slot.videoSetup && (slot.lastRtcpVideoMs == 0 || (uint32_t)(now - slot.lastRtcpVideoMs) >= 1000U)) {
+            if (sendRtcpSenderReport(slot, false)) {
+                slot.lastRtcpVideoMs = now;
+                ++slot.videoRtcpReportsSent;
+            }
+            else {
+                closeRtspClientSlot(i);
+                continue;
+            }
+        }
+        if (slot.audioSetup && audioActive &&
+            (slot.lastRtcpAudioMs == 0 || (uint32_t)(now - slot.lastRtcpAudioMs) >= 1000U)) {
+            if (sendRtcpSenderReport(slot, true)) {
+                slot.lastRtcpAudioMs = now;
+                ++slot.audioRtcpReportsSent;
+            }
+            else
+                closeRtspClientSlot(i);
+        }
+    }
+}
+
+static bool shouldSendRtspVideoFrame(RtspClientSlot &slot)
+{
+    const uint8_t divider = std::max<uint8_t>(1U, slot.videoFrameDivider);
+    const bool sendThisFrame = slot.videoFramePhase == 0;
+    slot.videoFramePhase = (uint8_t)((slot.videoFramePhase + 1U) % divider);
+    if (!sendThisFrame)
+        ++slot.videoFramesSkipped;
+    return sendThisFrame;
+}
+
+static void setRtspVideoDivider(RtspClientSlot &slot, uint8_t divider, uint32_t sendUs)
+{
+    divider = std::max<uint8_t>(1U, std::min<uint8_t>(RTSP_LAG_MAX_DIVIDER, divider));
+    if (divider == slot.videoFrameDivider)
+        return;
+
+    const uint8_t oldDivider = slot.videoFrameDivider;
+    slot.videoFrameDivider = divider;
+    slot.videoFramePhase = 0;
+    slot.videoSlowSamples = 0;
+    slot.videoHealthySamples = 0;
+    ++slot.videoAdaptiveChanges;
+
+    String msg = "RTSP live-latency adapt | session=" + String(slot.session) +
+                 " | divider=" + String((unsigned)oldDivider) + "->" + String((unsigned)divider) +
+                 " | send_ms=" + String(sendUs / 1000.0f, 1) +
+                 " | skipped=" + String(slot.videoFramesSkipped);
+    logWrite(msg);
+}
+
+static void updateRtspVideoLagState(RtspClientSlot &slot, uint32_t sendUs)
+{
+    slot.videoLastSendUs = sendUs;
+
+    const uint32_t fps = std::max<uint32_t>(1U, effectiveStreamerFps());
+    const uint32_t frameBudgetUs = 1000000UL / fps;
+    const uint32_t enterUs = (frameBudgetUs * RTSP_LAG_ENTER_PERCENT) / 100U;
+    const uint32_t recoverUs = (frameBudgetUs * RTSP_LAG_RECOVER_PERCENT) / 100U;
+
+    if (sendUs >= enterUs) {
+        slot.videoHealthySamples = 0;
+        if (slot.videoSlowSamples < 255)
+            ++slot.videoSlowSamples;
+        if (slot.videoSlowSamples >= RTSP_LAG_SLOW_SAMPLES_TO_STEP_UP &&
+            slot.videoFrameDivider < RTSP_LAG_MAX_DIVIDER) {
+            setRtspVideoDivider(slot, (uint8_t)(slot.videoFrameDivider + 1U), sendUs);
+        }
+        return;
+    }
+
+    slot.videoSlowSamples = 0;
+    if (sendUs <= recoverUs) {
+        if (slot.videoHealthySamples < 255)
+            ++slot.videoHealthySamples;
+        if (slot.videoHealthySamples >= RTSP_LAG_HEALTHY_SAMPLES_TO_STEP_DOWN &&
+            slot.videoFrameDivider > 1U) {
+            setRtspVideoDivider(slot, (uint8_t)(slot.videoFrameDivider - 1U), sendUs);
+        }
+    } else {
+        // Neutral zone: keep the current divider and require a fresh healthy
+        // run before restoring more frames.
+        slot.videoHealthySamples = 0;
+    }
+}
+
+static uint32_t videoTimestampForNow()
+{
+    // RTP/JPEG uses a 90 kHz clock. Derive it from the real monotonic clock,
+    // not from the configured FPS. This prevents receiver jitter/playback
+    // buffers from growing when multi-client TCP delivery temporarily makes
+    // the actual frame cadence slower than the configured capture cadence.
+    const int64_t nowUs = esp_timer_get_time();
+    if (videoClockStartUs <= 0)
+        videoClockStartUs = nowUs;
+    const uint64_t elapsedUs = (uint64_t)std::max<int64_t>(0, nowUs - videoClockStartUs);
+    return videoTimestampBase + (uint32_t)((elapsedUs * 90ULL) / 1000ULL);
+}
+
 static bool sendRtpJpeg(RtspClientSlot &slot, const uint8_t *jpeg, size_t jpegBytes)
 {
     const uint32_t sendStartedUs = micros();
@@ -586,6 +839,9 @@ static bool sendRtpJpeg(RtspClientSlot &slot, const uint8_t *jpeg, size_t jpegBy
 
         ++rtspVideoPackets;
         rtspVideoWireBytes += (uint64_t)(h + fragment + 4U);
+        ++slot.videoRtpPacketsSent;
+        slot.videoRtpOctetsSent += (uint32_t)(h + fragment - 12U);
+        slot.lastVideoRtpTimestamp = videoTimestamp;
         ++slot.videoSequence;
         offset += fragment;
         delay(0);
@@ -599,6 +855,7 @@ static bool sendRtpJpeg(RtspClientSlot &slot, const uint8_t *jpeg, size_t jpegBy
     if (stressState.mode != StreamerStressMode::None && sendElapsedUs > stressState.maxRtspFrameSendUs)
         stressState.maxRtspFrameSendUs = sendElapsedUs;
 
+    slot.videoLastSendUs = sendElapsedUs;
     ++framesRtsp;
     return true;
 }
@@ -649,14 +906,25 @@ static bool startAudioIfNeeded()
         return false;
     }
 
-    audioSamplesSent = 0;
     audioBytesSent = 0;
     audioPacketsSent = 0;
+    audioSamplesDistributed = 0;
+    audioLiveDiscardBytes = 0;
+    audioDrainPacketsLast = 0;
+    audioDrainPacketsMax = 0;
     for (uint8_t i = 0; i < RTSP_CLIENT_SLOTS; ++i) {
-        if (rtspSlotConnected(rtspClients[i]) && rtspClients[i].playing && rtspClients[i].audioSetup)
-            rtspClients[i].audioTimestampBase = esp_random();
+        RtspClientSlot &slot = rtspClients[i];
+        if (rtspSlotConnected(slot) && slot.playing && slot.audioSetup) {
+            if (slot.audioTimestampBase == 0) {
+                const uint32_t rnd = esp_random();
+                slot.audioTimestampBase = rnd ? rnd : 1;
+            }
+            slot.audioSampleOrigin = audioSamplesDistributed;
+            slot.audioSamplesSent = 0;
+        }
     }
     audioActive = true;
+    audioStartedMs = millis();
     logWrite("RTSP audio capture started | rate=" + String(format.sampleRate) +
              " | bits=" + String(format.bitsPerSample) +
              " | channels=" + String(format.channels));
@@ -669,28 +937,104 @@ static void serviceAudio()
         return;
 
     AudioFormat format = audioCaptureActiveFormat();
-    if (format.bitsPerSample != 16 || format.channels == 0)
+    if (format.bitsPerSample != 16 || format.channels == 0 || format.sampleRate == 0)
         return;
 
-    uint8_t pcm[960];
-    size_t bytes = audioCaptureRead(pcm, sizeof(pcm), 0);
-    size_t frameBytes = 2U * format.channels;
-    bytes -= bytes % frameBytes;
-    if (!bytes)
-        return;
+    const size_t frameBytes = 2U * format.channels;
+    const size_t maxPayloadBytes = 1200U - 12U;
+    size_t packetBytes =
+        ((size_t)format.sampleRate * frameBytes * AUDIO_RTP_PACKET_TARGET_MS) / 1000U;
+    packetBytes -= packetBytes % frameBytes;
+    if (packetBytes == 0)
+        packetBytes = frameBytes;
+    if (packetBytes > maxPayloadBytes) {
+        packetBytes = maxPayloadBytes - (maxPayloadBytes % frameBytes);
+    }
 
-    // L16 uses network byte order. SensorForge's PCM capture is packed little-endian.
-    for (size_t i = 0; i + 1 < bytes; i += 2)
-        std::swap(pcm[i], pcm[i + 1]);
+    const size_t bytesPerSecond = (size_t)format.sampleRate * frameBytes;
+    const size_t targetBacklogBytes =
+        std::max<size_t>(frameBytes, (bytesPerSecond * AUDIO_TARGET_BACKLOG_MS) / 1000U);
+    const size_t highBacklogBytes =
+        std::max<size_t>(frameBytes, (bytesPerSecond * AUDIO_HIGH_BACKLOG_MS) / 1000U);
+    const size_t softTrimBacklogBytes =
+        std::max<size_t>(frameBytes, (bytesPerSecond * AUDIO_SOFT_TRIM_BACKLOG_MS) / 1000U);
+    const size_t staleBacklogBytes =
+        std::max<size_t>(frameBytes, (bytesPerSecond * AUDIO_STALE_BACKLOG_MS) / 1000U);
 
-    size_t offset = 0;
-    while (offset < bytes) {
-        uint8_t payloadBuffer[1200 - 12];
-        size_t payload = std::min(sizeof(payloadBuffer), bytes - offset);
-        payload -= payload % frameBytes;
-        if (!payload)
+    size_t buffered = audioCaptureBufferedBytes();
+
+    // Live correction is intentionally gradual. Once the ring exceeds a modest
+    // backlog, discard only a small bounded amount of the oldest complete PCM
+    // per service pass instead of cutting a large hole down to the target in one
+    // step. If a true >1 s backlog exists, the step is larger but remains
+    // bounded. This keeps the stream near live while reducing audible clicks.
+    const bool audioStartGraceActive =
+        audioStartedMs != 0 && (uint32_t)(millis() - audioStartedMs) < AUDIO_START_GRACE_MS;
+
+    if (!audioStartGraceActive && buffered > softTrimBacklogBytes) {
+        const uint32_t trimStepMs = buffered > staleBacklogBytes
+            ? AUDIO_STALE_TRIM_STEP_MS
+            : AUDIO_SOFT_TRIM_STEP_MS;
+        size_t maxDiscardBytes = (bytesPerSecond * trimStepMs) / 1000U;
+        maxDiscardBytes -= maxDiscardBytes % frameBytes;
+        size_t discardBytes = buffered > targetBacklogBytes
+            ? (buffered - targetBacklogBytes)
+            : 0;
+        discardBytes = std::min(discardBytes, maxDiscardBytes);
+        discardBytes -= discardBytes % frameBytes;
+
+        uint8_t discardBuffer[1200 - 12];
+        while (discardBytes > 0) {
+            size_t chunk = std::min(sizeof(discardBuffer), discardBytes);
+            chunk -= chunk % frameBytes;
+            if (!chunk)
+                break;
+            const size_t got = audioCaptureRead(discardBuffer, chunk, 0);
+            if (!got)
+                break;
+            const size_t aligned = got - (got % frameBytes);
+            if (!aligned)
+                break;
+            audioSamplesDistributed += aligned / frameBytes;
+            audioLiveDiscardBytes += aligned;
+            discardBytes -= std::min(discardBytes, aligned);
+            delay(0);
+        }
+        buffered = audioCaptureBufferedBytes();
+    }
+
+    uint32_t budgetMs = AUDIO_DRAIN_BUDGET_NORMAL_MS;
+    if (buffered > staleBacklogBytes)
+        budgetMs = AUDIO_DRAIN_BUDGET_STALE_MS;
+    else if (buffered > highBacklogBytes)
+        budgetMs = AUDIO_DRAIN_BUDGET_HIGH_MS;
+
+    const uint32_t startedMs = millis();
+    uint8_t packetsThisCall = 0;
+
+    while (packetsThisCall < AUDIO_DRAIN_MAX_PACKETS_PER_CALL) {
+        buffered = audioCaptureBufferedBytes();
+        if (buffered < packetBytes)
             break;
-        memcpy(payloadBuffer, pcm + offset, payload);
+        if (packetsThisCall > 0 && buffered <= targetBacklogBytes)
+            break;
+        if ((uint32_t)(millis() - startedMs) >= budgetMs)
+            break;
+
+        uint8_t pcm[1200 - 12];
+        size_t bytes = audioCaptureRead(pcm, packetBytes, 0);
+        bytes -= bytes % frameBytes;
+        if (!bytes)
+            break;
+
+        // L16 uses network byte order. SensorForge's PCM capture is packed
+        // little-endian. Convert once, then fan out this exact payload block to
+        // every active RTSP client.
+        for (size_t i = 0; i + 1 < bytes; i += 2)
+            std::swap(pcm[i], pcm[i + 1]);
+
+        const size_t samples = bytes / frameBytes;
+        const uint64_t sharedSamplePosition = audioSamplesDistributed;
 
         for (uint8_t i = 0; i < RTSP_CLIENT_SLOTS; ++i) {
             RtspClientSlot &slot = rtspClients[i];
@@ -698,7 +1042,12 @@ static void serviceAudio()
                 continue;
 
             uint8_t packet[1200];
-            uint32_t timestamp = slot.audioTimestampBase + (uint32_t)audioSamplesSent;
+            const uint64_t sessionSamples =
+                sharedSamplePosition >= slot.audioSampleOrigin
+                    ? (sharedSamplePosition - slot.audioSampleOrigin)
+                    : 0;
+            const uint32_t timestamp =
+                slot.audioTimestampBase + (uint32_t)sessionSamples;
             size_t h = 0;
             packet[h++] = 0x80;
             packet[h++] = RTP_PT_L16;
@@ -712,23 +1061,28 @@ static void serviceAudio()
             packet[h++] = (uint8_t)(slot.audioSsrc >> 16);
             packet[h++] = (uint8_t)(slot.audioSsrc >> 8);
             packet[h++] = (uint8_t)slot.audioSsrc;
-            memcpy(packet + h, payloadBuffer, payload);
+            memcpy(packet + h, pcm, bytes);
 
-            if (!sendInterleaved(slot, slot.audioChannel, packet, h + payload)) {
+            if (!sendInterleaved(slot, slot.audioChannel, packet, h + bytes)) {
                 lastError = "RTSP audio client disconnected";
                 closeRtspClientSlot(i);
                 continue;
             }
             ++slot.audioSequence;
+            ++slot.audioRtpPacketsSent;
+            slot.audioRtpOctetsSent += (uint32_t)bytes;
+            slot.lastAudioRtpTimestamp = timestamp;
+            slot.audioSamplesSent = sessionSamples + samples;
             ++audioPacketsSent;
-            audioBytesSent += payload;
+            audioBytesSent += bytes;
         }
 
-        size_t samples = payload / frameBytes;
-        audioSamplesSent += samples;
-        offset += payload;
+        audioSamplesDistributed += samples;
+        ++packetsThisCall;
         delay(0);
     }
+
+    audioDrainPacketsLast += packetsThisCall;
 }
 
 static String headerValue(const String &request, const char *name)
@@ -744,6 +1098,17 @@ static String headerValue(const String &request, const char *name)
     String value = request.substring(p, e);
     value.trim();
     return value;
+}
+
+static IPAddress activeNetworkIp()
+{
+    const wifi_mode_t mode = WiFi.getMode();
+    if (mode == WIFI_AP || mode == WIFI_AP_STA) {
+        const IPAddress apIp = WiFi.softAPIP();
+        if (apIp[0] || apIp[1] || apIp[2] || apIp[3])
+            return apIp;
+    }
+    return WiFi.localIP();
 }
 
 static String rtspBaseUrl()
@@ -782,7 +1147,7 @@ static String makeSdp()
     sdp += "o=- 0 0 IN IP4 0.0.0.0\r\n";
     sdp += "s=SensorForge Network Streamer\r\n";
     sdp += "t=0 0\r\n";
-    sdp += "c=IN IP4 " + WiFi.localIP().toString() + "\r\n";
+    sdp += "c=IN IP4 " + activeNetworkIp().toString() + "\r\n";
     sdp += "a=control:*\r\n";
     sdp += "a=sendonly\r\n";
     sdp += "m=video 0 RTP/AVP 26\r\n";
@@ -895,16 +1260,30 @@ static void handleRtspRequest(uint8_t slotIndex, const String &request)
         }
 
         slot.playing = true;
+        slot.playStartedUs = esp_timer_get_time();
+        slot.lastRtcpVideoMs = 0;
+        slot.lastRtcpAudioMs = 0;
+        slot.videoRtpPacketsSent = 0;
+        slot.videoRtpOctetsSent = 0;
+        slot.audioRtpPacketsSent = 0;
+        slot.audioRtpOctetsSent = 0;
+        slot.videoRtcpReportsSent = 0;
+        slot.audioRtcpReportsSent = 0;
+        // RTP-Info must describe the timeline that starts now, not the timestamp
+        // of the last idle snapshot (which can be several seconds old).
+        slot.videoPlayTimestamp = videoTimestampForNow();
         if (slot.audioSetup) {
-            if (slot.audioTimestampBase == 0)
-                slot.audioTimestampBase = esp_random() ? esp_random() : 1;
             startAudioIfNeeded();
+            const uint32_t rnd = esp_random();
+            slot.audioTimestampBase = rnd ? rnd : 1;
+            slot.audioSampleOrigin = audioSamplesDistributed;
+            slot.audioSamplesSent = 0;
         }
 
         logWrite("RTSP PLAY accepted | client=" + String((unsigned)slotIndex + 1U) +
                  " | video=1 | audio=" + String(slot.audioSetup ? 1 : 0));
         String rtpInfo = "RTP-Info: url=" + rtspBaseUrl() + "/trackID=0;seq=" +
-                         String(slot.videoSequence) + ";rtptime=" + String(videoTimestamp);
+                         String(slot.videoSequence) + ";rtptime=" + String(slot.videoPlayTimestamp);
         if (slot.audioSetup) {
             rtpInfo += ",url=" + rtspBaseUrl() + "/trackID=1;seq=" +
                        String(slot.audioSequence) + ";rtptime=" +
@@ -1114,6 +1493,7 @@ static bool recoverStreamerCamera(const String &reason)
     if (audioCaptureIsRunning())
         audioCaptureStop();
     audioActive = false;
+    audioStartedMs = 0;
 
     if (cameraInitialized) {
         esp_camera_deinit();
@@ -1184,12 +1564,15 @@ static bool restartStreamerAudioCapture()
     // capture backend/ring is restarted. Video and RTSP sessions stay alive.
     audioCaptureStop();
     audioActive = false;
+    audioStartedMs = 0;
     for (uint8_t i = 0; i < RTSP_CLIENT_SLOTS; ++i) {
         RtspClientSlot &slot = rtspClients[i];
-        if (rtspSlotConnected(slot) && slot.playing && slot.audioSetup)
-            slot.audioTimestampBase += (uint32_t)audioSamplesSent;
+        if (rtspSlotConnected(slot) && slot.playing && slot.audioSetup) {
+            slot.audioTimestampBase += (uint32_t)slot.audioSamplesSent;
+            slot.audioSampleOrigin = audioSamplesDistributed;
+            slot.audioSamplesSent = 0;
+        }
     }
-    audioSamplesSent = 0;
 
     if (!audioCaptureStart(format, error)) {
         lastError = "RTSP audio recovery failed: " + error;
@@ -1199,6 +1582,7 @@ static bool restartStreamerAudioCapture()
     }
 
     audioActive = true;
+    audioStartedMs = millis();
     lastAudioProgressMs = now;
     lastAudioCapturedBytes = audioCaptureStats().bytesCaptured;
     ++audioRecoveryCount;
@@ -1249,11 +1633,34 @@ static void serviceNetworkHealth()
     lastNetworkHealthMs = now;
 
     const wifi_mode_t mode = WiFi.getMode();
-    const bool apMode = (mode == WIFI_AP || mode == WIFI_AP_STA);
-    const IPAddress apIp = WiFi.softAPIP();
-    const bool apIpValid = apIp[0] != 0 || apIp[1] != 0 || apIp[2] != 0 || apIp[3] != 0;
+    const bool expectAp = cfg_hotspot_enabled != 0;
+    bool healthy = false;
+    String unhealthyReason;
 
-    if (apMode && apIpValid) {
+    if (expectAp) {
+        const bool apMode = (mode == WIFI_AP || mode == WIFI_AP_STA);
+        const IPAddress apIp = WiFi.softAPIP();
+        const bool apIpValid = apIp[0] != 0 || apIp[1] != 0 || apIp[2] != 0 || apIp[3] != 0;
+        healthy = apMode && apIpValid;
+        if (!healthy)
+            unhealthyReason = !apMode ? "WiFi AP mode lost" : "WiFi AP address unavailable";
+    } else {
+        const bool staMode = (mode == WIFI_STA || mode == WIFI_AP_STA);
+        const IPAddress staIp = WiFi.localIP();
+        const bool staIpValid = staIp[0] != 0 || staIp[1] != 0 || staIp[2] != 0 || staIp[3] != 0;
+        const bool staConnected = WiFi.status() == WL_CONNECTED;
+        healthy = staMode && staConnected && staIpValid;
+        if (!healthy) {
+            if (!staMode)
+                unhealthyReason = "WiFi STA mode lost";
+            else if (!staConnected)
+                unhealthyReason = "Infrastructure WiFi disconnected";
+            else
+                unhealthyReason = "Infrastructure WiFi address unavailable";
+        }
+    }
+
+    if (healthy) {
         networkBadChecks = 0;
         return;
     }
@@ -1262,7 +1669,7 @@ static void serviceNetworkHealth()
         ++networkBadChecks;
     if (networkBadChecks >= NETWORK_BAD_CHECKS_BEFORE_RECOVERY && !networkRecoveryRequested) {
         networkRecoveryRequested = true;
-        networkRecoveryReason = !apMode ? "WiFi AP mode lost" : "WiFi AP address unavailable";
+        networkRecoveryReason = unhealthyReason;
         lastRecoveryReason = networkRecoveryReason;
         logWrite("STREAMER network recovery requested | reason=" + networkRecoveryReason);
     }
@@ -1698,6 +2105,9 @@ static void captureAndDistributeFrame()
             jpegMaxBytes = (uint32_t)frame->len;
         if (stressState.mode != StreamerStressMode::None && frame->len > stressState.maxJpegBytes)
             stressState.maxJpegBytes = (uint32_t)frame->len;
+        // Stamp every captured JPEG from the real monotonic 90-kHz RTP clock.
+        // All RTSP clients sharing this camera frame receive the same timestamp.
+        videoTimestamp = videoTimestampForNow();
         cacheSnapshot(frame->buf, frame->len);
         snapshotLastMs = millis();
         if (needRtsp) {
@@ -1705,6 +2115,10 @@ static void captureAndDistributeFrame()
                 RtspClientSlot &slot = rtspClients[i];
                 if (!rtspSlotConnected(slot) || !slot.playing || !slot.videoSetup)
                     continue;
+                // Send every captured frame. Adaptive RTSP frame thinning is
+                // intentionally disabled while multi-client A/V timing is being
+                // qualified; dropping future frames did not address receiver-side
+                // latency reliably and could obscure timestamp faults.
                 if (!sendRtpJpeg(slot, frame->buf, frame->len))
                     closeRtspClientSlot(i);
             }
@@ -1714,7 +2128,6 @@ static void captureAndDistributeFrame()
     }
 
     esp_camera_fb_return(frame);
-    videoTimestamp += 90000U / fps;
 }
 
 static bool httpRequestIsStream(const String &request)
@@ -1892,6 +2305,8 @@ static void handleHttpStreamRedirect()
 
 static void handleStreamerStatus()
 {
+    const AudioCaptureStats audioStats = audioCaptureStats();
+    const size_t audioBufferedBytes = audioCaptureBufferedBytes();
     String json = String("{\"ready\":") + (started ? "true" : "false") +
         ",\"mode\":\"" + (streamerModeEnabled() ? "streamer" : "normal") + "\"" +
         ",\"rtsp_enabled\":" + (cfg_streamer_rtsp_enabled ? "true" : "false") +
@@ -1904,6 +2319,13 @@ static void handleStreamerStatus()
         ",\"audio_active\":" + (audioActive ? "true" : "false") +
         ",\"audio_packets\":" + String(audioPacketsSent) +
         ",\"audio_bytes\":" + String((unsigned long long)audioBytesSent) +
+        ",\"audio_buffered_bytes\":" + String((unsigned long long)audioBufferedBytes) +
+        ",\"audio_buffer_capacity\":" + String((unsigned long long)audioStats.bufferCapacity) +
+        ",\"audio_buffer_high_water\":" + String((unsigned long long)audioStats.bufferHighWater) +
+        ",\"audio_dropped_bytes\":" + String((unsigned long long)audioStats.bytesDropped) +
+        ",\"audio_live_discard_bytes\":" + String((unsigned long long)audioLiveDiscardBytes) +
+        ",\"audio_drain_packets_last\":" + String(audioDrainPacketsLast) +
+        ",\"audio_drain_packets_max\":" + String(audioDrainPacketsMax) +
         ",\"audio_recoveries\":" + String(audioRecoveryCount) +
         ",\"audio_recovery_failures\":" + String(audioRecoveryFailureCount) +
         ",\"socket_stalls\":" + String(socketStallCount) +
@@ -1938,6 +2360,21 @@ static void handleStreamerStatus()
         ",\"http_video_bytes\":" + String((unsigned long long)httpVideoBytes) +
         ",\"rtsp_send_avg_ms\":" + String(rtspFrameSendCount ? ((float)rtspFrameSendUsTotal / (float)rtspFrameSendCount / 1000.0f) : 0.0f, 2) +
         ",\"rtsp_send_max_ms\":" + String((float)rtspFrameSendMaxUs / 1000.0f, 2) +
+        ",\"rtsp_client1_divider\":" + String((unsigned)rtspClients[0].videoFrameDivider) +
+        ",\"rtsp_client1_skipped\":" + String(rtspClients[0].videoFramesSkipped) +
+        ",\"rtsp_client1_last_send_ms\":" + String((float)rtspClients[0].videoLastSendUs / 1000.0f, 2) +
+        ",\"rtsp_client1_adaptive_changes\":" + String(rtspClients[0].videoAdaptiveChanges) +
+        ",\"rtsp_client1_connected\":" + (rtspSlotConnected(rtspClients[0]) && rtspClients[0].playing ? "true" : "false") +
+        ",\"rtsp_client1_rtcp_video_sr\":" + String(rtspClients[0].videoRtcpReportsSent) +
+        ",\"rtsp_client1_rtcp_audio_sr\":" + String(rtspClients[0].audioRtcpReportsSent) +
+        ",\"rtsp_client2_divider\":" + String((unsigned)rtspClients[1].videoFrameDivider) +
+        ",\"rtsp_client2_skipped\":" + String(rtspClients[1].videoFramesSkipped) +
+        ",\"rtsp_client2_last_send_ms\":" + String((float)rtspClients[1].videoLastSendUs / 1000.0f, 2) +
+        ",\"rtsp_client2_adaptive_changes\":" + String(rtspClients[1].videoAdaptiveChanges) +
+        ",\"rtsp_client2_connected\":" + (rtspSlotConnected(rtspClients[1]) && rtspClients[1].playing ? "true" : "false") +
+        ",\"rtsp_client2_rtcp_video_sr\":" + String(rtspClients[1].videoRtcpReportsSent) +
+        ",\"rtsp_client2_rtcp_audio_sr\":" + String(rtspClients[1].audioRtcpReportsSent) +
+        ",\"rtp_video_clock\":\"monotonic_90khz\"" +
         ",\"stress_active\":" + (stressState.mode != StreamerStressMode::None ? "true" : "false") +
         ",\"stress_mode\":\"" + String(stressModeName(stressState.mode)) + "\"" +
         ",\"stress_remaining_ms\":" + String(stressState.mode != StreamerStressMode::None ? (stressState.durationMs - std::min<uint32_t>(stressState.durationMs, (uint32_t)(millis() - stressState.startedMs))) : 0U) +
@@ -1999,7 +2436,9 @@ bool streamerBegin(String &error)
     memset(heapHistory, 0, sizeof(heapHistory));
     heapHistoryCount = 0;
     heapHistoryPos = 0;
-    videoTimestamp = esp_random();
+    videoTimestampBase = esp_random();
+    videoTimestamp = videoTimestampBase;
+    videoClockStartUs = esp_timer_get_time();
     jpegBytesCaptured = 0;
     jpegFramesCaptured = 0;
     jpegMaxBytes = 0;
@@ -2027,8 +2466,15 @@ void streamerLoop()
 
     serviceRtspControl();
     serviceHttpControl();
+    audioDrainPacketsLast = 0;
     serviceAudio();
     captureAndDistributeFrame();
+    // A second short drain pass prevents the long serial video fan-out from
+    // starving 16-kHz PCM when multiple RTSP/HTTP consumers are active.
+    serviceAudio();
+    if (audioDrainPacketsLast > audioDrainPacketsMax)
+        audioDrainPacketsMax = audioDrainPacketsLast;
+    serviceRtcpSenderReports();
     serviceStreamerHealth();
     serviceStreamerStress();
 
@@ -2072,7 +2518,7 @@ void streamerNoteNetworkRecoveryResult(bool success, const String &error)
         networkRecoveryReason = "retry after failed network recovery";
         nextNetworkRecoveryAllowedMs = millis() + 5000UL;
     }
-    // A failed AP/WebConfig restart leaves the device unreachable. Reboot is
+    // A failed network/WebConfig restart leaves the device unreachable. Reboot is
     // safer than spinning in a fast retry loop, but only after two confirmed
     // failed full-stack recovery attempts.
     if (networkRecoveryFailureCount >= 2) {

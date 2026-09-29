@@ -3,6 +3,24 @@
 #include <Arduino.h>
 
 // =============================================================
+// GENERELLE SENSORFORGE-WIFI-SICHERHEIT
+// =============================================================
+
+// Global reachability safety floor for user-configurable WiFi TX power.
+// Stored in tenths of dBm: 85 = 8.5 dBm.
+//
+// This is deliberately NOT a board-specific radio capability value. A future
+// board profile may list hardware-valid TX levels below 8.5 dBm, but SensorForge
+// will not expose/apply them through config.txt because an accidentally tiny
+// transmit power can make a field device difficult or impossible to reach.
+//
+// The effective minimum is always the first value in the active board's
+// BOARD_WIFI_TX_POWER_LEVELS_X10[] that is >= this global floor. Therefore a
+// board without an 8.5-dBm step automatically uses its next higher valid step.
+static constexpr int16_t SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10 = 85;
+
+
+// =============================================================
 // BOARD AUSWÄHLEN
 // =============================================================
 
@@ -98,17 +116,15 @@
 // constant (not config.txt) so field configuration cannot weaken protection.
 #define BOARD_THERMAL_EMERGENCY_C 80.0f
 
-// WiFi TX-power policy. Values are stored as tenths of dBm so the supported
-// ESP32-S3 steps remain exact without floating-point comparisons. The actual
-// user selection is persisted in config.txt; this board profile defines only
-// the hardware-valid choices and the safe backwards-compatible default.
+// WiFi TX-power capabilities. Values are stored as tenths of dBm so supported
+// steps remain exact without floating-point comparisons. Keep this list in
+// ascending order. The actual user selection is persisted in config.txt; the
+// generic SensorForge safety floor decides which low levels are selectable.
 static constexpr int16_t BOARD_WIFI_TX_POWER_LEVELS_X10[] = {
     20, 50, 70, 85, 110, 130, 140, 150, 165, 180, 200
 };
 static constexpr size_t BOARD_WIFI_TX_POWER_LEVEL_COUNT =
     sizeof(BOARD_WIFI_TX_POWER_LEVELS_X10) / sizeof(BOARD_WIFI_TX_POWER_LEVELS_X10[0]);
-static constexpr int16_t BOARD_WIFI_TX_POWER_MIN_X10 = 20;
-static constexpr int16_t BOARD_WIFI_TX_POWER_MAX_X10 = 200;
 static constexpr int16_t BOARD_WIFI_TX_POWER_DEFAULT_X10 = 200;
 
 
@@ -241,16 +257,15 @@ static constexpr int16_t BOARD_WIFI_TX_POWER_DEFAULT_X10 = 200;
 // without changing the generic thermal safety implementation.
 #define BOARD_THERMAL_EMERGENCY_C 80.0f
 
-// WiFi TX-power policy for XIAO ESP32S3 Sense. Keep the full ESP32-S3
-// discrete TX-power set available; the default deliberately matches the
-// previous firmware behaviour (maximum/default radio power).
+// WiFi TX-power capabilities for XIAO ESP32S3 Sense. Keep the list in
+// ascending order. The generic SensorForge safety floor above decides which
+// low levels are user-selectable; the board profile itself describes the
+// hardware-valid levels and the backwards-compatible default.
 static constexpr int16_t BOARD_WIFI_TX_POWER_LEVELS_X10[] = {
-    20, 50, 70, 85, 110, 130, 140, 150, 165, 180, 200
+    85, 110, 130, 140, 150, 165, 180, 200
 };
 static constexpr size_t BOARD_WIFI_TX_POWER_LEVEL_COUNT =
     sizeof(BOARD_WIFI_TX_POWER_LEVELS_X10) / sizeof(BOARD_WIFI_TX_POWER_LEVELS_X10[0]);
-static constexpr int16_t BOARD_WIFI_TX_POWER_MIN_X10 = 20;
-static constexpr int16_t BOARD_WIFI_TX_POWER_MAX_X10 = 200;
 static constexpr int16_t BOARD_WIFI_TX_POWER_DEFAULT_X10 = 200;
 
 #define RECORDING_PRODUCTION_FPS_CAP_1024X768 4
@@ -274,6 +289,42 @@ static inline bool boardWifiTxPowerSupportedX10(int16_t valueX10)
             return true;
     }
     return false;
+}
+
+static inline int16_t boardWifiTxPowerSafeMinimumX10()
+{
+    for (size_t i = 0; i < BOARD_WIFI_TX_POWER_LEVEL_COUNT; ++i) {
+        if (BOARD_WIFI_TX_POWER_LEVELS_X10[i] >= SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10)
+            return BOARD_WIFI_TX_POWER_LEVELS_X10[i];
+    }
+
+    // Board profiles must provide at least one level at or above the global
+    // SensorForge safety floor. Fall back to the board default defensively.
+    return BOARD_WIFI_TX_POWER_DEFAULT_X10;
+}
+
+static inline int16_t boardWifiTxPowerNormalizeUpX10(int16_t requestedX10)
+{
+    int16_t targetX10 = requestedX10;
+    if (targetX10 < SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10)
+        targetX10 = SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10;
+
+    for (size_t i = 0; i < BOARD_WIFI_TX_POWER_LEVEL_COUNT; ++i) {
+        int16_t levelX10 = BOARD_WIFI_TX_POWER_LEVELS_X10[i];
+        if (levelX10 >= targetX10 &&
+            levelX10 >= SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10)
+            return levelX10;
+    }
+
+    // No higher discrete step exists. Use the highest board-valid level that
+    // still satisfies the global safety floor. Lists are documented ascending.
+    for (size_t i = BOARD_WIFI_TX_POWER_LEVEL_COUNT; i > 0; --i) {
+        int16_t levelX10 = BOARD_WIFI_TX_POWER_LEVELS_X10[i - 1];
+        if (levelX10 >= SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10)
+            return levelX10;
+    }
+
+    return BOARD_WIFI_TX_POWER_DEFAULT_X10;
 }
 
 static inline int8_t boardWifiTxPowerQuarterDbm(int16_t valueX10)

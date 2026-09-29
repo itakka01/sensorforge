@@ -13938,80 +13938,138 @@ void startWebConfig()
     motionDiagnosticsSetPresenceRtcSampling(false);
 #endif
 
+    const bool useHotspot = cfg_hotspot_enabled != 0;
+
     Serial.println(
-        "Starting WiFi hotspot for web config..."
+        useHotspot
+            ? "Starting WiFi hotspot for web config..."
+            : "Connecting to configured WiFi for web config..."
     );
 
-    // WebConfig runs as its own access point. Infrastructure WiFi is used
-    // only by wifiSyncTime() for the single boot-time NTP attempt.
+    // The configured network mode is authoritative for WebConfig and the
+    // streamer: hotspot_enabled=1 -> local AP, hotspot_enabled=0 -> STA on the
+    // configured infrastructure WLAN. Start from a clean radio state so mode,
+    // hostname and TX power are applied deterministically.
     WiFi.mode(WIFI_OFF);
     delay(50);
+    infrastructureWifiRssiValid = false;
 
-    String apSsid = cfg_hostname;
+    if (useHotspot) {
+        String apSsid = cfg_hostname;
 
-    if (apSsid.length() == 0) {
-        apSsid = "sensorforge";
-    }
+        if (apSsid.length() == 0) {
+            apSsid = "sensorforge";
+        }
 
-    // IEEE 802.11 SSIDs are limited to 32 bytes. cfg_hostname is ASCII in
-    // normal use, so truncating here also keeps unusually long values safe.
-    if (apSsid.length() > 32) {
-        apSsid = apSsid.substring(0, 32);
-    }
+        // IEEE 802.11 SSIDs are limited to 32 bytes. cfg_hostname is ASCII in
+        // normal use, so truncating here also keeps unusually long values safe.
+        if (apSsid.length() > 32) {
+            apSsid = apSsid.substring(0, 32);
+        }
 
-    WiFi.mode(WIFI_AP);
+        WiFi.mode(WIFI_AP);
 
-    if (
-        cfg_hotspot_password.length() < 8 ||
-        cfg_hotspot_password.length() > 63
-    ) {
+        if (
+            cfg_hotspot_password.length() < 8 ||
+            cfg_hotspot_password.length() > 63
+        ) {
+            consoleWrite(
+                "WIFI",
+                "Hotspot start blocked | invalid password length"
+            );
+
+            WiFi.mode(WIFI_OFF);
+            return;
+        }
+
+        if (!WiFi.softAP(
+                apSsid.c_str(),
+                cfg_hotspot_password.c_str(),
+                1,
+                cfg_hotspot_hidden ? 1 : 0
+            )) {
+            consoleWrite(
+                "WIFI",
+                "Hotspot start failed"
+            );
+
+            WiFi.mode(WIFI_OFF);
+            return;
+        }
+
+        // The same configured TX-power ceiling applies to the local access
+        // point. A failed optional power adjustment must never prevent startup.
+        applyConfiguredWifiTxPower("AP");
 
         consoleWrite(
             "WIFI",
-            "Hotspot start blocked | invalid password length"
+            "Hotspot ON | SSID=" + apSsid +
+            " | hidden=" + String(cfg_hotspot_hidden) +
+            " | IP=" + WiFi.softAPIP().toString()
+        );
+    } else {
+        if (cfg_wifi_ssid.length() == 0) {
+            consoleWrite(
+                "WIFI",
+                "Infrastructure WiFi start blocked | SSID missing"
+            );
+            WiFi.mode(WIFI_OFF);
+            return;
+        }
+
+        bool hostnameOk = WiFi.setHostname(cfg_hostname.c_str());
+        if (!hostnameOk) {
+            consoleWrite(
+                "WIFI",
+                "Infrastructure WiFi hostname setup failed"
+            );
+        }
+
+        WiFi.mode(WIFI_STA);
+        WiFi.setAutoReconnect(true);
+        WiFi.begin(
+            cfg_wifi_ssid.c_str(),
+            cfg_wifi_pass.c_str()
         );
 
-        WiFi.mode(WIFI_OFF);
-        return;
-    }
+        // Apply the user-selected board-safe ceiling to STA as soon as the
+        // interface exists. A rejected optional adjustment is non-fatal.
+        applyConfiguredWifiTxPower("STA");
 
-    if (!WiFi.softAP(
-            apSsid.c_str(),
-            cfg_hotspot_password.c_str(),
-            1,
-            cfg_hotspot_hidden ? 1 : 0
-        )) {
+        const unsigned long connectStartedMs = millis();
+        while (
+            WiFi.status() != WL_CONNECTED &&
+            millis() - connectStartedMs < 12000UL
+        ) {
+            feedWatchdog();
+            delay(100);
+        }
+
+        if (WiFi.status() != WL_CONNECTED) {
+            consoleWrite(
+                "WIFI",
+                "Infrastructure WiFi connection failed | SSID=" + cfg_wifi_ssid
+            );
+            WiFi.disconnect(true, false);
+            WiFi.mode(WIFI_OFF);
+            return;
+        }
+
+        infrastructureWifiRssiDbm = WiFi.RSSI();
+        infrastructureWifiRssiValid = true;
 
         consoleWrite(
             "WIFI",
-            "Hotspot start failed"
+            "Infrastructure WiFi ON | SSID=" + cfg_wifi_ssid +
+            " | IP=" + WiFi.localIP().toString() +
+            " | RSSI=" + String(infrastructureWifiRssiDbm) + " dBm"
         );
-
-        WiFi.mode(WIFI_OFF);
-        return;
     }
 
-    // The same configured TX-power ceiling applies to the local access point.
-    // A failed optional power adjustment must never prevent WebConfig startup.
-    applyConfiguredWifiTxPower("AP");
-
-    consoleWrite(
-        "WIFI",
-        "Hotspot ON | SSID=" + apSsid +
-        " | hidden=" + String(cfg_hotspot_hidden) +
-        " | IP=" + WiFi.softAPIP().toString()
-    );
-
-
-    if (MDNS.begin(
-            cfg_hostname.c_str()
-        )) {
-
+    if (MDNS.begin(cfg_hostname.c_str())) {
         consoleWrite(
             "WIFI",
-            "mDNS | http://" +
-            cfg_hostname +
-            ".local"
+            "mDNS | http://" + cfg_hostname + ".local"
         );
 
         if (streamerModeEnabled() && cfg_streamer_rtsp_enabled) {
@@ -14019,11 +14077,9 @@ void startWebConfig()
         }
     }
 
-
     // Kamera bereits für Live-Preview initialisieren.
     // startRecording() verwendet später dieselbe laufende Kamera.
     if (!cameraInitialized) {
-
         Serial.println(
             "Initializing camera for WebConfig preview..."
         );
@@ -14033,16 +14089,13 @@ void startWebConfig()
                 cfg_resolution,
                 cfg_quality
             )) {
-
             Serial.println(
                 "WebConfig: camera init failed - preview unavailable"
             );
         }
     }
 
-
     webConfigStart();
-
     webConfigStarted = true;
 }
 
@@ -14199,6 +14252,13 @@ void enableWifiByMagnet()
 
 bool handleWifiInactivityTimeout()
 {
+    // A network streamer must remain reachable continuously. Preserve the
+    // stored timeout for normal mode, but never apply it while streamer mode
+    // owns the camera/network.
+    if (streamerModeEnabled()) {
+        return false;
+    }
+
     if (
         !webConfigStarted ||
         cfg_wifi_timeout_sec <= 0
@@ -15188,30 +15248,26 @@ void setup() {
     // Web config
     // ---------------------------------------------------------
 
-    // Infrastructure WiFi/NTP and the local hotspot are independent.
-    // hotspot_enabled controls automatic AP startup. A magnet wake remains
-    // an explicit manual request and therefore overrides this setting.
-    if (
-        streamerModeEnabled() ||
-        cfg_hotspot_enabled ||
-        wokeByMagnet
-    ) {
+    // WebConfig always starts on the network mode selected by the user:
+    // hotspot_enabled=1 -> local AP, hotspot_enabled=0 -> configured STA WLAN.
+    // In normal mode cfg_wifi_timeout_sec may later switch this network off;
+    // timeout=0 keeps it online. Streamer mode deliberately ignores that
+    // timeout and remains reachable continuously. A magnet wake continues to
+    // be an explicit request to bring the selected network mode back online.
+    if (wokeByMagnet) {
+        powerConsole(
+            "Magnet wake | WiFi/WebConfig ON requested"
+        );
+    }
 
-        if (wokeByMagnet) {
-            powerConsole(
-                "Magnet wake | WiFi/WebConfig ON requested"
-            );
-        }
+    startWebConfig();
 
-        startWebConfig();
-
-        if (wokeByMagnet) {
-            powerConsole(
-                webConfigStarted
-                    ? "Magnet wake | WiFi/WebConfig ON"
-                    : "Magnet wake | WiFi/WebConfig start failed"
-            );
-        }
+    if (wokeByMagnet) {
+        powerConsole(
+            webConfigStarted
+                ? "Magnet wake | WiFi/WebConfig ON"
+                : "Magnet wake | WiFi/WebConfig start failed"
+        );
     }
 
 
@@ -15480,7 +15536,7 @@ static void serviceStreamerNetworkRecovery()
     if (!streamerTakeNetworkRecoveryRequest(reason))
         return;
 
-    logWrite("STREAMER network recovery | full AP/WebConfig restart | reason=" + reason);
+    logWrite("STREAMER network recovery | network/WebConfig restart | reason=" + reason);
 
     // The main firmware owns AP, mDNS and WebConfig lifecycle. Stop only these
     // network-facing services and the streamer transport; keep camera power and
@@ -15500,7 +15556,7 @@ static void serviceStreamerNetworkRecovery()
 
     startWebConfig();
     if (!webConfigStarted) {
-        streamerNoteNetworkRecoveryResult(false, "AP/WebConfig restart failed");
+        streamerNoteNetworkRecoveryResult(false, "network/WebConfig restart failed");
         return;
     }
 

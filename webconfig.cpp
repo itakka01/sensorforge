@@ -4601,7 +4601,7 @@ static void handleConfig()
     html += "</select></div>";
 
     html +=
-        "<div class='config-label'>WLAN beim Systemstart</div>"
+        "<div class='config-label'>Zeitabgleich über externes WLAN beim Systemstart</div>"
         "<div class='config-control'><select name='wifi_on_system_start'>"
         "<option value='off'" + String(cfg_wifi_on_system_start == "off" ? " selected" : "") + ">Aus</option>"
         "<option value='on'" + String(cfg_wifi_on_system_start == "on" ? " selected" : "") + ">Ein</option>"
@@ -4612,7 +4612,7 @@ static void handleConfig()
         "<div class='config-label'>WLAN automatisch ausschalten</div>"
         "<div class='config-control'><input name='wifi_timeout_sec' type='number' min='0' max='86400' value='" +
         String(cfg_wifi_timeout_sec) + "'></div>"
-        "<div class='config-note'>Sekunden; 0 = automatische Abschaltung deaktiviert.</div>";
+        "<div class='config-note'>Sekunden; 0 = automatische Abschaltung deaktiviert. Im Streamer-Modus bleibt das gewählte Netzwerk unabhängig davon dauerhaft aktiv.</div>";
 
     html +=
         "<div class='config-label'>WLAN-Netzwerk (SSID)</div>"
@@ -4633,6 +4633,8 @@ static void handleConfig()
 
     for (size_t i = 0; i < BOARD_WIFI_TX_POWER_LEVEL_COUNT; ++i) {
         int16_t valueX10 = BOARD_WIFI_TX_POWER_LEVELS_X10[i];
+        if (valueX10 < SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10)
+            continue;
         String valueText = String(valueX10 / 10.0f, 1);
         html +=
             "<option value='" + valueText + "'" +
@@ -4645,6 +4647,18 @@ static void handleConfig()
         "<div class='config-note'>Gilt für externes WLAN und Hotspot. Niedrigere Werte können Funkleistung und Wärme reduzieren, "
         "verringern aber die Funkreserve. Board-Default: " +
         String(BOARD_WIFI_TX_POWER_DEFAULT_X10 / 10.0f, 1) + " dBm.</div>";
+
+    int16_t effectiveTxSafeMinX10 = boardWifiTxPowerSafeMinimumX10();
+    if (effectiveTxSafeMinX10 <= 110) {
+        html +=
+            "<div></div><div class='config-note' style='color:#b45309'><b>Achtung:</b> "
+            "Sehr geringe Sendeleistung reduziert die Reichweitenreserve. "
+            "Die generelle SensorForge-Sicherheitsgrenze liegt bei 8.5 dBm; "
+            "für dieses Board ist die kleinste freigegebene Stufe " +
+            String(effectiveTxSafeMinX10 / 10.0f, 1) +
+            " dBm. Niedrige Werte bis 11 dBm nur verwenden, wenn die Funkstrecke "
+            "vor Ort zuverlässig getestet wurde.</div>";
+    }
 
     html +=
         "<div class='config-label'>Empfang externes WLAN</div><div class='config-control'>";
@@ -4694,11 +4708,12 @@ static void handleConfig()
     html += "<div class='config-field-grid'>";
 
     html +=
-        "<div class='config-label'>Hotspot beim Systemstart</div>"
+        "<div class='config-label'>Netzwerkmodus</div>"
         "<div class='config-control'><select name='hotspot_enabled'>"
-        "<option value='1'" + String(cfg_hotspot_enabled ? " selected" : "") + ">Aktiviert - Hotspot automatisch starten</option>"
-        "<option value='0'" + String(!cfg_hotspot_enabled ? " selected" : "") + ">Deaktiviert - Hotspot nicht automatisch starten</option>"
-        "</select></div>";
+        "<option value='1'" + String(cfg_hotspot_enabled ? " selected" : "") + ">Aktiviert - eigenen Hotspot verwenden</option>"
+        "<option value='0'" + String(!cfg_hotspot_enabled ? " selected" : "") + ">Deaktiviert - konfiguriertes WLAN verwenden</option>"
+        "</select></div>"
+        "<div class='config-note'>Diese Auswahl bestimmt den Netzwerkmodus für Webinterface und Streamer: Hotspot an = eigener Access Point; Hotspot aus = Verbindung mit der oben konfigurierten SSID. Im Normalmodus kann der WLAN-Timeout die Verbindung später wieder abschalten.</div>";
 
     html +=
         "<div class='config-label'>Hotspot-Passwort</div>"

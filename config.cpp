@@ -2734,8 +2734,7 @@ static bool validateValues(
 
         if (
             fabsf(values.wifiTxPowerDbm * 10.0f - txPowerX10) > 0.01f ||
-            txPowerX10 < BOARD_WIFI_TX_POWER_MIN_X10 ||
-            txPowerX10 > BOARD_WIFI_TX_POWER_MAX_X10 ||
+            txPowerX10 < SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10 ||
             !boardWifiTxPowerSupportedX10(txPowerX10)
         ) {
             error =
@@ -4470,6 +4469,19 @@ static bool parseConfigText(
     // switch model so WebConfig always has a valid retained interval to show.
     if (!values.shooterEnabled && values.shooterIntervalMs == 0)
         values.shooterIntervalMs = 60000;
+
+    // WiFi TX-power normalization/migration. Board profiles define their own
+    // discrete valid levels, while SensorForge defines only a global reachability
+    // safety floor. Any finite stored value is normalized to the next higher
+    // valid level of the active board. If there is no higher level, the board's
+    // highest safe level is used. This also safely migrates older candidate
+    // configs that stored very-low or no-longer-listed values.
+    if (seen.wifiTxPowerDbm && isfinite(values.wifiTxPowerDbm)) {
+        int16_t txPowerX10 =
+            (int16_t)lroundf(values.wifiTxPowerDbm * 10.0f);
+        values.wifiTxPowerDbm =
+            boardWifiTxPowerNormalizeUpX10(txPowerX10) / 10.0f;
+    }
 
     // Transport threshold migration:
     // - new config: transport_black_threshold is canonical.

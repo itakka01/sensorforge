@@ -136,7 +136,7 @@ extern String cfg_wifi_pass;
 extern float cfg_wifi_tx_power_dbm;   // discrete board-supported TX power; applies to STA and AP
 
 // Hotspot / access point
-extern int cfg_hotspot_enabled;       // 0/1, automatic AP start at boot
+extern int cfg_hotspot_enabled;       // 1 = local AP, 0 = configured infrastructure WiFi (STA)
 extern String cfg_hotspot_password;  // empty = open AP; otherwise 8..63 chars
 extern int cfg_hotspot_hidden;        // 0/1
 

@@ -1,3 +1,117 @@
+## v84-candidate - 2026-09-30 - AP/STA compile fix for generic WiFi TX-power minimum
+
+- Fixed `webconfig.cpp` after the AP/STA network-mode merge: the WiFi TX-power warning still referenced the removed legacy `BOARD_WIFI_TX_POWER_MIN_X10` constant.
+- The UI now again derives the effective board-safe minimum through `boardWifiTxPowerSafeMinimumX10()` and filters offered TX levels against the global `SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10` guard.
+- No runtime network, streamer, RTSP, audio, HTTP-MJPEG, thermal or recording behavior is changed by this compile-only correction.
+- This correction addresses the Arduino-ESP32 GCC 14 compile error reported at `webconfig.cpp:4649`.
+
+## v84-candidate - 2026-09-30 - AP/STA network selection for streamer and WebConfig
+
+- `hotspot_enabled=1` keeps the existing local SensorForge access-point path; `hotspot_enabled=0` now starts WebConfig and the streamer on the configured infrastructure WLAN (STA) instead of leaving the persistent service network unavailable.
+- In normal SensorForge mode, `wifi_timeout_sec=0` keeps the selected network mode online; a positive timeout retains the existing inactivity shutdown behavior.
+- In streamer mode, the WiFi inactivity timeout is intentionally ignored so RTSP/HTTP remain continuously reachable. The persisted timeout value is not modified and applies again after returning to normal mode.
+- Streamer network health/recovery now validates the configured AP or STA mode instead of assuming AP-only operation. STA loss is handled by the existing bounded network/WebConfig recovery path.
+- RTSP SDP now advertises the active interface IP (AP IP in hotspot mode, STA IP in infrastructure-WLAN mode). Hostname-based RTSP/HTTP URLs remain unchanged.
+- Network settings UI now describes `hotspot_enabled` as the AP-vs-STA selector and clarifies streamer timeout behavior. Existing credentials, TX-power controls, mDNS, RTSP, HTTP-MJPEG, audio, thermal and recording logic are otherwise unchanged.
+- No automatic AP fallback is introduced when STA credentials/connectivity fail; the configured network mode remains authoritative.
+- Static/source review only in this environment; no Arduino build or hardware validation is claimed for this change.
+
+## v84-candidate - 2026-09-30 - Audio live correction final tuning / dashboard live counts
+
+- RTSP L16 live reserve raised to about 220 ms; routine live trimming starts only above about 500 ms backlog.
+- First 3 s after audio capture start/restart are exempt from live trimming to avoid startup clicks.
+- Gentle correction steps reduced; hard stale-backlog protection remains above about 1 s.
+- Existing two-pass audio drain, RTCP synchronization, video/HTTP paths and thermal behavior are unchanged.
+- Streamer overview RTSP/HTTP/audio summary now follows the same live status polling as the detailed diagnostics instead of remaining a render-time snapshot.
+
+## v84 candidate - 2026-09-30 - smoother multi-client RTSP audio live correction
+
+- Kept the proven 20-ms L16 packetization and bounded real-time drain, but changed live backlog correction from a large one-shot cut to small bounded steps.
+- A modest backlog now triggers only about 40 ms of oldest-audio discard per service pass; a true >1 s stale backlog can use a larger but still bounded ~120 ms correction. The RTP sample timeline advances by exactly the discarded sample count.
+- The target live reserve is slightly relaxed to about 60 ms to reduce correction oscillation.
+- `serviceAudio()` now runs once before and once after the serial video fan-out. This addresses the field case where 2x RTSP + 1x HTTP reduced the main-loop cadence to roughly 2.4 fps and starved a single audio-drain pass even though the audio payload itself was small.
+- Drain diagnostics now report the aggregate number of audio packets drained across both passes of the current firmware loop.
+- RTCP, RTP A/V timing, video capture/packetization, HTTP-MJPEG, WiFi/TX power and thermal behavior are otherwise unchanged.
+- Hardware qualification remains required; key acceptance signals are Capture-Drops=0, substantially reduced Live-Abwurf growth, audio ring well below capacity and no loud/periodic clicking with two RTSP clients.
+
+## v84 candidate - 2026-09-29 - Audio drain compile fix
+
+- `streamer.cpp`: backlog threshold calculations now use explicit `std::max<size_t>` so Arduino-ESP32 GCC 14 does not fail template deduction on mixed `size_t`/`uint32_t` operands.
+- Runtime behavior of the real-time audio drain is unchanged.
+
+## v84 candidate - 2026-09-29 - real-time RTSP audio drain / overflow protection
+
+- Fixed a deterministic RTSP audio throughput bug: the streamer previously read at most 960 PCM bytes per firmware loop. At 16 kHz / 16 bit / mono the capture produces about 32 KiB/s, so two RTSP clients plus serial video transmission could fill the 256-KiB PSRAM audio ring and cause hard drops, rhythmic clicks and loud crackling.
+- RTSP L16 audio is now packetized in short approximately 20-ms blocks and `serviceAudio()` drains multiple blocks per call within a bounded work budget. Drain effort increases when the live ring backlog rises.
+- Normal operation keeps only a small live PCM reserve instead of allowing seconds of queued audio to accumulate.
+- If an exceptional stall has already accumulated more than about one second of stale PCM, the oldest complete samples are discarded down to the live reserve and the shared RTP sample timeline advances by exactly the discarded sample count. This favors live continuity over replaying stale audio and avoids repeated ring overflow.
+- Streamer diagnostics now distinguish capture-side drops from intentional live stale-audio discard and show the most recent / maximum drain packet count.
+- RTCP, RTP A/V timing, video capture, HTTP-MJPEG, WiFi and thermal logic are otherwise unchanged.
+- This remains a v84 implementation candidate; no Arduino build or hardware qualification is claimed by this change.
+
+
+## v84 candidate - 2026-09-29 - RTCP A/V synchronization
+
+- RTSP/TCP now sends RFC3550 compound RTCP Sender Reports plus SDES CNAME for every active client and media track.
+- Video RTCP uses the 90-kHz RTP clock; audio RTCP uses the configured sample clock. Both are mapped to the same NTP wall-clock reference so standard clients can synchronize JPEG video and L16 audio.
+- RTCP uses the negotiated interleaved channel immediately following each RTP channel (video RTP/RTCP and audio RTP/RTCP).
+- RTP packet/octet counters are maintained per client and per track for correct Sender Report statistics.
+- Streamer diagnostics now show per-client Video/Audio RTCP Sender Report counters plus live audio-ring occupancy, capacity, high-water and dropped bytes.
+- Camera capture, HTTP-MJPEG, recording paths and the current AP/STA behavior are unchanged.
+- This remains a v84 implementation candidate; no Arduino build or hardware qualification is claimed by this change.
+## v84 candidate - shared PCM fan-out / PLAY A/V timeline alignment
+
+- Multi-client RTSP audio now advances one shared PCM sample position exactly once per captured payload block. The unchanged L16 payload block is then offered to every active RTSP client; only RTP sequence number, SSRC, timestamp base and session origin remain client-local.
+- Each RTSP client records the shared sample position present at its own `PLAY` as `audioSampleOrigin`. Audio RTP timestamps are derived from the shared block position relative to that origin, so serial delivery to client 1 and client 2 cannot advance the media clock twice or make their timelines influence each other.
+- Fixed a separate A/V start-offset bug in RTSP `RTP-Info`: video `rtptime` previously reported the timestamp of the most recently captured JPEG. In streamer idle mode that frame can be up to five seconds old, matching the observed several-second audio/video offset. `PLAY` now snapshots a fresh monotonic 90-kHz video timestamp and reports that as the session start.
+- Audio and video session origins are therefore both established at the client's `PLAY`; the first subsequent media packets advance from those announced origins instead of inheriting stale pre-PLAY video time.
+- Existing shared PDM/I2S capture, single-pass L16 byte-order conversion, HTTP-MJPEG, camera settings, WiFi/TX power and thermal logic are unchanged.
+- Hardware qualification remains open: verify 1x RTSP audio, then 2x RTSP audio for rhythmic clicks, and measure A/V offset after 1/10/30 minutes.
+
+## v84 candidate - fully isolated multi-client RTSP audio clocks
+
+- Fixed the remaining multi-client RTSP audio coupling: RTP audio sample progress is now stored entirely inside each `RtspClientSlot`. The shared PCM capture no longer has a global RTP sample counter.
+- Both RTSP viewers still receive the same captured PCM payload, but each session independently owns its sequence number, SSRC, timestamp base and sent-sample count.
+- A second RTSP client can therefore no longer alter or inherit the first client's audio clock state.
+- Audio capture recovery advances each client's timestamp base by exactly that client's own successfully transmitted sample count before resetting that client's local counter.
+- The L16 payload conversion remains single-pass before fan-out; PCM data is not byte-swapped separately per client.
+- No changes to camera capture, HTTP-MJPEG, RTSP video timing, WiFi, thermal handling or persisted configuration.
+- Hardware qualification remains required, especially 1x RTSP audio versus 2x RTSP audio for noise, intelligibility and A/V drift.
+
+## v84 candidate - per-client RTSP audio timeline / thinning disabled
+
+- Fixed multi-client RTSP audio timing: every RTSP client now receives its own audio sample origin at `PLAY`. A later client no longer inherits the sample count accumulated while an older client was already streaming.
+- RTP-Info audio `rtptime` and the first L16 RTP packet of that client now start from the same per-client timeline. This addresses the observed case where a second client could accumulate tens of seconds or minutes of A/V playback delay.
+- Audio capture remains shared; only RTP timestamp accounting is per client. No second PDM/I2S capture path is introduced.
+- Audio recovery preserves timestamp continuity independently for each active client before the shared capture sample counter is reset.
+- Adaptive RTSP video frame thinning is disabled for this qualification step. Every captured video frame is again offered to every playing RTSP client; the real monotonic 90-kHz video clock remains active.
+- Existing RTSP diagnostics continue to show connection and per-frame send pressure, but no longer claim that adaptive thinning is catching a client up.
+- No changes to camera settings, HTTP-MJPEG, WiFi mode/TX power, thermal guard, recording, storage or persisted configuration.
+- Arduino build and long-running 2x RTSP + audio + HTTP-MJPEG hardware qualification remain open.
+
+## v84 candidate - RTSP monotonic clock / visible live-latency diagnostics
+
+- Corrected RTP/JPEG timestamp generation: video timestamps now come from the real monotonic ESP timer at 90 kHz instead of being advanced by a fixed `90000/fps` step. This prevents RTSP receivers from interpreting temporary multi-client send delays as a continuously growing timing/jitter offset.
+- The HTTP-MJPEG path is unchanged; this specifically addresses the observed case where HTTP stayed near-live while long-running RTSP sessions accumulated seconds to nearly a minute of delay.
+- Per-client adaptive thinning remains connection-preserving and whole-frame-only, but reacts slightly earlier (two sustained slow samples, 60% of the current frame budget). Recovery remains deliberately slower to avoid oscillation.
+- The existing dashboard button `Streamer-Status / Diagnose` now shows two visual RTSP client cards with connection state, frame send time, frame-budget load, active thinning divider, skipped frames and number of adaptive adjustments. Green = healthy, orange = currently thinning/catching up, red = elevated transport pressure.
+- `/streamer_status` adds per-client connected/adaptive-change fields and reports the video clock mode as `monotonic_90khz`. No new URL has to be remembered by the user; the dashboard continues to poll the existing status endpoint.
+- The diagnostic intentionally calls this a transport/backlog indicator rather than claiming exact TCP-buffer byte occupancy; Arduino-ESP32 does not expose a portable per-client TX-queue occupancy API here. Existing socket-stall counters remain the hard overflow/stall signal.
+- No RTSP client is intentionally disconnected by the adaptive latency controller. Real socket/write failures still use the existing cleanup path because a partially written interleaved RTP packet cannot safely be abandoned mid-frame.
+- Arduino build and long-run multi-client hardware validation remain open.
+
+## v84 candidate - adaptive RTSP live-latency control
+
+- Added per-client adaptive video frame thinning for RTSP/TCP to prevent a slower viewer from accumulating many seconds of live-stream delay.
+- A slow client is not disconnected merely because it falls behind. SensorForge first sends every second frame for that client; if sustained send pressure remains, it can step to every third and every fourth frame.
+- Frame thinning is strictly per RTSP client, so a healthy second viewer keeps its full frame cadence.
+- Recovery is gradual: after a sustained healthy send-time window the divider is reduced one step at a time back toward full frame rate.
+- Only complete future JPEG frames are skipped. A frame already being packetized over RTSP/TCP is never intentionally cut mid-packet, preserving interleaved RTP framing.
+- Existing cleanup remains authoritative for a real socket/write failure; the adaptive lag mechanism itself does not force client reconnects.
+- Divider transitions are logged with session, old/new divider, last frame send time and accumulated skipped-frame count. `/streamer_status` additionally exposes divider, skipped-frame count and last send time for both RTSP client slots.
+- No change to camera capture rate, RTP/JPEG format, audio format, thermal guard, WiFi mode or persisted configuration.
+- Arduino build and multi-client long-run validation remain open.
+
 ## v84 candidate - Webviewer linker/integration fix
 
 - restores the complete `/stream_view` implementation that was accidentally lost when later streamer hardening/thermal changes were based on an older `streamer.cpp`
@@ -92,7 +206,8 @@
 
 - Streamer thermal throttling begins 1 °C earlier (77/78 °C stages) while the board thermal emergency limit remains 80 °C.
 - Moved the CPU thermal emergency threshold into `board_config.h` for board-specific future qualification.
-- Added board-scoped discrete WiFi TX-power levels plus a board default in `board_config.h`.
+- Added board-scoped discrete WiFi TX-power levels plus a board default in `board_config.h`. A global SensorForge reachability floor of 8.5 dBm is documented once near the top of `board_config.h`; it is not tied to a specific board capability table.
+- WiFi TX-power normalization is now generic for future boards: any finite stored value is lifted to the next higher valid level from the active board table after applying the global 8.5-dBm safety floor. If that exact floor is not supported by a board, its next higher listed level is used automatically; if a stored value exceeds all listed levels, the highest safe board level is used. Lower hardware-valid levels may remain documented in a board table but are not exposed/applied by SensorForge.
 - Added additive `wifi_tx_power_dbm` config with a backwards-compatible default of 20.0 dBm; the selected ceiling is applied to both STA and local AP without changing WiFi mode/credentials/fallback behaviour.
 - Added WLAN RSSI capture during a real infrastructure-WiFi connection and a green-to-red reception scale in Configuration. The UI provides a conservative TX-power suggestion but never changes TX power automatically.
 - No claim of completed Arduino build, RF qualification or thermal hardware validation for this candidate.
