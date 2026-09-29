@@ -42,6 +42,8 @@
 #include "image_motion.h"
 #include "motion_diagnostics.h"
 #include "streamer.h"
+#include "webconfig_streamer.h"
+#include "webconfig_audio.h"
 
 static const char *AUDIO_MIC_TEST_PATH = "/sensorforge_audio_test.wav";
 static const uint32_t AUDIO_MIC_TEST_DURATION_MS = 10000UL;
@@ -51,6 +53,8 @@ static const uint32_t AUDIO_MIC_TEST_DURATION_MS = 10000UL;
 // This is the same state used by the periodic STATUS line.
 extern bool recording;
 extern bool sdReady;
+extern bool wifiInfrastructureRssiAvailable();
+extern int wifiInfrastructureRssiDbm();
 
 // Gracefully finalizes an active recording when the operator explicitly
 // pauses the recording automation from WebConfig.
@@ -2281,82 +2285,7 @@ static void handleRoot()
                 "</h2><p>" + htmlEscape(cfg_hostname) +
                 " &middot; " SENSORFORGE_PLATFORM_LITERAL " &middot; Core v" SENSORFORGE_CORE_VERSION_LITERAL
                 "</p></div><span class='status-pill warn'>STREAMER</span></div>";
-        html += "<section class='settings-section'><h3>Netzwerk-Streamer</h3>"
-                "<p><strong>Status:</strong> " + String(streamerReady() ? "bereit" : "nicht gestartet") + "</p>"
-                "<p>Kamera und optionales Audio gehören in diesem Betriebsmodus exklusiv dem Netzwerk-Streamer. "
-                "Motion Recording, Power Shooter und die normale Aufnahme-Sleep-Automatik sind deaktiviert.</p>";
-        html += "<p><strong>RTSP:</strong> <code>" + htmlEscape(streamerRtspUrl()) + "</code><br>"
-                "<strong>HTTP-MJPEG (blank):</strong> <code>" + htmlEscape(streamerHttpUrl()) + "</code><br>"
-                "<strong>Web-Viewer (+ Infos):</strong> <a href='" + htmlEscape(streamerHttpViewerUrl()) + "' target='_blank' rel='noopener'><code>" + htmlEscape(streamerHttpViewerUrl()) + "</code></a></p>";
-        html += "<p><strong>RTSP-Clients:</strong> " + String((unsigned)streamerRtspClientCount()) + "/2" +
-                " · <strong>HTTP-Clients:</strong> " + String((unsigned)streamerHttpClientCount()) + "/2" +
-                "<br><strong>Audio:</strong> " + htmlEscape(streamerAudioStatus()) + "</p>";
-        html += "<div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:10px;margin:12px 0'>"
-                "<div style='border:1px solid #d7e2e8;border-radius:8px;padding:10px 12px;background:#fbfdfe'><strong>Web-Oberflächen / Systemwartung</strong><br><span id='webSessionCount'>" + String((unsigned)activeWebUiSessionCount()) +
-                "</span> aktiv</div>"
-                "<div style='border:1px solid #d7e2e8;border-radius:8px;padding:10px 12px;background:#fbfdfe'><strong>Streaming-Verbindungen</strong><br><span id='streamClientCount'>" +
-                String((unsigned)(streamerRtspClientCount() + streamerHttpClientCount())) +
-                "</span> aktiv (max. 4)<br><span class='muted'>RTSP <span id='streamRtspCount'>" + String((unsigned)streamerRtspClientCount()) + "/2</span> · HTTP <span id='streamHttpCount'>" + String((unsigned)streamerHttpClientCount()) + "/2</span></span></div></div>";
-        html += "<p><strong>Frames:</strong> <span id='streamLiveFrames'>" + String(streamerFramesCaptured()) + "</span>" +
-                " · <strong>FPS:</strong> <span id='streamLiveFps'>" + String(streamerMeasuredFps(), 2) + "</span>" +
-                " · <strong>Gesendet:</strong> <span id='streamLiveBytes'>" + String((unsigned long long)streamerBytesSent()) + "</span> Byte</p>";
-        html += "<p><button class='button' type='button' id='streamDiagToggle' aria-expanded='false' aria-controls='streamDiagPanel'>Streamer-Status / Diagnose</button></p>";
-        html += "<div id='streamDiagPanel' style='display:none;border:1px solid #8fb5c9;border-radius:8px;padding:12px;margin:8px 0 14px;background:#f7fbfd'>"
-                "<p style='margin-top:0'><strong>Live-Streamerstatus</strong><br><span class='muted'>Aktualisierung alle 2 Sekunden, solange diese Seite sichtbar ist.</span></p>"
-                "<p><strong>RTSP:</strong> <span id='diagRtspClients'>" + String((unsigned)streamerRtspClientCount()) + "/2</span> · "
-                "<strong>HTTP-MJPEG:</strong> <span id='diagHttpClients'>" + String((unsigned)streamerHttpClientCount()) + "/2</span></p>"
-                "<p><strong>Audio:</strong> <span id='diagAudioState'>" + htmlEscape(streamerAudioStatus()) + "</span><br>"
-                "<strong>Audio-RTP-Pakete:</strong> <span id='diagAudioPackets'>0</span> · "
-                "<strong>Audio gesendet:</strong> <span id='diagAudioBytes'>0</span> Byte</p>"
-                "<p><strong>Frames:</strong> <span id='diagFrames'>" + String(streamerFramesCaptured()) + "</span> · "
-                "<strong>FPS:</strong> <span id='diagFps'>" + String(streamerMeasuredFps(), 2) + "</span> · "
-                "<strong>Gesendet gesamt:</strong> <span id='diagBytes'>" + String((unsigned long long)streamerBytesSent()) + "</span> Byte</p>"
-                "<p><strong>Self-Healing:</strong> Kamera <span id='diagCameraRecoveries'>0</span> · "
-                "Audio <span id='diagAudioRecoveries'>0</span> · Netzwerk <span id='diagNetworkRecoveries'>0</span> Recoveries<br>"
-                "<strong>Socket-Stalls:</strong> <span id='diagSocketStalls'>0</span> · "
-                "fehlgeschlagene Kamera-Recovery-Versuche <span id='diagRecoveryFailures'>0</span><br>"
-                "<strong>Letzter erfolgreicher Frame:</strong> vor <span id='diagLastFrameAge'>0</span> ms · "
-                "<strong>aktuelle Capture-Fehler:</strong> <span id='diagCaptureFailures'>0</span><br>"
-                "<strong>Speichertrend:</strong> <span id='diagMemoryWarning'>unauffällig</span> · "
-                "<strong>Reset-Ursache:</strong> <span id='diagResetReason'>–</span><br>"
-                "<strong>Langzeit gesamt:</strong> Kamera <span id='diagPersistCamera'>0</span> · Audio <span id='diagPersistAudio'>0</span> · Netzwerk <span id='diagPersistNetwork'>0</span> · Socket-Stalls <span id='diagPersistSocket'>0</span><br>"
-                "<span class='muted'>Letzter Recovery-Grund: <span id='diagRecoveryReason'>–</span><br>"
-                "Vorheriger kontrollierter Streamer-Neustart: <span id='diagPreviousReset'>–</span></span></p>"
-                "<p class='muted' style='margin-bottom:0'>Die Health-Checks laufen langsam und ereignisorientiert. Ein einzelner Client- oder Audiofehler wird lokal behandelt; Netzwerk/Kamera werden erst nach bestätigtem Stall neu initialisiert. Ein Board-Neustart ist nur die letzte Eskalationsstufe.</p>"
-                "</div>";
-        html += "<p><strong>Systemressourcen:</strong> interner Heap <span id='heapFreeKb'>" +
-                String((unsigned long)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024U)) +
-                " KB</span> frei (Minimum seit Boot <span id='heapMinKb'>" +
-                String((unsigned long)(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024U)) +
-                " KB</span>) · PSRAM <span id='psramFreeKb'>" +
-                String((unsigned long)(ESP.getFreePsram() / 1024U)) + " KB</span> frei</p>";
-        if (streamerLastError().length()) {
-            html += "<div class='flash-notice error'><strong>Streamer-Fehler</strong><span>" +
-                    htmlEscape(streamerLastError()) + "</span></div>";
-        }
-        html += "</section>";
-        html += "<script>(function(){"
-                "var b=document.getElementById('streamDiagToggle'),p=document.getElementById('streamDiagPanel');"
-                "if(!b||!p)return;"
-                "function set(id,v){var e=document.getElementById(id);if(e)e.textContent=v;}"
-                "function apply(s){if(!s)return;"
-                "set('diagRtspClients',String(Number(s.rtsp_clients)||0)+'/2');"
-                "set('diagHttpClients',String(Number(s.http_clients)||0)+'/2');"
-                "var ast=s.audio_active?'aktiv':(s.audio_available?'verfügbar, aber nicht aktiv':'nicht verfügbar');set('diagAudioState',ast);"
-                "set('diagAudioPackets',String(Number(s.audio_packets)||0));set('diagAudioBytes',String(Number(s.audio_bytes)||0));"
-                "set('diagFrames',String(Number(s.frames)||0));set('diagFps',Number(s.fps||0).toFixed(2));set('diagBytes',String(Number(s.bytes_sent)||0));"
-                "set('diagCameraRecoveries',String(Number(s.camera_recoveries)||0));set('diagAudioRecoveries',String(Number(s.audio_recoveries)||0));set('diagNetworkRecoveries',String(Number(s.network_recoveries)||0));"
-                "set('diagSocketStalls',String(Number(s.socket_stalls)||0));set('diagRecoveryFailures',String(Number(s.camera_recovery_failures)||0));"
-                "set('diagLastFrameAge',String(Number(s.last_frame_age_ms)||0));set('diagCaptureFailures',String(Number(s.capture_failures)||0));set('diagRecoveryReason',s.last_recovery_reason||'–');"
-                "set('diagMemoryWarning',s.memory_warning?'auffällig':'unauffällig');set('diagResetReason',s.reset_reason||'–');set('diagPreviousReset',s.previous_controlled_reset||'–');"
-                "set('diagPersistCamera',String(Number(s.persistent_camera_recoveries)||0));set('diagPersistAudio',String(Number(s.persistent_audio_recoveries)||0));set('diagPersistNetwork',String(Number(s.persistent_network_recoveries)||0));set('diagPersistSocket',String(Number(s.persistent_socket_stalls)||0));"
-                "set('streamLiveFrames',String(Number(s.frames)||0));set('streamLiveFps',Number(s.fps||0).toFixed(2));set('streamLiveBytes',String(Number(s.bytes_sent)||0));"
-                "var sc=document.getElementById('streamClientCount');if(sc)sc.textContent=String((Number(s.rtsp_clients)||0)+(Number(s.http_clients)||0));var src=document.getElementById('streamRtspCount');if(src)src.textContent=String(Number(s.rtsp_clients)||0)+'/2';var shc=document.getElementById('streamHttpCount');if(shc)shc.textContent=String(Number(s.http_clients)||0)+'/2';"
-                "}"
-                "function poll(){if(document.hidden)return;fetch('/streamer_status?t='+Date.now(),{cache:'no-store',credentials:'same-origin'}).then(function(r){if(!r.ok)throw new Error();return r.json();}).then(apply).catch(function(){});}"
-                "b.addEventListener('click',function(){var show=p.style.display==='none';p.style.display=show?'block':'none';b.setAttribute('aria-expanded',show?'true':'false');b.textContent=show?'Streamer-Status / Diagnose ausblenden':'Streamer-Status / Diagnose';if(show)poll();});"
-                "setInterval(poll,2000);document.addEventListener('visibilitychange',function(){if(!document.hidden)poll();});poll();"
-                "})();</script>";
+        html += webconfigStreamerDashboardHtml(activeWebUiSessionCount());
         html += htmlFooter();
         server.sendHeader("Cache-Control", "no-store");
         server.send(200, "text/html; charset=utf-8", html);
@@ -4349,11 +4278,6 @@ static void handleConfig()
 
     html += "<div class='settings-section'><h3>Aufnahme</h3>";
 
-    String operatingModeInfo =
-        "Hier legst du den zentralen Betriebsmodus von SensorForge fest. Die Aufnahmevarianten arbeiten wie bisher. "
-        "Im Netzwerk-Streamer-Modus gehören Kamera und optionales Audio exklusiv dem Streamer; automatische Aufnahme, Power Shooter und normale Aufnahme-Sleep-Automatik bleiben inaktiv. "
-        "Ein Wechsel zum oder vom Netzwerk-Streamer wird gespeichert und erst nach einem Neustart wirksam.";
-
     String pendingOperatingMode =
         server.arg("pending_mode");
     pendingOperatingMode.trim();
@@ -4384,102 +4308,11 @@ static void handleConfig()
         "Sensor + Bildbestätigung: Der Sensor meldet zuerst Bewegung; anschließend muss die Bildanalyse die Bewegung bestätigen.\n"
         "Nur Bildbewegung: Die Kamera-Bildanalyse entscheidet selbst, ob eine Aufnahme startet.";
 
-    String streamerSettingsInfo =
-        "Der Netzwerk-Streamer verwendet die bereits vorhandenen Kamera- und Audioeinstellungen von SensorForge. "
-        "Auflösung, Bildrate, JPEG-Qualität und Audioquelle werden deshalb nicht ein zweites Mal hier eingestellt. "
-        "Diese Parameter bleiben auf den Kamera- bzw. Audioseiten konfigurierbar.";
-
-    const String streamerRtspCommandUrl = streamerRtspUrl();
-    const String streamerHttpCommandUrl = streamerHttpUrl();
-    const String streamerHttpViewerCommandUrl = streamerHttpViewerUrl();
-    const String rtspOverlayLabel = cfg_camera_overlay_text.length() ? cfg_camera_overlay_text : (cfg_camera_display_name.length() ? cfg_camera_display_name : String("SensorForge"));
-    const String rtspOverlayFilter = "drawtext=text='" + ffmpegDrawtextEscape(rtspOverlayLabel) + "':x=18:y=18:fontsize=24:fontcolor=white:box=1:boxcolor=black@0.55,drawtext=text='%{localtime\\:%d.%m.%Y %H\\:%M\\:%S}':x=18:y=h-th-18:fontsize=22:fontcolor=white:box=1:boxcolor=black@0.55";
-    const String streamerFfplayOverlayCommand = "ffplay -rtsp_transport tcp -vf \"" + rtspOverlayFilter + "\" \"" + streamerRtspCommandUrl + "\"";
-    const String streamerFfplayCommand = "ffplay -rtsp_transport tcp \"" + streamerRtspCommandUrl + "\"";
-    const String streamerVlcCommand = "vlc \"" + streamerRtspCommandUrl + "\"";
-    const String streamerMpvCommand = "mpv --demuxer-lavf-o=rtsp_transport=tcp \"" + streamerRtspCommandUrl + "\"";
-    const String streamerHttpFfplayCommand = "ffplay \"" + streamerHttpCommandUrl + "\"";
-    const String streamerHttpVlcCommand = "vlc \"" + streamerHttpCommandUrl + "\"";
-    const String streamerHttpMpvCommand = "mpv \"" + streamerHttpCommandUrl + "\"";
-
-    String streamerTransportInfo =
-        "RTSP ist die bevorzugte Wahl für klassische Video- und Überwachungsprogramme. "
-        "Typische Anwendungen sind VLC, ffmpeg sowie NVR-/Überwachungssysteme wie Frigate oder Shinobi. RTSP wird von normalen Webbrowsern wie Chrome nicht direkt abgespielt; optionales SensorForge-Audio wird über RTSP übertragen.\n\n"
-        "HTTP-MJPEG ist besonders einfach für Webbrowser, Home Assistant, Dashboards und eigene HTTP-Integrationen. Der Link kann direkt in Chrome/Firefox geöffnet werden und liefert Video ohne Audio. "
-        "Es ist unkompliziert einzubinden, aber bei dauerhaftem Betrieb meist weniger effizient als RTSP.\n\n"
-        "Beide Stream-Arten dürfen gleichzeitig aktiviert sein. SensorForge verwendet dafür denselben Kameraframe. "
-        "Pro Stream-Art sind aktuell maximal zwei gleichzeitig verbundene Clients vorgesehen; alle Clients teilen denselben Kameraframe.";
-
-    html +=
-        "<div id='operating-mode' style='margin:0 0 18px 0;padding:14px;border:1px solid #d8dee6;border-radius:8px;background:#f8fbff'>"
-        "<div style='display:flex;align-items:center;gap:6px;flex-wrap:wrap'><b>Betriebsmodus</b>" +
-        pageInfoButton("Betriebsmodus", operatingModeInfo) +
-        "</div>"
-        "<select id='cfgOperatingMode' name='operating_mode_ui' style='min-width:320px;max-width:100%;margin-top:8px'>"
-        "<option value='off'" + String(!configuredStreamerMode && !cfg_motion_recording_enabled && !cfg_shooter_enabled ? " selected" : "") + ">Aus - keine automatische Aufnahme</option>"
-        "<option value='motion'" + String(!configuredStreamerMode && cfg_motion_recording_enabled && !cfg_shooter_enabled ? " selected" : "") + ">Normal Recording - Motion/Alarm</option>"
-        "<option value='shooter'" + String(!configuredStreamerMode && !cfg_motion_recording_enabled && cfg_shooter_enabled ? " selected" : "") + ">Power Shooter standalone</option>"
-        "<option value='motion_shooter'" + String(!configuredStreamerMode && cfg_motion_recording_enabled && cfg_shooter_enabled ? " selected" : "") + ">Normal Recording + Power Shooter</option>"
-        "<option value='streamer'" + String(configuredStreamerMode ? " selected" : "") + ">Netzwerk-Streamer</option>"
-        "</select>"
-        "<div id='cfgStreamerOptions' style='margin-top:14px;padding:14px;border:1px solid #8fb5c9;border-radius:8px;background:#f7fbfd'>"
-        "<div style='display:flex;align-items:center;gap:6px;flex-wrap:wrap'><b>Netzwerk-Streamer</b>" +
-        pageInfoButton("Netzwerk-Streamer", streamerSettingsInfo) +
-        "</div>"
-        "<div style='display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:8px 0 12px 0'><span class='muted'>Wähle mindestens eine Ausgabe. Beide können gleichzeitig verwendet werden.</span>" +
-        pageInfoButton("Welche Stream-Art brauche ich?", streamerTransportInfo) +
-        "</div>"
-        "<div style='padding:10px 12px;border:1px solid #d6e1e8;border-radius:9px;background:#fff;margin-bottom:10px'>"
-        "<label class='stream-toggle' for='cfgStreamerRtsp'><input id='cfgStreamerRtsp' type='checkbox' name='streamer_rtsp_enabled' value='1'" + String(displayedStreamerRtspEnabled ? " checked" : "") + "><span class='stream-toggle-title'>RTSP-Stream</span><span id='cfgStreamerRtspState' class='stream-toggle-state " + String(displayedStreamerRtspEnabled ? "on" : "off") + "'>" + String(displayedStreamerRtspEnabled ? "AKTIV" : "INAKTIV") + "</span></label>"
-        "<div class='muted' style='margin:4px 0 0 24px'>Für VLC, ffmpeg, NVR und Überwachungssoftware wie Frigate oder Shinobi. <strong>Empfohlen für Videoüberwachung und dauerhafte Integration.</strong> Nicht direkt in Chrome/Firefox abspielbar; optional mit Audio.</div>"
-        "<div id='cfgStreamerRtspDetails' style='margin:7px 0 0 24px" + String(displayedStreamerRtspEnabled ? "" : ";display:none") + "'>"
-        "<div><strong>Adresse:</strong> <code>" + htmlEscape(streamerRtspCommandUrl) + "</code></div>"
-        "<div style='margin-top:10px'><strong>Stream öffnen:</strong></div>"
-        "<div class='muted' style='margin:3px 0 7px 0'>Die folgenden Befehle können direkt in einem Terminal verwendet werden.</div>"
-        "<div style='display:grid;gap:7px;max-width:900px'>"
-        "<div style='display:flex;gap:7px;align-items:center;flex-wrap:wrap'><span style='min-width:55px'><strong>ffplay</strong></span><code style='flex:1;min-width:240px;overflow-wrap:anywhere'>" + htmlEscape(streamerFfplayCommand) + "</code><button type='button' class='button cfgStreamerCopyCmd' data-copy='" + htmlEscape(streamerFfplayCommand) + "'>Kopieren</button></div>"
-        "<div style='display:flex;gap:7px;align-items:center;flex-wrap:wrap'><span style='min-width:55px'><strong>VLC</strong></span><code style='flex:1;min-width:240px;overflow-wrap:anywhere'>" + htmlEscape(streamerVlcCommand) + "</code><button type='button' class='button cfgStreamerCopyCmd' data-copy='" + htmlEscape(streamerVlcCommand) + "'>Kopieren</button></div>"
-        "<div style='display:flex;gap:7px;align-items:center;flex-wrap:wrap'><span style='min-width:55px'><strong>mpv</strong></span><code style='flex:1;min-width:240px;overflow-wrap:anywhere'>" + htmlEscape(streamerMpvCommand) + "</code><button type='button' class='button cfgStreamerCopyCmd' data-copy='" + htmlEscape(streamerMpvCommand) + "'>Kopieren</button></div>"
-        "<div style='display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin-top:7px'><span style='min-width:110px'><strong>ffplay + Overlay</strong></span><code style='flex:1;min-width:240px;overflow-wrap:anywhere'>" + htmlEscape(streamerFfplayOverlayCommand) + "</code><button type='button' class='button cfgStreamerCopyCmd' data-copy='" + htmlEscape(streamerFfplayOverlayCommand) + "'>Kopieren</button></div>"
-        "<div class='muted' style='margin-top:6px'>Das RTSP-Overlay wird ausschließlich vom Player-PC erzeugt (ffplay/FFmpeg drawtext); SensorForge verändert oder rekodiert keine JPEG-Frames.</div>"
-        "</div>"
-        "<div class='muted' style='margin-top:7px'>SensorForge überträgt RTSP als RTP über TCP. Bei ffplay und mpv wird TCP deshalb ausdrücklich vorgegeben. VLC wird mit der normalen RTSP-Adresse gestartet, da nicht jede VLC-Version dieselbe TCP-Kommandozeilenoption unterstützt.</div>"
-        "</div>"
-        "</div>"
-        "<div style='padding:10px 12px;border:1px solid #d6e1e8;border-radius:9px;background:#fff'>"
-        "<label class='stream-toggle' for='cfgStreamerHttp'><input id='cfgStreamerHttp' type='checkbox' name='streamer_http_mjpeg_enabled' value='1'" + String(displayedStreamerHttpEnabled ? " checked" : "") + "><span class='stream-toggle-title'>Browser-Stream (HTTP-MJPEG)</span><span id='cfgStreamerHttpState' class='stream-toggle-state " + String(displayedStreamerHttpEnabled ? "on" : "off") + "'>" + String(displayedStreamerHttpEnabled ? "AKTIV" : "INAKTIV") + "</span></label>"
-        "<div class='muted' style='margin:4px 0 0 24px'>Für Webbrowser, Home Assistant, einfache Dashboards und eigene Integrationen. <strong>Direkt in Chrome/Firefox nutzbar; Video ohne Audio.</strong> Einfach zu verwenden, aber weniger effizient als RTSP.</div>"
-        "<div id='cfgStreamerHttpDetails' style='margin:7px 0 0 24px" + String(displayedStreamerHttpEnabled ? "" : ";display:none") + "'>"
-        "<div><strong>Adresse:</strong> <code>" + htmlEscape(streamerHttpCommandUrl) + "</code></div>"
-        "<div style='margin-top:10px'><strong>Stream öffnen:</strong></div>"
-        "<div class='muted' style='margin:3px 0 7px 0'>Die URL kann direkt im Browser geöffnet oder mit einem der folgenden Programme verwendet werden.</div>"
-        "<div style='display:grid;gap:7px;max-width:900px'>"
-        "<div style='display:flex;gap:7px;align-items:center;flex-wrap:wrap'><span style='min-width:105px'><strong>Browser blank</strong></span><code style='flex:1;min-width:240px;overflow-wrap:anywhere'>" + htmlEscape(streamerHttpCommandUrl) + "</code><button type='button' class='button cfgStreamerCopyCmd' data-copy='" + htmlEscape(streamerHttpCommandUrl) + "'>Kopieren</button><a class='button' href='" + htmlEscape(streamerHttpCommandUrl) + "' target='_blank' rel='noopener'>Öffnen</a></div>"
-        "<div style='display:flex;gap:7px;align-items:center;flex-wrap:wrap'><span style='min-width:105px'><strong>Browser + Info</strong></span><code style='flex:1;min-width:240px;overflow-wrap:anywhere'>" + htmlEscape(streamerHttpViewerCommandUrl) + "</code><button type='button' class='button cfgStreamerCopyCmd' data-copy='" + htmlEscape(streamerHttpViewerCommandUrl) + "'>Kopieren</button><a class='button' href='" + htmlEscape(streamerHttpViewerCommandUrl) + "' target='_blank' rel='noopener'>Öffnen</a></div>"
-        "<div style='display:flex;gap:7px;align-items:center;flex-wrap:wrap'><span style='min-width:55px'><strong>ffplay</strong></span><code style='flex:1;min-width:240px;overflow-wrap:anywhere'>" + htmlEscape(streamerHttpFfplayCommand) + "</code><button type='button' class='button cfgStreamerCopyCmd' data-copy='" + htmlEscape(streamerHttpFfplayCommand) + "'>Kopieren</button></div>"
-        "<div style='display:flex;gap:7px;align-items:center;flex-wrap:wrap'><span style='min-width:55px'><strong>VLC</strong></span><code style='flex:1;min-width:240px;overflow-wrap:anywhere'>" + htmlEscape(streamerHttpVlcCommand) + "</code><button type='button' class='button cfgStreamerCopyCmd' data-copy='" + htmlEscape(streamerHttpVlcCommand) + "'>Kopieren</button></div>"
-        "<div style='display:flex;gap:7px;align-items:center;flex-wrap:wrap'><span style='min-width:55px'><strong>mpv</strong></span><code style='flex:1;min-width:240px;overflow-wrap:anywhere'>" + htmlEscape(streamerHttpMpvCommand) + "</code><button type='button' class='button cfgStreamerCopyCmd' data-copy='" + htmlEscape(streamerHttpMpvCommand) + "'>Kopieren</button></div>"
-        "</div>"
-        "<div class='muted' style='margin-top:7px'>HTTP-MJPEG enthält nur Video. Für Audio verwende den RTSP-Stream.</div>"
-        "</div>"
-        "</div>"
-        "<div id='cfgStreamerTransportWarning' class='flash-notice error' style='display:none;margin-top:10px'><strong>Keine Stream-Ausgabe gewählt</strong><span>Aktiviere RTSP oder Browser-Stream. Beide dürfen auch gleichzeitig aktiv sein.</span></div>"
-        "<p><strong>Audio:</strong> " + htmlEscape(streamerAudioStatus()) + "</p>"
-        "<p class='muted'>Im Streamer-Modus sind Recording, Power Shooter und die normale Aufnahme-Sleep-Automatik nicht aktiv. "
-        "Der Wechsel zum oder vom Streamer wird erst nach einem Neustart wirksam.</p>"
-        "<a class='button' href='/preview'>Kameraeinstellungen</a>"
-        "</div>"
-        "</div>"
-        "<script>(function(){"
-        "var m=document.getElementById('cfgOperatingMode'),p=document.getElementById('cfgStreamerOptions'),r=document.getElementById('cfgStreamerRtsp'),h=document.getElementById('cfgStreamerHttp'),rs=document.getElementById('cfgStreamerRtspState'),hs=document.getElementById('cfgStreamerHttpState'),rd=document.getElementById('cfgStreamerRtspDetails'),hd=document.getElementById('cfgStreamerHttpDetails'),w=document.getElementById('cfgStreamerTransportWarning'),f=document.getElementById('configForm');"
-        "function setState(el,on){if(!el)return;el.textContent=on?'AKTIV':'INAKTIV';el.classList.toggle('on',on);el.classList.toggle('off',!on);}function transportDetails(){if(rd)rd.style.display=r.checked?'block':'none';if(hd)hd.style.display=h.checked?'block':'none';setState(rs,r.checked);setState(hs,h.checked);}"
-        "function copyText(v){if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(v).catch(function(){});return;}var t=document.createElement('textarea');t.value=v;t.setAttribute('readonly','');t.style.position='fixed';t.style.opacity='0';document.body.appendChild(t);t.select();try{document.execCommand('copy');}catch(x){}document.body.removeChild(t);}"
-        "document.querySelectorAll('.cfgStreamerCopyCmd').forEach(function(b){b.addEventListener('click',function(){copyText(b.getAttribute('data-copy')||'');var old=b.textContent;b.textContent='Kopiert';setTimeout(function(){b.textContent=old;},1200);});});"
-        "function valid(){var ok=r.checked||h.checked;if(w)w.style.display=(m.value==='streamer'&&!ok)?'block':'none';transportDetails();return ok;}"
-        "function sync(ev){p.style.display=m.value==='streamer'?'block':'none';if(m.value==='streamer'&&ev&&!r.checked&&!h.checked)r.checked=true;valid();}"
-        "m.addEventListener('change',function(){sync(true);});r.addEventListener('change',valid);h.addEventListener('change',valid);"
-        "f.addEventListener('submit',function(ev){if(m.value==='streamer'&&!valid()){ev.preventDefault();w.scrollIntoView({behavior:'smooth',block:'center'});}});"
-        "sync(false);})();</script>";
+    html += webconfigStreamerOperatingModeHtml(
+        configuredStreamerMode,
+        displayedStreamerRtspEnabled,
+        displayedStreamerHttpEnabled
+    );
 
     html +=
         "<div style='margin:0 0 18px 0;padding:15px;border:2px solid #7aa7d9;border-radius:9px;background:#f5f9ff'>"
@@ -4672,219 +4505,7 @@ static void handleConfig()
         "</script>";
 
 
-    html += "</div><div class='settings-section'><h3>Audio / Mikrofon</h3>";
-
-    AudioCaptureCapabilities audioCaps =
-        audioCaptureCapabilities();
-
-    html +=
-        "<div style='padding:14px;border:1px solid #8fb5c9;border-radius:8px;background:#f7fbfd'>"
-        "<span class='muted'>" +
-        htmlText(UI_AUDIO_SIMPLE_HELP) +
-        "</span><br><br>";
-
-    html +=
-        htmlText(UI_AUDIO_ENABLE) +
-        ": <select id='cfgAudioEnabled' name='audio_enabled' onchange='sfAudioUi()'>";
-    html += "<option value='0'" +
-            String(!cfg_audio_enabled ? " selected" : "") +
-            ">0 - " + htmlText(UI_AUDIO_OFF) + "</option>";
-    html += "<option value='1'" +
-            String(cfg_audio_enabled ? " selected" : "") +
-            ">1 - " + htmlText(UI_AUDIO_ON) + "</option>";
-    html += "</select><br>";
-
-    html +=
-        "<small class='muted'>" +
-        htmlText(UI_AUDIO_MKV_REQUIRED) +
-        "</small><br><br>";
-
-    html +=
-        "<button type='button' onclick=\"sfAudioAdvancedOpen()\">" +
-        htmlText(UI_AUDIO_ADVANCED_SETTINGS) +
-        "</button> ";
-
-    bool audioMicTestAllowed =
-        audioCaps.available &&
-        !streamerModeEnabled();
-
-    html +=
-        "<button id='sfAudioMicTestBtn' type='button' onclick=\"sfAudioMicTest()\"" +
-        String(audioMicTestAllowed ? "" : " disabled") +
-        ">" + htmlText(UI_AUDIO_MIC_TEST_BUTTON) + "</button>";
-
-    html +=
-        "<div id='sfAudioMicTestPanel' style='margin-top:10px;padding:10px;border:1px solid #cfd8dc;border-radius:6px;background:#fff'>"
-        "<small class='muted'>" + htmlText(UI_AUDIO_MIC_TEST_HELP) + "</small>";
-
-    if (streamerModeEnabled()) {
-        html +=
-            "<br><small style='color:#9a5a00'>" +
-            htmlText(UI_AUDIO_MIC_TEST_STREAMER_BLOCKED) +
-            "</small>";
-    }
-
-    html +=
-        "<div id='sfAudioMicTestStatus' style='margin-top:8px'>" +
-        htmlText(UI_AUDIO_MIC_TEST_READY) +
-        "</div>"
-        "<div id='sfAudioMicTestPlayback' style='display:none;margin-top:8px'>"
-        "<audio id='sfAudioMicTestAudio' controls preload='none' style='width:100%;max-width:520px'></audio><br>"
-        "<a id='sfAudioMicTestDownload' href='/audio_test_play?download=1'>" +
-        htmlText(UI_AUDIO_MIC_TEST_DOWNLOAD) +
-        "</a></div></div>";
-
-    if (!audioCaps.available) {
-        html +=
-            "<br><small style='color:#9a5a00'>" +
-            htmlText(UI_AUDIO_NO_INPUT) +
-            "</small>";
-    }
-
-    html +=
-        "<div id='sfAudioAdvancedModal' style='display:none;position:fixed;z-index:12000;inset:0;background:rgba(0,0,0,.48);padding:18px;overflow:auto'>"
-        "<div style='max-width:720px;margin:5vh auto;background:#fff;border-radius:10px;padding:18px;box-shadow:0 10px 36px rgba(0,0,0,.3)'>"
-        "<div style='display:flex;justify-content:space-between;align-items:center;gap:12px'>"
-        "<h3 style='margin:0'>" + htmlText(UI_AUDIO_ADVANCED_TITLE) + "</h3>"
-        "<button type='button' onclick=\"sfAudioAdvancedClose()\">&times;</button>"
-        "</div><p class='muted'>" + htmlText(UI_AUDIO_ADVANCED_HELP) + "</p>";
-
-#if BOARD_HAS_INTEGRATED_MIC
-    String boardAudioName = BOARD_INTEGRATED_MIC_NAME;
-#else
-    String boardAudioName = tr(UI_NOT_DETECTED);
-#endif
-
-    html +=
-        "<p class='muted'>" +
-        htmlText(UI_AUDIO_SOURCE_BOARD_DEFAULT) +
-        ": <b>" + htmlEscape(boardAudioName) + "</b><br>" +
-        htmlText(UI_AUDIO_SOURCE) +
-        " (" + htmlText(UI_STATUS_ACTIVE) + "): <b>" +
-        htmlEscape(String(audioCaptureBackendName())) +
-        "</b></p>";
-
-    html +=
-        htmlText(UI_AUDIO_EXPERT_MODE) +
-        ": <select id='cfgAudioExpertMode' name='audio_expert_mode' onchange='sfAudioUi()'>"
-        "<option value='0'" +
-        String(!cfg_audio_expert_mode ? " selected" : "") +
-        ">0 - User</option>"
-        "<option value='1'" +
-        String(cfg_audio_expert_mode ? " selected" : "") +
-        ">1 - Expert</option>"
-        "</select><br>";
-
-    html +=
-        htmlText(UI_AUDIO_SOURCE) +
-        ": <select id='cfgAudioSource' name='audio_source' onchange='sfAudioUi()'>"
-        "<option value='board_default'" +
-        String(cfg_audio_source == "board_default" ? " selected" : "") +
-        ">" + htmlText(UI_AUDIO_SOURCE_BOARD_DEFAULT) + "</option>"
-        "<option value='external'" +
-        String(cfg_audio_source == "external" ? " selected" : "") +
-        ">" + htmlText(UI_AUDIO_SOURCE_EXTERNAL) + "</option>"
-        "</select><br>";
-
-    html +=
-        "audio_sample_rate: <input name='audio_sample_rate' type='number' min='8000' max='96000' step='1000' value='" +
-        String(cfg_audio_sample_rate) +
-        "' style='width:110px'> Hz<br>";
-
-    html += "audio_bits_per_sample: <select name='audio_bits_per_sample'>";
-    html += "<option value='16'" + String(cfg_audio_bits_per_sample == 16 ? " selected" : "") + ">16 bit</option>";
-    html += "<option value='24'" + String(cfg_audio_bits_per_sample == 24 ? " selected" : "") + ">24 bit</option>";
-    html += "<option value='32'" + String(cfg_audio_bits_per_sample == 32 ? " selected" : "") + ">32 bit</option>";
-    html += "</select><br>";
-
-    html += "audio_channels: <select name='audio_channels'>";
-    html += "<option value='1'" + String(cfg_audio_channels == 1 ? " selected" : "") + ">1 - mono</option>";
-    html += "<option value='2'" + String(cfg_audio_channels == 2 ? " selected" : "") + ">2 - stereo</option>";
-    html += "</select><br>";
-
-    html +=
-        "<div id='cfgAudioExpertPanel' style='margin-top:12px;padding:12px;border:1px dashed #78909c;border-radius:6px'>"
-        "<b>" + htmlText(UI_AUDIO_EXTERNAL_PINS) + "</b><br>"
-        "<small class='muted'>" + htmlText(UI_AUDIO_EXPERT_HELP) + "</small><br>"
-        "<small style='color:#9a5a00'>" + htmlText(UI_AUDIO_GPIO_WARNING) + "</small><br><br>" +
-        htmlText(UI_AUDIO_BACKEND) +
-        ": <select id='cfgAudioBackend' name='audio_backend' onchange='sfAudioUi()'>"
-        "<option value='pdm'" +
-        String(cfg_audio_backend == "pdm" ? " selected" : "") +
-        ">" + htmlText(UI_AUDIO_BACKEND_PDM) + "</option>"
-        "<option value='i2s'" +
-        String(cfg_audio_backend == "i2s" ? " selected" : "") +
-        ">" + htmlText(UI_AUDIO_BACKEND_I2S) + "</option>"
-        "</select><br>";
-
-    html +=
-        "<div id='cfgAudioPdmPanel' style='margin-top:8px'>"
-        "audio_pdm_clk_pin: <input name='audio_pdm_clk_pin' type='number' min='-1' max='48' value='" +
-        String(cfg_audio_pdm_clk_pin) +
-        "' style='width:80px'><br>"
-        "audio_pdm_data_pin: <input name='audio_pdm_data_pin' type='number' min='-1' max='48' value='" +
-        String(cfg_audio_pdm_data_pin) +
-        "' style='width:80px'><br>"
-        "</div>";
-
-    html +=
-        "<div id='cfgAudioI2sPanel' style='margin-top:8px'>"
-        "audio_i2s_bclk_pin: <input name='audio_i2s_bclk_pin' type='number' min='-1' max='48' value='" +
-        String(cfg_audio_i2s_bclk_pin) +
-        "' style='width:80px'><br>"
-        "audio_i2s_ws_pin: <input name='audio_i2s_ws_pin' type='number' min='-1' max='48' value='" +
-        String(cfg_audio_i2s_ws_pin) +
-        "' style='width:80px'><br>"
-        "audio_i2s_data_pin: <input name='audio_i2s_data_pin' type='number' min='-1' max='48' value='" +
-        String(cfg_audio_i2s_data_pin) +
-        "' style='width:80px'><br>"
-        "audio_i2s_mclk_pin: <input name='audio_i2s_mclk_pin' type='number' min='-1' max='48' value='" +
-        String(cfg_audio_i2s_mclk_pin) +
-        "' style='width:80px'> <small class='muted'>-1 = unused</small><br>" +
-        htmlText(UI_AUDIO_I2S_SLOT) +
-        ": <select name='audio_i2s_slot'>"
-        "<option value='left'" + String(cfg_audio_i2s_slot == "left" ? " selected" : "") + ">left</option>"
-        "<option value='right'" + String(cfg_audio_i2s_slot == "right" ? " selected" : "") + ">right</option>"
-        "<option value='stereo'" + String(cfg_audio_i2s_slot == "stereo" ? " selected" : "") + ">stereo</option>"
-        "</select><br>"
-        "</div>"
-        "<small class='muted'>" + htmlText(UI_AUDIO_SAVE_HARDWARE_NOTE) + "</small>"
-        "</div>";
-
-    if (audioCaps.available) {
-        html +=
-            "<p class='muted'>Backend: " +
-            String((unsigned long)audioCaps.minSampleRate) + ".." +
-            String((unsigned long)audioCaps.maxSampleRate) + " Hz; " +
-            htmlText(UI_AUDIO_RECOMMENDED) + " " +
-            String((unsigned long)audioCaps.recommendedSampleRate) +
-            " Hz.</p>";
-    }
-
-    html +=
-        "<div style='margin-top:16px;text-align:right'>"
-        "<button type='button' onclick=\"sfAudioAdvancedClose()\">" +
-        htmlText(UI_AUDIO_CLOSE) +
-        "</button>"
-        "</div></div></div>";
-
-    html +=
-        "<script>"
-        "function sfAudioAdvancedOpen(){var m=document.getElementById('sfAudioAdvancedModal');if(m)m.style.display='block';}"
-        "function sfAudioAdvancedClose(){var m=document.getElementById('sfAudioAdvancedModal');if(m)m.style.display='none';}"
-        "function sfAudioUi(){"
-        "var a=document.getElementById('cfgAudioEnabled');var r=document.getElementById('cfgRecordingFormat');var e=document.getElementById('cfgAudioExpertMode');var s=document.getElementById('cfgAudioSource');var p=document.getElementById('cfgAudioExpertPanel');var b=document.getElementById('cfgAudioBackend');var pp=document.getElementById('cfgAudioPdmPanel');var ip=document.getElementById('cfgAudioI2sPanel');"
-        "if(a&&r&&a.value==='1')r.value='mkv';"
-        "if(!e||!s||!p||!b||!pp||!ip)return;var expert=e.value==='1';if(!expert&&s.value==='external')s.value='board_default';p.style.display=expert?'block':'none';var external=expert&&s.value==='external';b.disabled=!external;pp.style.display=external&&b.value==='pdm'?'block':'none';ip.style.display=external&&b.value==='i2s'?'block':'none';}"
-        "async function sfAudioMicTest(){"
-        "var b=document.getElementById('sfAudioMicTestBtn'),st=document.getElementById('sfAudioMicTestStatus'),pb=document.getElementById('sfAudioMicTestPlayback'),au=document.getElementById('sfAudioMicTestAudio');"
-        "if(!b||!st||!pb||!au)return;b.disabled=true;pb.style.display='none';au.pause();au.removeAttribute('src');"
-        "st.textContent='" + htmlText(UI_AUDIO_MIC_TEST_RECORDING) + "';"
-        "try{var r=await fetch('/audio_test_record',{method:'POST',credentials:'same-origin'});var t=await r.text();if(!r.ok)throw new Error(t||('HTTP '+r.status));var j=JSON.parse(t);au.src='/audio_test_play?t='+Date.now();var dl=document.getElementById('sfAudioMicTestDownload');if(dl)dl.href='/audio_test_play?download=1&t='+Date.now();pb.style.display='block';st.textContent='" + htmlText(UI_AUDIO_MIC_TEST_DONE) + " '+(j.capture_ms||0)+' ms · Peak '+(j.peak||0)+' · RMS '+Number(j.rms||0).toFixed(1);}"
-        "catch(e){st.textContent='" + htmlText(UI_AUDIO_MIC_TEST_FAILED) + " '+e.message;}finally{b.disabled=false;}}"
-        "sfAudioUi();"
-        "</script>"
-        "</div>";
+    appendWebConfigAudioUi(html);
 
 
     html += "</div><div class='settings-section'><h3>Sleep / Stromsparen</h3>";
@@ -5002,6 +4623,68 @@ static void handleConfig()
         "<div class='config-label'>WLAN-Passwort</div>"
         "<div class='config-control'><input type='password' name='wifi_pass' autocomplete='new-password' value='' "
         "placeholder='Leer lassen = bestehendes Passwort behalten'></div>";
+
+    html +=
+        "<div class='config-label'>WiFi-Sendeleistung</div>"
+        "<div class='config-control'><select name='wifi_tx_power_dbm'>";
+
+    int16_t configuredTxPowerX10 =
+        (int16_t)lroundf(cfg_wifi_tx_power_dbm * 10.0f);
+
+    for (size_t i = 0; i < BOARD_WIFI_TX_POWER_LEVEL_COUNT; ++i) {
+        int16_t valueX10 = BOARD_WIFI_TX_POWER_LEVELS_X10[i];
+        String valueText = String(valueX10 / 10.0f, 1);
+        html +=
+            "<option value='" + valueText + "'" +
+            String(valueX10 == configuredTxPowerX10 ? " selected" : "") +
+            ">" + valueText + " dBm</option>";
+    }
+
+    html +=
+        "</select></div>"
+        "<div class='config-note'>Gilt für externes WLAN und Hotspot. Niedrigere Werte können Funkleistung und Wärme reduzieren, "
+        "verringern aber die Funkreserve. Board-Default: " +
+        String(BOARD_WIFI_TX_POWER_DEFAULT_X10 / 10.0f, 1) + " dBm.</div>";
+
+    html +=
+        "<div class='config-label'>Empfang externes WLAN</div><div class='config-control'>";
+
+    if (wifiInfrastructureRssiAvailable()) {
+        int rssi = wifiInfrastructureRssiDbm();
+        int markerPct = constrain((rssi + 90) * 100 / 45, 0, 100);
+        String qualityText;
+        String recommendation;
+
+        if (rssi >= -55) {
+            qualityText = "Sehr gut";
+            recommendation = "11 bis 15 dBm ausprobieren";
+        } else if (rssi >= -65) {
+            qualityText = "Gut";
+            recommendation = "15 bis 16.5 dBm ausprobieren";
+        } else if (rssi >= -72) {
+            qualityText = "Mittel";
+            recommendation = "16.5 bis 18 dBm verwenden";
+        } else {
+            qualityText = "Schwach";
+            recommendation = "hohe bzw. maximale Board-Sendeleistung beibehalten";
+        }
+
+        html +=
+            "<div><b>" + String(rssi) + " dBm - " + qualityText + "</b></div>"
+            "<div style='position:relative;height:14px;border-radius:7px;margin:8px 0 6px;"
+            "background:linear-gradient(90deg,#c62828 0%,#f9a825 45%,#7cb342 72%,#2e7d32 100%);'>"
+            "<span style='position:absolute;left:calc(" + String(markerPct) + "% - 2px);top:-4px;width:4px;height:22px;"
+            "background:#111;border-radius:2px'></span></div>"
+            "<div class='config-note'>Rot = schwacher Empfang, Grün = sehr guter Empfang. "
+            "Letzte Messung während der Verbindung mit dem externen WLAN in dieser Laufzeit. "
+            "Empfehlung: <b>" + recommendation + "</b>. Die Einstellung wird nicht automatisch geändert.</div>";
+    } else {
+        html +=
+            "<div class='config-note'>Noch keine Empfangsmessung in dieser Laufzeit. RSSI ist nur messbar, "
+            "während SensorForge tatsächlich mit dem konfigurierten externen WLAN verbunden ist.</div>";
+    }
+
+    html += "</div>";
 
     html += "</div>";
 
@@ -5703,6 +5386,20 @@ static void handleSave()
     }
 
 
+    float wifiTxPowerDbm = cfg_wifi_tx_power_dbm;
+    if (server.hasArg("wifi_tx_power_dbm")) {
+        String txPowerText = server.arg("wifi_tx_power_dbm");
+        txPowerText.trim();
+        char *end = nullptr;
+        double parsed = strtod(txPowerText.c_str(), &end);
+        if (end == txPowerText.c_str() || *end != '\0' || !isfinite(parsed)) {
+            server.send(400, "text/plain; charset=utf-8", "Invalid wifi_tx_power_dbm");
+            return;
+        }
+        wifiTxPowerDbm = (float)parsed;
+    }
+
+
     int hotspotEnabled =
         server.arg("hotspot_enabled").toInt()
         ? 1
@@ -6232,6 +5929,10 @@ static void handleSave()
 
     text += "wifi_pass=";
     text += newPassword;
+    text += '\n';
+
+    text += "wifi_tx_power_dbm=";
+    text += String(wifiTxPowerDbm, 1);
     text += '\n';
 
     text += "hotspot_enabled=";

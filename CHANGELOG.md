@@ -1,49 +1,29 @@
-## v84 candidate - UI cleanup: header, viewer and connections
+## v84 candidate - Webviewer linker/integration fix
 
-- Removed duplicate CPU temperature text from the date/time header; temperature remains on the dedicated TEMP meter.
-- Removed the explanatory MJPEG viewer sentence about browser-side overlay rendering.
-- Simplified the streamer overview by removing the web-vs-stream client explanation and separating web/system-maintenance sessions from streaming connections in two clear status cards.
-- Streaming connection card shows total active connections plus RTSP and HTTP counts against their existing 2-client limits.
-- No capture, RTSP, HTTP-MJPEG, thermal, CPU-load calculation, configuration or recovery logic changed.
+- restores the complete `/stream_view` implementation that was accidentally lost when later streamer hardening/thermal changes were based on an older `streamer.cpp`
+- restores the public `streamerHttpViewerUrl()` definition referenced by `webconfig_streamer.cpp`
+- re-registers `/stream_view` alongside the existing streamer web routes
+- keeps the MJPEG stream path unchanged; overlay text/time are still rendered only in the browser
+- preserves the later UI cleanup by not restoring the removed explanatory MJPEG text
+- no changes to capture, RTSP, HTTP-MJPEG transport, self-healing or thermal-throttle logic
 
-## v84 UI polish – Config clarity / dual health meters
+## v84 candidate - dynamic thermal streamer throttling / analyzer integration
 
-- Config header simplified; release line now includes `git-tag`, redundant SD-config status line removed.
-- Camera metadata explanatory text moved behind an info button; redundant camera-name hint removed.
-- RTSP and HTTP-MJPEG enable switches now use clearer equal-weight cards with live AKTIV/INAKTIV status chips; underlying checkbox/save behavior is unchanged.
-- Global header now shows two compact live meters: CPU temperature using the existing Thermal Guard thresholds, and CPU/system load using the existing load telemetry. No new polling or sensor reads were added.
-- No changes to capture, RTSP/HTTP streaming, config schema, save semantics, recovery logic or thermal protection.
+- Streamer thermal throttling is now relative to the configured frame rate instead of fixed 3/2 fps caps.
+- Stage 1 at 78.0 C uses 75% of configured fps; stage 2 at 79.0 C uses 50%, rounded to the nearest whole fps with a minimum of 1 fps.
+- Existing hysteresis and the independent 80 C Thermal Guard remain unchanged.
+- Thermal throttle escalation is logged as `WARNING | THERMAL | STREAMER_THROTTLE` with CPU temperature, level, factor, configured/effective fps and client counts.
+- Relax/recovery transitions are logged separately, including episode duration and peak temperature when full fps is restored.
+- Integrated Web Log Analyzer now counts streamer throttle warnings and completed throttle recoveries explicitly in the thermal statistics.
 
-## v84 candidate - Kamera-Metadaten UI vereinfacht
+## v84 candidate - streamer thermal soft-throttling / idle capture reduction
 
-- Anzeigename und Text im Streamingbild sind in der Konfiguration zu einem einzigen benutzerseitigen Feld `Kameraname / Text im Streamingbild` zusammengefasst.
-- Beim Speichern werden `camera_display_name` und `camera_overlay_text` intern automatisch auf denselben Wert synchronisiert; bestehendes Config-Schema bleibt kompatibel.
-- Metadatenbereich optisch als kompakte, responsive Eingabekarten überarbeitet.
-- Info-Popups für Kameraname, Standort, GPS-Format/Wertebereiche, Verantwortlichen, E-Mail und Beschreibung ergänzt.
-- GPS bleibt optional und verwendet Dezimalgrad (WGS84); keine Änderung am Kamera-/Streamer-Capturepfad und keine zusätzliche Bildverarbeitung.
-
-## v84 candidate – Kamera-Metadaten und lastfreier Stream-Overlay-Viewer (2026-09-29)
-
-- Neue optionale, rückwärtskompatible Config-Keys: `camera_display_name`, `camera_location`, `camera_gps_lat`, `camera_gps_lon`, `camera_responsible`, `camera_email`, `camera_overlay_text`, `camera_description`.
-- Fehlende neue Keys bleiben leer; bestehende Konfigurationen benötigen keine Migration.
-- HTTP-MJPEG bleibt als unveränderter Blank-Stream auf Port 81 bestehen.
-- Neuer `/stream_view`-Webviewer zeigt denselben MJPEG-Stream mit Browser-seitigem Datum/Uhrzeit-Overlay und frei konfigurierbarem Text. Keine JPEG-Dekodierung oder -Rekodierung auf dem ESP32.
-- Der Viewer zeigt vorhandene Standort-/Kontaktmetadaten unter dem Bild an und verwendet die SensorForge-Zeitzone für die initiale Uhrzeit; die Sekundentakt-Aktualisierung läuft ausschließlich im Browser.
-- RTSP bleibt byte-/capture-seitig unverändert. Zusätzlich wird in der Konfiguration ein optionaler `ffplay + Overlay`-Befehl angeboten; `drawtext` läuft auf dem Client-PC.
-- HTTP-Konfiguration zeigt gleichberechtigt `Browser blank` und `Browser + Info` mit Kopieren-/Öffnen-Funktionen.
-- Keine zusätzlichen Kamera-Captures, keine zusätzlichen Encode-Schritte und keine schnellen Hintergrund-Pollings hinzugefügt.
-
-## v84 candidate - HTTP-MJPEG Bedienung gleichberechtigt zu RTSP
-
-- Browser-Stream-Konfiguration optisch und funktional an den RTSP-Block angeglichen.
-- HTTP-MJPEG zeigt jetzt dieselbe "Stream öffnen"-Struktur mit kopierbaren Aufrufen für Browser-URL, ffplay, VLC und mpv.
-- Direkter Browser-Button "Öffnen" ergänzt; HTTP-Hinweis stellt klar, dass dieser Pfad nur Video und kein Audio führt.
-- Keine Änderung am Streamer-Protokoll, Capture-Pfad, Client-Limit oder Self-Healing.
-
-## v84 candidate - Hauptseite vereinfacht
-- Die Direktbuttons `Betriebsmodus konfigurieren` und `Kameraeinstellungen` wurden von der Hauptseite entfernt.
-- Konfiguration erfolgt damit konsistent über die Hauptnavigation/Menüs.
-- Keine Änderung an den zugrunde liegenden Seiten oder Funktionen.
+- Added low-overhead streamer thermal soft-throttling without changing the existing 80 C Thermal Guard or emergency/cooldown policy.
+- No throttling below 78.0 C. At >=78.0 C the effective streamer cadence is capped at 3 fps; at >=79.0 C it is capped at 2 fps. Hysteresis restores 3 fps below 77.5 C and the configured rate below 77.0 C.
+- Thermal checks run only every 5 seconds. Transitions are logged with temperature, configured/effective fps and client counts. When an episode ends the log also records duration and peak temperature.
+- With no active RTSP/HTTP stream client the camera remains initialized but the cached snapshot refresh is reduced to one frame every 5 seconds. First/last client transitions log the active/idle capture profile. This avoids camera reinitialization and preserves fast reconnects.
+- `/streamer_status` now exposes configured/effective fps, thermal throttle level and the last streamer CPU temperature; the dashboard diagnostic block shows these values live.
+- No JPEG decode/re-encode, no additional camera captures, no new background task and no change to RTSP/HTTP/audio payload formats.
 
 ## v84 candidate - low-overhead streamer hardening / self-healing
 
@@ -107,6 +87,16 @@
 - Die Dashboard-Anzeige trennt Web-Oberflächen und Stream-Clients jetzt deutlicher und erklärt, dass eine Web-Oberfläche keinen Stream-Client-Platz belegt.
 
 # SensorForge Changelog
+
+## v84 candidate — 2026-09-29 — Thermal/WiFi tuning
+
+- Streamer thermal throttling begins 1 °C earlier (77/78 °C stages) while the board thermal emergency limit remains 80 °C.
+- Moved the CPU thermal emergency threshold into `board_config.h` for board-specific future qualification.
+- Added board-scoped discrete WiFi TX-power levels plus a board default in `board_config.h`.
+- Added additive `wifi_tx_power_dbm` config with a backwards-compatible default of 20.0 dBm; the selected ceiling is applied to both STA and local AP without changing WiFi mode/credentials/fallback behaviour.
+- Added WLAN RSSI capture during a real infrastructure-WiFi connection and a green-to-red reception scale in Configuration. The UI provides a conservative TX-power suggestion but never changes TX power automatically.
+- No claim of completed Arduino build, RF qualification or thermal hardware validation for this candidate.
+
 
 ## v84 candidate — 2026-09-28 (not yet released)
 
@@ -1013,3 +1003,19 @@ and identifies the concrete binary compilation time.
 - Aufnahme, Storage-Wartung, bereits aktiver Audio-Capture und Netzwerk-Streamer blockieren den Test, um Ownership-Konflikte zu vermeiden.
 - Der zentrale Systemtest bleibt erhalten; nur der kurze Hörtest wurde wiederhergestellt. Der historische Audio-Benchmark bleibt auf den Systemtest umgeleitet.
 - Neue sichtbare Texte sind in Deutsch und Englisch vorhanden.
+
+## v84 candidate - streamer telemetry + manual stress measurement
+
+- Add passive streamer telemetry without JPEG decode/re-encode or extra network traffic:
+  cumulative JPEG frame/byte statistics, JPEG average/max size, RTP/JPEG packet and wire-byte counters,
+  HTTP video payload bytes, and RTSP per-frame send-time average/max.
+- Expose these counters in `/streamer_status`; the Streamer diagnostics UI derives current aggregate video kbit/s
+  from counter deltas in the browser.
+- Add a manual, time-bounded Streamer stress/measurement panel in Config (30/60/120 s):
+  - Camera/JPEG: normal JPEG capture cadence without network output; requires no active stream clients.
+  - HTTP-MJPEG: browser itself opens one real MJPEG client; requires no pre-existing stream clients.
+  - Current stream: measures the already-running RTSP/HTTP/audio workload without changing it.
+- Stress START/END are logged with mode, duration, configured/effective FPS, frame count, average/max JPEG size,
+  video kbit/s, RTP packet count, RTSP/HTTP/audio byte counters, max RTSP frame send time, start/peak CPU temperature,
+  and current client/audio state. External current draw remains a manual multimeter measurement.
+- Existing 80 C thermal guard and dynamic 78/79 C relative FPS throttling remain authoritative during all tests.

@@ -1,7 +1,7 @@
 SENSORFORGE / ESP32-S3 CAMERA (XIAO + FREENOVE)
 PROJEKTBESCHREIBUNG, RELEASESTAND UND WIEDEREINSTIEGSPROMPT
-Stand: 2026-09-28
-Dokumentrevision: v83 + offene v84-Aufgabe RTSP/Netzwerk-Streamer / v67-Stabilitaetsbasis + Power-Shooter-Bewegungsverdacht + laienfreundliche System-/Transport-/Kamera-UI + offene Langzeitqualifikation
+Stand: 2026-09-29
+Dokumentrevision: v83 + v84-Kandidat RTSP/Netzwerk-Streamer + Thermal-/WiFi-Tuning 2026-09-29 / v67-Stabilitaetsbasis + offene Langzeitqualifikation
 Aktueller Entwicklungs-/Arbeits-Release: v83 (Produktionsqualifikation fuer XIAO-Langzeitrecording noch offen)
 Produktname: SensorForge
 Plattformname: Fabric Node
@@ -14,6 +14,16 @@ OFFENE V84-AUFGABE - RTSP / NETZWERK-STREAMER (WIEDEREINSTIEG VERBINDLICH)
 ======================================================================
 
 STATUS / AUSGANGSPUNKT:
+
+IMPLEMENTIERUNGSSTAND 2026-09-29, THERMAL-/WIFI-TUNING (V84-KANDIDAT, NOCH NICHT FREIGEGEBEN):
+
+- Streamer-Thermal-Throttling wurde konservativ um 1 °C vorgezogen: Stufe 1 ab 77 °C, Stufe 2 ab 78 °C; der Thermal-Emergency-Pfad bleibt bei 80 °C.
+- Die board-spezifische Thermal-Emergency-Grenze liegt nun in `board_config.h`, damit spätere Hardwarequalifikation je Board zentral erfolgen kann.
+- WiFi-TX-Power ist additiv über `wifi_tx_power_dbm` konfigurierbar. Fehlt der Key, bleibt der Board-Default 20.0 dBm und damit das bisherige Verhalten erhalten.
+- `board_config.h` definiert pro Board die diskreten zulässigen dBm-Stufen sowie Minimum, Maximum und Default.
+- Die konfigurierte TX-Power wird gleichermaßen im STA-Betrieb (externes WLAN) und AP-Betrieb (lokaler Hotspot) als maximale Sendeleistung angewendet. Die bestehende AP/STA-Betriebslogik wird dadurch NICHT geändert.
+- Bei einer realen Verbindung mit einem externen WLAN wird der RSSI-Wert erfasst. Die Konfigurationsseite zeigt die letzte Messung dieser Laufzeit auf einer Grün-Gelb-Rot-Skala und gibt eine konservative TX-Power-Empfehlung aus. Es erfolgt ausdrücklich KEINE automatische Änderung.
+- Für diese Änderungen sind noch echter Arduino-Build, Reichweiten-/Paketverlusttest und Temperatur-A/B-Test erforderlich; keine Hardwarequalifikation behaupten.
 
 IMPLEMENTIERUNGSSTAND 2026-09-28, V84-KANDIDAT (NOCH NICHT FREIGEGEBEN):
 

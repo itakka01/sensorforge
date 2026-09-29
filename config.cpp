@@ -166,6 +166,7 @@ String cfg_wifi_on_system_start = "off";
 int cfg_wifi_timeout_sec = 0;
 String cfg_wifi_ssid = "";
 String cfg_wifi_pass = "";
+float cfg_wifi_tx_power_dbm = BOARD_WIFI_TX_POWER_DEFAULT_X10 / 10.0f;
 
 int cfg_hotspot_enabled = 1;
 String cfg_hotspot_password = "";
@@ -540,6 +541,7 @@ struct ConfigValues {
     String timezone;
     String wifiSsid;
     String wifiPass;
+    float wifiTxPowerDbm;
 
     int hotspotEnabled;
     String hotspotPassword;
@@ -650,6 +652,7 @@ struct ConfigSeen {
     bool timezone;
     bool wifiSsid;
     bool wifiPass;
+    bool wifiTxPowerDbm;
 
     bool hotspotEnabled;
     bool hotspotPassword;
@@ -927,6 +930,9 @@ static ConfigValues makeDefaultValues()
     values.wifiPass =
         "";
 
+    values.wifiTxPowerDbm =
+        BOARD_WIFI_TX_POWER_DEFAULT_X10 / 10.0f;
+
     values.hotspotEnabled =
         1;
 
@@ -1079,6 +1085,7 @@ static bool serializeConfigValues(
     APPEND_CONFIG_VALUE("timezone", values.timezone);
     APPEND_CONFIG_VALUE("wifi_ssid", values.wifiSsid);
     APPEND_CONFIG_VALUE("wifi_pass", values.wifiPass);
+    APPEND_CONFIG_VALUE("wifi_tx_power_dbm", String(values.wifiTxPowerDbm, 1));
 
     APPEND_CONFIG_VALUE("hotspot_enabled", String(values.hotspotEnabled));
     APPEND_CONFIG_VALUE("hotspot_password", values.hotspotPassword);
@@ -2721,6 +2728,23 @@ static bool validateValues(
     }
 
 
+    {
+        int16_t txPowerX10 =
+            (int16_t)lroundf(values.wifiTxPowerDbm * 10.0f);
+
+        if (
+            fabsf(values.wifiTxPowerDbm * 10.0f - txPowerX10) > 0.01f ||
+            txPowerX10 < BOARD_WIFI_TX_POWER_MIN_X10 ||
+            txPowerX10 > BOARD_WIFI_TX_POWER_MAX_X10 ||
+            !boardWifiTxPowerSupportedX10(txPowerX10)
+        ) {
+            error =
+                "wifi_tx_power_dbm is not a supported value for this board";
+            return false;
+        }
+    }
+
+
     if (
         values.hotspotEnabled != 0 &&
         values.hotspotEnabled != 1
@@ -4165,6 +4189,31 @@ static bool parseConfigText(
                 }
 
             } else if (
+                key == "wifi_tx_power_dbm"
+            ) {
+
+                float decimalValue = 0.0f;
+
+                if (
+                    !markOnce(
+                        seen.wifiTxPowerDbm,
+                        key,
+                        error
+                    ) ||
+                    !parseFloatStrict(
+                        value,
+                        decimalValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid wifi_tx_power_dbm";
+                    return false;
+                }
+
+                values.wifiTxPowerDbm =
+                    decimalValue;
+
+            } else if (
                 key == "hotspot_enabled"
             ) {
 
@@ -4737,6 +4786,9 @@ static void applyValues(
 
     cfg_wifi_pass =
         values.wifiPass;
+
+    cfg_wifi_tx_power_dbm =
+        values.wifiTxPowerDbm;
 
     cfg_hotspot_enabled =
         values.hotspotEnabled;
@@ -5786,6 +5838,11 @@ config_loaded:
     Serial.println(
         "Config WiFi: hostname=" +
         cfg_hostname
+    );
+
+    Serial.println(
+        "Config WiFi: tx_power_dbm=" +
+        String(cfg_wifi_tx_power_dbm, 1)
     );
 
     Serial.println(

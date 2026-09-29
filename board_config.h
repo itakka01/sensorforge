@@ -94,6 +94,23 @@
 #define RECORDING_MAX_WEIGHTED_PIXEL_RATE 0UL
 #define RECORDING_PRODUCTION_FPS_CAP_1024X768 0
 
+// Board-specific CPU thermal emergency limit. This remains a firmware safety
+// constant (not config.txt) so field configuration cannot weaken protection.
+#define BOARD_THERMAL_EMERGENCY_C 80.0f
+
+// WiFi TX-power policy. Values are stored as tenths of dBm so the supported
+// ESP32-S3 steps remain exact without floating-point comparisons. The actual
+// user selection is persisted in config.txt; this board profile defines only
+// the hardware-valid choices and the safe backwards-compatible default.
+static constexpr int16_t BOARD_WIFI_TX_POWER_LEVELS_X10[] = {
+    20, 50, 70, 85, 110, 130, 140, 150, 165, 180, 200
+};
+static constexpr size_t BOARD_WIFI_TX_POWER_LEVEL_COUNT =
+    sizeof(BOARD_WIFI_TX_POWER_LEVELS_X10) / sizeof(BOARD_WIFI_TX_POWER_LEVELS_X10[0]);
+static constexpr int16_t BOARD_WIFI_TX_POWER_MIN_X10 = 20;
+static constexpr int16_t BOARD_WIFI_TX_POWER_MAX_X10 = 200;
+static constexpr int16_t BOARD_WIFI_TX_POWER_DEFAULT_X10 = 200;
+
 
 // =============================================================
 // XIAO ESP32S3 SENSE
@@ -218,6 +235,24 @@
 //
 // Re-qualify before raising either policy after a board/SD/core change.
 #define RECORDING_MAX_WEIGHTED_PIXEL_RATE 8000000UL
+
+// Board-specific CPU thermal emergency limit. Keep this in the board profile
+// so a future hardware qualification can raise/lower the limit centrally
+// without changing the generic thermal safety implementation.
+#define BOARD_THERMAL_EMERGENCY_C 80.0f
+
+// WiFi TX-power policy for XIAO ESP32S3 Sense. Keep the full ESP32-S3
+// discrete TX-power set available; the default deliberately matches the
+// previous firmware behaviour (maximum/default radio power).
+static constexpr int16_t BOARD_WIFI_TX_POWER_LEVELS_X10[] = {
+    20, 50, 70, 85, 110, 130, 140, 150, 165, 180, 200
+};
+static constexpr size_t BOARD_WIFI_TX_POWER_LEVEL_COUNT =
+    sizeof(BOARD_WIFI_TX_POWER_LEVELS_X10) / sizeof(BOARD_WIFI_TX_POWER_LEVELS_X10[0]);
+static constexpr int16_t BOARD_WIFI_TX_POWER_MIN_X10 = 20;
+static constexpr int16_t BOARD_WIFI_TX_POWER_MAX_X10 = 200;
+static constexpr int16_t BOARD_WIFI_TX_POWER_DEFAULT_X10 = 200;
+
 #define RECORDING_PRODUCTION_FPS_CAP_1024X768 4
 
 #if CAMERA_BASE_HMIRROR != 0 && CAMERA_BASE_HMIRROR != 1
@@ -229,3 +264,21 @@
 #endif
 
 #endif
+
+
+// Generic helpers for board-scoped WiFi TX-power validation.
+static inline bool boardWifiTxPowerSupportedX10(int16_t valueX10)
+{
+    for (size_t i = 0; i < BOARD_WIFI_TX_POWER_LEVEL_COUNT; ++i) {
+        if (BOARD_WIFI_TX_POWER_LEVELS_X10[i] == valueX10)
+            return true;
+    }
+    return false;
+}
+
+static inline int8_t boardWifiTxPowerQuarterDbm(int16_t valueX10)
+{
+    // esp_wifi_set_max_tx_power() uses quarter-dBm units. Every value in the
+    // board list maps exactly (for example 19.5 dBm -> 78).
+    return (int8_t)((valueX10 * 2) / 5);
+}

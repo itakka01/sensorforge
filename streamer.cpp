@@ -3,6 +3,7 @@
 #include "audio_capture.h"
 #include "config.h"
 #include "logger.h"
+#include "thermal.h"
 
 #include <WebServer.h>
 #include <esp_camera.h>
@@ -11,7 +12,6 @@
 #include <Preferences.h>
 #include <algorithm>
 #include <esp_heap_caps.h>
-#include <time.h>
 
 // Camera lifecycle is owned by the main firmware. The streamer requests a
 // controlled reinitialization only while operating_mode=streamer.
@@ -43,6 +43,21 @@ static const uint32_t AUDIO_RECOVERY_RETRY_MS = 10000;
 static const uint32_t MEMORY_HEALTH_INTERVAL_MS = 60000;
 static const uint8_t MEMORY_CRITICAL_CHECKS_BEFORE_REBOOT = 3;
 static const uint32_t HEALTH_PERSIST_INTERVAL_MS = 6UL * 60UL * 60UL * 1000UL;
+// Streamer thermal soft-throttling deliberately starts close to the board-specific
+// emergency threshold. It only reduces capture/network cadence; the
+// firmware thermal guard and its emergency policy remain authoritative.
+static constexpr float STREAM_THERMAL_STAGE1_C = 77.0f;
+static constexpr float STREAM_THERMAL_STAGE2_C = 78.0f;
+static constexpr float STREAM_THERMAL_STAGE1_RELEASE_C = 76.0f;
+static constexpr float STREAM_THERMAL_STAGE2_RELEASE_C = 76.5f;
+static const uint32_t STREAM_THERMAL_CHECK_INTERVAL_MS = 5000UL;
+static const uint32_t STREAM_IDLE_CAPTURE_INTERVAL_MS = 5000UL;
+// Diagnostic stress measurements are manual, time-bounded and never weaken
+// the thermal guard. Camera-only mode exercises the normal JPEG capture path
+// without creating synthetic network traffic.
+static const uint32_t STREAM_STRESS_DEFAULT_MS = 60000UL;
+static const uint32_t STREAM_STRESS_MIN_MS = 10000UL;
+static const uint32_t STREAM_STRESS_MAX_MS = 300000UL;
 
 static WiFiServer rtspServer(RTSP_PORT);
 static WiFiServer httpServer(HTTP_MJPEG_PORT);
@@ -89,6 +104,42 @@ static uint32_t framesCaptured = 0;
 static uint32_t framesRtsp = 0;
 static uint32_t framesHttp = 0;
 static uint64_t bytesSent = 0;
+// Passive streaming telemetry. These counters only accumulate values already
+// known in the hot path; no frame hashing/decoding or extra network traffic.
+static uint64_t jpegBytesCaptured = 0;
+static uint32_t jpegFramesCaptured = 0;
+static uint32_t jpegMaxBytes = 0;
+static uint64_t rtspVideoPackets = 0;
+static uint64_t rtspVideoWireBytes = 0;
+static uint64_t httpVideoBytes = 0;
+static uint64_t rtspFrameSendUsTotal = 0;
+static uint32_t rtspFrameSendCount = 0;
+static uint32_t rtspFrameSendMaxUs = 0;
+
+enum class StreamerStressMode : uint8_t {
+    None = 0,
+    CameraOnly,
+    HttpMeasure,
+    Observe
+};
+struct StreamerStressState {
+    StreamerStressMode mode = StreamerStressMode::None;
+    uint32_t startedMs = 0;
+    uint32_t durationMs = 0;
+    uint32_t framesStart = 0;
+    uint64_t jpegBytesStart = 0;
+    uint64_t rtspPacketsStart = 0;
+    uint64_t rtspBytesStart = 0;
+    uint64_t httpBytesStart = 0;
+    uint32_t audioPacketsStart = 0;
+    uint64_t audioBytesStart = 0;
+    uint64_t totalBytesStart = 0;
+    uint32_t maxJpegBytes = 0;
+    uint32_t maxRtspFrameSendUs = 0;
+    float startTempC = NAN;
+    float peakTempC = NAN;
+};
+static StreamerStressState stressState;
 static uint32_t snapshotLastMs = 0;
 static uint8_t *snapshotBuffer = nullptr;
 static size_t snapshotCapacity = 0;
@@ -100,6 +151,13 @@ static uint32_t cameraRecoveryCount = 0;
 static uint32_t cameraRecoveryFailureCount = 0;
 static uint32_t consecutiveCaptureFailures = 0;
 static String lastRecoveryReason;
+
+static uint8_t thermalThrottleLevel = 0;
+static uint32_t lastThermalThrottleCheckMs = 0;
+static float lastStreamerCpuTempC = NAN;
+static float thermalThrottlePeakC = NAN;
+static uint32_t thermalThrottleEpisodeStartedMs = 0;
+static bool streamDemandActive = false;
 
 static uint32_t socketStallCount = 0;
 static uint32_t audioRecoveryCount = 0;
@@ -466,6 +524,7 @@ static bool sendInterleaved(RtspClientSlot &slot, uint8_t channel, const uint8_t
 
 static bool sendRtpJpeg(RtspClientSlot &slot, const uint8_t *jpeg, size_t jpegBytes)
 {
+    const uint32_t sendStartedUs = micros();
     ParsedJpeg parsed;
     if (!parseJpeg(jpeg, jpegBytes, parsed)) {
         lastError = "JPEG format is not supported by RFC2435 packetizer";
@@ -525,10 +584,20 @@ static bool sendRtpJpeg(RtspClientSlot &slot, const uint8_t *jpeg, size_t jpegBy
         if (!sendInterleaved(slot, slot.videoChannel, packet, h + fragment))
             return false;
 
+        ++rtspVideoPackets;
+        rtspVideoWireBytes += (uint64_t)(h + fragment + 4U);
         ++slot.videoSequence;
         offset += fragment;
         delay(0);
     }
+
+    const uint32_t sendElapsedUs = (uint32_t)(micros() - sendStartedUs);
+    ++rtspFrameSendCount;
+    rtspFrameSendUsTotal += sendElapsedUs;
+    if (sendElapsedUs > rtspFrameSendMaxUs)
+        rtspFrameSendMaxUs = sendElapsedUs;
+    if (stressState.mode != StreamerStressMode::None && sendElapsedUs > stressState.maxRtspFrameSendUs)
+        stressState.maxRtspFrameSendUs = sendElapsedUs;
 
     ++framesRtsp;
     return true;
@@ -981,6 +1050,7 @@ static void sendHttpFrame(const uint8_t *jpeg, size_t len)
             continue;
         }
         ++framesHttp;
+        httpVideoBytes += len;
     }
 }
 
@@ -1256,6 +1326,283 @@ static void serviceMemoryHealth()
     }
 }
 
+static uint32_t configuredStreamerFps()
+{
+    return cfg_fps > 0 ? (uint32_t)cfg_fps : 1U;
+}
+
+static uint32_t thermalThrottlePercent()
+{
+    if (thermalThrottleLevel >= 2)
+        return 50U;
+    if (thermalThrottleLevel == 1)
+        return 75U;
+    return 100U;
+}
+
+static uint32_t effectiveStreamerFps()
+{
+    const uint32_t configured = configuredStreamerFps();
+    const uint32_t percent = thermalThrottlePercent();
+    // Round to the nearest whole fps while never dropping below 1 fps.
+    const uint32_t scaled = (configured * percent + 50U) / 100U;
+    return std::max<uint32_t>(1U, scaled);
+}
+
+static void logThermalThrottleTransition(uint8_t oldLevel, uint8_t newLevel, float tempC)
+{
+    const uint32_t configured = configuredStreamerFps();
+    const uint32_t effective = effectiveStreamerFps();
+    const uint32_t factor = thermalThrottlePercent();
+
+    String msg;
+    if (newLevel > oldLevel) {
+        msg = "WARNING | THERMAL | STREAMER_THROTTLE";
+    } else if (newLevel == 0 && oldLevel != 0) {
+        msg = "THERMAL | STREAMER_THROTTLE_RECOVERED";
+    } else {
+        msg = "THERMAL | STREAMER_THROTTLE_RELAX";
+    }
+
+    msg += " | CPU=" + String(tempC, 1) + " C" +
+           " | level=" + String((unsigned)newLevel) +
+           " | factor=" + String(factor) + "%" +
+           " | configured_fps=" + String(configured) +
+           " | effective_fps=" + String(effective) +
+           " | rtsp_clients=" + String((unsigned)streamerRtspClientCount()) +
+           " | http_clients=" + String((unsigned)streamerHttpClientCount());
+
+    if (newLevel == 0 && oldLevel != 0 && thermalThrottleEpisodeStartedMs != 0) {
+        const uint32_t durationSec = (millis() - thermalThrottleEpisodeStartedMs) / 1000UL;
+        msg += " | episode_s=" + String(durationSec);
+        if (isfinite(thermalThrottlePeakC))
+            msg += " | peak=" + String(thermalThrottlePeakC, 1) + " C";
+    }
+    logWrite(msg);
+}
+
+static void serviceThermalThrottle()
+{
+    const uint32_t now = millis();
+    if ((uint32_t)(now - lastThermalThrottleCheckMs) < STREAM_THERMAL_CHECK_INTERVAL_MS)
+        return;
+    lastThermalThrottleCheckMs = now;
+
+    const float tempC = thermalCpuTemperatureC();
+    if (!isfinite(tempC))
+        return;
+    lastStreamerCpuTempC = tempC;
+
+    if (thermalThrottleLevel != 0) {
+        if (!isfinite(thermalThrottlePeakC) || tempC > thermalThrottlePeakC)
+            thermalThrottlePeakC = tempC;
+    }
+
+    uint8_t newLevel = thermalThrottleLevel;
+    if (thermalThrottleLevel == 0) {
+        if (tempC >= STREAM_THERMAL_STAGE2_C)
+            newLevel = 2;
+        else if (tempC >= STREAM_THERMAL_STAGE1_C)
+            newLevel = 1;
+    } else if (thermalThrottleLevel == 1) {
+        if (tempC >= STREAM_THERMAL_STAGE2_C)
+            newLevel = 2;
+        else if (tempC <= STREAM_THERMAL_STAGE1_RELEASE_C)
+            newLevel = 0;
+    } else {
+        if (tempC <= STREAM_THERMAL_STAGE1_RELEASE_C)
+            newLevel = 0;
+        else if (tempC <= STREAM_THERMAL_STAGE2_RELEASE_C)
+            newLevel = 1;
+    }
+
+    if (newLevel == thermalThrottleLevel)
+        return;
+
+    const uint8_t oldLevel = thermalThrottleLevel;
+    if (oldLevel == 0 && newLevel != 0) {
+        thermalThrottleEpisodeStartedMs = now;
+        thermalThrottlePeakC = tempC;
+    }
+    thermalThrottleLevel = newLevel;
+    logThermalThrottleTransition(oldLevel, newLevel, tempC);
+    if (newLevel == 0) {
+        thermalThrottleEpisodeStartedMs = 0;
+        thermalThrottlePeakC = NAN;
+    }
+}
+
+static const char *stressModeName(StreamerStressMode mode)
+{
+    switch (mode) {
+        case StreamerStressMode::CameraOnly: return "camera";
+        case StreamerStressMode::HttpMeasure: return "http";
+        case StreamerStressMode::Observe: return "observe";
+        default: return "none";
+    }
+}
+
+static void finishStreamerStress(const char *reason)
+{
+    if (stressState.mode == StreamerStressMode::None)
+        return;
+
+    const uint32_t now = millis();
+    const uint32_t elapsedMs = std::max<uint32_t>(1U, now - stressState.startedMs);
+    const uint32_t frameDelta = framesCaptured - stressState.framesStart;
+    const uint64_t jpegDelta = jpegBytesCaptured - stressState.jpegBytesStart;
+    const uint64_t rtspPacketsDelta = rtspVideoPackets - stressState.rtspPacketsStart;
+    const uint64_t rtspBytesDelta = rtspVideoWireBytes - stressState.rtspBytesStart;
+    const uint64_t httpBytesDelta = httpVideoBytes - stressState.httpBytesStart;
+    const uint32_t audioPacketsDelta = audioPacketsSent - stressState.audioPacketsStart;
+    const uint64_t audioBytesDelta = audioBytesSent - stressState.audioBytesStart;
+    const uint64_t totalBytesDelta = bytesSent - stressState.totalBytesStart;
+    const float measuredFps = (float)frameDelta * 1000.0f / (float)elapsedMs;
+    const uint32_t avgJpeg = frameDelta ? (uint32_t)(jpegDelta / frameDelta) : 0U;
+    const uint32_t videoKbit = (uint32_t)(((rtspBytesDelta + httpBytesDelta) * 8ULL) / elapsedMs);
+
+    String msg = "STREAMER STRESS END";
+    msg += " | mode=" + String(stressModeName(stressState.mode));
+    msg += " | reason=" + String(reason ? reason : "finished");
+    msg += " | duration_ms=" + String(elapsedMs);
+    msg += " | frames=" + String(frameDelta);
+    msg += " | measured_fps=" + String(measuredFps, 2);
+    msg += " | avg_jpeg=" + String(avgJpeg);
+    msg += " | max_jpeg=" + String(stressState.maxJpegBytes);
+    msg += " | video_kbit_s=" + String(videoKbit);
+    msg += " | rtsp_packets=" + String((unsigned long long)rtspPacketsDelta);
+    msg += " | rtsp_bytes=" + String((unsigned long long)rtspBytesDelta);
+    msg += " | http_bytes=" + String((unsigned long long)httpBytesDelta);
+    msg += " | audio_packets=" + String(audioPacketsDelta);
+    msg += " | audio_bytes=" + String((unsigned long long)audioBytesDelta);
+    msg += " | total_wire_bytes=" + String((unsigned long long)totalBytesDelta);
+    msg += " | max_rtsp_frame_send_ms=" + String((float)stressState.maxRtspFrameSendUs / 1000.0f, 2);
+    if (isfinite(stressState.startTempC))
+        msg += " | start_temp=" + String(stressState.startTempC, 1) + " C";
+    if (isfinite(stressState.peakTempC))
+        msg += " | peak_temp=" + String(stressState.peakTempC, 1) + " C";
+    msg += " | configured_fps=" + String(configuredStreamerFps());
+    msg += " | effective_fps=" + String(effectiveStreamerFps());
+    msg += " | rtsp_clients=" + String((unsigned)streamerRtspClientCount());
+    msg += " | http_clients=" + String((unsigned)streamerHttpClientCount());
+    msg += " | audio_active=" + String(audioActive ? 1 : 0);
+    logWrite(msg);
+
+    stressState = StreamerStressState();
+}
+
+static bool startStreamerStress(StreamerStressMode mode, uint32_t durationMs, String &error)
+{
+    error = "";
+    if (!started || !streamerModeEnabled()) {
+        error = "streamer is not active";
+        return false;
+    }
+    if (stressState.mode != StreamerStressMode::None) {
+        error = "another streamer stress measurement is already active";
+        return false;
+    }
+    if (mode == StreamerStressMode::None) {
+        error = "invalid stress mode";
+        return false;
+    }
+    if (mode == StreamerStressMode::CameraOnly && anyActiveStreamClient()) {
+        error = "camera-only test requires zero RTSP/HTTP stream clients";
+        return false;
+    }
+    if (mode == StreamerStressMode::HttpMeasure) {
+        if (!cfg_streamer_http_mjpeg_enabled) {
+            error = "HTTP-MJPEG is disabled";
+            return false;
+        }
+        if (anyActiveStreamClient()) {
+            error = "HTTP test requires zero existing RTSP/HTTP stream clients";
+            return false;
+        }
+    }
+
+    durationMs = std::max<uint32_t>(STREAM_STRESS_MIN_MS,
+                 std::min<uint32_t>(STREAM_STRESS_MAX_MS, durationMs));
+    stressState.mode = mode;
+    stressState.startedMs = millis();
+    stressState.durationMs = durationMs;
+    stressState.framesStart = framesCaptured;
+    stressState.jpegBytesStart = jpegBytesCaptured;
+    stressState.rtspPacketsStart = rtspVideoPackets;
+    stressState.rtspBytesStart = rtspVideoWireBytes;
+    stressState.httpBytesStart = httpVideoBytes;
+    stressState.audioPacketsStart = audioPacketsSent;
+    stressState.audioBytesStart = audioBytesSent;
+    stressState.totalBytesStart = bytesSent;
+    stressState.startTempC = thermalCpuTemperatureC();
+    stressState.peakTempC = stressState.startTempC;
+
+    logWrite("STREAMER STRESS START | mode=" + String(stressModeName(mode)) +
+             " | duration_ms=" + String(durationMs) +
+             " | configured_fps=" + String(configuredStreamerFps()) +
+             " | effective_fps=" + String(effectiveStreamerFps()) +
+             " | rtsp_clients=" + String((unsigned)streamerRtspClientCount()) +
+             " | http_clients=" + String((unsigned)streamerHttpClientCount()) +
+             " | audio_active=" + String(audioActive ? 1 : 0) +
+             (isfinite(stressState.startTempC) ? " | start_temp=" + String(stressState.startTempC, 1) + " C" : ""));
+    return true;
+}
+
+static void serviceStreamerStress()
+{
+    if (stressState.mode == StreamerStressMode::None)
+        return;
+
+    const float tempC = thermalCpuTemperatureC();
+    if (isfinite(tempC) && (!isfinite(stressState.peakTempC) || tempC > stressState.peakTempC))
+        stressState.peakTempC = tempC;
+
+    if ((uint32_t)(millis() - stressState.startedMs) >= stressState.durationMs)
+        finishStreamerStress("timer");
+}
+
+static void handleStreamerStressStart()
+{
+    if (!webServer)
+        return;
+
+    String modeArg = webServer->arg("mode");
+    modeArg.toLowerCase();
+    StreamerStressMode mode = StreamerStressMode::Observe;
+    if (modeArg == "camera") mode = StreamerStressMode::CameraOnly;
+    else if (modeArg == "http") mode = StreamerStressMode::HttpMeasure;
+    else if (modeArg == "observe" || modeArg == "rtsp") mode = StreamerStressMode::Observe;
+    else {
+        webServer->send(400, "application/json", "{\"ok\":false,\"error\":\"invalid mode\"}");
+        return;
+    }
+
+    uint32_t durationMs = STREAM_STRESS_DEFAULT_MS;
+    if (webServer->hasArg("seconds")) {
+        const long seconds = webServer->arg("seconds").toInt();
+        if (seconds > 0)
+            durationMs = (uint32_t)seconds * 1000UL;
+    }
+
+    String error;
+    if (!startStreamerStress(mode, durationMs, error)) {
+        webServer->send(409, "application/json", "{\"ok\":false,\"error\":\"" + error + "\"}");
+        return;
+    }
+    webServer->sendHeader("Cache-Control", "no-store");
+    webServer->send(200, "application/json", "{\"ok\":true}");
+}
+
+static void handleStreamerStressStop()
+{
+    if (!webServer)
+        return;
+    if (stressState.mode != StreamerStressMode::None)
+        finishStreamerStress("manual");
+    webServer->sendHeader("Cache-Control", "no-store");
+    webServer->send(200, "application/json", "{\"ok\":true}");
+}
+
 static void serviceStreamerHealth()
 {
     if (!started)
@@ -1264,6 +1611,7 @@ static void serviceStreamerHealth()
     serviceAudioHealth();
     serviceNetworkHealth();
     serviceMemoryHealth();
+    serviceThermalThrottle();
     persistHealthCounters(false);
 
     if (consecutiveCaptureFailures >= CAMERA_CAPTURE_FAILURES_BEFORE_RECOVERY) {
@@ -1299,14 +1647,32 @@ static void captureAndDistributeFrame()
             }
         }
     }
-    bool refreshSnapshot = !snapshotBytes || (uint32_t)(millis() - snapshotLastMs) >= 1000UL;
-    if (!needRtsp && !needHttp && !refreshSnapshot)
+    // With no stream clients, keep only a very low-rate snapshot refresh. The
+    // camera stays initialized, so a new client can resume immediately without
+    // a deinit/init cycle.
+    const bool forceCameraStress = stressState.mode == StreamerStressMode::CameraOnly;
+    const bool activeDemand = needRtsp || needHttp || forceCameraStress;
+    if (activeDemand != streamDemandActive) {
+        streamDemandActive = activeDemand;
+        if (streamDemandActive) {
+            logWrite("STREAMER capture profile | active | configured_fps=" +
+                     String(configuredStreamerFps()) +
+                     " | effective_fps=" + String(effectiveStreamerFps()));
+        } else {
+            logWrite("STREAMER capture profile | idle | snapshot_interval_ms=" +
+                     String(STREAM_IDLE_CAPTURE_INTERVAL_MS));
+        }
+    }
+
+    bool refreshSnapshot = !snapshotBytes ||
+        (uint32_t)(millis() - snapshotLastMs) >= STREAM_IDLE_CAPTURE_INTERVAL_MS;
+    if (!activeDemand && !refreshSnapshot)
         return;
 
-    uint32_t fps = cfg_fps > 0 ? (uint32_t)cfg_fps : 1U;
-    uint32_t intervalMs = (needRtsp || needHttp)
+    const uint32_t fps = effectiveStreamerFps();
+    uint32_t intervalMs = activeDemand
         ? std::max<uint32_t>(1U, (uint32_t)(1000UL / fps))
-        : 1000U;
+        : STREAM_IDLE_CAPTURE_INTERVAL_MS;
     uint32_t now = millis();
     if (lastFrameDueMs && (int32_t)(now - lastFrameDueMs) < 0)
         return;
@@ -1326,6 +1692,12 @@ static void captureAndDistributeFrame()
     if (frame->format != PIXFORMAT_JPEG) {
         lastError = "camera frame is not JPEG";
     } else {
+        ++jpegFramesCaptured;
+        jpegBytesCaptured += frame->len;
+        if (frame->len > jpegMaxBytes)
+            jpegMaxBytes = (uint32_t)frame->len;
+        if (stressState.mode != StreamerStressMode::None && frame->len > stressState.maxJpegBytes)
+            stressState.maxJpegBytes = (uint32_t)frame->len;
         cacheSnapshot(frame->buf, frame->len);
         snapshotLastMs = millis();
         if (needRtsp) {
@@ -1501,7 +1873,7 @@ static void handleHttpViewer()
     if (cfg_camera_responsible.length()) html += "<div><b>Verantwortlich:</b> " + viewerHtmlEscape(cfg_camera_responsible) + "</div>";
     if (cfg_camera_email.length()) html += "<div><b>E-Mail:</b> " + viewerHtmlEscape(cfg_camera_email) + "</div>";
     if (cfg_camera_description.length()) html += "<div><b>Beschreibung:</b> " + viewerHtmlEscape(cfg_camera_description) + "</div>";
-    html += "</div>";
+    html += F("</div>");
     html += "<script>(function(){var base=" + initialLocalMs + ",t0=Date.now(),el=document.getElementById('sfClock');function p(n){return n<10?'0'+n:n;}function tick(){if(!base){el.textContent='Zeit nicht verfügbar';return;}var d=new Date(base+(Date.now()-t0));el.textContent=p(d.getUTCDate())+'.'+p(d.getUTCMonth()+1)+'.'+d.getUTCFullYear()+' '+p(d.getUTCHours())+':'+p(d.getUTCMinutes())+':'+p(d.getUTCSeconds());}tick();setInterval(tick,1000);}());</script></div></body></html>";
 
     webServer->sendHeader("Cache-Control", "no-store");
@@ -1553,6 +1925,22 @@ static void handleStreamerStatus()
         ",\"last_recovery_reason\":\"" + lastRecoveryReason + "\"" +
         ",\"frames\":" + String(framesCaptured) +
         ",\"fps\":" + String(streamerMeasuredFps(), 2) +
+        ",\"configured_fps\":" + String(configuredStreamerFps()) +
+        ",\"effective_fps\":" + String(effectiveStreamerFps()) +
+        ",\"thermal_throttle_level\":" + String((unsigned)thermalThrottleLevel) +
+        ",\"streamer_cpu_temp_c\":" + (isfinite(lastStreamerCpuTempC) ? String(lastStreamerCpuTempC, 1) : String("null")) +
+        ",\"jpeg_frames\":" + String(jpegFramesCaptured) +
+        ",\"jpeg_bytes\":" + String((unsigned long long)jpegBytesCaptured) +
+        ",\"jpeg_avg_bytes\":" + String(jpegFramesCaptured ? (uint32_t)(jpegBytesCaptured / jpegFramesCaptured) : 0U) +
+        ",\"jpeg_max_bytes\":" + String(jpegMaxBytes) +
+        ",\"rtsp_video_packets\":" + String((unsigned long long)rtspVideoPackets) +
+        ",\"rtsp_video_bytes\":" + String((unsigned long long)rtspVideoWireBytes) +
+        ",\"http_video_bytes\":" + String((unsigned long long)httpVideoBytes) +
+        ",\"rtsp_send_avg_ms\":" + String(rtspFrameSendCount ? ((float)rtspFrameSendUsTotal / (float)rtspFrameSendCount / 1000.0f) : 0.0f, 2) +
+        ",\"rtsp_send_max_ms\":" + String((float)rtspFrameSendMaxUs / 1000.0f, 2) +
+        ",\"stress_active\":" + (stressState.mode != StreamerStressMode::None ? "true" : "false") +
+        ",\"stress_mode\":\"" + String(stressModeName(stressState.mode)) + "\"" +
+        ",\"stress_remaining_ms\":" + String(stressState.mode != StreamerStressMode::None ? (stressState.durationMs - std::min<uint32_t>(stressState.durationMs, (uint32_t)(millis() - stressState.startedMs))) : 0U) +
         ",\"bytes_sent\":" + String((unsigned long long)bytesSent) + "}";
     webServer->sendHeader("Cache-Control", "no-store");
     webServer->send(200, "application/json", json);
@@ -1612,6 +2000,16 @@ bool streamerBegin(String &error)
     heapHistoryCount = 0;
     heapHistoryPos = 0;
     videoTimestamp = esp_random();
+    jpegBytesCaptured = 0;
+    jpegFramesCaptured = 0;
+    jpegMaxBytes = 0;
+    rtspVideoPackets = 0;
+    rtspVideoWireBytes = 0;
+    httpVideoBytes = 0;
+    rtspFrameSendUsTotal = 0;
+    rtspFrameSendCount = 0;
+    rtspFrameSendMaxUs = 0;
+    stressState = StreamerStressState();
     started = true;
 
     logWrite(
@@ -1632,6 +2030,7 @@ void streamerLoop()
     serviceAudio();
     captureAndDistributeFrame();
     serviceStreamerHealth();
+    serviceStreamerStress();
 
     for (uint8_t i = 0; i < HTTP_CLIENT_SLOTS; ++i) {
         if (httpClients[i].client && !httpClients[i].client.connected())
@@ -1686,6 +2085,8 @@ void streamerNoteNetworkRecoveryResult(bool success, const String &error)
 
 void streamerStop()
 {
+    if (stressState.mode != StreamerStressMode::None)
+        finishStreamerStress("streamer_stop");
     closeAllRtspClients();
     closeAllHttpClients();
     if (started && cfg_streamer_rtsp_enabled)
@@ -1708,6 +2109,8 @@ void streamerRegisterWebRoutes(WebServer &server)
     server.on("/stream", HTTP_GET, handleHttpStreamRedirect);
     server.on("/stream_view", HTTP_GET, handleHttpViewer);
     server.on("/streamer_status", HTTP_GET, handleStreamerStatus);
+    server.on("/streamer_stress_start", HTTP_POST, handleStreamerStressStart);
+    server.on("/streamer_stress_stop", HTTP_POST, handleStreamerStressStop);
 }
 
 bool streamerSendSnapshot(WebServer &server)

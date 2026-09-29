@@ -25,3 +25,10 @@
 #define SENSORFORGE_RELEASE_DATE "2026-09-28"
 #define SENSORFORGE_RELEASE_SUMMARY \
     "Simplify general configuration layout with clearer audio, timezone, network, LED and debug controls."
+
+// Current post-v83 development state. This does not claim a released v84;
+// promote the release tag only after the required build/hardware qualification.
+#define SENSORFORGE_WORKTREE_STAGE "v84-candidate"
+#define SENSORFORGE_WORKTREE_DATE "2026-09-29"
+#define SENSORFORGE_WORKTREE_SUMMARY \
+    "Streamer thermal thresholds and configurable board-scoped WiFi TX power with RSSI guidance."

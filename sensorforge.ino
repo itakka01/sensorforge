@@ -27,6 +27,7 @@
 #include "esp_heap_caps.h"
 #include "esp_idf_version.h"
 #include "esp_ota_ops.h"
+#include "esp_wifi.h"
 #include "driver/rtc_io.h"
 #include "driver/gpio.h"
 
@@ -95,6 +96,22 @@ bool recording = false;
 bool sdReady = false;
 bool webConfigStarted = false;
 bool cameraInitialized = false;
+
+// Last infrastructure-WiFi receive level measured during this boot. The normal
+// SensorForge architecture may later switch from STA to its local AP, so retain
+// the last valid STA RSSI for display instead of pretending the AP has an RSSI.
+static bool infrastructureWifiRssiValid = false;
+static int infrastructureWifiRssiDbm = 0;
+
+bool wifiInfrastructureRssiAvailable()
+{
+    return infrastructureWifiRssiValid;
+}
+
+int wifiInfrastructureRssiDbm()
+{
+    return infrastructureWifiRssiDbm;
+}
 
 // Camera state retained across light sleep. Fast light-sleep standby is enabled
 // only after the physical sensor has been identified as an OV3660. Other
@@ -2375,7 +2392,55 @@ const char *thermalSourceName()
 // WIFI + TIME SYNC
 // =============================================================
 
+static bool applyConfiguredWifiTxPower(const char *context)
+{
+    int16_t configuredX10 =
+        (int16_t)lroundf(cfg_wifi_tx_power_dbm * 10.0f);
+
+    if (!boardWifiTxPowerSupportedX10(configuredX10)) {
+        configuredX10 = BOARD_WIFI_TX_POWER_DEFAULT_X10;
+    }
+
+    esp_err_t result =
+        esp_wifi_set_max_tx_power(
+            boardWifiTxPowerQuarterDbm(configuredX10)
+        );
+
+    if (result != ESP_OK) {
+        consoleWrite(
+            "WIFI",
+            String("TX power apply failed | context=") +
+            (context ? context : "?") +
+            " | requested=" + String(configuredX10 / 10.0f, 1) +
+            " dBm | err=" + String((int)result)
+        );
+        return false;
+    }
+
+    int8_t actualQuarterDbm = 0;
+    esp_err_t readResult =
+        esp_wifi_get_max_tx_power(&actualQuarterDbm);
+
+    String actualText =
+        readResult == ESP_OK
+            ? String(actualQuarterDbm / 4.0f, 2) + " dBm"
+            : String("unavailable");
+
+    consoleWrite(
+        "WIFI",
+        String("TX power | context=") +
+        (context ? context : "?") +
+        " | configured=" + String(configuredX10 / 10.0f, 1) +
+        " dBm | driver=" + actualText
+    );
+
+    return true;
+}
+
+
 void wifiSyncTime() {
+
+    infrastructureWifiRssiValid = false;
 
     if (cfg_wifi_ssid.length() == 0)
         return;
@@ -2417,6 +2482,11 @@ void wifiSyncTime() {
         cfg_wifi_pass.c_str()
     );
 
+    // TX power is a maximum transmit limit and does not alter credentials,
+    // channel selection or reconnect policy. If the driver rejects it, WiFi
+    // remains operational with the driver's existing/default setting.
+    applyConfiguredWifiTxPower("STA");
+
     unsigned long start = millis();
 
     while (
@@ -2427,6 +2497,15 @@ void wifiSyncTime() {
     }
 
     if (WiFi.status() == WL_CONNECTED) {
+
+        infrastructureWifiRssiDbm = WiFi.RSSI();
+        infrastructureWifiRssiValid = true;
+
+        Serial.println(
+            "WiFi RSSI: " +
+            String(infrastructureWifiRssiDbm) +
+            " dBm"
+        );
 
         Serial.println(
             "Connected. IP: " +
@@ -13911,6 +13990,10 @@ void startWebConfig()
         WiFi.mode(WIFI_OFF);
         return;
     }
+
+    // The same configured TX-power ceiling applies to the local access point.
+    // A failed optional power adjustment must never prevent WebConfig startup.
+    applyConfiguredWifiTxPower("AP");
 
     consoleWrite(
         "WIFI",

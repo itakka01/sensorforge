@@ -133,6 +133,7 @@ extern String cfg_wifi_on_system_start; // "off", "on", "on_missing_time"
 extern int cfg_wifi_timeout_sec;       // 0 = auto-off disabled; firmware default is 0
 extern String cfg_wifi_ssid;
 extern String cfg_wifi_pass;
+extern float cfg_wifi_tx_power_dbm;   // discrete board-supported TX power; applies to STA and AP
 
 // Hotspot / access point
 extern int cfg_hotspot_enabled;       // 0/1, automatic AP start at boot

@@ -1,6 +1,11 @@
 #pragma once
 
 #include <Arduino.h>
+#include "board_config.h"
+
+#ifndef BOARD_THERMAL_EMERGENCY_C
+#error "BOARD_THERMAL_EMERGENCY_C must be defined by board_config.h"
+#endif
 
 // SensorForge thermal safety policy.
 //
@@ -12,7 +17,7 @@
 // threshold is a secondary enclosure-temperature indicator. It is NOT a
 // direct LiPo cell-temperature measurement.
 static constexpr float SENSORFORGE_THERMAL_WARNING_C = 70.0f;
-static constexpr float SENSORFORGE_THERMAL_EMERGENCY_C = 80.0f;
+static constexpr float SENSORFORGE_THERMAL_EMERGENCY_C = BOARD_THERMAL_EMERGENCY_C;
 static constexpr float SENSORFORGE_THERMAL_RECOVERY_C = 65.0f;
 
 static constexpr float SENSORFORGE_THERMAL_RTC_WARNING_C = 45.0f;
