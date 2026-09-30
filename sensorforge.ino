@@ -2438,68 +2438,108 @@ static bool applyConfiguredWifiTxPower(const char *context)
 }
 
 
-void wifiSyncTime() {
+static int activeInfrastructureWifiProfile = -1;
 
+static bool wifiConnectConfiguredInfrastructure(
+    unsigned long timeoutPerProfileMs,
+    const char *context
+)
+{
+    activeInfrastructureWifiProfile = -1;
     infrastructureWifiRssiValid = false;
 
-    if (cfg_wifi_ssid.length() == 0)
-        return;
+    bool anyConfigured = false;
+    for (size_t i = 0; i < SENSORFORGE_WIFI_PROFILE_COUNT; ++i) {
+        if (cfg_wifi_ssids[i].length()) {
+            anyConfigured = true;
+            break;
+        }
+    }
 
-    Serial.println();
-    Serial.println("Connecting to WiFi...");
-    Serial.println("SSID: " + cfg_wifi_ssid);
-    Serial.println("HOSTNAME: " + cfg_hostname);
+    if (!anyConfigured)
+        return false;
 
-    // Ensure the STA interface is fully down before assigning the
-    // configured hostname. This makes sure DHCP sees cfg_hostname
-    // when the interface is enabled again.
+    // Apply the hostname before enabling STA so DHCP sees the configured name.
     WiFi.mode(WIFI_OFF);
     delay(50);
 
-    bool hostnameOk =
-        WiFi.setHostname(
-            cfg_hostname.c_str()
+    bool hostnameOk = WiFi.setHostname(cfg_hostname.c_str());
+    if (!hostnameOk) {
+        consoleWrite(
+            "WIFI",
+            String(context ? context : "STA") + " hostname setup failed"
         );
-
-    Serial.println(
-        "WiFi setHostname: " +
-        String(
-            hostnameOk
-                ? "OK"
-                : "FAILED"
-        )
-    );
-
-    WiFi.mode(WIFI_STA);
-
-    Serial.println(
-        "WiFi hostname active: " +
-        String(WiFi.getHostname())
-    );
-
-    WiFi.begin(
-        cfg_wifi_ssid.c_str(),
-        cfg_wifi_pass.c_str()
-    );
-
-    // TX power is a maximum transmit limit and does not alter credentials,
-    // channel selection or reconnect policy. If the driver rejects it, WiFi
-    // remains operational with the driver's existing/default setting.
-    applyConfiguredWifiTxPower("STA");
-
-    unsigned long start = millis();
-
-    while (
-        WiFi.status() != WL_CONNECTED &&
-        millis() - start < 8000
-    ) {
-        delay(200);
     }
 
-    if (WiFi.status() == WL_CONNECTED) {
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(false);
+    applyConfiguredWifiTxPower("STA");
 
-        infrastructureWifiRssiDbm = WiFi.RSSI();
-        infrastructureWifiRssiValid = true;
+    for (size_t i = 0; i < SENSORFORGE_WIFI_PROFILE_COUNT; ++i) {
+        if (!cfg_wifi_ssids[i].length())
+            continue;
+
+        consoleWrite(
+            "WIFI",
+            String(context ? context : "STA") +
+            " connect attempt | profile=" + String(i + 1) +
+            " | SSID=" + cfg_wifi_ssids[i]
+        );
+
+        WiFi.disconnect(false, false);
+        delay(50);
+        WiFi.begin(
+            cfg_wifi_ssids[i].c_str(),
+            cfg_wifi_passes[i].c_str()
+        );
+
+        const unsigned long startedMs = millis();
+        while (
+            WiFi.status() != WL_CONNECTED &&
+            millis() - startedMs < timeoutPerProfileMs
+        ) {
+            feedWatchdog();
+            delay(100);
+        }
+
+        if (WiFi.status() == WL_CONNECTED) {
+            activeInfrastructureWifiProfile = (int)i;
+            infrastructureWifiRssiDbm = WiFi.RSSI();
+            infrastructureWifiRssiValid = true;
+            WiFi.setAutoReconnect(true);
+
+            consoleWrite(
+                "WIFI",
+                String(context ? context : "STA") +
+                " connected | profile=" + String(i + 1) +
+                " | SSID=" + cfg_wifi_ssids[i] +
+                " | IP=" + WiFi.localIP().toString() +
+                " | RSSI=" + String(infrastructureWifiRssiDbm) + " dBm"
+            );
+            return true;
+        }
+
+        consoleWrite(
+            "WIFI",
+            String(context ? context : "STA") +
+            " connection failed | profile=" + String(i + 1) +
+            " | SSID=" + cfg_wifi_ssids[i]
+        );
+    }
+
+    WiFi.disconnect(true, false);
+    WiFi.mode(WIFI_OFF);
+    return false;
+}
+
+
+void wifiSyncTime() {
+
+    Serial.println();
+    Serial.println("Connecting to configured WiFi profiles...");
+    Serial.println("HOSTNAME: " + cfg_hostname);
+
+    if (wifiConnectConfiguredInfrastructure(8000UL, "Time sync")) {
 
         Serial.println(
             "WiFi RSSI: " +
@@ -2560,11 +2600,12 @@ void wifiSyncTime() {
 
     } else {
 
-        Serial.println("WiFi connection FAILED");
+        Serial.println("WiFi connection FAILED for all configured profiles");
     }
 
     WiFi.disconnect(true, false);
     WiFi.mode(WIFI_OFF);
+    activeInfrastructureWifiProfile = -1;
 }
 
 
@@ -13954,7 +13995,7 @@ void startWebConfig()
     delay(50);
     infrastructureWifiRssiValid = false;
 
-    if (useHotspot) {
+    auto startConfiguredHotspot = []() -> bool {
         String apSsid = cfg_hostname;
 
         if (apSsid.length() == 0) {
@@ -13977,9 +14018,8 @@ void startWebConfig()
                 "WIFI",
                 "Hotspot start blocked | invalid password length"
             );
-
             WiFi.mode(WIFI_OFF);
-            return;
+            return false;
         }
 
         if (!WiFi.softAP(
@@ -13992,13 +14032,10 @@ void startWebConfig()
                 "WIFI",
                 "Hotspot start failed"
             );
-
             WiFi.mode(WIFI_OFF);
-            return;
+            return false;
         }
 
-        // The same configured TX-power ceiling applies to the local access
-        // point. A failed optional power adjustment must never prevent startup.
         applyConfiguredWifiTxPower("AP");
 
         consoleWrite(
@@ -14007,63 +14044,30 @@ void startWebConfig()
             " | hidden=" + String(cfg_hotspot_hidden) +
             " | IP=" + WiFi.softAPIP().toString()
         );
+        return true;
+    };
+
+    if (useHotspot) {
+        if (!startConfiguredHotspot())
+            return;
     } else {
-        if (cfg_wifi_ssid.length() == 0) {
+        if (!wifiConnectConfiguredInfrastructure(8000UL, "Infrastructure WiFi")) {
             consoleWrite(
                 "WIFI",
-                "Infrastructure WiFi start blocked | SSID missing"
+                "Infrastructure WiFi start failed | no configured profile reachable"
             );
-            WiFi.mode(WIFI_OFF);
-            return;
-        }
 
-        bool hostnameOk = WiFi.setHostname(cfg_hostname.c_str());
-        if (!hostnameOk) {
+            if (!cfg_hotspot_fallback_enabled)
+                return;
+
             consoleWrite(
                 "WIFI",
-                "Infrastructure WiFi hostname setup failed"
+                "Infrastructure WiFi unavailable | starting configured hotspot fallback"
             );
+
+            if (!startConfiguredHotspot())
+                return;
         }
-
-        WiFi.mode(WIFI_STA);
-        WiFi.setAutoReconnect(true);
-        WiFi.begin(
-            cfg_wifi_ssid.c_str(),
-            cfg_wifi_pass.c_str()
-        );
-
-        // Apply the user-selected board-safe ceiling to STA as soon as the
-        // interface exists. A rejected optional adjustment is non-fatal.
-        applyConfiguredWifiTxPower("STA");
-
-        const unsigned long connectStartedMs = millis();
-        while (
-            WiFi.status() != WL_CONNECTED &&
-            millis() - connectStartedMs < 12000UL
-        ) {
-            feedWatchdog();
-            delay(100);
-        }
-
-        if (WiFi.status() != WL_CONNECTED) {
-            consoleWrite(
-                "WIFI",
-                "Infrastructure WiFi connection failed | SSID=" + cfg_wifi_ssid
-            );
-            WiFi.disconnect(true, false);
-            WiFi.mode(WIFI_OFF);
-            return;
-        }
-
-        infrastructureWifiRssiDbm = WiFi.RSSI();
-        infrastructureWifiRssiValid = true;
-
-        consoleWrite(
-            "WIFI",
-            "Infrastructure WiFi ON | SSID=" + cfg_wifi_ssid +
-            " | IP=" + WiFi.localIP().toString() +
-            " | RSSI=" + String(infrastructureWifiRssiDbm) + " dBm"
-        );
     }
 
     if (MDNS.begin(cfg_hostname.c_str())) {

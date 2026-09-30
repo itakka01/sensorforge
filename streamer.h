@@ -27,6 +27,12 @@ void streamerRegisterWebRoutes(WebServer &server);
 // Sends the most recently captured JPEG without taking a second camera frame.
 bool streamerSendSnapshot(WebServer &server);
 
+// WebConfig camera preview is an internal consumer of the existing streamer
+// capture pipeline. It never owns the camera itself; these hooks only raise or
+// clear capture demand while the preview page is actively requesting frames.
+void streamerNotePreviewActivity();
+void streamerClearPreviewDemand();
+
 bool streamerRtspClientConnected();
 uint8_t streamerRtspClientCount();
 bool streamerHttpClientConnected();

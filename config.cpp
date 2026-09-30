@@ -166,9 +166,12 @@ String cfg_wifi_on_system_start = "off";
 int cfg_wifi_timeout_sec = 0;
 String cfg_wifi_ssid = "";
 String cfg_wifi_pass = "";
+String cfg_wifi_ssids[SENSORFORGE_WIFI_PROFILE_COUNT];
+String cfg_wifi_passes[SENSORFORGE_WIFI_PROFILE_COUNT];
 float cfg_wifi_tx_power_dbm = BOARD_WIFI_TX_POWER_DEFAULT_X10 / 10.0f;
 
 int cfg_hotspot_enabled = 1;
+int cfg_hotspot_fallback_enabled = 0;
 String cfg_hotspot_password = "";
 int cfg_hotspot_hidden = 0;
 
@@ -539,11 +542,12 @@ struct ConfigValues {
     String cameraOverlayText;
     String cameraDescription;
     String timezone;
-    String wifiSsid;
-    String wifiPass;
+    String wifiSsids[SENSORFORGE_WIFI_PROFILE_COUNT];
+    String wifiPasses[SENSORFORGE_WIFI_PROFILE_COUNT];
     float wifiTxPowerDbm;
 
     int hotspotEnabled;
+    int hotspotFallbackEnabled;
     String hotspotPassword;
     int hotspotHidden;
 
@@ -650,11 +654,12 @@ struct ConfigSeen {
     bool cameraOverlayText;
     bool cameraDescription;
     bool timezone;
-    bool wifiSsid;
-    bool wifiPass;
+    bool wifiSsids[SENSORFORGE_WIFI_PROFILE_COUNT];
+    bool wifiPasses[SENSORFORGE_WIFI_PROFILE_COUNT];
     bool wifiTxPowerDbm;
 
     bool hotspotEnabled;
+    bool hotspotFallbackEnabled;
     bool hotspotPassword;
     bool hotspotHidden;
 
@@ -924,17 +929,19 @@ static ConfigValues makeDefaultValues()
     values.timezone =
         "CET-1CEST,M3.5.0,M10.5.0/3";
 
-    values.wifiSsid =
-        "";
-
-    values.wifiPass =
-        "";
+    for (size_t i = 0; i < SENSORFORGE_WIFI_PROFILE_COUNT; ++i) {
+        values.wifiSsids[i] = "";
+        values.wifiPasses[i] = "";
+    }
 
     values.wifiTxPowerDbm =
         BOARD_WIFI_TX_POWER_DEFAULT_X10 / 10.0f;
 
     values.hotspotEnabled =
         1;
+
+    values.hotspotFallbackEnabled =
+        0;
 
     values.hotspotPassword =
         "";
@@ -1083,11 +1090,16 @@ static bool serializeConfigValues(
     APPEND_CONFIG_VALUE("camera_overlay_text", values.cameraOverlayText);
     APPEND_CONFIG_VALUE("camera_description", values.cameraDescription);
     APPEND_CONFIG_VALUE("timezone", values.timezone);
-    APPEND_CONFIG_VALUE("wifi_ssid", values.wifiSsid);
-    APPEND_CONFIG_VALUE("wifi_pass", values.wifiPass);
+    APPEND_CONFIG_VALUE("wifi_ssid", values.wifiSsids[0]);
+    APPEND_CONFIG_VALUE("wifi_pass", values.wifiPasses[0]);
+    for (size_t i = 1; i < SENSORFORGE_WIFI_PROFILE_COUNT; ++i) {
+        APPEND_CONFIG_VALUE((String("wifi_ssid_") + String(i + 1)).c_str(), values.wifiSsids[i]);
+        APPEND_CONFIG_VALUE((String("wifi_pass_") + String(i + 1)).c_str(), values.wifiPasses[i]);
+    }
     APPEND_CONFIG_VALUE("wifi_tx_power_dbm", String(values.wifiTxPowerDbm, 1));
 
     APPEND_CONFIG_VALUE("hotspot_enabled", String(values.hotspotEnabled));
+    APPEND_CONFIG_VALUE("hotspot_fallback_enabled", String(values.hotspotFallbackEnabled));
     APPEND_CONFIG_VALUE("hotspot_password", values.hotspotPassword);
     APPEND_CONFIG_VALUE("hotspot_hidden", String(values.hotspotHidden));
 
@@ -1569,8 +1581,8 @@ static bool allRequiredKeysSeen(
         {"hostname", seen.hostname},
         // timezone was added after the original config schema; if absent,
         // makeDefaultValues() supplies the firmware default.
-        {"wifi_ssid", seen.wifiSsid},
-        {"wifi_pass", seen.wifiPass},
+        {"wifi_ssid", seen.wifiSsids[0]},
+        {"wifi_pass", seen.wifiPasses[0]},
         {"debug_enabled", seen.debugEnabled},
         {"log_file", seen.logFile},
     };
@@ -1841,7 +1853,8 @@ static bool validateValues(
 
     values.hostname.trim();
     values.timezone.trim();
-    values.wifiSsid.trim();
+    for (size_t i = 0; i < SENSORFORGE_WIFI_PROFILE_COUNT; ++i)
+        values.wifiSsids[i].trim();
 
     values.webLanguage.trim();
     values.webLanguage.toLowerCase();
@@ -2752,6 +2765,15 @@ static bool validateValues(
         error =
             "hotspot_enabled must be 0 or 1";
 
+        return false;
+    }
+
+
+    if (
+        values.hotspotFallbackEnabled != 0 &&
+        values.hotspotFallbackEnabled != 1
+    ) {
+        error = "hotspot_fallback_enabled must be 0 or 1";
         return false;
     }
 
@@ -4147,14 +4169,14 @@ static bool parseConfigText(
             ) {
 
                 if (!markOnce(
-                        seen.wifiSsid,
+                        seen.wifiSsids[0],
                         key,
                         error
                     )) {
                     return false;
                 }
 
-                values.wifiSsid =
+                values.wifiSsids[0] =
                     value;
 
             } else if (
@@ -4162,7 +4184,7 @@ static bool parseConfigText(
             ) {
 
                 if (!markOnce(
-                        seen.wifiPass,
+                        seen.wifiPasses[0],
                         key,
                         error
                     )) {
@@ -4176,7 +4198,7 @@ static bool parseConfigText(
                     if (!configSecretDecode(
                             "wifi_pass",
                             value,
-                            values.wifiPass,
+                            values.wifiPasses[0],
                             wasEncrypted,
                             secretError
                         )) {
@@ -4187,6 +4209,27 @@ static bool parseConfigText(
                     }
                 }
 
+            } else if (key.startsWith("wifi_ssid_") || key.startsWith("wifi_pass_")) {
+                const bool isPass = key.startsWith("wifi_pass_");
+                const String suffix = key.substring(10);
+                const int profileNumber = suffix.toInt();
+                if (profileNumber < 2 || profileNumber > SENSORFORGE_WIFI_PROFILE_COUNT || suffix != String(profileNumber)) {
+                    error = "invalid WiFi profile key: " + key;
+                    return false;
+                }
+                const size_t profileIndex = (size_t)(profileNumber - 1);
+                if (isPass) {
+                    if (!markOnce(seen.wifiPasses[profileIndex], key, error)) return false;
+                    bool wasEncrypted = false;
+                    String secretError;
+                    if (!configSecretDecode(key.c_str(), value, values.wifiPasses[profileIndex], wasEncrypted, secretError)) {
+                        error = key + ": " + secretError;
+                        return false;
+                    }
+                } else {
+                    if (!markOnce(seen.wifiSsids[profileIndex], key, error)) return false;
+                    values.wifiSsids[profileIndex] = value;
+                }
             } else if (
                 key == "wifi_tx_power_dbm"
             ) {
@@ -4234,6 +4277,29 @@ static bool parseConfigText(
                 }
 
                 values.hotspotEnabled =
+                    (int)numericValue;
+
+            } else if (
+                key == "hotspot_fallback_enabled"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.hotspotFallbackEnabled,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid hotspot_fallback_enabled";
+                    return false;
+                }
+
+                values.hotspotFallbackEnabled =
                     (int)numericValue;
 
             } else if (
@@ -4793,17 +4859,21 @@ static void applyValues(
     cfg_timezone =
         values.timezone;
 
-    cfg_wifi_ssid =
-        values.wifiSsid;
-
-    cfg_wifi_pass =
-        values.wifiPass;
+    for (size_t i = 0; i < SENSORFORGE_WIFI_PROFILE_COUNT; ++i) {
+        cfg_wifi_ssids[i] = values.wifiSsids[i];
+        cfg_wifi_passes[i] = values.wifiPasses[i];
+    }
+    cfg_wifi_ssid = cfg_wifi_ssids[0];
+    cfg_wifi_pass = cfg_wifi_passes[0];
 
     cfg_wifi_tx_power_dbm =
         values.wifiTxPowerDbm;
 
     cfg_hotspot_enabled =
         values.hotspotEnabled;
+
+    cfg_hotspot_fallback_enabled =
+        values.hotspotFallbackEnabled;
 
     cfg_hotspot_password =
         values.hotspotPassword;
@@ -5183,6 +5253,7 @@ static bool configSecretFieldName(const String &key)
 {
     return
         key == "wifi_pass" ||
+        key.startsWith("wifi_pass_") ||
         key == "hotspot_password" ||
         key == "web_password";
 }
@@ -5857,27 +5928,18 @@ config_loaded:
         String(cfg_wifi_tx_power_dbm, 1)
     );
 
-    Serial.println(
-        "Config WiFi: ssid=" +
-        (
-            cfg_wifi_ssid.length()
-            ? cfg_wifi_ssid
-            : String("<empty>")
-        )
-    );
-
-    Serial.println(
-        "Config WiFi: password=" +
-        String(
-            cfg_wifi_pass.length()
-            ? "set"
-            : "empty"
-        )
-    );
+    for (size_t i = 0; i < SENSORFORGE_WIFI_PROFILE_COUNT; ++i) {
+        Serial.println(
+            "Config WiFi profile " + String(i + 1) + ": ssid=" +
+            (cfg_wifi_ssids[i].length() ? cfg_wifi_ssids[i] : String("<empty>")) +
+            " password=" + String(cfg_wifi_passes[i].length() ? "set" : "empty")
+        );
+    }
 
     Serial.println(
         "Config Hotspot: enabled=" +
         String(cfg_hotspot_enabled) +
+        " fallback=" + String(cfg_hotspot_fallback_enabled) +
         " hidden=" +
         String(cfg_hotspot_hidden) +
         " password=" +
@@ -6766,6 +6828,9 @@ ConfigSaveResult configSaveCameraSettings(
     int cameraAutoExposure,
     int cameraAeLevel,
     int rotation,
+    const String &cropZoom,
+    int cropPositionX,
+    int cropPositionY,
     bool writeToSd,
     String &error
 )
@@ -6774,8 +6839,10 @@ ConfigSaveResult configSaveCameraSettings(
 
     String normalizedCamera = camera;
     String normalizedResolution = resolution;
+    String normalizedCropZoom = cropZoom;
     normalizedCamera.trim();
     normalizedResolution.trim();
+    normalizedCropZoom.trim();
 
     if (!normalizedCamera.length()) {
         error = "camera is empty";
@@ -6818,6 +6885,25 @@ ConfigSaveResult configSaveCameraSettings(
 
     if (rotation != 0 && rotation != 180) {
         error = "rotation must be 0 or 180";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        normalizedCropZoom != "1.0" &&
+        normalizedCropZoom != "1.5" &&
+        normalizedCropZoom != "2.0"
+    ) {
+        error = "camera crop zoom must be 1.0, 1.5 or 2.0";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        cropPositionX < 0 ||
+        cropPositionX > 2 ||
+        cropPositionY < 0 ||
+        cropPositionY > 2
+    ) {
+        error = "camera crop position must be in range 0..2";
         return CONFIG_SAVE_INTERNAL_FAILED;
     }
 
@@ -6909,7 +6995,10 @@ ConfigSaveResult configSaveCameraSettings(
         !replaceOrAppendConfigKey(text, "camera_xclk_mhz", String(cameraXclkMhz)) ||
         !replaceOrAppendConfigKey(text, "camera_auto_exposure", String(cameraAutoExposure)) ||
         !replaceOrAppendConfigKey(text, "camera_ae_level", String(cameraAeLevel)) ||
-        !replaceOrAppendConfigKey(text, "rotation", String(rotation))
+        !replaceOrAppendConfigKey(text, "rotation", String(rotation)) ||
+        !replaceOrAppendConfigKey(text, "camera_crop_zoom", normalizedCropZoom) ||
+        !replaceOrAppendConfigKey(text, "camera_crop_x", String(cropPositionX)) ||
+        !replaceOrAppendConfigKey(text, "camera_crop_y", String(cropPositionY))
     ) {
         error = "could not patch camera setting keys";
         return CONFIG_SAVE_INTERNAL_FAILED;
@@ -6943,6 +7032,9 @@ ConfigSaveResult configSaveCameraSettings(
         cfg_camera_auto_exposure = cameraAutoExposure;
         cfg_camera_ae_level = cameraAeLevel;
         cfg_rotation = rotation;
+        cfg_camera_crop_zoom = normalizedCropZoom;
+        cfg_camera_crop_x = cropPositionX;
+        cfg_camera_crop_y = cropPositionY;
     }
 
     return result;
@@ -7393,6 +7485,183 @@ ConfigSaveResult configSaveWebLanguage(
             normalized;
     }
 
+
+    return result;
+}
+
+
+ConfigSaveResult configSaveWifiSettings(
+    const String &hostname,
+    const String &wifiOnSystemStart,
+    int wifiTimeoutSec,
+    const String wifiSsids[SENSORFORGE_WIFI_PROFILE_COUNT],
+    const String wifiPasses[SENSORFORGE_WIFI_PROFILE_COUNT],
+    float wifiTxPowerDbm,
+    int hotspotEnabled,
+    int hotspotFallbackEnabled,
+    const String &hotspotPassword,
+    int hotspotHidden,
+    bool writeToSd,
+    String &error
+)
+{
+    error = "";
+
+    String normalizedHostname = hostname;
+    normalizedHostname.trim();
+
+    String normalizedStartup = wifiOnSystemStart;
+    normalizedStartup.trim();
+    normalizedStartup.toLowerCase();
+
+    String normalizedSsids[SENSORFORGE_WIFI_PROFILE_COUNT];
+    for (size_t i = 0; i < SENSORFORGE_WIFI_PROFILE_COUNT; ++i) {
+        normalizedSsids[i] = wifiSsids[i];
+        normalizedSsids[i].trim();
+        if (normalizedSsids[i].length() > 32) {
+            error = "wifi_ssid profile " + String(i + 1) + " exceeds 32 characters";
+            return CONFIG_SAVE_INTERNAL_FAILED;
+        }
+        if (!normalizedSsids[i].length() && wifiPasses[i].length()) {
+            error = "wifi_pass set for empty WiFi profile " + String(i + 1);
+            return CONFIG_SAVE_INTERNAL_FAILED;
+        }
+    }
+
+    if (
+        normalizedStartup != "off" &&
+        normalizedStartup != "on" &&
+        normalizedStartup != "on_missing_time"
+    ) {
+        error = "wifi_on_system_start must be off, on or on_missing_time";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (wifiTimeoutSec < 0 || wifiTimeoutSec > 86400) {
+        error = "wifi_timeout_sec out of range (0..86400)";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    int16_t txPowerX10 = (int16_t)lroundf(wifiTxPowerDbm * 10.0f);
+    if (
+        fabsf(wifiTxPowerDbm * 10.0f - txPowerX10) > 0.01f ||
+        txPowerX10 < SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10 ||
+        !boardWifiTxPowerSupportedX10(txPowerX10)
+    ) {
+        error = "wifi_tx_power_dbm is not a supported value for this board";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (hotspotEnabled != 0 && hotspotEnabled != 1) {
+        error = "hotspot_enabled must be 0 or 1";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (hotspotFallbackEnabled != 0 && hotspotFallbackEnabled != 1) {
+        error = "hotspot_fallback_enabled must be 0 or 1";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (hotspotHidden != 0 && hotspotHidden != 1) {
+        error = "hotspot_hidden must be 0 or 1";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        hotspotPassword.length() != 0 &&
+        (hotspotPassword.length() < 8 || hotspotPassword.length() > 63)
+    ) {
+        error = "hotspot_password must be empty (open AP) or 8..63 characters";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String text;
+    bool sourceRead = false;
+
+    if (
+        activeConfigSource == CONFIG_SOURCE_SD &&
+        sdAvailableState &&
+        STORAGE.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    }
+
+    if (
+        !sourceRead &&
+        internalAvailableState &&
+        LittleFS.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(LittleFS, "/config.txt", text);
+    }
+
+    if (
+        !sourceRead &&
+        sdAvailableState &&
+        STORAGE.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    }
+
+    if (!sourceRead) {
+        error = "no persistent config.txt available for WiFi settings save";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        !replaceOrAppendConfigKey(text, "hostname", normalizedHostname) ||
+        !replaceOrAppendConfigKey(text, "wifi_on_system_start", normalizedStartup) ||
+        !replaceOrAppendConfigKey(text, "wifi_timeout_sec", String(wifiTimeoutSec)) ||
+        !replaceOrAppendConfigKey(text, "wifi_ssid", normalizedSsids[0]) ||
+        !replaceOrAppendConfigKey(text, "wifi_pass", wifiPasses[0]) ||
+        !replaceOrAppendConfigKey(text, "wifi_tx_power_dbm", String(wifiTxPowerDbm, 1)) ||
+        !replaceOrAppendConfigKey(text, "hotspot_enabled", String(hotspotEnabled)) ||
+        !replaceOrAppendConfigKey(text, "hotspot_fallback_enabled", String(hotspotFallbackEnabled)) ||
+        !replaceOrAppendConfigKey(text, "hotspot_password", hotspotPassword) ||
+        !replaceOrAppendConfigKey(text, "hotspot_hidden", String(hotspotHidden))
+    ) {
+        error = "could not patch WiFi setting keys";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    for (size_t i = 1; i < SENSORFORGE_WIFI_PROFILE_COUNT; ++i) {
+        const String ssidKey = "wifi_ssid_" + String(i + 1);
+        const String passKey = "wifi_pass_" + String(i + 1);
+        if (
+            !replaceOrAppendConfigKey(text, ssidKey.c_str(), normalizedSsids[i]) ||
+            !replaceOrAppendConfigKey(text, passKey.c_str(), wifiPasses[i])
+        ) {
+            error = "could not patch WiFi profile " + String(i + 1);
+            return CONFIG_SAVE_INTERNAL_FAILED;
+        }
+    }
+
+    String validationError;
+    if (!configValidateText(text, validationError)) {
+        error = "patched config invalid: " + validationError;
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    ConfigSaveResult result = configSaveText(text, writeToSd, error);
+
+    if (
+        result == CONFIG_SAVE_BOTH ||
+        result == CONFIG_SAVE_INTERNAL_ONLY
+    ) {
+        cfg_hostname = normalizedHostname;
+        cfg_wifi_on_system_start = normalizedStartup;
+        cfg_wifi_timeout_sec = wifiTimeoutSec;
+        for (size_t i = 0; i < SENSORFORGE_WIFI_PROFILE_COUNT; ++i) {
+            cfg_wifi_ssids[i] = normalizedSsids[i];
+            cfg_wifi_passes[i] = wifiPasses[i];
+        }
+        cfg_wifi_ssid = cfg_wifi_ssids[0];
+        cfg_wifi_pass = cfg_wifi_passes[0];
+        cfg_wifi_tx_power_dbm = wifiTxPowerDbm;
+        cfg_hotspot_enabled = hotspotEnabled;
+        cfg_hotspot_fallback_enabled = hotspotFallbackEnabled;
+        cfg_hotspot_password = hotspotPassword;
+        cfg_hotspot_hidden = hotspotHidden;
+    }
 
     return result;
 }

@@ -1,7 +1,144 @@
 SENSORFORGE / ESP32-S3 CAMERA (XIAO + FREENOVE)
 PROJEKTBESCHREIBUNG, RELEASESTAND UND WIEDEREINSTIEGSPROMPT
 Stand: 2026-09-30
-Dokumentrevision: v83 + v84-Kandidat RTSP/Netzwerk-Streamer + Thermal-/WiFi-Tuning + vorlaeufig abgeschlossene Streamer-Feldqualifikation
+Dokumentrevision: v84 RELEASE - RTSP/Netzwerk-Streamer + Multi-WiFi/Fallback/UI-Refactor + zentrale Streamer-Preview + Kamera-Save/Crop-Konsolidierung + Thermal-/WiFi-Tuning
+
+
+======================================================================
+V84 OFFIZIELLER RELEASE 2026-09-30
+======================================================================
+
+- SensorForge v84 ist mit Stand 2026-09-30 offiziell freigegeben.
+- Release-ID: `v84`; Core-Version im Branding bleibt `7.1.0`.
+- Hauptumfang des Releases:
+    * optionaler Netzwerk-Streamer mit RTSP/RTP-JPEG ueber TCP, HTTP-MJPEG,
+      optionalem L16-Audio, RTCP-Synchronisation und Streamer-Diagnose
+    * AP- oder externes WLAN als Service-Netzwerk, bis zu 5 priorisierte
+      externe WLAN-Profile und optionaler Fallback auf den eigenen Hotspot
+    * eigene kompakte WiFi-Konfigurationsseite mit WLAN-Scan und responsiver
+      fester Save-Leiste
+    * dieselbe feste Save-Logik auf normaler und erweiterter Kamera-Seite
+    * Kamera-Livepreview im Streamer-Modus aus der zentralen Streamer-
+      Framepipeline statt ueber einen konkurrierenden zweiten Capture-Pfad
+    * OV3660-Crop wird ueber den zentralen Kamera-Save persistiert; im
+      Streamer-Modus wird eine Aenderung sicher nach Neustart aktiv
+    * Thermal-/WiFi-TX-Power-Tuning und die dokumentierten RTSP-/Audio-
+      Stabilitaetskorrekturen
+- Rueckwaertskompatibilitaet bleibt verbindlich: Fehlen neue v84-Keys, startet
+  SensorForge wie bisher im Normalbetrieb; bestehende Recording-, Shooter- und
+  Sleep-Einstellungen werden durch den Streamer-Modus nicht zerstoert.
+- Der Streamer-Funktionspfad wurde im XIAO-Feldtest bis 2x RTSP + 2x HTTP-MJPEG
+  mit aktivem 16-kHz/16-bit/Mono-Audio als ausreichend stabil fuer den Release
+  bewertet. Ein vereinzelter RTSP-Audio-Startknackser bleibt als akzeptiertes
+  Restartefakt dokumentiert.
+- Die separat gefuehrte Langzeitqualifikation des Recording-/Storage-Pfads ist
+  weiterhin ein eigener offener Punkt und wird durch die v84-Freigabe nicht als
+  abgeschlossen behauptet.
+- Die nachfolgenden mit `V84-KANDIDAT` bezeichneten Abschnitte bleiben bewusst
+  als Entwicklungs- und Diagnosechronik erhalten. Sie beschreiben Zwischenstaende
+  auf dem Weg zum jetzt freigegebenen v84-Release und sind nicht mehr der aktuelle
+  Release-Status.
+
+
+======================================================================
+V84-KANDIDAT 2026-09-30 - WIFI-KONFIGURATION / MULTI-PROFILE / HOTSPOT-FALLBACK
+======================================================================
+
+- Die WiFi-Konfiguration ist aus der langen allgemeinen Konfigurationsseite in
+  einen eigenen Menuepunkt `System -> WiFi Einstellungen` ausgelagert.
+  `webconfig_wifi.cpp/.h` besitzt Darstellung, Formularauswertung, Validierung,
+  WLAN-Scan und den gezielten WiFi-Save; `webconfig.cpp` enthaelt nur die
+  schlanken HTTP-Handler/Integration.
+- Die allgemeine Konfiguration schreibt WiFi-Werte nicht mehr mit. Der eigene
+  `configSaveWifiSettings()`-Pfad aktualisiert nur die zugehoerigen Netzwerk-
+  und Hotspot-Keys, damit andere Konfigurationsbereiche nicht unbeabsichtigt
+  veraendert werden.
+- Die Konfigurationsseiten verwenden eine feste, responsive Save-Leiste. Auf
+  Desktop bleibt sie kompakt im sichtbaren Bereich, auf kleinen Displays wird
+  sie breit am unteren Viewport-Rand dargestellt und beruecksichtigt die
+  Safe-Area des Geraets. Gespeichert wird weiterhin bewusst per Benutzeraktion;
+  es wurde kein Auto-Save eingefuehrt.
+- Fuer externes WLAN koennen bis zu 5 priorisierte Profile gespeichert werden.
+  Profil 1 verwendet aus Rueckwaertskompatibilitaet weiterhin `wifi_ssid` und
+  `wifi_pass`; die Profile 2..5 verwenden additiv `wifi_ssid_2..5` und
+  `wifi_pass_2..5`. Alte Configs ohne die neuen Keys verhalten sich unveraendert
+  wie ein Ein-Profil-System.
+- Beim STA-Verbindungsaufbau werden nur konfigurierte Profile streng in der vom
+  Benutzer festgelegten Reihenfolge versucht. Dieselbe zentrale Auswahlroutine
+  wird fuer den Systemzeit-Abgleich und fuer das laufende Service-Netzwerk
+  verwendet; es gibt damit keine getrennten Auswahlregeln.
+- `hotspot_fallback_enabled=1` erlaubt im externen WLAN-Modus einen expliziten
+  Fallback auf den konfigurierten SensorForge-Hotspot, wenn kein gespeichertes
+  WLAN erreichbar ist. Default ist 0/AUS; bestehende Installationen wechseln
+  daher nach einem Firmwareupdate nicht automatisch in den Hotspot.
+- Die Streamer-Netzwerkueberwachung bewertet beim aktivierten Fallback das
+  tatsaechlich aktive Interface. Ein korrekt gestarteter Fallback-AP wird nicht
+  faelschlich als fehlgeschlagene STA-Verbindung behandelt.
+- Die WiFi-Seite ist fuer normale Benutzer verdichtet: Verbindungsart und
+  Fallback sind Dropdowns; nicht benoetigte AP-/STA-Bloecke werden ausgeblendet.
+  WLAN-Profile erscheinen als responsive Liste mit Prioritaet, Netzwerkname
+  (SSID), Passwort und Aktionen. Unterhalb der belegten Profile wird genau eine
+  freie Eingabezeile angeboten; Sortier-/Loeschaktionen erscheinen dort erst,
+  wenn tatsaechlich eine SSID eingetragen wurde.
+- Ein WLAN-Scan laeuft nur auf ausdruecklichen Klick. Die gefundenen Netze werden
+  in einem eigenen Modal mit RSSI und qualitativer Bewertung gezeigt und koennen
+  in den naechsten freien Profilplatz uebernommen werden. Es gibt keinen
+  permanenten Hintergrundscan.
+- Systemzeit-Synchronisation, WLAN-Inaktivitaets-Timeout und WiFi-TX-Power sind
+  laienverstaendlicher beschriftet; technische Erklaerungen liegen hinter
+  Info-Buttons. Die TX-Power-Anzeige zeigt Board-Default und effektives
+  Board-Minimum; RSSI wird kompakt als aktuelle Messung mit Bewertung dargestellt.
+- Alle WLAN-Profilpasswoerter werden durch den bestehenden SFSEC1-Mechanismus
+  geschuetzt. `configSecretFieldName()` behandelt neben `wifi_pass` auch
+  `wifi_pass_2..5` als Secret-Felder.
+- Der fruehere Zwischenstand ohne AP-Fallback ist damit optional erweitert.
+  Ohne `hotspot_fallback_enabled=1` bleibt das damalige Verhalten erhalten.
+- Fuer diese WiFi-/UI-Aenderungen wurde in dieser Umgebung kein echter
+  Arduino-ESP32-Build und kein neuer Hardware-Langzeittest ausgefuehrt.
+
+
+======================================================================
+V84 RELEASE 2026-09-30 - KAMERA-SAVE-LEISTE / CROP-KONSOLIDIERUNG
+======================================================================
+
+- Normale und erweiterte Kameraeinstellungen verwenden dieselbe feste,
+  responsive Save-Leiste wie die WiFi-Einstellungen. Der Button wird erst bei
+  geaenderten Formularwerten aktiv; die bestehende Kamera-Save-Logik bleibt der
+  persistente Commit-Pfad.
+- Der separate Crop-Save-Button der aelteren Preview-Logik ist entfernt.
+  OV3660-Crop-Werte werden zusammen mit den uebrigen Kameraeinstellungen ueber
+  den zentralen Kamera-Save gespeichert.
+- Im Normalbetrieb bleibt der bestehende Live-Crop-Test erhalten. Im aktiven
+  Streamer-Modus wird kein unsicherer Live-Crop gegen die laufende zentrale
+  Framepipeline erzwungen: Die Aenderung wird gespeichert und nach Neustart
+  wirksam. Dadurch entfaellt im normalen UI-Ablauf die fruehere Fehlermeldung
+  `Crop changes require leaving streamer mode and rebooting`.
+- Der alte Crop-Save-Endpunkt bleibt nur als interner Kompatibilitaetspfad im
+  Code bestehen und ist ueber die aktuelle Benutzeroberflaeche nicht mehr noetig.
+
+
+======================================================================
+V84-KANDIDAT 2026-09-30 - KAMERA-PREVIEW UEBER ZENTRALE STREAMER-FRAMEPIPELINE
+======================================================================
+
+- Die Kameraeinstellungen verwenden weiterhin die gemeinsame URL `/snapshot`.
+  Im Normalbetrieb bleibt der bisherige Preview-/Kamerapfad unveraendert.
+- Im aktiven Streamer-Modus erzeugt `/snapshot` keinen zweiten konkurrierenden
+  `esp_camera_fb_get()`-Pfad. Stattdessen wird das bereits vom Streamer zentral
+  gecapturete/cachierte JPEG ueber `streamerSendSnapshot()` ausgeliefert.
+- Eine geoeffnete Kamera-Livevorschau meldet ueber `streamerNotePreviewActivity()`
+  temporaeren Preview-Bedarf an die bestehende Streamer-Pipeline. Dadurch wird
+  der sonstige 5-s-Leerlauf-Snapshot-Takt waehrend der sichtbaren Vorschau auf
+  die normale effektive Streamer-Bildrate angehoben.
+- Beim Schliessen/Verlassen der Vorschau wird der Bedarf geloescht; ein kurzer
+  Timeout ist zusaetzlicher Fail-Safe, falls ein Browser ohne `/preview_stop`
+  verschwindet. Danach gilt wieder der sparsame Streamer-Leerlauftakt.
+- Kamera-Ownership, Recording im Normalbetrieb, RTSP/RTP, HTTP-MJPEG, Audio,
+  Thermal- und Storage-Pfade werden dadurch nicht umgebaut. Ziel ist explizit
+  eine gemeinsame Framequelle im Streamer-Modus statt eines zweiten Capture-
+  Besitzers.
+- Fuer diese kleine Preview-Integration wurde in dieser Umgebung kein echter
+  Arduino-ESP32-Build oder Hardwaretest ausgefuehrt.
 
 WICHTIGER BUILD-FIX 2026-09-30:
 - Nach dem AP/STA-Netzwerkumbau enthielt `webconfig.cpp` noch eine Alt-Referenz auf
@@ -20,7 +157,7 @@ V84-KANDIDAT - AUDIO-DRAIN BUILD-FIX 2026-09-29
   `std::max<size_t>(...)`. Damit ist die GCC-14-Template-Aufloesung bei
   gemischten `size_t`-/`uint32_t`-Operanden eindeutig.
 - Keine Aenderung am Laufzeitverhalten des Audio-Realtime-Drains.
-Aktueller Entwicklungs-/Arbeits-Release: v83 (Produktionsqualifikation fuer XIAO-Langzeitrecording noch offen)
+Aktueller freigegebener Release: v84 (separate XIAO-Recording-/Storage-Langzeitqualifikation weiterhin offen)
 Produktname: SensorForge
 Plattformname: Fabric Node
 Core-Version im Branding: 7.1.0
@@ -34,7 +171,9 @@ V84-KANDIDAT 2026-09-30 - NETZWERKMODUS AP ODER EXTERNES WLAN
     * `hotspot_enabled=1` -> SensorForge stellt wie bisher den eigenen Hotspot/AP
       bereit.
     * `hotspot_enabled=0` -> SensorForge verbindet sich dauerhaft bzw. bis zum
-      normalen Timeout mit `wifi_ssid`/`wifi_pass` als STA im vorhandenen WLAN.
+      normalen Timeout als STA mit den priorisierten externen WLAN-Profilen.
+      Profil 1 bleibt `wifi_ssid`/`wifi_pass`; bis zu vier weitere Profile werden
+      additiv als `wifi_ssid_2..5`/`wifi_pass_2..5` gespeichert.
 - Diese Auswahl gilt fuer WebConfig und den Netzwerk-Streamer. Der Streamer ist
   damit nicht mehr auf den Hotspot-Modus beschraenkt und kann RTSP/HTTP ueber
   das konfigurierte Infrastruktur-WLAN bereitstellen.
@@ -47,18 +186,21 @@ V84-KANDIDAT 2026-09-30 - NETZWERKMODUS AP ODER EXTERNES WLAN
   gespeicherte Timeout wieder.
 - Magnet-/Service-Wakeup startet jeweils den vom Benutzer ausgewaehlten
   Netzwerkmodus erneut; kein separater AP-Zwang wird eingefuehrt.
-- Streamer-Network-Health und Recovery pruefen jetzt passend zur Konfiguration
-  entweder AP+AP-IP oder STA+WL_CONNECTED+STA-IP.
+- Streamer-Network-Health und Recovery pruefen passend zum tatsaechlich aktiven
+  Interface entweder AP+AP-IP oder STA+WL_CONNECTED+STA-IP. Das gilt auch fuer
+  einen spaeter explizit aktivierten Hotspot-Fallback.
 - SDP verwendet die IP des tatsaechlich aktiven Interfaces; die sichtbaren
   Hostname-URLs `*.local` bleiben unveraendert.
-- Kein automatischer Wechsel auf Hotspot bei fehlgeschlagenem STA-Connect. Eine
-  falsche SSID/ein nicht erreichbares WLAN fuehrt deshalb bewusst nicht still
-  zu einer anderen Betriebsart.
+- Der damalige Zwischenstand hatte noch keinen automatischen Hotspot-Wechsel.
+  Der spaetere Multi-WiFi-Stand erweitert dies optional ueber
+  `hotspot_fallback_enabled`; ohne diesen Key bzw. bei Wert 0 bleibt das hier
+  beschriebene Verhalten erhalten.
 - RTSP/Audio/HTTP-MJPEG, RTCP, Thermal- und WiFi-TX-Power-Logik wurden durch
   diesen Umbau nicht funktional veraendert.
-- Fuer diesen Netzwerkumbau wurde in dieser Umgebung kein echter Arduino-Build
-  und kein Hardwaretest ausgefuehrt; diese Qualifikation bleibt vor Freigabe
-  des vollstaendigen v84-Releases erforderlich.
+- Fuer diesen Netzwerkumbau wurde in dieser Umgebung kein eigener Arduino-Build
+  oder Hardwaretest ausgefuehrt. Die v84-Freigabe basiert auf dem zusammengefuehrten
+  Release-Stand und den dokumentierten Feldbefunden; diese Aussage behauptet keinen
+  zusaetzlichen Testlauf in dieser Umgebung.
 
 
 ======================================================================
@@ -107,11 +249,10 @@ V84 STREAMER-FELDQUALIFIKATION 2026-09-30 - VORLAEUFIG PRODUKTIONSREIF
   positiven Temperatureffekt. Mit angepasster Sendeleistung lag der beobachtete
   Dauerbetrieb mit Streaming/Audio deutlich unter der 80-C-Notfallgrenze. Die
   TX-Power bleibt benutzerkonfigurierbar und board-sicher begrenzt.
-- Die formale Release-ID bleibt weiterhin v83 / Worktree v84-candidate, bis der
-  komplette v84-Stand als Release paketiert, dokumentiert und getaggt wird. Die
-  Aussage 'vorlaeufig produktionsreif' bezieht sich hier auf den getesteten
-  Streamer-Funktionspfad, nicht auf die weiterhin separat offene Langzeit-
-  qualifikation des Recording-/Storage-Pfads.
+- Mit der Freigabe vom 2026-09-30 ist die formale Release-ID jetzt v84. Die
+  Streamer-Feldqualifikation ist Bestandteil dieser Freigabe. Die weiterhin
+  separat offene Langzeitqualifikation des Recording-/Storage-Pfads bleibt
+  davon unberuehrt.
 
 ======================================================================
 V84-KANDIDAT 2026-09-30 - SANFTER AUDIO-LIVE-ABWURF / ZWEITER DRAIN-PASS
@@ -185,7 +326,7 @@ V84-KANDIDAT 2026-09-29 - RTCP SENDER REPORTS / A-V-ZEITREFERENZ
 ======================================================================
 OFFENE V84-AUFGABE - RTSP / NETZWERK-STREAMER (WIEDEREINSTIEG VERBINDLICH)
 
-AKTUELLER V84-KANDIDAT 2026-09-29 - GEMEINSAMER PCM-BLOCK / PLAY-A/V-ZEITBASIS:
+HISTORISCHER V84-KANDIDAT 2026-09-29 - GEMEINSAMER PCM-BLOCK / PLAY-A/V-ZEITBASIS:
 
 - Feldbefund nach Trennung des RTP-Audiozustands: Mit zwei RTSP-Clients ist Sprache wieder verstaendlich, jedoch tritt ein rhythmisches Klicken auf. Mit nur einem RTSP-Client ist Audio wieder sauber. Zusaetzlich wurde bei einem Stream ein A/V-Versatz von ca. 4 s beobachtet.
 - Multi-Client-Audio verwendet nun eine einzige monotone Sampleposition fuer den gemeinsam aus dem PSRAM-Ring gelesenen PCM-Block. Diese Position wird pro Nutzdatenblock genau EINMAL fortgeschrieben, nachdem derselbe unveraenderte L16-Nutzdatenblock allen aktiven RTSP-Clients angeboten wurde.
@@ -195,7 +336,7 @@ AKTUELLER V84-KANDIDAT 2026-09-29 - GEMEINSAMER PCM-BLOCK / PLAY-A/V-ZEITBASIS:
 - Keine Aenderung an HTTP-MJPEG, Kamera-Capture, WiFi/TX-Power, Thermal, Recording oder persistenter Konfiguration.
 - Hardwaretest offen: zuerst 1x RTSP + Audio, danach 2x RTSP + Audio; rhythmisches Klicken sowie A/V-Versatz nach 1/10/30 min beobachten.
 
-AKTUELLER V84-KANDIDAT 2026-09-29 - MULTI-CLIENT AUDIO RTP-STATE VOLLSTAENDIG GETRENNT:
+HISTORISCHER V84-KANDIDAT 2026-09-29 - MULTI-CLIENT AUDIO RTP-STATE VOLLSTAENDIG GETRENNT:
 
 - Feldbefund: Mit genau einem RTSP-Client war L16-Audio verstaendlich, mit zwei parallelen RTSP-Clients trat dagegen nur noch Rauschen auf. Der gemeinsame Audio-Capture selbst ist damit nicht der primaere Verdaechtige.
 - Die zuvor eingefuehrte `audioSampleOrigin`-Loesung liess weiterhin einen globalen `audioSamplesSent`-Zaehler als gemeinsame RTP-Zeitquelle bestehen. Das war fuer strikt getrennte RTSP-Sessions unnoetige Kopplung.
@@ -205,7 +346,7 @@ AKTUELLER V84-KANDIDAT 2026-09-29 - MULTI-CLIENT AUDIO RTP-STATE VOLLSTAENDIG GE
 - Keine Aenderung an RTSP-Video, HTTP-MJPEG, Kamera, WiFi, Thermal oder persistenter Konfiguration.
 - Hardwaretest offen: erst 1x RTSP + Audio, danach 2x RTSP + Audio. Dabei Audioqualitaet beider Clients und A/V-Drift getrennt pruefen.
 
-AKTUELLER V84-KANDIDAT 2026-09-29 - MULTI-CLIENT RTSP AUDIO-ZEITBASIS:
+HISTORISCHER V84-KANDIDAT 2026-09-29 - MULTI-CLIENT RTSP AUDIO-ZEITBASIS:
 
 - Feldtest mit zwei RTSP-Clients zeigte trotz unauffaelliger Server-Sendediagnose stark anwachsende RTSP-Verzoegerungen bis in den Minutenbereich; HTTP-MJPEG blieb dagegen nahezu aktuell.
 - Ursache im Code: `audioSamplesSent` war ein globaler Capture-Zaehler, waehrend jeder RTSP-Client einen eigenen `audioTimestampBase` erhielt. Ein spaeter gestarteter Client bekam dadurch im ersten Audio-RTP-Paket zusaetzlich die bereits vor seinem PLAY fuer andere Clients aufgelaufene Samplezahl. Bei 16 kHz entsprechen 9,6 Mio. Samples bereits 600 Sekunden Zeitversatz.
@@ -220,7 +361,7 @@ AKTUELLER V84-KANDIDAT 2026-09-29 - MULTI-CLIENT RTSP AUDIO-ZEITBASIS:
 
 STATUS / AUSGANGSPUNKT:
 
-AKTUELLER V84-KANDIDAT 2026-09-29 - RTSP LIVE-LATENZ / DIAGNOSE:
+HISTORISCHER V84-KANDIDAT 2026-09-29 - RTSP LIVE-LATENZ / DIAGNOSE:
 
 - Nach Feldbeobachtung mit zwei parallelen RTSP-Clients und einem HTTP-MJPEG-Client zeigte HTTP weiterhin nahezu Echtzeit, waehrend RTSP nach laengerem Lauf Sekunden bis fast eine Minute Verzoegerung aufbauen konnte.
 - Ursache im bisherigen Sender-Timing: RTP/JPEG verwendete einen starren Timestamp-Fortschritt `90000/fps`. Wenn reale Multi-Client-TCP-Auslieferung zeitweise langsamer als die konfigurierte Bildrate war, konnte der Empfaenger dies als wachsenden Timing-/Jitterversatz interpretieren.
@@ -231,7 +372,7 @@ AKTUELLER V84-KANDIDAT 2026-09-29 - RTSP LIVE-LATENZ / DIAGNOSE:
 - HTTP-MJPEG bleibt unveraendert. Kein zusaetzlicher Diagnose-Endpunkt fuer den Benutzer; die vorhandene Seite nutzt weiter `/streamer_status` intern.
 - Echte Arduino-Build- und Langzeit-Hardwaretests dieses Kandidaten sind noch offen.
 
-IMPLEMENTIERUNGSSTAND 2026-09-29, RTSP-LIVE-LATENZ (V84-KANDIDAT, NOCH NICHT FREIGEGEBEN):
+IMPLEMENTIERUNGSSTAND 2026-09-29, RTSP-LIVE-LATENZ (HISTORISCHER V84-KANDIDAT):
 
 - RTSP/TCP-Video besitzt nun pro Client eine adaptive Lag-Entlastung. Ein langsamer Viewer wird bei steigender Sendelast nicht vorschnell getrennt, sondern erhaelt zunaechst jeden zweiten Video-Frame; bei anhaltendem Rueckstau kann die Ausduennung schrittweise auf jeden dritten bzw. vierten Frame steigen.
 - Die Ausduennung gilt nur fuer den betroffenen RTSP-Client. Ein zweiter gesunder Viewer bleibt bei voller Framefolge.
@@ -240,7 +381,7 @@ IMPLEMENTIERUNGSSTAND 2026-09-29, RTSP-LIVE-LATENZ (V84-KANDIDAT, NOCH NICHT FRE
 - `/streamer_status` zeigt fuer beide RTSP-Slots den aktuellen Frame-Divider, die Zahl ausgelassener Frames und die letzte gemessene Frame-Sendezeit, damit die Regelung im Feld beobachtbar bleibt.
 - Keine Aenderung an Kamera-Capture-FPS, RTP/JPEG-Format, Audioformat, WiFi-Betriebsart oder persistenter Config. Arduino-Build sowie Zwei-Client-Langzeittest/Delay-Messung sind noch offen.
 
-IMPLEMENTIERUNGSSTAND 2026-09-29, THERMAL-/WIFI-TUNING (V84-KANDIDAT, NOCH NICHT FREIGEGEBEN):
+IMPLEMENTIERUNGSSTAND 2026-09-29, THERMAL-/WIFI-TUNING (HISTORISCHER V84-KANDIDAT):
 
 - Streamer-Thermal-Throttling wurde konservativ um 1 °C vorgezogen: Stufe 1 ab 77 °C, Stufe 2 ab 78 °C; der Thermal-Emergency-Pfad bleibt bei 80 °C.
 - Die board-spezifische Thermal-Emergency-Grenze liegt nun in `board_config.h`, damit spätere Hardwarequalifikation je Board zentral erfolgen kann.
@@ -252,7 +393,7 @@ IMPLEMENTIERUNGSSTAND 2026-09-29, THERMAL-/WIFI-TUNING (V84-KANDIDAT, NOCH NICHT
 - Bei einer realen Verbindung mit einem externen WLAN wird der RSSI-Wert erfasst. Die Konfigurationsseite zeigt die letzte Messung dieser Laufzeit auf einer Grün-Gelb-Rot-Skala und gibt eine konservative TX-Power-Empfehlung aus. Es erfolgt ausdrücklich KEINE automatische Änderung.
 - Für diese Änderungen sind noch echter Arduino-Build, Reichweiten-/Paketverlusttest und Temperatur-A/B-Test erforderlich; keine Hardwarequalifikation behaupten.
 
-IMPLEMENTIERUNGSSTAND 2026-09-28, V84-KANDIDAT (NOCH NICHT FREIGEGEBEN):
+IMPLEMENTIERUNGSSTAND 2026-09-28, HISTORISCHER V84-KANDIDAT:
 
 AKTUELLER NACHTRAG 2026-09-30 - RTSP/AUDIO-LIVE-FEINSCHLIFF:
 - RTSP L16 Audio nutzt den inzwischen bewaehrten Zwei-Pass-Drain mit RTCP-Synchronisation.
@@ -272,19 +413,17 @@ AKTUELLER NACHTRAG 2026-09-30 - RTSP/AUDIO-LIVE-FEINSCHLIFF:
   langer Browserstream nicht den synchronen WebConfig-Server bzw. Thermal/RTSP/OTA.
 - Die neue Konfiguration defaultet auf `operating_mode=normal` sowie beide Streamer-
   Ausgaenge AUS. Alte v83-config.txt ohne diese Keys starten daher unveraendert normal.
-- `sensorforge_version.h` bleibt absichtlich auf v83, bis ein echter Arduino-ESP32-
-  Build sowie die unten geforderten Hardware-/VLC-/ffmpeg-Tests erfolgt sind. Der
-  vorliegende Stand ist ein Implementierungs-/Review-Kandidat, kein freigegebener v84.
+- `sensorforge_version.h` ist mit der Freigabe vom 2026-09-30 auf v84 gesetzt.
+  Die darunter dokumentierten Kandidaten- und Qualifikationsschritte bleiben als
+  historische Entwicklungsnotizen erhalten.
 
 
-- Letzter bestaetigter/freigegebener Arbeitsstand bleibt v83.
-- Die RTSP-/Streamer-Arbeit wurde nach v83 begonnen, aber im Chat unterbrochen,
-  bevor ein vollstaendig gepruefter und freigegebener v84-Release erzeugt wurde.
-- Ein eventuell vorhandener lokaler/temporarer v84-Arbeitsordner ist deshalb NICHT
-  automatisch als autoritative Basis zu behandeln.
-- Beim Wiedereinstieg fuer die eigentliche Implementierung zuerst den aktuellen,
-  vollstaendigen v83-Quellstand bzw. einen vom Benutzer danach ausdruecklich
-  bestaetigten neueren Stand verwenden und ALLE betroffenen Dateien erneut lesen.
+- Letzter bestaetigter/freigegebener Arbeitsstand ist v84 vom 2026-09-30.
+- Fuer weitere Entwicklung ist der vollstaendige v84-Quellstand die autoritative
+  Basis. Temporäre aeltere v84-Kandidatenordner duerfen nicht als Ausgangspunkt
+  verwendet werden.
+- Beim Wiedereinstieg den vollstaendigen v84-Stand verwenden und alle fuer die
+  jeweilige Aenderung betroffenen Dateien erneut lesen.
 - Bestehende produktive SensorForge-Funktionalitaet hat absolute Prioritaet.
   Streaming darf den Normalbetrieb nicht veraendern, wenn der Streamer-Modus
   nicht bewusst aktiviert wurde.
@@ -758,8 +897,9 @@ F. BUILD-/FLASH-RESERVE
 
 RELEASE-/DOKUMENTATIONSREGEL:
 
-- Erst wenn der Streamer vollstaendig implementiert, statisch/kompilatorisch geprueft
-  und als zusammenhaengender Stand paketiert ist, Release auf v84 setzen.
+- Fuer kuenftige Releases gilt weiterhin: erst einen zusammenhaengenden, dokumentierten
+  Stand freigeben; Build- und Hardwareaussagen nur dort treffen, wo sie tatsaechlich
+  durch entsprechende Tests belegt sind.
 - Ohne echten Arduino-Build nicht behaupten, dass der Sketch kompiliert.
 - Ohne Hardwaretest nicht behaupten, dass VLC/NVR/Audio real funktionieren.
 - CHANGELOG, sensorforge_version.h, Projektbeschreibung und API-Dokumentation gemeinsam
@@ -3241,15 +3381,15 @@ Passwoerter sollen weder auf einer entnommenen microSD noch im internen
 LittleFS-Config-Shadow im Klartext stehen. Die Config-Struktur selbst bleibt
 weiterhin textuell und wartbar; nur echte Secrets werden geschuetzt.
 
-Es wurden KEINE neuen Benutzer-Config-Keys eingefuehrt. Geschuetzt werden
-genau die bereits bestehenden Felder:
+Geschuetzt werden alle Passwortfelder der aktiven Konfiguration:
 
-- wifi_pass
+- wifi_pass (WLAN-Profil 1)
+- wifi_pass_2 .. wifi_pass_5 (optionale WLAN-Profile 2..5)
 - hotspot_password
 - web_password
 
-Nicht geheime Werte wie wifi_ssid, hostname oder web_username bleiben
-absichtlich im Klartext.
+Die zusaetzlichen WLAN-Profil-Keys wurden mit v84 additiv eingefuehrt. Nicht geheime Werte wie wifi_ssid, wifi_ssid_2..5, hostname oder
+web_username bleiben absichtlich im Klartext.
 
 Neue zentrale Module:
 
@@ -3265,8 +3405,9 @@ Kryptographie:
 - 12-Byte Nonce pro Secret-Wert
 - 16-Byte GCM Authentication Tag
 - maximal 255 Byte Klartext pro Secret im generischen SFSEC1-Container
-- der Feldname wird als AAD eingebunden:
+- der jeweilige Feldname wird als AAD eingebunden, z.B.:
   SFSEC1|wifi_pass
+  SFSEC1|wifi_pass_2
   SFSEC1|hotspot_password
   SFSEC1|web_password
 
@@ -3296,7 +3437,7 @@ Schreiben/Migration:
 
 - neue/aktualisierte Configs werden vor dem Persistieren zentral durch
   protectConfigSecretsForStorage() gefuehrt
-- ein Save schreibt die drei Secrets niemals absichtlich wieder im Klartext
+- ein Save schreibt keines der erkannten Secret-Felder absichtlich wieder im Klartext
 - auch auskommentierte historische Secret-Zeilen wie
   #wifi_pass=...
   oder ;wifi_pass=...
@@ -6793,9 +6934,10 @@ WICHTIGE ENTWICKLUNGSREGELN
 - Config-Keys und interne Variablennamen nicht aus kosmetischen Gruenden
   umbenennen, wenn die bestehende Funktion bereits stabil ist.
 
-- Die drei Config-Secrets wifi_pass, hotspot_password und web_password duerfen
-  nach eingefuehrtem SFSEC1-Pfad nicht wieder im Klartext persistiert werden.
-  Keine neue Passwort-Parallelkonfiguration einfuehren.
+- Alle Config-Secrets (`wifi_pass`, `wifi_pass_2..5`, `hotspot_password` und
+  `web_password`) duerfen nach eingefuehrtem SFSEC1-Pfad nicht wieder im Klartext
+  persistiert werden. Neue Passwortfelder muessen in denselben zentralen
+  Secret-Schutz integriert werden; keine ungeschuetzte Parallelkonfiguration.
 
 - SFENC1, SFSEC1 und SFLOG1 verwenden denselben eFuse-Hardware-Root nur als
   Vertrauensanker, aber getrennte Domain-Ableitungen. Diese Trennung nicht
@@ -7164,11 +7306,11 @@ ohne konkreten Fehler neu designen.
 
 CONFIG-SECRETS / SFSEC1:
 
-Die bereits bestehenden Keys wifi_pass, hotspot_password und web_password
-werden persistent als SFSEC1:<base64url> gespeichert. Keine neuen Passwort-
-Config-Keys einfuehren. config_secrets.cpp/.h verwendet AES-256-GCM mit
-12-Byte-Nonce und 16-Byte-Tag. Der jeweilige Feldname ist AAD, daher sind
-Ciphertexte nicht zwischen den drei Feldern austauschbar.
+Die Passwort-Keys `wifi_pass`, `wifi_pass_2..5`, `hotspot_password` und
+`web_password` werden persistent als SFSEC1:<base64url> gespeichert.
+`config_secrets.cpp/.h` verwendet AES-256-GCM mit 12-Byte-Nonce und 16-Byte-Tag.
+Der jeweilige Feldname ist AAD, daher sind Ciphertexte nicht zwischen den
+verschiedenen Secret-Feldern austauschbar.
 
 Key-Ableitung kommt aus demselben eFuse-HMAC-Root, aber eigener Domain
 SENSORFORGE-CONFIG-SECRETS-V1. Lesen einer fremden SFSEC1-Config darf niemals

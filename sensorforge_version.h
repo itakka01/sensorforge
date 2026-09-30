@@ -20,15 +20,14 @@
 // The same release tag is written to the firmware boot log and shown in
 // WebConfig, so a running device can be mapped back to the exact Git tag.
 
-#define SENSORFORGE_RELEASE_NUMBER 83
-#define SENSORFORGE_RELEASE_TAG "v83"
-#define SENSORFORGE_RELEASE_DATE "2026-09-28"
+#define SENSORFORGE_RELEASE_NUMBER 84
+#define SENSORFORGE_RELEASE_TAG "v84"
+#define SENSORFORGE_RELEASE_DATE "2026-09-30"
 #define SENSORFORGE_RELEASE_SUMMARY \
-    "Simplify general configuration layout with clearer audio, timezone, network, LED and debug controls."
+    "Network streamer, multi-WiFi/AP fallback, unified responsive settings UI and central camera preview/save workflow."
 
-// Current post-v83 development state. This does not claim a released v84;
-// promote the release tag only after the required build/hardware qualification.
-#define SENSORFORGE_WORKTREE_STAGE "v84-candidate"
+// Current source-tree stage. v84 was promoted to an official release on 2026-09-30.
+#define SENSORFORGE_WORKTREE_STAGE "v84-release"
 #define SENSORFORGE_WORKTREE_DATE "2026-09-30"
 #define SENSORFORGE_WORKTREE_SUMMARY \
-    "AP/STA streamer networking with generic board-safe WiFi TX-power UI; compile fix removes obsolete board minimum reference."
+    "Official v84 release: streamer, prioritized WiFi profiles/AP fallback, responsive save UI and central camera preview/crop workflow."

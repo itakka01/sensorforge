@@ -1,3 +1,37 @@
+## v84 — 2026-09-30
+
+- Promoted the complete v84 worktree to the official **v84** release. The detailed v84 candidate/development entries below remain as the implementation history for this release.
+- Added the optional **Network Streamer** operating mode with RTSP/RTP-JPEG over interleaved TCP, HTTP-MJPEG, optional L16 audio, RTCP sender reports, multi-client timing fixes, bounded real-time audio draining and streamer diagnostics. The tested XIAO streamer path reached the accepted field state with up to 2x RTSP + 2x HTTP-MJPEG and active 16-kHz/16-bit/mono audio.
+- Added AP/STA service-network selection, board-safe configurable WiFi TX power, up to five prioritized external WiFi profiles, on-demand WLAN scan and optional hotspot fallback. Legacy `wifi_ssid` / `wifi_pass` remain profile 1 for backward compatibility.
+- Moved WiFi configuration into **System > WiFi Einstellungen** and introduced the fixed responsive save bar. The same save interaction is now used on the normal and advanced camera-settings pages.
+- Unified camera live preview around the existing `/snapshot` route. In streamer mode the preview reuses the central streamer frame pipeline instead of starting a competing camera capture owner.
+- Consolidated OV3660 crop persistence into the central camera save workflow. The separate crop save button is removed; in streamer mode a changed crop is persisted by the normal camera save and becomes active after reboot rather than attempting an unsafe live crop change.
+- Preserved the v83 compatibility rule: missing new streamer/WiFi keys still start normal SensorForge behavior, and existing recording/shooter/sleep configuration is not overwritten merely by selecting streamer mode.
+- Known accepted streamer residual: an occasional startup click can still occur when opening an RTSP audio stream; the previous continuous ring-overflow crackling is resolved in the qualified streamer path.
+- Release decision/status was confirmed on 2026-09-30. The separately tracked long-term Recording/Storage qualification remains independent of the v84 streamer/network/UI release status. This documentation promotion itself does not claim an additional Arduino build performed in this environment.
+
+## v84-candidate - 2026-09-30 - dedicated WiFi configuration, prioritized profiles and optional hotspot fallback
+
+- Moved WiFi/network settings out of the general configuration page into the dedicated **System > WiFi Einstellungen** page. `webconfig_wifi.cpp/.h` now owns rendering, validation, scanning and WiFi-specific persistence; the general config save preserves WiFi values unchanged.
+- Added a fixed responsive save bar for configuration pages: compact and always visible on desktop, wide and safe-area aware on small/mobile displays. Saving remains explicit; no automatic persistence on every field change was introduced.
+- Expanded infrastructure WiFi from one credential pair to up to five ordered profiles. Profile 1 keeps the legacy `wifi_ssid` / `wifi_pass` keys; profiles 2..5 are additive `wifi_ssid_2..5` / `wifi_pass_2..5`, so old configs remain valid without migration.
+- Centralized STA connection attempts: configured profiles are tried in user-defined order for both boot-time time synchronization and the persistent WebConfig/streamer network. The first successful profile becomes active.
+- Added optional `hotspot_fallback_enabled`. When external-WLAN mode is selected and no configured profile can connect, an explicitly enabled fallback starts the configured SensorForge AP. Default is off, preserving the previous no-fallback behavior for existing installations.
+- Streamer network health now validates the actually active interface, including an AP that was started by fallback, rather than assuming the originally selected STA mode must remain active.
+- Reworked the WiFi UI into clearly separated conditional external-WLAN and hotspot blocks. Connection type and failure behavior use dropdowns; external profiles are shown as a responsive priority list with one automatic empty entry row. Reorder/delete controls appear only for configured rows.
+- Added an on-demand WiFi scan modal. Scan results show SSID, RSSI and a qualitative signal rating and can populate the next free profile; scanning never runs continuously in the background.
+- Simplified user-facing wording for system-time synchronization, WiFi inactivity timeout and TX power. Technical explanations moved behind info buttons; TX power now shows board default and effective board minimum together, and RSSI is presented as a compact current measurement.
+- Extended SFSEC1 secret recognition to `wifi_pass_2..5`; all WiFi profile passwords therefore use the same at-rest protection as the legacy profile-1 password.
+- Static/source review only in this environment; no new Arduino build or hardware qualification is claimed for these WiFi/UI changes.
+
+## v84-candidate - 2026-09-30 - camera preview reuses the central streamer frame pipeline
+
+- Kept `/snapshot` as the common camera-preview URL. Normal SensorForge mode retains the existing preview/camera path unchanged.
+- In streamer mode, `/snapshot` now explicitly raises preview demand and serves the cached JPEG from the existing streamer capture pipeline through `streamerSendSnapshot()`; it does not start a second `esp_camera_fb_get()` owner.
+- While the camera settings live preview is visible, a short demand lease raises the streamer from its 5-second idle snapshot refresh to the normal effective streamer frame cadence. `/preview_stop` clears demand, with an expiry timeout as a fail-safe for vanished browser tabs.
+- RTSP/RTP, HTTP-MJPEG, audio, recording ownership in normal mode, thermal handling and storage behavior are otherwise unchanged.
+- Static/source review only in this environment; no Arduino build or hardware test is claimed for this preview integration.
+
 ## v84-candidate - 2026-09-30 - AP/STA compile fix for generic WiFi TX-power minimum
 
 - Fixed `webconfig.cpp` after the AP/STA network-mode merge: the WiFi TX-power warning still referenced the removed legacy `BOARD_WIFI_TX_POWER_MIN_X10` constant.

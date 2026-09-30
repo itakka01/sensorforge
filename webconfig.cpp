@@ -44,6 +44,7 @@
 #include "streamer.h"
 #include "webconfig_streamer.h"
 #include "webconfig_audio.h"
+#include "webconfig_wifi.h"
 
 static const char *AUDIO_MIC_TEST_PATH = "/sensorforge_audio_test.wav";
 static const uint32_t AUDIO_MIC_TEST_DURATION_MS = 10000UL;
@@ -53,8 +54,6 @@ static const uint32_t AUDIO_MIC_TEST_DURATION_MS = 10000UL;
 // This is the same state used by the periodic STATUS line.
 extern bool recording;
 extern bool sdReady;
-extern bool wifiInfrastructureRssiAvailable();
-extern int wifiInfrastructureRssiDbm();
 
 // Gracefully finalizes an active recording when the operator explicitly
 // pauses the recording automation from WebConfig.
@@ -1252,6 +1251,16 @@ static String htmlHeader()
         ".recording-control.paused .recording-control-actions button{background:#d97706;color:#fff;}"
         ".form-actions{padding:14px 0 2px;}"
         ".form-actions button{background:var(--accent);color:#fff;min-width:120px;}"
+        ".floating-save-space{height:84px;}"
+        ".floating-save-bar{position:fixed;right:20px;bottom:max(18px,env(safe-area-inset-bottom));z-index:1600;"
+        "display:flex;align-items:center;gap:14px;padding:10px 12px 10px 16px;border:1px solid var(--line);"
+        "border-radius:10px;background:rgba(255,255,255,.97);box-shadow:0 8px 28px rgba(16,24,40,.18);backdrop-filter:blur(8px);}"
+        ".floating-save-state{font-size:.88rem;color:var(--muted);white-space:nowrap;}"
+        ".floating-save-bar.dirty .floating-save-state{color:#9a5a00;font-weight:700;}"
+        ".floating-save-bar button{margin:0;min-width:130px;background:var(--accent);color:#fff;}"
+        ".floating-save-bar button:disabled{opacity:.48;cursor:default;filter:none;}"
+        "@media(max-width:720px){.floating-save-space{height:96px;}.floating-save-bar{left:10px;right:10px;bottom:max(10px,env(safe-area-inset-bottom));"
+        "justify-content:space-between;border-radius:10px;padding:10px 10px 10px 13px;}.floating-save-state{white-space:normal;}.floating-save-bar button{min-width:118px;}}"
         ".flash-notice{position:relative;margin:0 0 16px;padding:14px 16px 14px 18px;"
         "border:1px solid #b8d5bf;border-left:5px solid var(--ok);border-radius:9px;"
         "background:#eef9f0;box-shadow:0 2px 8px rgba(16,24,40,.06);"
@@ -1432,6 +1441,7 @@ static String htmlHeader()
 
     html +=
         "<a href='/system'>" + htmlText(UI_NAV_SYSTEM) + "</a>"
+        "<a href='/wifi_settings'>WiFi Einstellungen</a>"
         "<a href='/shooter'>Power Shooter</a>"
         "<a href='/sd_maintenance'>" + htmlText(UI_NAV_SD_MAINTENANCE) + "</a>"
         "<a href='/log'>" + htmlText(UI_NAV_LOG_VIEWER) + "</a>"
@@ -4559,18 +4569,13 @@ static void handleConfig()
         "</div>";
 
 
-    html += "</div><div class='settings-section'><h3>WLAN / Zeit</h3>";
+    html += "</div><div class='settings-section'><h3>Zeit</h3>";
 
     String timezoneInfo =
         "Die Zeitzone bestimmt die lokale Uhrzeit in SensorForge, zum Beispiel für Zeitstempel und geplante Aufnahmefreigaben. "
         "Wähle die Region, die deinem Standort entspricht. Die technischen POSIX-Zeitzonenwerte werden intern automatisch gesetzt.";
 
     html += "<div class='config-field-grid'>";
-
-    html +=
-        "<div class='config-label'>Gerätename / Hotspot-Name</div>"
-        "<div class='config-control'><input name='hostname' maxlength='63' autocomplete='off' value='" +
-        htmlEscape(cfg_hostname) + "'></div>";
 
     html +=
         "<div class='config-label'><span class='config-label-inline'>Zeitzone" +
@@ -4599,136 +4604,9 @@ static void handleConfig()
     }
 
     html += "</select></div>";
-
     html +=
-        "<div class='config-label'>Zeitabgleich über externes WLAN beim Systemstart</div>"
-        "<div class='config-control'><select name='wifi_on_system_start'>"
-        "<option value='off'" + String(cfg_wifi_on_system_start == "off" ? " selected" : "") + ">Aus</option>"
-        "<option value='on'" + String(cfg_wifi_on_system_start == "on" ? " selected" : "") + ">Ein</option>"
-        "<option value='on_missing_time'" + String(cfg_wifi_on_system_start == "on_missing_time" ? " selected" : "") + ">Nur einschalten, wenn die Uhrzeit fehlt</option>"
-        "</select></div>";
-
-    html +=
-        "<div class='config-label'>WLAN automatisch ausschalten</div>"
-        "<div class='config-control'><input name='wifi_timeout_sec' type='number' min='0' max='86400' value='" +
-        String(cfg_wifi_timeout_sec) + "'></div>"
-        "<div class='config-note'>Sekunden; 0 = automatische Abschaltung deaktiviert. Im Streamer-Modus bleibt das gewählte Netzwerk unabhängig davon dauerhaft aktiv.</div>";
-
-    html +=
-        "<div class='config-label'>WLAN-Netzwerk (SSID)</div>"
-        "<div class='config-control'><input name='wifi_ssid' autocomplete='off' value='" +
-        htmlEscape(cfg_wifi_ssid) + "' placeholder='Name des WLAN-Netzwerks'></div>";
-
-    html +=
-        "<div class='config-label'>WLAN-Passwort</div>"
-        "<div class='config-control'><input type='password' name='wifi_pass' autocomplete='new-password' value='' "
-        "placeholder='Leer lassen = bestehendes Passwort behalten'></div>";
-
-    html +=
-        "<div class='config-label'>WiFi-Sendeleistung</div>"
-        "<div class='config-control'><select name='wifi_tx_power_dbm'>";
-
-    int16_t configuredTxPowerX10 =
-        (int16_t)lroundf(cfg_wifi_tx_power_dbm * 10.0f);
-
-    for (size_t i = 0; i < BOARD_WIFI_TX_POWER_LEVEL_COUNT; ++i) {
-        int16_t valueX10 = BOARD_WIFI_TX_POWER_LEVELS_X10[i];
-        if (valueX10 < SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10)
-            continue;
-        String valueText = String(valueX10 / 10.0f, 1);
-        html +=
-            "<option value='" + valueText + "'" +
-            String(valueX10 == configuredTxPowerX10 ? " selected" : "") +
-            ">" + valueText + " dBm</option>";
-    }
-
-    html +=
-        "</select></div>"
-        "<div class='config-note'>Gilt für externes WLAN und Hotspot. Niedrigere Werte können Funkleistung und Wärme reduzieren, "
-        "verringern aber die Funkreserve. Board-Default: " +
-        String(BOARD_WIFI_TX_POWER_DEFAULT_X10 / 10.0f, 1) + " dBm.</div>";
-
-    int16_t effectiveTxSafeMinX10 = boardWifiTxPowerSafeMinimumX10();
-    if (effectiveTxSafeMinX10 <= 110) {
-        html +=
-            "<div></div><div class='config-note' style='color:#b45309'><b>Achtung:</b> "
-            "Sehr geringe Sendeleistung reduziert die Reichweitenreserve. "
-            "Die generelle SensorForge-Sicherheitsgrenze liegt bei 8.5 dBm; "
-            "für dieses Board ist die kleinste freigegebene Stufe " +
-            String(effectiveTxSafeMinX10 / 10.0f, 1) +
-            " dBm. Niedrige Werte bis 11 dBm nur verwenden, wenn die Funkstrecke "
-            "vor Ort zuverlässig getestet wurde.</div>";
-    }
-
-    html +=
-        "<div class='config-label'>Empfang externes WLAN</div><div class='config-control'>";
-
-    if (wifiInfrastructureRssiAvailable()) {
-        int rssi = wifiInfrastructureRssiDbm();
-        int markerPct = constrain((rssi + 90) * 100 / 45, 0, 100);
-        String qualityText;
-        String recommendation;
-
-        if (rssi >= -55) {
-            qualityText = "Sehr gut";
-            recommendation = "11 bis 15 dBm ausprobieren";
-        } else if (rssi >= -65) {
-            qualityText = "Gut";
-            recommendation = "15 bis 16.5 dBm ausprobieren";
-        } else if (rssi >= -72) {
-            qualityText = "Mittel";
-            recommendation = "16.5 bis 18 dBm verwenden";
-        } else {
-            qualityText = "Schwach";
-            recommendation = "hohe bzw. maximale Board-Sendeleistung beibehalten";
-        }
-
-        html +=
-            "<div><b>" + String(rssi) + " dBm - " + qualityText + "</b></div>"
-            "<div style='position:relative;height:14px;border-radius:7px;margin:8px 0 6px;"
-            "background:linear-gradient(90deg,#c62828 0%,#f9a825 45%,#7cb342 72%,#2e7d32 100%);'>"
-            "<span style='position:absolute;left:calc(" + String(markerPct) + "% - 2px);top:-4px;width:4px;height:22px;"
-            "background:#111;border-radius:2px'></span></div>"
-            "<div class='config-note'>Rot = schwacher Empfang, Grün = sehr guter Empfang. "
-            "Letzte Messung während der Verbindung mit dem externen WLAN in dieser Laufzeit. "
-            "Empfehlung: <b>" + recommendation + "</b>. Die Einstellung wird nicht automatisch geändert.</div>";
-    } else {
-        html +=
-            "<div class='config-note'>Noch keine Empfangsmessung in dieser Laufzeit. RSSI ist nur messbar, "
-            "während SensorForge tatsächlich mit dem konfigurierten externen WLAN verbunden ist.</div>";
-    }
-
-    html += "</div>";
-
-    html += "</div>";
-
-
-    html += "</div><div class='settings-section'><h3>Hotspot / Access Point</h3>";
-
-    html += "<div class='config-field-grid'>";
-
-    html +=
-        "<div class='config-label'>Netzwerkmodus</div>"
-        "<div class='config-control'><select name='hotspot_enabled'>"
-        "<option value='1'" + String(cfg_hotspot_enabled ? " selected" : "") + ">Aktiviert - eigenen Hotspot verwenden</option>"
-        "<option value='0'" + String(!cfg_hotspot_enabled ? " selected" : "") + ">Deaktiviert - konfiguriertes WLAN verwenden</option>"
-        "</select></div>"
-        "<div class='config-note'>Diese Auswahl bestimmt den Netzwerkmodus für Webinterface und Streamer: Hotspot an = eigener Access Point; Hotspot aus = Verbindung mit der oben konfigurierten SSID. Im Normalmodus kann der WLAN-Timeout die Verbindung später wieder abschalten.</div>";
-
-    html +=
-        "<div class='config-label'>Hotspot-Passwort</div>"
-        "<div class='config-control'><input type='password' name='hotspot_password' minlength='8' maxlength='63' "
-        "autocomplete='new-password' value='' placeholder='Leer lassen = bestehende Einstellung behalten'></div>"
-        "<div class='config-note'>Aktuell: " +
-        String(cfg_hotspot_password.length() ? "passwortgeschützt" : "offen / kein Passwort") +
-        ". Neues Passwort: 8 bis 63 Zeichen.</div>";
-
-    html +=
-        "<div class='config-label'>Hotspot-Name sichtbar</div>"
-        "<div class='config-control'><select name='hotspot_hidden'>"
-        "<option value='0'" + String(!cfg_hotspot_hidden ? " selected" : "") + ">Ja - Netzwerkname wird angezeigt</option>"
-        "<option value='1'" + String(cfg_hotspot_hidden ? " selected" : "") + ">Nein - Netzwerkname wird versteckt</option>"
-        "</select></div>";
+        "<div></div><div class='config-note'>Netzwerk, Hotspot und WLAN-Startverhalten befinden sich unter "
+        "<a href='/wifi_settings'>System &gt; WiFi Einstellungen</a>.</div>";
 
     html += "</div>";
 
@@ -4797,8 +4675,23 @@ static void handleConfig()
     html += "</div>";
 
     html += "</div>";
-    html += "<div class='form-actions'><button type='submit'>Speichern</button></div>";
+    html +=
+        "<div class='floating-save-space'></div>"
+        "<div id='configSaveBar' class='floating-save-bar'>"
+        "<span id='configSaveState' class='floating-save-state'>Keine ungespeicherten Änderungen</span>"
+        "<button id='configSaveButton' type='submit' disabled>Speichern</button>"
+        "</div>";
     html += "</form>";
+
+    html +=
+        "<script>(function(){"
+        "var f=document.getElementById('configForm'),b=document.getElementById('configSaveBar'),"
+        "s=document.getElementById('configSaveState'),btn=document.getElementById('configSaveButton');"
+        "if(!f||!b||!s||!btn)return;"
+        "function dirty(){b.classList.add('dirty');s.textContent='Ungespeicherte Änderungen';btn.disabled=false;}"
+        "f.addEventListener('input',dirty);f.addEventListener('change',dirty);"
+        "f.addEventListener('submit',function(){btn.disabled=true;s.textContent='Speichert …';});"
+        "})();</script>";
 
 
     appendPageInfoUi(html);
@@ -5365,76 +5258,15 @@ static void handleSave()
         cfg_disk_full_action;
 
 
-    String wifiOnSystemStart =
-        server.arg("wifi_on_system_start");
-
-    wifiOnSystemStart.trim();
-    wifiOnSystemStart.toLowerCase();
-
-    if (
-        wifiOnSystemStart != "off" &&
-        wifiOnSystemStart != "on" &&
-        wifiOnSystemStart != "on_missing_time"
-    ) {
-        wifiOnSystemStart = "off";
-    }
-
-
-    int wifiTimeoutSec =
-        server.arg("wifi_timeout_sec").toInt();
-
-    wifiTimeoutSec =
-        constrain(
-            wifiTimeoutSec,
-            0,
-            86400
-        );
-
-
-    String newPassword =
-        server.arg("wifi_pass");
-
-    // Empty password field means: keep current password.
-    if (!newPassword.length()) {
-        newPassword =
-            cfg_wifi_pass;
-    }
-
-
+    // WiFi/network settings are owned exclusively by /wifi_settings.
+    // A general configuration save must preserve them verbatim.
+    String wifiOnSystemStart = cfg_wifi_on_system_start;
+    int wifiTimeoutSec = cfg_wifi_timeout_sec;
+    String newPassword = cfg_wifi_pass;
     float wifiTxPowerDbm = cfg_wifi_tx_power_dbm;
-    if (server.hasArg("wifi_tx_power_dbm")) {
-        String txPowerText = server.arg("wifi_tx_power_dbm");
-        txPowerText.trim();
-        char *end = nullptr;
-        double parsed = strtod(txPowerText.c_str(), &end);
-        if (end == txPowerText.c_str() || *end != '\0' || !isfinite(parsed)) {
-            server.send(400, "text/plain; charset=utf-8", "Invalid wifi_tx_power_dbm");
-            return;
-        }
-        wifiTxPowerDbm = (float)parsed;
-    }
-
-
-    int hotspotEnabled =
-        server.arg("hotspot_enabled").toInt()
-        ? 1
-        : 0;
-
-
-    String newHotspotPassword =
-        server.arg("hotspot_password");
-
-    // Empty password field means: keep current hotspot password.
-    if (!newHotspotPassword.length()) {
-        newHotspotPassword =
-            cfg_hotspot_password;
-    }
-
-
-    int hotspotHidden =
-        server.arg("hotspot_hidden").toInt()
-        ? 1
-        : 0;
+    int hotspotEnabled = cfg_hotspot_enabled;
+    String newHotspotPassword = cfg_hotspot_password;
+    int hotspotHidden = cfg_hotspot_hidden;
 
 
     String webLanguage =
@@ -5584,10 +5416,8 @@ static void handleSave()
         return;
     }
 
-    String hostname =
-        server.arg("hostname");
-
-    hostname.trim();
+    // Hostname and SSID are edited on the dedicated WiFi page.
+    String hostname = cfg_hostname;
 
 
     String timezone =
@@ -5596,10 +5426,7 @@ static void handleSave()
     timezone.trim();
 
 
-    String wifiSsid =
-        server.arg("wifi_ssid");
-
-    wifiSsid.trim();
+    String wifiSsid = cfg_wifi_ssid;
 
 
     String logFile =
@@ -7245,23 +7072,24 @@ static void handleCameraSettingsSave()
     if (rejectWhileRecording("camera settings save"))
         return;
 
-    // Leaving/submitting the Camera page must never accidentally persist a
-    // temporary unsaved live crop. Restore the saved crop before changing the
-    // persistent non-crop camera settings.
-    stopCameraPreview();
-
     String camera = server.arg("camera");
     String resolution = server.arg("resolution");
     String returnTo = server.arg("return_to");
     String xclkText = server.arg("camera_xclk_mhz");
     String autoExposureText = server.arg("camera_auto_exposure");
     String rotationText = server.arg("rotation");
+    String cropZoom = server.arg("camera_crop_zoom");
+    String cropXText = server.arg("camera_crop_x");
+    String cropYText = server.arg("camera_crop_y");
 
     camera.trim();
     resolution.trim();
     xclkText.trim();
     autoExposureText.trim();
     rotationText.trim();
+    cropZoom.trim();
+    cropXText.trim();
+    cropYText.trim();
     returnTo.trim();
 
     if (returnTo != "advanced")
@@ -7286,14 +7114,33 @@ static void handleCameraSettingsSave()
         return;
     }
 
+    if (
+        cropZoom != "1.0" &&
+        cropZoom != "1.5" &&
+        cropZoom != "2.0"
+    ) {
+        server.send(400, "text/plain; charset=utf-8", "Ungueltiger camera_crop_zoom Wert");
+        return;
+    }
+
+    if (
+        (cropXText != "0" && cropXText != "1" && cropXText != "2") ||
+        (cropYText != "0" && cropYText != "1" && cropYText != "2")
+    ) {
+        server.send(400, "text/plain; charset=utf-8", "Ungueltige camera_crop_x/camera_crop_y Position");
+        return;
+    }
+
     int fps = server.arg("fps").toInt();
     int quality = server.arg("quality").toInt();
     int cameraXclkMhz = xclkText.toInt();
     int cameraAutoExposure = autoExposureText.toInt();
     int cameraAeLevel = server.arg("camera_ae_level").toInt();
     int rotation = rotationText.toInt();
+    int cropX = cropXText.toInt();
+    int cropY = cropYText.toInt();
 
-    bool restartRequired =
+    bool nonCropRestartRequired =
         camera != cfg_camera ||
         resolution != cfg_resolution ||
         quality != cfg_quality ||
@@ -7302,13 +7149,57 @@ static void handleCameraSettingsSave()
         cameraAeLevel != cfg_camera_ae_level ||
         rotation != cfg_rotation;
 
+    bool cropChanged =
+        cropZoom != cfg_camera_crop_zoom ||
+        cropX != cfg_camera_crop_x ||
+        cropY != cfg_camera_crop_y;
+
+    // In normal mode a crop-only change may stay live immediately. If another
+    // sensor setting already requires a restart, or if the streamer owns the
+    // camera, do not reprogram geometry underneath that active owner. The new
+    // crop is still persisted atomically with the other Camera-page values and
+    // becomes active after the required reboot.
+    bool applyCropLive =
+        cropChanged &&
+        !streamerModeEnabled() &&
+        !nonCropRestartRequired;
+
+    String error;
+
+    if (applyCropLive) {
+        noteCameraPreviewActivity();
+        cameraPreviewCropTemporary = true;
+
+        if (!cameraApplyCropRuntime(
+                cropZoom,
+                cropX,
+                cropY,
+                error
+            )) {
+
+            String applyError = error;
+            restoreSavedCameraCrop();
+
+            server.send(
+                409,
+                "text/plain; charset=utf-8",
+                applyError
+            );
+            return;
+        }
+    } else {
+        // A temporary preview crop must not leak into a save that will only
+        // become active after reboot. Restore the current persisted geometry
+        // before releasing the preview owner.
+        stopCameraPreview();
+    }
+
     configRefreshSdStatus();
 
     bool writeToSd =
         configSdAvailable() &&
         configSdPresent();
 
-    String error;
     ConfigSaveResult result =
         configSaveCameraSettings(
             camera,
@@ -7319,6 +7210,9 @@ static void handleCameraSettingsSave()
             cameraAutoExposure,
             cameraAeLevel,
             rotation,
+            cropZoom,
+            cropX,
+            cropY,
             writeToSd,
             error
         );
@@ -7327,6 +7221,9 @@ static void handleCameraSettingsSave()
         result != CONFIG_SAVE_BOTH &&
         result != CONFIG_SAVE_INTERNAL_ONLY
     ) {
+        if (applyCropLive)
+            restoreSavedCameraCrop();
+
         server.send(
             400,
             "text/plain; charset=utf-8",
@@ -7336,6 +7233,15 @@ static void handleCameraSettingsSave()
         );
         return;
     }
+
+    if (applyCropLive) {
+        cameraPreviewCropTemporary = false;
+        stopCameraPreview();
+    }
+
+    bool restartRequired =
+        nonCropRestartRequired ||
+        (cropChanged && streamerModeEnabled());
 
     if (restartRequired)
         cameraSettingsRestartRequired = true;
@@ -7355,6 +7261,9 @@ static void handleCameraSettingsSave()
         " auto_exposure=" + String(cameraAutoExposure) +
         " ae_level=" + String(cameraAeLevel) +
         " rotation=" + String(rotation) +
+        " crop_zoom=" + cropZoom +
+        " crop_x=" + String(cropX) +
+        " crop_y=" + String(cropY) +
         " | " + storageText
     );
 
@@ -7366,7 +7275,10 @@ static void handleCameraSettingsSave()
         " xclk=" + String(cameraXclkMhz) +
         " auto_exposure=" + String(cameraAutoExposure) +
         " ae_level=" + String(cameraAeLevel) +
-        " rotation=" + String(rotation)
+        " rotation=" + String(rotation) +
+        " crop_zoom=" + cropZoom +
+        " crop_x=" + String(cropX) +
+        " crop_y=" + String(cropY)
     );
 
     String redirectBase =
@@ -8182,8 +8094,7 @@ static void handleImageMotionPage()
             "</div><input id='imGlobalChange' type='number' min='20' max='100' value='" + String(cfg_image_motion_global_change_pct) +
             "'><div class='im-help'>" + htmlText(UI_IMAGE_MOTION_GLOBAL_CHANGE_HELP) + "</div></div>";
 
-        html += "</div><div class='im-actions'><button type='button' id='imSave'>" + htmlText(UI_IMAGE_MOTION_SAVE) +
-            "</button><button type='button' id='imDefaults'>" + htmlText(UI_IMAGE_MOTION_RESET_DEFAULTS) +
+        html += "</div><div class='im-actions'><button type='button' id='imDefaults'>" + htmlText(UI_IMAGE_MOTION_RESET_DEFAULTS) +
             "</button>" + imageMotionInfoButton(UI_IMAGE_MOTION_RESET_DEFAULTS, UI_IMAGE_MOTION_RESET_DEFAULTS_HELP) + "</div>";
 
         html += "<div class='im-card' style='margin-top:14px'><h3>" + htmlText(UI_IMAGE_MOTION_TEST) + "</h3><p class='muted'>" +
@@ -8197,6 +8108,13 @@ static void handleImageMotionPage()
             htmlText(UI_IMAGE_MOTION_RESULT_TITLE) + "</div><div id='imResultText' class='im-result-text'>-</div><div id='imResultMeta' class='im-result-meta'></div></div>";
         html += "<details class='im-details'><summary>" + htmlText(UI_IMAGE_MOTION_TECH_DETAILS) +
             "</summary><div id='imDiag' class='im-diag'>-</div></details></div></div></div>";
+
+        html +=
+            "<div class='floating-save-space'></div>"
+            "<div id='imageMotionSaveBar' class='floating-save-bar'>"
+            "<span id='imageMotionSaveState' class='floating-save-state'>Keine ungespeicherten Änderungen</span>"
+            "<button id='imageMotionSaveButton' type='button' disabled>" + htmlText(UI_IMAGE_MOTION_SAVE) + "</button>"
+            "</div>";
 
         html += "<div id='imInfoBackdrop' class='im-modal-backdrop' role='dialog' aria-modal='true'><div class='im-modal'><h3 id='imInfoTitle'></h3><div id='imInfoBody'></div><div class='im-modal-actions'><button type='button' id='imInfoClose'>" +
             htmlText(UI_IMAGE_MOTION_INFO_CLOSE) + "</button></div></div></div>";
@@ -8241,6 +8159,10 @@ const imImage=document.getElementById('imImage'),imCanvas=document.getElementByI
 const imStatus=document.getElementById('imStatus'),imDiag=document.getElementById('imDiag'),imResultText=document.getElementById('imResultText'),imResultMeta=document.getElementById('imResultMeta'),imDiagBufferStatus=document.getElementById('imDiagBufferStatus');
 const imLiveState=document.getElementById('imLiveState'),imLiveConfirm=document.getElementById('imLiveConfirm'),imLiveFrameMotion=document.getElementById('imLiveFrameMotion'),imLiveBackground=document.getElementById('imLiveBackground'),imLiveLimit=document.getElementById('imLiveLimit'),imLiveLast=document.getElementById('imLiveLast'),imLivePulse=document.getElementById('imLivePulse');
 const imInfoBackdrop=document.getElementById('imInfoBackdrop'),imInfoTitle=document.getElementById('imInfoTitle'),imInfoBody=document.getElementById('imInfoBody');
+const imSaveBar=document.getElementById('imageMotionSaveBar'),imSaveState=document.getElementById('imageMotionSaveState'),imSaveButton=document.getElementById('imageMotionSaveButton');
+let imDirty=false;
+function markImageMotionDirty(){imDirty=true;if(imSaveBar)imSaveBar.classList.add('dirty');if(imSaveState)imSaveState.textContent='Ungespeicherte Änderungen';if(imSaveButton)imSaveButton.disabled=false}
+function markImageMotionSaved(){imDirty=false;if(imSaveBar)imSaveBar.classList.remove('dirty');if(imSaveState)imSaveState.textContent='Gespeichert';if(imSaveButton)imSaveButton.disabled=true}
 function maskBytes(){const a=[];for(let i=0;i<imMask.length;i+=2)a.push(parseInt(imMask.slice(i,i+2),16)||0);return a}
 function setMaskBytes(a){imMask=a.map(v=>v.toString(16).padStart(2,'0')).join('')}
 function bit(i){const a=maskBytes();return !!(a[i>>3]&(1<<(i&7)))}
@@ -8248,11 +8170,11 @@ function setBit(i,on){const a=maskBytes();if(on)a[i>>3]|=1<<(i&7);else a[i>>3]&=
 function drawGrid(){const r=imCanvas.getBoundingClientRect();imCanvas.width=Math.max(1,Math.round(r.width*devicePixelRatio));imCanvas.height=Math.max(1,Math.round(r.height*devicePixelRatio));imCtx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);const w=r.width,h=r.height,cw=w/IM_W,ch=h/IM_H;for(let y=0;y<IM_H;y++)for(let x=0;x<IM_W;x++){const i=y*IM_W+x;if(!bit(i)){imCtx.fillStyle='rgba(220,38,38,.35)';imCtx.fillRect(x*cw,y*ch,cw,ch)}imCtx.strokeStyle='rgba(255,255,255,.55)';imCtx.strokeRect(x*cw,y*ch,cw,ch)}}
 let painting=false,paintValue=true;
 function cellAt(e){const r=imCanvas.getBoundingClientRect(),x=Math.floor((e.clientX-r.left)/r.width*IM_W),y=Math.floor((e.clientY-r.top)/r.height*IM_H);if(x<0||x>=IM_W||y<0||y>=IM_H)return-1;return y*IM_W+x}
-imCanvas.addEventListener('pointerdown',e=>{const i=cellAt(e);if(i<0)return;painting=true;paintValue=!bit(i);setBit(i,paintValue);imCanvas.setPointerCapture(e.pointerId);drawGrid()});
-imCanvas.addEventListener('pointermove',e=>{if(!painting)return;const i=cellAt(e);if(i>=0){setBit(i,paintValue);drawGrid()}});imCanvas.addEventListener('pointerup',()=>painting=false);imCanvas.addEventListener('pointercancel',()=>painting=false);
-document.getElementById('imAll').onclick=()=>{const a=new Array(38).fill(255);a[37]&=15;setMaskBytes(a);drawGrid()};
-document.getElementById('imClear').onclick=()=>{setMaskBytes(new Array(38).fill(0));drawGrid()};
-document.getElementById('imInvert').onclick=()=>{const a=maskBytes().map(v=>(~v)&255);a[37]&=15;setMaskBytes(a);drawGrid()};
+imCanvas.addEventListener('pointerdown',e=>{const i=cellAt(e);if(i<0)return;painting=true;paintValue=!bit(i);setBit(i,paintValue);markImageMotionDirty();imCanvas.setPointerCapture(e.pointerId);drawGrid()});
+imCanvas.addEventListener('pointermove',e=>{if(!painting)return;const i=cellAt(e);if(i>=0&&bit(i)!==paintValue){setBit(i,paintValue);markImageMotionDirty();drawGrid()}});imCanvas.addEventListener('pointerup',()=>painting=false);imCanvas.addEventListener('pointercancel',()=>painting=false);
+document.getElementById('imAll').onclick=()=>{const a=new Array(38).fill(255);a[37]&=15;setMaskBytes(a);markImageMotionDirty();drawGrid()};
+document.getElementById('imClear').onclick=()=>{setMaskBytes(new Array(38).fill(0));markImageMotionDirty();drawGrid()};
+document.getElementById('imInvert').onclick=()=>{const a=maskBytes().map(v=>(~v)&255);a[37]&=15;setMaskBytes(a);markImageMotionDirty();drawGrid()};
 function liveAgeText(valid,ms){if(!valid)return IM_TEXT.liveNever;ms=Math.max(0,Number(ms)||0);let v='';if(ms<1000)v='<1 s';else if(ms<60000)v=Math.floor(ms/1000)+' s';else{const sec=Math.floor(ms/1000),min=Math.floor(sec/60),rest=sec%60;v=min+' min '+rest+' s'}return IM_TEXT.ago+(IM_TEXT.ago?' ':'')+v+IM_TEXT.agoSuffix}
 function liveStateText(d){if(d.motion_active||d.image_motion_state==='confirmed')return IM_TEXT.liveDetected;if(d.image_motion_state==='background_init')return IM_TEXT.liveLearning;if(d.image_motion_state==='global_change')return IM_TEXT.liveGlobalLight;if(d.image_motion_state==='error')return IM_TEXT.liveError;return IM_TEXT.liveNone}
 let imLastAnalysisStamp=0,imLastAnalysisLocalMs=0,imStatusInFlight=false;
@@ -8265,9 +8187,10 @@ function openInfo(title,body){imInfoTitle.textContent=title;imInfoBody.textConte
 function closeInfo(){imInfoBackdrop.classList.remove('open')}
 document.querySelectorAll('.im-info').forEach(b=>b.addEventListener('click',()=>openInfo(b.dataset.title||'',b.dataset.info||'')));
 document.getElementById('imInfoClose').onclick=closeInfo;imInfoBackdrop.addEventListener('click',e=>{if(e.target===imInfoBackdrop)closeInfo()});document.addEventListener('keydown',e=>{if(e.key==='Escape')closeInfo()});
-function setDefaults(){document.getElementById('imSensitivity').value=IM_DEFAULTS.sensitivity;document.getElementById('imMinArea').value=IM_DEFAULTS.minArea;document.getElementById('imConfirm').value=IM_DEFAULTS.confirm;document.getElementById('imRelease').value=IM_DEFAULTS.release;document.getElementById('imLearning').value=IM_DEFAULTS.learning;document.getElementById('imGlobalMean').value=IM_DEFAULTS.globalMean;document.getElementById('imGlobalChange').value=IM_DEFAULTS.globalChange;imMask=IM_DEFAULTS.roi;drawGrid();imStatus.textContent=IM_TEXT.defaultsDone}
+function setDefaults(){document.getElementById('imSensitivity').value=IM_DEFAULTS.sensitivity;document.getElementById('imMinArea').value=IM_DEFAULTS.minArea;document.getElementById('imConfirm').value=IM_DEFAULTS.confirm;document.getElementById('imRelease').value=IM_DEFAULTS.release;document.getElementById('imLearning').value=IM_DEFAULTS.learning;document.getElementById('imGlobalMean').value=IM_DEFAULTS.globalMean;document.getElementById('imGlobalChange').value=IM_DEFAULTS.globalChange;imMask=IM_DEFAULTS.roi;drawGrid();markImageMotionDirty();imStatus.textContent=IM_TEXT.defaultsDone}
 document.getElementById('imDefaults').onclick=setDefaults;
-document.getElementById('imSave').onclick=async()=>{imStatus.textContent='...';try{const r=await fetch('/image_motion_save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:params()});const j=await r.json();if(!r.ok||!j.ok)throw new Error(IM_TEXT.saveFailed+(j.error?': '+j.error:''));imSavedMinArea=parseInt(document.getElementById('imMinArea').value,10)||imSavedMinArea;imStatus.textContent=IM_TEXT.saved}catch(e){imStatus.textContent=e.message}};
+['imSensitivity','imMinArea','imConfirm','imRelease','imLearning','imGlobalMean','imGlobalChange'].forEach(id=>{const el=document.getElementById(id);if(el){el.addEventListener('input',markImageMotionDirty);el.addEventListener('change',markImageMotionDirty)}});
+if(imSaveButton)imSaveButton.onclick=async()=>{if(!imDirty)return;imSaveButton.disabled=true;if(imSaveState)imSaveState.textContent='Speichert …';imStatus.textContent='...';try{const r=await fetch('/image_motion_save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:params()});const j=await r.json();if(!r.ok||!j.ok)throw new Error(IM_TEXT.saveFailed+(j.error?': '+j.error:''));imSavedMinArea=parseInt(document.getElementById('imMinArea').value,10)||imSavedMinArea;markImageMotionSaved();imStatus.textContent=IM_TEXT.saved}catch(e){if(imSaveBar)imSaveBar.classList.add('dirty');if(imSaveState)imSaveState.textContent='Speichern fehlgeschlagen';imSaveButton.disabled=false;imStatus.textContent=e.message}};
 function friendlyResult(d){if(d.motion_active||d.image_motion_state==='confirmed')return IM_TEXT.resultMotion;switch(d.reject_reason){case'disabled':return IM_TEXT.resultDisabled;case'background_init':return IM_TEXT.resultLearning;case'confirming':return IM_TEXT.resultConfirming;case'global_light':return IM_TEXT.resultGlobalLight;case'no_roi':return IM_TEXT.resultNoRoi;case'decode':case'invalid_frame':return IM_TEXT.resultError;default:return IM_TEXT.resultNone}}
 function renderDiagnostics(d){imResultText.textContent=friendlyResult(d);const active=Math.max(0,Number(d.active_roi_blocks)||0),changed=Math.max(0,Number(d.changed_blocks)||0),cluster=Math.max(0,Number(d.largest_cluster_blocks)||0),frameChanged=Math.max(0,Number(d.frame_changed_blocks)||0),frameCluster=Math.max(0,Number(d.frame_largest_cluster_blocks)||0);const total=Number(d.global_change_pct||0).toFixed(1)+' %'+(active?' ('+changed+' / '+active+')':'');const area=Number(d.changed_area_pct||0).toFixed(1)+' %'+(cluster?' ('+cluster+')':'');const frameTotal=d.frame_delta_ready?(Number(d.frame_changed_pct||0).toFixed(1)+' %'+(active?' ('+frameChanged+' / '+active+')':'')):'-';const frameArea=d.frame_delta_ready?(Number(d.frame_cluster_pct||0).toFixed(1)+' %'+(frameCluster?' ('+frameCluster+')':'')):'-';const limit=imSavedMinArea+' %';imResultMeta.innerHTML='';[[IM_TEXT.resultTime,(d.analyze_frame_ms!==undefined?d.analyze_frame_ms:'-')+' ms'],[IM_TEXT.liveCurrentMotion,frameTotal+' / '+frameArea+' '+IM_TEXT.liveConnectedShort],[IM_TEXT.liveBackgroundDifference,total+' / '+area+' '+IM_TEXT.liveConnectedShort],[IM_TEXT.resultLimit,limit]].forEach(([k,v])=>{const span=document.createElement('span');span.textContent=k+': '+v;imResultMeta.appendChild(span)});imDiag.textContent=JSON.stringify(d,null,2)}
 document.getElementById('imTest').onclick=async()=>{imStatus.textContent='...';try{const r=await fetch('/image_motion_test',{method:'POST'}),j=await r.json();if(!r.ok||!j.ok)throw new Error(IM_TEXT.testFailed+(j.error?': '+j.error:''));renderDiagnostics(j.diagnostics||{});imStatus.textContent='OK'}catch(e){imResultText.textContent=IM_TEXT.resultError;imStatus.textContent=e.message}};
@@ -8334,7 +8257,7 @@ static void handlePreview()
 </style>
 <section class='settings-section' id='camera-settings'>
 <h3>Kameraeinstellungen</h3>
-<form method='POST' action='/camera_settings_save'>
+<form id='cameraSettingsForm' method='POST' action='/camera_settings_save'>
 <input type='hidden' name='return_to' value='main'>
 )HTML";
 
@@ -8343,7 +8266,10 @@ static void handlePreview()
         "<input type='hidden' name='quality' value='" + String(cfg_quality) + "'>"
         "<input type='hidden' name='camera_xclk_mhz' value='" + String(cfg_camera_xclk_mhz) + "'>"
         "<input type='hidden' name='camera_auto_exposure' value='" + String(cfg_camera_auto_exposure) + "'>"
-        "<input type='hidden' name='camera_ae_level' value='" + String(cfg_camera_ae_level) + "'>";
+        "<input type='hidden' name='camera_ae_level' value='" + String(cfg_camera_ae_level) + "'>"
+        "<input id='cameraCropZoomField' type='hidden' name='camera_crop_zoom' value='" + htmlEscape(cfg_camera_crop_zoom) + "'>"
+        "<input id='cameraCropXField' type='hidden' name='camera_crop_x' value='" + String(cfg_camera_crop_x) + "'>"
+        "<input id='cameraCropYField' type='hidden' name='camera_crop_y' value='" + String(cfg_camera_crop_y) + "'>";
 
     const String cameraModelInfo =
         "Der Eintrag legt den konfigurierten Kamerasensortyp fest. Auf den unterstützten Boards wird die Pinbelegung durch das Board bestimmt; der tatsächlich erkannte Sensor wird zur Laufzeit über seine Sensor-ID geprüft. Die Auswahlliste verhindert Tippfehler in der Konfiguration.";
@@ -8388,15 +8314,21 @@ static void handlePreview()
         "</div>";
 
     html +=
-        "<button class='primary' type='submit'" +
-        String(cameraSaveBlocked ? " disabled" : "") +
-        ">Kameraeinstellungen speichern</button>"
-        " <a class='button' href='/camera_advanced'>Erweiterte Einstellungen</a>";
+        "<a class='button' href='/camera_advanced'>Erweiterte Einstellungen</a>";
 
     if (cameraSaveBlocked) {
         html +=
             " <small class='muted'>Während einer laufenden Aufnahme können Kameraeinstellungen nicht gespeichert werden.</small>";
     }
+
+    html +=
+        "<div class='floating-save-space'></div>"
+        "<div id='cameraSaveBar' class='floating-save-bar'>"
+        "<span id='cameraSaveState' class='floating-save-state'>" +
+        String(cameraSaveBlocked ? "Speichern während Aufnahme nicht möglich" : "Keine ungespeicherten Änderungen") +
+        "</span>"
+        "<button id='cameraSaveButton' type='submit' disabled>Speichern</button>"
+        "</div>";
 
     html += R"HTML(
 </form>
@@ -8420,6 +8352,21 @@ function updateResolutionWarning(){
 }
 r.addEventListener('change',updateResolutionWarning);
 updateResolutionWarning();
+})();
+(function(){
+const f=document.getElementById('cameraSettingsForm');
+const b=document.getElementById('cameraSaveBar');
+const s=document.getElementById('cameraSaveState');
+const btn=document.getElementById('cameraSaveButton');
+if(!f||!b||!s||!btn)return;
+const blocked=)HTML";
+    html += String(cameraSaveBlocked ? "true" : "false");
+    html += R"HTML(;
+function dirty(){if(blocked)return;b.classList.add('dirty');s.textContent='Ungespeicherte Änderungen';btn.disabled=false;}
+window.sensorforgeCameraMarkDirty=dirty;
+f.addEventListener('input',dirty);
+f.addEventListener('change',dirty);
+f.addEventListener('submit',function(){btn.disabled=true;s.textContent='Speichert …';});
 })();
 </script>
 )HTML";
@@ -8491,13 +8438,14 @@ updateResolutionWarning();
             String(cfg_camera_crop_x) +
             "' data-saved-y='" +
             String(cfg_camera_crop_y) +
+            "' data-live-apply='" +
+            String(streamerModeEnabled() ? "0" : "1") +
             "'>";
 
         html +=
             "<div class='sensor-crop-head'>"
             "<div><strong>Sensor-Ausschnitt (OV3660)</strong>"
-            "<div class='sensor-crop-sub'>Dieser Ausschnitt wird direkt im Sensor gewählt. "
-            "Nach SAVE gilt er dauerhaft für alle künftigen Aufnahmen.</div></div>"
+            "<div class='sensor-crop-sub'>Ausschnitt wählen und anschließend mit dem zentralen Speichern-Button übernehmen.</div></div>"
             "<span id='sensorCropStatus' class='status-pill ok'>Gespeichert</span>"
             "</div>";
 
@@ -8564,13 +8512,8 @@ updateResolutionWarning();
 
         html +=
             "</div></div>"
-            "<div class='sensor-crop-save-wrap'>"
-            "<button id='sensorCropSaveBtn' type='button' class='primary'" +
-            String(cropAvailable ? "" : " disabled") +
-            ">Crop SAVE</button>"
             "<div id='sensorCropMessage' class='sensor-crop-message'>"
-            "Änderungen werden zuerst nur live getestet.</div>"
-            "</div>"
+            "Gespeicherter Ausschnitt ist aktiv.</div>"
             "</div>"
             "</section>";
 
@@ -8643,12 +8586,6 @@ updateResolutionWarning();
 .sensor-crop-grid button:disabled{
     opacity:.45;
     cursor:not-allowed;
-}
-.sensor-crop-save-wrap{
-    min-width:220px;
-}
-.sensor-crop-save-wrap button{
-    margin:0 0 5px;
 }
 .sensor-crop-message{
     color:var(--muted);
@@ -8754,10 +8691,13 @@ const camZoomLabel=document.getElementById('camZoomLabel');
 const sensorCropPanel=document.getElementById('sensorCropPanel');
 const sensorCropZoomSelect=document.getElementById('sensorCropZoom');
 const sensorCropGrid=document.getElementById('sensorCropGrid');
-const sensorCropSaveBtn=document.getElementById('sensorCropSaveBtn');
 const sensorCropStatus=document.getElementById('sensorCropStatus');
 const sensorCropMessage=document.getElementById('sensorCropMessage');
+const sensorCropZoomField=document.getElementById('cameraCropZoomField');
+const sensorCropXField=document.getElementById('cameraCropXField');
+const sensorCropYField=document.getElementById('cameraCropYField');
 const sensorCropAvailable=!!sensorCropPanel&&sensorCropPanel.dataset.available==='1';
+const sensorCropLiveApply=!!sensorCropPanel&&sensorCropPanel.dataset.liveApply==='1';
 
 let sensorCropZoom=sensorCropPanel?sensorCropPanel.dataset.savedZoom:'1.0';
 let sensorCropX=sensorCropPanel?Number(sensorCropPanel.dataset.savedX):1;
@@ -8769,6 +8709,18 @@ function sensorCropHasChanges(){
     return sensorCropZoom!==sensorCropPanel.dataset.savedZoom||
         sensorCropX!==Number(sensorCropPanel.dataset.savedX)||
         sensorCropY!==Number(sensorCropPanel.dataset.savedY);
+}
+
+function syncSensorCropForm(){
+    if(sensorCropZoomField)sensorCropZoomField.value=sensorCropZoom;
+    if(sensorCropXField)sensorCropXField.value=String(sensorCropX);
+    if(sensorCropYField)sensorCropYField.value=String(sensorCropY);
+}
+
+function markSensorCropDirty(){
+    syncSensorCropForm();
+    if(typeof window.sensorforgeCameraMarkDirty==='function')
+        window.sensorforgeCameraMarkDirty();
 }
 
 function updateSensorCropUi(message){
@@ -8789,9 +8741,6 @@ function updateSensorCropUi(message){
     if(sensorCropZoomSelect)
         sensorCropZoomSelect.disabled=!sensorCropAvailable||sensorCropBusy;
 
-    if(sensorCropSaveBtn)
-        sensorCropSaveBtn.disabled=!sensorCropAvailable||sensorCropBusy||!changed;
-
     if(sensorCropStatus){
         sensorCropStatus.textContent=changed?'Nicht gespeichert':'Gespeichert';
         sensorCropStatus.classList.toggle('ok',!changed);
@@ -8801,8 +8750,10 @@ function updateSensorCropUi(message){
     if(sensorCropMessage){
         if(message){
             sensorCropMessage.textContent=message;
+        }else if(changed&&sensorCropLiveApply){
+            sensorCropMessage.textContent='Live-Test aktiv. Der zentrale Speichern-Button übernimmt den Ausschnitt dauerhaft.';
         }else if(changed){
-            sensorCropMessage.textContent='Live-Test aktiv. SAVE speichert diesen Ausschnitt dauerhaft.';
+            sensorCropMessage.textContent='Der Ausschnitt wird mit Speichern übernommen und nach dem Neustart aktiv.';
         }else{
             sensorCropMessage.textContent='Gespeicherter Ausschnitt ist aktiv.';
         }
@@ -8839,12 +8790,21 @@ function applySensorCrop(nextZoom,nextX,nextY){
     sensorCropZoom=nextZoom;
     sensorCropX=nextX;
     sensorCropY=nextY;
+
+    if(!sensorCropLiveApply){
+        sensorCropBusy=false;
+        markSensorCropDirty();
+        updateSensorCropUi();
+        return;
+    }
+
     sensorCropBusy=true;
     updateSensorCropUi('Sensor-Ausschnitt wird angewendet ...');
 
     sensorCropRequest('/camera_crop_apply')
     .then(function(){
         sensorCropBusy=false;
+        markSensorCropDirty();
         updateSensorCropUi();
     })
     .catch(function(error){
@@ -8852,6 +8812,7 @@ function applySensorCrop(nextZoom,nextX,nextY){
         sensorCropX=previousX;
         sensorCropY=previousY;
         sensorCropBusy=false;
+        syncSensorCropForm();
         updateSensorCropUi('Änderung fehlgeschlagen: '+error.message);
     });
 }
@@ -8862,6 +8823,7 @@ function resetSensorCropUiToSaved(){
     sensorCropX=Number(sensorCropPanel.dataset.savedX);
     sensorCropY=Number(sensorCropPanel.dataset.savedY);
     sensorCropBusy=false;
+    syncSensorCropForm();
     updateSensorCropUi('Gespeicherter Ausschnitt ist aktiv.');
 }
 
@@ -8883,36 +8845,9 @@ if(sensorCropGrid){
     });
 }
 
-if(sensorCropSaveBtn){
-    sensorCropSaveBtn.addEventListener('click',function(){
-        if(!sensorCropAvailable||sensorCropBusy||!sensorCropHasChanges())return;
-
-        sensorCropBusy=true;
-        updateSensorCropUi('Crop wird gespeichert ...');
-
-        sensorCropRequest('/camera_crop_save')
-        .then(function(result){
-            sensorCropPanel.dataset.savedZoom=result.zoom;
-            sensorCropPanel.dataset.savedX=String(result.x);
-            sensorCropPanel.dataset.savedY=String(result.y);
-            sensorCropZoom=result.zoom;
-            sensorCropX=Number(result.x);
-            sensorCropY=Number(result.y);
-            sensorCropBusy=false;
-            updateSensorCropUi(
-                result.storage
-                ? ('Gespeichert in '+result.storage+'.')
-                : 'Crop dauerhaft gespeichert.'
-            );
-        })
-        .catch(function(error){
-            sensorCropBusy=false;
-            updateSensorCropUi('Speichern fehlgeschlagen: '+error.message);
-        });
-    });
-}
-
+syncSensorCropForm();
 updateSensorCropUi();
+
 
 const camZoomLevels=[0.5,0.75,1,1.25,1.5,2,2.5];
 const camZoomStorageKey='sensorforge.viewer.zoom';
@@ -9056,7 +8991,7 @@ document.addEventListener('visibilitychange',function(){
     if(document.hidden){
         previewPaused=true;
         releasePreview();
-        resetSensorCropUiToSaved();
+        if(sensorCropLiveApply)resetSensorCropUiToSaved();
     }else if(!previewStopped){
         previewPaused=false;
         nextFrame();
@@ -9150,7 +9085,7 @@ static void handleCameraAdvanced()
 @media(max-width:720px){.camera-settings-grid{grid-template-columns:1fr;gap:5px}.camera-settings-grid input,.camera-settings-grid select{width:100%;max-width:none;margin-bottom:7px}}
 </style>
 <section class='settings-section'>
-<form method='POST' action='/camera_settings_save'>
+<form id='cameraAdvancedSettingsForm' method='POST' action='/camera_settings_save'>
 <input type='hidden' name='return_to' value='advanced'>
 )HTML";
 
@@ -9158,6 +9093,9 @@ static void handleCameraAdvanced()
         "<input type='hidden' name='camera' value='" + htmlEscape(cfg_camera) + "'>"
         "<input type='hidden' name='resolution' value='" + htmlEscape(cfg_resolution) + "'>"
         "<input type='hidden' name='rotation' value='" + String(cfg_rotation) + "'>"
+        "<input type='hidden' name='camera_crop_zoom' value='" + htmlEscape(cfg_camera_crop_zoom) + "'>"
+        "<input type='hidden' name='camera_crop_x' value='" + String(cfg_camera_crop_x) + "'>"
+        "<input type='hidden' name='camera_crop_y' value='" + String(cfg_camera_crop_y) + "'>"
         "<div class='camera-settings-grid'>";
 
     html +=
@@ -9215,14 +9153,22 @@ static void handleCameraAdvanced()
         "<div id='cameraPerformanceHint' class='camera-settings-note'></div>";
 
     html +=
-        "<button class='primary' type='submit'" + String(cameraSaveBlocked ? " disabled" : "") + ">Erweiterte Einstellungen speichern</button>"
-        " <button id='cameraDefaultsBtn' type='button'" + String(cameraSaveBlocked ? " disabled" : "") + ">Standardwerte einsetzen</button>"
+        "<button id='cameraDefaultsBtn' type='button'" + String(cameraSaveBlocked ? " disabled" : "") + ">Standardwerte einsetzen</button>"
         " <a class='button' href='/preview'>Zurück zur Kamera</a>";
 
     if (cameraSaveBlocked) {
         html +=
             " <small class='muted'>Während einer laufenden Aufnahme können Kameraeinstellungen nicht gespeichert werden.</small>";
     }
+
+    html +=
+        "<div class='floating-save-space'></div>"
+        "<div id='cameraAdvancedSaveBar' class='floating-save-bar'>"
+        "<span id='cameraAdvancedSaveState' class='floating-save-state'>" +
+        String(cameraSaveBlocked ? "Speichern während Aufnahme nicht möglich" : "Keine ungespeicherten Änderungen") +
+        "</span>"
+        "<button id='cameraAdvancedSaveButton' type='submit' disabled>Speichern</button>"
+        "</div>";
 
     html += R"HTML(
 </form>
@@ -9237,10 +9183,13 @@ const cap=)HTML";
     html += "const defaults={fps:" + String(cameraAdvancedDefaultFps) +
         ",quality:12,xclk:'" + String(cameraAdvancedDefaultXclk) +
         "',autoExposure:'1',aeLevel:'-1'};";
+    html += "const saveBlocked=" + String(cameraSaveBlocked ? "true" : "false") + ";";
     html += R"HTML(
 const px={'160x120':19200,'320x240':76800,'640x480':307200,'800x600':480000,'1024x768':786432,'1280x1024':1310720,'1600x1200':1920000,'2048x1536':3145728};
 const f=document.getElementById('cameraCfgFps'),q=document.getElementById('cameraCfgQuality'),h=document.getElementById('cameraPerformanceHint');
 const xclk=document.getElementById('cameraCfgXclk'),ae=document.getElementById('cameraCfgAutoExposure'),ael=document.getElementById('cameraCfgAeLevel'),defaultsBtn=document.getElementById('cameraDefaultsBtn');
+const form=document.getElementById('cameraAdvancedSettingsForm'),saveBar=document.getElementById('cameraAdvancedSaveBar'),saveState=document.getElementById('cameraAdvancedSaveState'),saveBtn=document.getElementById('cameraAdvancedSaveButton');
+function dirty(){if(saveBlocked||!saveBar||!saveState||!saveBtn)return;saveBar.classList.add('dirty');saveState.textContent='Ungespeicherte Änderungen';saveBtn.disabled=false;}
 function qw(v){v=Math.max(0,Math.min(63,Number(v)||0));if(v>=12)return 100;return Math.min(160,100+(12-v)*5)}
 function update(){
     h.className='camera-settings-note';
@@ -9257,7 +9206,8 @@ function update(){
     h.textContent=text;
 }
 q.addEventListener('input',update);f.addEventListener('input',update);
-if(defaultsBtn)defaultsBtn.addEventListener('click',function(){f.value=String(defaults.fps);q.value=String(defaults.quality);xclk.value=defaults.xclk;ae.value=defaults.autoExposure;ael.value=defaults.aeLevel;update()});
+if(defaultsBtn)defaultsBtn.addEventListener('click',function(){f.value=String(defaults.fps);q.value=String(defaults.quality);xclk.value=defaults.xclk;ae.value=defaults.autoExposure;ael.value=defaults.aeLevel;update();dirty();});
+if(form){form.addEventListener('input',dirty);form.addEventListener('change',dirty);form.addEventListener('submit',function(){if(saveBtn)saveBtn.disabled=true;if(saveState)saveState.textContent='Speichert …';});}
 update();
 })();
 </script>
@@ -9273,6 +9223,11 @@ update();
 static void handleSnapshot()
 {
     if (streamerModeEnabled()) {
+        // The camera settings page remains on the common /snapshot URL. In
+        // streamer mode this request only raises demand on the existing shared
+        // capture pipeline and serves its cached JPEG; no second camera owner is
+        // introduced.
+        streamerNotePreviewActivity();
         streamerSendSnapshot(server);
         return;
     }
@@ -9352,6 +9307,7 @@ static void handleSnapshot()
 static void handlePreviewStop()
 {
     stopCameraPreview();
+    streamerClearPreviewDemand();
 
     if (server.hasArg("im") && server.arg("im") == "1") {
         // Keep the learned background, but never let a diagnostic/live-preview
@@ -12181,6 +12137,57 @@ static String systemInfoButton(
         "data-title='" + htmlEscape(title) + "' "
         "data-info='" + htmlEscape(info) + "' "
         "aria-label='Information' title='Information'>i</button>";
+}
+
+
+static void handleWifiSettingsPage()
+{
+    String html = htmlHeader();
+    html += webconfigWifiSettingsHtml(server.arg("notice"));
+    html += htmlFooter();
+    server.send(200, "text/html; charset=utf-8", html);
+}
+
+
+static void handleWifiScan()
+{
+    if (rejectWhileRecording("WiFi scan"))
+        return;
+
+    server.send(
+        200,
+        "application/json; charset=utf-8",
+        webconfigWifiScanJson()
+    );
+}
+
+
+static void handleWifiSettingsSave()
+{
+    if (rejectWhileRecording("WiFi settings save"))
+        return;
+
+    configRefreshSdStatus();
+    bool writeToSd = configSdAvailable() && configSdPresent();
+
+    String error;
+    if (!webconfigWifiSaveRequest(server, writeToSd, error)) {
+        server.send(
+            400,
+            "text/plain; charset=utf-8",
+            error.length() ? error : String("WiFi-Einstellungen konnten nicht gespeichert werden")
+        );
+        return;
+    }
+
+    logWrite(
+        "WiFi settings saved | mode=" + String(cfg_hotspot_enabled ? "AP" : "STA") +
+        " hostname=" + cfg_hostname +
+        " tx_power_dbm=" + String(cfg_wifi_tx_power_dbm, 1)
+    );
+
+    server.sendHeader("Location", "/wifi_settings?notice=saved");
+    server.send(303, "text/plain; charset=utf-8", "");
 }
 
 
@@ -18853,6 +18860,9 @@ void webConfigStart()
         server.on("/", HTTP_GET, handleRoot);
         server.on("/config", HTTP_GET, handleConfig);
         server.on("/save", HTTP_POST, handleSave);
+        server.on("/wifi_settings", HTTP_GET, handleWifiSettingsPage);
+        server.on("/wifi_scan", HTTP_GET, handleWifiScan);
+        server.on("/wifi_settings_save", HTTP_POST, handleWifiSettingsSave);
         server.on("/streamer", HTTP_GET, handleStreamerPage);
         server.on("/streamer_save", HTTP_POST, handleStreamerSave);
         server.on("/shooter", HTTP_GET, handleShooterPage);

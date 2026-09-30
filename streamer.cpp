@@ -208,6 +208,11 @@ static uint32_t snapshotLastMs = 0;
 static uint8_t *snapshotBuffer = nullptr;
 static size_t snapshotCapacity = 0;
 static size_t snapshotBytes = 0;
+// Internal WebConfig preview demand expires automatically if a browser tab is
+// closed or disappears without sending /preview_stop. Snapshot polling normally
+// refreshes this timestamp every ~200 ms.
+static uint32_t previewDemandLastMs = 0;
+static const uint32_t PREVIEW_DEMAND_TIMEOUT_MS = 2500UL;
 
 static uint32_t lastSuccessfulFrameMs = 0;
 static uint32_t nextCameraRecoveryAllowedMs = 0;
@@ -1633,7 +1638,10 @@ static void serviceNetworkHealth()
     lastNetworkHealthMs = now;
 
     const wifi_mode_t mode = WiFi.getMode();
-    const bool expectAp = cfg_hotspot_enabled != 0;
+    const bool expectAp =
+        cfg_hotspot_enabled != 0 ||
+        mode == WIFI_AP ||
+        mode == WIFI_AP_STA;
     bool healthy = false;
     String unhealthyReason;
 
@@ -2058,7 +2066,10 @@ static void captureAndDistributeFrame()
     // camera stays initialized, so a new client can resume immediately without
     // a deinit/init cycle.
     const bool forceCameraStress = stressState.mode == StreamerStressMode::CameraOnly;
-    const bool activeDemand = needRtsp || needHttp || forceCameraStress;
+    const bool previewDemand =
+        previewDemandLastMs != 0 &&
+        (uint32_t)(millis() - previewDemandLastMs) <= PREVIEW_DEMAND_TIMEOUT_MS;
+    const bool activeDemand = needRtsp || needHttp || forceCameraStress || previewDemand;
     if (activeDemand != streamDemandActive) {
         streamDemandActive = activeDemand;
         if (streamDemandActive) {
@@ -2542,6 +2553,7 @@ void streamerStop()
     started = false;
     persistHealthCounters(false);
     snapshotBytes = 0;
+    previewDemandLastMs = 0;
     if (snapshotBuffer) {
         free(snapshotBuffer);
         snapshotBuffer = nullptr;
@@ -2572,6 +2584,17 @@ bool streamerSendSnapshot(WebServer &server)
     return writeAll(server.client(), snapshotBuffer, snapshotBytes);
 }
 
+void streamerNotePreviewActivity()
+{
+    if (!streamerModeEnabled() || !started)
+        return;
+    previewDemandLastMs = millis();
+}
+
+void streamerClearPreviewDemand()
+{
+    previewDemandLastMs = 0;
+}
 
 bool streamerRtspClientConnected()
 {

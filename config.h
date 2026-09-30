@@ -131,12 +131,16 @@ extern String cfg_camera_description;
 extern String cfg_timezone;             // POSIX TZ string, e.g. CET-1CEST,M3.5.0,M10.5.0/3
 extern String cfg_wifi_on_system_start; // "off", "on", "on_missing_time"
 extern int cfg_wifi_timeout_sec;       // 0 = auto-off disabled; firmware default is 0
-extern String cfg_wifi_ssid;
-extern String cfg_wifi_pass;
+#define SENSORFORGE_WIFI_PROFILE_COUNT 5
+extern String cfg_wifi_ssid;   // compatibility alias for profile 1
+extern String cfg_wifi_pass;   // compatibility alias for profile 1
+extern String cfg_wifi_ssids[SENSORFORGE_WIFI_PROFILE_COUNT];
+extern String cfg_wifi_passes[SENSORFORGE_WIFI_PROFILE_COUNT];
 extern float cfg_wifi_tx_power_dbm;   // discrete board-supported TX power; applies to STA and AP
 
 // Hotspot / access point
 extern int cfg_hotspot_enabled;       // 1 = local AP, 0 = configured infrastructure WiFi (STA)
+extern int cfg_hotspot_fallback_enabled; // 1 = use AP if all configured STA profiles fail
 extern String cfg_hotspot_password;  // empty = open AP; otherwise 8..63 chars
 extern int cfg_hotspot_hidden;        // 0/1
 
@@ -311,9 +315,10 @@ ConfigSaveResult configSaveCameraCrop(
     String &error
 );
 
-// Persist the non-crop camera settings while preserving every unrelated config
-// key/comment. The Camera page uses this dedicated path so camera settings no
-// longer need to be edited through the general configuration form.
+// Persist the complete Camera-page settings, including the OV3660 crop, while
+// preserving every unrelated config key/comment. Main and advanced Camera pages
+// use this dedicated path so the visible central Save action commits one coherent
+// camera configuration.
 ConfigSaveResult configSaveCameraSettings(
     const String &camera,
     const String &resolution,
@@ -323,6 +328,9 @@ ConfigSaveResult configSaveCameraSettings(
     int cameraAutoExposure,
     int cameraAeLevel,
     int rotation,
+    const String &cropZoom,
+    int cropPositionX,
+    int cropPositionY,
     bool writeToSd,
     String &error
 );
@@ -365,6 +373,23 @@ ConfigSaveResult configSaveRecordingEncryption(
 // field names remain language-neutral.
 ConfigSaveResult configSaveWebLanguage(
     const String &languageCode,
+    bool writeToSd,
+    String &error
+);
+
+// Persist only network/WiFi settings while preserving the complete active
+// config text and all unrelated/future keys. Used by the dedicated WiFi page.
+ConfigSaveResult configSaveWifiSettings(
+    const String &hostname,
+    const String &wifiOnSystemStart,
+    int wifiTimeoutSec,
+    const String wifiSsids[SENSORFORGE_WIFI_PROFILE_COUNT],
+    const String wifiPasses[SENSORFORGE_WIFI_PROFILE_COUNT],
+    float wifiTxPowerDbm,
+    int hotspotEnabled,
+    int hotspotFallbackEnabled,
+    const String &hotspotPassword,
+    int hotspotHidden,
     bool writeToSd,
     String &error
 );
