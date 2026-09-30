@@ -24,8 +24,23 @@ void streamerStop();
 // The settings page itself remains in webconfig.cpp so it shares the normal UI.
 void streamerRegisterWebRoutes(WebServer &server);
 
+// Optional internal observer for the exact cached JPEG served by
+// streamerSendSnapshot(). The pointer is valid only for the duration of the
+// callback and must not be retained. This lets WebConfig diagnostics consume
+// the shared streamer frame without introducing another camera owner.
+using StreamerSnapshotObserver = void (*)(
+    const uint8_t *jpeg,
+    size_t len,
+    uint16_t width,
+    uint16_t height
+);
+
 // Sends the most recently captured JPEG without taking a second camera frame.
-bool streamerSendSnapshot(WebServer &server);
+// If supplied, observer is called after a successful send with that same JPEG.
+bool streamerSendSnapshot(
+    WebServer &server,
+    StreamerSnapshotObserver observer = nullptr
+);
 
 // WebConfig camera preview is an internal consumer of the existing streamer
 // capture pipeline. It never owns the camera itself; these hooks only raise or

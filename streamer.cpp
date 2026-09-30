@@ -208,6 +208,8 @@ static uint32_t snapshotLastMs = 0;
 static uint8_t *snapshotBuffer = nullptr;
 static size_t snapshotCapacity = 0;
 static size_t snapshotBytes = 0;
+static uint16_t snapshotWidth = 0;
+static uint16_t snapshotHeight = 0;
 // Internal WebConfig preview demand expires automatically if a browser tab is
 // closed or disappears without sending /preview_stop. Snapshot polling normally
 // refreshes this timestamp every ~200 ms.
@@ -1438,7 +1440,12 @@ static void sendHttpFrame(const uint8_t *jpeg, size_t len)
     }
 }
 
-static void cacheSnapshot(const uint8_t *jpeg, size_t len)
+static void cacheSnapshot(
+    const uint8_t *jpeg,
+    size_t len,
+    uint16_t width,
+    uint16_t height
+)
 {
     if (!jpeg || !len)
         return;
@@ -1459,6 +1466,8 @@ static void cacheSnapshot(const uint8_t *jpeg, size_t len)
 
     memcpy(snapshotBuffer, jpeg, len);
     snapshotBytes = len;
+    snapshotWidth = width;
+    snapshotHeight = height;
 }
 
 
@@ -1516,6 +1525,8 @@ static bool recoverStreamerCamera(const String &reason)
         consecutiveCaptureFailures = 0;
         lastFrameDueMs = 0;
         snapshotBytes = 0;
+        snapshotWidth = 0;
+        snapshotHeight = 0;
         snapshotLastMs = 0;
         lastSuccessfulFrameMs = millis();
         lastError = "";
@@ -2119,7 +2130,12 @@ static void captureAndDistributeFrame()
         // Stamp every captured JPEG from the real monotonic 90-kHz RTP clock.
         // All RTSP clients sharing this camera frame receive the same timestamp.
         videoTimestamp = videoTimestampForNow();
-        cacheSnapshot(frame->buf, frame->len);
+        cacheSnapshot(
+            frame->buf,
+            frame->len,
+            (uint16_t)frame->width,
+            (uint16_t)frame->height
+        );
         snapshotLastMs = millis();
         if (needRtsp) {
             for (uint8_t i = 0; i < RTSP_CLIENT_SLOTS; ++i) {
@@ -2553,6 +2569,8 @@ void streamerStop()
     started = false;
     persistHealthCounters(false);
     snapshotBytes = 0;
+    snapshotWidth = 0;
+    snapshotHeight = 0;
     previewDemandLastMs = 0;
     if (snapshotBuffer) {
         free(snapshotBuffer);
@@ -2571,7 +2589,10 @@ void streamerRegisterWebRoutes(WebServer &server)
     server.on("/streamer_stress_stop", HTTP_POST, handleStreamerStressStop);
 }
 
-bool streamerSendSnapshot(WebServer &server)
+bool streamerSendSnapshot(
+    WebServer &server,
+    StreamerSnapshotObserver observer
+)
 {
     if (!streamerModeEnabled() || !started || !snapshotBuffer || !snapshotBytes) {
         server.send(503, "text/plain; charset=utf-8", "No streamer frame is available yet");
@@ -2581,7 +2602,17 @@ bool streamerSendSnapshot(WebServer &server)
     server.sendHeader("Cache-Control", "no-store");
     server.setContentLength(snapshotBytes);
     server.send(200, "image/jpeg", "");
-    return writeAll(server.client(), snapshotBuffer, snapshotBytes);
+
+    const bool sent = writeAll(server.client(), snapshotBuffer, snapshotBytes);
+    if (sent && observer) {
+        observer(
+            snapshotBuffer,
+            snapshotBytes,
+            snapshotWidth,
+            snapshotHeight
+        );
+    }
+    return sent;
 }
 
 void streamerNotePreviewActivity()

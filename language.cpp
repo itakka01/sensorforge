@@ -236,26 +236,26 @@ static const UiTextEntry UI_TEXTS[] = {
     {"Gespeicherte WLAN-, Hotspot- und Web-Passwörter sind in dieser Datei gerätegebunden als SFSEC1 verschlüsselt und nicht im Klartext enthalten.", "Stored Wi-Fi, hotspot and web passwords are device-bound and encrypted as SFSEC1 in this file; they are not stored in plaintext."}, // UI_CONFIG_SECRETS_DOWNLOAD_NOTE
     {"Bildbewegung", "Image motion"}, // UI_NAV_IMAGE_MOTION
     {"Bewegungserkennung im Bild", "Motion detection in the image"}, // UI_IMAGE_MOTION_TITLE
-    {"Hier stellst du die Bildbewegung ein und siehst live, ob sie anschlägt. Welche Quelle eine Aufnahme startet, wird separat unter Konfiguration > Aufnahme gewählt.", "Tune image motion here and see live whether it triggers. Which source starts a recording is selected separately under Configuration > Recording."}, // UI_IMAGE_MOTION_SUBTITLE
+    {"Hier stellst du ein, wie SensorForge Bewegung im Kamerabild erkennt. Die Vorschau zeigt live, ob die Erkennung anspricht. Welche Quelle tatsächlich eine Aufnahme starten darf, wird separat unter Konfiguration > Aufnahme festgelegt. Solange diese Seite geöffnet ist, ist die Live-Vorschau aktiv; neue automatische Aufnahmen werden deshalb aus Sicherheitsgründen blockiert. Die Analyse auf dieser Seite dient nur zum Einstellen und Testen und startet selbst keine Aufnahme.", "Configure here how SensorForge detects motion in the camera image. The preview shows live whether detection responds. Which source is actually allowed to start a recording is selected separately under Configuration > Recording. While this page is open, the live preview is active, so new automatic recordings are blocked for safety. Analysis on this page is only for setup and testing and does not start a recording itself."}, // UI_IMAGE_MOTION_SUBTITLE
     {"Bildanalyse verwenden", "Use image analysis"}, // UI_IMAGE_MOTION_ACTIVE
     {"Wann soll eine Aufnahme starten?", "When should a recording start?"}, // UI_IMAGE_MOTION_DECISION
     {"Direkt – Sensor startet Aufnahme sofort", "Direct – sensor starts recording immediately"}, // UI_IMAGE_MOTION_DIRECT
     {"Mit Bildbestätigung – Sensor + erkannte Bildbewegung", "With image verification – sensor + detected image motion"}, // UI_IMAGE_MOTION_VERIFY
     {"Empfindlichkeit (1–10)", "Sensitivity (1–10)"}, // UI_IMAGE_MOTION_SENSITIVITY
-    {"Mindestgröße der Bewegung (%)", "Minimum motion size (%)"}, // UI_IMAGE_MOTION_MIN_AREA
-    {"Bestätigung über mehrere Bilder", "Confirmation across multiple images"}, // UI_IMAGE_MOTION_CONFIRM
-    {"Bewegungsende nach ruhigen Bildern", "End motion after quiet images"}, // UI_IMAGE_MOTION_RELEASE
-    {"Anpassung an langsame Änderungen", "Adaptation to slow changes"}, // UI_IMAGE_MOTION_BG_LEARNING
-    {"Helligkeitssprung-Schwelle", "Brightness-jump threshold"}, // UI_IMAGE_MOTION_GLOBAL_MEAN
-    {"Großflächige Änderung ab (%)", "Large-area change from (%)"}, // UI_IMAGE_MOTION_GLOBAL_CHANGE
+    {"Mindestfläche (%)", "Minimum area (%)"}, // UI_IMAGE_MOTION_MIN_AREA
+    {"Bestätigung (Bilder)", "Confirmation (frames)"}, // UI_IMAGE_MOTION_CONFIRM
+    {"Ende nach Ruhe (Bilder)", "End after quiet frames"}, // UI_IMAGE_MOTION_RELEASE
+    {"Hintergrund-Anpassung", "Background adaptation"}, // UI_IMAGE_MOTION_BG_LEARNING
+    {"Lichtwechsel-Schwelle", "Lighting-change threshold"}, // UI_IMAGE_MOTION_GLOBAL_MEAN
+    {"Großflächige Änderung (%)", "Large-area change (%)"}, // UI_IMAGE_MOTION_GLOBAL_CHANGE
     {"Überwachungsbereich im Bild", "Monitored area in the image"}, // UI_IMAGE_MOTION_ROI
     {"Felder per Klick oder Ziehen ein- bzw. ausschalten.", "Click or drag over the image to enable or exclude grid cells."}, // UI_IMAGE_MOTION_ROI_HELP
     {"Gesamtes Bild überwachen", "Monitor entire image"}, // UI_IMAGE_MOTION_SELECT_ALL
     {"Gesamtes Bild ignorieren", "Ignore entire image"}, // UI_IMAGE_MOTION_CLEAR
     {"Invertieren", "Invert"}, // UI_IMAGE_MOTION_INVERT
     {"Einstellungen speichern", "Save settings"}, // UI_IMAGE_MOTION_SAVE
-    {"Bildanalyse jetzt testen", "Test image analysis now"}, // UI_IMAGE_MOTION_TEST
-    {"Referenzbild neu lernen", "Relearn reference image"}, // UI_IMAGE_MOTION_RESET_BG
+    {"Bildanalyse testen", "Test image analysis"}, // UI_IMAGE_MOTION_TEST
+    {"Hintergrund neu lernen", "Relearn background"}, // UI_IMAGE_MOTION_RESET_BG
     {"Testergebnis", "Test result"}, // UI_IMAGE_MOTION_DIAGNOSTICS
     {"Solange diese Seite geöffnet ist, sind neue automatische Aufnahmen gesperrt. Die Kameravorschau wird laufend analysiert, startet dabei aber keine Aufnahme.", "While this page is open, new automatic recordings are blocked. The camera preview is analyzed continuously but does not start a recording."}, // UI_IMAGE_MOTION_TEST_NOTE
     {"Bildbewegungs-Einstellungen gespeichert.", "Image-motion settings saved."}, // UI_IMAGE_MOTION_SAVED
@@ -278,25 +278,25 @@ static const UiTextEntry UI_TEXTS[] = {
     {"Setzt alle Felder und den Überwachungsbereich im Formular auf die SensorForge-Standardwerte zurück. Es wird noch nichts gespeichert; erst 'Einstellungen speichern' übernimmt die Werte dauerhaft.", "Resets all fields and the monitored area in the form to the SensorForge defaults. Nothing is saved yet; only Save settings stores the values permanently."}, // UI_IMAGE_MOTION_RESET_DEFAULTS_HELP
     {"Standardwerte wurden in das Formular eingesetzt. Zum Übernehmen bitte Einstellungen speichern.", "Default values were inserted into the form. Save settings to apply them."}, // UI_IMAGE_MOTION_RESET_DEFAULTS_DONE
     {"Analysiert die aktuelle Kameraszene mit den gespeicherten Einstellungen. Es wird keine Aufnahme gestartet. Das Ergebnis wird darunter in verständlicher Form angezeigt. Nach Änderungen an den Feldern zuerst speichern.", "Analyzes the current camera scene using the saved settings. No recording is started. The result is shown below in an understandable form. Save first after changing any fields."}, // UI_IMAGE_MOTION_TEST_HELP
-    {"Vergisst das bisher gelernte Referenzbild der ruhigen Szene. Sinnvoll, wenn die Kamera versetzt wurde oder sich die Umgebung dauerhaft verändert hat. Beim nächsten Test oder Sensortrigger wird die aktuelle Szene wieder als Referenz gelernt. Die Einstellungen selbst bleiben unverändert.", "Forgets the previously learned reference image of the quiet scene. Useful if the camera was moved or the environment changed permanently. On the next test or sensor trigger, the current scene is learned again as the reference. Settings themselves remain unchanged."}, // UI_IMAGE_MOTION_RESET_BG_HELP
-    {"Das bisherige Referenzbild wurde verworfen. Beim nächsten Test oder Sensortrigger wird die aktuelle Szene neu gelernt.", "The previous reference image was discarded. The current scene will be learned again on the next test or sensor trigger."}, // UI_IMAGE_MOTION_RESET_BG_DONE
+    {"Verwirft den bisher gelernten Hintergrund und lernt die aktuelle ruhige Szene neu. Sinnvoll nach einer Kameraverschiebung oder wenn sich die Umgebung dauerhaft verändert hat. Während des Lernens sollte sich im überwachten Bereich möglichst nichts bewegen. Die Einstellungen selbst bleiben unverändert.", "Discards the previously learned background and relearns the current quiet scene. Useful after moving the camera or when the environment has changed permanently. While learning, there should be as little motion as possible in the monitored area. Settings themselves remain unchanged."}, // UI_IMAGE_MOTION_RESET_BG_HELP
+    {"Der Hintergrund wird neu gelernt. Halte den überwachten Bereich kurz möglichst ruhig.", "The background is being relearned. Keep the monitored area as still as possible for a moment."}, // UI_IMAGE_MOTION_RESET_BG_DONE
     {"Hier erscheint nach einem Test zuerst eine einfache Aussage wie 'Bewegung erkannt' oder 'keine ausreichende Bewegung'. Technische Messwerte sind darunter optional aufklappbar.", "After a test, this first shows a simple result such as 'motion detected' or 'no sufficient motion'. Technical measurements can optionally be expanded below."}, // UI_IMAGE_MOTION_DIAGNOSTICS_HELP
-    {"Technische Diagnose anzeigen", "Show technical diagnostics"}, // UI_IMAGE_MOTION_TECH_DETAILS
+    {"Technische Details", "Technical details"}, // UI_IMAGE_MOTION_TECH_DETAILS
     {"Info", "Info"}, // UI_IMAGE_MOTION_INFO
     {"Schließen", "Close"}, // UI_IMAGE_MOTION_INFO_CLOSE
     {"Ergebnis", "Result"}, // UI_IMAGE_MOTION_RESULT_TITLE
     {"Bewegung erkannt – die Bildanalyse würde diesen Trigger bestätigen.", "Motion detected – image analysis would confirm this trigger."}, // UI_IMAGE_MOTION_RESULT_MOTION
     {"Keine ausreichende Bewegung erkannt.", "No sufficient motion detected."}, // UI_IMAGE_MOTION_RESULT_NONE
     {"Bildanalyse steht momentan nicht zur Verfügung.", "Image analysis is currently unavailable."}, // UI_IMAGE_MOTION_RESULT_DISABLED
-    {"Das Referenzbild wurde neu gelernt. Führe den Test erneut aus, während sich etwas im überwachten Bereich bewegt.", "The reference image was relearned. Run the test again while something moves in the monitored area."}, // UI_IMAGE_MOTION_RESULT_LEARNING
+    {"Der Hintergrund wird gerade gelernt. Halte den überwachten Bereich kurz möglichst ruhig und teste danach erneut.", "The background is currently being learned. Keep the monitored area as still as possible for a moment, then test again."}, // UI_IMAGE_MOTION_RESULT_LEARNING
     {"Eine Bildänderung wurde erkannt, aber noch nicht oft genug hintereinander bestätigt.", "An image change was detected but has not yet been confirmed in enough consecutive images."}, // UI_IMAGE_MOTION_RESULT_CONFIRMING
     {"Großflächiger Helligkeitswechsel erkannt. Er wurde bewusst nicht als Bewegung gewertet.", "Large-area brightness change detected. It was deliberately not treated as motion."}, // UI_IMAGE_MOTION_RESULT_GLOBAL_LIGHT
     {"Es ist kein Bildbereich zur Überwachung aktiviert. Markiere mindestens einen Bereich als aktiv und speichere die Einstellung.", "No image area is enabled for monitoring. Enable at least one area and save the setting."}, // UI_IMAGE_MOTION_RESULT_NO_ROI
     {"Die Bildanalyse konnte nicht korrekt ausgewertet werden. Siehe technische Diagnose.", "Image analysis could not be evaluated correctly. See technical diagnostics."}, // UI_IMAGE_MOTION_RESULT_ERROR
     {"Analysezeit", "Analysis time"}, // UI_IMAGE_MOTION_RESULT_TIME
-    {"Größte zusammenhängende Änderung", "Largest connected change"}, // UI_IMAGE_MOTION_RESULT_AREA
-    {"Eingestellte Mindestgröße", "Configured minimum size"}, // UI_IMAGE_MOTION_RESULT_LIMIT
-    {"Der Test verwendet die zuletzt gespeicherten Werte.", "The test uses the most recently saved values."}, // UI_IMAGE_MOTION_TEST_USES_SAVED
+    {"Erkannte Fläche", "Detected area"}, // UI_IMAGE_MOTION_RESULT_AREA
+    {"Auslösung ab", "Trigger from"}, // UI_IMAGE_MOTION_RESULT_LIMIT
+    {"Die Live-Erkennung verwendet die zuletzt gespeicherten Einstellungen. Aktuelle Bewegung zeigt die zusammenhängende Änderung zwischen den letzten analysierten Bildern. Abweichung vom Hintergrund zeigt die zusammenhängende Änderung gegenüber der gelernten ruhigen Szene. Damit ist erkennbar, ob sich gerade etwas bewegt oder ob die Szene nur weiterhin vom Hintergrund abweicht. Änderungen an Maske oder Werten werden erst nach Einstellungen speichern aktiv. Die Vorschau selbst startet keine Aufnahme.", "Live detection uses the most recently saved settings. Current motion shows the connected change between the most recently analyzed images. Background difference shows the connected change from the learned quiet scene. This makes it possible to distinguish current movement from a scene that still differs from the background. Changes to the mask or values only become active after Save settings. The preview itself does not start a recording."}, // UI_IMAGE_MOTION_TEST_USES_SAVED
     {"Aktueller Sensorstatus", "Current sensor status"}, // UI_MOTION_CURRENT_SENSOR_STATUS
     {"Radar-Auswertung", "Radar evaluation"}, // UI_MOTION_RADAR_EVALUATION
     {"Keine Bewegung", "No motion"}, // UI_MOTION_RADAR_EVALUATION_NONE
@@ -310,22 +310,22 @@ static const UiTextEntry UI_TEXTS[] = {
     {"Bildbewegung ist ausgeschaltet. Bildbasierte Aufnahmemodi sind damit momentan nicht aktiv; SensorForge verwendet bis zur Aktivierung den direkten Sensorpfad.", "Image motion is disabled. Image-based recording modes are currently inactive; SensorForge uses the direct sensor path until image motion is enabled."}, // UI_RECORDING_TRIGGER_IMAGE_DISABLED_WARNING
     {"Bildbewegung einstellen", "Configure image motion"}, // UI_RECORDING_TRIGGER_IMAGE_SETTINGS
     {"Live-Erkennung", "Live detection"}, // UI_IMAGE_MOTION_LIVE_TITLE
-    {"Bildbewegung", "Image motion"}, // UI_IMAGE_MOTION_LIVE_STATUS
+    {"Status", "Status"}, // UI_IMAGE_MOTION_LIVE_STATUS
     {"Bestätigung", "Confirmation"}, // UI_IMAGE_MOTION_LIVE_CONFIRMATION
     {"Bild insgesamt verändert", "Total image changed"}, // UI_IMAGE_MOTION_LIVE_CHANGED_AREA
     {"Aktuelle Bewegung", "Current motion"}, // UI_IMAGE_MOTION_LIVE_CURRENT_MOTION
     {"Abweichung vom Hintergrund", "Background difference"}, // UI_IMAGE_MOTION_LIVE_BACKGROUND_DIFFERENCE
     {"gesamt", "total"}, // UI_IMAGE_MOTION_LIVE_TOTAL_SHORT
     {"zusammenhängend", "connected"}, // UI_IMAGE_MOTION_LIVE_CONNECTED_SHORT
-    {"Letzte Erkennung", "Last detection"}, // UI_IMAGE_MOTION_LIVE_LAST_DETECTION
-    {"BEWEGUNG", "MOTION"}, // UI_IMAGE_MOTION_LIVE_DETECTED
+    {"Letzte Bewegung", "Last motion"}, // UI_IMAGE_MOTION_LIVE_LAST_DETECTION
+    {"BEWEGUNG ERKANNT", "MOTION DETECTED"}, // UI_IMAGE_MOTION_LIVE_DETECTED
     {"Keine Bewegung", "No motion"}, // UI_IMAGE_MOTION_LIVE_NONE
-    {"Referenz wird gelernt", "Learning reference"}, // UI_IMAGE_MOTION_LIVE_LEARNING
+    {"Hintergrund wird neu gelernt …", "Relearning background …"}, // UI_IMAGE_MOTION_LIVE_LEARNING
     {"Helligkeitswechsel ignoriert", "Brightness change ignored"}, // UI_IMAGE_MOTION_LIVE_GLOBAL_LIGHT
     {"Fehler", "Error"}, // UI_IMAGE_MOTION_LIVE_ERROR
-    {"Bestätigt", "Confirmed"}, // UI_IMAGE_MOTION_LIVE_CONFIRMED
+    {"Bewegung wird geprüft …", "Checking motion …"}, // UI_IMAGE_MOTION_LIVE_CONFIRMED
     {"noch keine", "none yet"}, // UI_IMAGE_MOTION_LIVE_NEVER
-    {"warte auf Daten", "waiting for data"}, // UI_IMAGE_MOTION_LIVE_WAITING
+    {"Warte auf Bildanalyse …", "Waiting for image analysis …"}, // UI_IMAGE_MOTION_LIVE_WAITING
     {"Nicht aktiv", "Inactive"}, // UI_IMAGE_MOTION_LIVE_INACTIVE
     {"Diagnose herunterladen", "Download diagnostics"}, // UI_IMAGE_MOTION_DIAG_DOWNLOAD
     {"RAM-Puffer; keine SD-/Hauptlog-Einträge", "RAM buffer; no SD/main-log writes"}, // UI_IMAGE_MOTION_DIAG_BUFFER

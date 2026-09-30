@@ -1,7 +1,49 @@
 SENSORFORGE / ESP32-S3 CAMERA (XIAO + FREENOVE)
 PROJEKTBESCHREIBUNG, RELEASESTAND UND WIEDEREINSTIEGSPROMPT
-Stand: 2026-09-30
-Dokumentrevision: v84 RELEASE - RTSP/Netzwerk-Streamer + Multi-WiFi/Fallback/UI-Refactor + zentrale Streamer-Preview + Kamera-Save/Crop-Konsolidierung + Thermal-/WiFi-Tuning
+Stand: 2026-10-01
+Dokumentrevision: v85 RELEASE - Image-Motion UI/Liveanalyse + Streamer-Frame-Analyse; v84 Streamer/Multi-WiFi/Kamera-Workflow bleibt Basis
+
+
+======================================================================
+V85 OFFIZIELLER RELEASE / ZWISCHENSTAND 2026-10-01
+======================================================================
+
+- SensorForge v85 ist mit Stand 2026-10-01 als neuer sauberer Release-/
+  Wiedereinstiegsstand festgeschrieben.
+- Release-ID: `v85`; Core-Version im Branding bleibt `7.1.0`.
+- v85 baut auf dem freigegebenen v84-Streamer-/Netzwerkstand auf und konsolidiert
+  vor allem die danach ueberarbeitete Bildbewegungs-/Image-Motion-Bedienung.
+- Image Motion verwendet nun dieselbe feste responsive Save-Leiste wie WiFi und
+  Kamera. ROI-/Maskenzeichnen, Parameter-Aenderungen und Standardwerte markieren
+  den Stand als ungespeichert; dauerhaft geschrieben wird weiterhin bewusst erst
+  ueber den zentralen Save-Button.
+- Die Image-Motion-Seite wurde fuer normale Benutzer deutlich reduziert:
+    * lange Erklaertexte liegen hinter Info-Buttons
+    * der alte separate Einmal-Test `Bildanalyse testen / Testergebnis` ist entfernt
+    * es gibt nur noch eine laufende Live-Erkennung plus eingeklappte technische
+      Diagnose
+- Die Live-Erkennung zeigt getrennt:
+    * `Aktuelle Bewegung` = zusammenhaengende Aenderung zwischen aufeinanderfolgenden
+      analysierten Bildern
+    * `Abweichung vom Hintergrund` = zusammenhaengende Aenderung zur gelernten
+      ruhigen Szene
+    * Ausloeseschwelle, Bestaetigungsfortschritt und letzte Bewegung
+- `Hintergrund neu lernen` ersetzt die technischere Referenzbild-Bezeichnung und
+  verwirft gezielt den gelernten Hintergrund. Die eigentliche Aufnahmeentscheidung
+  wurde dadurch nicht auf Frame-to-Frame-Motion umgestellt.
+- Im Streamer-Modus funktioniert die Image-Motion-Liveanalyse nun ebenfalls. Sie
+  analysiert den bereits vorhandenen zentralen Streamer-JPEG-Frame und startet
+  KEINEN zweiten `esp_camera_fb_get()`-/Kamera-Capture-Pfad. Kamera-Ownership des
+  Streamers bleibt damit erhalten.
+- Die Frame-to-Frame-Messung dient weiterhin Diagnose/Verstaendlichkeit. Die
+  produktive Image-Motion-Ausloesung verwendet unveraendert das bestehende
+  Hintergrund-/Connected-Area-/Confirm-/Release-Verfahren.
+- Die separat offene Recording-/Storage-Langzeitqualifikation sowie die bereits
+  dokumentierte abschliessende Image-Motion-Feldqualifikation bleiben eigene
+  offene Testpunkte und werden durch die v85-Versionierung nicht als abgeschlossen
+  behauptet.
+- Die folgenden v84-Abschnitte bleiben als vollstaendige Release- und
+  Entwicklungschronik erhalten.
 
 
 ======================================================================
@@ -157,7 +199,7 @@ V84-KANDIDAT - AUDIO-DRAIN BUILD-FIX 2026-09-29
   `std::max<size_t>(...)`. Damit ist die GCC-14-Template-Aufloesung bei
   gemischten `size_t`-/`uint32_t`-Operanden eindeutig.
 - Keine Aenderung am Laufzeitverhalten des Audio-Realtime-Drains.
-Aktueller freigegebener Release: v84 (separate XIAO-Recording-/Storage-Langzeitqualifikation weiterhin offen)
+Aktueller freigegebener Release: v85 (separate XIAO-Recording-/Storage-Langzeitqualifikation weiterhin offen)
 Produktname: SensorForge
 Plattformname: Fabric Node
 Core-Version im Branding: 7.1.0
@@ -413,16 +455,16 @@ AKTUELLER NACHTRAG 2026-09-30 - RTSP/AUDIO-LIVE-FEINSCHLIFF:
   langer Browserstream nicht den synchronen WebConfig-Server bzw. Thermal/RTSP/OTA.
 - Die neue Konfiguration defaultet auf `operating_mode=normal` sowie beide Streamer-
   Ausgaenge AUS. Alte v83-config.txt ohne diese Keys starten daher unveraendert normal.
-- `sensorforge_version.h` ist mit der Freigabe vom 2026-09-30 auf v84 gesetzt.
-  Die darunter dokumentierten Kandidaten- und Qualifikationsschritte bleiben als
-  historische Entwicklungsnotizen erhalten.
+- `sensorforge_version.h` ist mit dem aktuellen Zwischenstand vom 2026-10-01 auf
+  v85 gesetzt. Die darunter dokumentierten v84-Kandidaten- und Qualifikationsschritte
+  bleiben als historische Entwicklungsnotizen erhalten.
 
 
-- Letzter bestaetigter/freigegebener Arbeitsstand ist v84 vom 2026-09-30.
-- Fuer weitere Entwicklung ist der vollstaendige v84-Quellstand die autoritative
-  Basis. Temporäre aeltere v84-Kandidatenordner duerfen nicht als Ausgangspunkt
+- Letzter bestaetigter/freigegebener Arbeitsstand ist v85 vom 2026-10-01.
+- Fuer weitere Entwicklung ist der vollstaendige v85-Quellstand die autoritative
+  Basis. Temporäre aeltere v84-/v85-Arbeitsordner duerfen nicht als Ausgangspunkt
   verwendet werden.
-- Beim Wiedereinstieg den vollstaendigen v84-Stand verwenden und alle fuer die
+- Beim Wiedereinstieg den vollstaendigen v85-Stand verwenden und alle fuer die
   jeweilige Aenderung betroffenen Dateien erneut lesen.
 - Bestehende produktive SensorForge-Funktionalitaet hat absolute Prioritaet.
   Streaming darf den Normalbetrieb nicht veraendern, wenn der Streamer-Modus
@@ -5292,18 +5334,26 @@ Live-/WebConfig-Stand:
 - Livebild mit editierbarer Ueberwachungsmaske
 - KEINE rote Markierung = aktiv ueberwacht
 - ROETLICH markiert = von der Bildanalyse ignoriert
-- kompakter Statusblock mit laufender Anzeige des aktuellen Motion-Status
-- Download-Button fuer den RAM-Diagnoselog direkt im Statusblock
-- weniger ROI-Erklaertext im Livebereich
+- feste responsive Save-Leiste wie auf WiFi-/Kamera-Seiten; ROI und Parameter
+  werden nicht automatisch persistiert
+- kompakter laufender Live-Status mit `Aktuelle Bewegung`,
+  `Abweichung vom Hintergrund`, Ausloeseschwelle, Bestaetigung und letzter Bewegung
+- `Aktuelle Bewegung` ist die Frame-to-Frame-Messung; `Abweichung vom Hintergrund`
+  ist die Aenderung zur gelernten ruhigen Szene
+- `Hintergrund neu lernen` verwirft den gelernten Hintergrund, z.B. nach
+  Kameraversetzen oder dauerhafter Szenenaenderung
+- der alte Einmal-Test `Bildanalyse testen / Testergebnis` wurde entfernt; die
+  Seite testet ausschliesslich ueber die kontinuierliche Live-Erkennung
+- technische Rohwerte und Diagnose-Download liegen eingeklappt unter
+  `Technische Details`
+- lange Erklaertexte wurden aus der Hauptansicht in Info-Popups verschoben
 - Vorschau wurde fuer fluessigere Aktualisierung optimiert
 - Frischekontrolle verhindert, dass veraltete Analysewerte als aktuell erscheinen
+- im Streamer-Modus analysiert Image Motion den bereits vorhandenen zentralen
+  Streamer-JPEG-Frame; kein konkurrierender zweiter Kamera-Capture
 - auch das Haupt-Dashboard zeigt den aktuellen Bildbewegungsstatus
-- Parameter besitzen kurze Laien-Hilfetexte, Info-Popups und Standardwerte
 - "Standardwerte einsetzen" setzt nur das Formular zurueck; dauerhaft wird erst
   mit Speichern uebernommen
-- "Referenzbild neu lernen" verwirft den gelernten Hintergrund, z.B. nach
-  Kameraversetzen oder dauerhafter Szenenaenderung
-- "Bildanalyse jetzt testen" startet KEINE automatische Aufnahme
 
 Image-Motion-Diagnose:
 
@@ -5959,17 +6009,20 @@ Bildbewegung / Image Motion:
   image_motion_enabled mehr
 - Livebild mit editierbarer ROI-/Ueberwachungsmaske
 - rot markierte Bereiche werden ignoriert; nicht rot markierte ueberwacht
-- kompakter Live-Statusblock mit aktuellem Motion-Status und Diagnose-Download
+- feste Save-Leiste; Maske und Parameter werden bewusst gemeinsam gespeichert
+- kompakter Live-Status mit `Aktuelle Bewegung` (Frame-to-Frame) und
+  `Abweichung vom Hintergrund` sowie Ausloeseschwelle/Bestaetigung
+- `Hintergrund neu lernen` fuer eine neue ruhige Ausgangsszene
+- kein separater Einmal-Test mehr; kontinuierliche Live-Erkennung ist der
+  Benutzer-Testpfad
+- technische Diagnose und Download eingeklappt unter `Technische Details`
 - fluessigere Vorschau und Frischekontrolle fuer Analysewerte
-- laienverstaendliche Hilfetexte + Info-Popups + Standardwerte
-- Standardwerte ins Formular einsetzen
-- Referenzbild neu lernen
-- Bildanalyse testen, ohne dabei automatisch eine Aufnahme zu starten
-- Diagnose trennt Gesamtveraenderung, groesste zusammenhaengende Aenderung und
-  Schwellwert
+- laienverstaendliche kurze Hauptansicht; Details liegen in Info-Popups
+- im Streamer-Modus wird der zentrale Streamer-JPEG fuer die Liveanalyse
+  wiederverwendet, ohne zweiten Kamera-Capture
 - separater RAM-only Image-Motion-Diagnoselog mit bis zu 400 Frames
-- Frame-to-Frame-Bewegung wird zusaetzlich diagnostisch gemessen, beeinflusst die
-  Aufnahmeentscheidung derzeit aber noch nicht
+- Frame-to-Frame-Bewegung bleibt diagnostisch und beeinflusst die
+  Aufnahmeentscheidung derzeit nicht
 
 Aufnahmen:
 
@@ -7228,13 +7281,16 @@ etwa 29 Basiswert; die dynamische Reserve ist deutlich kleiner und wird aus
 kurzfristigem Frame-Jitter statt der Hintergrundabweichung gelernt. Als naechster
 Test ist vorgesehen, die Mindestflaeche auf etwa 2 Prozent zu reduzieren.
 
-WebConfig besitzt eine Live-Bildbewegungsseite mit ROI, kompaktem Statusblock,
-Diagnose-Download, fluessigerer Vorschau und Frischekontrolle. Auch das Dashboard
-zeigt den Image-Motion-Status. Die Diagnose trennt Gesamtveraenderung, groesste
-zusammenhaengende Aenderung und Schwellwert. Ein RAM-only Ringpuffer speichert bis
-zu 400 Frames. Zusaetzlich wird echte Frame-to-Frame-Bewegung gemessen und damit
-von der Abweichung zum Hintergrund getrennt; diese Messung ist derzeit nur
-Diagnose und beeinflusst die Aufnahmeentscheidung noch nicht.
+WebConfig besitzt eine kompakte Live-Bildbewegungsseite mit ROI und derselben
+festen Save-Leiste wie WiFi/Kamera. Die laufende Anzeige trennt `Aktuelle Bewegung`
+(Frame-to-Frame) und `Abweichung vom Hintergrund` und zeigt zusaetzlich Schwelle,
+Bestaetigung und letzte Bewegung. `Hintergrund neu lernen` setzt die ruhige
+Ausgangsszene neu; der alte separate Einmal-Test wurde entfernt. Technische Rohwerte
+und Diagnose-Download liegen unter `Technische Details`. Ein RAM-only Ringpuffer
+speichert bis zu 400 Frames. Im Streamer-Modus wird fuer die Liveanalyse der bereits
+vorhandene zentrale Streamer-JPEG verwendet; kein zweiter Kamera-Capture wird
+gestartet. Die Frame-to-Frame-Messung bleibt derzeit Diagnose und beeinflusst die
+Aufnahmeentscheidung noch nicht.
 
 WICHTIG: Der Bildanalysepfad ist funktional, aber NOCH NICHT abschliessend im
 Feld getestet. image_verify und image_only weiter auf Erkennungsqualitaet,

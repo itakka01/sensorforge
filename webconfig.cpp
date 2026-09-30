@@ -7994,8 +7994,10 @@ static void handleImageMotionPage()
 {
     String html = htmlHeader();
 
-    html += "<h2>" + htmlText(UI_IMAGE_MOTION_TITLE) + "</h2>";
-    html += "<p class='muted'>" + htmlText(UI_IMAGE_MOTION_SUBTITLE) + "</p>";
+    html += "<div style='display:flex;align-items:center;gap:7px;flex-wrap:wrap'><h2 style='margin-right:0'>" +
+        htmlText(UI_IMAGE_MOTION_TITLE) + "</h2>" +
+        imageMotionInfoButton(UI_IMAGE_MOTION_TITLE, UI_IMAGE_MOTION_SUBTITLE) +
+        "</div>";
 
     if (recorderIsOpen()) {
         stopCameraPreview();
@@ -8016,32 +8018,38 @@ static void handleImageMotionPage()
 
         html += R"HTML(
 <style>
-.im-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:12px 0}.im-card{border:1px solid #d7dde5;border-radius:10px;padding:14px;background:#fff}.im-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.im-field{border:1px solid #e5e7eb;border-radius:8px;padding:10px;background:#fafbfc}.im-label-row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}.im-label-row label{font-weight:600}.im-help{font-size:.86rem;line-height:1.35;color:#5f6b7a;margin-top:6px}.im-info{flex:0 0 auto;width:26px;height:26px;padding:0;border-radius:50%;font-weight:700;line-height:24px}.im-stage{position:relative;display:inline-block;max-width:100%;touch-action:none}.im-stage img{display:block;max-width:100%;height:auto}.im-stage canvas{position:absolute;inset:0;width:100%;height:100%;cursor:crosshair;touch-action:none}.im-actions{display:flex;flex-wrap:wrap;gap:8px;margin:9px 0}.im-legend{display:flex;flex-wrap:wrap;gap:10px;margin:0 0 8px}.im-legend span{display:inline-flex;align-items:center;gap:6px;font-size:.86rem}.im-roi-hint{font-size:.84rem;line-height:1.25;margin:5px 0 8px}.im-swatch{width:18px;height:14px;border:1px solid #9ca3af;border-radius:3px;background:#fff}.im-swatch.excluded{background:rgba(220,38,38,.35)}.im-result{border:1px solid #d7dde5;border-radius:8px;padding:12px;background:#f8fafc;margin:10px 0}.im-result-title{font-weight:700;margin-bottom:6px}.im-result-text{font-size:1rem;margin-bottom:8px}.im-result-meta{display:flex;flex-wrap:wrap;gap:8px 16px;font-size:.88rem;color:#4b5563}.im-live-card{margin:10px 0;padding:10px 12px}.im-live-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:7px}.im-live-title{display:flex;align-items:center;gap:7px}.im-live-head h3{margin:0}.im-live-pulse{font-size:.72rem;line-height:1;opacity:.22;transition:opacity .08s}.im-live-pulse.tick{opacity:1}.im-live-tools{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;font-size:.84rem}.im-live-tools button{padding:6px 10px;margin:0}.im-live-grid{display:grid;grid-template-columns:minmax(205px,38%) minmax(0,1fr);gap:5px 14px;align-items:center;line-height:1.25}.im-live-label{font-weight:700;white-space:normal;overflow-wrap:anywhere}.im-live-value{min-width:0;min-height:1.25em;overflow-wrap:anywhere}.im-diag{white-space:pre-wrap;overflow-wrap:anywhere;background:#111827;color:#e5e7eb;padding:12px;border-radius:8px;min-height:100px;font-family:monospace;font-size:.82rem}.im-details{margin-top:10px}.im-details summary{cursor:pointer;font-weight:600}.im-modal-backdrop{position:fixed;inset:0;background:rgba(15,23,42,.5);display:none;align-items:center;justify-content:center;padding:18px;z-index:10000}.im-modal-backdrop.open{display:flex}.im-modal{width:min(560px,100%);max-height:80vh;overflow:auto;background:#fff;border-radius:12px;padding:18px;box-shadow:0 18px 50px rgba(0,0,0,.25)}.im-modal h3{margin-top:0}.im-modal-actions{display:flex;justify-content:flex-end;margin-top:14px}@media(max-width:760px){.im-grid,.im-fields{grid-template-columns:1fr}.im-live-head{align-items:flex-start;flex-direction:column}.im-live-tools{justify-content:flex-start}.im-live-grid{grid-template-columns:minmax(145px,42%) minmax(0,1fr);gap:5px 10px}.im-live-label{margin-top:0}.im-live-value{padding-bottom:0}}@media(max-width:480px){.im-live-grid{grid-template-columns:1fr;gap:2px}.im-live-label{margin-top:5px}}
+.im-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:12px 0}.im-card{border:1px solid #d7dde5;border-radius:10px;padding:14px;background:#fff}.im-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.im-field{border:1px solid #e5e7eb;border-radius:8px;padding:10px;background:#fafbfc}.im-label-row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}.im-label-row label{font-weight:600}.im-info{flex:0 0 auto;width:26px;height:26px;padding:0;border-radius:50%;font-weight:700;line-height:24px}.im-stage{position:relative;display:inline-block;max-width:100%;touch-action:none}.im-stage img{display:block;max-width:100%;height:auto}.im-stage canvas{position:absolute;inset:0;width:100%;height:100%;cursor:crosshair;touch-action:none}.im-actions{display:flex;flex-wrap:wrap;gap:8px;margin:9px 0}.im-legend{display:flex;flex-wrap:wrap;gap:10px;margin:0 0 8px}.im-legend span{display:inline-flex;align-items:center;gap:6px;font-size:.86rem}.im-swatch{width:18px;height:14px;border:1px solid #9ca3af;border-radius:3px;background:#fff}.im-swatch.excluded{background:rgba(220,38,38,.35)}.im-result{border:1px solid #d7dde5;border-radius:8px;padding:12px;background:#f8fafc;margin:10px 0}.im-result-title{font-weight:700;margin-bottom:6px}.im-result-text{font-size:1rem;margin-bottom:8px}.im-result-meta{display:flex;flex-wrap:wrap;gap:8px 16px;font-size:.88rem;color:#4b5563}.im-live-card{margin:10px 0;padding:10px 12px}.im-live-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:7px}.im-live-title{display:flex;align-items:center;gap:7px}.im-live-head h3{margin:0}.im-live-pulse{font-size:.72rem;line-height:1;opacity:.22;transition:opacity .08s}.im-live-pulse.tick{opacity:1}.im-live-tools{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;font-size:.84rem}.im-live-tools button{padding:6px 10px;margin:0}.im-live-grid{display:grid;grid-template-columns:minmax(205px,38%) minmax(0,1fr);gap:5px 14px;align-items:center;line-height:1.25}.im-live-label{font-weight:700;white-space:normal;overflow-wrap:anywhere}.im-live-value{min-width:0;min-height:1.25em;overflow-wrap:anywhere}.im-diag{white-space:pre-wrap;overflow-wrap:anywhere;background:#111827;color:#e5e7eb;padding:12px;border-radius:8px;min-height:100px;font-family:monospace;font-size:.82rem}.im-details{margin-top:10px}.im-details summary{cursor:pointer;font-weight:600}.im-modal-backdrop{position:fixed;inset:0;background:rgba(15,23,42,.5);display:none;align-items:center;justify-content:center;padding:18px;z-index:10000}.im-modal-backdrop.open{display:flex}.im-modal{width:min(560px,100%);max-height:80vh;overflow:auto;background:#fff;border-radius:12px;padding:18px;box-shadow:0 18px 50px rgba(0,0,0,.25)}.im-modal h3{margin-top:0}.im-modal-actions{display:flex;justify-content:flex-end;margin-top:14px}@media(max-width:760px){.im-grid,.im-fields{grid-template-columns:1fr}.im-live-head{align-items:flex-start;flex-direction:column}.im-live-tools{justify-content:flex-start}.im-live-grid{grid-template-columns:minmax(145px,42%) minmax(0,1fr);gap:5px 10px}.im-live-label{margin-top:0}.im-live-value{padding-bottom:0}}@media(max-width:480px){.im-live-grid{grid-template-columns:1fr;gap:2px}.im-live-label{margin-top:5px}}
 </style>
 )HTML";
 
-        html += "<div class='flash-notice' style='border-left-color:var(--accent);background:#eef4ff'><strong>" +
-            htmlText(UI_IMAGE_MOTION_TEST_NOTE) + "</strong></div>";
-
         html += "<div class='im-card im-live-card'><div class='im-live-head'><div class='im-live-title'><h3>" +
             htmlText(UI_IMAGE_MOTION_LIVE_TITLE) +
-            "</h3><span id='imLivePulse' class='im-live-pulse' aria-hidden='true'>●</span></div><div class='im-live-tools'><span class='muted'>RAM <b id='imDiagBufferStatus'>0 / " + String(imageMotionDiagnosticCapacity()) + "</b></span>" +
-            "<a href='/image_motion_diag_download'><button type='button'>" + htmlText(UI_IMAGE_MOTION_DIAG_DOWNLOAD) + "</button></a></div></div><div class='im-live-grid'>" +
+            "</h3>" + imageMotionInfoButton(UI_IMAGE_MOTION_LIVE_TITLE, UI_IMAGE_MOTION_TEST_USES_SAVED) +
+            "<span id='imLivePulse' class='im-live-pulse' aria-hidden='true'>●</span></div></div><div class='im-live-grid'>" +
             "<div class='im-live-label'>" + htmlText(UI_IMAGE_MOTION_LIVE_STATUS) + "</div>" +
             "<div class='im-live-value'><span id='imLiveState' class='status-pill warn'>" + htmlText(UI_IMAGE_MOTION_LIVE_WAITING) + "</span></div>" +
-            "<div class='im-live-label'>" + htmlText(UI_IMAGE_MOTION_LIVE_CONFIRMATION) + "</div>" +
-            "<div id='imLiveConfirm' class='im-live-value'>0 / " + String(cfg_image_motion_confirm_frames) + "</div>" +
             "<div class='im-live-label'>" + htmlText(UI_IMAGE_MOTION_LIVE_CURRENT_MOTION) + "</div>" +
             "<div id='imLiveFrameMotion' class='im-live-value'>-</div>" +
             "<div class='im-live-label'>" + htmlText(UI_IMAGE_MOTION_LIVE_BACKGROUND_DIFFERENCE) + "</div>" +
-            "<div id='imLiveBackground' class='im-live-value'>0.0 %</div>" +
+            "<div id='imLiveBackground' class='im-live-value'>-</div>" +
             "<div class='im-live-label'>" + htmlText(UI_IMAGE_MOTION_RESULT_LIMIT) + "</div>" +
             "<div id='imLiveLimit' class='im-live-value'>" + String(cfg_image_motion_min_area_pct) + " %</div>" +
+            "<div class='im-live-label'>" + htmlText(UI_IMAGE_MOTION_LIVE_CONFIRMATION) + "</div>" +
+            "<div id='imLiveConfirm' class='im-live-value'>0 / " + String(cfg_image_motion_confirm_frames) + "</div>" +
             "<div class='im-live-label'>" + htmlText(UI_IMAGE_MOTION_LIVE_LAST_DETECTION) + "</div>" +
             "<div id='imLiveLast' class='im-live-value'>" + htmlText(UI_IMAGE_MOTION_LIVE_NEVER) + "</div>" +
-            "</div></div>";
+            "</div><div class='im-actions'><button type='button' id='imResetBg'>" + htmlText(UI_IMAGE_MOTION_RESET_BG) +
+            "</button>" + imageMotionInfoButton(UI_IMAGE_MOTION_RESET_BG, UI_IMAGE_MOTION_RESET_BG_HELP) + "</div>" +
+            "<div id='imStatus' class='muted'></div>" +
+            "<details class='im-details'><summary>" + htmlText(UI_IMAGE_MOTION_TECH_DETAILS) + "</summary>" +
+            "<div class='im-live-grid' style='margin-top:8px'><div class='im-live-label'>RAM</div><div id='imDiagBufferStatus' class='im-live-value'>0 / " + String(imageMotionDiagnosticCapacity()) + "</div></div>" +
+            "<div id='imDiag' class='im-diag' style='margin-top:8px'>-</div>" +
+            "<div class='im-actions'><a href='/image_motion_diag_download'><button type='button'>" + htmlText(UI_IMAGE_MOTION_DIAG_DOWNLOAD) + "</button></a></div></details></div>";
 
         html += "<div class='im-grid'><div class='im-card'>";
+
+        html += "<div class='im-label-row'><h3 style='margin:0'>" + htmlText(UI_IMAGE_MOTION_ROI) + "</h3>" +
+            imageMotionInfoButton(UI_IMAGE_MOTION_ROI, UI_IMAGE_MOTION_ROI_HELP) + "</div>";
 
         html += "<div class='im-legend'><span><i class='im-swatch'></i>" +
             htmlText(UI_IMAGE_MOTION_ROI_ACTIVE_LEGEND) +
@@ -8052,7 +8060,6 @@ static void handleImageMotionPage()
         html += "<div class='im-stage' id='imStage'><img id='imImage' alt='" +
             htmlText(UI_IMAGE_MOTION_TITLE) +
             "'><canvas id='imCanvas'></canvas></div>";
-        html += "<p class='im-roi-hint muted'>" + htmlText(UI_IMAGE_MOTION_ROI_HELP) + "</p>";
         html += "<div class='im-actions'><button type='button' id='imAll'>" + htmlText(UI_IMAGE_MOTION_SELECT_ALL) +
             "</button><button type='button' id='imClear'>" + htmlText(UI_IMAGE_MOTION_CLEAR) +
             "</button><button type='button' id='imInvert'>" + htmlText(UI_IMAGE_MOTION_INVERT) + "</button></div></div>";
@@ -8062,52 +8069,42 @@ static void handleImageMotionPage()
         html += "<div class='im-field'><div class='im-label-row'><label for='imSensitivity'>" + htmlText(UI_IMAGE_MOTION_SENSITIVITY) + "</label>" +
             imageMotionInfoButton(UI_IMAGE_MOTION_SENSITIVITY, UI_IMAGE_MOTION_SENSITIVITY_HELP) +
             "</div><input id='imSensitivity' type='number' min='1' max='10' value='" + String(cfg_image_motion_sensitivity) +
-            "'><div class='im-help'>" + htmlText(UI_IMAGE_MOTION_SENSITIVITY_HELP) + "</div></div>";
+            "'></div>";
 
         html += "<div class='im-field'><div class='im-label-row'><label for='imMinArea'>" + htmlText(UI_IMAGE_MOTION_MIN_AREA) + "</label>" +
             imageMotionInfoButton(UI_IMAGE_MOTION_MIN_AREA, UI_IMAGE_MOTION_MIN_AREA_HELP) +
             "</div><input id='imMinArea' type='number' min='1' max='100' value='" + String(cfg_image_motion_min_area_pct) +
-            "'><div class='im-help'>" + htmlText(UI_IMAGE_MOTION_MIN_AREA_HELP) + "</div></div>";
+            "'></div>";
 
         html += "<div class='im-field'><div class='im-label-row'><label for='imConfirm'>" + htmlText(UI_IMAGE_MOTION_CONFIRM) + "</label>" +
             imageMotionInfoButton(UI_IMAGE_MOTION_CONFIRM, UI_IMAGE_MOTION_CONFIRM_HELP) +
             "</div><input id='imConfirm' type='number' min='1' max='6' value='" + String(cfg_image_motion_confirm_frames) +
-            "'><div class='im-help'>" + htmlText(UI_IMAGE_MOTION_CONFIRM_HELP) + "</div></div>";
+            "'></div>";
 
         html += "<div class='im-field'><div class='im-label-row'><label for='imRelease'>" + htmlText(UI_IMAGE_MOTION_RELEASE) + "</label>" +
             imageMotionInfoButton(UI_IMAGE_MOTION_RELEASE, UI_IMAGE_MOTION_RELEASE_HELP) +
             "</div><input id='imRelease' type='number' min='1' max='10' value='" + String(cfg_image_motion_release_frames) +
-            "'><div class='im-help'>" + htmlText(UI_IMAGE_MOTION_RELEASE_HELP) + "</div></div>";
+            "'></div>";
 
         html += "<div class='im-field'><div class='im-label-row'><label for='imLearning'>" + htmlText(UI_IMAGE_MOTION_BG_LEARNING) + "</label>" +
             imageMotionInfoButton(UI_IMAGE_MOTION_BG_LEARNING, UI_IMAGE_MOTION_BG_LEARNING_HELP) +
             "</div><input id='imLearning' type='number' min='1' max='64' value='" + String(cfg_image_motion_background_learning) +
-            "'><div class='im-help'>" + htmlText(UI_IMAGE_MOTION_BG_LEARNING_HELP) + "</div></div>";
+            "'></div>";
 
         html += "<div class='im-field'><div class='im-label-row'><label for='imGlobalMean'>" + htmlText(UI_IMAGE_MOTION_GLOBAL_MEAN) + "</label>" +
             imageMotionInfoButton(UI_IMAGE_MOTION_GLOBAL_MEAN, UI_IMAGE_MOTION_GLOBAL_MEAN_HELP) +
             "</div><input id='imGlobalMean' type='number' min='5' max='100' value='" + String(cfg_image_motion_global_mean_delta) +
-            "'><div class='im-help'>" + htmlText(UI_IMAGE_MOTION_GLOBAL_MEAN_HELP) + "</div></div>";
+            "'></div>";
 
         html += "<div class='im-field'><div class='im-label-row'><label for='imGlobalChange'>" + htmlText(UI_IMAGE_MOTION_GLOBAL_CHANGE) + "</label>" +
             imageMotionInfoButton(UI_IMAGE_MOTION_GLOBAL_CHANGE, UI_IMAGE_MOTION_GLOBAL_CHANGE_HELP) +
             "</div><input id='imGlobalChange' type='number' min='20' max='100' value='" + String(cfg_image_motion_global_change_pct) +
-            "'><div class='im-help'>" + htmlText(UI_IMAGE_MOTION_GLOBAL_CHANGE_HELP) + "</div></div>";
+            "'></div>";
 
         html += "</div><div class='im-actions'><button type='button' id='imDefaults'>" + htmlText(UI_IMAGE_MOTION_RESET_DEFAULTS) +
             "</button>" + imageMotionInfoButton(UI_IMAGE_MOTION_RESET_DEFAULTS, UI_IMAGE_MOTION_RESET_DEFAULTS_HELP) + "</div>";
 
-        html += "<div class='im-card' style='margin-top:14px'><h3>" + htmlText(UI_IMAGE_MOTION_TEST) + "</h3><p class='muted'>" +
-            htmlText(UI_IMAGE_MOTION_TEST_HELP) + " <strong>" + htmlText(UI_IMAGE_MOTION_TEST_USES_SAVED) + "</strong></p>";
-        html += "<div class='im-actions'><button type='button' id='imTest'>" + htmlText(UI_IMAGE_MOTION_TEST) +
-            "</button>" + imageMotionInfoButton(UI_IMAGE_MOTION_TEST, UI_IMAGE_MOTION_TEST_HELP) +
-            "<button type='button' id='imResetBg'>" + htmlText(UI_IMAGE_MOTION_RESET_BG) +
-            "</button>" + imageMotionInfoButton(UI_IMAGE_MOTION_RESET_BG, UI_IMAGE_MOTION_RESET_BG_HELP) + "</div>";
-        html += "<div id='imStatus' class='muted'></div><h3>" + htmlText(UI_IMAGE_MOTION_DIAGNOSTICS) + "</h3><p class='muted'>" +
-            htmlText(UI_IMAGE_MOTION_DIAGNOSTICS_HELP) + "</p><div class='im-result'><div class='im-result-title'>" +
-            htmlText(UI_IMAGE_MOTION_RESULT_TITLE) + "</div><div id='imResultText' class='im-result-text'>-</div><div id='imResultMeta' class='im-result-meta'></div></div>";
-        html += "<details class='im-details'><summary>" + htmlText(UI_IMAGE_MOTION_TECH_DETAILS) +
-            "</summary><div id='imDiag' class='im-diag'>-</div></details></div></div></div>";
+        html += "</div></div>";
 
         html +=
             "<div class='floating-save-space'></div>"
@@ -8148,7 +8145,8 @@ static void handleImageMotionPage()
             "\",liveLearning:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_LEARNING))) +
             "\",liveGlobalLight:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_GLOBAL_LIGHT))) +
             "\",liveError:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_ERROR))) +
-            "\",liveConfirmed:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_CONFIRMED))) +
+            "\",liveChecking:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_CONFIRMED))) +
+            "\",images:\"" + imageMotionJsonEscape(String(tr(UI_IMAGES))) +
             "\",liveNever:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_NEVER))) +
             "\",liveWaiting:\"" + imageMotionJsonEscape(String(tr(UI_IMAGE_MOTION_LIVE_WAITING))) +
             "\",ago:\"" + imageMotionJsonEscape(String(tr(UI_MOTION_AGO))) +
@@ -8156,7 +8154,7 @@ static void handleImageMotionPage()
 
         html += R"JS(
 const imImage=document.getElementById('imImage'),imCanvas=document.getElementById('imCanvas'),imCtx=imCanvas.getContext('2d');
-const imStatus=document.getElementById('imStatus'),imDiag=document.getElementById('imDiag'),imResultText=document.getElementById('imResultText'),imResultMeta=document.getElementById('imResultMeta'),imDiagBufferStatus=document.getElementById('imDiagBufferStatus');
+const imStatus=document.getElementById('imStatus'),imDiag=document.getElementById('imDiag'),imDiagBufferStatus=document.getElementById('imDiagBufferStatus');
 const imLiveState=document.getElementById('imLiveState'),imLiveConfirm=document.getElementById('imLiveConfirm'),imLiveFrameMotion=document.getElementById('imLiveFrameMotion'),imLiveBackground=document.getElementById('imLiveBackground'),imLiveLimit=document.getElementById('imLiveLimit'),imLiveLast=document.getElementById('imLiveLast'),imLivePulse=document.getElementById('imLivePulse');
 const imInfoBackdrop=document.getElementById('imInfoBackdrop'),imInfoTitle=document.getElementById('imInfoTitle'),imInfoBody=document.getElementById('imInfoBody');
 const imSaveBar=document.getElementById('imageMotionSaveBar'),imSaveState=document.getElementById('imageMotionSaveState'),imSaveButton=document.getElementById('imageMotionSaveButton');
@@ -8176,10 +8174,10 @@ document.getElementById('imAll').onclick=()=>{const a=new Array(38).fill(255);a[
 document.getElementById('imClear').onclick=()=>{setMaskBytes(new Array(38).fill(0));markImageMotionDirty();drawGrid()};
 document.getElementById('imInvert').onclick=()=>{const a=maskBytes().map(v=>(~v)&255);a[37]&=15;setMaskBytes(a);markImageMotionDirty();drawGrid()};
 function liveAgeText(valid,ms){if(!valid)return IM_TEXT.liveNever;ms=Math.max(0,Number(ms)||0);let v='';if(ms<1000)v='<1 s';else if(ms<60000)v=Math.floor(ms/1000)+' s';else{const sec=Math.floor(ms/1000),min=Math.floor(sec/60),rest=sec%60;v=min+' min '+rest+' s'}return IM_TEXT.ago+(IM_TEXT.ago?' ':'')+v+IM_TEXT.agoSuffix}
-function liveStateText(d){if(d.motion_active||d.image_motion_state==='confirmed')return IM_TEXT.liveDetected;if(d.image_motion_state==='background_init')return IM_TEXT.liveLearning;if(d.image_motion_state==='global_change')return IM_TEXT.liveGlobalLight;if(d.image_motion_state==='error')return IM_TEXT.liveError;return IM_TEXT.liveNone}
+function liveStateText(d,current,required){if(d.motion_active||d.image_motion_state==='confirmed')return IM_TEXT.liveDetected;if(d.image_motion_state==='candidate')return IM_TEXT.liveChecking+' '+Math.min(current,required)+' / '+required;if(d.image_motion_state==='background_init')return IM_TEXT.liveLearning;if(d.image_motion_state==='global_change')return IM_TEXT.liveGlobalLight;if(d.image_motion_state==='error')return IM_TEXT.liveError;return IM_TEXT.liveNone}
 let imLastAnalysisStamp=0,imLastAnalysisLocalMs=0,imStatusInFlight=false;
 function setLiveWaiting(clearValues){if(imLivePulse)imLivePulse.classList.remove('tick');if(imLiveState){imLiveState.textContent=IM_TEXT.liveWaiting;imLiveState.classList.remove('danger','ok');imLiveState.classList.add('warn')}if(clearValues){if(imLiveConfirm)imLiveConfirm.textContent='-';if(imLiveFrameMotion)imLiveFrameMotion.textContent='-';if(imLiveBackground)imLiveBackground.textContent='-'}}
-function motionPair(total,cluster){return Number(total||0).toFixed(1)+' % '+IM_TEXT.liveTotalShort+' · '+Number(cluster||0).toFixed(1)+' % '+IM_TEXT.liveConnectedShort}function renderLive(payload){const d=(payload&&payload.diagnostics)||{};const stamp=Math.max(0,Number((payload&&payload.analysis_stamp_ms)||0)||0);const age=Math.max(0,Number(d.last_analysis_age_ms)||0);if(imLiveLimit)imLiveLimit.textContent=Number((payload&&payload.area_limit_pct)||imSavedMinArea).toFixed(1)+' %';if(imLiveLast)imLiveLast.textContent=liveAgeText(!!d.last_detection_valid,d.last_detection_age_ms);if(imDiagBufferStatus)imDiagBufferStatus.textContent=String(Number((payload&&payload.diag_count)||0))+' / '+String(Number((payload&&payload.diag_capacity)||0));if(!stamp||!d.last_analysis_valid||age>1500){setLiveWaiting(true);return}if(stamp===imLastAnalysisStamp){return}imLastAnalysisStamp=stamp;imLastAnalysisLocalMs=Date.now();if(imLivePulse){imLivePulse.classList.add('tick');setTimeout(()=>imLivePulse.classList.remove('tick'),180)}const required=Math.max(1,Number((payload&&payload.confirm_required)||0)||1);const current=Math.max(0,Number(d.confirm_counter)||0);if(imLiveState){imLiveState.textContent=liveStateText(d);imLiveState.classList.remove('danger','warn','ok');if(d.motion_active||d.image_motion_state==='confirmed')imLiveState.classList.add('danger');else if(d.image_motion_state==='candidate'||d.image_motion_state==='background_init'||d.image_motion_state==='global_change')imLiveState.classList.add('warn');else if(d.image_motion_state==='error')imLiveState.classList.add('danger');else imLiveState.classList.add('ok')}if(imLiveConfirm){imLiveConfirm.textContent=(d.motion_active||d.image_motion_state==='confirmed')?IM_TEXT.liveConfirmed+' ('+Math.min(required,Math.max(current,required))+' / '+required+')':Math.min(current,required)+' / '+required}if(imLiveFrameMotion){imLiveFrameMotion.textContent=d.frame_delta_ready?motionPair(d.frame_changed_pct,d.frame_cluster_pct):'-'}if(imLiveBackground){imLiveBackground.textContent=motionPair(d.global_change_pct,d.changed_area_pct)}imDiag.textContent=JSON.stringify(d,null,2)}
+function livePercent(v){return Number(v||0).toFixed(1)+' %'}function renderLive(payload){const d=(payload&&payload.diagnostics)||{};const stamp=Math.max(0,Number((payload&&payload.analysis_stamp_ms)||0)||0);const age=Math.max(0,Number(d.last_analysis_age_ms)||0);if(imLiveLimit)imLiveLimit.textContent=Number((payload&&payload.area_limit_pct)||imSavedMinArea).toFixed(1)+' %';if(imLiveLast)imLiveLast.textContent=liveAgeText(!!d.last_detection_valid,d.last_detection_age_ms);if(imDiagBufferStatus)imDiagBufferStatus.textContent=String(Number((payload&&payload.diag_count)||0))+' / '+String(Number((payload&&payload.diag_capacity)||0));if(!stamp||!d.last_analysis_valid||age>1500){setLiveWaiting(true);return}if(stamp===imLastAnalysisStamp){return}imLastAnalysisStamp=stamp;imLastAnalysisLocalMs=Date.now();if(imLivePulse){imLivePulse.classList.add('tick');setTimeout(()=>imLivePulse.classList.remove('tick'),180)}const required=Math.max(1,Number((payload&&payload.confirm_required)||0)||1);const current=Math.max(0,Number(d.confirm_counter)||0);if(imLiveState){imLiveState.textContent=liveStateText(d,current,required);imLiveState.classList.remove('danger','warn','ok');if(d.motion_active||d.image_motion_state==='confirmed')imLiveState.classList.add('danger');else if(d.image_motion_state==='candidate'||d.image_motion_state==='background_init'||d.image_motion_state==='global_change')imLiveState.classList.add('warn');else if(d.image_motion_state==='error')imLiveState.classList.add('danger');else imLiveState.classList.add('ok')}if(imLiveConfirm){const shown=(d.motion_active||d.image_motion_state==='confirmed')?required:Math.min(current,required);imLiveConfirm.textContent=shown+' / '+required+' '+IM_TEXT.images}if(imLiveFrameMotion)imLiveFrameMotion.textContent=d.frame_delta_ready?livePercent(d.frame_cluster_pct):'-';if(imLiveBackground)imLiveBackground.textContent=livePercent(d.changed_area_pct);imDiag.textContent=JSON.stringify(d,null,2)}
 async function pollLiveStatus(){if(imStatusInFlight||document.hidden)return;imStatusInFlight=true;try{const r=await fetch('/image_motion_status?t='+Date.now(),{cache:'no-store',credentials:'same-origin'});if(!r.ok)throw new Error();const j=await r.json();renderLive(j)}catch(e){setLiveWaiting(true)}finally{imStatusInFlight=false}}
 let imRefreshTimer=0,imFreshnessTimer=0;function scheduleRefresh(ms){clearTimeout(imRefreshTimer);imRefreshTimer=setTimeout(refresh,ms)}function scheduleFreshness(ms){clearTimeout(imFreshnessTimer);imFreshnessTimer=setTimeout(checkFreshness,ms)}function refresh(){if(document.hidden){scheduleRefresh(1000);return}imImage.src='/snapshot?im=1&t='+Date.now()}function checkFreshness(){if(!document.hidden&&imLastAnalysisLocalMs&&Date.now()-imLastAnalysisLocalMs>1600)setLiveWaiting(true);scheduleFreshness(300)}imImage.onload=()=>{drawGrid();pollLiveStatus();scheduleRefresh(200)};imImage.onerror=()=>{setLiveWaiting(true);scheduleRefresh(500)};window.addEventListener('resize',drawGrid);refresh();pollLiveStatus();scheduleFreshness(300);
 function params(){const p=new URLSearchParams();p.set('sensitivity',document.getElementById('imSensitivity').value);p.set('min_area',document.getElementById('imMinArea').value);p.set('confirm',document.getElementById('imConfirm').value);p.set('release',document.getElementById('imRelease').value);p.set('learning',document.getElementById('imLearning').value);p.set('global_mean',document.getElementById('imGlobalMean').value);p.set('global_change',document.getElementById('imGlobalChange').value);p.set('roi',imMask);return p}
@@ -8191,10 +8189,7 @@ function setDefaults(){document.getElementById('imSensitivity').value=IM_DEFAULT
 document.getElementById('imDefaults').onclick=setDefaults;
 ['imSensitivity','imMinArea','imConfirm','imRelease','imLearning','imGlobalMean','imGlobalChange'].forEach(id=>{const el=document.getElementById(id);if(el){el.addEventListener('input',markImageMotionDirty);el.addEventListener('change',markImageMotionDirty)}});
 if(imSaveButton)imSaveButton.onclick=async()=>{if(!imDirty)return;imSaveButton.disabled=true;if(imSaveState)imSaveState.textContent='Speichert …';imStatus.textContent='...';try{const r=await fetch('/image_motion_save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:params()});const j=await r.json();if(!r.ok||!j.ok)throw new Error(IM_TEXT.saveFailed+(j.error?': '+j.error:''));imSavedMinArea=parseInt(document.getElementById('imMinArea').value,10)||imSavedMinArea;markImageMotionSaved();imStatus.textContent=IM_TEXT.saved}catch(e){if(imSaveBar)imSaveBar.classList.add('dirty');if(imSaveState)imSaveState.textContent='Speichern fehlgeschlagen';imSaveButton.disabled=false;imStatus.textContent=e.message}};
-function friendlyResult(d){if(d.motion_active||d.image_motion_state==='confirmed')return IM_TEXT.resultMotion;switch(d.reject_reason){case'disabled':return IM_TEXT.resultDisabled;case'background_init':return IM_TEXT.resultLearning;case'confirming':return IM_TEXT.resultConfirming;case'global_light':return IM_TEXT.resultGlobalLight;case'no_roi':return IM_TEXT.resultNoRoi;case'decode':case'invalid_frame':return IM_TEXT.resultError;default:return IM_TEXT.resultNone}}
-function renderDiagnostics(d){imResultText.textContent=friendlyResult(d);const active=Math.max(0,Number(d.active_roi_blocks)||0),changed=Math.max(0,Number(d.changed_blocks)||0),cluster=Math.max(0,Number(d.largest_cluster_blocks)||0),frameChanged=Math.max(0,Number(d.frame_changed_blocks)||0),frameCluster=Math.max(0,Number(d.frame_largest_cluster_blocks)||0);const total=Number(d.global_change_pct||0).toFixed(1)+' %'+(active?' ('+changed+' / '+active+')':'');const area=Number(d.changed_area_pct||0).toFixed(1)+' %'+(cluster?' ('+cluster+')':'');const frameTotal=d.frame_delta_ready?(Number(d.frame_changed_pct||0).toFixed(1)+' %'+(active?' ('+frameChanged+' / '+active+')':'')):'-';const frameArea=d.frame_delta_ready?(Number(d.frame_cluster_pct||0).toFixed(1)+' %'+(frameCluster?' ('+frameCluster+')':'')):'-';const limit=imSavedMinArea+' %';imResultMeta.innerHTML='';[[IM_TEXT.resultTime,(d.analyze_frame_ms!==undefined?d.analyze_frame_ms:'-')+' ms'],[IM_TEXT.liveCurrentMotion,frameTotal+' / '+frameArea+' '+IM_TEXT.liveConnectedShort],[IM_TEXT.liveBackgroundDifference,total+' / '+area+' '+IM_TEXT.liveConnectedShort],[IM_TEXT.resultLimit,limit]].forEach(([k,v])=>{const span=document.createElement('span');span.textContent=k+': '+v;imResultMeta.appendChild(span)});imDiag.textContent=JSON.stringify(d,null,2)}
-document.getElementById('imTest').onclick=async()=>{imStatus.textContent='...';try{const r=await fetch('/image_motion_test',{method:'POST'}),j=await r.json();if(!r.ok||!j.ok)throw new Error(IM_TEXT.testFailed+(j.error?': '+j.error:''));renderDiagnostics(j.diagnostics||{});imStatus.textContent='OK'}catch(e){imResultText.textContent=IM_TEXT.resultError;imStatus.textContent=e.message}};
-document.getElementById('imResetBg').onclick=async()=>{imStatus.textContent='...';try{const r=await fetch('/image_motion_reset',{method:'POST'}),j=await r.json();if(!r.ok||!j.ok)throw new Error(IM_TEXT.testFailed);imResultText.textContent=IM_TEXT.resetBgDone;imResultMeta.textContent='';imDiag.textContent='-';imStatus.textContent=IM_TEXT.resetBgDone}catch(e){imStatus.textContent=e.message}};
+document.getElementById('imResetBg').onclick=async()=>{imStatus.textContent='...';if(imLiveState){imLiveState.textContent=IM_TEXT.liveLearning;imLiveState.classList.remove('danger','ok');imLiveState.classList.add('warn')}if(imLiveFrameMotion)imLiveFrameMotion.textContent='-';if(imLiveBackground)imLiveBackground.textContent='-';if(imLiveConfirm)imLiveConfirm.textContent='-';try{const r=await fetch('/image_motion_reset',{method:'POST'}),j=await r.json();if(!r.ok||!j.ok)throw new Error(IM_TEXT.testFailed);imLastAnalysisStamp=0;imLastAnalysisLocalMs=0;if(imDiag)imDiag.textContent='-';imStatus.textContent=IM_TEXT.resetBgDone}catch(e){imStatus.textContent=e.message}};
 function release(){fetch('/preview_stop?im=1',{method:'POST',keepalive:true}).catch(()=>{})}window.addEventListener('pagehide',release);document.addEventListener('visibilitychange',()=>{if(document.hidden){clearTimeout(imRefreshTimer);clearTimeout(imFreshnessTimer);release()}else{clearTimeout(imRefreshTimer);clearTimeout(imFreshnessTimer);imLastAnalysisStamp=0;imLastAnalysisLocalMs=0;refresh();pollLiveStatus();scheduleFreshness(300)}});
 )JS";
         html += "</script>";
@@ -9220,6 +9215,29 @@ update();
 }
 
 
+static void analyzeStreamerSnapshotForImageMotion(
+    const uint8_t *jpeg,
+    size_t len,
+    uint16_t width,
+    uint16_t height
+)
+{
+    if (!jpeg || !len || !width || !height)
+        return;
+
+    imageMotionPreviewLastAnalysisMs = millis();
+
+    ImageMotionDiagnostics diagnostics;
+    (void)imageMotionAnalyzeJpeg(
+        jpeg,
+        len,
+        width,
+        height,
+        diagnostics
+    );
+}
+
+
 static void handleSnapshot()
 {
     if (streamerModeEnabled()) {
@@ -9228,7 +9246,20 @@ static void handleSnapshot()
         // capture pipeline and serves its cached JPEG; no second camera owner is
         // introduced.
         streamerNotePreviewActivity();
-        streamerSendSnapshot(server);
+
+        StreamerSnapshotObserver observer = nullptr;
+        if (server.hasArg("im") && server.arg("im") == "1") {
+            const uint32_t nowMs = millis();
+            if (
+                imageMotionPreviewLastAnalysisMs == 0 ||
+                (uint32_t)(nowMs - imageMotionPreviewLastAnalysisMs) >=
+                    IMAGE_MOTION_PREVIEW_ANALYSIS_INTERVAL_MS
+            ) {
+                observer = analyzeStreamerSnapshotForImageMotion;
+            }
+        }
+
+        streamerSendSnapshot(server, observer);
         return;
     }
 

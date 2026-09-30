@@ -1,3 +1,14 @@
+## v85 — 2026-10-01
+
+- Promoted the current source tree to the official **v85** checkpoint. v84 remains the preceding streamer/network release baseline; v85 primarily consolidates the Image-Motion/WebConfig work completed afterwards.
+- Unified **Image Motion** with the fixed responsive save-bar interaction used by WiFi/camera settings. Drawing the ROI mask, changing parameters or inserting defaults now marks the page as having unsaved changes; persistence remains explicit rather than automatic.
+- Simplified the Image-Motion page for normal users. Long explanatory text moved behind info buttons, field labels were shortened, and the obsolete one-shot **Bildanalyse testen / Testergebnis** workflow was removed.
+- Reworked the live analysis into a single continuously updated status view showing **Aktuelle Bewegung** (frame-to-frame change), **Abweichung vom Hintergrund**, trigger threshold, confirmation progress and last motion. Technical/raw diagnostics remain available in a collapsed **Technische Details** section.
+- Renamed the background/reference reset action to the user-facing **Hintergrund neu lernen** and placed it directly with the live-analysis controls. This resets the learned background only; the recording decision algorithm is otherwise unchanged.
+- Fixed Image-Motion live analysis while operating in **streamer mode**: the analyzer now consumes the already captured central streamer JPEG frame instead of attempting a second camera capture. This preserves exclusive camera ownership and allows WebConfig live motion diagnostics in streamer mode.
+- The additional frame-to-frame measurement remains diagnostic only and does **not** change the existing Image-Motion recording-trigger decision, which continues to use the established background/connected-area/confirm-release logic.
+- The separately tracked Recording/Storage long-term qualification and the existing Image-Motion field-quality qualification remain open where previously documented. This release documentation does not claim an additional Arduino build performed in this environment.
+
 ## v84 — 2026-09-30
 
 - Promoted the complete v84 worktree to the official **v84** release. The detailed v84 candidate/development entries below remain as the implementation history for this release.
