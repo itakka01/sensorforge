@@ -5322,26 +5322,33 @@ static bool protectConfigSecretsForStorage(
                 if (configSecretFieldName(key)) {
                     String protectedValue = value;
 
-                    if (!configSecretIsEncrypted(value)) {
-                        String secretError;
+                    // Empty secret fields are valid (for example unused WiFi
+                    // profile slots). Keep them empty instead of passing a
+                    // zero-length plaintext through the ESP32-S3 PSA GCM
+                    // implementation, which rejects that call with
+                    // PSA_ERROR_INVALID_ARGUMENT (-135).
+                    if (value.length() > 0) {
+                        if (!configSecretIsEncrypted(value)) {
+                            String secretError;
 
-                        if (!configSecretEncrypt(
-                                key.c_str(),
-                                value,
-                                protectedValue,
-                                secretError
-                            )) {
-                            error =
-                                key +
-                                ": " +
-                                secretError;
-                            return false;
+                            if (!configSecretEncrypt(
+                                    key.c_str(),
+                                    value,
+                                    protectedValue,
+                                    secretError
+                                )) {
+                                error =
+                                    key +
+                                    ": " +
+                                    secretError;
+                                return false;
+                            }
+
+                            newlyEncryptedCount++;
                         }
 
-                        newlyEncryptedCount++;
+                        encryptedFieldCount++;
                     }
-
-                    encryptedFieldCount++;
 
                     if (commentMarker)
                         output += commentMarker;

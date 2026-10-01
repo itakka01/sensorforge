@@ -34,6 +34,10 @@ static bool fieldSupported(const char *fieldName)
 
     return
         strcmp(fieldName, "wifi_pass") == 0 ||
+        strcmp(fieldName, "wifi_pass_2") == 0 ||
+        strcmp(fieldName, "wifi_pass_3") == 0 ||
+        strcmp(fieldName, "wifi_pass_4") == 0 ||
+        strcmp(fieldName, "wifi_pass_5") == 0 ||
         strcmp(fieldName, "hotspot_password") == 0 ||
         strcmp(fieldName, "web_password") == 0;
 }
