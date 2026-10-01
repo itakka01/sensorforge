@@ -164,6 +164,8 @@ String cfg_camera_description = "";
 String cfg_timezone = "CET-1CEST,M3.5.0,M10.5.0/3";
 String cfg_wifi_on_system_start = "off";
 int cfg_wifi_timeout_sec = 0;
+int cfg_wifi_alive_schedule_enabled = 0;
+String cfg_wifi_alive_schedule = "";
 String cfg_wifi_ssid = "";
 String cfg_wifi_pass = "";
 String cfg_wifi_ssids[SENSORFORGE_WIFI_PROFILE_COUNT];
@@ -180,6 +182,10 @@ int cfg_web_recording_auto_pause = 1;
 String cfg_web_language = "de";
 String cfg_web_username = "admin";
 String cfg_web_password = "sensorforgeweb1234";
+String cfg_stream_usernames[SENSORFORGE_STREAM_USER_COUNT];
+String cfg_stream_passwords[SENSORFORGE_STREAM_USER_COUNT];
+int cfg_stream_allow_annotation_edit = 0;
+int cfg_stream_allow_delete = 0;
 
 String cfg_log_file = "/log.txt";
 
@@ -451,6 +457,123 @@ static void reconcilePendingTransportMode()
 // TEMPORARY PARSED VALUES
 // =============================================================
 
+bool configParseWifiAliveSchedule(
+    const String &value,
+    WifiAliveScheduleEntry entries[SENSORFORGE_WIFI_ALIVE_SCHEDULE_MAX_ENTRIES],
+    size_t &count,
+    String *error
+)
+{
+    count = 0;
+    if (error)
+        *error = "";
+
+    String text = value;
+    text.trim();
+
+    if (!text.length())
+        return true;
+
+    size_t start = 0;
+
+    while (start <= text.length()) {
+        int separator = text.indexOf(';', start);
+        size_t end = separator >= 0 ? (size_t)separator : text.length();
+
+        String token = text.substring(start, end);
+        token.trim();
+
+        if (!token.length()) {
+            if (error)
+                *error = "wifi_alive_schedule contains an empty entry";
+            return false;
+        }
+
+        if (count >= SENSORFORGE_WIFI_ALIVE_SCHEDULE_MAX_ENTRIES) {
+            if (error)
+                *error = "wifi_alive_schedule has too many entries";
+            return false;
+        }
+
+        int slash = token.indexOf('/');
+        if (slash != 5 || token.length() <= 6) {
+            if (error)
+                *error = "wifi_alive_schedule entry must be HH:MM/minutes";
+            return false;
+        }
+
+        if (
+            token.charAt(2) != ':' ||
+            !isDigit(token.charAt(0)) ||
+            !isDigit(token.charAt(1)) ||
+            !isDigit(token.charAt(3)) ||
+            !isDigit(token.charAt(4))
+        ) {
+            if (error)
+                *error = "wifi_alive_schedule time must be HH:MM";
+            return false;
+        }
+
+        const int hour =
+            (token.charAt(0) - '0') * 10 +
+            (token.charAt(1) - '0');
+        const int minute =
+            (token.charAt(3) - '0') * 10 +
+            (token.charAt(4) - '0');
+
+        if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+            if (error)
+                *error = "wifi_alive_schedule time out of range";
+            return false;
+        }
+
+        String durationText = token.substring((size_t)slash + 1);
+        durationText.trim();
+
+        if (!durationText.length()) {
+            if (error)
+                *error = "wifi_alive_schedule duration missing";
+            return false;
+        }
+
+        for (size_t i = 0; i < durationText.length(); ++i) {
+            if (!isDigit(durationText.charAt(i))) {
+                if (error)
+                    *error = "wifi_alive_schedule duration must be numeric";
+                return false;
+            }
+        }
+
+        const long duration = strtol(durationText.c_str(), nullptr, 10);
+        if (duration < 1 || duration > 1440) {
+            if (error)
+                *error = "wifi_alive_schedule duration out of range (1..1440 minutes)";
+            return false;
+        }
+
+        for (size_t i = 0; i < count; ++i) {
+            if (entries[i].startMinuteOfDay == (uint16_t)(hour * 60 + minute)) {
+                if (error)
+                    *error = "wifi_alive_schedule contains duplicate start times";
+                return false;
+            }
+        }
+
+        entries[count].startMinuteOfDay =
+            (uint16_t)(hour * 60 + minute);
+        entries[count].durationMinutes =
+            (uint16_t)duration;
+        ++count;
+
+        if (separator < 0)
+            break;
+
+        start = (size_t)separator + 1;
+    }
+
+    return true;
+}
+
 struct ConfigValues {
     String camera;
     String resolution;
@@ -532,6 +655,8 @@ struct ConfigValues {
 
     String wifiOnSystemStart;
     int wifiTimeoutSec;
+    int wifiAliveScheduleEnabled;
+    String wifiAliveSchedule;
     String hostname;
     String cameraDisplayName;
     String cameraLocation;
@@ -556,6 +681,10 @@ struct ConfigValues {
     String webLanguage;
     String webUsername;
     String webPassword;
+    String streamUsernames[SENSORFORGE_STREAM_USER_COUNT];
+    String streamPasswords[SENSORFORGE_STREAM_USER_COUNT];
+    int streamAllowAnnotationEdit;
+    int streamAllowDelete;
 
     int debugEnabled;
     String logFile;
@@ -644,6 +773,8 @@ struct ConfigSeen {
 
     bool wifiOnSystemStart;
     bool wifiTimeoutSec;
+    bool wifiAliveScheduleEnabled;
+    bool wifiAliveSchedule;
     bool hostname;
     bool cameraDisplayName;
     bool cameraLocation;
@@ -668,6 +799,10 @@ struct ConfigSeen {
     bool webLanguage;
     bool webUsername;
     bool webPassword;
+    bool streamUsernames[SENSORFORGE_STREAM_USER_COUNT];
+    bool streamPasswords[SENSORFORGE_STREAM_USER_COUNT];
+    bool streamAllowAnnotationEdit;
+    bool streamAllowDelete;
 
     bool debugEnabled;
     bool logFile;
@@ -914,6 +1049,12 @@ static ConfigValues makeDefaultValues()
     values.wifiTimeoutSec =
         0;
 
+    values.wifiAliveScheduleEnabled =
+        0;
+
+    values.wifiAliveSchedule =
+        "";
+
     values.hostname =
         makeDefaultHostnameFromBranding();
 
@@ -963,6 +1104,14 @@ static ConfigValues makeDefaultValues()
 
     values.webPassword =
         "sensorforgeweb1234";
+
+    for (size_t i = 0; i < SENSORFORGE_STREAM_USER_COUNT; ++i) {
+        values.streamUsernames[i] = "";
+        values.streamPasswords[i] = "";
+    }
+
+    values.streamAllowAnnotationEdit = 0;
+    values.streamAllowDelete = 0;
 
     values.debugEnabled =
         0;
@@ -1080,6 +1229,8 @@ static bool serializeConfigValues(
 
     APPEND_CONFIG_VALUE("wifi_on_system_start", values.wifiOnSystemStart);
     APPEND_CONFIG_VALUE("wifi_timeout_sec", String(values.wifiTimeoutSec));
+    APPEND_CONFIG_VALUE("wifi_alive_schedule_enabled", String(values.wifiAliveScheduleEnabled));
+    APPEND_CONFIG_VALUE("wifi_alive_schedule", values.wifiAliveSchedule);
     APPEND_CONFIG_VALUE("hostname", values.hostname);
     APPEND_CONFIG_VALUE("camera_display_name", values.cameraDisplayName);
     APPEND_CONFIG_VALUE("camera_location", values.cameraLocation);
@@ -1108,6 +1259,12 @@ static bool serializeConfigValues(
     APPEND_CONFIG_VALUE("web_language", values.webLanguage);
     APPEND_CONFIG_VALUE("web_username", values.webUsername);
     APPEND_CONFIG_VALUE("web_password", values.webPassword);
+    for (size_t i = 0; i < SENSORFORGE_STREAM_USER_COUNT; ++i) {
+        APPEND_CONFIG_VALUE((String("stream_username_") + String(i + 1)).c_str(), values.streamUsernames[i]);
+        APPEND_CONFIG_VALUE((String("stream_password_") + String(i + 1)).c_str(), values.streamPasswords[i]);
+    }
+    APPEND_CONFIG_VALUE("stream_allow_annotation_edit", String(values.streamAllowAnnotationEdit));
+    APPEND_CONFIG_VALUE("stream_allow_delete", String(values.streamAllowDelete));
 
     APPEND_CONFIG_VALUE("debug_enabled", String(values.debugEnabled));
     APPEND_CONFIG_VALUE("log_file", values.logFile);
@@ -1860,6 +2017,8 @@ static bool validateValues(
     values.webLanguage.toLowerCase();
 
     values.webUsername.trim();
+    for (size_t i = 0; i < SENSORFORGE_STREAM_USER_COUNT; ++i)
+        values.streamUsernames[i].trim();
 
     values.logFile.trim();
 
@@ -2740,6 +2899,32 @@ static bool validateValues(
         return false;
     }
 
+    if (
+        values.wifiAliveScheduleEnabled != 0 &&
+        values.wifiAliveScheduleEnabled != 1
+    ) {
+        error =
+            "wifi_alive_schedule_enabled must be 0 or 1";
+
+        return false;
+    }
+
+    {
+        WifiAliveScheduleEntry scheduleEntries[SENSORFORGE_WIFI_ALIVE_SCHEDULE_MAX_ENTRIES];
+        size_t scheduleCount = 0;
+        String scheduleError;
+
+        if (!configParseWifiAliveSchedule(
+                values.wifiAliveSchedule,
+                scheduleEntries,
+                scheduleCount,
+                &scheduleError
+            )) {
+            error = scheduleError;
+            return false;
+        }
+    }
+
 
     {
         int16_t txPowerX10 =
@@ -2865,6 +3050,49 @@ static bool validateValues(
             "web_password length must be 8..63";
 
         return false;
+    }
+
+    if ((values.streamAllowAnnotationEdit != 0 && values.streamAllowAnnotationEdit != 1) ||
+        (values.streamAllowDelete != 0 && values.streamAllowDelete != 1)) {
+        error = "streaming permissions must be 0 or 1";
+        return false;
+    }
+
+    for (size_t i = 0; i < SENSORFORGE_STREAM_USER_COUNT; ++i) {
+        String username = values.streamUsernames[i];
+        username.trim();
+
+        if (!username.length()) {
+            if (values.streamPasswords[i].length()) {
+                error = "stream_password_" + String(i + 1) + " set for empty streaming username";
+                return false;
+            }
+            continue;
+        }
+
+        if (username.length() > 32 || username.indexOf(':') >= 0) {
+            error = "stream_username_" + String(i + 1) + " must be 1..32 chars and must not contain ':'";
+            return false;
+        }
+
+        if (values.streamPasswords[i].length() < 8 || values.streamPasswords[i].length() > 63) {
+            error = "stream_password_" + String(i + 1) + " length must be 8..63";
+            return false;
+        }
+
+        if (username == values.webUsername) {
+            error = "streaming username must differ from administrator username";
+            return false;
+        }
+
+        for (size_t j = 0; j < i; ++j) {
+            String previous = values.streamUsernames[j];
+            previous.trim();
+            if (previous.length() && username == previous) {
+                error = "duplicate streaming username: " + username;
+                return false;
+            }
+        }
     }
 
 
@@ -4111,6 +4339,45 @@ static bool parseConfigText(
                     (int)numericValue;
 
             } else if (
+                key == "wifi_alive_schedule_enabled"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.wifiAliveScheduleEnabled,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid wifi_alive_schedule_enabled";
+
+                    return false;
+                }
+
+                values.wifiAliveScheduleEnabled =
+                    (int)numericValue;
+
+            } else if (
+                key == "wifi_alive_schedule"
+            ) {
+
+                if (!markOnce(
+                        seen.wifiAliveSchedule,
+                        key,
+                        error
+                    )) {
+                    return false;
+                }
+
+                values.wifiAliveSchedule =
+                    value;
+
+            } else if (
                 key == "hostname"
             ) {
 
@@ -4462,6 +4729,45 @@ static bool parseConfigText(
                             secretError;
                         return false;
                     }
+                }
+
+            } else if (key == "stream_allow_annotation_edit" || key == "stream_allow_delete") {
+                bool &seenFlag = key == "stream_allow_annotation_edit"
+                    ? seen.streamAllowAnnotationEdit
+                    : seen.streamAllowDelete;
+
+                if (!markOnce(seenFlag, key, error) || !parseIntegerStrict(value, numericValue)) {
+                    if (!error.length())
+                        error = "invalid " + key;
+                    return false;
+                }
+
+                if (key == "stream_allow_annotation_edit")
+                    values.streamAllowAnnotationEdit = (int)numericValue;
+                else
+                    values.streamAllowDelete = (int)numericValue;
+
+            } else if (key.startsWith("stream_username_") || key.startsWith("stream_password_")) {
+                const bool isPassword = key.startsWith("stream_password_");
+                const size_t prefixLength = 16U;
+                const String suffix = key.substring(prefixLength);
+                const int userNumber = suffix.toInt();
+                if (userNumber < 1 || userNumber > SENSORFORGE_STREAM_USER_COUNT || suffix != String(userNumber)) {
+                    error = "invalid streaming user key: " + key;
+                    return false;
+                }
+                const size_t userIndex = (size_t)(userNumber - 1);
+                if (isPassword) {
+                    if (!markOnce(seen.streamPasswords[userIndex], key, error)) return false;
+                    bool wasEncrypted = false;
+                    String secretError;
+                    if (!configSecretDecode(key.c_str(), value, values.streamPasswords[userIndex], wasEncrypted, secretError)) {
+                        error = key + ": " + secretError;
+                        return false;
+                    }
+                } else {
+                    if (!markOnce(seen.streamUsernames[userIndex], key, error)) return false;
+                    values.streamUsernames[userIndex] = value;
                 }
 
             } else if (
@@ -4844,6 +5150,12 @@ static void applyValues(
     cfg_wifi_timeout_sec =
         values.wifiTimeoutSec;
 
+    cfg_wifi_alive_schedule_enabled =
+        values.wifiAliveScheduleEnabled;
+
+    cfg_wifi_alive_schedule =
+        values.wifiAliveSchedule;
+
     cfg_hostname =
         values.hostname;
 
@@ -4895,6 +5207,13 @@ static void applyValues(
 
     cfg_web_password =
         values.webPassword;
+
+    for (size_t i = 0; i < SENSORFORGE_STREAM_USER_COUNT; ++i) {
+        cfg_stream_usernames[i] = values.streamUsernames[i];
+        cfg_stream_passwords[i] = values.streamPasswords[i];
+    }
+    cfg_stream_allow_annotation_edit = values.streamAllowAnnotationEdit;
+    cfg_stream_allow_delete = values.streamAllowDelete;
 
     cfg_debug_enabled =
         values.debugEnabled;
@@ -5255,7 +5574,8 @@ static bool configSecretFieldName(const String &key)
         key == "wifi_pass" ||
         key.startsWith("wifi_pass_") ||
         key == "hotspot_password" ||
-        key == "web_password";
+        key == "web_password" ||
+        key.startsWith("stream_password_");
 }
 
 
@@ -5923,6 +6243,13 @@ config_loaded:
     Serial.println(
         "Config WiFi: timeout_sec=" +
         String(cfg_wifi_timeout_sec)
+    );
+
+    Serial.println(
+        "Config WiFi: alive_schedule=" +
+        String(cfg_wifi_alive_schedule_enabled ? "on" : "off") +
+        " entries=" +
+        cfg_wifi_alive_schedule
     );
 
     Serial.println(
@@ -7497,10 +7824,142 @@ ConfigSaveResult configSaveWebLanguage(
 }
 
 
+ConfigSaveResult configSaveAccessSettings(
+    int authEnabled,
+    const String &adminUsernameInput,
+    const String &adminPassword,
+    const String streamUsernames[SENSORFORGE_STREAM_USER_COUNT],
+    const String streamPasswords[SENSORFORGE_STREAM_USER_COUNT],
+    int streamAllowAnnotationEdit,
+    int streamAllowDelete,
+    bool writeToSd,
+    String &error
+)
+{
+    error = "";
+
+    if (authEnabled != 0 && authEnabled != 1) {
+        error = "web_auth_enabled must be 0 or 1";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+    if ((streamAllowAnnotationEdit != 0 && streamAllowAnnotationEdit != 1) ||
+        (streamAllowDelete != 0 && streamAllowDelete != 1)) {
+        error = "streaming permissions must be 0 or 1";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String adminUsername = adminUsernameInput;
+    adminUsername.trim();
+    if (!adminUsername.length() || adminUsername.length() > 32 || adminUsername.indexOf(':') >= 0) {
+        error = "web_username must be 1..32 chars and must not contain ':'";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+    if (adminPassword.length() < 8 || adminPassword.length() > 63) {
+        error = "web_password length must be 8..63";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String normalizedUsers[SENSORFORGE_STREAM_USER_COUNT];
+    String finalPasswords[SENSORFORGE_STREAM_USER_COUNT];
+    for (size_t i = 0; i < SENSORFORGE_STREAM_USER_COUNT; ++i) {
+        normalizedUsers[i] = streamUsernames[i];
+        normalizedUsers[i].trim();
+        finalPasswords[i] = streamPasswords[i];
+
+        if (!normalizedUsers[i].length()) {
+            if (finalPasswords[i].length()) {
+                error = "stream_password_" + String(i + 1) + " set for empty streaming username";
+                return CONFIG_SAVE_INTERNAL_FAILED;
+            }
+            continue;
+        }
+
+        if (normalizedUsers[i].length() > 32 || normalizedUsers[i].indexOf(':') >= 0) {
+            error = "stream_username_" + String(i + 1) + " must be 1..32 chars and must not contain ':'";
+            return CONFIG_SAVE_INTERNAL_FAILED;
+        }
+        if (finalPasswords[i].length() < 8 || finalPasswords[i].length() > 63) {
+            error = "stream_password_" + String(i + 1) + " length must be 8..63";
+            return CONFIG_SAVE_INTERNAL_FAILED;
+        }
+        if (normalizedUsers[i] == adminUsername) {
+            error = "streaming username must differ from administrator username";
+            return CONFIG_SAVE_INTERNAL_FAILED;
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (normalizedUsers[j].length() && normalizedUsers[j] == normalizedUsers[i]) {
+                error = "duplicate streaming username: " + normalizedUsers[i];
+                return CONFIG_SAVE_INTERNAL_FAILED;
+            }
+        }
+    }
+
+    String text;
+    bool sourceRead = false;
+    if (activeConfigSource == CONFIG_SOURCE_SD && sdAvailableState && STORAGE.exists("/config.txt"))
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    if (!sourceRead && internalAvailableState && LittleFS.exists("/config.txt"))
+        sourceRead = readTextFile(LittleFS, "/config.txt", text);
+    if (!sourceRead && sdAvailableState && STORAGE.exists("/config.txt"))
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+
+    if (!sourceRead) {
+        error = "no persistent config.txt available for access settings save";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (!replaceOrAppendConfigKey(text, "web_auth_enabled", String(authEnabled)) ||
+        !replaceOrAppendConfigKey(text, "web_username", adminUsername) ||
+        !replaceOrAppendConfigKey(text, "web_password", adminPassword)) {
+        error = "could not patch administrator access keys";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    for (size_t i = 0; i < SENSORFORGE_STREAM_USER_COUNT; ++i) {
+        const String userKey = "stream_username_" + String(i + 1);
+        const String passKey = "stream_password_" + String(i + 1);
+        if (!replaceOrAppendConfigKey(text, userKey.c_str(), normalizedUsers[i]) ||
+            !replaceOrAppendConfigKey(text, passKey.c_str(), finalPasswords[i])) {
+            error = "could not patch streaming user " + String(i + 1);
+            return CONFIG_SAVE_INTERNAL_FAILED;
+        }
+    }
+
+    if (!replaceOrAppendConfigKey(text, "stream_allow_annotation_edit", String(streamAllowAnnotationEdit)) ||
+        !replaceOrAppendConfigKey(text, "stream_allow_delete", String(streamAllowDelete))) {
+        error = "could not patch streaming permissions";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String validationError;
+    if (!configValidateText(text, validationError)) {
+        error = "patched config invalid: " + validationError;
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    ConfigSaveResult result = configSaveText(text, writeToSd, error);
+    if (result == CONFIG_SAVE_BOTH || result == CONFIG_SAVE_INTERNAL_ONLY) {
+        cfg_web_auth_enabled = authEnabled;
+        cfg_web_username = adminUsername;
+        cfg_web_password = adminPassword;
+        for (size_t i = 0; i < SENSORFORGE_STREAM_USER_COUNT; ++i) {
+            cfg_stream_usernames[i] = normalizedUsers[i];
+            cfg_stream_passwords[i] = finalPasswords[i];
+        }
+        cfg_stream_allow_annotation_edit = streamAllowAnnotationEdit;
+        cfg_stream_allow_delete = streamAllowDelete;
+    }
+
+    return result;
+}
+
+
 ConfigSaveResult configSaveWifiSettings(
     const String &hostname,
     const String &wifiOnSystemStart,
     int wifiTimeoutSec,
+    int wifiAliveScheduleEnabled,
+    const String &wifiAliveSchedule,
     const String wifiSsids[SENSORFORGE_WIFI_PROFILE_COUNT],
     const String wifiPasses[SENSORFORGE_WIFI_PROFILE_COUNT],
     float wifiTxPowerDbm,
@@ -7520,6 +7979,9 @@ ConfigSaveResult configSaveWifiSettings(
     String normalizedStartup = wifiOnSystemStart;
     normalizedStartup.trim();
     normalizedStartup.toLowerCase();
+
+    String normalizedAliveSchedule = wifiAliveSchedule;
+    normalizedAliveSchedule.trim();
 
     String normalizedSsids[SENSORFORGE_WIFI_PROFILE_COUNT];
     for (size_t i = 0; i < SENSORFORGE_WIFI_PROFILE_COUNT; ++i) {
@@ -7547,6 +8009,26 @@ ConfigSaveResult configSaveWifiSettings(
     if (wifiTimeoutSec < 0 || wifiTimeoutSec > 86400) {
         error = "wifi_timeout_sec out of range (0..86400)";
         return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (wifiAliveScheduleEnabled != 0 && wifiAliveScheduleEnabled != 1) {
+        error = "wifi_alive_schedule_enabled must be 0 or 1";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    {
+        WifiAliveScheduleEntry scheduleEntries[SENSORFORGE_WIFI_ALIVE_SCHEDULE_MAX_ENTRIES];
+        size_t scheduleCount = 0;
+        String scheduleError;
+        if (!configParseWifiAliveSchedule(
+                normalizedAliveSchedule,
+                scheduleEntries,
+                scheduleCount,
+                &scheduleError
+            )) {
+            error = scheduleError;
+            return CONFIG_SAVE_INTERNAL_FAILED;
+        }
     }
 
     int16_t txPowerX10 = (int16_t)lroundf(wifiTxPowerDbm * 10.0f);
@@ -7618,6 +8100,8 @@ ConfigSaveResult configSaveWifiSettings(
         !replaceOrAppendConfigKey(text, "hostname", normalizedHostname) ||
         !replaceOrAppendConfigKey(text, "wifi_on_system_start", normalizedStartup) ||
         !replaceOrAppendConfigKey(text, "wifi_timeout_sec", String(wifiTimeoutSec)) ||
+        !replaceOrAppendConfigKey(text, "wifi_alive_schedule_enabled", String(wifiAliveScheduleEnabled)) ||
+        !replaceOrAppendConfigKey(text, "wifi_alive_schedule", normalizedAliveSchedule) ||
         !replaceOrAppendConfigKey(text, "wifi_ssid", normalizedSsids[0]) ||
         !replaceOrAppendConfigKey(text, "wifi_pass", wifiPasses[0]) ||
         !replaceOrAppendConfigKey(text, "wifi_tx_power_dbm", String(wifiTxPowerDbm, 1)) ||
@@ -7657,6 +8141,8 @@ ConfigSaveResult configSaveWifiSettings(
         cfg_hostname = normalizedHostname;
         cfg_wifi_on_system_start = normalizedStartup;
         cfg_wifi_timeout_sec = wifiTimeoutSec;
+        cfg_wifi_alive_schedule_enabled = wifiAliveScheduleEnabled;
+        cfg_wifi_alive_schedule = normalizedAliveSchedule;
         for (size_t i = 0; i < SENSORFORGE_WIFI_PROFILE_COUNT; ++i) {
             cfg_wifi_ssids[i] = normalizedSsids[i];
             cfg_wifi_passes[i] = wifiPasses[i];

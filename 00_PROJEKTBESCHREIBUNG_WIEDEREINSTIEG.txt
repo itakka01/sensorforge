@@ -1,7 +1,140 @@
 SENSORFORGE / ESP32-S3 CAMERA (XIAO + FREENOVE)
 PROJEKTBESCHREIBUNG, RELEASESTAND UND WIEDEREINSTIEGSPROMPT
-Stand: 2026-10-01
-Dokumentrevision: v85 RELEASE - Image-Motion UI/Liveanalyse + Streamer-Frame-Analyse; v84 Streamer/Multi-WiFi/Kamera-Workflow bleibt Basis
+Stand: 2026-10-02
+Dokumentrevision: v87 BETA 1 - erster Beta-/Feature-Freeze-Stand auf Basis von v86; Stabilitaet und UI-Feinschliff haben Vorrang
+
+
+======================================================================
+AKTUELLE RELEASE-TABELLE
+======================================================================
+
+Release | Datum      | Status      | Schwerpunkt
+--------|------------|-------------|------------------------------------------------------------
+v87     | 2026-10-02 | BETA 1      | Feature-Freeze, WiFi-Zeitplan, Fallback-TX, Config-UI
+v86     | 2026-10-01 | OFFIZIELL   | Rollen/Zugriff, RTSP+HTTP-MJPEG Auth, Home Assistant, WiFi-Fixes
+v85     | 2026-10-01 | OFFIZIELL   | Image-Motion UI/Liveanalyse, Streamer-Frame-Analyse
+v84     | 2026-09-30 | OFFIZIELL   | Netzwerk-Streamer, Multi-WiFi, Kamera-/Preview-Workflow
+
+
+======================================================================
+V87 BETA 1 2026-10-02 - ERSTER BETA-/FEATURE-FREEZE-STAND
+======================================================================
+
+- SensorForge v87 Beta 1 ist mit Stand 2026-10-02 der aktuelle Beta-, Test- und
+  Wiedereinstiegsstand. Der letzte stabile offizielle Release bleibt v86 vom
+  2026-10-01.
+- Release-ID: `v87-beta1`; Core-Version im Branding bleibt `7.1.0`.
+- v87 Beta 1 fasst den vollstaendigen v86-Release plus die danach bewusst
+  additiv eingebauten Funktionen und UI-Korrekturen zusammen. Dieser Stand ist
+  ab jetzt die autoritative Basis fuer weitere Arbeiten.
+- Mit Beta 1 gilt fuer den Funktionsumfang grundsaetzlich Feature-Freeze:
+    * keine grossen neuen Funktionen mehr in diesen Beta-Stand aufnehmen
+    * Fokus auf Stabilitaet, Feldtests, Regressionen und Strom-/Sleep-Verhalten
+    * optischen/UI-Feinschliff weiterhin zulassen, solange keine bestehende
+      Funktionalitaet entfernt oder semantisch veraendert wird
+- Additive geplante WiFi-Erreichbarkeit im normalen SensorForge-/Recordingbetrieb:
+    * bis zu 16 taegliche lokale Zeitfenster `HH:MM / Dauer in Minuten`
+    * ausserhalb der Fenster bleibt die bisherige Magnet-/WiFi-/Timeout-Logik
+      unveraendert
+    * waehrend eines aktiven Fensters darf der normale WiFi-Inaktivitaets-Timeout
+      die Erreichbarkeit nicht beenden
+    * nach Fensterende wird eine durch den Zeitplan gestartete WiFi-Sitzung erst
+      beendet, wenn kein laufender Web-/API-Zugriff bzw. API-Exclusive-Download
+      mehr geschuetzt werden muss
+    * Light-/Deep-Sleep plant den naechsten WiFi-Zeitfensterstart als Timer-Wake
+      mit ein; ohne gueltige Systemzeit werden keine Zeitfenster ausgeloest
+    * die Funktion ist fuer alte Konfigurationen standardmaessig AUS
+- Netzwerk-Fallback wurde fuer bessere Notfall-Erreichbarkeit praezisiert:
+    * externe WLAN-Verbindungen und ein bewusst konfigurierter eigener Hotspot
+      verwenden weiterhin die vom Benutzer gewaehlte WiFi-Sendeleistung
+    * nur der automatisch gestartete Hotspot-Fallback verwendet die volle
+      Board-Default-Sendeleistung; beim XIAO derzeit 20.0 dBm
+    * der gespeicherte Benutzerwert wird dadurch nicht ueberschrieben
+- Die allgemeine WebConfig wurde optisch konsolidiert, ohne Einstellmoeglichkeiten
+  zu entfernen: Aufnahmeparameter sind als zusammengehoeriger Block dargestellt;
+  LED, Sleep, Bootloop-/Unterspannungsschutz, Zeitzone, Webinterface und Debug/Log
+  sind unter `Allgemeine Einstellungen` gebuendelt. Kontextbezogene Info-Buttons
+  erklaeren u. a. Sleep und die boardabhaengige Power-/Status-LED. Release-/Build-
+  Informationen liegen beim Firmware-Punkt unter `System`.
+- Die bestehende `/api/v1` Integration bleibt in Beta 1 funktional unveraendert,
+  Administrator-only und kompatibel zu den bisherigen Sync-/Integrationsclients.
+  Die API ist damit noch NICHT als vollstaendige Android-App-Steuerschnittstelle
+  abgeschlossen. Der naechste getrennte Entwicklungsschritt soll die API additiv
+  auf nahezu alle sinnvollen WebConfig-/Geraetefunktionen erweitern, ohne bestehende
+  API-v1-Routen oder Felder umzudeuten.
+- Fuer Beta 1 ist insbesondere zu qualifizieren:
+    * Langzeitstabilitaet Recording/Storage inklusive der bereits dokumentierten
+      offenen EIO-Randfaelle
+    * Sleep/Wake plus WiFi-Zeitfenster ueber mehrere reale Tageswechsel
+    * Magnet-Wakeup, Zeitfenster, Web/API-Transfers und API-Exclusive im Zusammenspiel
+    * STA -> Fallback-AP inklusive Rueckkehr und thermischem Verhalten bei voller TX
+    * bestehende Streamer-/Image-Motion-/Recording-Regressionsfaelle
+- Diese Dokumentations-/Versionsfreigabe behauptet keinen neuen Arduino-Build oder
+  Hardware-Langzeittest in dieser Arbeitsumgebung. Hardwarebefunde muessen weiterhin
+  aus dem realen Zielgeraetetest stammen.
+
+
+======================================================================
+V86 OFFIZIELLER RELEASE 2026-10-01
+======================================================================
+
+- SensorForge v86 ist mit Stand 2026-10-01 als neuer offizieller Release- und
+  Wiedereinstiegsstand festgeschrieben.
+- Release-ID: `v86`; Core-Version im Branding bleibt `7.1.0`.
+- v86 baut auf v85 auf und konsolidiert die danach implementierte Rollen-/
+  Zugriffskontrolle, geschuetzte Stream-Ausgaenge, Home-Assistant-Dokumentation
+  sowie die nach v85 korrigierten Multi-WiFi-Persistenzpfade.
+- Der bestehende Web-Zugang ist der Administrator mit Vollzugriff. Additiv koennen
+  bis zu 5 Streaming-Benutzer verwaltet werden. Streaming-Benutzer duerfen Live-
+  Streams, Snapshots sowie vorhandene Aufnahmen ansehen und herunterladen, erhalten
+  aber keinen allgemeinen Konfigurations-, Wartungs-, Reboot- oder API-Control-
+  Zugriff.
+- Fuer alle Streaming-Benutzer gibt es zwei globale optionale Zusatzrechte:
+    * `Anmerkungen bearbeiten`
+    * `Aufnahmen loeschen`
+  Beide sind standardmaessig AUS. Die Berechtigung wird serverseitig geprueft; bei
+  deaktiviertem Recht werden die entsprechenden Bedienelemente zusaetzlich in der
+  Weboberflaeche ausgeblendet.
+- Benutzer und Rechte liegen ausschliesslich unter `System -> Benutzer & Zugriff`.
+  Der redundante Verweis aus der allgemeinen Konfiguration wurde entfernt.
+- Streaming-Benutzer landen beim Aufruf von `/` weiterhin auf der eingeschraenkten
+  Hauptseite. Dort sind nur `Viewer` und `Aufnahmen` sichtbar. `Viewer` fuehrt direkt
+  zum Livebild; die alte Viewer-Zwischenseite enthaelt keinen doppelten Verweis auf
+  die Aufnahmen mehr.
+- Wenn der SensorForge-Zugriffsschutz aktiv ist, sind jetzt auch die Stream-Ausgaenge
+  geschuetzt:
+    * RTSP akzeptiert Administrator- oder Streaming-Benutzer und verwendet Basic Auth.
+      Beispiel: `rtsp://BENUTZER:PASSWORT@<IP>:554/stream`
+    * HTTP-MJPEG auf Port 81 akzeptiert dieselben Zugangsdaten.
+    * `/snapshot` ist fuer Administrator und Streaming-Benutzer verfuegbar.
+  Basic Auth schuetzt den Zugriff, verschluesselt den Transport aber nicht; die
+  Ausgaenge bleiben fuer ein vertrauenswuerdiges lokales Netz vorgesehen.
+- Die Streamer-Seite dokumentiert den Home-Assistant-Weg direkt. Fuer die getestete
+  Kameraeinbindung wird `MJPEG IP Camera` verwendet:
+    * MJPEG URL: `http://<IP>:81/stream`
+    * Still Image URL: `http://<IP>/snapshot`
+    * Benutzername/Passwort werden in Home Assistant separat eingetragen.
+  Der MJPEG-/Snapshot-Pfad wurde im Entwicklungszyklus erfolgreich mit Home Assistant
+  getestet.
+- Die stabile `/api/v1` Integration bleibt bewusst Administrator-only und verwendet
+  weiterhin die Administrator-Web-Zugangsdaten. Streaming-Benutzer sind keine API-
+  Steuerbenutzer.
+- Multi-WiFi-Persistenz wurde nach v85 korrigiert:
+    * `wifi_pass_2..5` sind im Secret-Whitelist-Pfad zugelassen.
+    * leere Passwoerter ungenutzter Profile werden nicht mehr verschluesselt und
+      verursachen dadurch keinen Save-Abbruch.
+    * der dedizierte WiFi-Save uebergibt `hotspot_fallback_enabled` wieder in der
+      korrekten Signaturposition.
+    * `webconfigWifiScanJson()` ist wieder vollstaendig vorhanden; Scan-Popup,
+      Auto-Freizeile, Profilreihenfolge, Fallback und TX-Power-UI bleiben erhalten.
+- Vor der v86-Freigabe wurde die Sourcebasis gegen die jeweils letzten v86-Deltas
+  geprueft. Der finale Root-Fix ist enthalten; aeltere temporaere Arbeitsstaende
+  duerfen weiterhin nicht als Basis fuer neue Aenderungen verwendet werden.
+- In dieser Arbeitsumgebung wurde kein eigener Arduino-Build ausgefuehrt. Daher wird
+  durch die Dokumentation kein neuer Build-/Hardwaretest behauptet. Authentifizierte
+  RTSP-/HTTP-Pfade sollen auf Zielhardware weiterhin im normalen Release-Test
+  gegengeprueft werden.
+
 
 
 ======================================================================
@@ -199,7 +332,8 @@ V84-KANDIDAT - AUDIO-DRAIN BUILD-FIX 2026-09-29
   `std::max<size_t>(...)`. Damit ist die GCC-14-Template-Aufloesung bei
   gemischten `size_t`-/`uint32_t`-Operanden eindeutig.
 - Keine Aenderung am Laufzeitverhalten des Audio-Realtime-Drains.
-Aktueller freigegebener Release: v85 (separate XIAO-Recording-/Storage-Langzeitqualifikation weiterhin offen)
+Aktueller stabiler Release: v86; aktueller Beta-/Wiedereinstiegsstand: v87 Beta 1
+(separate XIAO-Recording-/Storage-Langzeitqualifikation weiterhin offen)
 Produktname: SensorForge
 Plattformname: Fabric Node
 Core-Version im Branding: 7.1.0
@@ -455,17 +589,19 @@ AKTUELLER NACHTRAG 2026-09-30 - RTSP/AUDIO-LIVE-FEINSCHLIFF:
   langer Browserstream nicht den synchronen WebConfig-Server bzw. Thermal/RTSP/OTA.
 - Die neue Konfiguration defaultet auf `operating_mode=normal` sowie beide Streamer-
   Ausgaenge AUS. Alte v83-config.txt ohne diese Keys starten daher unveraendert normal.
-- `sensorforge_version.h` ist mit dem aktuellen Zwischenstand vom 2026-10-01 auf
-  v85 gesetzt. Die darunter dokumentierten v84-Kandidaten- und Qualifikationsschritte
-  bleiben als historische Entwicklungsnotizen erhalten.
+- `sensorforge_version.h` ist fuer den aktuellen Beta-Stand vom 2026-10-02 auf
+  `v87-beta1` gesetzt. v86 bleibt der letzte stabile offizielle Release; die darunter
+  dokumentierten v86-/v85-/v84-Abschnitte bleiben als historische Release- und
+  Entwicklungsnotizen erhalten.
 
 
-- Letzter bestaetigter/freigegebener Arbeitsstand ist v85 vom 2026-10-01.
-- Fuer weitere Entwicklung ist der vollstaendige v85-Quellstand die autoritative
-  Basis. Temporäre aeltere v84-/v85-Arbeitsordner duerfen nicht als Ausgangspunkt
-  verwendet werden.
-- Beim Wiedereinstieg den vollstaendigen v85-Stand verwenden und alle fuer die
-  jeweilige Aenderung betroffenen Dateien erneut lesen.
+- Aktueller autoritativer Arbeits- und Wiedereinstiegsstand ist v87 Beta 1 vom
+  2026-10-02. Der letzte stabile offizielle Release bleibt v86 vom 2026-10-01.
+- Fuer weitere Entwicklung ist der vollstaendige v87-Beta-1-Quellstand die
+  autoritative Basis. Temporaere aeltere v84-/v85-/v86-/v87-Arbeitsordner duerfen
+  nicht als Ausgangspunkt verwendet werden.
+- Beim Wiedereinstieg den vollstaendigen v87-Beta-1-Stand verwenden und alle fuer
+  die jeweilige Aenderung betroffenen Dateien erneut lesen.
 - Bestehende produktive SensorForge-Funktionalitaet hat absolute Prioritaet.
   Streaming darf den Normalbetrieb nicht veraendern, wenn der Streamer-Modus
   nicht bewusst aktiviert wurde.

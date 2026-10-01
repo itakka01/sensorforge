@@ -1,3 +1,28 @@
+## v87-beta1 — 2026-10-02
+
+- Promoted the consolidated post-v86 worktree to the first **v87 Beta 1** checkpoint. Core branding remains 7.1.0; **v86 remains the last stable official release** while v87 Beta 1 becomes the authoritative development, qualification and re-entry basis.
+- Declared a feature freeze for this beta line: further work should prioritize stability, regression testing, power/sleep behaviour and UI polish instead of adding broad new features.
+- Added optional daily WiFi-alive scheduling with up to 16 local-time windows. A scheduled window keeps WiFi/WebConfig available independently of the normal inactivity timeout, integrates its next start into timer wake planning, and never tears down an active Web/API or API-exclusive transfer merely because the window ended. Existing magnet wake and normal WiFi behaviour remain additive and unchanged outside scheduled windows.
+- Changed only the **automatic fallback hotspot** to use the board default/full configured board TX level for maximum recovery reachability. Infrastructure WiFi and a deliberately selected normal hotspot continue to use the user-configured TX-power setting; the stored setting is not overwritten.
+- Consolidated the general WebConfig layout without removing configuration options: recording parameters are visually grouped, general LED/sleep/bootloop/timezone/web/debug settings share one section, context info buttons were added, and release/build identity is presented under the System firmware section.
+- Integration API behaviour remains unchanged for Beta 1 and administrator-only. The next dedicated development track is to expand `/api/v1` additively toward near-complete application control for the planned Android client without breaking existing Sync/API clients.
+- Documentation was corrected to reflect the already-supported AP/STA/multi-WiFi/fallback network operation. No new Arduino build or hardware long-run qualification is claimed by this documentation/version promotion.
+
+## v86 — 2026-10-01
+
+- Promoted the consolidated post-v85 worktree to the official **v86** release. Core branding remains 7.1.0; v85 is the preceding Image-Motion/WebConfig checkpoint.
+- Added role-aware WebConfig access with the existing Web credentials retained as the **Administrator** account plus up to five additional **Streaming-Benutzer**. Streaming users can access live streams, snapshots and recorded media without receiving general configuration, maintenance, reboot or control privileges.
+- Added global optional streaming-user permissions for **recording annotation editing** and **recording deletion**. Both permissions default to disabled; when disabled, the corresponding UI controls are hidden and the server-side POST routes remain denied.
+- Protected the RTSP and direct HTTP-MJPEG outputs when SensorForge web access protection is enabled. Both administrator and streaming-user credentials are accepted for stream access; disabling web access protection keeps the streams unauthenticated. RTSP uses Basic authentication and therefore provides access control but not transport encryption.
+- Added a dedicated **System > Benutzer & Zugriff** page and removed the redundant access-management link from the general configuration page. The administrator and streaming-user roles are now explained in one place.
+- Simplified the streaming-user navigation: the restricted start page remains the normal entry point with only **Viewer** and **Aufnahmen** visible; **Viewer** leads directly to the live view, while recordings remain available only through their dedicated top-level menu item.
+- Expanded the Streamer page with authenticated RTSP example URLs (`rtsp://BENUTZER:PASSWORT@<IP>:554/stream`) and clear Home Assistant setup guidance. The documented Home Assistant path uses the **MJPEG IP Camera** integration with `http://<IP>:81/stream` plus `http://<IP>/snapshot` and separate username/password fields. The MJPEG/snapshot integration path was successfully exercised in Home Assistant during this development cycle.
+- Kept `/api/v1` authentication intentionally administrator-only. Streaming-user credentials grant media/stream access but do not become API control credentials.
+- Fixed post-v85 multi-WiFi secret persistence: `wifi_pass_2..5` are recognized by the secret whitelist and empty unused profile passwords are no longer sent through secret encryption. This prevents failed saves when additional WiFi profiles are configured.
+- Corrected the dedicated WiFi save-call signature for `hotspot_fallback_enabled` and restored the missing `webconfigWifiScanJson()` implementation while preserving the latest multi-profile/scan/fallback/TX-power UI.
+- Before release promotion, the current v86 source basis was re-audited against the latest delivered deltas. The final streaming-user root-page correction is included: visiting `/` stays on the restricted main page instead of redirecting directly to the live view.
+- Release documentation does not claim a fresh Arduino build performed in this environment. The final authenticated RTSP/HTTP access paths should continue to be verified on the target hardware as part of normal release qualification.
+
 ## v85 — 2026-10-01
 
 - Promoted the current source tree to the official **v85** checkpoint. v84 remains the preceding streamer/network release baseline; v85 primarily consolidates the Image-Motion/WebConfig work completed afterwards.

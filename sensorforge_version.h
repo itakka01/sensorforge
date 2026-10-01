@@ -20,14 +20,14 @@
 // The same release tag is written to the firmware boot log and shown in
 // WebConfig, so a running device can be mapped back to the exact Git tag.
 
-#define SENSORFORGE_RELEASE_NUMBER 85
-#define SENSORFORGE_RELEASE_TAG "v85"
-#define SENSORFORGE_RELEASE_DATE "2026-10-01"
+#define SENSORFORGE_RELEASE_NUMBER 87
+#define SENSORFORGE_RELEASE_TAG "v87-beta1"
+#define SENSORFORGE_RELEASE_DATE "2026-10-02"
 #define SENSORFORGE_RELEASE_SUMMARY \
-    "Image Motion UI/live-analysis refinement with unified save workflow, dual motion metrics and streamer-frame analysis."
+    "First beta feature-freeze: scheduled WiFi availability, full-power fallback AP and consolidated configuration UI."
 
-// Current source-tree stage. v85 was promoted to an official release checkpoint on 2026-10-01.
-#define SENSORFORGE_WORKTREE_STAGE "v85-release"
-#define SENSORFORGE_WORKTREE_DATE "2026-10-01"
+// Current source-tree stage. v87 Beta 1 is the active beta/qualification checkpoint.
+#define SENSORFORGE_WORKTREE_STAGE "v87-beta1"
+#define SENSORFORGE_WORKTREE_DATE "2026-10-02"
 #define SENSORFORGE_WORKTREE_SUMMARY \
-    "Official v85 checkpoint: compact Image Motion UI, fixed save bar, dual live metrics and streamer-frame live analysis."
+    "v87 Beta 1 feature freeze: stabilize the post-v86 WiFi scheduling, fallback-radio and UI consolidation work before further feature growth."

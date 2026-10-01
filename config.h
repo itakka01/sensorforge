@@ -131,12 +131,25 @@ extern String cfg_camera_description;
 extern String cfg_timezone;             // POSIX TZ string, e.g. CET-1CEST,M3.5.0,M10.5.0/3
 extern String cfg_wifi_on_system_start; // "off", "on", "on_missing_time"
 extern int cfg_wifi_timeout_sec;       // 0 = auto-off disabled; firmware default is 0
+#define SENSORFORGE_WIFI_ALIVE_SCHEDULE_MAX_ENTRIES 16
+struct WifiAliveScheduleEntry {
+    uint16_t startMinuteOfDay; // 0..1439, local SensorForge time
+    uint16_t durationMinutes;  // 1..1440
+};
+extern int cfg_wifi_alive_schedule_enabled; // 0/1, daily local-time windows
+extern String cfg_wifi_alive_schedule;      // normalized "HH:MM/min;HH:MM/min"
+bool configParseWifiAliveSchedule(
+    const String &value,
+    WifiAliveScheduleEntry entries[SENSORFORGE_WIFI_ALIVE_SCHEDULE_MAX_ENTRIES],
+    size_t &count,
+    String *error = nullptr
+);
 #define SENSORFORGE_WIFI_PROFILE_COUNT 5
 extern String cfg_wifi_ssid;   // compatibility alias for profile 1
 extern String cfg_wifi_pass;   // compatibility alias for profile 1
 extern String cfg_wifi_ssids[SENSORFORGE_WIFI_PROFILE_COUNT];
 extern String cfg_wifi_passes[SENSORFORGE_WIFI_PROFILE_COUNT];
-extern float cfg_wifi_tx_power_dbm;   // discrete board-supported TX power; applies to STA and AP
+extern float cfg_wifi_tx_power_dbm;   // board-supported TX power for STA/configured AP; fallback AP uses board default
 
 // Hotspot / access point
 extern int cfg_hotspot_enabled;       // 1 = local AP, 0 = configured infrastructure WiFi (STA)
@@ -150,6 +163,11 @@ extern int cfg_web_recording_auto_pause; // 0/1, pause recording automation when
 extern String cfg_web_language;       // "de" or "en"; optional in older configs
 extern String cfg_web_username;
 extern String cfg_web_password;       // 8..63 chars
+#define SENSORFORGE_STREAM_USER_COUNT 5
+extern String cfg_stream_usernames[SENSORFORGE_STREAM_USER_COUNT];
+extern String cfg_stream_passwords[SENSORFORGE_STREAM_USER_COUNT];
+extern int cfg_stream_allow_annotation_edit; // 0/1, applies to all streaming users
+extern int cfg_stream_allow_delete;          // 0/1, applies to all streaming users
 
 // Logging
 extern String cfg_log_file;
@@ -377,12 +395,29 @@ ConfigSaveResult configSaveWebLanguage(
     String &error
 );
 
+// Persist the administrator/access-protection settings plus streaming users
+// and their optional media-edit permissions while preserving unrelated keys/comments. Existing
+// web_username/web_password remain the authoritative administrator credentials.
+ConfigSaveResult configSaveAccessSettings(
+    int authEnabled,
+    const String &adminUsername,
+    const String &adminPassword,
+    const String streamUsernames[SENSORFORGE_STREAM_USER_COUNT],
+    const String streamPasswords[SENSORFORGE_STREAM_USER_COUNT],
+    int streamAllowAnnotationEdit,
+    int streamAllowDelete,
+    bool writeToSd,
+    String &error
+);
+
 // Persist only network/WiFi settings while preserving the complete active
 // config text and all unrelated/future keys. Used by the dedicated WiFi page.
 ConfigSaveResult configSaveWifiSettings(
     const String &hostname,
     const String &wifiOnSystemStart,
     int wifiTimeoutSec,
+    int wifiAliveScheduleEnabled,
+    const String &wifiAliveSchedule,
     const String wifiSsids[SENSORFORGE_WIFI_PROFILE_COUNT],
     const String wifiPasses[SENSORFORGE_WIFI_PROFILE_COUNT],
     float wifiTxPowerDbm,

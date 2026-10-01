@@ -4,6 +4,7 @@
 #include "streamer.h"
 
 #include <esp_heap_caps.h>
+#include <WiFi.h>
 
 namespace {
 
@@ -48,6 +49,30 @@ String streamerUiInfoButton(const String &title, const String &info)
         "data-title='" + streamerUiHtmlEscape(title) + "' data-info='" + streamerUiHtmlEscape(info) + "'>i</button>";
 }
 
+String streamerUiActiveHost()
+{
+    IPAddress ip = WiFi.localIP();
+    if (!(ip[0] || ip[1] || ip[2] || ip[3]))
+        ip = WiFi.softAPIP();
+
+    if (ip[0] || ip[1] || ip[2] || ip[3])
+        return ip.toString();
+
+    return cfg_hostname + ".local";
+}
+
+String streamerUiWithCredentialPlaceholder(const String &url)
+{
+    if (!cfg_web_auth_enabled)
+        return url;
+
+    int scheme = url.indexOf("://");
+    if (scheme < 0)
+        return url;
+
+    return url.substring(0, scheme + 3) + "BENUTZER:PASSWORT@" + url.substring(scheme + 3);
+}
+
 } // namespace
 
 String webconfigStreamerDashboardHtml(uint8_t activeWebUiSessions)
@@ -59,7 +84,8 @@ String webconfigStreamerDashboardHtml(uint8_t activeWebUiSessions)
                 "Motion Recording, Power Shooter und die normale Aufnahme-Sleep-Automatik sind deaktiviert.</p>";
         html += "<p><strong>RTSP:</strong> <code>" + streamerUiHtmlEscape(streamerRtspUrl()) + "</code><br>"
                 "<strong>HTTP-MJPEG (blank):</strong> <code>" + streamerUiHtmlEscape(streamerHttpUrl()) + "</code><br>"
-                "<strong>Web-Viewer (+ Infos):</strong> <a href='" + streamerUiHtmlEscape(streamerHttpViewerUrl()) + "' target='_blank' rel='noopener'><code>" + streamerUiHtmlEscape(streamerHttpViewerUrl()) + "</code></a></p>";
+                "<strong>Web-Viewer (+ Infos):</strong> <a href='" + streamerUiHtmlEscape(streamerHttpViewerUrl()) + "' target='_blank' rel='noopener'><code>" + streamerUiHtmlEscape(streamerHttpViewerUrl()) + "</code></a><br>"
+                "<strong>Zugriff:</strong> " + String(cfg_web_auth_enabled ? "geschützt (Administrator / Streaming-Benutzer)" : "ohne Anmeldung") + "</p>";
         html += "<p><strong>RTSP-Clients:</strong> <span id='streamTopRtspCount'>" + String((unsigned)streamerRtspClientCount()) + "/2</span>" +
                 " · <strong>HTTP-Clients:</strong> <span id='streamTopHttpCount'>" + String((unsigned)streamerHttpClientCount()) + "/2</span>" +
                 "<br><strong>Audio:</strong> <span id='streamTopAudioState'>" + streamerUiHtmlEscape(streamerAudioStatus()) + "</span></p>";
@@ -168,15 +194,20 @@ String webconfigStreamerOperatingModeHtml(
     const String streamerRtspCommandUrl = streamerRtspUrl();
     const String streamerHttpCommandUrl = streamerHttpUrl();
     const String streamerHttpViewerCommandUrl = streamerHttpViewerUrl();
+    const String streamerRtspAuthCommandUrl = streamerUiWithCredentialPlaceholder(streamerRtspCommandUrl);
+    const String streamerHttpAuthCommandUrl = streamerUiWithCredentialPlaceholder(streamerHttpCommandUrl);
+    const String homeAssistantHost = streamerUiActiveHost();
+    const String homeAssistantMjpegUrl = "http://" + homeAssistantHost + ":81/stream";
+    const String homeAssistantSnapshotUrl = "http://" + homeAssistantHost + "/snapshot";
     const String rtspOverlayLabel = cfg_camera_overlay_text.length() ? cfg_camera_overlay_text : (cfg_camera_display_name.length() ? cfg_camera_display_name : String("SensorForge"));
     const String rtspOverlayFilter = "drawtext=text='" + streamerUiFfmpegDrawtextEscape(rtspOverlayLabel) + "':x=18:y=18:fontsize=24:fontcolor=white:box=1:boxcolor=black@0.55,drawtext=text='%{localtime\\:%d.%m.%Y} %{localtime\\:%H}\\:%{localtime\\:%M}\\:%{localtime\\:%S}':x=18:y=h-th-18:fontsize=22:fontcolor=white:box=1:boxcolor=black@0.55";
-    const String streamerFfplayOverlayCommand = "ffplay -rtsp_transport tcp -vf \"" + rtspOverlayFilter + "\" \"" + streamerRtspCommandUrl + "\"";
-    const String streamerFfplayCommand = "ffplay -rtsp_transport tcp \"" + streamerRtspCommandUrl + "\"";
-    const String streamerVlcCommand = "vlc \"" + streamerRtspCommandUrl + "\"";
-    const String streamerMpvCommand = "mpv --demuxer-lavf-o=rtsp_transport=tcp \"" + streamerRtspCommandUrl + "\"";
-    const String streamerHttpFfplayCommand = "ffplay \"" + streamerHttpCommandUrl + "\"";
-    const String streamerHttpVlcCommand = "vlc \"" + streamerHttpCommandUrl + "\"";
-    const String streamerHttpMpvCommand = "mpv \"" + streamerHttpCommandUrl + "\"";
+    const String streamerFfplayOverlayCommand = "ffplay -rtsp_transport tcp -vf \"" + rtspOverlayFilter + "\" \"" + streamerRtspAuthCommandUrl + "\"";
+    const String streamerFfplayCommand = "ffplay -rtsp_transport tcp \"" + streamerRtspAuthCommandUrl + "\"";
+    const String streamerVlcCommand = "vlc \"" + streamerRtspAuthCommandUrl + "\"";
+    const String streamerMpvCommand = "mpv --demuxer-lavf-o=rtsp_transport=tcp \"" + streamerRtspAuthCommandUrl + "\"";
+    const String streamerHttpFfplayCommand = "ffplay \"" + streamerHttpAuthCommandUrl + "\"";
+    const String streamerHttpVlcCommand = "vlc \"" + streamerHttpAuthCommandUrl + "\"";
+    const String streamerHttpMpvCommand = "mpv \"" + streamerHttpAuthCommandUrl + "\"";
 
     String streamerTransportInfo =
         "RTSP ist die bevorzugte Wahl für klassische Video- und Überwachungsprogramme. "
@@ -209,6 +240,8 @@ String webconfigStreamerOperatingModeHtml(
         "<div class='muted' style='margin:4px 0 0 24px'>Für VLC, ffmpeg, NVR und Überwachungssoftware wie Frigate oder Shinobi. <strong>Empfohlen für Videoüberwachung und dauerhafte Integration.</strong> Nicht direkt in Chrome/Firefox abspielbar; optional mit Audio.</div>"
         "<div id='cfgStreamerRtspDetails' style='margin:7px 0 0 24px" + String(displayedStreamerRtspEnabled ? "" : ";display:none") + "'>"
         "<div><strong>Adresse:</strong> <code>" + streamerUiHtmlEscape(streamerRtspCommandUrl) + "</code></div>"
+        "<div style='margin-top:5px'><strong>Mit Benutzer/Passwort:</strong> <code>" + streamerUiHtmlEscape(streamerRtspAuthCommandUrl) + "</code></div>"
+        "<div class='muted' style='margin-top:4px'>Bei aktiviertem Zugriffsschutz <strong>BENUTZER</strong> und <strong>PASSWORT</strong> durch einen Administrator- oder Streaming-Benutzer ersetzen.</div>"
         "<div style='margin-top:10px'><strong>Stream öffnen:</strong></div>"
         "<div class='muted' style='margin:3px 0 7px 0'>Die folgenden Befehle können direkt in einem Terminal verwendet werden.</div>"
         "<div style='display:grid;gap:7px;max-width:900px'>"
@@ -219,6 +252,7 @@ String webconfigStreamerOperatingModeHtml(
         "<div class='muted' style='margin-top:6px'>Das RTSP-Overlay wird ausschließlich vom Player-PC erzeugt (ffplay/FFmpeg drawtext); SensorForge verändert oder rekodiert keine JPEG-Frames.</div>"
         "</div>"
         "<div class='muted' style='margin-top:7px'>SensorForge überträgt RTSP als RTP über TCP. Bei ffplay und mpv wird TCP deshalb ausdrücklich vorgegeben. VLC wird mit der normalen RTSP-Adresse gestartet, da nicht jede VLC-Version dieselbe TCP-Kommandozeilenoption unterstützt.</div>"
+        + String(cfg_web_auth_enabled ? "<div class='muted' style='margin-top:6px'><strong>Zugriffsschutz aktiv:</strong> RTSP akzeptiert Administrator- und Streaming-Benutzer. In den Terminalbeispielen BENUTZER und PASSWORT ersetzen.</div>" : "") +
         "</div>"
         "</div>"
         "<div style='padding:10px 12px;border:1px solid #d6e1e8;border-radius:9px;background:#fff'>"
@@ -226,6 +260,7 @@ String webconfigStreamerOperatingModeHtml(
         "<div class='muted' style='margin:4px 0 0 24px'>Für Webbrowser, Home Assistant, einfache Dashboards und eigene Integrationen. <strong>Direkt in Chrome/Firefox nutzbar; Video ohne Audio.</strong> Einfach zu verwenden, aber weniger effizient als RTSP.</div>"
         "<div id='cfgStreamerHttpDetails' style='margin:7px 0 0 24px" + String(displayedStreamerHttpEnabled ? "" : ";display:none") + "'>"
         "<div><strong>Adresse:</strong> <code>" + streamerUiHtmlEscape(streamerHttpCommandUrl) + "</code></div>"
+        "<div class='muted' style='margin-top:4px'>Bei aktiviertem Zugriffsschutz Benutzername und Passwort im Browser, Player oder Integrationsprogramm eingeben.</div>"
         "<div style='margin-top:10px'><strong>Stream öffnen:</strong></div>"
         "<div class='muted' style='margin:3px 0 7px 0'>Die URL kann direkt im Browser geöffnet oder mit einem der folgenden Programme verwendet werden.</div>"
         "<div style='display:grid;gap:7px;max-width:900px'>"
@@ -238,6 +273,15 @@ String webconfigStreamerOperatingModeHtml(
         "<div class='muted' style='margin-top:7px'>HTTP-MJPEG enthält nur Video. Für Audio verwende den RTSP-Stream.</div>"
         "</div>"
         "</div>"
+        "<div style='margin:12px 0;padding:12px 14px;border:1px solid #b8cddd;border-radius:9px;background:#f7fbfd'>"
+        "<div style='display:flex;align-items:center;gap:6px;flex-wrap:wrap'><strong>Home Assistant</strong>" +
+        streamerUiInfoButton("Home Assistant", "Getesteter SensorForge-Weg: In Home Assistant die Integration MJPEG IP Camera verwenden. Der HTTP-MJPEG-Stream liefert das Livebild, /snapshot das Standbild. Die Generic-Camera-RTSP-Variante ist für den SensorForge-MJPEG-RTSP-Stream nicht der empfohlene Weg. Läuft Home Assistant in Docker und kann .local nicht auflösen, verwende die angezeigte IP-Adresse. Bei aktivem Zugriffsschutz einen Administrator- oder Streaming-Benutzer eintragen.") +
+        "</div>"
+        "<div class='muted' style='margin-top:5px'>Integration: <strong>MJPEG IP Camera</strong></div>"
+        "<div style='margin-top:8px'><strong>MJPEG URL:</strong> <code>" + streamerUiHtmlEscape(homeAssistantMjpegUrl) + "</code></div>"
+        "<div style='margin-top:5px'><strong>Still Image URL:</strong> <code>" + streamerUiHtmlEscape(homeAssistantSnapshotUrl) + "</code></div>"
+        + String(cfg_web_auth_enabled ? "<div style='margin-top:8px'><strong>Benutzername:</strong> Administrator oder Streaming-Benutzer<br><strong>Passwort:</strong> zugehöriges Passwort</div><div class='muted' style='margin-top:5px'>Die Zugangsdaten in Home Assistant in die dafür vorgesehenen Benutzername-/Passwortfelder eintragen. Streaming-Benutzer werden unter <a href='/access_settings'>System &gt; Benutzer &amp; Zugriff</a> verwaltet.</div>" : "<div class='muted' style='margin-top:7px'>Zugriffsschutz ist derzeit deaktiviert; Home Assistant benötigt keine Zugangsdaten.</div>") +
+        "</div>"
         "<div id='cfgStreamerTransportWarning' class='flash-notice error' style='display:none;margin-top:10px'><strong>Keine Stream-Ausgabe gewählt</strong><span>Aktiviere RTSP oder Browser-Stream. Beide dürfen auch gleichzeitig aktiv sein.</span></div>"
         "<p><strong>Audio:</strong> " + streamerUiHtmlEscape(streamerAudioStatus()) + "</p>"
         "<div id='cfgStreamerStress' style='margin:14px 0 10px;padding:12px;border:1px solid #d6e1e8;border-radius:9px;background:#fff'>"
@@ -245,10 +289,10 @@ String webconfigStreamerOperatingModeHtml(
         "<div class='muted' style='margin-top:5px'>Manueller Messmodus für Stromaufnahme und Temperatur. Die Tests verwenden reale SensorForge-Pfade und verändern keine gespeicherten Einstellungen. Thermal Guard und dynamisches FPS-Throttling bleiben aktiv.</div>"
         "<div style='display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px'><label>Dauer <select id='cfgStressSeconds'><option value='30'>30 s</option><option value='60' selected>60 s</option><option value='120'>120 s</option></select></label>"
         "<button type='button' class='button' id='cfgStressCamera'>Kamera/JPEG</button>"
-        "<button type='button' class='button' id='cfgStressHttp'>HTTP-MJPEG</button>"
+        "<button type='button' class='button' id='cfgStressHttp'" + String(cfg_web_auth_enabled ? " disabled title='Bei aktivem Zugriffsschutz nicht über das versteckte Testbild startbar'" : "") + ">HTTP-MJPEG</button>"
         "<button type='button' class='button' id='cfgStressObserve'>Aktuellen Stream messen</button>"
         "<button type='button' class='button' id='cfgStressStop'>Stop</button></div>"
-        "<div id='cfgStressStatus' class='muted' style='margin-top:9px'>Bereit. Für Kamera/JPEG und HTTP bitte vorher andere Streamclients schließen. Für RTSP(+Audio) zuerst den Player starten und dann ‘Aktuellen Stream messen’ wählen.</div>"
+        "<div id='cfgStressStatus' class='muted' style='margin-top:9px'>Bereit. Für Kamera/JPEG und HTTP bitte vorher andere Streamclients schließen. Für RTSP(+Audio) zuerst den Player starten und dann ‘Aktuellen Stream messen’ wählen." + String(cfg_web_auth_enabled ? " Der interne HTTP-MJPEG-Stresstest ist bei aktivem Zugriffsschutz deaktiviert; einen bereits geöffneten Stream kannst du weiterhin über ‘Aktuellen Stream messen’ beobachten." : "") + "</div>"
         "<img id='cfgStressHttpImg' alt='' style='position:absolute;left:-10000px;top:-10000px;width:1px;height:1px'>"
         "<div class='muted' style='margin-top:6px'>Stromaufnahme extern am Messgerät ablesen/notieren. START und END werden mit Dauer, Temperatur, Frames, JPEG-Größe, Videodatenrate, RTP-Paketen, RTSP-Sendezeit und Audiozählern im Log protokolliert.</div>"
         "</div>"

@@ -2,6 +2,7 @@
 
 #include "board_config.h"
 #include "config.h"
+#include "access_control.h"
 #include "recorder.h"
 #include "storage_guard.h"
 #include "branding.h"
@@ -6355,6 +6356,30 @@ static void handlePlayerNeighbors()
 
 
 // =============================================================
+// ROLE-AWARE PLAYER UI PERMISSIONS
+// =============================================================
+
+static void handlePlayerPermissionsCss()
+{
+    if (!playerServer)
+        return;
+
+    String css;
+    if (cfg_web_auth_enabled &&
+        accessControlWebRole(*playerServer) == SENSORFORGE_ACCESS_STREAM) {
+        if (!cfg_stream_allow_delete)
+            css += ".deleteBtn{display:none!important;}";
+
+        if (!cfg_stream_allow_annotation_edit)
+            css += ".annotation-panel{display:none!important;}";
+    }
+
+    playerServer->sendHeader("Cache-Control", "no-store");
+    playerServer->send(200, "text/css; charset=utf-8", css);
+}
+
+
+// =============================================================
 // PLAYER HTML PAGE
 // =============================================================
 
@@ -6397,6 +6422,7 @@ R"HTML(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="/player_permissions.css">
 <title>)HTML"
 SENSORFORGE_APP_NAME_LITERAL " &middot; "
 SENSORFORGE_PLATFORM_LITERAL " &middot; v"
@@ -9140,6 +9166,13 @@ void webPlayerRegisterRoutes(
 {
     playerServer =
         &server;
+
+
+    server.on(
+        "/player_permissions.css",
+        HTTP_GET,
+        handlePlayerPermissionsCss
+    );
 
 
     server.on(

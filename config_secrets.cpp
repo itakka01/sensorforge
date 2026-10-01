@@ -39,7 +39,12 @@ static bool fieldSupported(const char *fieldName)
         strcmp(fieldName, "wifi_pass_4") == 0 ||
         strcmp(fieldName, "wifi_pass_5") == 0 ||
         strcmp(fieldName, "hotspot_password") == 0 ||
-        strcmp(fieldName, "web_password") == 0;
+        strcmp(fieldName, "web_password") == 0 ||
+        strcmp(fieldName, "stream_password_1") == 0 ||
+        strcmp(fieldName, "stream_password_2") == 0 ||
+        strcmp(fieldName, "stream_password_3") == 0 ||
+        strcmp(fieldName, "stream_password_4") == 0 ||
+        strcmp(fieldName, "stream_password_5") == 0;
 }
 
 static bool importAesGcmKey(

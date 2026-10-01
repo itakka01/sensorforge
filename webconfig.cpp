@@ -45,6 +45,7 @@
 #include "webconfig_streamer.h"
 #include "webconfig_audio.h"
 #include "webconfig_wifi.h"
+#include "access_control.h"
 
 static const char *AUDIO_MIC_TEST_PATH = "/sensorforge_audio_test.wav";
 static const uint32_t AUDIO_MIC_TEST_DURATION_MS = 10000UL;
@@ -1124,7 +1125,14 @@ static void recordingArmFormDefaults(
 
 static String htmlHeader()
 {
-    maybeAutoPauseRecordingForWebUi();
+    const bool streamingAccess =
+        cfg_web_auth_enabled && accessControlWebRole(server) == SENSORFORGE_ACCESS_STREAM;
+
+    // Streaming users may inspect live/recorded media without
+    // changing recording automation state. Administrator pages retain the
+    // established WebConfig maintenance-pause behavior.
+    if (!streamingAccess)
+        maybeAutoPauseRecordingForWebUi();
 
     String html =
         String("<!doctype html><html lang='") +
@@ -1332,6 +1340,8 @@ static String htmlHeader()
         ".log-analysis-status{text-align:left;}.log-analysis-grid{grid-template-columns:1fr;}}"
         "table{max-width:100%;}"
         "code{background:#f2f4f7;padding:2px 4px;border-radius:4px;}"
+        ".stream-role .navitem[data-nav='home'],.stream-role .navitem[data-nav='camera'],.stream-role #navSensor,.stream-role #navSystem,.stream-role .navitem[data-nav='config']{display:none!important;}"
+        ".stream-role .module-actions{display:none!important;}"
         "@media(max-width:900px){.dashboard-grid{grid-template-columns:repeat(2,minmax(0,1fr));}}"
         "@media(max-width:760px){"
         ".navwrap{align-items:flex-start;flex-direction:column;padding:8px 12px;}"
@@ -1354,6 +1364,9 @@ static String htmlHeader()
         ".page-title{flex-direction:column;}"
         "}"
         "</style></head><body>";
+
+    if (streamingAccess)
+        html.replace("<body>", "<body class='stream-role'>");
 
     String returnPath =
         server.uri();
@@ -1379,6 +1392,10 @@ static String htmlHeader()
 
     html +=
         "<div class='navlinks'>";
+
+    if (streamingAccess) {
+        html += "<a class='navitem' href='/stream_view'>Viewer</a>";
+    }
 
     html +=
         "<a class='navitem' data-nav='home' href='/'>" +
@@ -1442,6 +1459,7 @@ static String htmlHeader()
     html +=
         "<a href='/system'>" + htmlText(UI_NAV_SYSTEM) + "</a>"
         "<a href='/wifi_settings'>WiFi Einstellungen</a>"
+        "<a href='/access_settings'>Benutzer &amp; Zugriff</a>"
         "<a href='/shooter'>Power Shooter</a>"
         "<a href='/sd_maintenance'>" + htmlText(UI_NAV_SD_MAINTENANCE) + "</a>"
         "<a href='/log'>" + htmlText(UI_NAV_LOG_VIEWER) + "</a>"
@@ -4008,6 +4026,9 @@ static void handleConfig()
         ".config-field-grid .config-control{min-width:0}"
         ".config-field-grid .config-note{grid-column:2;color:var(--muted);font-size:.86rem;margin-top:-4px;margin-bottom:4px}"
         ".config-label-inline{display:flex;align-items:center;gap:4px;flex-wrap:wrap}"
+        ".config-section-title-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--line)}"
+        ".config-section-title-row h3{margin:0;padding:0;border:0}"
+        ".config-group-box{border:1px solid #d8dee6;border-radius:9px;padding:14px;background:#fbfcfd}"
         ".stream-toggle{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:8px;border:1px solid #d6e1e8;background:#fff;cursor:pointer;transition:.15s ease}"
         ".stream-toggle:hover{border-color:#9db4c3;background:#fbfdff}"
         ".stream-toggle input{width:20px;height:20px;margin:0;flex:0 0 auto}"
@@ -4017,21 +4038,6 @@ static void handleConfig()
         ".stream-toggle-state.off{background:#fff0f0;color:#a22b2b;border-color:#e6adad}"
         "@media(max-width:720px){.config-field-grid{grid-template-columns:1fr;gap:4px}.config-field-grid .config-note{grid-column:1;margin-top:-2px;margin-bottom:8px}.config-field-grid input,.config-field-grid select{max-width:none}}"
         "</style>";
-
-    html += "<p style='padding:10px;background:#f7f7f7;border-radius:6px;'>"
-            "<b>Release:</b> " +
-            htmlEscape(String(SENSORFORGE_RELEASE_TAG)) +
-            " (" + htmlEscape(String(SENSORFORGE_RELEASE_DATE)) + ")" +
-            " &middot; <span class='muted'>git-tag: " +
-            htmlEscape(String(SENSORFORGE_RELEASE_TAG)) +
-            "</span>" +
-            "<br><b>Firmware Build:</b> " +
-            htmlEscape(firmwareBuildTimestamp()) +
-            "<br><b>Installiert:</b> " +
-            htmlEscape(firmwareInstallTimestamp()) +
-            "<br><b>Quelle:</b> " +
-            htmlEscape(firmwareInstallSource()) +
-            "</p>";
 
     if (configNotice.length()) {
         html +=
@@ -4131,27 +4137,26 @@ static void handleConfig()
 
     html +=
         "<section class='settings-section'>"
+        "<div class='config-section-title-row'>"
         "<h3>Config-Datei</h3>";
 
     if (sdSyncEnabled) {
         html +=
-            "<p style='display:flex;align-items:center;gap:6px;flex-wrap:wrap'>"
             "<span class='status-pill ok'>INTERN + SD</span>" +
             pageInfoButton(
                 "Konfigurationsspeicher",
                 "SensorForge speichert Einstellungen intern und zusätzlich in der bereits vorhandenen config.txt auf der SD-Karte. Beide Kopien werden bei normalen Änderungen gemeinsam aktualisiert."
-            ) +
-            "</p>";
+            );
     } else {
         html +=
-            "<p style='display:flex;align-items:center;gap:6px;flex-wrap:wrap'>"
             "<span class='status-pill warn'>NUR INTERN</span>" +
             pageInfoButton(
                 "Konfigurationsspeicher",
                 "SensorForge speichert die Einstellungen derzeit nur im internen Speicher des Geräts. Auf der SD-Karte gibt es keine config.txt. Das ist ein gültiger Betriebsmodus. Eine SD-config.txt wird nur angelegt, wenn du die interne config.txt hier ausdrücklich auf die SD-Karte kopierst."
-            ) +
-            "</p>";
+            );
     }
+
+    html += "</div>";
 
     html +=
         "<p><a class='button' href='/config_download'>Interne config.txt herunterladen</a></p>"
@@ -4286,7 +4291,7 @@ static void handleConfig()
         "</div>"
         "</div></div>";
 
-    html += "<div class='settings-section'><h3>Aufnahme</h3>";
+    html += "<div class='settings-section'><h3>Aufnahme</h3><div class='config-group-box'>";
 
     String pendingOperatingMode =
         server.arg("pending_mode");
@@ -4515,67 +4520,69 @@ static void handleConfig()
         "</script>";
 
 
+    html += "</div>";
     appendWebConfigAudioUi(html);
 
 
-    html += "</div><div class='settings-section'><h3>Sleep / Stromsparen</h3>";
+    html += "</div><div class='settings-section'><h3>Allgemeine Einstellungen</h3>";
 
-    html += "sleep_mode: <select name='sleep_mode'>";
+    String sleepModeInfo =
+        "Der Sleep-Modus bestimmt, wie SensorForge im normalen Recording-Betrieb zwischen Aktivitäten Strom spart.\n\n"
+        "off: SensorForge bleibt dauerhaft aktiv.\n"
+        "light_sleep: schnelleres Aufwachen bei weiterhin reduziertem Verbrauch.\n"
+        "deep_sleep: maximal stromsparend; das Gerät wird weitgehend abgeschaltet und über die vorgesehenen Wake-Quellen wieder gestartet.\n\n"
+        "Bestehende Wake-Funktionen wie Magnet, geplante Timer und Sicherheitsmechanismen werden durch diese Auswahl nicht ersetzt.";
 
-    html += "<option value='off'" +
-            String(cfg_sleep_mode == "off" ? " selected" : "") +
-            ">off - kein Sleep</option>";
+    String sleepDelayInfo =
+        "Die Sleep-Verzögerung legt fest, wie lange SensorForge nach einem abgeschlossenen Arbeitszyklus noch wach bleibt, bevor der konfigurierte Sleep-Modus verwendet wird.\n\n"
+        "0 ms bedeutet: keine zusätzliche Verzögerung. Zulässig sind 0 bis 60000 ms. Eine längere Verzögerung erleichtert kurzfristige Folgeaktivitäten, erhöht aber den Stromverbrauch.";
 
-    html += "<option value='light_sleep'" +
-            String(cfg_sleep_mode == "light_sleep" ? " selected" : "") +
-            ">light_sleep - schneller Wake</option>";
-
-    html += "<option value='deep_sleep'" +
-            String(cfg_sleep_mode == "deep_sleep" ? " selected" : "") +
-            ">deep_sleep - maximal stromsparend</option>";
-
-    html += "</select><br>";
-
-    html += "sleep_delay_ms: <input name='sleep_delay_ms' type='number' "
-            "min='0' max='60000' value='" +
-            String(cfg_sleep_delay_ms) +
-            "'> <small>(0..60000 ms)</small><br><br>";
-
-    html +=
-        "<b>Bootloop-/Unterspannungsschutz</b><br>"
-        "<span class='muted'>Schützt SensorForge vor wiederholten kurzen Neustarts, "
-        "z. B. wenn ein fast leerer oder instabiler Akku beim Hochfahren immer wieder einbricht. "
-        "Nach mehreren unvollständigen Starts legt das Gerät automatisch eine längere Deep-Sleep-Pause ein.</span><br>";
-
-    html += "bootloop_protection: <select name='bootloop_protection'>";
-    html += "<option value='1'" +
-            String(cfg_bootloop_protection ? " selected" : "") +
-            ">1 - aktiviert (empfohlen)</option>";
-    html += "<option value='0'" +
-            String(!cfg_bootloop_protection ? " selected" : "") +
-            ">0 - deaktiviert</option>";
-    html += "</select> <small>(vollständige Wirkung ab dem nächsten Neustart)</small><br>";
-
-
-    html += "</div><div class='settings-section'><h3>LED</h3>";
-
-    html +=
-        "<div class='config-field-grid'>"
-        "<div class='config-label'>Status-LED</div>"
-        "<div class='config-control'><select id='cfgLedEnabled' name='led_enabled'>"
-        "<option value='1'" + String(cfg_led_enabled ? " selected" : "") + ">Aktiviert - Status-LED verwenden</option>"
-        "<option value='0'" + String(!cfg_led_enabled ? " selected" : "") + ">Deaktiviert - Status-LED bleibt aus</option>"
-        "</select></div>"
-        "</div>";
-
-
-    html += "</div><div class='settings-section'><h3>Zeit</h3>";
+    String statusLedInfo =
+        "Diese Einstellung betrifft die Power-/Status-LED des Boards. Ob diese LED softwareseitig deaktiviert werden kann, hängt vom verwendeten Board ab; nicht alle Boards unterstützen diese Funktion.\n\n"
+        "Eine separate LED für Speicherzugriffe wird dadurch nicht beeinflusst. Diese lässt sich bei den meisten Boards hardware- bzw. treiberbedingt nicht softwareseitig deaktivieren.";
 
     String timezoneInfo =
         "Die Zeitzone bestimmt die lokale Uhrzeit in SensorForge, zum Beispiel für Zeitstempel und geplante Aufnahmefreigaben. "
         "Wähle die Region, die deinem Standort entspricht. Die technischen POSIX-Zeitzonenwerte werden intern automatisch gesetzt.";
 
-    html += "<div class='config-field-grid'>";
+    String debugInfo =
+        "Debug aktiviert zusätzliche technische Diagnosemeldungen in Konsole und Log. Das hilft bei einer gezielten Fehleranalyse, erzeugt aber deutlich mehr Diagnoseausgaben und kann zusätzliche Log-Schreibvorgänge verursachen. Für den normalen Betrieb sollte Debug ausgeschaltet bleiben.";
+
+    html += "<div class='config-group-box'><div class='config-field-grid'>";
+
+    html +=
+        "<div class='config-label'><span class='config-label-inline'>Status-LED" +
+        pageInfoButton("Status-LED", statusLedInfo) +
+        "</span></div>"
+        "<div class='config-control'><select id='cfgLedEnabled' name='led_enabled'>"
+        "<option value='1'" + String(cfg_led_enabled ? " selected" : "") + ">Aktiviert - Status-LED verwenden</option>"
+        "<option value='0'" + String(!cfg_led_enabled ? " selected" : "") + ">Deaktiviert - Status-LED bleibt aus</option>"
+        "</select></div>";
+
+    html +=
+        "<div class='config-label'><span class='config-label-inline'>Sleep-Modus" +
+        pageInfoButton("Sleep-Modus", sleepModeInfo) +
+        "</span></div><div class='config-control'><select name='sleep_mode'>"
+        "<option value='off'" + String(cfg_sleep_mode == "off" ? " selected" : "") + ">off - kein Sleep</option>"
+        "<option value='light_sleep'" + String(cfg_sleep_mode == "light_sleep" ? " selected" : "") + ">light_sleep - schneller Wake</option>"
+        "<option value='deep_sleep'" + String(cfg_sleep_mode == "deep_sleep" ? " selected" : "") + ">deep_sleep - maximal stromsparend</option>"
+        "</select></div>";
+
+    html +=
+        "<div class='config-label'><span class='config-label-inline'>Sleep-Verzögerung" +
+        pageInfoButton("Sleep-Verzögerung", sleepDelayInfo) +
+        "</span></div>"
+        "<div class='config-control'><input name='sleep_delay_ms' type='number' min='0' max='60000' value='" +
+        String(cfg_sleep_delay_ms) +
+        "'> <small>(0..60000 ms)</small></div>";
+
+    html +=
+        "<div class='config-label'>Bootloop-/Unterspannungsschutz</div>"
+        "<div class='config-control'><select name='bootloop_protection'>"
+        "<option value='1'" + String(cfg_bootloop_protection ? " selected" : "") + ">1 - aktiviert (empfohlen)</option>"
+        "<option value='0'" + String(!cfg_bootloop_protection ? " selected" : "") + ">0 - deaktiviert</option>"
+        "</select></div>"
+        "<div></div><div class='config-note'>Schützt vor wiederholten kurzen Neustarts, z. B. bei fast leerem oder instabilem Akku. Nach mehreren unvollständigen Starts legt SensorForge automatisch eine längere Deep-Sleep-Pause ein. Vollständige Wirkung ab dem nächsten Neustart.</div>";
 
     html +=
         "<div class='config-label'><span class='config-label-inline'>Zeitzone" +
@@ -4608,13 +4615,6 @@ static void handleConfig()
         "<div></div><div class='config-note'>Netzwerk, Hotspot und WLAN-Startverhalten befinden sich unter "
         "<a href='/wifi_settings'>System &gt; WiFi Einstellungen</a>.</div>";
 
-    html += "</div>";
-
-
-    html += "</div><div class='settings-section'><h3>Webinterface / Zugriffsschutz</h3>";
-
-    html += "<div class='config-field-grid'>";
-
     html +=
         "<div class='config-label'>Sprache</div>"
         "<div class='config-control'><select name='web_language'>"
@@ -4630,35 +4630,6 @@ static void handleConfig()
         "</select></div>";
 
     html +=
-        "<div class='config-label'>Web-Login</div>"
-        "<div class='config-control'><select name='web_auth_enabled'>"
-        "<option value='1'" + String(cfg_web_auth_enabled ? " selected" : "") + ">Aktiviert - Login erforderlich</option>"
-        "<option value='0'" + String(!cfg_web_auth_enabled ? " selected" : "") + ">Deaktiviert - Zugriff ohne Login</option>"
-        "</select></div>";
-
-    html +=
-        "<div class='config-label'>Benutzername</div>"
-        "<div class='config-control'><input name='web_username' maxlength='32' autocomplete='username' value='" +
-        htmlEscape(cfg_web_username) + "'></div>"
-        "<div class='config-note'>1 bis 32 Zeichen; kein Doppelpunkt.</div>";
-
-    html +=
-        "<div class='config-label'>Neues Web-Passwort</div>"
-        "<div class='config-control'><input type='password' name='web_password' minlength='8' maxlength='63' "
-        "autocomplete='new-password' value='' placeholder='Leer lassen = bestehendes Passwort behalten'></div>"
-        "<div class='config-note'>8 bis 63 Zeichen.</div>";
-
-    html += "</div>";
-
-
-    html += "</div><div class='settings-section'><h3>Debug / Log</h3>";
-
-    String debugInfo =
-        "Debug aktiviert zusätzliche technische Diagnosemeldungen in Konsole und Log. Das hilft bei einer gezielten Fehleranalyse, erzeugt aber deutlich mehr Diagnoseausgaben und kann zusätzliche Log-Schreibvorgänge verursachen. Für den normalen Betrieb sollte Debug ausgeschaltet bleiben.";
-
-    html += "<div class='config-field-grid'>";
-
-    html +=
         "<div class='config-label'><span class='config-label-inline'>Debug-Ausgaben" +
         pageInfoButton("Debug-Ausgaben", debugInfo) +
         "</span></div>"
@@ -4672,7 +4643,7 @@ static void handleConfig()
         "<div class='config-control'><input name='log_file' value='" +
         htmlEscape(cfg_log_file) + "'></div>";
 
-    html += "</div>";
+    html += "</div></div>";
 
     html += "</div>";
     html +=
@@ -5293,26 +5264,11 @@ static void handleSave()
         : 0;
 
 
-    int webAuthEnabled =
-        server.arg("web_auth_enabled").toInt()
-        ? 1
-        : 0;
-
-
-    String webUsername =
-        server.arg("web_username");
-
-    webUsername.trim();
-
-
-    String newWebPassword =
-        server.arg("web_password");
-
-    // Empty password field means: keep current web password.
-    if (!newWebPassword.length()) {
-        newWebPassword =
-            cfg_web_password;
-    }
+    // Access credentials are owned by the dedicated /access_settings page.
+    // A general configuration save must preserve them verbatim.
+    int webAuthEnabled = cfg_web_auth_enabled;
+    String webUsername = cfg_web_username;
+    String newWebPassword = cfg_web_password;
 
 
     String camera =
@@ -5808,6 +5764,15 @@ static void handleSave()
     text += "web_password=";
     text += newWebPassword;
     text += '\n';
+
+    for (size_t i = 0; i < SENSORFORGE_STREAM_USER_COUNT; ++i) {
+        text += "stream_username_" + String(i + 1) + "=";
+        text += cfg_stream_usernames[i];
+        text += '\n';
+        text += "stream_password_" + String(i + 1) + "=";
+        text += cfg_stream_passwords[i];
+        text += '\n';
+    }
 
     text += "debug_enabled=";
     text += String(debugEnabled);
@@ -6961,6 +6926,212 @@ static void handleTransportCancel()
     rebootAtMs =
         millis() +
         3000UL;
+}
+
+
+// -------------------------------------------------------------
+// USERS / ACCESS CONTROL
+// -------------------------------------------------------------
+
+static bool accessConfigWriteToSd()
+{
+    configRefreshSdStatus();
+    return configSdAvailable() && configSdPresent();
+}
+
+static void handleAccessSettingsPage()
+{
+    String html = htmlHeader();
+
+    html += "<div class='page-title'><div><h2>Benutzer &amp; Zugriff</h2>"
+            "<p>Administrator und Streaming-Zugänge verwalten</p></div></div>";
+
+    if (server.arg("notice") == "saved") {
+        html += "<div class='flash-notice'><strong>Zugriffseinstellungen gespeichert</strong>"
+                "<span class='muted'>Neue Zugangsdaten gelten ab sofort für Webzugriff, Snapshot, HTTP-MJPEG und RTSP.</span></div>"
+                "<script>history.replaceState(null,'','/access_settings');</script>";
+    }
+
+    html +=
+        "<style>"
+        ".access-grid{display:grid;grid-template-columns:minmax(180px,230px) minmax(220px,1fr);gap:9px 16px;align-items:center}"
+        ".access-grid input,.access-grid select{width:100%;max-width:430px;margin:0}"
+        ".access-user-list{display:grid;gap:8px;margin-top:10px}"
+        ".access-user-row{display:grid;grid-template-columns:44px minmax(180px,1fr) minmax(180px,1fr) auto;gap:8px;align-items:center;border:1px solid #d9e1e7;border-radius:8px;padding:9px 10px;background:#fff}"
+        ".access-user-row input{width:100%;margin:0;box-sizing:border-box}"
+        ".access-user-role{font-weight:700;text-align:center;color:var(--muted)}"
+        "@media(max-width:760px){.access-grid{grid-template-columns:1fr}.access-user-row{grid-template-columns:36px 1fr}.access-user-row .access-pass{grid-column:2}.access-user-row .access-remove{grid-column:2;justify-self:start}}"
+        "</style>";
+
+    html += "<form id='accessForm' method='POST' action='/access_settings_save'>";
+
+    html += "<section class='settings-section'><h3>Zugriffsschutz</h3>"
+            "<div class='access-grid'>"
+            "<div><strong>Zugriffsschutz</strong></div><div><select name='web_auth_enabled'>"
+            "<option value='1'" + String(cfg_web_auth_enabled ? " selected" : "") + ">Aktiv - Anmeldung erforderlich</option>"
+            "<option value='0'" + String(!cfg_web_auth_enabled ? " selected" : "") + ">Aus - Zugriff ohne Anmeldung</option>"
+            "</select></div></div>"
+            "<p class='muted'>Wenn der Zugriffsschutz aktiv ist, gelten die Zugangsdaten für Webinterface, Snapshot, HTTP-MJPEG und RTSP. "
+            "Die Übertragung selbst ist weiterhin unverschlüsseltes HTTP/RTSP und sollte nur in einem vertrauenswürdigen lokalen Netz verwendet werden.</p>"
+            "</section>";
+
+    html += "<section class='settings-section'><h3>Administrator</h3>"
+            "<p class='muted'>Der Administrator hat vollständigen Zugriff auf Konfiguration, Wartung, Aufnahmen und Streaming.</p>"
+            "<div class='access-grid'>"
+            "<div><strong>Benutzername</strong></div><div><input name='admin_username' maxlength='32' autocomplete='username' value='" + htmlEscape(cfg_web_username) + "'></div>"
+            "<div><strong>Neues Passwort</strong></div><div><input type='password' name='admin_password' minlength='8' maxlength='63' autocomplete='new-password' placeholder='Leer lassen = bestehendes Passwort behalten'></div>"
+            "</div></section>";
+
+    html += "<section class='settings-section'><h3>Streaming-Benutzer</h3>"
+            "<p class='muted'>Streaming-Benutzer dürfen Live-Streams, Snapshots sowie vorhandene Aufnahmen ansehen und herunterladen. "
+            "Konfiguration, Wartung, Neustart und Steuerfunktionen bleiben gesperrt. Diese Zugangsdaten können unter anderem auch direkt in Home Assistant verwendet werden.</p>"
+            "<div class='access-user-list'>";
+
+    for (size_t i = 0; i < SENSORFORGE_STREAM_USER_COUNT; ++i) {
+        const String n = String(i + 1);
+        html += "<div class='access-user-row' data-access-row='" + n + "'>"
+                "<div class='access-user-role'>" + n + "</div>"
+                "<input class='access-name' name='stream_username_" + n + "' maxlength='32' autocomplete='off' value='" + htmlEscape(cfg_stream_usernames[i]) + "' placeholder='Benutzername'>"
+                "<input class='access-pass' type='password' name='stream_password_" + n + "' minlength='8' maxlength='63' autocomplete='new-password' placeholder='" + String(cfg_stream_usernames[i].length() ? "Leer = Passwort behalten" : "Passwort (8–63 Zeichen)") + "'>"
+                "<button type='button' class='button access-remove' data-clear-row='" + n + "'" + String(cfg_stream_usernames[i].length() ? "" : " style='visibility:hidden'") + ">Entfernen</button>"
+                "</div>";
+    }
+
+    html += "</div></section>";
+
+    html += "<section class='settings-section'><h3>Rechte für Streaming-Benutzer</h3>"
+            "<div class='access-grid'>"
+            "<div><strong>Anmerkungen bearbeiten</strong></div><div><select name='stream_allow_annotation_edit'>"
+            "<option value='0'" + String(!cfg_stream_allow_annotation_edit ? " selected" : "") + ">Nicht erlaubt</option>"
+            "<option value='1'" + String(cfg_stream_allow_annotation_edit ? " selected" : "") + ">Erlaubt</option>"
+            "</select></div>"
+            "<div><strong>Aufnahmen löschen</strong></div><div><select name='stream_allow_delete'>"
+            "<option value='0'" + String(!cfg_stream_allow_delete ? " selected" : "") + ">Nicht erlaubt</option>"
+            "<option value='1'" + String(cfg_stream_allow_delete ? " selected" : "") + ">Erlaubt</option>"
+            "</select></div>"
+            "</div>"
+            "<p class='muted'>Live-Streams, Snapshots sowie Ansehen und Herunterladen von Aufnahmen sind für Streaming-Benutzer immer freigegeben. "
+            "Systemeinstellungen und Wartungsfunktionen bleiben unabhängig von diesen Optionen gesperrt.</p>"
+            "</section>";
+
+    html +=
+        "<div class='floating-save-space'></div>"
+        "<div id='accessSaveBar' class='floating-save-bar'>"
+        "<span id='accessSaveState' class='floating-save-state'>Keine ungespeicherten Änderungen</span>"
+        "<button id='accessSaveButton' type='submit' disabled>Speichern</button>"
+        "</div></form>";
+
+    html +=
+        "<script>(function(){"
+        "var f=document.getElementById('accessForm'),b=document.getElementById('accessSaveBar'),s=document.getElementById('accessSaveState'),btn=document.getElementById('accessSaveButton');"
+        "if(!f||!b||!s||!btn)return;"
+        "function dirty(){b.classList.add('dirty');s.textContent='Ungespeicherte Änderungen';btn.disabled=false;}"
+        "function syncRows(){document.querySelectorAll('[data-access-row]').forEach(function(r){var n=r.querySelector('.access-name'),x=r.querySelector('.access-remove');if(x)x.style.visibility=(n&&n.value.trim())?'visible':'hidden';});}"
+        "f.addEventListener('input',function(){dirty();syncRows();});f.addEventListener('change',dirty);"
+        "document.querySelectorAll('[data-clear-row]').forEach(function(x){x.addEventListener('click',function(){var r=x.closest('[data-access-row]');if(!r)return;var n=r.querySelector('.access-name'),p=r.querySelector('.access-pass');if(n)n.value='';if(p)p.value='';syncRows();dirty();});});"
+        "f.addEventListener('submit',function(){btn.disabled=true;s.textContent='Speichert …';});syncRows();"
+        "})();</script>";
+
+    appendPageInfoUi(html);
+    html += htmlFooter();
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "text/html; charset=utf-8", html);
+}
+
+static void handleAccessSettingsSave()
+{
+    if (rejectWhileRecording("access settings save"))
+        return;
+
+    const int authEnabled = server.arg("web_auth_enabled").toInt() ? 1 : 0;
+    const int streamAllowAnnotationEdit =
+        server.arg("stream_allow_annotation_edit").toInt() ? 1 : 0;
+    const int streamAllowDelete =
+        server.arg("stream_allow_delete").toInt() ? 1 : 0;
+
+    String adminUsername = server.arg("admin_username");
+    adminUsername.trim();
+
+    String adminPassword = server.arg("admin_password");
+    if (!adminPassword.length())
+        adminPassword = cfg_web_password;
+
+    String streamUsers[SENSORFORGE_STREAM_USER_COUNT];
+    String streamPasswords[SENSORFORGE_STREAM_USER_COUNT];
+
+    for (size_t i = 0; i < SENSORFORGE_STREAM_USER_COUNT; ++i) {
+        const String n = String(i + 1);
+        streamUsers[i] = server.arg("stream_username_" + n);
+        streamUsers[i].trim();
+        String submittedPassword = server.arg("stream_password_" + n);
+
+        if (!streamUsers[i].length()) {
+            streamPasswords[i] = "";
+            continue;
+        }
+
+        if (submittedPassword.length()) {
+            streamPasswords[i] = submittedPassword;
+        } else if (streamUsers[i] == cfg_stream_usernames[i] && cfg_stream_passwords[i].length()) {
+            streamPasswords[i] = cfg_stream_passwords[i];
+        } else {
+            server.send(400, "text/plain; charset=utf-8",
+                        "Für einen neuen oder umbenannten Streaming-Benutzer ist ein Passwort erforderlich.");
+            return;
+        }
+    }
+
+    String error;
+    ConfigSaveResult result = configSaveAccessSettings(
+        authEnabled,
+        adminUsername,
+        adminPassword,
+        streamUsers,
+        streamPasswords,
+        streamAllowAnnotationEdit,
+        streamAllowDelete,
+        accessConfigWriteToSd(),
+        error
+    );
+
+    if (result != CONFIG_SAVE_BOTH && result != CONFIG_SAVE_INTERNAL_ONLY) {
+        server.send(400, "text/plain; charset=utf-8",
+                    error.length() ? error : String("Zugriffseinstellungen konnten nicht gespeichert werden"));
+        return;
+    }
+
+    logWrite("Access settings saved | auth=" + String(cfg_web_auth_enabled) +
+             " | streaming_users=" + String(accessControlAnyStreamingUserConfigured() ? "configured" : "none") +
+             " | stream_annotation_edit=" + String(cfg_stream_allow_annotation_edit) +
+             " | stream_delete=" + String(cfg_stream_allow_delete));
+
+    server.sendHeader("Location", "/access_settings?notice=saved");
+    server.send(303, "text/plain; charset=utf-8", "");
+}
+
+static void handleViewerHome()
+{
+    if (cfg_web_auth_enabled && accessControlWebRole(server) == SENSORFORGE_ACCESS_STREAM) {
+        server.sendHeader("Location", "/stream_view");
+        server.send(303, "text/plain; charset=utf-8", "");
+        return;
+    }
+
+    String html = htmlHeader();
+    html += "<div class='page-title'><div><h2>Livebild</h2>"
+            "<p>Direkter Zugriff auf den HTTP-MJPEG-Viewer</p></div></div>";
+
+    html += "<section class='settings-section'><h3>Livebild</h3>";
+    if (streamerModeEnabled() && cfg_streamer_http_mjpeg_enabled) {
+        html += "<p><a class='button' href='/stream_view' target='_blank' rel='noopener'>Livebild öffnen</a></p>";
+    } else {
+        html += "<p class='muted'>Der HTTP-MJPEG-Livestream ist im aktuellen Betriebsmodus nicht aktiv.</p>";
+    }
+    html += "</section>";
+
+    html += htmlFooter();
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "text/html; charset=utf-8", html);
 }
 
 
@@ -12565,7 +12736,13 @@ static void sendSystemPage(
         "<div class='sys-section-head'><h3>Firmware Update</h3>" +
         systemInfoButton("Firmware Update", firmwareInfo) +
         "</div>"
-        "<p><b>Build:</b> " +
+        "<p><b>Release:</b> " +
+        htmlEscape(String(SENSORFORGE_RELEASE_TAG)) +
+        " (" + htmlEscape(String(SENSORFORGE_RELEASE_DATE)) + ")" +
+        " &middot; <span class='muted'>git-tag: " +
+        htmlEscape(String(SENSORFORGE_RELEASE_TAG)) +
+        "</span>"
+        "<br><b>Firmware Build:</b> " +
         htmlEscape(
             firmwareBuildTimestamp()
         ) +
@@ -15939,7 +16116,11 @@ static void handleDeleteDay()
 
 static void handleFiles()
 {
-    maybeAutoPauseRecordingForWebUi();
+    const bool streamingViewer =
+        cfg_web_auth_enabled && accessControlWebRole(server) == SENSORFORGE_ACCESS_STREAM;
+
+    if (!streamingViewer)
+        maybeAutoPauseRecordingForWebUi();
 
     if (recorderIsOpen()) {
         String html =
@@ -16184,6 +16365,10 @@ static void handleFiles()
     // Preserve the opened day and its already loaded HTML in the
     // browser session. Returning from the player therefore does not
     // require another SD directory scan.
+    if (streamingViewer && !cfg_stream_allow_delete) {
+        html += "<style>.deleteDayBtn,.deleteSelectedBtn,.selectionAction,.selectionHint,.mediaSelectWrap{display:none!important}</style>";
+    }
+
     html +=
         "<style>"
         ".recordingsToolbar{"
@@ -18839,18 +19024,25 @@ void webConfigStart()
             Middleware::Callback next
         ) -> bool {
 
-            // Protect every route, including player, downloads, destructive
-            // tools and the activity heartbeat. Unauthorized requests do not
-            // keep the WiFi inactivity timer alive.
-            if (
-                cfg_web_auth_enabled &&
-                !requestServer.authenticate(
-                    cfg_web_username.c_str(),
-                    cfg_web_password.c_str()
-                )
-            ) {
-                requestServer.requestAuthentication();
-                return true;
+            // Central role-aware access gate. The legacy web_username/web_password
+            // remains the administrator. Additional streaming users have restricted
+            // and can reach only live/snapshot/media-viewer routes.
+            if (cfg_web_auth_enabled) {
+                const SensorForgeAccessRole role = accessControlWebRole(requestServer);
+
+                if (role == SENSORFORGE_ACCESS_NONE) {
+                    requestServer.requestAuthentication();
+                    return true;
+                }
+
+                if (!accessControlWebRequestAllowed(
+                        role,
+                        requestServer.method(),
+                        requestServer.uri()
+                    )) {
+                    requestServer.send(403, "text/plain; charset=utf-8", "Zugriff für diesen Benutzer nicht erlaubt");
+                    return true;
+                }
             }
 
             noteWebActivity();
@@ -18867,10 +19059,11 @@ void webConfigStart()
         });
 
         server.on("/activity", HTTP_GET, []() {
-            // /activity is the common visible-browser heartbeat used by both
-            // normal WebConfig pages and the standalone player. It therefore
-            // owns automatic maintenance-pause recovery as well as WiFi liveness.
-            maybeAutoPauseRecordingForWebUi();
+            // Streaming users must never pause recording automation
+            // merely by watching live/recorded media. Administrator WebConfig
+            // retains the established maintenance-pause behavior.
+            if (accessControlWebRole(server) != SENSORFORGE_ACCESS_STREAM)
+                maybeAutoPauseRecordingForWebUi();
             if (server.hasArg("sid"))
                 noteWebUiSession(server.arg("sid"));
 
@@ -18889,11 +19082,14 @@ void webConfigStart()
         server.on("/transport_pause_release", HTTP_POST, handleTransportPauseRelease);
 
         server.on("/", HTTP_GET, handleRoot);
+        server.on("/viewer", HTTP_GET, handleViewerHome);
         server.on("/config", HTTP_GET, handleConfig);
         server.on("/save", HTTP_POST, handleSave);
         server.on("/wifi_settings", HTTP_GET, handleWifiSettingsPage);
         server.on("/wifi_scan", HTTP_GET, handleWifiScan);
         server.on("/wifi_settings_save", HTTP_POST, handleWifiSettingsSave);
+        server.on("/access_settings", HTTP_GET, handleAccessSettingsPage);
+        server.on("/access_settings_save", HTTP_POST, handleAccessSettingsSave);
         server.on("/streamer", HTTP_GET, handleStreamerPage);
         server.on("/streamer_save", HTTP_POST, handleStreamerSave);
         server.on("/shooter", HTTP_GET, handleShooterPage);

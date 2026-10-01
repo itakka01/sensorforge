@@ -2,6 +2,7 @@
 
 #include "audio_capture.h"
 #include "config.h"
+#include "access_control.h"
 #include "logger.h"
 #include "thermal.h"
 
@@ -1094,8 +1095,12 @@ static void serviceAudio()
 
 static String headerValue(const String &request, const char *name)
 {
-    String needle = String("\r\n") + name + ":";
-    int p = request.indexOf(needle);
+    String lowerRequest = request;
+    lowerRequest.toLowerCase();
+    String lowerName = String(name);
+    lowerName.toLowerCase();
+    String needle = String("\r\n") + lowerName + ":";
+    int p = lowerRequest.indexOf(needle);
     if (p < 0)
         return "";
     p += needle.length();
@@ -1203,6 +1208,19 @@ static void handleRtspRequest(uint8_t slotIndex, const String &request)
     String method = first.substring(0, sp1);
     String uri = first.substring(sp1 + 1, sp2);
     String cseq = headerValue(request, "CSeq");
+
+    if (cfg_web_auth_enabled) {
+        const SensorForgeAccessRole role =
+            accessControlAuthorizationRole(headerValue(request, "Authorization"));
+        if (role == SENSORFORGE_ACCESS_NONE) {
+            logWrite("RTSP authentication required | client=" + String((unsigned)slotIndex + 1U) +
+                     " | method=" + method);
+            rtspReply(slot, 401, "Unauthorized", cseq,
+                      "WWW-Authenticate: Basic realm=\"SensorForge\"\r\n");
+            return;
+        }
+    }
+
     slot.lastActivityMs = millis();
     logWrite("RTSP request | client=" + String((unsigned)slotIndex + 1U) +
              " | method=" + method + " | uri=" + uri + " | cseq=" + cseq);
@@ -2213,9 +2231,24 @@ static void serviceHttpControl()
             slot.rx += (char)slot.client.read();
             slot.lastActivityMs = millis();
             if (slot.rx.endsWith("\r\n\r\n")) {
-                bool valid = httpRequestIsStream(slot.rx);
+                const String request = slot.rx;
                 slot.rx = "";
-                if (!valid) {
+
+                if (cfg_web_auth_enabled) {
+                    const SensorForgeAccessRole role =
+                        accessControlAuthorizationRole(headerValue(request, "Authorization"));
+                    if (role == SENSORFORGE_ACCESS_NONE) {
+                        writeText(slot.client,
+                            "HTTP/1.1 401 Unauthorized\r\n"
+                            "WWW-Authenticate: Basic realm=\"SensorForge\"\r\n"
+                            "Connection: close\r\n"
+                            "Content-Length: 0\r\n\r\n");
+                        closeHttpClientSlot(i);
+                        break;
+                    }
+                }
+
+                if (!httpRequestIsStream(request)) {
                     writeText(slot.client,
                         "HTTP/1.1 404 Not Found\r\nConnection: close\r\n"
                         "Content-Length: 0\r\n\r\n");

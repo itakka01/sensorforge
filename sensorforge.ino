@@ -376,6 +376,19 @@ static const uint32_t SHOOTER_DEEP_SLEEP_RTC_MAGIC = 0x53465348UL; // "SFSH"
 RTC_DATA_ATTR uint32_t shooterDeepSleepRtcMagic = 0;
 RTC_DATA_ATTR int64_t shooterDeepSleepScheduledWallUs = 0;
 
+// Daily WiFi-alive schedule deep-sleep marker. The schedule itself remains in
+// config.txt; RTC memory only identifies a timer wake that was armed for the
+// next configured WiFi window so the normal boot can classify ownership.
+static const uint32_t WIFI_ALIVE_DEEP_SLEEP_RTC_MAGIC = 0x53465741UL; // "SFWA"
+RTC_DATA_ATTR uint32_t wifiAliveDeepSleepRtcMagic = 0;
+
+static bool wifiAliveScheduleWindowActive = false;
+static bool wifiAliveScheduleOwnsSession = false;
+static uint32_t wifiAliveScheduleLastServiceMs = 0;
+static bool wifiAliveScheduleClockWarningLogged = false;
+static bool wifiAliveLightSleepWakeArmed = false;
+static const uint32_t WIFI_ALIVE_POST_WINDOW_IDLE_SECONDS = 30UL;
+
 // Runtime continuous-shooter scheduler and PSRAM queue.
 static int shooterScheduleCachedIntervalMs = -1;
 static int shooterScheduleCachedEnabled = -1;
@@ -2392,18 +2405,18 @@ const char *thermalSourceName()
 // WIFI + TIME SYNC
 // =============================================================
 
-static bool applyConfiguredWifiTxPower(const char *context)
+static bool applyWifiTxPowerX10(
+    int16_t targetX10,
+    const char *context
+)
 {
-    int16_t configuredX10 =
-        (int16_t)lroundf(cfg_wifi_tx_power_dbm * 10.0f);
-
-    if (!boardWifiTxPowerSupportedX10(configuredX10)) {
-        configuredX10 = BOARD_WIFI_TX_POWER_DEFAULT_X10;
+    if (!boardWifiTxPowerSupportedX10(targetX10)) {
+        targetX10 = BOARD_WIFI_TX_POWER_DEFAULT_X10;
     }
 
     esp_err_t result =
         esp_wifi_set_max_tx_power(
-            boardWifiTxPowerQuarterDbm(configuredX10)
+            boardWifiTxPowerQuarterDbm(targetX10)
         );
 
     if (result != ESP_OK) {
@@ -2411,7 +2424,7 @@ static bool applyConfiguredWifiTxPower(const char *context)
             "WIFI",
             String("TX power apply failed | context=") +
             (context ? context : "?") +
-            " | requested=" + String(configuredX10 / 10.0f, 1) +
+            " | requested=" + String(targetX10 / 10.0f, 1) +
             " dBm | err=" + String((int)result)
         );
         return false;
@@ -2430,11 +2443,20 @@ static bool applyConfiguredWifiTxPower(const char *context)
         "WIFI",
         String("TX power | context=") +
         (context ? context : "?") +
-        " | configured=" + String(configuredX10 / 10.0f, 1) +
+        " | target=" + String(targetX10 / 10.0f, 1) +
         " dBm | driver=" + actualText
     );
 
     return true;
+}
+
+
+static bool applyConfiguredWifiTxPower(const char *context)
+{
+    int16_t configuredX10 =
+        (int16_t)lroundf(cfg_wifi_tx_power_dbm * 10.0f);
+
+    return applyWifiTxPowerX10(configuredX10, context);
 }
 
 
@@ -2643,6 +2665,252 @@ void maybeSyncTime(
     }
 
     wifiSyncTime();
+}
+
+
+// =============================================================
+// DAILY WIFI-ALIVE SCHEDULE
+// =============================================================
+
+static time_t wifiAliveLocalOccurrence(
+    const struct tm &referenceLocal,
+    int dayOffset,
+    uint16_t startMinuteOfDay
+)
+{
+    struct tm candidate = referenceLocal;
+    candidate.tm_mday += dayOffset;
+    candidate.tm_hour = startMinuteOfDay / 60U;
+    candidate.tm_min = startMinuteOfDay % 60U;
+    candidate.tm_sec = 0;
+    candidate.tm_isdst = -1;
+    return mktime(&candidate);
+}
+
+
+static bool wifiAliveScheduleEvaluate(
+    time_t nowEpoch,
+    bool &active,
+    time_t &activeUntilEpoch,
+    time_t &nextStartEpoch
+)
+{
+    active = false;
+    activeUntilEpoch = 0;
+    nextStartEpoch = 0;
+
+    if (!cfg_wifi_alive_schedule_enabled)
+        return false;
+
+    WifiAliveScheduleEntry entries[SENSORFORGE_WIFI_ALIVE_SCHEDULE_MAX_ENTRIES];
+    size_t entryCount = 0;
+    String parseError;
+
+    if (!configParseWifiAliveSchedule(
+            cfg_wifi_alive_schedule,
+            entries,
+            entryCount,
+            &parseError
+        ) || entryCount == 0) {
+        return false;
+    }
+
+    struct tm localNow;
+    if (!localtime_r(&nowEpoch, &localNow))
+        return false;
+
+    for (size_t i = 0; i < entryCount; ++i) {
+        const time_t todayStart =
+            wifiAliveLocalOccurrence(localNow, 0, entries[i].startMinuteOfDay);
+
+        const time_t yesterdayStart =
+            wifiAliveLocalOccurrence(localNow, -1, entries[i].startMinuteOfDay);
+
+        const time_t durationSeconds =
+            (time_t)entries[i].durationMinutes * 60;
+
+        const time_t todayEnd =
+            todayStart > 0 ? todayStart + durationSeconds : 0;
+
+        const time_t yesterdayEnd =
+            yesterdayStart > 0 ? yesterdayStart + durationSeconds : 0;
+
+        if (
+            todayStart > 0 &&
+            nowEpoch >= todayStart &&
+            nowEpoch < todayEnd
+        ) {
+            active = true;
+            if (todayEnd > activeUntilEpoch)
+                activeUntilEpoch = todayEnd;
+        }
+
+        if (
+            yesterdayStart > 0 &&
+            nowEpoch >= yesterdayStart &&
+            nowEpoch < yesterdayEnd
+        ) {
+            active = true;
+            if (yesterdayEnd > activeUntilEpoch)
+                activeUntilEpoch = yesterdayEnd;
+        }
+
+        time_t candidateNext = todayStart;
+        if (candidateNext <= nowEpoch) {
+            candidateNext =
+                wifiAliveLocalOccurrence(localNow, 1, entries[i].startMinuteOfDay);
+        }
+
+        if (
+            candidateNext > nowEpoch &&
+            (nextStartEpoch == 0 || candidateNext < nextStartEpoch)
+        ) {
+            nextStartEpoch = candidateNext;
+        }
+    }
+
+    return true;
+}
+
+
+static bool wifiAliveScheduleNextWakeDelayUs(
+    uint64_t &delayUs
+)
+{
+    delayUs = 0;
+
+    if (
+        !cfg_wifi_alive_schedule_enabled ||
+        streamerModeEnabled() ||
+        !timeIsValid()
+    ) {
+        return false;
+    }
+
+    struct timeval tv;
+    if (gettimeofday(&tv, nullptr) != 0)
+        return false;
+
+    bool active = false;
+    time_t activeUntilEpoch = 0;
+    time_t nextStartEpoch = 0;
+
+    if (!wifiAliveScheduleEvaluate(
+            tv.tv_sec,
+            active,
+            activeUntilEpoch,
+            nextStartEpoch
+        )) {
+        return false;
+    }
+
+    // An active window should already have brought WiFi online and therefore
+    // normally blocks sleep. Do not arm a redundant timer in that state.
+    if (active || nextStartEpoch <= tv.tv_sec)
+        return false;
+
+    int64_t remainingUs =
+        (int64_t)(nextStartEpoch - tv.tv_sec) * 1000000LL -
+        (int64_t)tv.tv_usec;
+
+    if (remainingUs < 1000LL)
+        remainingUs = 1000LL;
+
+    delayUs = (uint64_t)remainingUs;
+    return true;
+}
+
+
+static void serviceWifiAliveSchedule()
+{
+    if (streamerModeEnabled()) {
+        wifiAliveScheduleWindowActive = false;
+        wifiAliveScheduleOwnsSession = false;
+        return;
+    }
+
+    const uint32_t nowMs = millis();
+    if (
+        wifiAliveScheduleLastServiceMs != 0 &&
+        (uint32_t)(nowMs - wifiAliveScheduleLastServiceMs) < 1000UL
+    ) {
+        return;
+    }
+
+    wifiAliveScheduleLastServiceMs = nowMs;
+
+    bool scheduleActive = false;
+    time_t scheduleEndEpoch = 0;
+    time_t nextStartEpoch = 0;
+
+    if (cfg_wifi_alive_schedule_enabled) {
+        if (!timeIsValid()) {
+            wifiAliveScheduleWindowActive = false;
+
+            if (!wifiAliveScheduleClockWarningLogged) {
+                wifiAliveScheduleClockWarningLogged = true;
+                logWrite("WiFi schedule inactive | system time invalid");
+            }
+        } else {
+            wifiAliveScheduleClockWarningLogged = false;
+            const time_t nowEpoch = time(nullptr);
+            wifiAliveScheduleEvaluate(
+                nowEpoch,
+                scheduleActive,
+                scheduleEndEpoch,
+                nextStartEpoch
+            );
+        }
+    } else {
+        wifiAliveScheduleClockWarningLogged = false;
+    }
+
+    const bool wasActive = wifiAliveScheduleWindowActive;
+    wifiAliveScheduleWindowActive = scheduleActive;
+
+    if (scheduleActive) {
+        if (!webConfigStarted) {
+            logWrite("WiFi schedule window start | WiFi/WebConfig ON requested");
+            startWebConfig();
+
+            if (webConfigStarted) {
+                wifiAliveScheduleOwnsSession = true;
+                logWrite("WiFi schedule window start | WiFi/WebConfig ON");
+            } else {
+                logWrite("WiFi schedule window start | WiFi/WebConfig start failed");
+            }
+        } else if (!wasActive) {
+            logWrite("WiFi schedule window active | existing WiFi session retained");
+        }
+
+        return;
+    }
+
+    if (wasActive) {
+        logWrite("WiFi schedule window ended");
+    }
+
+    if (!wifiAliveScheduleOwnsSession)
+        return;
+
+    if (!webConfigStarted) {
+        wifiAliveScheduleOwnsSession = false;
+        return;
+    }
+
+    // API Exclusive is the established high-speed sync/download ownership.
+    // Never terminate a scheduled network session while that lease is active.
+    if (syncApiExclusiveActive())
+        return;
+
+    // The normal WebConfig activity clock is refreshed by every authenticated
+    // request before and after handling. Long synchronous downloads therefore
+    // cannot be cut off mid-transfer, and an open UI heartbeat remains active.
+    if (!webConfigInactiveFor(WIFI_ALIVE_POST_WINDOW_IDLE_SECONDS))
+        return;
+
+    stopWebConfigWifi("WiFi OFF: scheduled window ended");
+    wifiAliveScheduleOwnsSession = false;
 }
 
 
@@ -12157,34 +12425,77 @@ static bool configureSleepWakeSources()
 
     shooterDeepSleepRtcMagic = 0;
     shooterDeepSleepScheduledWallUs = 0;
+    wifiAliveDeepSleepRtcMagic = 0;
 
     uint64_t shooterDelayUs = 0;
     int64_t shooterScheduledWallUs = 0;
     uint8_t shooterWakeKind = SHOOTER_WAKE_NONE;
 
-    if (continuousShooterNextWakeDelayUs(
+    const bool shooterWakeAvailable =
+        continuousShooterNextWakeDelayUs(
             shooterDelayUs,
             shooterScheduledWallUs,
             shooterWakeKind
         ) &&
-        shooterWakeKind == SHOOTER_WAKE_SAMPLE
-    ) {
+        shooterWakeKind == SHOOTER_WAKE_SAMPLE;
+
+    uint64_t wifiAliveDelayUs = 0;
+    const bool wifiAliveWakeAvailable =
+        wifiAliveScheduleNextWakeDelayUs(
+            wifiAliveDelayUs
+        );
+
+    uint64_t timerDelayUs = UINT64_MAX;
+    bool timerForShooter = false;
+    bool timerForWifiAlive = false;
+
+    if (shooterWakeAvailable) {
+        timerDelayUs = shooterDelayUs;
+        timerForShooter = true;
+    }
+
+    if (wifiAliveWakeAvailable) {
+        if (timerDelayUs == UINT64_MAX || wifiAliveDelayUs < timerDelayUs) {
+            timerDelayUs = wifiAliveDelayUs;
+            timerForShooter = false;
+            timerForWifiAlive = true;
+        } else if (wifiAliveDelayUs == timerDelayUs) {
+            timerForWifiAlive = true;
+        }
+    }
+
+    if (timerDelayUs != UINT64_MAX) {
         esp_err_t timerErr =
             esp_sleep_enable_timer_wakeup(
-                shooterDelayUs
+                timerDelayUs
             );
 
         if (timerErr == ESP_OK) {
-            shooterDeepSleepRtcMagic =
-                SHOOTER_DEEP_SLEEP_RTC_MAGIC;
+            if (timerForShooter) {
+                shooterDeepSleepRtcMagic =
+                    SHOOTER_DEEP_SLEEP_RTC_MAGIC;
+                shooterDeepSleepScheduledWallUs =
+                    shooterScheduledWallUs;
+            }
 
-            shooterDeepSleepScheduledWallUs =
-                shooterScheduledWallUs;
-        } else if (cfg_debug_enabled) {
-            powerConsole(
-                "Shooter deep-sleep timer setup failed | error=0x%x",
-                timerErr
-            );
+            if (timerForWifiAlive) {
+                wifiAliveDeepSleepRtcMagic =
+                    WIFI_ALIVE_DEEP_SLEEP_RTC_MAGIC;
+            }
+        } else {
+            if (cfg_debug_enabled) {
+                powerConsole(
+                    "Deep-sleep timer setup failed | error=0x%x",
+                    timerErr
+                );
+            }
+
+            // Existing shooter behavior is preserved. The new WiFi schedule,
+            // however, must not knowingly enter deep sleep when its only timed
+            // wake could not be armed, otherwise the availability window would
+            // be silently missed.
+            if (wifiAliveWakeAvailable)
+                return false;
         }
     }
 
@@ -12321,6 +12632,7 @@ static bool configureLightSleepWakeSources()
 
     shooterLightSleepScheduledWallUs = 0;
     shooterLightSleepWakeKind = SHOOTER_WAKE_NONE;
+    wifiAliveLightSleepWakeArmed = false;
 
     uint64_t shooterDelayUs = 0;
     int64_t shooterScheduledWallUs = 0;
@@ -12329,45 +12641,73 @@ static bool configureLightSleepWakeSources()
     const bool shooterWakeRequired =
         continuousShooterIntervalUs() > 0;
 
-    bool shooterWakeArmed =
-        !shooterWakeRequired;
-
-    bool shooterWakeAvailable =
+    const bool shooterWakeAvailable =
         continuousShooterNextWakeDelayUs(
             shooterDelayUs,
             shooterScheduledWallUs,
             shooterWakeKind
         );
 
+    uint64_t wifiAliveDelayUs = 0;
+    const bool wifiAliveWakeAvailable =
+        wifiAliveScheduleNextWakeDelayUs(
+            wifiAliveDelayUs
+        );
+
+    uint64_t timerDelayUs = UINT64_MAX;
+    bool timerForShooter = false;
+    bool timerForWifiAlive = false;
+
     if (shooterWakeAvailable) {
+        timerDelayUs = shooterDelayUs;
+        timerForShooter = true;
+    }
+
+    if (wifiAliveWakeAvailable) {
+        if (timerDelayUs == UINT64_MAX || wifiAliveDelayUs < timerDelayUs) {
+            timerDelayUs = wifiAliveDelayUs;
+            timerForShooter = false;
+            timerForWifiAlive = true;
+        } else if (wifiAliveDelayUs == timerDelayUs) {
+            timerForWifiAlive = true;
+        }
+    }
+
+    bool timerArmed = timerDelayUs == UINT64_MAX;
+
+    if (timerDelayUs != UINT64_MAX) {
         esp_err_t timerErr =
             esp_sleep_enable_timer_wakeup(
-                shooterDelayUs
+                timerDelayUs
             );
 
         if (timerErr == ESP_OK) {
-            shooterLightSleepScheduledWallUs =
-                shooterScheduledWallUs;
-            shooterLightSleepWakeKind =
-                shooterWakeKind;
-            shooterWakeArmed = true;
+            timerArmed = true;
+
+            if (timerForShooter) {
+                shooterLightSleepScheduledWallUs =
+                    shooterScheduledWallUs;
+                shooterLightSleepWakeKind =
+                    shooterWakeKind;
+            }
+
+            wifiAliveLightSleepWakeArmed =
+                timerForWifiAlive;
         } else {
             powerConsole(
-                "Light sleep blocked | shooter timer setup failed | error=0x%x",
+                "Light sleep blocked | timer setup failed | error=0x%x",
                 timerErr
             );
         }
-    } else if (shooterWakeRequired) {
-        powerConsole(
-            "Light sleep blocked | shooter timer unavailable"
-        );
     }
 
-    // Fail safe: an enabled continuous shooter must never enter light sleep
-    // unless its next sample/flush wake is definitely armed. Otherwise a
-    // shooter-only installation without an active presence wake source could
-    // sleep indefinitely after WiFi shuts down.
-    if (!shooterWakeArmed) {
+    // A timer for an earlier event also protects every later event: after that
+    // wake the next light-sleep pass recalculates both schedules. Never sleep
+    // when a required shooter/WiFi wake exists but no timer could be armed.
+    if (
+        !timerArmed ||
+        (shooterWakeRequired && !shooterWakeAvailable)
+    ) {
         esp_sleep_disable_wakeup_source(
             ESP_SLEEP_WAKEUP_EXT0
         );
@@ -12389,6 +12729,7 @@ static bool configureLightSleepWakeSources()
 
         shooterLightSleepScheduledWallUs = 0;
         shooterLightSleepWakeKind = SHOOTER_WAKE_NONE;
+        wifiAliveLightSleepWakeArmed = false;
         return false;
     }
 
@@ -13466,9 +13807,17 @@ static bool enterLightSleep()
         wakeCause ==
         ESP_SLEEP_WAKEUP_EXT1;
 
-    const bool wokeByShooterTimer =
+    const bool wokeByTimer =
         wakeCause ==
         ESP_SLEEP_WAKEUP_TIMER;
+
+    const bool wokeByShooterTimer =
+        wokeByTimer &&
+        shooterLightSleepWakeKind != SHOOTER_WAKE_NONE;
+
+    const bool wokeByWifiAliveTimer =
+        wokeByTimer &&
+        wifiAliveLightSleepWakeArmed;
 
     esp_sleep_disable_wakeup_source(
         ESP_SLEEP_WAKEUP_EXT0
@@ -13519,14 +13868,14 @@ static bool enterLightSleep()
     if (
         wokeByPresence ||
         (
-            wokeByShooterTimer &&
+            wokeByTimer &&
             digitalRead(PIR_PIN) == HIGH
         )
     ) {
         motionDiagnosticsNotePresenceTrigger();
     }
 
-    if (wokeByShooterTimer) {
+    if (wokeByTimer) {
         // Drain the live radar/diagnostics once before classifying a simultaneous
         // TIMER + motion condition. This is RAM/UART work only; no SD/log delay.
         radarLoop();
@@ -13534,7 +13883,7 @@ static bool enterLightSleep()
     }
 
     const bool timerWakeMotionActive =
-        wokeByShooterTimer &&
+        wokeByTimer &&
         motionDetected();
 
     const bool recordingWakeFromSleep =
@@ -13676,6 +14025,21 @@ static bool enterLightSleep()
         shooterLightSleepScheduledWallUs = 0;
         shooterLightSleepWakeKind = SHOOTER_WAKE_NONE;
     }
+
+
+    if (
+        wokeByWifiAliveTimer &&
+        !timerWakeMotionActive &&
+        !wokeByMagnet
+    ) {
+        // Re-evaluate against the wall clock after wake instead of assuming the
+        // timer alone proves that the window is active (DST/time corrections may
+        // have happened). If active, this path starts and owns the WiFi session.
+        wifiAliveScheduleLastServiceMs = 0;
+        serviceWifiAliveSchedule();
+    }
+
+    wifiAliveLightSleepWakeArmed = false;
 
 
     if (wokeByMagnet) {
@@ -13995,7 +14359,7 @@ void startWebConfig()
     delay(50);
     infrastructureWifiRssiValid = false;
 
-    auto startConfiguredHotspot = []() -> bool {
+    auto startConfiguredHotspot = [](bool fallbackHotspot) -> bool {
         String apSsid = cfg_hostname;
 
         if (apSsid.length() == 0) {
@@ -14036,7 +14400,18 @@ void startWebConfig()
             return false;
         }
 
-        applyConfiguredWifiTxPower("AP");
+        if (fallbackHotspot) {
+            // The fallback AP is the recovery path when no configured
+            // infrastructure WLAN is reachable. Give it the full board-default
+            // TX power so recovery access has the best available range. This
+            // intentionally does not change the persisted user TX-power value.
+            applyWifiTxPowerX10(
+                BOARD_WIFI_TX_POWER_DEFAULT_X10,
+                "AP fallback"
+            );
+        } else {
+            applyConfiguredWifiTxPower("AP");
+        }
 
         consoleWrite(
             "WIFI",
@@ -14048,7 +14423,7 @@ void startWebConfig()
     };
 
     if (useHotspot) {
-        if (!startConfiguredHotspot())
+        if (!startConfiguredHotspot(false))
             return;
     } else {
         if (!wifiConnectConfiguredInfrastructure(8000UL, "Infrastructure WiFi")) {
@@ -14065,7 +14440,7 @@ void startWebConfig()
                 "Infrastructure WiFi unavailable | starting configured hotspot fallback"
             );
 
-            if (!startConfiguredHotspot())
+            if (!startConfiguredHotspot(true))
                 return;
         }
     }
@@ -14260,6 +14635,16 @@ bool handleWifiInactivityTimeout()
     // stored timeout for normal mode, but never apply it while streamer mode
     // owns the camera/network.
     if (streamerModeEnabled()) {
+        return false;
+    }
+
+    // A configured daily WiFi window is an additive keep-alive source. If the
+    // schedule itself started the current session, its post-window shutdown
+    // policy owns the lifecycle until the session is safely closed.
+    if (
+        wifiAliveScheduleWindowActive ||
+        wifiAliveScheduleOwnsSession
+    ) {
         return false;
     }
 
@@ -14590,6 +14975,11 @@ void setup() {
         wakeCause == ESP_SLEEP_WAKEUP_TIMER &&
         shooterDeepSleepRtcMagic == SHOOTER_DEEP_SLEEP_RTC_MAGIC;
 
+    const bool wifiAliveTimerWake =
+        resetReason == ESP_RST_DEEPSLEEP &&
+        wakeCause == ESP_SLEEP_WAKEUP_TIMER &&
+        wifiAliveDeepSleepRtcMagic == WIFI_ALIVE_DEEP_SLEEP_RTC_MAGIC;
+
     const int64_t shooterWakeWallUs =
         shooterTimerWake
         ? shooterDeepSleepScheduledWallUs
@@ -14599,6 +14989,7 @@ void setup() {
     // the same deep-sleep cycle must never leave a stale TIMER classification.
     shooterDeepSleepRtcMagic = 0;
     shooterDeepSleepScheduledWallUs = 0;
+    wifiAliveDeepSleepRtcMagic = 0;
 
     if (resetReason != ESP_RST_DEEPSLEEP) {
         normalDeepSleepRtcMagic = 0;
@@ -14647,7 +15038,7 @@ void setup() {
         );
     }
 
-    if (shooterTimerWake) {
+    if (shooterTimerWake || wifiAliveTimerWake) {
         // Normal deep sleep configured BOTH service inputs as RTC wake pads.
         // A timer wake leaves neither one as the reported wake cause, so restore
         // both explicitly before ordinary GPIO/diagnostic initialization.
@@ -15266,6 +15657,15 @@ void setup() {
 
     startWebConfig();
 
+    if (wifiAliveTimerWake && webConfigStarted) {
+        // This boot exists specifically because the daily availability timer
+        // fired. Treat the just-started network as schedule-owned so the
+        // ordinary inactivity timeout cannot shorten the configured window.
+        wifiAliveScheduleOwnsSession = true;
+        wifiAliveScheduleLastServiceMs = 0;
+        serviceWifiAliveSchedule();
+    }
+
     if (wokeByMagnet) {
         powerConsole(
             webConfigStarted
@@ -15485,6 +15885,20 @@ void setup() {
 
         // Deep sleep reboots the device, so there is no retained PSRAM queue
         // from the previous cycle. Start the normal idle delay after capture.
+        resetSleepDelayTimer();
+
+    }
+
+    else if (wifiAliveTimerWake) {
+
+        Serial.println(
+            "Wake reason: WIFI ALIVE SCHEDULE"
+        );
+
+        logWrite(
+            "Wake by WiFi alive schedule"
+        );
+
         resetSleepDelayTimer();
 
     }
@@ -15787,6 +16201,10 @@ void loop() {
 
     if (webConfigStarted)
         webConfigLoop();
+
+    // Additive daily availability schedule. This can bring WiFi/WebConfig back
+    // online after the ordinary inactivity timeout has switched the radio off.
+    serviceWifiAliveSchedule();
 
 
     // The explicit Recording Load Test owns the normal camera/recorder path but

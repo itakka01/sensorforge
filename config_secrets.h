@@ -10,7 +10,7 @@
 // The encryption key is derived from the board's SensorForge eFuse HMAC root
 // using a dedicated domain that is independent from video-storage keys.
 // The field name is authenticated as AAD, so ciphertext cannot be moved between
-// wifi_pass / hotspot_password / web_password without authentication failure.
+// WiFi/hotspot/web/stream passwords without authentication failure.
 
 bool configSecretIsEncrypted(const String &value);
 

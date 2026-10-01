@@ -1,6 +1,6 @@
 # SensorForge Integration API 1.0
 
-Status: 2026-09-22
+Status: 2026-10-02
 
 This document defines the stable local integration profile built on the existing
 SensorForge `/api/v1` HTTP API. It is intended for Home Assistant and other
@@ -16,7 +16,8 @@ local automation clients.
 - Existing camera configuration and stored media are not migrated by this API.
 - API 1.0 does not persistently change shooter or motion-recording settings.
 - Authentication remains the established SensorForge API HTTP Basic Auth using
-  the configured Web credentials.
+  the configured **administrator** Web credentials. v86 streaming-user accounts
+  are intentionally not accepted for `/api/v1` control/API access.
 - API responses never expose license hardware IDs, Wi-Fi passwords, web
   passwords, hotspot passwords, encryption keys or other secrets.
 
@@ -121,12 +122,26 @@ unavailable storage.
 The current Python sync client continues to use the existing routes and does not
 depend on the new Integration API 1.0 fields.
 
-## Current networking limitation
+## Current network behaviour
 
-The present SensorForge WebConfig/API server runs in the established local AP
-mode. Integration API 1.0 intentionally does not change Wi-Fi, sleep or boot
-behaviour. A later Connected profile can add infrastructure-Wi-Fi operation and
-Zeroconf discovery without changing this API contract.
+The WebConfig/API service follows the existing SensorForge network selection. It
+can run on the configured local hotspot or on the prioritized infrastructure-WiFi
+profiles; when enabled, the automatic hotspot fallback remains available if none
+of the configured external WLANs can be reached. Integration API 1.0 does not
+change that network, sleep or wake policy; it uses whichever supported service
+network SensorForge currently provides.
+
+## v86+ media-access note
+
+The v86 role split and the v87 Beta 1 WiFi/UI additions do not change Integration API 1.0. When SensorForge web
+access protection is enabled, administrator and streaming-user credentials may
+be used for the direct media paths such as `/snapshot`, HTTP-MJPEG on port 81
+and RTSP. The `/api/v1` namespace remains administrator-only.
+
+For a simple Home Assistant camera without API control, the documented media
+path is the MJPEG stream `http://<host>:81/stream` plus the still-image URL
+`http://<host>/snapshot`, with username/password supplied in the Home Assistant
+integration fields.
 
 ## Intended Home Assistant mapping
 
@@ -142,3 +157,33 @@ The first Home Assistant custom integration can be built read-mostly from:
 
 Persistent control of configuration switches should be added later through
 explicit API actions rather than by editing `config.txt` from Home Assistant.
+
+## Planned Android/application API expansion (not part of API 1.0)
+
+The planned Android client needs a substantially broader control surface than the
+current read-mostly integration profile. This is a roadmap, not an implemented or
+stable API contract. The preferred direction is additive `/api/v1` expansion with
+capability discovery and the existing administrator authorization model.
+
+Coverage should be brought close to the meaningful WebConfig/device functions,
+including at least:
+
+- read/write configuration in typed groups instead of raw `config.txt` editing
+- recording state/control and recording-related policy
+- continuous shooter configuration/control in addition to the existing status/flush
+- image-motion configuration, ROI/mask/background-learning actions and diagnostics
+- camera and advanced-camera settings plus safe preview/snapshot actions
+- audio configuration/status where supported
+- WiFi profiles, hotspot/fallback, TX power and WiFi-alive schedule management
+- streamer mode/configuration/status and stream endpoint discovery
+- storage/media maintenance operations with the same safety gates used by WebConfig
+- log/diagnostic access with bounded payloads
+- reboot/shutdown and other explicit system actions
+- user/access management only if a dedicated secure API contract is defined for it
+- firmware/update status; firmware upload itself should remain separately gated and
+  should not be exposed casually as a generic configuration action
+
+Existing `/api/v1` fields and routes should remain backward compatible. New write
+actions should validate exactly the same constraints and safety/ownership rules as
+the corresponding WebConfig paths rather than introducing a second independent
+configuration logic.
