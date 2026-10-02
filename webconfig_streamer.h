@@ -9,5 +9,6 @@ String webconfigStreamerDashboardHtml(uint8_t activeWebUiSessions);
 String webconfigStreamerOperatingModeHtml(
     bool configuredStreamerMode,
     int displayedStreamerRtspEnabled,
-    int displayedStreamerHttpEnabled
+    int displayedStreamerHttpEnabled,
+    int displayedOnvifEnabled
 );

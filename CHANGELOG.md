@@ -1,3 +1,73 @@
+## v87-beta16 — 2026-10-03
+
+- Documentation/version closeout for the ONVIF MVP after successful real Android/Onvier field qualification. Runtime source code is unchanged from v87-beta15.
+- Automatic WS-Discovery is again confirmed working on the real XIAO test device. Onvier discovers SensorForge without manual IP entry.
+- The same field test confirms ONVIF device/media queries, existing SensorForge credential authentication, snapshot access and RTSP/JPEG video playback. Onvier reports video streaming success with ONVIF service/snapshot on port 80 and RTSP on port 554.
+- The implemented scope is intentionally described as a SensorForge ONVIF basic/MVP integration, not as official ONVIF certification or full Profile-T conformance.
+- ONVIF is considered complete/frozen for the current product scope. Further changes should only be made for a concrete reproducible interoperability issue with another relevant NVR/client.
+- Host API remains 1.21 and Integration/App profile remains 1.1.
+
+## v87-beta15 — 2026-10-03
+
+- Compile fix for the Beta-14 ONVIF discovery rollback. `onvifBegin()` still contained initialization of the removed Beta-13 `discoveryInstanceId` / `discoveryMessageNumber` AppSequence state, although those variables had intentionally been removed when restoring the known-working Beta-9 discovery wire format.
+- Removed only those stale references. ProbeMatch/ResolveMatch/Hello/Bye payloads, Beta-10/11 authentication fixes, Beta-12 retry logic and Beta-13 discovery diagnostics remain unchanged.
+- This fixes the Arduino-ESP32 3.3.12 errors `discoveryInstanceId was not declared in this scope` and `discoveryMessageNumber was not declared in this scope`. No runtime media or ONVIF behavior is otherwise changed.
+
+## v87-beta14 — 2026-10-03
+
+- Fixed the remaining automatic ONVIF discovery regression using the real Beta-13 field diagnostics. Onvier probes reached SensorForge (`onvif_probe_rx` increased), SensorForge successfully transmitted ProbeMatch replies (`onvif_probe_match_tx` increased), and the remote endpoint was the Android client, proving that multicast reception and UDP reply transport were working while the client rejected the response payload.
+- Compared the discovery wire format against v87-beta9, the last field-proven build that Onvier discovered automatically. Beta 13 had changed the ProbeMatch/Hello/Bye headers, XAddr advertisement and `Types` field. In particular, Beta 9 advertised `tds:Device dn:NetworkVideoTransmitter`, while Beta 13 had dropped `tds:Device`.
+- ProbeMatch, ResolveMatch, Hello and Bye are therefore restored to the exact Beta-9-compatible envelope/body format, including `tds:Device dn:NetworkVideoTransmitter` and the single established Device-Service XAddr. The later AppSequence/mustUnderstand/multi-XAddr experiment is removed instead of stacking further speculative discovery changes.
+- Beta-10/11 WS-Security authentication fixes, Beta-12 startup retry and Beta-13 discovery counters remain intact. Manual ONVIF setup, RTSP video and snapshot behavior are unchanged. No camera, RTSP/RTP, HTTP-MJPEG, audio, recording or download data path changed.
+- Static comparison confirms that the current `discoveryEnvelope()`, `discoveryMatchBody()` and `sendHello()` payload generators are byte-for-byte identical in source form to the known-working Beta-9 implementations; only the newer diagnostics/retry remain around them. Real automatic Onvier discovery retest is required.
+
+## v87-beta13 — 2026-10-03
+
+- Fixed the remaining automatic ONVIF discovery interoperability issue after a real Android/Onvier test proved that manual IP setup, WS-Security authentication, snapshot/RTSP ports and video streaming all work while automatic device discovery still fails. The fault domain is therefore limited to WS-Discovery.
+- ProbeMatch/Hello/Bye messages now include a WS-Discovery `AppSequence` plus WS-Addressing `mustUnderstand` attributes consistent with the ONVIF reference exchange. The per-boot InstanceId is random/non-zero and MessageNumber advances monotonically for discovery messages.
+- Discovery now advertises all usable local Device Service addresses in `XAddrs` when WiFi is in AP+STA mode instead of always preferring the AP address. This avoids returning an unreachable AP address to a client probing from the infrastructure WLAN.
+- Discovery advertises the legacy-compatible `dn:NetworkVideoTransmitter` device type used by ONVIF discovery examples and expected by many older clients. SOAP Device/Media functionality is unchanged.
+- Added lightweight diagnostics to `/streamer_status`: `onvif_probe_rx`, `onvif_probe_match_tx` and `onvif_last_remote`. They add no media-path processing and make future discovery failures immediately distinguishable between missing incoming Probes and rejected ProbeMatch responses.
+- Beta-12 startup retry and Beta-11/10 authentication fixes remain intact. No RTSP, JPEG, HTTP-MJPEG, audio, recording or download path changed. Host API remains 1.21 / Integration profile 1.1.
+- The ONVIF module passes the isolated Arduino-ESP32-3.3.12 compatibility syntax build. Real Onvier automatic-discovery retest remains required.
+
+## v87-beta12 — 2026-10-03
+
+- Hardened ONVIF WS-Discovery startup after a real Beta-11 field observation where the camera was no longer discovered after reboot/update. Discovery startup previously ran only once when the streamer started.
+- If IPv4/network readiness or the UDP multicast bind is not yet available at that exact moment, ONVIF now retries the discovery join every 5 seconds while streamer mode, RTSP and `onvif_enabled` remain active. A failed multicast socket is stopped before retrying.
+- Retry work is performed only while discovery is inactive and consists of a bounded network-state check/multicast bind attempt; it does not touch camera capture, RTSP/RTP, HTTP-MJPEG, audio, recording or download paths.
+- Beta-11 UsernameToken/XML parsing remains unchanged. Host API remains 1.21 / Integration profile 1.1.
+- The updated module passed the isolated C++ syntax build against the Arduino-ESP32 3.3.12 compatibility stub. Real XIAO/Freenove WS-Discovery retest remains required.
+
+## v87-beta11 — 2026-10-03
+
+- Fixed the remaining ONVIF/Onvier authentication failure after Beta 10. Real WS-Security UsernameToken requests commonly encode `Password` and `Nonce` with attributes such as `Type="...#PasswordDigest"` and `EncodingType="...#Base64Binary"`.
+- The previous lightweight XML helper only recognized opening tags that ended immediately after the element name, so it silently failed to extract attributed `Password`/`Nonce` elements and rejected an otherwise valid UsernameToken with HTTP 401.
+- ONVIF text-element parsing now matches XML local names independently of namespace prefix and opening-tag attributes, and decodes the standard XML text entities. This also makes profile/address parsing more tolerant without introducing a general-purpose XML dependency.
+- The PasswordDigest calculation, configured administrator/streaming-user credentials, PRE_AUTH behavior and HTTP Digest fallback are unchanged. No media, RTSP, HTTP-MJPEG, snapshot, audio, recording or download path changed.
+- The parser was exercised with a representative WS-Security UsernameToken containing attributed `Password` and `Nonce` elements; isolated C++ syntax compilation passed. Full Arduino-ESP32 3.3.12 build and renewed Onvier/NVR hardware test remain required.
+
+## v87-beta10 — 2026-10-03
+
+- Fixed ONVIF authentication interoperability found during the first real Android/Onvier test. Beta 9 challenged every ONVIF SOAP request in the central WebConfig middleware, so even ONVIF `PRE_AUTH` operations such as `GetSystemDateAndTime` incorrectly returned HTTP 401.
+- ONVIF Device operations defined as pre-authentication reads in the implemented subset (`GetSystemDateAndTime`, `GetCapabilities`, `GetServices`, `GetServiceCapabilities`, `GetHostname`) now reach the Device service without credentials as required by the ONVIF Core access model.
+- Added WS-Security UsernameToken `PasswordDigest` verification for authenticated ONVIF SOAP requests. The verifier uses the existing SensorForge administrator and streaming-user credentials and validates the standard `Base64(SHA1(Base64Decode(Nonce) + Created + Password))` form; plaintext SOAP passwords are not accepted.
+- Existing HTTP Basic/Digest compatibility remains available for ONVIF clients that use HTTP-layer authentication. `GetServiceCapabilities` now advertises both `UsernameToken=true` and `HttpDigest=true`.
+- ONVIF authentication is now owned by the ONVIF SOAP handlers rather than the generic browser access middleware, while the endpoints remain excluded from browser CSRF handling because they expose read-only machine-to-machine operations.
+- No RTSP, HTTP-MJPEG, snapshot, audio, recording or download media path changed. Host API remains 1.21 / Integration profile 1.1.
+- The PasswordDigest calculation was cross-checked against a known Onvifer/Onvier-compatible request vector. A full Arduino-ESP32 3.3.12 build and renewed real Onvier/NVR test remain required.
+
+## v87-beta9 — 2026-10-02
+
+- Added an optional `onvif_enabled` integration for streamer mode. It defaults to off and requires the existing RTSP output; older configurations without the key remain unchanged.
+- Added lightweight WS-Discovery on UDP multicast `239.255.255.250:3702`, including Probe/Resolve responses plus Hello/Bye lifecycle announcements. Discovery work is bounded to at most two datagrams per streamer loop pass.
+- Added read-only ONVIF Device and Media SOAP endpoints at `/onvif/device_service` and `/onvif/media_service`. The initial interoperability set covers device information/capabilities/scopes/time/hostname and media profiles, JPEG source/encoder information, RTSP stream URI and snapshot URI.
+- ONVIF does not create a second camera or media path. It advertises the existing SensorForge RTSP/RTP-JPEG stream and `/snapshot`; RTSP, HTTP-MJPEG, audio, recording and download data paths are otherwise unchanged.
+- When SensorForge access protection is enabled, ONVIF web-service requests use the existing administrator/streaming-user credentials and are challenged with HTTP Digest. The machine-to-machine ONVIF SOAP POSTs are intentionally outside the browser CSRF-token contract and expose no mutating ONVIF actions.
+- Added ONVIF configuration/status visibility to WebConfig, streamer diagnostics and API host protocol **1.21**. Integration profile remains **1.1**.
+- This is a pragmatic ONVIF interoperability layer, not an ONVIF Profile T conformance claim. SensorForge continues to stream JPEG/MJPEG over RTSP; no H.264/H.265 transcoder or additional media encryption/load was introduced.
+- Static/source checks were performed, including an isolated C++ syntax build of the new ONVIF module against Arduino-ESP32-3.3.12 API signatures. A full Arduino build plus real NVR/WS-Discovery tests on XIAO/Freenove remain required.
+
 ## v87-beta8 — 2026-10-02
 
 - Documentation-only security clarification; no firmware runtime logic changed from v87 Beta 7.

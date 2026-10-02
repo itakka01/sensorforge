@@ -1,15 +1,15 @@
 # SensorForge Local API v1
 
-Status: 2026-10-02  
-Firmware worktree: **v87 Beta 3**  
-Host protocol: **1.20**  
+Status: 2026-10-03  
+Firmware worktree: **v87 Beta 16**  
+Host protocol: **1.21**  
 Integration profile: **1.1**
 
 This document defines the local HTTP API used by SensorForge Sync clients,
 Home Assistant-style integrations and the planned Android application.
 
 The API remains deliberately inside the existing `/api/v1` namespace. The
-1.20/1.1 expansion is additive: existing v1 routes and previously documented
+1.21/1.1 expansion is additive: existing v1 routes and previously documented
 fields remain valid.
 
 ## Security model
@@ -85,6 +85,22 @@ Machine-oriented API feature discovery. It explicitly reports support for:
 - transport control
 - config-storage management
 - reboot/shutdown
+- basic ONVIF interoperability capability (`onvif_basic`) and `onvif_enabled` state/configuration
+
+ONVIF itself is not transported through `/api/v1`: when enabled in streamer mode,
+WS-Discovery and the read-only `/onvif/device_service` / `/onvif/media_service`
+SOAP endpoints expose the existing RTSP/JPEG stream and snapshot URI. Device
+operations marked PRE_AUTH by the implemented ONVIF subset are available before
+authentication; protected SOAP reads accept the existing SensorForge credentials
+through HTTP Basic/Digest or WS-Security UsernameToken/PasswordDigest. This does
+not change Integration profile 1.1 or the established media-transfer paths.
+
+Field qualification status (v87 Beta 16): the implemented ONVIF basic/MVP scope
+was verified on real XIAO hardware with Android Onvier. Automatic WS-Discovery,
+protected Device/Media SOAP reads, snapshot access and RTSP/JPEG video playback
+all succeeded. The implementation is therefore frozen for the current product
+scope unless a concrete reproducible interoperability issue is found. This is
+not a claim of official ONVIF certification or full Profile-T conformance.
 
 Firmware upload, license management and generic factory reset are intentionally
 not exposed by this API expansion yet. Those operations remain on their existing
@@ -148,7 +164,7 @@ Returns every canonical configuration key currently known to the API with:
 - whether generic partial writes are allowed
 
 The canonical set covers camera, recording, audio, shooter, image motion,
-streamer, sleep/power, transport tuning, storage policy, network/WiFi,
+streamer (including additive `onvif_enabled`), sleep/power, transport tuning, storage policy, network/WiFi,
 metadata, WebConfig/access and logging.
 
 `transport_mode` is intentionally read-only in the generic config endpoint; use

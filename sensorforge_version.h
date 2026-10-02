@@ -21,13 +21,13 @@
 // WebConfig, so a running device can be mapped back to the exact Git tag.
 
 #define SENSORFORGE_RELEASE_NUMBER 87
-#define SENSORFORGE_RELEASE_TAG "v87-beta8"
-#define SENSORFORGE_RELEASE_DATE "2026-10-02"
+#define SENSORFORGE_RELEASE_TAG "v87-beta16"
+#define SENSORFORGE_RELEASE_DATE "2026-10-03"
 #define SENSORFORGE_RELEASE_SUMMARY \
-    "Beta 8: documentation-only security clarification for HTTP/Basic management access and future HTTPS/TLS hardening."
+    "Beta 16: ONVIF field qualification completed; discovery, authentication, snapshot and RTSP/JPEG video verified with Onvier."
 
-// Current source-tree stage. v87 Beta 8 is documentation-only: current local HTTP/Basic management trust model and future HTTPS/TLS hardening are made explicit; runtime behavior is unchanged.
-#define SENSORFORGE_WORKTREE_STAGE "v87-beta8"
-#define SENSORFORGE_WORKTREE_DATE "2026-10-02"
+// Current source-tree stage. v87 Beta 16 is the field-qualified ONVIF reference stand; runtime code is unchanged from Beta 15.
+#define SENSORFORGE_WORKTREE_STAGE "v87-beta16"
+#define SENSORFORGE_WORKTREE_DATE "2026-10-03"
 #define SENSORFORGE_WORKTREE_SUMMARY \
-    "v87 Beta 8: documentation-only management transport policy; HTTP/Basic remains local/trusted-network only, HTTPS/TLS stays a future hardening item."
+    "v87 Beta 16: ONVIF MVP field-qualified with automatic discovery, authentication, snapshot and RTSP/JPEG video; ONVIF frozen unless a reproducible client issue appears."

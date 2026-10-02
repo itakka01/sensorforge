@@ -1,4 +1,5 @@
 #include "streamer.h"
+#include "onvif.h"
 
 #include "audio_capture.h"
 #include "config.h"
@@ -2371,6 +2372,11 @@ static void handleStreamerStatus()
         ",\"mode\":\"" + (streamerModeEnabled() ? "streamer" : "normal") + "\"" +
         ",\"rtsp_enabled\":" + (cfg_streamer_rtsp_enabled ? "true" : "false") +
         ",\"http_mjpeg_enabled\":" + (cfg_streamer_http_mjpeg_enabled ? "true" : "false") +
+        ",\"onvif_enabled\":" + (cfg_onvif_enabled ? "true" : "false") +
+        ",\"onvif_active\":" + (onvifActive() ? "true" : "false") +
+        ",\"onvif_probe_rx\":" + String(onvifDiscoveryProbeCount()) +
+        ",\"onvif_probe_match_tx\":" + String(onvifDiscoveryMatchCount()) +
+        ",\"onvif_last_remote\":\"" + onvifDiscoveryLastRemote() + "\"" +
         ",\"rtsp_client\":" + (streamerRtspClientConnected() ? "true" : "false") +
         ",\"rtsp_clients\":" + String((unsigned)streamerRtspClientCount()) +
         ",\"http_client\":" + (streamerHttpClientConnected() ? "true" : "false") +
@@ -2511,9 +2517,17 @@ bool streamerBegin(String &error)
     stressState = StreamerStressState();
     started = true;
 
+    String onvifError;
+    if (!onvifBegin(onvifError)) {
+        // ONVIF is an optional integration layer. Discovery failure must not
+        // take the established RTSP/HTTP media service down.
+        logWrite("ONVIF startup failed | " + onvifError);
+    }
+
     logWrite(
         "STREAMER started | rtsp=" + String(cfg_streamer_rtsp_enabled) +
         " | http_mjpeg=" + String(cfg_streamer_http_mjpeg_enabled) +
+        " | onvif=" + String(cfg_onvif_enabled) +
         " | fps=" + String(cfg_fps)
     );
     return true;
@@ -2526,6 +2540,7 @@ void streamerLoop()
 
     serviceRtspControl();
     serviceHttpControl();
+    onvifLoop();
     audioDrainPacketsLast = 0;
     serviceAudio();
     captureAndDistributeFrame();
@@ -2593,6 +2608,7 @@ void streamerStop()
 {
     if (stressState.mode != StreamerStressMode::None)
         finishStreamerStress("streamer_stop");
+    onvifStop();
     closeAllRtspClients();
     closeAllHttpClients();
     if (started && cfg_streamer_rtsp_enabled)

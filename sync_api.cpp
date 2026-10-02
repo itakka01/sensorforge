@@ -15,6 +15,7 @@
 #include "recording_storage.h"
 #include "image_motion.h"
 #include "streamer.h"
+#include "onvif.h"
 #include "webconfig.h"
 #include "webconfig_wifi.h"
 #include "sensorforge_version.h"
@@ -72,7 +73,7 @@ static WebServer *syncServer = nullptr;
 // firmware compile timestamp, so every newly compiled API identifies itself
 // with a fresh, chronologically increasing build version.
 static const uint16_t SYNC_API_VERSION_MAJOR = 1;
-static const uint16_t SYNC_API_VERSION_MINOR = 20;
+static const uint16_t SYNC_API_VERSION_MINOR = 21;
 
 // Stable integration contract intended for Home Assistant and other local
 // automation clients. The transport/protocol version above may grow additively,
@@ -625,7 +626,10 @@ static void handleDevice()
         "\",\"operating_mode\":\"" + jsonEscape(cfg_operating_mode) +
         "\",\"streamer_rtsp_enabled\":" + String(cfg_streamer_rtsp_enabled ? "true" : "false") +
         ",\"streamer_http_mjpeg_enabled\":" + String(cfg_streamer_http_mjpeg_enabled ? "true" : "false") +
-        ",\"capabilities\":{" +
+        ",\"onvif_enabled\":" + String(cfg_onvif_enabled ? "true" : "false") +
+        ",\"onvif_active\":" + String(onvifActive() ? "true" : "false") +
+        ",\"onvif_device_service\":\"" + jsonEscape(onvifDeviceServiceUrl()) +
+        "\",\"capabilities\":{" +
             "\"camera_snapshot\":true," +
             "\"motion_state\":true," +
             "\"image_motion_state\":true," +
@@ -645,6 +649,7 @@ static void handleDevice()
             "\"network_scan\":true," +
             "\"system_actions\":true," +
             "\"rtsp\":true," +
+            "\"onvif_basic\":true," +
             "\"mqtt\":false" +
         "}}";
 
@@ -692,6 +697,7 @@ static void handleIntegrationState()
         ",\"exclusive_active\":" + String(syncExclusiveActiveState ? "true" : "false") +
         ",\"operating_mode\":\"" + jsonEscape(cfg_operating_mode) +
         "\",\"streamer_ready\":" + String(streamerReady() ? "true" : "false") +
+        ",\"onvif_enabled\":" + String(cfg_onvif_enabled ? "true" : "false") +
         ",\"streamer_rtsp_client\":" + String(streamerRtspClientConnected() ? "true" : "false") +
         ",\"streamer_http_client\":" + String(streamerHttpClientConnected() ? "true" : "false") +
         ",\"streamer_audio_available\":" + String(streamerAudioAvailable() ? "true" : "false") +
@@ -2565,6 +2571,7 @@ static const ApiConfigFieldDef API_CONFIG_FIELDS[] = {
     {"operating_mode", "streamer", false, true},
     {"streamer_rtsp_enabled", "streamer", false, true},
     {"streamer_http_mjpeg_enabled", "streamer", false, true},
+    {"onvif_enabled", "streamer", false, true},
 
     {"sleep_mode", "power", false, true},
     {"sleep_delay_ms", "power", false, true},
@@ -3316,6 +3323,9 @@ static void handleStreamerStatusExtended()
         ",\"ready\":" + String(streamerReady() ? "true" : "false") +
         ",\"rtsp_enabled\":" + String(cfg_streamer_rtsp_enabled ? "true" : "false") +
         ",\"http_mjpeg_enabled\":" + String(cfg_streamer_http_mjpeg_enabled ? "true" : "false") +
+        ",\"onvif_enabled\":" + String(cfg_onvif_enabled ? "true" : "false") +
+        ",\"onvif_active\":" + String(onvifActive() ? "true" : "false") +
+        ",\"onvif_device_service\":\"" + jsonEscape(onvifDeviceServiceUrl()) + "\"" +
         ",\"rtsp_clients\":" + String(streamerRtspClientCount()) +
         ",\"http_clients\":" + String(streamerHttpClientCount()) +
         ",\"audio_available\":" + String(streamerAudioAvailable() ? "true" : "false") +

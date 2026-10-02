@@ -102,6 +102,15 @@ static bool streamReadOnlyPath(const String &uri)
         return true;
     }
 
+    // Read-only ONVIF device/media web-service endpoints. They use POST for
+    // SOAP reads, but SensorForge exposes no mutating ONVIF operations.
+    if (
+        uri == "/onvif/device_service" ||
+        uri == "/onvif/media_service"
+    ) {
+        return true;
+    }
+
     // Read-only recording browser and WebPlayer resources.
     if (
         uri == "/files" ||
@@ -183,6 +192,9 @@ bool accessControlWebRequestAllowed(
     }
 
     if (method == HTTP_POST) {
+        if (uri == "/onvif/device_service" || uri == "/onvif/media_service")
+            return true;
+
         if (uri == "/player_annotation")
             return cfg_stream_allow_annotation_edit != 0;
 

@@ -48,6 +48,7 @@
 #include "access_control.h"
 #include "firmware_security.h"
 #include "web_csrf.h"
+#include "onvif.h"
 
 static const char *AUDIO_MIC_TEST_PATH = "/sensorforge_audio_test.wav";
 static const uint32_t AUDIO_MIC_TEST_DURATION_MS = 10000UL;
@@ -4335,6 +4336,11 @@ static void handleConfig()
         ? (server.arg("pending_http").toInt() ? 1 : 0)
         : cfg_streamer_http_mjpeg_enabled;
 
+    const int displayedOnvifEnabled =
+        server.hasArg("pending_onvif")
+        ? (server.arg("pending_onvif").toInt() ? 1 : 0)
+        : cfg_onvif_enabled;
+
     String recordingTriggerInfo =
         "Hier legst du fest, wodurch eine automatische Alarm-/Motionaufnahme ausgelöst wird.\n\n"
         "Sensor direkt: Ein angeschlossener Radar-/PIR-Sensor startet die Aufnahme sofort.\n"
@@ -4344,7 +4350,8 @@ static void handleConfig()
     html += webconfigStreamerOperatingModeHtml(
         configuredStreamerMode,
         displayedStreamerRtspEnabled,
-        displayedStreamerHttpEnabled
+        displayedStreamerHttpEnabled,
+        displayedOnvifEnabled
     );
 
     html +=
@@ -5037,6 +5044,20 @@ static void handleSave()
         ? (server.hasArg("streamer_http_mjpeg_enabled") ? 1 : 0)
         : cfg_streamer_http_mjpeg_enabled;
 
+    int onvifEnabled =
+        hasOperatingModeUi
+        ? (server.hasArg("onvif_enabled") ? 1 : 0)
+        : cfg_onvif_enabled;
+
+    if (onvifEnabled && !streamerRtspEnabled) {
+        server.send(
+            400,
+            "text/plain; charset=utf-8",
+            "ONVIF benötigt den RTSP-Stream. Aktiviere RTSP oder deaktiviere ONVIF."
+        );
+        return;
+    }
+
     if (hasOperatingModeUi && operatingMode == "streamer" &&
         !streamerRtspEnabled && !streamerHttpMjpegEnabled) {
         server.send(
@@ -5055,7 +5076,8 @@ static void handleSave()
                 cfg_operating_mode == "streamer" &&
                 (
                     streamerRtspEnabled != cfg_streamer_rtsp_enabled ||
-                    streamerHttpMjpegEnabled != cfg_streamer_http_mjpeg_enabled
+                    streamerHttpMjpegEnabled != cfg_streamer_http_mjpeg_enabled ||
+                    onvifEnabled != cfg_onvif_enabled
                 )
             )
         );
@@ -5674,6 +5696,10 @@ static void handleSave()
 
     text += "streamer_http_mjpeg_enabled=";
     text += String(streamerHttpMjpegEnabled);
+    text += '\n';
+
+    text += "onvif_enabled=";
+    text += String(onvifEnabled);
     text += '\n';
 
     // transport_mode is an operational flag controlled by the dedicated
@@ -7183,11 +7209,13 @@ static void handleStreamerSave()
     String mode = server.arg("operating_mode");
     int rtsp = server.hasArg("rtsp") ? 1 : 0;
     int http = server.hasArg("http") ? 1 : 0;
+    int onvif = rtsp ? cfg_onvif_enabled : 0;
     String error;
     ConfigSaveResult result = configSaveStreamerSettings(
         mode,
         rtsp,
         http,
+        onvif,
         streamerConfigWriteToSd(),
         error
     );
@@ -19256,7 +19284,14 @@ void webConfigStart()
             SensorForgeAccessRole role =
                 SENSORFORGE_ACCESS_ADMIN;
 
-            if (cfg_web_auth_enabled) {
+            const bool onvifRequest =
+                requestServer.uri() == "/onvif/device_service" ||
+                requestServer.uri() == "/onvif/media_service";
+
+            // ONVIF owns authentication inside its SOAP handlers. Some Device
+            // operations are PRE_AUTH by specification, while authenticated
+            // clients may use either HTTP Digest or WS-Security UsernameToken.
+            if (cfg_web_auth_enabled && !onvifRequest) {
                 role = accessControlWebRole(requestServer);
 
                 if (role == SENSORFORGE_ACCESS_NONE) {
@@ -19441,6 +19476,7 @@ void webConfigStart()
     // unchanged; the API adds browser/Python/app access on the same server.
     syncApiRegisterRoutes(server);
     streamerRegisterWebRoutes(server);
+    onvifRegisterWebRoutes(server);
 
     webPlayerRegisterRoutes(server);
 

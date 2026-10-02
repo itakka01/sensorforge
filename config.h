@@ -92,6 +92,7 @@ extern String cfg_image_motion_roi_mask; // 20x15 compact bit mask, 76 hex chars
 extern String cfg_operating_mode;              // "normal" or "streamer"
 extern int cfg_streamer_rtsp_enabled;           // 0/1
 extern int cfg_streamer_http_mjpeg_enabled;     // 0/1
+extern int cfg_onvif_enabled;                    // 0/1, basic ONVIF discovery/media integration
 
 // Sleep / power management
 extern String cfg_sleep_mode;         // "off", "light_sleep", "deep_sleep"
@@ -451,6 +452,7 @@ ConfigSaveResult configSaveStreamerSettings(
     const String &operatingMode,
     int rtspEnabled,
     int httpMjpegEnabled,
+    int onvifEnabled,
     bool writeToSd,
     String &error
 );

@@ -137,6 +137,7 @@ String cfg_image_motion_roi_mask = imageMotionDefaultRoiMask();
 String cfg_operating_mode = "normal";
 int cfg_streamer_rtsp_enabled = 0;
 int cfg_streamer_http_mjpeg_enabled = 0;
+int cfg_onvif_enabled = 0;
 
 String cfg_sleep_mode = "off";
 int cfg_sleep_delay_ms = 2000;
@@ -636,6 +637,7 @@ struct ConfigValues {
     String operatingMode;
     int streamerRtspEnabled;
     int streamerHttpMjpegEnabled;
+    int onvifEnabled;
 
     String sleepMode;
     int sleepDelayMs;
@@ -754,6 +756,7 @@ struct ConfigSeen {
     bool operatingMode;
     bool streamerRtspEnabled;
     bool streamerHttpMjpegEnabled;
+    bool onvifEnabled;
 
     bool sleepMode;
     bool sleepDelayMs;
@@ -1004,6 +1007,9 @@ static ConfigValues makeDefaultValues()
     values.streamerHttpMjpegEnabled =
         0;
 
+    values.onvifEnabled =
+        0;
+
     values.sleepMode =
         "off";
 
@@ -1212,6 +1218,7 @@ static bool serializeConfigValues(
     APPEND_CONFIG_VALUE("operating_mode", values.operatingMode);
     APPEND_CONFIG_VALUE("streamer_rtsp_enabled", String(values.streamerRtspEnabled));
     APPEND_CONFIG_VALUE("streamer_http_mjpeg_enabled", String(values.streamerHttpMjpegEnabled));
+    APPEND_CONFIG_VALUE("onvif_enabled", String(values.onvifEnabled));
 
     APPEND_CONFIG_VALUE("sleep_mode", values.sleepMode);
     APPEND_CONFIG_VALUE("sleep_delay_ms", String(values.sleepDelayMs));
@@ -2740,6 +2747,16 @@ static bool validateValues(
         return false;
     }
 
+    if (values.onvifEnabled != 0 && values.onvifEnabled != 1) {
+        error = "onvif_enabled must be 0 or 1";
+        return false;
+    }
+
+    if (values.onvifEnabled && !values.streamerRtspEnabled) {
+        error = "onvif_enabled requires streamer_rtsp_enabled=1";
+        return false;
+    }
+
 
     if (
         values.sleepMode != "off" &&
@@ -3998,6 +4015,20 @@ static bool parseConfigText(
                 values.streamerHttpMjpegEnabled = (int)numericValue;
 
             } else if (
+                key == "onvif_enabled"
+            ) {
+
+                if (
+                    !markOnce(seen.onvifEnabled, key, error) ||
+                    !parseIntegerStrict(value, numericValue)
+                ) {
+                    if (!error.length()) error = "invalid onvif_enabled";
+                    return false;
+                }
+
+                values.onvifEnabled = (int)numericValue;
+
+            } else if (
                 key == "sleep_mode"
             ) {
 
@@ -5110,6 +5141,9 @@ static void applyValues(
 
     cfg_streamer_http_mjpeg_enabled =
         values.streamerHttpMjpegEnabled;
+
+    cfg_onvif_enabled =
+        values.onvifEnabled;
 
     cfg_sleep_mode =
         values.sleepMode;
@@ -8245,6 +8279,7 @@ ConfigSaveResult configSaveStreamerSettings(
     const String &operatingModeInput,
     int rtspEnabled,
     int httpMjpegEnabled,
+    int onvifEnabled,
     bool writeToSd,
     String &error
 )
@@ -8259,8 +8294,14 @@ ConfigSaveResult configSaveStreamerSettings(
     }
 
     if ((rtspEnabled != 0 && rtspEnabled != 1) ||
-        (httpMjpegEnabled != 0 && httpMjpegEnabled != 1)) {
-        error = "streamer enable flags must be 0 or 1";
+        (httpMjpegEnabled != 0 && httpMjpegEnabled != 1) ||
+        (onvifEnabled != 0 && onvifEnabled != 1)) {
+        error = "streamer/ONVIF enable flags must be 0 or 1";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (onvifEnabled && !rtspEnabled) {
+        error = "onvif_enabled requires streamer_rtsp_enabled=1";
         return CONFIG_SAVE_INTERNAL_FAILED;
     }
 
@@ -8291,6 +8332,7 @@ ConfigSaveResult configSaveStreamerSettings(
     setKey("operating_mode", operatingMode);
     setKey("streamer_rtsp_enabled", String(rtspEnabled));
     setKey("streamer_http_mjpeg_enabled", String(httpMjpegEnabled));
+    setKey("onvif_enabled", String(onvifEnabled));
 
     // Operating-mode and streamer transport changes are reboot-only by design.
     // Do NOT alter runtime globals here: hot-switching camera/audio ownership

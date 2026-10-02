@@ -2,6 +2,7 @@
 
 #include "config.h"
 #include "streamer.h"
+#include "onvif.h"
 
 #include <esp_heap_caps.h>
 #include <WiFi.h>
@@ -178,7 +179,8 @@ String webconfigStreamerDashboardHtml(uint8_t activeWebUiSessions)
 String webconfigStreamerOperatingModeHtml(
     bool configuredStreamerMode,
     int displayedStreamerRtspEnabled,
-    int displayedStreamerHttpEnabled
+    int displayedStreamerHttpEnabled,
+    int displayedOnvifEnabled
 )
 {
     String html;
@@ -199,6 +201,15 @@ String webconfigStreamerOperatingModeHtml(
     const String homeAssistantHost = streamerUiActiveHost();
     const String homeAssistantMjpegUrl = "http://" + homeAssistantHost + ":81/stream";
     const String homeAssistantSnapshotUrl = "http://" + homeAssistantHost + "/snapshot";
+    const String onvifDeviceUrl = onvifDeviceServiceUrl();
+    const bool onvifUiEnglish = cfg_web_language == "en";
+    const String onvifTitle = onvifUiEnglish ? "ONVIF / NVR discovery" : "ONVIF / NVR-Erkennung";
+    const String onvifDescription = onvifUiEnglish
+        ? "Optional WS-Discovery/ONVIF basic integration for NVR software. It reuses the existing RTSP/JPEG stream and /snapshot; no second media pipeline. ONVIF therefore requires RTSP."
+        : "Optionale WS-Discovery-/ONVIF-Basisintegration für NVR-Software. Verwendet ausschließlich den bestehenden RTSP/JPEG-Stream und /snapshot; keine zweite Medienpipeline. ONVIF benötigt daher RTSP.";
+    const String onvifSecurityNote = onvifUiEnglish
+        ? "When access protection is enabled, ONVIF web services use HTTP Digest with an administrator or streaming user. SensorForge does not claim ONVIF Profile T conformance; the current RTSP stream remains JPEG/MJPEG."
+        : "Bei aktivem Zugriffsschutz verwenden ONVIF-Webservices HTTP Digest mit Administrator- oder Streaming-Benutzer. SensorForge bewirbt keine ONVIF-Profile-T-Konformität; der aktuelle RTSP-Stream bleibt JPEG/MJPEG.";
     const String rtspOverlayLabel = cfg_camera_overlay_text.length() ? cfg_camera_overlay_text : (cfg_camera_display_name.length() ? cfg_camera_display_name : String("SensorForge"));
     const String rtspOverlayFilter = "drawtext=text='" + streamerUiFfmpegDrawtextEscape(rtspOverlayLabel) + "':x=18:y=18:fontsize=24:fontcolor=white:box=1:boxcolor=black@0.55,drawtext=text='%{localtime\\:%d.%m.%Y} %{localtime\\:%H}\\:%{localtime\\:%M}\\:%{localtime\\:%S}':x=18:y=h-th-18:fontsize=22:fontcolor=white:box=1:boxcolor=black@0.55";
     const String streamerFfplayOverlayCommand = "ffplay -rtsp_transport tcp -vf \"" + rtspOverlayFilter + "\" \"" + streamerRtspAuthCommandUrl + "\"";
@@ -274,6 +285,14 @@ String webconfigStreamerOperatingModeHtml(
         "</div>"
         "</div>"
         "<div style='margin:12px 0;padding:12px 14px;border:1px solid #b8cddd;border-radius:9px;background:#f7fbfd'>"
+        "<label class='stream-toggle' for='cfgOnvif'><input id='cfgOnvif' type='checkbox' name='onvif_enabled' value='1'" + String(displayedOnvifEnabled ? " checked" : "") + String(displayedStreamerRtspEnabled ? "" : " disabled") + "><span class='stream-toggle-title'>" + streamerUiHtmlEscape(onvifTitle) + "</span><span id='cfgOnvifState' class='stream-toggle-state " + String(displayedOnvifEnabled && displayedStreamerRtspEnabled ? "on" : "off") + "'>" + String(displayedOnvifEnabled && displayedStreamerRtspEnabled ? "AKTIV" : "INAKTIV") + "</span></label>"
+        "<div class='muted' style='margin:5px 0 0 24px'>" + streamerUiHtmlEscape(onvifDescription) + "</div>"
+        "<div id='cfgOnvifDetails' style='margin:7px 0 0 24px" + String(displayedOnvifEnabled && displayedStreamerRtspEnabled ? "" : ";display:none") + "'>"
+        "<div><strong>Device Service:</strong> <code>" + streamerUiHtmlEscape(onvifDeviceUrl) + "</code></div>"
+        "<div class='muted' style='margin-top:5px'>" + streamerUiHtmlEscape(onvifSecurityNote) + "</div>"
+        "</div>"
+        "</div>"
+        "<div style='margin:12px 0;padding:12px 14px;border:1px solid #b8cddd;border-radius:9px;background:#f7fbfd'>"
         "<div style='display:flex;align-items:center;gap:6px;flex-wrap:wrap'><strong>Home Assistant</strong>" +
         streamerUiInfoButton("Home Assistant", "Getesteter SensorForge-Weg: In Home Assistant die Integration MJPEG IP Camera verwenden. Der HTTP-MJPEG-Stream liefert das Livebild, /snapshot das Standbild. Die Generic-Camera-RTSP-Variante ist für den SensorForge-MJPEG-RTSP-Stream nicht der empfohlene Weg. Läuft Home Assistant in Docker und kann .local nicht auflösen, verwende die angezeigte IP-Adresse. Bei aktivem Zugriffsschutz einen Administrator- oder Streaming-Benutzer eintragen.") +
         "</div>"
@@ -302,13 +321,13 @@ String webconfigStreamerOperatingModeHtml(
         "</div>"
         "</div>"
         "<script>(function(){"
-        "var m=document.getElementById('cfgOperatingMode'),p=document.getElementById('cfgStreamerOptions'),r=document.getElementById('cfgStreamerRtsp'),h=document.getElementById('cfgStreamerHttp'),rs=document.getElementById('cfgStreamerRtspState'),hs=document.getElementById('cfgStreamerHttpState'),rd=document.getElementById('cfgStreamerRtspDetails'),hd=document.getElementById('cfgStreamerHttpDetails'),w=document.getElementById('cfgStreamerTransportWarning'),f=document.getElementById('configForm'),sc=document.getElementById('cfgStressCamera'),sh=document.getElementById('cfgStressHttp'),so=document.getElementById('cfgStressObserve'),ss=document.getElementById('cfgStressStop'),sd=document.getElementById('cfgStressSeconds'),st=document.getElementById('cfgStressStatus'),si=document.getElementById('cfgStressHttpImg');"
-        "function setState(el,on){if(!el)return;el.textContent=on?'AKTIV':'INAKTIV';el.classList.toggle('on',on);el.classList.toggle('off',!on);}function transportDetails(){if(rd)rd.style.display=r.checked?'block':'none';if(hd)hd.style.display=h.checked?'block':'none';setState(rs,r.checked);setState(hs,h.checked);}"
+        "var m=document.getElementById('cfgOperatingMode'),p=document.getElementById('cfgStreamerOptions'),r=document.getElementById('cfgStreamerRtsp'),h=document.getElementById('cfgStreamerHttp'),o=document.getElementById('cfgOnvif'),rs=document.getElementById('cfgStreamerRtspState'),hs=document.getElementById('cfgStreamerHttpState'),os=document.getElementById('cfgOnvifState'),rd=document.getElementById('cfgStreamerRtspDetails'),hd=document.getElementById('cfgStreamerHttpDetails'),od=document.getElementById('cfgOnvifDetails'),w=document.getElementById('cfgStreamerTransportWarning'),f=document.getElementById('configForm'),sc=document.getElementById('cfgStressCamera'),sh=document.getElementById('cfgStressHttp'),so=document.getElementById('cfgStressObserve'),ss=document.getElementById('cfgStressStop'),sd=document.getElementById('cfgStressSeconds'),st=document.getElementById('cfgStressStatus'),si=document.getElementById('cfgStressHttpImg');"
+        "function setState(el,on){if(!el)return;el.textContent=on?'AKTIV':'INAKTIV';el.classList.toggle('on',on);el.classList.toggle('off',!on);}function transportDetails(){if(rd)rd.style.display=r.checked?'block':'none';if(hd)hd.style.display=h.checked?'block':'none';if(o){if(!r.checked){o.checked=false;o.disabled=true;}else{o.disabled=false;}if(od)od.style.display=(r.checked&&o.checked)?'block':'none';setState(os,r.checked&&o.checked);}setState(rs,r.checked);setState(hs,h.checked);}"
         "function copyText(v){if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(v).catch(function(){});return;}var t=document.createElement('textarea');t.value=v;t.setAttribute('readonly','');t.style.position='fixed';t.style.opacity='0';document.body.appendChild(t);t.select();try{document.execCommand('copy');}catch(x){}document.body.removeChild(t);}"
         "document.querySelectorAll('.cfgStreamerCopyCmd').forEach(function(b){b.addEventListener('click',function(){copyText(b.getAttribute('data-copy')||'');var old=b.textContent;b.textContent='Kopiert';setTimeout(function(){b.textContent=old;},1200);});});"
         "function valid(){var ok=r.checked||h.checked;if(w)w.style.display=(m.value==='streamer'&&!ok)?'block':'none';transportDetails();return ok;}"
         "function sync(ev){p.style.display=m.value==='streamer'?'block':'none';if(m.value==='streamer'&&ev&&!r.checked&&!h.checked)r.checked=true;valid();}"
-        "m.addEventListener('change',function(){sync(true);});r.addEventListener('change',valid);h.addEventListener('change',valid);"
+        "m.addEventListener('change',function(){sync(true);});r.addEventListener('change',valid);h.addEventListener('change',valid);if(o)o.addEventListener('change',transportDetails);"
         "f.addEventListener('submit',function(ev){if(m.value==='streamer'&&!valid()){ev.preventDefault();w.scrollIntoView({behavior:'smooth',block:'center'});}});"
         "function stressMsg(v,bad){if(!st)return;st.textContent=v;st.style.color=bad?'#b00020':'';}function stressPost(url,data){return fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(data),cache:'no-store',credentials:'same-origin'}).then(function(x){return x.json().then(function(j){if(!x.ok||!j.ok)throw new Error(j.error||('HTTP '+x.status));return j;});});}"
         "function startStress(mode){var sec=Number(sd&&sd.value||60);stressPost('/streamer_stress_start',{mode:mode,seconds:String(sec)}).then(function(){stressMsg('Messung läuft: '+mode+' · '+sec+' s. Stromaufnahme jetzt am Messgerät beobachten.',false);if(mode==='http'&&si){si.src='" + streamerUiHtmlEscape(streamerHttpCommandUrl) + "?stress='+Date.now();}}).catch(function(e){stressMsg('Stresstest nicht gestartet: '+e.message,true);});}"

@@ -1,7 +1,7 @@
 SENSORFORGE / ESP32-S3 CAMERA (XIAO + FREENOVE)
 PROJEKTBESCHREIBUNG, RELEASESTAND UND WIEDEREINSTIEGSPROMPT
-Stand: 2026-10-02
-Dokumentrevision: v87 BETA 8 - dokumentiertes HTTP/Basic-Auth-Bedrohungsmodell und spaeteres HTTPS/TLS-Hardening; Laufzeitlogik unveraendert
+Stand: 2026-10-03
+Dokumentrevision: v87 BETA 16 - ONVIF Feldqualifikation abgeschlossen / Referenzstand
 
 
 ======================================================================
@@ -10,19 +10,288 @@ AKTUELLE RELEASE-TABELLE
 
 Release | Datum      | Status      | Schwerpunkt
 --------|------------|-------------|------------------------------------------------------------
-v87     | 2026-10-02 | BETA 8      | Security-Doku: lokales HTTP/Basic-Auth-Modell; HTTPS/TLS als spaeteres Hardening
+v87     | 2026-10-03 | BETA 16     | ONVIF-MVP feldqualifiziert: Auto-Discovery, Auth, Snapshot und RTSP/JPEG-Video erfolgreich
 v86     | 2026-10-01 | OFFIZIELL   | Rollen/Zugriff, RTSP+HTTP-MJPEG Auth, Home Assistant, WiFi-Fixes
 v85     | 2026-10-01 | OFFIZIELL   | Image-Motion UI/Liveanalyse, Streamer-Frame-Analyse
 v84     | 2026-09-30 | OFFIZIELL   | Netzwerk-Streamer, Multi-WiFi, Kamera-/Preview-Workflow
 
 
 
+
+======================================================================
+V87 BETA 16 2026-10-03 - ONVIF FELDQUALIFIKATION ABGESCHLOSSEN / REFERENZSTAND
+======================================================================
+
+- SensorForge v87 Beta 16 ist der aktuelle autoritative Beta-, Test- und
+  Wiedereinstiegsstand. v86 bleibt der letzte stabile offizielle Release.
+- Release-ID: `v87-beta16`; Core-Version im Branding bleibt `7.1.0`.
+- Beta 16 ist ein Dokumentations-/Versionsabschluss. Die Firmware-Laufzeitlogik
+  ist gegenueber Beta 15 unveraendert.
+- Der reale Android-/Onvier-Feldtest auf XIAO bestaetigt fuer den implementierten
+  ONVIF-MVP den vorgesehenen Funktionsumfang:
+    * automatische WS-Discovery findet SensorForge ohne manuelle IP-Eingabe
+    * ONVIF Device-/Media-Abfragen funktionieren
+    * Authentifizierung mit den bestehenden SensorForge-Zugangsdaten funktioniert
+    * Snapshot funktioniert ueber HTTP/Port 80
+    * RTSP/JPEG-Stream funktioniert ueber Port 554
+    * Onvier meldet den Videostream als erfolgreich
+- Die Beta-10/11-Authentifizierungsfixes, Beta-12-Discovery-Retry, Beta-13-
+  Diagnosezaehler sowie das in Beta 14 wiederhergestellte Beta-9-kompatible
+  Discovery-Wireformat bilden zusammen den jetzt feldqualifizierten Stand.
+- ONVIF gilt fuer den aktuell definierten SensorForge-Produktumfang damit als
+  ABGESCHLOSSEN und wird eingefroren. Weitere Aenderungen nur bei einem konkreten,
+  reproduzierbaren Interoperabilitaetsproblem mit einem relevanten NVR/Client.
+- SensorForge behauptet damit KEINE offizielle ONVIF-Zertifizierung und keine
+  vollstaendige Profile-T-Konformitaet. Es handelt sich bewusst um die benoetigte
+  ONVIF-Basisintegration ueber die bestehende RTSP/JPEG-/Snapshot-Pipeline.
+- Keine zusaetzliche Encoder-/Medienpipeline und keine Aenderung an Kamera-, Audio-,
+  Recording-, Storage-, Download- oder normalen Streamerpfaden.
+- Host-API bleibt 1.21; stabiles Integration-/App-Profil bleibt 1.1.
+
+
+
+======================================================================
+V87 BETA 15 2026-10-03 - ONVIF DISCOVERY-ROLLBACK COMPILEFIX
+======================================================================
+
+- SensorForge v87 Beta 15 war der compile-bereinigte ONVIF-Stand und ist durch
+  Beta 16 als autoritativer Wiedereinstiegsstand abgeloest. v86 bleibt der letzte
+  stabile offizielle Release.
+- Release-ID: `v87-beta15`; Core-Version im Branding bleibt `7.1.0`.
+- Beta 14 stellte das WS-Discovery-Wireformat auf den im Feld funktionierenden
+  Beta-9-Aufbau zurueck. Dabei blieben in `onvifBegin()` versehentlich noch
+  Initialisierungen fuer die bereits entfernten Beta-13-AppSequence-Variablen
+  `discoveryInstanceId` und `discoveryMessageNumber` stehen. Das fuehrte unter
+  Arduino-ESP32 3.3.12 zu einem Compilefehler.
+- Beta 15 entfernt ausschliesslich diese verwaisten Referenzen. Das Beta-9-
+  Discovery-Wireformat, Beta-10/11-Authentifizierung, Beta-12-Retry und die
+  Beta-13-Diagnosezaehler bleiben funktional unveraendert.
+- Keine Aenderung an Kamera-, RTSP/RTP-, HTTP-MJPEG-, Audio-, Recording-,
+  Storage- oder Downloadpfaden. Host-API bleibt 1.21, Integration-/App-Profil 1.1.
+
+======================================================================
+V87 BETA 14 2026-10-03 - ONVIF WS-DISCOVERY REGRESSION-ROLLBACK / ONVIER-FIX 4
+======================================================================
+
+- SensorForge v87 Beta 14 war der Discovery-Rollback-Stand und ist durch die
+  nachfolgenden Beta-Staende abgeloest. v86 bleibt der letzte stabile offizielle
+  Release.
+- Release-ID: `v87-beta14`; Core-Version im Branding bleibt `7.1.0`.
+- Der reale Beta-13-Onvier-Test liefert jetzt eine eindeutige Fehlergrenze:
+  `onvif_probe_rx=87`, `onvif_probe_match_tx=27` und
+  `onvif_last_remote=192.168.0.99:59358`. Damit kamen Android-Probes am ESP32
+  an und SensorForge sendete erfolgreich unicast ProbeMatch-Antworten an genau
+  diesen Client. Das Netzwerk-/Multicast-Binding ist daher nicht die Ursache;
+  der Client verwirft das Discovery-Antwortformat.
+- Der Discovery-Teil wurde deshalb gegen v87 Beta 9 verglichen. Beta 9 war der
+  letzte reale Stand, in dem Onvier SensorForge automatisch gefunden hatte.
+  Spaetere Fixes fuer SOAP/PRE_AUTH/UsernameToken waren fuer die manuelle
+  Einrichtung notwendig, hatten aber keinen Grund, das bereits funktionierende
+  Discovery-Wireformat umzubauen.
+- Beta 14 stellt ProbeMatch/ResolveMatch/Hello/Bye gezielt auf den bewaehrten
+  Beta-9-Aufbau zurueck:
+    * Types wieder `tds:Device dn:NetworkVideoTransmitter`
+    * wieder die einzelne etablierte Device-Service-XAddr
+    * keine zusaetzliche AppSequence-/mustUnderstand-Erweiterung
+    * Envelope/Body der Discovery-Antwort entspricht wieder dem Beta-9-Code
+- Erhalten bleiben ausdrücklich:
+    * Beta-10 PRE_AUTH + WS-Security UsernameToken/PasswordDigest
+    * Beta-11 XML-Parser fuer Attribute in Password/Nonce
+    * Beta-12 Discovery-Startup-Retry
+    * Beta-13 Diagnosezaehler `onvif_probe_rx`, `onvif_probe_match_tx`,
+      `onvif_last_remote`
+- Manuelle ONVIF-Einrichtung, RTSP/JPEG-Video und Snapshot waren im realen Test
+  bereits erfolgreich. Dieser Fix beruehrt ausschliesslich die automatische
+  WS-Discovery und keine Kamera-, Audio-, Recording-, Download- oder
+  Streaming-Datenpfade. Host-API bleibt 1.21, Integration-/App-Profil 1.1.
+- Statischer Vergleich bestaetigt, dass `discoveryEnvelope()`,
+  `discoveryMatchBody()` und `sendHello()` wieder dem nachweislich
+  funktionierenden Beta-9-Implementierungsstand entsprechen. Reeller
+  automatischer Onvier-Discovery-Test bleibt erforderlich.
+
+
+======================================================================
+V87 BETA 13 2026-10-03 - ONVIF WS-DISCOVERY INTEROPERABILITAET / ONVIER-FIX 3
+======================================================================
+
+- SensorForge v87 Beta 13 war der ProbeMatch-/XAddr-Interoperabilitaetsstand und
+  ist durch Beta 14 als autoritativer Wiedereinstiegsstand abgeloest. v86 bleibt
+  der letzte stabile offizielle Release.
+- Release-ID: `v87-beta13`; Core-Version im Branding bleibt `7.1.0`.
+- Der reale Android-/Onvier-Test nach Beta 12 hat die Fehlergrenze klar
+  eingegrenzt: manuelle Einrichtung ueber `192.168.0.3` funktioniert, ONVIF-
+  Authentifizierung funktioniert, RTSP-Port 554 und Snapshot/Device-Service auf
+  Port 80 werden korrekt erkannt und das Video wird erfolgreich wiedergegeben.
+  Nur die automatische WS-Discovery findet das Geraet nicht.
+- Die WS-Discovery-Antworten wurden deshalb an den ONVIF-Referenzaustausch
+  angenaehert: ProbeMatch/Hello/Bye enthalten nun eine `AppSequence` mit
+  nicht-null InstanceId und monotoner MessageNumber sowie `mustUnderstand` an
+  den relevanten WS-Addressing-Headern.
+- Bei gleichzeitig aktivem AP+STA werden in `XAddrs` jetzt alle nutzbaren
+  lokalen Device-Service-Adressen angeboten. Zuvor konnte die generische
+  Adresswahl den AP bevorzugen und damit einem Client im Infrastruktur-WLAN
+  eine fuer ihn nicht erreichbare AP-Adresse melden.
+- Fuer maximale Legacy-Interoperabilitaet wird im Discovery-Types-Feld
+  `dn:NetworkVideoTransmitter` angekuendigt. Die eigentlichen Device-/Media-
+  SOAP-Endpunkte bleiben unveraendert.
+- `/streamer_status` zeigt additiv `onvif_probe_rx`,
+  `onvif_probe_match_tx` und `onvif_last_remote`. Damit ist beim naechsten
+  Feldtest sofort sichtbar, ob ein Client-Probe am ESP32 ankommt und ob eine
+  ProbeMatch-Antwort erfolgreich versendet wurde.
+- Beta-12-Discovery-Retry sowie Beta-10/11-Auth-/UsernameToken-Fixes bleiben
+  erhalten. RTSP, JPEG, HTTP-MJPEG, Audio, Recording und Downloads wurden nicht
+  veraendert. Host-API bleibt 1.21, Integration-/App-Profil bleibt 1.1.
+- Isolierter Arduino-ESP32-3.3.12-Kompatibilitaets-Syntaxcheck des ONVIF-Moduls
+  ist sauber. Der reale automatische Onvier-Discovery-Test bleibt erforderlich.
+
+
+======================================================================
+V87 BETA 12 2026-10-03 - ONVIF WS-DISCOVERY STARTUP-RETRY
+======================================================================
+
+- SensorForge v87 Beta 12 war der Discovery-Startup-Retry-Stand und ist durch
+  Beta 13 als autoritativer Wiedereinstiegsstand abgeloest. v86 bleibt der
+  letzte stabile offizielle Release.
+- Release-ID: `v87-beta12`; Core-Version im Branding bleibt `7.1.0`.
+- Nach dem Beta-11-Update wurde im realen Android-Test beobachtet, dass das
+  Geraet zeitweise gar nicht mehr ueber ONVIF/WS-Discovery gefunden wurde.
+  Dieser Befund liegt vor dem SOAP-/UsernameToken-Pfad und betrifft damit die
+  UDP-Multicast-Discovery.
+- Im bisherigen ONVIF-MVP wurde der Multicast-Bind beim Streamer-Start genau
+  einmal versucht. Falls zu diesem Zeitpunkt noch keine nutzbare IPv4-Adresse
+  vorlag oder der Multicast-Bind temporaer fehlschlug, blieb ONVIF fuer den
+  gesamten Boot inaktiv. Der RTSP-/HTTP-Streamer selbst lief dabei weiter.
+- ONVIF versucht den Discovery-Start nun im Fehlerfall alle 5 Sekunden erneut,
+  solange Streamer-Modus, RTSP und `onvif_enabled` aktiv sind. Vor einem neuen
+  Multicast-Bind wird ein eventuell unvollstaendiger UDP-Zustand sauber
+  geschlossen. Nach erfolgreichem Start endet der Retry sofort.
+- Der Retry laeuft nur solange Discovery inaktiv ist und fuehrt keine Kamera-,
+  Audio-, Recording-, Datei- oder Streamverarbeitung aus. Die Medienpfade
+  bleiben unveraendert.
+- Der Beta-11-UsernameToken-/XML-Parserfix bleibt unveraendert erhalten.
+  Host-API bleibt 1.21, Integration-/App-Profil bleibt 1.1.
+- Isolierter C++-Syntaxcheck des aktualisierten ONVIF-Moduls ist sauber. Ein
+  erneuter realer XIAO/Freenove-Discovery-/Onvier-Test bleibt erforderlich.
+
+
+======================================================================
+V87 BETA 11 2026-10-03 - ONVIF USERNAMETOKEN XML-PARSER / ONVIER-FIX 2
+======================================================================
+
+- SensorForge v87 Beta 11 war der UsernameToken-/XML-Parserfix und ist durch
+  Beta 12 als autoritativer Wiedereinstiegsstand abgeloest. v86 bleibt der
+  letzte stabile offizielle Release.
+- Release-ID: `v87-beta11`; Core-Version im Branding bleibt `7.1.0`.
+- Der zweite reale Android-/Onvier-Test bestaetigte, dass der PRE_AUTH-Fix aus
+  Beta 10 funktioniert: `GetSystemDateAndTime` wird erfolgreich beantwortet.
+  `GetDeviceInformation` scheiterte jedoch weiterhin mit HTTP 401.
+- Ursache war nicht die PasswordDigest-Berechnung, sondern der bewusst kleine
+  XML-Helfer: Er erkannte nur Opening-Tags ohne Attribute. Reale ONVIF-/WS-
+  Security-Requests verwenden dagegen typischerweise z. B.
+  `<wsse:Password Type="...#PasswordDigest">` und
+  `<wsse:Nonce EncodingType="...#Base64Binary">`. Dadurch wurden Password
+  und Nonce nicht extrahiert und ein gueltiger UsernameToken abgelehnt.
+- Der Parser matched Text-Elemente jetzt ueber ihren XML-Local-Name, unabhaengig
+  von Namespace-Praefix und Opening-Tag-Attributen. Standard-XML-Entities in
+  Textwerten werden ebenfalls dekodiert. Es wird bewusst keine schwere XML-
+  Bibliothek eingefuehrt.
+- PasswordDigest-Formel, bestehende Administrator-/Streaming-Benutzer, PRE_AUTH,
+  HTTP-Digest-Fallback und ONVIF-Read-only-Semantik bleiben unveraendert.
+- RTSP, HTTP-MJPEG, Snapshot, Audio, Recording und Downloads sind von diesem
+  Fix unveraendert. Host-API bleibt 1.21, Integration-/App-Profil bleibt 1.1.
+- Der neue Parser wurde mit einem representativen WS-Security-UsernameToken mit
+  attributierten Password-/Nonce-Tags getestet; isolierter C++-Syntaxcheck ist
+  sauber. Vollstaendiger Arduino-ESP32-3.3.12-Build und erneuter realer Onvier-/
+  NVR-Test bleiben erforderlich.
+
+
+======================================================================
+V87 BETA 10 2026-10-03 - ONVIF AUTH-INTEROPERABILITAET / ONVIER-FIX
+======================================================================
+
+- SensorForge v87 Beta 10 war der erste ONVIF-Auth-Interoperabilitaetsfix und
+  ist durch Beta 11 als autoritativer Wiedereinstiegsstand abgeloest. v86 bleibt
+  der letzte stabile offizielle Release.
+- Release-ID: `v87-beta10`; Core-Version im Branding bleibt `7.1.0`.
+- Der erste reale Android-Test mit Onvier zeigte zwei Interoperabilitaetsfehler
+  der Beta-9-ONVIF-Basisintegration: Der zentrale Web-Middleware-Gate forderte
+  Authentifizierung auch fuer ONVIF-PRE_AUTH-Operationen, und authentifizierte
+  SOAP-Clients mit WS-Security UsernameToken wurden noch nicht akzeptiert.
+- Die im implementierten Device-Service vorhandenen PRE_AUTH-Leseoperationen
+  `GetSystemDateAndTime`, `GetCapabilities`, `GetServices`,
+  `GetServiceCapabilities` und `GetHostname` sind nun ohne Login erreichbar.
+  Insbesondere kann ein Client damit zuerst die Geraetezeit abfragen und danach
+  einen zeitgestempelten UsernameToken erzeugen.
+- Authentifizierte ONVIF-SOAP-Requests akzeptieren additiv WS-Security
+  UsernameToken mit `PasswordDigest`. Verifiziert wird die ONVIF-Formel
+  `Base64(SHA1(Base64Decode(Nonce) + Created + Password))` gegen die bereits
+  vorhandenen Administrator- bzw. Streaming-Benutzer-Zugangsdaten.
+  SOAP-Passwoerter im Klartext werden nicht akzeptiert.
+- HTTP Basic/Digest bleibt fuer Clients erhalten, die die HTTP-Auth-Schicht
+  verwenden. Der ONVIF Device Service meldet jetzt `UsernameToken=true` und
+  `HttpDigest=true`.
+- Die ONVIF-Endpunkte entscheiden ihre Authentifizierung nun selbst, damit
+  PRE_AUTH und SOAP-Level-Authentifizierung korrekt behandelt werden koennen.
+  Der Browser-CSRF-Schutz bleibt fuer diese read-only Machine-to-Machine-POSTs
+  weiterhin bewusst ausgenommen.
+- RTSP, HTTP-MJPEG, Snapshot, Audio, Recording und Downloads sind von diesem
+  Fix unveraendert. Host-API bleibt 1.21, Integration-/App-Profil bleibt 1.1.
+- Der UsernameToken-Digest wurde gegen einen bekannten Onvifer/Onvier-
+  kompatiblen Testvektor gegengeprueft. Vollstaendiger Arduino-Build sowie
+  erneuter Android-/NVR-Hardwaretest bleiben erforderlich.
+
+
+======================================================================
+V87 BETA 9 2026-10-02 - ONVIF-BASISINTEGRATION / NVR-DISCOVERY
+======================================================================
+
+- SensorForge v87 Beta 9 war der erste ONVIF-Basisstand und ist durch Beta 10
+  als autoritativer Wiedereinstiegsstand abgeloest. v86 bleibt der letzte stabile offizielle Release.
+- Release-ID: `v87-beta9`; Core-Version im Branding bleibt `7.1.0`.
+- Additiv steht im Streamer-Modus jetzt `onvif_enabled=0|1` zur Verfuegung.
+  Default ist 0/AUS; alte Konfigurationen verhalten sich unveraendert. ONVIF
+  setzt den bereits vorhandenen RTSP-Ausgang voraus und wird ohne RTSP nicht
+  akzeptiert.
+- ONVIF ist bewusst nur eine duenne Integrationsschicht ueber der bestehenden
+  Medienarchitektur:
+    * WS-Discovery auf UDP-Multicast 239.255.255.250:3702 mit Probe/Resolve
+      sowie Hello/Bye beim Streamer-Lifecycle
+    * read-only Device Service unter `/onvif/device_service`
+    * read-only Media Service unter `/onvif/media_service`
+    * ein festes Medienprofil fuer die aktuell konfigurierte JPEG-Aufloesung,
+      Bildrate und Qualitaet
+    * `GetStreamUri` verweist auf den bestehenden RTSP/RTP-JPEG-Stream
+    * `GetSnapshotUri` verweist auf den bestehenden `/snapshot`-Pfad
+- Es gibt KEINEN zweiten Kamera-Capture-, Encoder- oder Media-Transferpfad.
+  RTSP, HTTP-MJPEG, Audio, Recording und Downloads erhalten durch ONVIF keine
+  zusaetzliche Verschluesselungs-/Transcoding-Last. Im Streamer-Hauptloop werden
+  pro Durchlauf maximal zwei Discovery-Datagramme verarbeitet.
+- Bei aktivem SensorForge-Zugriffsschutz verwenden die ONVIF-Webservices die
+  bestehenden Administrator-/Streaming-Benutzer und fordern HTTP Digest an.
+  ONVIF-SOAP-POSTs sind Machine-to-Machine-Leseoperationen und bewusst vom
+  Browser-CSRF-Token ausgenommen; mutierende ONVIF-Aktionen sind nicht implementiert.
+- WebConfig zeigt den ONVIF-Schalter und den Device-Service-Endpunkt. Neue
+  ONVIF-Hinweise sind DE/EN ausgelegt; historische Streamer-Texte bleiben von
+  dieser Aenderung unberuehrt.
+- Host-Protokoll `/api/v1` steigt additiv auf 1.21; Integration-/App-Profil
+  bleibt 1.1. Capability `onvif_basic` und `onvif_enabled` werden additiv
+  gemeldet; bestehende API-Felder/Routen bleiben kompatibel.
+- WICHTIG: SensorForge behauptet mit diesem Stand KEINE offizielle ONVIF-Profile-T-
+  Konformitaet. Der etablierte RTSP-Stream bleibt JPEG/MJPEG; fuer Profile T
+  waere insbesondere ein anderer Video-Codec-/Konformitaetsumfang erforderlich.
+- Statische/API-Pruefung in dieser Arbeitsumgebung: SOAP-Rohbody-Verhalten,
+  HTTP-Digest-Unterstuetzung und UDP-Multicast-Signaturen wurden gegen
+  Arduino-ESP32 3.3.12 abgeglichen; `onvif.cpp` wurde isoliert auf C++-Syntax
+  geprueft. Vollstaendiger Arduino-Build sowie reale NVR-/Discovery-Tests auf
+  XIAO/Freenove bleiben offen.
+
+
 ======================================================================
 V87 BETA 8 2026-10-02 - MANAGEMENT-TRANSPORT / HTTPS-TLS ALS ZUKUNFTSPUNKT
 ======================================================================
 
-- SensorForge v87 Beta 8 ist der aktuelle autoritative Beta-, Test- und
-  Wiedereinstiegsstand. v86 bleibt der letzte stabile offizielle Release.
+- SensorForge v87 Beta 8 war der damalige autoritative Beta-, Test- und
+  Wiedereinstiegsstand. v86 blieb der letzte stabile offizielle Release.
 - Release-ID: `v87-beta8`; Core-Version im Branding bleibt `7.1.0`.
 - Diese Revision aendert keine Laufzeitlogik. Sie praezisiert das aktuelle
   Sicherheits-/Betriebsmodell fuer WebConfig und `/api/v1`.
@@ -50,8 +319,8 @@ V87 BETA 8 2026-10-02 - MANAGEMENT-TRANSPORT / HTTPS-TLS ALS ZUKUNFTSPUNKT
 V87 BETA 7 2026-10-02 - ARDUINO-COMPILEFIX FUER CSRF-TOKEN-GENERATOR
 ======================================================================
 
-- SensorForge v87 Beta 7 ist der aktuelle autoritative Beta-, Test- und
-  Wiedereinstiegsstand. v86 bleibt der letzte stabile offizielle Release.
+- SensorForge v87 Beta 7 war der damalige autoritative Beta-, Test- und
+  Wiedereinstiegsstand. v86 blieb der letzte stabile offizielle Release.
 - Release-ID: `v87-beta7`; Core-Version im Branding bleibt `7.1.0`.
 - Realer Arduino-ESP32-3.3.12-Build zeigte einen Namenskonflikt in
   `web_csrf.cpp`: Arduino `Print.h` definiert `HEX` als Makro (`#define HEX 16`).
@@ -68,8 +337,8 @@ V87 BETA 7 2026-10-02 - ARDUINO-COMPILEFIX FUER CSRF-TOKEN-GENERATOR
 V87 BETA 6 2026-10-02 - ZENTRALER CSRF-SCHUTZ FUER BROWSER-AKTIONEN
 ======================================================================
 
-- SensorForge v87 Beta 6 ist der aktuelle autoritative Beta-, Test- und
-  Wiedereinstiegsstand. v86 bleibt der letzte stabile offizielle Release.
+- SensorForge v87 Beta 6 war der damalige autoritative Beta-, Test- und
+  Wiedereinstiegsstand. v86 blieb der letzte stabile offizielle Release.
 - Release-ID: `v87-beta6`; Core-Version im Branding bleibt `7.1.0`.
 - Mutierende Browser-POSTs werden jetzt zentral gegen CSRF geschuetzt:
     * pro Boot werden zufaellige 128-bit Tokens erzeugt
@@ -100,8 +369,8 @@ V87 BETA 6 2026-10-02 - ZENTRALER CSRF-SCHUTZ FUER BROWSER-AKTIONEN
 V87 BETA 5 2026-10-02 - FACTORY-/RECOVERY-HOTSPOT KONSISTENT
 ======================================================================
 
-- SensorForge v87 Beta 5 ist der aktuelle autoritative Beta-, Test- und
-  Wiedereinstiegsstand. v86 bleibt der letzte stabile offizielle Release.
+- SensorForge v87 Beta 5 war der damalige autoritative Beta-, Test- und
+  Wiedereinstiegsstand. v86 blieb der letzte stabile offizielle Release.
 - Release-ID: `v87-beta5`; Core-Version im Branding bleibt `7.1.0`.
 - Ein Widerspruch zwischen Config-Policy und Hotspot-Start wurde behoben:
     * `hotspot_password=` leer bedeutet weiterhin bewusst offener AP.
@@ -569,7 +838,7 @@ V84-KANDIDAT - AUDIO-DRAIN BUILD-FIX 2026-09-29
   `std::max<size_t>(...)`. Damit ist die GCC-14-Template-Aufloesung bei
   gemischten `size_t`-/`uint32_t`-Operanden eindeutig.
 - Keine Aenderung am Laufzeitverhalten des Audio-Realtime-Drains.
-Aktueller stabiler Release: v86; aktueller Beta-/Wiedereinstiegsstand: v87 Beta 8
+Aktueller stabiler Release: v86; aktueller Beta-/Wiedereinstiegsstand: v87 Beta 9
 (separate XIAO-Recording-/Storage-Langzeitqualifikation weiterhin offen)
 Produktname: SensorForge
 Plattformname: Fabric Node
@@ -827,17 +1096,17 @@ AKTUELLER NACHTRAG 2026-09-30 - RTSP/AUDIO-LIVE-FEINSCHLIFF:
 - Die neue Konfiguration defaultet auf `operating_mode=normal` sowie beide Streamer-
   Ausgaenge AUS. Alte v83-config.txt ohne diese Keys starten daher unveraendert normal.
 - `sensorforge_version.h` ist fuer den aktuellen Beta-Stand vom 2026-10-02 auf
-  `v87-beta8` gesetzt. v86 bleibt der letzte stabile offizielle Release; die darunter
+  `v87-beta9` gesetzt. v86 bleibt der letzte stabile offizielle Release; die darunter
   dokumentierten v86-/v85-/v84-Abschnitte bleiben als historische Release- und
   Entwicklungsnotizen erhalten.
 
 
-- Aktueller autoritativer Arbeits- und Wiedereinstiegsstand ist v87 Beta 8 vom
+- Aktueller autoritativer Arbeits- und Wiedereinstiegsstand ist v87 Beta 9 vom
   2026-10-02. Der letzte stabile offizielle Release bleibt v86 vom 2026-10-01.
-- Fuer weitere Entwicklung ist der vollstaendige v87-Beta-6-Quellstand die
+- Fuer weitere Entwicklung ist der vollstaendige v87-Beta-9-Quellstand die
   autoritative Basis. Temporaere aeltere v84-/v85-/v86-/v87-Arbeitsordner duerfen
   nicht als Ausgangspunkt verwendet werden.
-- Beim Wiedereinstieg den vollstaendigen v87-Beta-6-Stand verwenden und alle fuer
+- Beim Wiedereinstieg den vollstaendigen v87-Beta-9-Stand verwenden und alle fuer
   die jeweilige Aenderung betroffenen Dateien erneut lesen.
 - Bestehende produktive SensorForge-Funktionalitaet hat absolute Prioritaet.
   Streaming darf den Normalbetrieb nicht veraendern, wenn der Streamer-Modus
@@ -1981,7 +2250,7 @@ Auf echter Freenove-Hardware wurden mit SR602 mehrere aufeinanderfolgende
 Light-Sleep -> PIR-Wake -> Recording -> Light-Sleep-Zyklen erfolgreich
 beobachtet, darunter auch ein Wake nach mehr als 13 Minuten Sleep.
 
-Der aktuelle Sync-API-Stand ist Host-Protokoll 1.20 mit stabilem Integration-
+Der aktuelle Sync-API-Stand ist Host-Protokoll 1.21 mit stabilem Integration-
 API-/App-Profil 1.1. Der aktuelle Python-Sync-Client ist 1.4. Die boardgebundene Offline-Lizenzierung ist als technisches Fundament
 implementiert und auf echter Hardware erstmals erfolgreich aktiviert worden.
 Die transparente Video-Verschluesselung fuer neue AVI/MKV-Aufnahmen ist
@@ -6182,7 +6451,7 @@ SYNC API / PC-DOWNLOAD
 ======================================================================
 
 Fuer schnellen PC-seitigen Download existiert eine eigene stateless Sync API.
-Der aktuelle Host-Stand ist Protokoll API 1.20. Das stabile lokale
+Der aktuelle Host-Stand ist Protokoll API 1.21. Das stabile lokale
 Integration-/App-Profil ist 1.1; der historische v17-Vertrag 1.0 bleibt darin
 abwaertskompatibel enthalten. Der aktuelle Python-Client
 sensorforge_sync.py ist 1.4.
@@ -6280,7 +6549,7 @@ Getestete Alternativen:
 
 Der Transferpfad mit 32 KB / Core 0 bleibt daher der bewaehrte Sweet Spot.
 API 1.10 fuehrte die read-only Status-/Sensor-/Snapshot-Funktionen ein. Der
-aktuelle Host-Stand ist inzwischen Protokoll API 1.20 mit Integration-/App-Profil
+aktuelle Host-Stand ist inzwischen Protokoll API 1.21 mit Integration-/App-Profil
 1.1; der v17-Vertrag 1.0 bleibt darin additiv kompatibel enthalten. Der bewaehrte Downloadpfad wurde
 dadurch nicht grundsaetzlich neu designt.
 
@@ -7336,7 +7605,7 @@ WICHTIGE ENTWICKLUNGSREGELN
 
 - Die bewaehrte Sync-API-Semantik mit Auth, Exclusive-Lease und Range/Resume
   bei spaeteren Client-/App-Implementierungen kompatibel halten. Aktueller Host
-  ist Protokoll API 1.20 mit Integration API 1.1. Neue Funktionen weiterhin
+  ist Protokoll API 1.21 mit Integration API 1.1. Neue Funktionen weiterhin
   additiv einfuehren und vorhandene zentrale Validierungs-/Safety-Pfade nutzen.
   Bestehende dokumentierte API-v1-Felder und Routen nicht ohne neue Major-Version
   entfernen oder umbenennen.
@@ -7838,7 +8107,7 @@ aktuell Vorrang, aber jeder neue sichtbare UI-Text muss sofort DE+EN erhalten.
 
 SYNC API:
 
-Aktuelles Host-Protokoll API 1.20, stabiles Integration-API-Profil 1.1.
+Aktuelles Host-Protokoll API 1.21, stabiles Integration-API-Profil 1.1.
 Python-Client sensorforge_sync.py 1.4 und die bewaehrten Transferendpunkte fuer
 status/days/files/file/exclusive bleiben kompatibel. Die bisherigen Device-,
 State-, Storage-, Sensor-, Snapshot- und Shooter-Routen bleiben ebenfalls erhalten.
