@@ -3,6 +3,7 @@
 #include "board_config.h"
 #include "config.h"
 #include "access_control.h"
+#include "web_csrf.h"
 #include "recorder.h"
 #include "storage_guard.h"
 #include "branding.h"
@@ -6142,6 +6143,218 @@ static void handlePlayerAnnotationPost()
 
 
 // =============================================================
+// SHARED MEDIA OPERATIONS FOR LOCAL ADMIN API
+// =============================================================
+
+int webPlayerApiReadAnnotation(
+    const String &path,
+    String &text,
+    String &message
+)
+{
+    text = "";
+    message = "";
+
+    if (
+        !validRecordingPath(path) ||
+        (
+            !isAviPath(path) &&
+            !isMkvPath(path)
+        )
+    ) {
+        message = "invalid_recording_path";
+        return 400;
+    }
+
+    if (g_storageLocked) {
+        message = "storage_locked";
+        return 409;
+    }
+
+    if (recorderIsOpen()) {
+        message = "recording_active";
+        return 409;
+    }
+
+    if (!loadMediaAnnotation(path, text)) {
+        message = "annotation_read_failed";
+        return 500;
+    }
+
+    return 200;
+}
+
+
+int webPlayerApiWriteAnnotation(
+    const String &path,
+    const String &requestedText,
+    String &savedText,
+    String &message
+)
+{
+    savedText = "";
+    message = "";
+
+    if (
+        !validRecordingPath(path) ||
+        (
+            !isAviPath(path) &&
+            !isMkvPath(path)
+        )
+    ) {
+        message = "invalid_recording_path";
+        return 400;
+    }
+
+    if (g_storageLocked) {
+        message = "storage_locked";
+        return 409;
+    }
+
+    if (recorderIsOpen()) {
+        message = "recording_active";
+        return 409;
+    }
+
+    RecordingStartBlockGuard recordingBlock;
+
+    if (recorderIsOpen()) {
+        message = "recording_active";
+        return 409;
+    }
+
+    closePlayerFile();
+
+    savedText = normalizedAnnotationText(requestedText);
+    String notePath = annotationPathForMedia(path);
+    String tempPath = notePath + ".tmp";
+
+    STORAGE.remove(tempPath.c_str());
+
+    if (!savedText.length()) {
+        STORAGE.remove(notePath.c_str());
+        message = "cleared";
+        return 200;
+    }
+
+    RecordingStorageFile file;
+    if (!file.openWrite(tempPath, cfg_recording_encryption != 0)) {
+        message = "annotation_write_failed";
+        return 500;
+    }
+
+    size_t written = file.write(
+        (const uint8_t *)savedText.c_str(),
+        savedText.length()
+    );
+
+    bool finalized = file.closeChecked();
+    if (written != savedText.length() || !finalized) {
+        STORAGE.remove(tempPath.c_str());
+        message = "annotation_write_failed";
+        return 500;
+    }
+
+    STORAGE.remove(notePath.c_str());
+    if (!STORAGE.rename(tempPath.c_str(), notePath.c_str())) {
+        STORAGE.remove(tempPath.c_str());
+        message = "annotation_finalize_failed";
+        return 500;
+    }
+
+    message = "saved";
+    return 200;
+}
+
+
+int webPlayerApiDeleteMedia(
+    const String &path,
+    String &message
+)
+{
+    message = "";
+
+    if (
+        !validRecordingPath(path) ||
+        (
+            !isAviPath(path) &&
+            !isMkvPath(path) &&
+            !isJpegPath(path)
+        )
+    ) {
+        message = "invalid_media_path";
+        return 400;
+    }
+
+    if (g_storageLocked) {
+        message = "storage_locked";
+        return 409;
+    }
+
+    if (recorderIsOpen()) {
+        closePlayerFile();
+        if (!queuePendingDelete(path)) {
+            message = "delete_queue_full";
+            return 503;
+        }
+
+        Serial.println("WebPlayer API: delete queued until recording ends " + path);
+        message = "queued_until_recording_ends";
+        return 202;
+    }
+
+    RecordingStartBlockGuard recordingBlock;
+
+    if (recorderIsOpen()) {
+        closePlayerFile();
+        if (!queuePendingDelete(path)) {
+            message = "delete_queue_full";
+            return 503;
+        }
+        message = "queued_until_recording_ends";
+        return 202;
+    }
+
+    closePlayerFile();
+
+    File existing = STORAGE.open(path.c_str(), FILE_READ);
+    if (!existing) {
+        message = "recording_not_found";
+        return 404;
+    }
+
+    bool isDirectory = existing.isDirectory();
+    existing.close();
+    if (isDirectory) {
+        message = "invalid_recording_path";
+        return 400;
+    }
+
+    if (!STORAGE.remove(path.c_str())) {
+        message = "delete_failed";
+        return 500;
+    }
+
+    if (isAviPath(path)) {
+        String srtPath = path.substring(0, path.length() - 4) + ".srt";
+        File srtFile = STORAGE.open(srtPath.c_str(), FILE_READ);
+        if (srtFile) {
+            srtFile.close();
+            STORAGE.remove(srtPath.c_str());
+        }
+    }
+
+    String notePath = annotationPathForMedia(path);
+    STORAGE.remove(notePath.c_str());
+    STORAGE.remove((notePath + ".tmp").c_str());
+
+    Serial.println("WebPlayer API: deleted " + path);
+    message = "deleted";
+    return 200;
+}
+
+
+// =============================================================
 // MEDIA PREVIOUS / NEXT
 // =============================================================
 
@@ -6866,6 +7079,27 @@ R"HTML(</span></a>
 </div></main>
 
 <script>
+(function(){
+    const match = document.cookie.match(/(?:^|;\s*)sf_csrf=([0-9a-f]{32})(?:;|$)/);
+    const token = match ? match[1] : '';
+    const originalFetch = window.fetch;
+    window.fetch = function(input, init) {
+        const method = (init && init.method) || (input && input.method) || 'GET';
+        if (token && String(method).toUpperCase() === 'POST') {
+            try {
+                const raw = typeof input === 'string' ? input : input.url;
+                const url = new URL(raw, location.href);
+                if (url.origin === location.origin) {
+                    url.searchParams.set('_csrf', token);
+                    const protectedUrl = url.pathname + url.search + url.hash;
+                    input = typeof input === 'string' ? protectedUrl : new Request(protectedUrl, input);
+                }
+            } catch (e) {}
+        }
+        return originalFetch.call(this, input, init);
+    };
+})();
+
 const params = new URLSearchParams(location.search);
 const path = params.get('path');
 const requestedMediaMode = params.get('mode') || 'all';
@@ -9147,6 +9381,18 @@ initPlayer();
 </html>
 )HTML";
 
+
+    const SensorForgeAccessRole pageRole =
+        accessControlWebRole(*playerServer);
+
+    playerServer->sendHeader(
+        "Set-Cookie",
+        webCsrfCookieHeader(pageRole)
+    );
+    playerServer->sendHeader(
+        "Cache-Control",
+        "no-store"
+    );
 
     playerServer->send(
         200,

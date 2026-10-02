@@ -1,7 +1,7 @@
 SENSORFORGE / ESP32-S3 CAMERA (XIAO + FREENOVE)
 PROJEKTBESCHREIBUNG, RELEASESTAND UND WIEDEREINSTIEGSPROMPT
 Stand: 2026-10-02
-Dokumentrevision: v87 BETA 1 - erster Beta-/Feature-Freeze-Stand auf Basis von v86; Stabilitaet und UI-Feinschliff haben Vorrang
+Dokumentrevision: v87 BETA 8 - dokumentiertes HTTP/Basic-Auth-Bedrohungsmodell und spaeteres HTTPS/TLS-Hardening; Laufzeitlogik unveraendert
 
 
 ======================================================================
@@ -10,18 +10,255 @@ AKTUELLE RELEASE-TABELLE
 
 Release | Datum      | Status      | Schwerpunkt
 --------|------------|-------------|------------------------------------------------------------
-v87     | 2026-10-02 | BETA 1      | Feature-Freeze, WiFi-Zeitplan, Fallback-TX, Config-UI
+v87     | 2026-10-02 | BETA 8      | Security-Doku: lokales HTTP/Basic-Auth-Modell; HTTPS/TLS als spaeteres Hardening
 v86     | 2026-10-01 | OFFIZIELL   | Rollen/Zugriff, RTSP+HTTP-MJPEG Auth, Home Assistant, WiFi-Fixes
 v85     | 2026-10-01 | OFFIZIELL   | Image-Motion UI/Liveanalyse, Streamer-Frame-Analyse
 v84     | 2026-09-30 | OFFIZIELL   | Netzwerk-Streamer, Multi-WiFi, Kamera-/Preview-Workflow
+
+
+
+======================================================================
+V87 BETA 8 2026-10-02 - MANAGEMENT-TRANSPORT / HTTPS-TLS ALS ZUKUNFTSPUNKT
+======================================================================
+
+- SensorForge v87 Beta 8 ist der aktuelle autoritative Beta-, Test- und
+  Wiedereinstiegsstand. v86 bleibt der letzte stabile offizielle Release.
+- Release-ID: `v87-beta8`; Core-Version im Branding bleibt `7.1.0`.
+- Diese Revision aendert keine Laufzeitlogik. Sie praezisiert das aktuelle
+  Sicherheits-/Betriebsmodell fuer WebConfig und `/api/v1`.
+- WebConfig und die lokale API verwenden derzeit HTTP mit HTTP Basic Auth.
+  Basic Auth bietet Zugriffskontrolle, aber keine Transportverschluesselung;
+  Zugangsdaten und Managementdaten koennen in einem kompromittierten bzw.
+  nicht vertrauenswuerdigen Netz mitgelesen werden.
+- Verbindliche aktuelle Betriebsannahme: Managementzugriffe nur im eigenen
+  SensorForge-Hotspot oder in einem vertrauenswuerdigen/isolierten lokalen Netz;
+  keine direkte Internet-Exposition und keine Portweiterleitung fuer WebConfig,
+  API oder andere Management-Endpunkte.
+- HTTPS/TLS fuer WebConfig und API bleibt bewusst ein spaeterer Hardening-Punkt.
+  Eine Umsetzung soll erst erfolgen, wenn Board-Ressourcen und Betriebsnutzen
+  dies rechtfertigen und Zertifikats-/Schluesselverwaltung ohne unnoetige
+  Komplexitaet sauber geloest werden kann.
+- Zeitkritische Medienpfade wie RTSP, HTTP-MJPEG, Video-/Audio-Wiedergabe und
+  Dateiuebertragung sollen durch ein spaeteres Management-TLS nicht automatisch
+  mit zusaetzlicher Verschluesselungs-/CPU-Last belegt werden. Managementkanal
+  und Media-Datenpfade sind dabei getrennt zu betrachten.
+- Neubewertung erforderlich, wenn SensorForge kuenftig bewusst in fremden,
+  gemeinsam genutzten oder anderweitig nicht vertrauenswuerdigen Netzen
+  administriert werden soll oder leistungsfaehigere Boards eingesetzt werden.
+
+======================================================================
+V87 BETA 7 2026-10-02 - ARDUINO-COMPILEFIX FUER CSRF-TOKEN-GENERATOR
+======================================================================
+
+- SensorForge v87 Beta 7 ist der aktuelle autoritative Beta-, Test- und
+  Wiedereinstiegsstand. v86 bleibt der letzte stabile offizielle Release.
+- Release-ID: `v87-beta7`; Core-Version im Branding bleibt `7.1.0`.
+- Realer Arduino-ESP32-3.3.12-Build zeigte einen Namenskonflikt in
+  `web_csrf.cpp`: Arduino `Print.h` definiert `HEX` als Makro (`#define HEX 16`).
+  Die lokale Hex-Zeichentabelle in `randomToken()` hiess ebenfalls `HEX` und
+  wurde dadurch beim Preprocessing ersetzt.
+- Fix: die lokale Tabelle heisst jetzt `HEX_DIGITS`. Es handelt sich um eine
+  reine Compilekorrektur; Tokenlaenge, Zufallsquelle, Rollen-Trennung,
+  CSRF-Gates und alle Laufzeitpfade aus Beta 6 bleiben unveraendert.
+- RTSP, HTTP-MJPEG, Media-Downloads und `/api/v1` bleiben weiterhin unberuehrt.
+- Nach diesem Fix erneut einen vollstaendigen Arduino-Build ausfuehren; die
+  Hardware-/Browser-Regressionspunkte aus Beta 6 bleiben danach bestehen.
+
+======================================================================
+V87 BETA 6 2026-10-02 - ZENTRALER CSRF-SCHUTZ FUER BROWSER-AKTIONEN
+======================================================================
+
+- SensorForge v87 Beta 6 ist der aktuelle autoritative Beta-, Test- und
+  Wiedereinstiegsstand. v86 bleibt der letzte stabile offizielle Release.
+- Release-ID: `v87-beta6`; Core-Version im Branding bleibt `7.1.0`.
+- Mutierende Browser-POSTs werden jetzt zentral gegen CSRF geschuetzt:
+    * pro Boot werden zufaellige 128-bit Tokens erzeugt
+    * Administrator und Streaming-Rolle verwenden getrennte Tokens
+    * der gemeinsame WebConfig-Header versieht POST-Formulare und same-origin
+      JavaScript-POSTs automatisch mit dem passenden Token
+    * der eigenstaendige WebPlayer erhaelt denselben rollenbezogenen Schutz
+      separat fuer Annotation/Delete/Steuer-POSTs
+- Multipart-Uploads von Konfiguration und Firmware pruefen den CSRF-Token
+  zusaetzlich bereits beim Upload-Start, bevor Nutzdaten verarbeitet werden.
+- Bestehende spezielle Firmware-/Lizenz-Action-Tokens bleiben als zusaetzliche
+  transaktionsbezogene Schutzschicht erhalten.
+- `/api/v1` ist bewusst NICHT an den Browser-CSRF-Token gekoppelt. Die bestehende
+  Administrator-Authentifizierung und App-/Sync-Kompatibilitaet bleiben damit
+  unveraendert.
+- RTSP, HTTP-MJPEG, Snapshots, Video-/Audio-Playback, Datei-/Tagesdownloads und
+  sonstige lesende GET-Datenpfade wurden nicht veraendert und erhalten keine
+  neue Verschluesselungs-, Hash- oder Tokenlast.
+- Performancewirkung beschraenkt sich auf wenige Byte Tokenvergleich bei
+  zustandsaendernden Browseraktionen; die zeitkritischen Media-Datenpfade sind
+  davon nicht betroffen.
+- Hardware-/Browsertest offen: normale Admin-Saves, Factory Reset, Radar/Image
+  Motion/Shooter, SD-Wartung, Config-/Firmware-Upload sowie Streaming-Benutzer
+  mit erlaubter Annotation/Delete pruefen. Direkte POSTs ohne/falschen Token
+  muessen mit HTTP 403 abgelehnt werden.
+
+======================================================================
+V87 BETA 5 2026-10-02 - FACTORY-/RECOVERY-HOTSPOT KONSISTENT
+======================================================================
+
+- SensorForge v87 Beta 5 ist der aktuelle autoritative Beta-, Test- und
+  Wiedereinstiegsstand. v86 bleibt der letzte stabile offizielle Release.
+- Release-ID: `v87-beta5`; Core-Version im Branding bleibt `7.1.0`.
+- Ein Widerspruch zwischen Config-Policy und Hotspot-Start wurde behoben:
+    * `hotspot_password=` leer bedeutet weiterhin bewusst offener AP.
+    * 8..63 Zeichen bedeuten passwortgeschuetzter AP.
+    * nichtleere Passwoerter mit 1..7 Zeichen bleiben ungueltig und werden
+      weiterhin abgelehnt.
+- `startConfiguredHotspot()` in `sensorforge.ino` akzeptiert den leeren
+  Factory-/Recovery-Wert jetzt und startet den AP explizit ohne Passphrase.
+  Dadurch kann WebConfig nach Factory Reset, fehlender SD-Konfiguration oder
+  komplettem Config-Fallback wieder ueber den dokumentierten offenen Hotspot
+  erreichbar werden.
+- Geschuetzter Hotspot, Fallback-Hotspot, SSID-/Hidden-Logik und TX-Power-Policy
+  wurden nicht umgebaut.
+- Keine neue Sicherheits-/Provisionierungsfunktion: diese Aenderung stellt nur
+  die bereits bestehende und dokumentierte Factory-Default-Policy konsistent her.
+- Hardwaretest offen: Factory Reset/default boot, offener AP, normaler
+  passwortgeschuetzter AP und STA->Fallback-AP auf XIAO und Freenove pruefen.
+
+
+======================================================================
+V87 BETA 4 2026-10-02 - SIGNING-WORKFLOW / KEY-HANDLING KONSOLIDIERT
+======================================================================
+
+- SensorForge v87 Beta 4 war der Signing-Workflow-Konsolidierungsstand vor
+  Beta 5. v86 bleibt der letzte stabile offizielle Release.
+- Release-ID: `v87-beta4`; Core-Version im Branding bleibt `7.1.0`.
+- Die eigentliche Firmware-Update-Sicherheitslogik bleibt funktional auf dem
+  Stand von Beta 3: SD- und WebConfig/WiFi-Updates akzeptieren weiterhin nur
+  signierte `.sfw`-Pakete mit ECDSA P-256 / SHA-256. Secure Boot, eFuses und
+  Anti-Rollback bleiben bewusst ausserhalb dieses Schritts.
+- `sensorforge_firmware_sign.py` verwaltet jetzt den kompletten lokalen
+  Signing-Workflow:
+    * `keygen` erzeugt standardmaessig `sensorforge_firmware_private.pem` und
+      `sensorforge_firmware_public.pem`.
+    * Beim `keygen` wird `firmware_public_key.h` automatisch aus dem neuen
+      Public Key erzeugt bzw. ersetzt. Dadurch wird der im Firmwarebuild
+      verwendete Trust Anchor mit dem erzeugten Schluesselpaar synchronisiert.
+    * Vorhandene PEM-Dateien werden durch `keygen` nicht ueberschrieben.
+    * `--header <pfad>` erlaubt einen abweichenden Headerpfad; `--no-header`
+      erzeugt bewusst nur die PEM-Dateien.
+    * `update-header` kann `firmware_public_key.h` jederzeit aus einer bereits
+      vorhandenen Public-PEM neu erzeugen.
+    * `sign <firmware.bin>` verwendet ohne weitere Angabe automatisch
+      `sensorforge_firmware_private.pem`; ein anderer Private Key kann weiterhin
+      explizit mit `--key <datei.pem>` angegeben werden.
+- Verbindlicher Release-Ablauf fuer signierte SD-/WiFi-Firmware:
+    1. Einmalig `python3 sensorforge_firmware_sign.py keygen` ausfuehren.
+    2. SensorForge danach neu bauen, damit der erzeugte Public Key aus
+       `firmware_public_key.h` in der Firmware enthalten ist.
+    3. Die erzeugte Arduino-`.bin` mit
+       `python3 sensorforge_firmware_sign.py sign <firmware.bin>` signieren.
+    4. Fuer SD-/WiFi-Update ausschliesslich die erzeugte `.sfw` verwenden.
+- Der Private Key bleibt ausserhalb von Source-/Releasearchiven und darf nicht
+  auf Geraet oder SD-Karte verteilt werden. Public PEM und
+  `firmware_public_key.h` sind nicht geheim.
+- Direkter USB-/Programmer-Flash einer normalen `.bin` bleibt unveraendert.
+- Beta-4-Aenderung betrifft Tooling, Dokumentation und Release-Identitaet; die
+  auf dem Geraet laufende Signaturpruefung selbst wurde gegenueber Beta 3 nicht
+  neu designt. Hardwarequalifikation der Beta-3-Updatepfade bleibt offen.
+
+
+======================================================================
+V87 BETA 3 2026-10-02 - SIGNIERTE SD-/WIFI-FIRMWAREUPDATES
+======================================================================
+
+- SensorForge v87 Beta 3 ist der erste Stand mit kryptografisch authentifizierten
+  SD-/WiFi-Firmwareupdates. Beta 4 baut darauf auf und aendert nur den
+  Signing-/Key-Workflow; v86 bleibt der letzte stabile offizielle Release.
+- Release-ID: `v87-beta3`; Core-Version im Branding bleibt `7.1.0`.
+- SD-Autoupdate und WebConfig/WiFi-Upload akzeptieren nur noch signierte
+  SensorForge-Pakete mit Endung `.sfw`. Direkte USB-/Programmer-Flashes der
+  normalen `.bin` werden dadurch nicht veraendert.
+- Signaturverfahren: ECDSA P-256 / SHA-256 mit eigenem Firmware-Public-Key.
+  Der Firmware-Key ist bewusst vom Lizenz-Key getrennt.
+- SD prueft die komplette Signatur vor `Update.begin()`/`Update.write()` und
+  schreibt danach nur das enthaltene ESP-App-Image. Alte unsignierte `.bin`
+  werden aus `/firmware` nicht mehr automatisch installiert.
+- WiFi schreibt weiterhin nur in die inaktive OTA-Partition. SHA-256 wird beim
+  Upload mitgefuehrt; vor `esp_ota_end()` wird die ECDSA-Signatur geprueft.
+  Erst die bestehende explizite INSTALL-Aktion darf danach die Bootpartition
+  umstellen. Fehlerhafte oder manipulierte Pakete werden verworfen.
+- Board-Kompatibilitaetsmarker, ESP-Image-Pruefung, Recording-Gates,
+  First-Boot-SD-Guard und Installationsmetadaten bleiben erhalten.
+- Bewusst NICHT Teil dieser Aenderung: Secure Boot, Flash Encryption, eFuse-
+  Provisionierung oder Anti-Rollback. Diese Punkte bleiben optionale spaetere
+  Hardening-Massnahmen ohne aktuelle Prioritaet.
+- `sensorforge_firmware_sign.py` erzeugt aus der Arduino-`.bin` das signierte
+  `.sfw`-Paket. Der Private Key gehoert ausschliesslich auf den Release-Rechner
+  und nicht in Sourcearchiv, SD-Karte oder Geraet.
+- In dieser Arbeitsumgebung wurde kein Arduino-/Hardwarebuild ausgefuehrt.
+  XIAO und Freenove muessen mit gueltigem, manipuliertem und unsigniertem Update
+  jeweils ueber SD und WiFi getestet werden.
+
+
+======================================================================
+V87 BETA 2 2026-10-02 - API 1.20 / INTEGRATION 1.1 / APP-CONTROL-BASIS
+======================================================================
+
+- SensorForge v87 Beta 2 war der API-1.20-/Integration-1.1-Ausbaustand vor
+  den nachfolgenden Beta-3-/Beta-4-Schritten. v87 Beta 1 bleibt der erste
+  Feature-Freeze-Checkpoint; v86 bleibt der letzte stabile offizielle Release.
+- Release-ID: `v87-beta2`; Core-Version im Branding bleibt `7.1.0`.
+- Der nach Beta 1 ausdruecklich geplante API-Ausbau wurde jetzt additiv umgesetzt.
+  Das Host-Protokoll ist `1.20`, das stabile lokale Integration-/App-Profil `1.1`.
+  Bestehende `/api/v1`-Routen und bereits dokumentierte Felder bleiben erhalten.
+- Grundsatz fuer den Ausbau: keine parallele Schattenlogik. Persistente API-
+  Aenderungen verwenden weiterhin die zentrale `configValidateText()`-/
+  `configSaveText()`-Kette. Laufzeitaktionen verwenden die vorhandenen SensorForge-
+  Owner-/Safety-Pfade. Die API darf bestehende Recording-, Streamer-, Storage-,
+  Radar- oder Sleep-Schutzmechanismen nicht umgehen.
+- Neue API-Bloecke fuer die geplante Android-App:
+    * Capability Discovery und erweiterte Device/System-Telemetrie
+    * vollstaendiges Lesen der kanonischen persistenten Config ohne Secret-Leak
+    * partielle Config-Aenderungen ueber kanonische Keys mit Dry-Run und optionalem
+      anschliessendem Reboot
+    * Netzwerk-/WiFi-Status und On-Demand-Scan
+    * detaillierter Streamer-, Audio-, Recording-, Image-Motion- und Radar-Status
+    * manueller Recording-Start/Stop ueber die bestehenden zentralen Gates
+    * Image-Motion-Hintergrund-Reset
+    * Radar-Konfiguration plus Kalibrierungsaktionen
+    * Transportmodus-Aktivierung/-Deaktivierung mit sauberem Reboot
+    * Config-Shadow/SD-Copy-Status und explizite Copy/Delete-Aktionen
+    * Aufnahme-Anmerkungen lesen/schreiben und einzelne Medien ueber die bestehenden
+      Recording-/Delete-Schutzpfade sicher loeschen
+    * SFLOG1-/Plaintext-Log chunkweise lesen und ueber den bestehenden Log-Clear-Pfad
+      kontrolliert leeren
+    * verzogerter Reboot und Software-Shutdown ueber denselben Lifecycle wie WebConfig
+- Generische Config-Writes werden absichtlich NICHT teilweise hot-applied. Nach
+  erfolgreichem Persistieren meldet die API `reboot_required=true`. Dadurch werden
+  Kamera, WiFi, Audio, Streamer, Sleep und Ownership in einem sauberen Bootzustand
+  uebernommen statt waehrend eines laufenden Systems gemischt umgeschaltet zu werden.
+- Secrets wie WLAN-, Hotspot-, Administrator- und Streaming-Passwoerter koennen
+  geschrieben, aber niemals gelesen werden. GET `/api/v1/config` liefert dafuer
+  nur `*_configured`-Zustaende.
+- On-Demand-WiFi-Scan wird waehrend aktiver Aufnahme oder aktiver Streamer-Clients
+  abgelehnt, damit der API-Ausbau keine produktiven Funk-/Timingpfade stoert.
+- Noch bewusst NICHT in diese erste breite App-Control-Erweiterung aufgenommen:
+    * Firmware-Upload/Installation als generische API-Action
+    * Lizenz-Provisionierung
+    * generischer Factory-Reset
+  Diese hochriskanten Sonderpfade bleiben vorerst bei ihren bewaehrten spezialisierten
+  WebConfig-Transaktionen und sollen spaeter nur durch echte Wrapper, nicht durch
+  duplizierte Implementierungen, in die API aufgenommen werden.
+- Beta-Fokus bleibt trotz API-Ausbau: Stabilitaet, Regressionen, Hardwaretests und
+  UI-Politur. Keine weiteren breiten Feature-Bloecke ohne konkreten Bedarf.
+- In dieser Arbeitsumgebung wurde weiterhin kein eigener Arduino-Build oder neuer
+  Hardware-Langzeittest ausgefuehrt. Die API-Aenderungen muessen auf Zielhardware
+  insbesondere gegen Recording, Sleep/Wake, Streamer-Last und lange Downloads
+  qualifiziert werden.
 
 
 ======================================================================
 V87 BETA 1 2026-10-02 - ERSTER BETA-/FEATURE-FREEZE-STAND
 ======================================================================
 
-- SensorForge v87 Beta 1 ist mit Stand 2026-10-02 der aktuelle Beta-, Test- und
-  Wiedereinstiegsstand. Der letzte stabile offizielle Release bleibt v86 vom
+- SensorForge v87 Beta 1 war mit Stand 2026-10-02 der erste Beta-, Test- und
+  Feature-Freeze-Checkpoint. Der letzte stabile offizielle Release bleibt v86 vom
   2026-10-01.
 - Release-ID: `v87-beta1`; Core-Version im Branding bleibt `7.1.0`.
 - v87 Beta 1 fasst den vollstaendigen v86-Release plus die danach bewusst
@@ -332,7 +569,7 @@ V84-KANDIDAT - AUDIO-DRAIN BUILD-FIX 2026-09-29
   `std::max<size_t>(...)`. Damit ist die GCC-14-Template-Aufloesung bei
   gemischten `size_t`-/`uint32_t`-Operanden eindeutig.
 - Keine Aenderung am Laufzeitverhalten des Audio-Realtime-Drains.
-Aktueller stabiler Release: v86; aktueller Beta-/Wiedereinstiegsstand: v87 Beta 1
+Aktueller stabiler Release: v86; aktueller Beta-/Wiedereinstiegsstand: v87 Beta 8
 (separate XIAO-Recording-/Storage-Langzeitqualifikation weiterhin offen)
 Produktname: SensorForge
 Plattformname: Fabric Node
@@ -590,17 +827,17 @@ AKTUELLER NACHTRAG 2026-09-30 - RTSP/AUDIO-LIVE-FEINSCHLIFF:
 - Die neue Konfiguration defaultet auf `operating_mode=normal` sowie beide Streamer-
   Ausgaenge AUS. Alte v83-config.txt ohne diese Keys starten daher unveraendert normal.
 - `sensorforge_version.h` ist fuer den aktuellen Beta-Stand vom 2026-10-02 auf
-  `v87-beta1` gesetzt. v86 bleibt der letzte stabile offizielle Release; die darunter
+  `v87-beta8` gesetzt. v86 bleibt der letzte stabile offizielle Release; die darunter
   dokumentierten v86-/v85-/v84-Abschnitte bleiben als historische Release- und
   Entwicklungsnotizen erhalten.
 
 
-- Aktueller autoritativer Arbeits- und Wiedereinstiegsstand ist v87 Beta 1 vom
+- Aktueller autoritativer Arbeits- und Wiedereinstiegsstand ist v87 Beta 8 vom
   2026-10-02. Der letzte stabile offizielle Release bleibt v86 vom 2026-10-01.
-- Fuer weitere Entwicklung ist der vollstaendige v87-Beta-1-Quellstand die
+- Fuer weitere Entwicklung ist der vollstaendige v87-Beta-6-Quellstand die
   autoritative Basis. Temporaere aeltere v84-/v85-/v86-/v87-Arbeitsordner duerfen
   nicht als Ausgangspunkt verwendet werden.
-- Beim Wiedereinstieg den vollstaendigen v87-Beta-1-Stand verwenden und alle fuer
+- Beim Wiedereinstieg den vollstaendigen v87-Beta-6-Stand verwenden und alle fuer
   die jeweilige Aenderung betroffenen Dateien erneut lesen.
 - Bestehende produktive SensorForge-Funktionalitaet hat absolute Prioritaet.
   Streaming darf den Normalbetrieb nicht veraendern, wenn der Streamer-Modus
@@ -1083,6 +1320,11 @@ RELEASE-/DOKUMENTATIONSREGEL:
 - CHANGELOG, sensorforge_version.h, Projektbeschreibung und API-Dokumentation gemeinsam
   aktualisieren.
 - Deltapaket enthaelt nur tatsaechlich geaenderte/neue Projektdateien.
+- VERBINDLICHE AUSLIEFERUNGSREGEL: Nach jeder Code-/Dokumentationsaenderung die
+  geaenderten bzw. neu hinzugekommenen Projektdateien zusaetzlich immer gemeinsam
+  als ZIP-Deltapaket bereitstellen. Das ZIP enthaelt ausschliesslich diese Dateien
+  unter ihren originalen Dateinamen; kein komplettes Projektarchiv, ausser dies wird
+  ausdruecklich angefordert.
 
 KERNPRINZIP FUER DIE IMPLEMENTIERUNG:
 
@@ -1303,11 +1545,14 @@ Wichtig / VERBINDLICHE ENTWICKLUNGSREGELN:
   Arduino-Build oder Hardwaretest unterscheiden.
 - Der Benutzer bevorzugt komplette austauschbare Dateien und keine schwer
   anzuwendenden Patch-Schnipsel.
-- WICHTIGE PAKETREGEL: Bei Codeaenderungen duerfen ZIP-/Dateipakete nur die
-  tatsaechlich geaenderten bzw. neu hinzugekommenen Projektdateien enthalten.
-  Unveraenderte Dateien nicht erneut mitsenden und kein komplettes Projektarchiv
-  erzeugen, ausser der Benutzer fordert das ausdruecklich an. Projektdateien
-  immer unter ihrem originalen Dateinamen liefern.
+- WICHTIGE PAKETREGEL: Bei Code- oder Dokumentationsaenderungen duerfen ZIP-/
+  Dateipakete nur die tatsaechlich geaenderten bzw. neu hinzugekommenen
+  Projektdateien enthalten. Unveraenderte Dateien nicht erneut mitsenden und kein
+  komplettes Projektarchiv erzeugen, ausser der Benutzer fordert das ausdruecklich
+  an. Projektdateien immer unter ihrem originalen Dateinamen liefern.
+- Nach jeder solchen Aenderung MUSS zusaetzlich ein ZIP-Deltapaket mit genau diesen
+  geaenderten/neuen Dateien bereitgestellt werden. Einzeldateien koennen ebenfalls
+  angeboten werden; das ZIP ist jedoch die verbindliche Standardauslieferung.
 - Deltapakete sind KEINE vollstaendigen Projekt-Snapshots. Fuer eine neue
   Aenderung immer die aktuellste Version jeder konkret betroffenen Datei als
   Basis verwenden. Nach jeder freigegebenen Release-Version soll dagegen der
@@ -1736,8 +1981,8 @@ Auf echter Freenove-Hardware wurden mit SR602 mehrere aufeinanderfolgende
 Light-Sleep -> PIR-Wake -> Recording -> Light-Sleep-Zyklen erfolgreich
 beobachtet, darunter auch ein Wake nach mehr als 13 Minuten Sleep.
 
-Der aktuelle Sync-API-Stand ist Host-Protokoll 1.12 mit stabilem Integration-
-API-Profil 1.0. Der aktuelle Python-Sync-Client ist 1.4. Die boardgebundene Offline-Lizenzierung ist als technisches Fundament
+Der aktuelle Sync-API-Stand ist Host-Protokoll 1.20 mit stabilem Integration-
+API-/App-Profil 1.1. Der aktuelle Python-Sync-Client ist 1.4. Die boardgebundene Offline-Lizenzierung ist als technisches Fundament
 implementiert und auf echter Hardware erstmals erfolgreich aktiviert worden.
 Die transparente Video-Verschluesselung fuer neue AVI/MKV-Aufnahmen ist
 ebenfalls implementiert und auf echter XIAO-ESP32S3-Hardware inklusive
@@ -2854,7 +3099,7 @@ Neue Header ab v17:
 
 - X-SensorForge-API-Version
 - X-SensorForge-Device-ID
-- X-SensorForge-Integration-API-Version: 1.0
+- X-SensorForge-Integration-API-Version: 1.1
 
 Capabilities in /device kennzeichnen den real vorhandenen Funktionsumfang.
 RTSP und MQTT sind in v17 ausdruecklich noch NICHT implementiert und werden als
@@ -5937,8 +6182,9 @@ SYNC API / PC-DOWNLOAD
 ======================================================================
 
 Fuer schnellen PC-seitigen Download existiert eine eigene stateless Sync API.
-Der aktuelle Host-Stand ist Protokoll API 1.12. Zusaetzlich definiert v17 das
-stabile lokale Integration-API-Profil 1.0. Der aktuelle Python-Client
+Der aktuelle Host-Stand ist Protokoll API 1.20. Das stabile lokale
+Integration-/App-Profil ist 1.1; der historische v17-Vertrag 1.0 bleibt darin
+abwaertskompatibel enthalten. Der aktuelle Python-Client
 sensorforge_sync.py ist 1.4.
 
 Wesentliche bestehende Endpunkte:
@@ -6034,8 +6280,8 @@ Getestete Alternativen:
 
 Der Transferpfad mit 32 KB / Core 0 bleibt daher der bewaehrte Sweet Spot.
 API 1.10 fuehrte die read-only Status-/Sensor-/Snapshot-Funktionen ein. Der
-aktuelle Host-Stand ist inzwischen Protokoll API 1.12; v17 ergaenzt darauf
-additiv das stabile Integration-API-Profil 1.0. Der bewaehrte Downloadpfad wurde
+aktuelle Host-Stand ist inzwischen Protokoll API 1.20 mit Integration-/App-Profil
+1.1; der v17-Vertrag 1.0 bleibt darin additiv kompatibel enthalten. Der bewaehrte Downloadpfad wurde
 dadurch nicht grundsaetzlich neu designt.
 
 
@@ -6699,9 +6945,9 @@ Solange kein konkretes Problem besteht, nicht wieder grundlos umbauen:
 - Recorder-Interface komplett neu designen
 - Camera Queue neu designen
 - extreme SD-Mikrooptimierungen
-- Sync-/Integration-API ohne konkreten Bedarf ueber den bewaehrten aktuellen
-  API-1.12-/Integration-1.0-Vertrag hinaus grundsaetzlich neu designen oder
-  durch FTP ersetzen
+- Sync-/Integration-API ausserhalb des jetzt festgelegten API-1.20-/
+  Integration-1.1-Vertrags ohne konkreten Bedarf grundsaetzlich neu designen
+  oder durch FTP ersetzen
 - bereits funktionierende Fast-Light-Sleep-Logik neu schreiben
 - Transportmodus automatisiert nur aufgrund von Dunkelheit aktivieren
 
@@ -7090,9 +7336,10 @@ WICHTIGE ENTWICKLUNGSREGELN
 
 - Die bewaehrte Sync-API-Semantik mit Auth, Exclusive-Lease und Range/Resume
   bei spaeteren Client-/App-Implementierungen kompatibel halten. Aktueller Host
-  ist Protokoll API 1.12 mit Integration API 1.0; neue Funktionen bevorzugt
-  read-only und additiv einfuehren. Bestehende dokumentierte API-v1-Felder und
-  Routen nicht ohne neue Major-Version entfernen oder umbenennen.
+  ist Protokoll API 1.20 mit Integration API 1.1. Neue Funktionen weiterhin
+  additiv einfuehren und vorhandene zentrale Validierungs-/Safety-Pfade nutzen.
+  Bestehende dokumentierte API-v1-Felder und Routen nicht ohne neue Major-Version
+  entfernen oder umbenennen.
 
 - Debug-Zeitstempel im kritischen Pfad sammeln, Console-Ausgabe danach.
 
@@ -7591,21 +7838,32 @@ aktuell Vorrang, aber jeder neue sichtbare UI-Text muss sofort DE+EN erhalten.
 
 SYNC API:
 
-Aktuelles Host-Protokoll API 1.12, stabiles Integration-API-Profil 1.0,
-Python-Client sensorforge_sync.py 1.4. Bewaehrte Endpunkte fuer
-status/days/files/file/exclusive und Diagnose bleiben. Bereits seit API 1.10
-read-only vorhanden:
+Aktuelles Host-Protokoll API 1.20, stabiles Integration-API-Profil 1.1.
+Python-Client sensorforge_sync.py 1.4 und die bewaehrten Transferendpunkte fuer
+status/days/files/file/exclusive bleiben kompatibel. Die bisherigen Device-,
+State-, Storage-, Sensor-, Snapshot- und Shooter-Routen bleiben ebenfalls erhalten.
 
-- GET /api/v1/storage
-- GET /api/v1/sensors
-- GET /api/v1/camera/snapshot
+Fuer v87 Beta 2 ist `/api/v1` additiv zur App-/Administrationsschnittstelle
+ausgebaut. Zusaetzlich stehen insbesondere bereit:
 
-Mit v17 additiv hinzugekommen:
+- GET /api/v1/capabilities
+- GET/POST /api/v1/config sowie GET /api/v1/config/schema
+- GET/POST /api/v1/config/storage
+- GET /api/v1/network und GET /api/v1/network/scan
+- GET/POST /api/v1/media/annotation und POST /api/v1/media/delete
+- GET /api/v1/log und POST /api/v1/log/clear
+- GET /api/v1/streamer, /audio, /image-motion, /recording und /radar
+- POST /api/v1/image-motion/background/reset
+- POST /api/v1/recording/start und /recording/stop
+- POST /api/v1/radar/config und /radar/calibration
+- POST /api/v1/transport
+- GET /api/v1/system sowie POST /api/v1/system/reboot und /system/shutdown
 
-- GET /api/v1/device
-- GET /api/v1/state
-- GET /api/v1/shooter
-- POST /api/v1/shooter/flush
+Persistente Config-Aenderungen verwenden die zentrale Config-Validierung und
+werden standardmaessig erst nach sauberem Neustart wirksam. Secrets sind nicht
+lesbar. Laufzeitaktionen verwenden die bestehenden Ownership-/Safety-Gates.
+Firmware-Upload, Lizenz-Provisionierung und generischer Factory-Reset sind in
+diesem API-Ausbauschritt bewusst noch nicht freigegeben.
 
 /status liefert device_id=cfg_hostname. Responses tragen API-Version und
 Device-ID Header. device_id ist nur Netzwerk-/Sync-Identitaet und NICHT die
@@ -7620,9 +7878,9 @@ Core 0. Da NORMAL==MAX, wird bei Exclusive kein reiner 20->20-MHz-Remount mehr
 benoetigt.
 Realer Transfer liegt typischerweise bei etwa 0.80-0.81 MB/s.
 
-HOME ASSISTANT / INTEGRATION - WIEDEREINSTIEGSPUNKT:
+HOME ASSISTANT / INTEGRATION - HISTORISCHER V17-WIEDEREINSTIEGSPUNKT:
 
-Gueltiger letzter Stand ist v17. Host-Protokoll API 1.12, Integration API 1.0.
+Historischer Stand v17: Host-Protokoll API 1.12, Integration API 1.0.
 Neue Routen: /device, /state, /shooter und POST /shooter/flush. /device besitzt
 eine stabile zufaellige integration_id in NVS. Bestehende Sync-Routen bleiben
 unveraendert. RTSP, MQTT und Home-Assistant-Discovery sind NOCH NICHT
@@ -7761,9 +8019,9 @@ WEITERE PRIORITAETEN:
   verkleinern; web_log.cpp/.h ist seit v22 ausgelagert und SD Maintenance seit
   v40 als web_sd_maintenance.cpp/.h. Keine grosse gleichzeitige
   Komplettrefaktorierung vor Feldqualifikation
-- Integration-API-Vertrag von v17 (Host 1.12 / Integration API 1.0) als stabile
-  Basis einfrieren; bei Wiederaufnahme von HA den dann aktuellen Firmwarestand
-  gegen bestehende Kamera-/Sync-Funktion regressionsfrei pruefen
+- aktuellen Integration-API-Vertrag von v87 Beta 2 (Host 1.20 / Integration
+  API 1.1) kompatibel halten; bei weiteren HA-/App-Erweiterungen den aktuellen
+  Firmwarestand gegen bestehende Kamera-/Sync-Funktion regressionsfrei pruefen
 - danach Home Assistant nur additiv ueber optionales home_assistant_enabled=0|1
   einfuehren; alte Config ohne Key muss exakt bisherigen Betrieb behalten
 - mDNS/Zeroconf + HA-Custom-Integration vor RTSP umsetzen; RTSP/MJPEG erst danach

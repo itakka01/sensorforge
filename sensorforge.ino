@@ -52,6 +52,7 @@
 #include "image_motion.h"
 #include "motion_diagnostics.h"
 #include "streamer.h"
+#include "firmware_security.h"
 
 
 // =============================================================
@@ -3246,22 +3247,23 @@ static bool initSDWithRetries(
 // SD FIRMWARE AUTO-UPDATE
 // =============================================================
 //
-// Trigger: exactly ONE file ending in .bin inside /firmware.
+// Trigger: exactly ONE signed file ending in .sfw inside /firmware.
 //
 // Accepted examples:
-//   /firmware/sensorforge.ino.bin
-//   /firmware/release_2026-09-08.bin
+//   /firmware/sensorforge-v88.sfw
+//   /firmware/release_2026-10-02.sfw
 //
 // Safety:
-//   - 0 *.bin: normal boot
-//   - >1 *.bin: no update (ambiguous)
+//   - 0 *.sfw: normal boot
+//   - >1 *.sfw: no update (ambiguous)
+//   - ECDSA-P256/SHA-256 signature required
 //   - ESP image magic checked
 //   - size checked against inactive OTA partition
 //   - board-specific SENSORFORGE compatibility marker required
 //   - candidate renamed before flash to prevent automatic reflash loops
 //
-// Success: original.bin -> original.bin.done
-// Failure: original.bin -> original.bin.failed
+// Success: original.sfw -> original.sfw.done
+// Failure: original.sfw -> original.sfw.failed
 // Interrupted update: update.inprogress -> update.interrupted.failed
 
 static const char *FW_UPDATE_DIR =
@@ -3449,7 +3451,7 @@ static bool firmwareFindSingleCandidate(
 
             lower.toLowerCase();
 
-            if (lower.endsWith(".bin")) {
+            if (lower.endsWith(".sfw")) {
 
                 ++candidateCount;
 
@@ -3490,7 +3492,7 @@ static bool firmwareFindSingleCandidate(
         candidatePath = "";
         candidateName = "";
         error =
-            "more than one .bin file found in /firmware - update skipped";
+            "more than one .sfw file found in /firmware - update skipped";
         return false;
     }
 
@@ -3500,7 +3502,9 @@ static bool firmwareFindSingleCandidate(
 
 static bool firmwareFileContainsMarker(
     File &firmware,
-    const char *marker
+    const char *marker,
+    size_t startOffset,
+    size_t searchLength
 )
 {
     if (!marker)
@@ -3511,7 +3515,8 @@ static bool firmwareFileContainsMarker(
 
     if (
         markerLength == 0 ||
-        markerLength >= 128U
+        markerLength >= 128U ||
+        searchLength < markerLength
     ) {
         return false;
     }
@@ -3519,20 +3524,28 @@ static bool firmwareFileContainsMarker(
     static uint8_t scanBuffer[4096 + 128];
 
     size_t carry = 0;
+    size_t remaining = searchLength;
 
-    if (!firmware.seek(0))
+    if (!firmware.seek(startOffset))
         return false;
 
-    while (firmware.available()) {
+    while (remaining > 0) {
+
+        size_t requested =
+            remaining < 4096U
+            ? remaining
+            : 4096U;
 
         size_t got =
             firmware.read(
                 scanBuffer + carry,
-                4096
+                requested
             );
 
         if (got == 0)
             break;
+
+        remaining -= got;
 
         size_t total =
             carry + got;
@@ -3556,7 +3569,7 @@ static bool firmwareFileContainsMarker(
                     ) == 0
                 ) {
 
-                    firmware.seek(0);
+                    firmware.seek(startOffset);
                     return true;
                 }
             }
@@ -3578,20 +3591,24 @@ static bool firmwareFileContainsMarker(
         yield();
     }
 
-    firmware.seek(0);
+    firmware.seek(startOffset);
     return false;
 }
 
 
 static bool firmwareFileContainsCompatMarker(
-    File &firmware
+    File &firmware,
+    size_t startOffset,
+    size_t searchLength
 )
 {
     // Current SensorForge releases.
     if (
         firmwareFileContainsMarker(
             firmware,
-            FW_COMPAT_MARKER
+            FW_COMPAT_MARKER,
+            startOffset,
+            searchLength
         )
     ) {
         return true;
@@ -3601,7 +3618,9 @@ static bool firmwareFileContainsCompatMarker(
     if (
         firmwareFileContainsMarker(
             firmware,
-            FW_COMPAT_MARKER_LEGACY
+            FW_COMPAT_MARKER_LEGACY,
+            startOffset,
+            searchLength
         )
     ) {
         return true;
@@ -3632,7 +3651,19 @@ static bool firmwareValidateCandidate(
         return false;
     }
 
-    firmwareSize = firmware.size();
+    SensorForgeFirmwarePackageInfo packageInfo;
+
+    if (!firmwareSecurityReadHeader(
+            firmware,
+            packageInfo,
+            error
+        )) {
+        firmware.close();
+        return false;
+    }
+
+    firmwareSize =
+        packageInfo.firmwareSize;
 
     const esp_partition_t *targetPartition =
         esp_ota_get_next_update_partition(
@@ -3650,7 +3681,25 @@ static bool firmwareValidateCandidate(
         firmwareSize > targetPartition->size
     ) {
         firmware.close();
-        error = "firmware file is empty or too large for OTA partition";
+        error = "firmware image is empty or too large for OTA partition";
+        return false;
+    }
+
+    const uint64_t expectedPackageSize =
+        (uint64_t)SENSORFORGE_FIRMWARE_PACKAGE_HEADER_SIZE +
+        (uint64_t)firmwareSize;
+
+    if ((uint64_t)firmware.size() != expectedPackageSize) {
+        firmware.close();
+        error = "firmware package size is inconsistent";
+        return false;
+    }
+
+    if (!firmware.seek(
+            SENSORFORGE_FIRMWARE_PACKAGE_HEADER_SIZE
+        )) {
+        firmware.close();
+        error = "cannot seek to firmware image payload";
         return false;
     }
 
@@ -3663,47 +3712,27 @@ static bool firmwareValidateCandidate(
         return false;
     }
 
-    if (!firmwareFileContainsCompatMarker(firmware)) {
+    if (!firmwareFileContainsCompatMarker(
+            firmware,
+            SENSORFORGE_FIRMWARE_PACKAGE_HEADER_SIZE,
+            firmwareSize
+        )) {
         firmware.close();
         error = "firmware compatibility marker missing/wrong board";
         return false;
     }
 
+    if (!firmwareSecurityVerifyPackageFile(
+            firmware,
+            packageInfo,
+            error
+        )) {
+        firmware.close();
+        return false;
+    }
+
     firmware.close();
     return true;
-}
-
-
-// Public read-only helpers for WebConfig's staged WiFi firmware upload.
-// The web layer deliberately reuses the exact same validator as the SD
-// auto-update path so both installation paths enforce identical image,
-// partition-size and board-compatibility checks.
-bool firmwareValidateStagedImage(
-    const String &candidatePath,
-    size_t &firmwareSize,
-    String &error
-)
-{
-    return
-        firmwareValidateCandidate(
-            candidatePath,
-            firmwareSize,
-            error
-        );
-}
-
-
-size_t firmwareInactiveOtaCapacity()
-{
-    const esp_partition_t *targetPartition =
-        esp_ota_get_next_update_partition(
-            nullptr
-        );
-
-    return
-        targetPartition
-        ? targetPartition->size
-        : 0U;
 }
 
 
@@ -3780,11 +3809,11 @@ static bool firmwareUpdateFromSdIfPresent()
     );
 
     Serial.println(
-        "Firmware update: compatibility OK: " +
+        "Firmware update: signature + compatibility OK: " +
         String(FW_COMPAT_MARKER)
     );
 
-    // Rename before flash: after a power loss there is no .bin left
+    // Rename before flash: after a power loss there is no .sfw left
     // that could be flashed repeatedly on every boot.
     if (!STORAGE.rename(
             candidatePath.c_str(),
@@ -3824,6 +3853,20 @@ static bool firmwareUpdateFromSdIfPresent()
             "Firmware update: ERROR - cannot open update.inprogress"
         );
 
+        firmwareUpdateLedStop();
+        firmwareMoveWorkTo(failedPath);
+        return false;
+    }
+
+    if (!firmware.seek(
+            SENSORFORGE_FIRMWARE_PACKAGE_HEADER_SIZE
+        )) {
+
+        Serial.println(
+            "Firmware update: ERROR - cannot seek to signed image payload"
+        );
+
+        firmware.close();
         firmwareUpdateLedStop();
         firmwareMoveWorkTo(failedPath);
         return false;
@@ -14374,9 +14417,10 @@ void startWebConfig()
 
         WiFi.mode(WIFI_AP);
 
+        const size_t hotspotPasswordLength = cfg_hotspot_password.length();
         if (
-            cfg_hotspot_password.length() < 8 ||
-            cfg_hotspot_password.length() > 63
+            hotspotPasswordLength != 0 &&
+            (hotspotPasswordLength < 8 || hotspotPasswordLength > 63)
         ) {
             consoleWrite(
                 "WIFI",
@@ -14386,12 +14430,22 @@ void startWebConfig()
             return false;
         }
 
-        if (!WiFi.softAP(
-                apSsid.c_str(),
-                cfg_hotspot_password.c_str(),
-                1,
-                cfg_hotspot_hidden ? 1 : 0
-            )) {
+        const bool hotspotStarted =
+            hotspotPasswordLength == 0
+                ? WiFi.softAP(
+                    apSsid.c_str(),
+                    nullptr,
+                    1,
+                    cfg_hotspot_hidden ? 1 : 0
+                )
+                : WiFi.softAP(
+                    apSsid.c_str(),
+                    cfg_hotspot_password.c_str(),
+                    1,
+                    cfg_hotspot_hidden ? 1 : 0
+                );
+
+        if (!hotspotStarted) {
             consoleWrite(
                 "WIFI",
                 "Hotspot start failed"

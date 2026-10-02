@@ -7,6 +7,13 @@ void webConfigStart();
 void webConfigStop();
 void webConfigLoop();
 
+// API/system-action hooks. These reuse the same delayed WebConfig lifecycle
+// used by the browser UI so HTTP responses can complete before restart/power-off.
+// The functions refuse unsafe transitions such as reboot/shutdown during an
+// active recording and return a machine-readable reason in error.
+bool webConfigScheduleReboot(uint32_t delayMs, String &error);
+bool webConfigScheduleShutdown(uint32_t delayMs, String &error);
+
 // Software PIR simulation
 bool webConfigMotionActive();
 uint32_t webConfigMotionRemainingMs();

@@ -1,0 +1,85 @@
+Ja. Hier ist der belastbare Zwischenstand. Wichtig: Das ist noch nicht der vollständige Gesamtaudit; insbesondere Streaming, Recording-Langzeitpfade, Sleep/Wakeup, SD-Recovery und Concurrency sind noch nicht vollständig durchverfolgt.
+Eine Korrektur zu meiner abgebrochenen Nachricht: Der Factory-Default erzeugt nicht einfach einen offenen Hotspot. Der tiefere Call-Trace zeigt vielmehr einen Widerspruch, durch den der Default-Hotspot gar nicht startet.
+Bisher bestätigte Befunde
+1. BEHOBEN IN v87-beta3 – Firmware-Updates im Anwendungscode kryptografisch authentifiziert
+Datei/Funktion: sensorforge.ino, firmwareValidateCandidate(), firmwareUpdateFromSdIfPresent() ca. Zeilen 3615–3988.
+Ursache: Ein Firmware-Image wird nur auf Größe, ESP32-Image-Header 0xE9 und einen im Binärfile auffindbaren Board-Kompatibilitätsmarker geprüft. Es gibt keine Signaturprüfung gegen einen vertrauenswürdigen Firmware-Public-Key.
+Szenario: Jemand kann eine manipulierte .bin mit passendem Marker auf die SD-Karte unter /firmware legen. Diese wird bereits sehr früh beim Booten automatisch installiert, noch vor normaler Config-/Web-/Authentifizierungsinitialisierung.
+Auswirkung: Vollständige Übernahme des Geräts durch beliebigen Firmware-Code, sofern nicht außerhalb dieses Sourcecodes ESP32 Secure Boot per eFuse wirksam erzwungen wird.
+Umsetzung v87-beta3: SD und WiFi akzeptieren nur signierte `.sfw`-Pakete (ECDSA P-256 / SHA-256) mit eigenem Firmware-Public-Key. SD authentifiziert vor dem Flash-Schreibpfad; WiFi schreibt nur in die inaktive OTA-Partition und authentifiziert vor dem Staging/Boot-Select. Secure Boot/Anti-Rollback bleiben bewusst optionale spaetere Hardening-Punkte.
+Hardwaretest erforderlich: JA. Gueltiges, manipuliertes und unsigniertes Update auf XIAO und Freenove jeweils per SD und WiFi pruefen.
+2. HOCH – Der mitgelieferte Lizenz-Private-Key gehört exakt zum von der Firmware akzeptierten Public-Key
+Dateien: sensorforge_license_private_DEV.pem, sensorforge_license_public_DEV.pem, license_public_key.h, license.cpp.
+Ich habe den Public-Key aus dem Private-Key abgeleitet: Er stimmt exakt mit SENSORFORGE_LICENSE_PUBLIC_KEY_PEM überein.
+Ursache: Der Signatur-Private-Key des aktuell eingebauten Lizenz-Vertrauensankers befindet sich im Source-ZIP.
+Szenario: Jeder Besitzer dieses ZIPs kann kryptografisch gültige SensorForge-Lizenzen erzeugen, die license.cpp akzeptiert.
+Auswirkung: Die Authentizität des Lizenzsystems ist mit diesem Schlüsselpaar vollständig aufgehoben.
+Aktuell mildert license_policy.cpp die direkte Produktauswirkung etwas ab: Die Lizenzierung ist dort momentan bewusst permissiv und schaltet noch keine Funktionen ab. Sobald dieser Key aber für echte Lizenzrestriktionen verwendet würde, wäre die Umgehung unmittelbar.
+Korrekturrichtung: Produktions-Keypair rotieren; vorhandenen DEV-Key niemals als Produktionsanker verwenden; Private Keys vollständig aus Source-/Releasearchiven entfernen.
+Hardwaretest: Nein.
+3. HOCH – Reale Zugangsdaten befinden sich im Klartext im gelieferten Source-ZIP
+Datei: config.txt.
+Enthalten sind Klartextwerte für WLAN, WLAN-Passwort, Hotspot und Web-Administrator. Ich gebe die konkreten Werte hier bewusst nicht wieder.
+Szenario: Weitergabe/Backup/Support-Upload dieses Sourcearchivs gibt gleichzeitig operative Credentials weiter.
+Auswirkung: Je nach weiterer Verwendung Zugang zum WLAN und/oder vollständiger SensorForge-Adminzugriff.
+Korrekturrichtung: Operative config.txt nicht in Source-/Releasearchive aufnehmen, Credentials wechseln und nur redigierte Beispielkonfiguration versionieren.
+Hardwaretest: Nein.
+Positiv dabei: Der eigentliche Runtime-Code besitzt inzwischen eine wesentlich bessere SFSEC1-Speicherung mittels AES-GCM und gerätegebundenem eFuse-HMAC-Key. Das Problem hier ist primär das gelieferte Archiv selbst.
+4. BEHOBEN IN v87-beta5 – Factory-Defaults führten zu einem widersprüchlichen Hotspot-Zustand und konnten WebConfig unzugänglich machen
+Dateien/Funktionen: config.cpp::makeDefaultValues(), config.cpp::loadConfig(), sensorforge.ino::startWebConfig().
+Factory-Defaults:
+- hotspot_enabled = 1
+- hotspot_password = ""
+- Validator akzeptiert explizit ein leeres Passwort als offenen AP.
+- Factory-Reset-Webseite sagt ebenfalls ausdrücklich „offener Hotspot ohne Passwort“.
+Vor v87-beta5 machte startConfiguredHotspot():
+password.length() < 8  -> Hotspot start blocked
+WiFi.mode(WIFI_OFF)
+return false
+
+Damit funktionierte der dokumentierte/konfigurierte offene Factory-AP vor v87-beta5 nicht.
+Szenarien: Factory Reset; SD-Konfiguration beschädigt/fehlt und LittleFS-Konfiguration ebenfalls beschädigt/fehlt; neues Gerät nur mit Firmware-Defaults.
+Auswirkung: SensorForge fällt auf Defaults zurück, kann anschließend aber WebConfig nicht starten. Besonders problematisch ist das als Recovery-Pfad im Feld.
+Umsetzung v87-beta5: `startConfiguredHotspot()` folgt jetzt der bereits bestehenden Config-Policy. Leeres Passwort startet explizit einen offenen AP; 8..63 Zeichen starten einen geschützten AP; nichtleere 1..7-Zeichen-Werte bleiben ungültig. Die Factory-/Recovery-Defaults werden nicht geändert.
+Hardwaretest: JA, inklusive Factory Reset, fehlender SD und zerstörter LittleFS-Config.
+5. BEHOBEN IN v87-beta6 – Viele zustandsändernde Web-Endpunkte hatten keinen serverseitigen CSRF-Schutz
+Betroffen u. a.: /config_factory_reset, /save, /wifi_settings_save, /access_settings_save, /delete_day, /player_delete, /recording_pause, Shooter/Radar/Image-Motion-POSTs usw.
+Die zentrale Authentifizierung schützt grundsätzlich den Zugriff, aber für zahlreiche POSTs gibt es keinen Origin-/Referer-Check und keinen serverseitigen Request-Token. JavaScript-confirm() ist kein Sicherheitsmechanismus.
+Einige besonders kritische Firmware-/Systemaktionen besitzen dagegen bereits Action-Tokens. Der Schutz ist also inkonsistent.
+Szenario: Ein Administrator hat HTTP-Basic-Credentials im Browser gecacht und öffnet anschließend eine fremde Website. Ein Cross-Origin-Form-POST kann je nach Browser/Protection-Space mit den gespeicherten Credentials an SensorForge gehen.
+Besonders ungünstig ist die Kombination mit Befund 4: Ein CSRF-ausgelöster Factory Reset kann anschließend die Netzwerk-Erreichbarkeit verlieren.
+Auswirkung: Konfigurationsänderungen, Aufnahmesteuerung oder Datenlöschung ohne bewusste Aktion des Administrators.
+Umsetzung v87-beta6: Zentraler per-Boot-CSRF-Mechanismus fuer mutierende Browser-POSTs. Admin und Streaming-Rolle verwenden getrennte 128-bit Tokens. Der gemeinsame WebConfig-Header versieht POST-Formulare und same-origin `fetch()` automatisch; der standalone WebPlayer erhaelt denselben rollenbezogenen Schutz separat. Config-/Firmware-Multipart-Uploads pruefen den Token zusaetzlich bereits im Upload-Startpfad. `/api/v1` bleibt absichtlich ausserhalb dieses Browser-Token-Vertrags, damit bestehende App/Sync-Clients unveraendert funktionieren. Stream-, Snapshot-, Playback- und Download-GET-Datenpfade wurden nicht veraendert.
+Hardwaretest: JA, vor allem mit realen Browsern und HTTP-Basic-Credential-Caching; fehlender/falscher Token muss 403 liefern, normale UI-Aktionen muessen unveraendert funktionieren.
+6. MITTEL – Legacy-Aufzeichnungsverschlüsselung enthält einen öffentlichen Development-Master-Seed
+Datei: recording_crypto.cpp, LEGACY_DEVELOPMENT_SEED, deriveLegacyDevelopmentMasterKey().
+Der Legacy-Master-Key wird aus einem im Source enthaltenen konstanten Seed und der Factory-MAC abgeleitet. Der Code unterstützt diese Legacy-Keys weiterhin explizit zum Lesen alter SFENC1-Dateien.
+Szenario: Angreifer besitzt eine alte, mit diesem Development-Verfahren erzeugte Aufzeichnung und kennt die Factory-MAC des Geräts.
+Auswirkung: Vertraulichkeit dieser Legacy-Aufzeichnungen beruht nicht mehr auf einem geheimen Schlüssel.
+Korrekturrichtung: Legacy-Migrationsfenster begrenzen bzw. alte Dateien einmalig auf den eFuse-basierten Key migrieren und anschließend Legacy-Key-Unterstützung entfernen.
+Hardwaretest: Für den kryptografischen Befund nein; für Migration/Kompatibilität ja.
+7. MITTEL – Web/API-Authentifizierung läuft über HTTP Basic ohne Transportverschlüsselung
+Dateien: access_control.cpp, sync_api.cpp, WebServer-Initialisierung.
+Credentials werden mit HTTP Basic übertragen. Im Projekt ist bislang kein HTTPS/TLS-Webserver erkennbar.
+Szenario: MITM bzw. kompromittiertes/unsicheres LAN oder WLAN.
+Auswirkung: Abgegriffene Admin-Credentials ermöglichen weitreichende Kontrolle über das Gerät.
+Korrekturrichtung: Transportverschlüsselung oder ein entsprechend gesicherter Management-Kanal; zumindest das Bedrohungsmodell für unverschlüsselte Managementzugriffe explizit begrenzen.
+Hardware-/Netzwerktest: Ja.
+Bereits positiv aufgefallene Absicherungen
+Bei allen 43 aktuell in syncApiRegisterRoutes() registrierten /api/v1/...-Endpunkten konnte ich bislang einen direkten authenticate()-Aufruf im Handler bestätigen. Die API hängt damit nicht nur von der allgemeinen Web-Middleware ab.
+Ebenfalls gut:
+- API-Recording-Pfade werden auf ein enges Recording-Schema beschränkt; .. wird verworfen.
+- Config-Upload ist auf 32 KiB begrenzt.
+- Multipart-Config- und Firmware-Uploads prüfen die Authentifizierung zusätzlich innerhalb des Upload-Callbacks.
+- Config-Secrets werden auf dem Gerät per AES-GCM geschützt; Feldname wird als AAD verwendet.
+- Der Config-Code verwendet atomare .tmp/.bak-Mechanismen.
+- In den bisher überprüften C/C++-Bereichen fand ich keine offensichtliche Verwendung von strcpy, strcat, sprintf, gets etc.
+- Viele Recording-/Delete-Pfade besitzen bereits einen zweiten Recorder-Check nach dem Setzen eines Start-Blockers.
+Noch offene Verdachtsbereiche
+Noch nicht als Fehler bewiesen, aber im weiteren Audit besonders relevant:
+g_storageLocked ist laut eigenem Header ausdrücklich nur ein volatile bool-State-Gate und kein Mutex. Ob daraus echte TOCTOU-/Ownership-Races zwischen Recorder, Webserver, API, Logger, Maintenance und Background-Writer entstehen, muss über alle Task-Kontexte hinweg weiterverfolgt werden.
+Ebenso noch nicht vollständig abgeschlossen sind Multi-Client RTSP/RTP/MJPEG, Audio-Task-Lifetime, Socket-/Disconnect-Pfade, Recording-Segmentwechsel, Stromausfall während verschlüsselter Writes, Secure-Erase/Format-Recovery, Sleep/Wakeup-Kollisionen, Shooter, WiFi-Schedule und Timer-Langzeitverhalten.
+Build-Status
+Einen echten ESP32-/Arduino-Build konnte ich in der vorhandenen Umgebung bislang nicht durchführen: arduino-cli, PlatformIO und der ESP32-S3-Crosscompiler sind hier nicht installiert. Vorhanden ist nur ein normaler Host-clang++; damit einen Arduino/ESP-IDF-Build zu simulieren wäre kein belastbarer Buildtest.
+Daher behandle ich die bisherigen Ergebnisse ausdrücklich als statische Codeanalyse, nicht als erfolgreichen Build.
+Das ist der konsolidierte Stand, den ich zum Zeitpunkt des Abbruchs plus der jetzt nachgeholten Verifikation belastbar bestätigen kann.

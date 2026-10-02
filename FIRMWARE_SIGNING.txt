@@ -1,0 +1,30 @@
+SENSORFORGE SIGNIERTE FIRMWARE-UPDATES (.sfw)
+==============================================
+
+SD- und WiFi-Updates akzeptieren ab v87-beta3 nur noch signierte .sfw-Pakete.
+Direktes Flashen per USB/Programmer verwendet weiterhin die normale Arduino-.bin.
+
+SIGNIEREN
+---------
+python3 sensorforge_firmware_sign.py sign sensorforge.ino.bin \
+  --key /SICHERER/PFAD/sensorforge_firmware_private.pem \
+  --output sensorforge-v87-beta3.sfw
+
+Das Tool prueft dabei auch, ob genau ein aktueller XIAO- oder Freenove-
+Kompatibilitaetsmarker im .bin vorhanden ist.
+
+VERWENDUNG
+----------
+SD:   die .sfw nach /firmware kopieren; genau eine .sfw dort ablegen.
+WiFi: unter System -> Firmware Update die .sfw auswaehlen, hochladen/pruefen
+      und danach wie bisher explizit installieren.
+
+EIGENEN PRODUKTIONSKEY ERZEUGEN
+-------------------------------
+python3 sensorforge_firmware_sign.py keygen \
+  --private /SICHERER/PFAD/sensorforge_firmware_private.pem \
+  --public  /SICHERER/PFAD/sensorforge_firmware_public.pem \
+  --header  firmware_public_key.h
+
+Danach SensorForge mit dem neuen firmware_public_key.h neu kompilieren.
+Den Private Key nicht in Sourcearchiv, Git, SD-Karte oder Geraet kopieren.

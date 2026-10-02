@@ -46,6 +46,8 @@
 #include "webconfig_audio.h"
 #include "webconfig_wifi.h"
 #include "access_control.h"
+#include "firmware_security.h"
+#include "web_csrf.h"
 
 static const char *AUDIO_MIC_TEST_PATH = "/sensorforge_audio_test.wav";
 static const uint32_t AUDIO_MIC_TEST_DURATION_MS = 10000UL;
@@ -1367,6 +1369,13 @@ static String htmlHeader()
 
     if (streamingAccess)
         html.replace("<body>", "<body class='stream-role'>");
+
+    html +=
+        webCsrfBrowserBootstrap(
+            streamingAccess
+            ? SENSORFORGE_ACCESS_STREAM
+            : SENSORFORGE_ACCESS_ADMIN
+        );
 
     String returnPath =
         server.uri();
@@ -3470,6 +3479,15 @@ static void handleConfigUploadData()
 
         // Multipart callbacks may be invoked while the request body is still
         // being parsed. Protect the upload independently of route middleware.
+        const SensorForgeAccessRole uploadRole =
+            accessControlWebRole(server);
+
+        if (!webCsrfRequestValid(server, uploadRole)) {
+            webConfigUploadError =
+                "Invalid or missing CSRF token";
+            return;
+        }
+
         if (
             cfg_web_auth_enabled &&
             !server.authenticate(
@@ -11606,20 +11624,19 @@ static void handleRadarConfigDefaults()
 // WIFI FIRMWARE UPDATE
 // -------------------------------------------------------------
 //
-// Browser uploads are staged directly in the inactive internal OTA partition.
-// The SD card is deliberately not part of the WiFi update path. This keeps
-// remote recovery available when the SD card is absent, damaged or unstable.
+// Browser uploads use a signed SensorForge .sfw package. The package header
+// contains the raw ESP application size, SHA-256 and ECDSA-P256 signature.
+// Only the raw application payload is written to the inactive OTA partition.
 //
 // Safety model:
-//   1. Upload writes only to the inactive OTA partition.
-//   2. ESP image magic, partition capacity and SensorForge board marker are
-//      checked while streaming.
-//   3. esp_ota_end() validates the completed application image.
-//   4. The running/boot partition is NOT changed by the upload.
-//   5. Only the explicit INSTALL action calls esp_ota_set_boot_partition().
+//   1. Only signed .sfw packages are accepted.
+//   2. Package format, image size, ESP magic and board marker are checked.
+//   3. SHA-256 is calculated while the payload is streamed.
+//   4. The ECDSA signature is verified before esp_ota_end() can stage the image.
+//   5. The running/boot partition is NOT changed by the upload.
+//   6. Only the explicit INSTALL action calls esp_ota_set_boot_partition().
 //
-// A failed/interrupted upload therefore leaves the currently running firmware
-// selected. The next upload simply overwrites the inactive OTA partition again.
+// A failed/interrupted/unsigned upload therefore never becomes bootable.
 
 static const uint8_t WEB_FW_ESP_IMAGE_MAGIC = 0xE9U;
 static const size_t WEB_FW_MARKER_MAX_BYTES = 96U;
@@ -11629,6 +11646,7 @@ static bool webFirmwareUploadSucceeded = false;
 static bool webFirmwareUploadLocksHeld = false;
 static bool webFirmwarePreviousRecordingBlock = false;
 static size_t webFirmwareUploadBytes = 0;
+static size_t webFirmwarePackageBytes = 0;
 static size_t webFirmwareUploadCapacity = 0;
 static String webFirmwareUploadFilename;
 static String webFirmwareUploadError;
@@ -11636,6 +11654,14 @@ static String webFirmwareUploadError;
 static bool webFirmwareOtaActive = false;
 static esp_ota_handle_t webFirmwareOtaHandle = 0;
 static const esp_partition_t *webFirmwareUploadPartition = nullptr;
+
+static uint8_t webFirmwarePackageHeader[
+    SENSORFORGE_FIRMWARE_PACKAGE_HEADER_SIZE
+] = {};
+static size_t webFirmwarePackageHeaderBytes = 0;
+static bool webFirmwarePackageHeaderParsed = false;
+static SensorForgeFirmwarePackageInfo webFirmwarePackageInfo;
+static SensorForgeFirmwareHashContext webFirmwareHashContext;
 
 // A successfully uploaded image remains staged only in RAM state until the
 // operator either installs it or discards it. The image bytes themselves live
@@ -11731,6 +11757,10 @@ static void webFirmwareReleaseUploadLocks()
 
 static void webFirmwareAbortActiveOta()
 {
+    firmwareSecurityHashAbort(
+        webFirmwareHashContext
+    );
+
     if (webFirmwareOtaActive) {
         esp_ota_abort(
             webFirmwareOtaHandle
@@ -11948,6 +11978,7 @@ static void handleFirmwareUploadData()
         webFirmwareUploadAttempted = true;
         webFirmwareUploadSucceeded = false;
         webFirmwareUploadBytes = 0;
+        webFirmwarePackageBytes = 0;
         webFirmwareUploadCapacity = 0;
         webFirmwareUploadFilename =
             webFirmwareBaseName(
@@ -11958,6 +11989,18 @@ static void handleFirmwareUploadData()
         webFirmwareMarkerFound = false;
         webFirmwareMarkerMatched = 0;
         webFirmwareMarkerLength = 0;
+        webFirmwarePackageHeaderBytes = 0;
+        webFirmwarePackageHeaderParsed = false;
+        webFirmwarePackageInfo =
+            SensorForgeFirmwarePackageInfo();
+        memset(
+            webFirmwarePackageHeader,
+            0,
+            sizeof(webFirmwarePackageHeader)
+        );
+        firmwareSecurityHashAbort(
+            webFirmwareHashContext
+        );
 
         // Recover from a malformed/interrupted previous HTTP request before
         // accepting a new upload. A successfully staged image is retained and
@@ -11966,8 +12009,18 @@ static void handleFirmwareUploadData()
         webFirmwareReleaseUploadLocks();
 
         // Defense in depth: multipart upload callbacks may run while the
-        // request body is being parsed. Never write unauthenticated firmware
-        // bytes even if route middleware behavior changes in a future core.
+        // request body is being parsed. Require the per-boot browser CSRF token
+        // before accepting any staged firmware bytes, then verify WebConfig auth.
+        const SensorForgeAccessRole uploadRole =
+            accessControlWebRole(server);
+
+        if (!webCsrfRequestValid(server, uploadRole)) {
+            webFirmwareFailUpload(
+                "Invalid or missing CSRF token for firmware upload."
+            );
+            return;
+        }
+
         if (
             cfg_web_auth_enabled &&
             !server.authenticate(
@@ -11985,9 +12038,9 @@ static void handleFirmwareUploadData()
             webFirmwareUploadFilename;
         lowerName.toLowerCase();
 
-        if (!lowerName.endsWith(".bin")) {
+        if (!lowerName.endsWith(".sfw")) {
             webFirmwareFailUpload(
-                "Please select a compiled .bin firmware image."
+                "Please select a signed SensorForge .sfw firmware package."
             );
             return;
         }
@@ -12049,28 +12102,8 @@ static void handleFirmwareUploadData()
         // itself is not required for this update path and is never locked here.
         webPlayerStop();
 
-        esp_ota_handle_t otaHandle = 0;
-        esp_err_t beginResult =
-            esp_ota_begin(
-                target,
-                OTA_WITH_SEQUENTIAL_WRITES,
-                &otaHandle
-            );
-
-        if (beginResult != ESP_OK) {
-            webFirmwareFailUpload(
-                "Could not prepare the internal OTA partition: " +
-                webFirmwareEspError(
-                    beginResult
-                )
-            );
-            webFirmwareReleaseUploadLocks();
-            return;
-        }
-
-        webFirmwareOtaHandle =
-            otaHandle;
-        webFirmwareOtaActive = true;
+        // OTA writing starts only after the fixed signed package header has
+        // arrived and passed structural validation.
         webFirmwareUploadPartition =
             target;
         return;
@@ -12079,7 +12112,6 @@ static void handleFirmwareUploadData()
     if (upload.status == UPLOAD_FILE_WRITE) {
         if (
             webFirmwareUploadError.length() ||
-            !webFirmwareOtaActive ||
             !webFirmwareUploadPartition
         ) {
             return;
@@ -12088,61 +12120,193 @@ static void handleFirmwareUploadData()
         if (upload.currentSize == 0)
             return;
 
-        if (!webFirmwareImageMagicChecked) {
-            if (
-                webFirmwareUploadBytes != 0 ||
-                upload.buf[0] !=
-                    WEB_FW_ESP_IMAGE_MAGIC
-            ) {
-                webFirmwareFailUpload(
-                    "Firmware rejected: invalid ESP32 application image header."
-                );
-                webFirmwareAbortActiveOta();
-                return;
-            }
+        if (
+            upload.currentSize >
+            SIZE_MAX - webFirmwarePackageBytes
+        ) {
+            webFirmwareFailUpload(
+                "Firmware upload size overflow."
+            );
+            webFirmwareCleanupPartial();
+            return;
+        }
 
-            webFirmwareImageMagicChecked = true;
+        webFirmwarePackageBytes +=
+            upload.currentSize;
+
+        const uint8_t *data =
+            upload.buf;
+        size_t remaining =
+            upload.currentSize;
+
+        if (!webFirmwarePackageHeaderParsed) {
+            size_t needed =
+                SENSORFORGE_FIRMWARE_PACKAGE_HEADER_SIZE -
+                webFirmwarePackageHeaderBytes;
+
+            size_t take =
+                remaining < needed
+                ? remaining
+                : needed;
+
+            memcpy(
+                webFirmwarePackageHeader +
+                    webFirmwarePackageHeaderBytes,
+                data,
+                take
+            );
+
+            webFirmwarePackageHeaderBytes +=
+                take;
+            data += take;
+            remaining -= take;
+
+            if (
+                webFirmwarePackageHeaderBytes ==
+                SENSORFORGE_FIRMWARE_PACKAGE_HEADER_SIZE
+            ) {
+                String packageError;
+
+                if (!firmwareSecurityParseHeader(
+                        webFirmwarePackageHeader,
+                        sizeof(webFirmwarePackageHeader),
+                        webFirmwarePackageInfo,
+                        packageError
+                    )) {
+                    webFirmwareFailUpload(
+                        "Firmware rejected: " +
+                        packageError + "."
+                    );
+                    webFirmwareCleanupPartial();
+                    return;
+                }
+
+                if (
+                    webFirmwarePackageInfo.firmwareSize == 0 ||
+                    webFirmwarePackageInfo.firmwareSize >
+                        webFirmwareUploadCapacity
+                ) {
+                    webFirmwareFailUpload(
+                        "Firmware rejected: image is larger than the inactive OTA partition."
+                    );
+                    webFirmwareCleanupPartial();
+                    return;
+                }
+
+                if (!firmwareSecurityHashBegin(
+                        webFirmwareHashContext,
+                        packageError
+                    )) {
+                    webFirmwareFailUpload(
+                        "Firmware signature check could not start: " +
+                        packageError + "."
+                    );
+                    webFirmwareCleanupPartial();
+                    return;
+                }
+
+                esp_ota_handle_t otaHandle = 0;
+                esp_err_t beginResult =
+                    esp_ota_begin(
+                        webFirmwareUploadPartition,
+                        webFirmwarePackageInfo.firmwareSize,
+                        &otaHandle
+                    );
+
+                if (beginResult != ESP_OK) {
+                    webFirmwareFailUpload(
+                        "Could not prepare the internal OTA partition: " +
+                        webFirmwareEspError(
+                            beginResult
+                        )
+                    );
+                    webFirmwareCleanupPartial();
+                    return;
+                }
+
+                webFirmwareOtaHandle =
+                    otaHandle;
+                webFirmwareOtaActive = true;
+                webFirmwarePackageHeaderParsed = true;
+            }
         }
 
         if (
-            webFirmwareUploadBytes >
-                webFirmwareUploadCapacity ||
-            upload.currentSize >
-                webFirmwareUploadCapacity -
-                    webFirmwareUploadBytes
+            remaining > 0 &&
+            webFirmwarePackageHeaderParsed
         ) {
-            webFirmwareFailUpload(
-                "Firmware rejected: image is larger than the inactive OTA partition."
+            if (
+                webFirmwareUploadBytes >
+                    webFirmwarePackageInfo.firmwareSize ||
+                remaining >
+                    webFirmwarePackageInfo.firmwareSize -
+                        webFirmwareUploadBytes
+            ) {
+                webFirmwareFailUpload(
+                    "Firmware rejected: package contains more image data than declared."
+                );
+                webFirmwareCleanupPartial();
+                return;
+            }
+
+            if (!webFirmwareImageMagicChecked) {
+                if (
+                    webFirmwareUploadBytes != 0 ||
+                    data[0] !=
+                        WEB_FW_ESP_IMAGE_MAGIC
+                ) {
+                    webFirmwareFailUpload(
+                        "Firmware rejected: invalid ESP32 application image header."
+                    );
+                    webFirmwareCleanupPartial();
+                    return;
+                }
+
+                webFirmwareImageMagicChecked = true;
+            }
+
+            webFirmwareScanCompatibilityMarker(
+                data,
+                remaining
             );
-            webFirmwareAbortActiveOta();
-            return;
+
+            String hashError;
+
+            if (!firmwareSecurityHashUpdate(
+                    webFirmwareHashContext,
+                    data,
+                    remaining,
+                    hashError
+                )) {
+                webFirmwareFailUpload(
+                    "Firmware signature check failed while hashing: " +
+                    hashError + "."
+                );
+                webFirmwareCleanupPartial();
+                return;
+            }
+
+            esp_err_t writeResult =
+                esp_ota_write(
+                    webFirmwareOtaHandle,
+                    data,
+                    remaining
+                );
+
+            if (writeResult != ESP_OK) {
+                webFirmwareFailUpload(
+                    "Firmware upload failed while writing internal flash: " +
+                    webFirmwareEspError(
+                        writeResult
+                    )
+                );
+                webFirmwareCleanupPartial();
+                return;
+            }
+
+            webFirmwareUploadBytes +=
+                remaining;
         }
-
-        webFirmwareScanCompatibilityMarker(
-            upload.buf,
-            upload.currentSize
-        );
-
-        esp_err_t writeResult =
-            esp_ota_write(
-                webFirmwareOtaHandle,
-                upload.buf,
-                upload.currentSize
-            );
-
-        if (writeResult != ESP_OK) {
-            webFirmwareFailUpload(
-                "Firmware upload failed while writing internal flash: " +
-                webFirmwareEspError(
-                    writeResult
-                )
-            );
-            webFirmwareAbortActiveOta();
-            return;
-        }
-
-        webFirmwareUploadBytes +=
-            upload.currentSize;
 
         serviceWebLongOperation();
         return;
@@ -12156,26 +12320,37 @@ static void handleFirmwareUploadData()
         }
 
         if (
+            !webFirmwarePackageHeaderParsed ||
             !webFirmwareOtaActive ||
             !webFirmwareUploadPartition ||
             webFirmwareUploadBytes == 0 ||
             !webFirmwareImageMagicChecked
         ) {
             webFirmwareFailUpload(
-                "Firmware upload did not contain a complete application image."
+                "Firmware upload did not contain a complete signed application image."
             );
             webFirmwareCleanupPartial();
             webFirmwareReleaseUploadLocks();
             return;
         }
 
+        const size_t expectedPackageBytes =
+            SENSORFORGE_FIRMWARE_PACKAGE_HEADER_SIZE +
+            (size_t)webFirmwarePackageInfo.firmwareSize;
+
         if (
-            upload.totalSize != 0 &&
-            upload.totalSize !=
-                webFirmwareUploadBytes
+            webFirmwareUploadBytes !=
+                webFirmwarePackageInfo.firmwareSize ||
+            webFirmwarePackageBytes !=
+                expectedPackageBytes ||
+            (
+                upload.totalSize != 0 &&
+                upload.totalSize !=
+                    webFirmwarePackageBytes
+            )
         ) {
             webFirmwareFailUpload(
-                "Firmware upload size mismatch - upload may have been interrupted."
+                "Firmware upload size mismatch - upload may have been interrupted or malformed."
             );
             webFirmwareCleanupPartial();
             webFirmwareReleaseUploadLocks();
@@ -12185,6 +12360,22 @@ static void handleFirmwareUploadData()
         if (!webFirmwareMarkerFound) {
             webFirmwareFailUpload(
                 "Firmware rejected: compatibility marker missing or wrong board."
+            );
+            webFirmwareCleanupPartial();
+            webFirmwareReleaseUploadLocks();
+            return;
+        }
+
+        String signatureError;
+
+        if (!firmwareSecurityHashFinishAndVerify(
+                webFirmwareHashContext,
+                webFirmwarePackageInfo,
+                signatureError
+            )) {
+            webFirmwareFailUpload(
+                "Firmware rejected: " +
+                signatureError + "."
             );
             webFirmwareCleanupPartial();
             webFirmwareReleaseUploadLocks();
@@ -12728,8 +12919,8 @@ static void sendSystemPage(
     );
 
     const String firmwareInfo =
-        "Die Firmware wird zuerst vollständig hochgeladen und automatisch geprüft. Erst mit „Jetzt installieren“ wird sie für den nächsten Neustart aktiviert. "
-        "Bricht der Upload vorher ab, bleibt die bisherige Firmware aktiv. Installiere möglichst nur Builds, die zuvor auf passender Hardware getestet wurden.";
+        "Firmware-Updates über WiFi werden als signiertes SensorForge-.sfw-Paket hochgeladen. Die Signatur und Gerätekompatibilität werden geprüft; erst mit „Jetzt installieren“ wird das Image für den nächsten Neustart aktiviert. "
+        "Bricht der Upload ab oder ist die Signatur ungültig, bleibt die bisherige Firmware aktiv.";
 
     html +=
         "<section class='settings-section' id='firmware'>"
@@ -12803,8 +12994,8 @@ static void sendSystemPage(
             "<form id='firmwareUploadForm' method='POST' action='/firmware_upload' enctype='multipart/form-data' "
             "onsubmit=\"var b=document.getElementById('fwUploadButton');if(b){b.disabled=true;b.textContent='Upload läuft ...';}"
             "var s=document.getElementById('fwUploadState');if(s)s.hidden=false;\">"
-            "<label for='firmwareFile'><b>Firmware-Datei auswählen</b></label><br>"
-            "<input id='firmwareFile' type='file' name='firmware' accept='.bin,application/octet-stream' required>"
+            "<label for='firmwareFile'><b>Signiertes Firmware-Paket (.sfw) auswählen</b></label><br>"
+            "<input id='firmwareFile' type='file' name='firmware' accept='.sfw,application/octet-stream' required>"
             "<br><button id='fwUploadButton' class='primary' type='submit'>HOCHLADEN &amp; PRÜFEN</button>"
             "<span id='fwUploadState' class='muted' hidden> Bitte Verbindung und Stromversorgung nicht unterbrechen.</span>"
             "</form>";
@@ -12817,7 +13008,7 @@ static void sendSystemPage(
     if (readyExists) {
         if (readyValid) {
             html +=
-                "<p>✓ Image geprüft &nbsp; · &nbsp; Größe: <b>" +
+                "<p>✓ Signatur und Image geprüft &nbsp; · &nbsp; Größe: <b>" +
                 webFirmwareFormatBytes(
                     webFirmwareReadyBytes
                 ) +
@@ -12973,7 +13164,7 @@ static void handleFirmwareInstall()
     webPlayerStop();
 
     // The first boot of the newly selected WiFi image must not immediately be
-    // replaced by a stale .bin file that happens to be present on SD. The
+    // replaced by a stale signed .sfw package that happens to be present on SD. The
     // one-shot NVS flag is consumed at the next firmware boot before the SD
     // auto-updater is considered.
     if (!firmwareInfoArmDirectOtaBoot()) {
@@ -13245,6 +13436,21 @@ static void handleRebooting()
 }
 
 
+bool webConfigScheduleReboot(uint32_t delayMs, String &error)
+{
+    error = "";
+
+    if (recorderIsOpen()) {
+        error = "recording_active";
+        return false;
+    }
+
+    rebootScheduled = true;
+    rebootAtMs = millis() + (delayMs < 250UL ? 250UL : delayMs);
+    return true;
+}
+
+
 static void handleRebootDo()
 {
     // Keep the server-side guard even though /reboot already shows the
@@ -13481,6 +13687,24 @@ static void handleShutdownDo()
         "text/plain; charset=utf-8",
         ""
     );
+}
+
+
+bool webConfigScheduleShutdown(uint32_t delayMs, String &error)
+{
+    error = "";
+
+    if (recorderIsOpen()) {
+        error = "recording_active";
+        return false;
+    }
+
+    // Match the browser shutdown path: once shutdown is accepted, prevent a
+    // new recording from starting during the short HTTP grace period.
+    g_recordingStartBlocked = true;
+    shutdownScheduled = true;
+    shutdownAtMs = millis() + (delayMs < 250UL ? 250UL : delayMs);
+    return true;
 }
 
 
@@ -19017,6 +19241,8 @@ void webConfigStart()
             webBootSessionId = 1;
     }
 
+    webCsrfBegin();
+
     if (!webRoutesRegistered) {
 
         server.addMiddleware([](
@@ -19027,8 +19253,11 @@ void webConfigStart()
             // Central role-aware access gate. The legacy web_username/web_password
             // remains the administrator. Additional streaming users have restricted
             // and can reach only live/snapshot/media-viewer routes.
+            SensorForgeAccessRole role =
+                SENSORFORGE_ACCESS_ADMIN;
+
             if (cfg_web_auth_enabled) {
-                const SensorForgeAccessRole role = accessControlWebRole(requestServer);
+                role = accessControlWebRole(requestServer);
 
                 if (role == SENSORFORGE_ACCESS_NONE) {
                     requestServer.requestAuthentication();
@@ -19043,6 +19272,27 @@ void webConfigStart()
                     requestServer.send(403, "text/plain; charset=utf-8", "Zugriff für diesen Benutzer nicht erlaubt");
                     return true;
                 }
+            }
+
+            // All browser-originated state-changing POST routes use one central
+            // per-boot CSRF gate. The /api/v1 integration protocol is excluded
+            // deliberately and retains its existing administrator auth contract.
+            if (
+                webCsrfRequestRequiresProtection(
+                    requestServer.method(),
+                    requestServer.uri()
+                ) &&
+                !webCsrfRequestValid(
+                    requestServer,
+                    role
+                )
+            ) {
+                requestServer.send(
+                    403,
+                    "text/plain; charset=utf-8",
+                    "Invalid or missing CSRF token"
+                );
+                return true;
             }
 
             noteWebActivity();

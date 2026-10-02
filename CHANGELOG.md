@@ -1,3 +1,65 @@
+## v87-beta8 — 2026-10-02
+
+- Documentation-only security clarification; no firmware runtime logic changed from v87 Beta 7.
+- Made the current WebConfig/API threat model explicit: HTTP Basic provides access control but not transport encryption, so management access is intended only through the SensorForge hotspot or a trusted/isolated local network, without direct Internet exposure or port forwarding.
+- Added HTTPS/TLS for WebConfig and `/api/v1` as a deliberate future hardening item, especially for later boards with more available resources or deployments in untrusted/shared networks.
+- Future management TLS must be evaluated separately from RTSP, HTTP-MJPEG, media playback and file-transfer data paths so time-critical media traffic is not automatically burdened with additional encryption/CPU cost.
+
+## v87-beta7 — 2026-10-02
+
+- Fixed an Arduino-ESP32 compile error in `web_csrf.cpp`: Arduino's `Print.h` defines `HEX` as a macro (`#define HEX 16`), which collided with the local hexadecimal lookup-table name used by `randomToken()`.
+- Renamed the local table to `HEX_DIGITS`; token generation, token length, role separation and all CSRF runtime behavior are unchanged from v87-beta6.
+- No stream, download, API, configuration or authentication behavior changed. This is a compile-only correction discovered by the real Arduino-ESP32 3.3.12 build.
+- Hardware/browser regression requirements from v87-beta6 remain open after a successful full build.
+
+## v87-beta6 — 2026-10-02
+
+- Added centralized server-side CSRF protection for state-changing browser `POST` routes. A fresh 128-bit token is generated per boot, with separate trust tokens for administrator and streaming-user roles.
+- The common WebConfig shell automatically attaches the role token to same-origin POST forms and `fetch()` calls. Existing page handlers therefore do not each carry independent CSRF logic.
+- The standalone WebPlayer receives the streaming/admin token through a SameSite cookie and appends it only to its mutating POST requests; frame, audio, video, snapshot, stream and download GET traffic is unchanged.
+- Config and firmware multipart uploads perform an additional early token check before accepting upload content, because their upload callbacks can run before the normal final route handler.
+- `/api/v1` is intentionally excluded from the browser CSRF token contract so existing Sync/App clients remain compatible and continue to use their established administrator authentication. Existing firmware/license action tokens remain in place as additional transaction-specific checks.
+- No encryption, hashing or additional processing was added to RTSP, HTTP-MJPEG, media playback/download or recording data paths. Runtime overhead is limited to token comparison on mutating browser actions.
+- Static/source review performed in this environment; browser/hardware regression remains required for admin forms, streaming-user annotation/delete permissions, multipart uploads and stale-page behavior across reboot.
+
+## v87-beta5 — 2026-10-02
+
+- Fixed the factory/recovery hotspot startup mismatch. Configuration and validation already define an empty `hotspot_password` as a valid open AP, but `startConfiguredHotspot()` previously rejected every password shorter than 8 characters and could therefore disable WebConfig after factory reset or full config fallback.
+- `startConfiguredHotspot()` now follows the same policy as the config layer: empty password starts an open AP, 8..63 characters start a protected AP, and invalid non-empty 1..7-character values remain rejected.
+- The open-AP branch passes a null passphrase explicitly to `WiFi.softAP()`; protected hotspot, fallback hotspot, SSID, hidden-SSID and TX-power behavior are otherwise unchanged.
+- Static/source review performed only. Hardware regression still required for factory reset/default boot, open recovery AP, protected AP and fallback AP on XIAO/Freenove.
+
+## v87-beta4 — 2026-10-02
+
+- Consolidated the firmware signing/key-management workflow without changing the Beta-3 device-side verification behavior. Signed `.sfw` remains mandatory for SD and WebConfig/WiFi updates; Secure Boot, eFuse provisioning and anti-rollback remain intentionally out of scope.
+- Extended `sensorforge_firmware_sign.py` with `keygen`: it creates the default `sensorforge_firmware_private.pem` / `sensorforge_firmware_public.pem` pair and automatically creates or replaces `firmware_public_key.h` from the new public key. Existing PEM files are never overwritten.
+- Added `--header` and `--no-header` controls for key generation plus `update-header` for synchronizing `firmware_public_key.h` from an existing public PEM.
+- `sign` now uses `sensorforge_firmware_private.pem` by default; `--key` remains available for an explicitly selected private PEM. Help output documents the complete keygen → rebuild → sign workflow.
+- Direct USB/programmer flashing of normal `.bin` images remains unchanged. The private signing key must remain outside source/release archives.
+- Release identity and re-entry documentation promoted to **v87 Beta 4**. Hardware qualification of the signed SD/WiFi update paths remains open.
+
+## v87-beta3 — 2026-10-02
+
+- Added application-level firmware authentication for the two remotely/removably supplied update paths: SD auto-update and WebConfig/WiFi upload now require a signed SensorForge `.sfw` package.
+- Added a dedicated firmware signing trust anchor, separate from the license key. Verification uses ECDSA P-256 / SHA-256; only the public key is compiled into the device.
+- SD update validates the complete package signature before `Update.begin()` / `Update.write()` and flashes only the embedded raw ESP application image. Unsigned legacy `.bin` files are no longer auto-installed from `/firmware`.
+- WiFi upload parses the signed package header, streams only the raw application into the inactive OTA partition, hashes while writing, verifies the signature before `esp_ota_end()`, and still requires the existing explicit INSTALL action before changing the boot partition.
+- Existing board compatibility markers, ESP image validation, recording gates, first-boot SD guard and update metadata remain in place. No Secure Boot, flash encryption, eFuse consumption or anti-rollback policy is added in this beta.
+- Added `sensorforge_firmware_sign.py` for `.bin` -> `.sfw` release packaging and key generation. Source-archive helper now excludes `*.pem`.
+- Static/source and signing-tool tests were performed in this environment; an Arduino build and XIAO/Freenove hardware update test remain required.
+
+## v87-beta2 — 2026-10-02
+
+- Expanded the local `/api/v1` protocol additively from host protocol 1.12 / Integration profile 1.0 to **host protocol 1.20 / Integration profile 1.1**. Existing Sync/API routes and fields remain available.
+- Added administrator-only capability discovery plus comprehensive persistent configuration read/schema/partial-write endpoints. Partial writes preserve unrelated config text, pass through the existing `configValidateText()` / `configSaveText()` authority, never return secrets and intentionally use a persist-then-reboot model instead of hot-applying mixed camera/network/ownership state.
+- Added extended network, streamer, audio, image-motion, recording, radar and system telemetry for application clients. Network scan reuses the existing WebConfig scan path and is blocked during active recording or active streamer clients.
+- Added explicit runtime actions for manual recording start/stop, image-motion background reset, radar configuration/calibration, transport-mode transition, delayed reboot and delayed software shutdown. Existing SensorForge ownership/safety functions remain authoritative; the API does not bypass streamer ownership, recording/storage locks or radar validation/verification.
+- Added config-copy status/control (`internal` / SD copy) while preserving the established config-source policy.
+- Added app-facing media annotation read/write, safe finalized-media deletion using the existing deferred-delete/storage gates, and bounded plaintext log read/clear over the established log-storage layer.
+- Firmware upload, license management and generic factory reset remain on their existing specialized WebConfig paths for now; this avoids duplicating high-risk transaction/safety logic merely to increase endpoint count.
+- Updated `SENSORFORGE_API_V1.md` as the authoritative application/API contract and promoted the changed worktree from v87 Beta 1 to **v87 Beta 2**.
+- Static/source review only in this environment; no Arduino compile or new hardware qualification is claimed by this API expansion.
+
 ## v87-beta1 — 2026-10-02
 
 - Promoted the consolidated post-v86 worktree to the first **v87 Beta 1** checkpoint. Core branding remains 7.1.0; **v86 remains the last stable official release** while v87 Beta 1 becomes the authoritative development, qualification and re-entry basis.
