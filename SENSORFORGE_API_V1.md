@@ -88,19 +88,29 @@ Machine-oriented API feature discovery. It explicitly reports support for:
 - basic ONVIF interoperability capability (`onvif_basic`) and `onvif_enabled` state/configuration
 
 ONVIF itself is not transported through `/api/v1`: when enabled in streamer mode,
-WS-Discovery and the read-only `/onvif/device_service` / `/onvif/media_service`
-SOAP endpoints expose the existing RTSP/JPEG stream and snapshot URI. Device
-operations marked PRE_AUTH by the implemented ONVIF subset are available before
-authentication; protected SOAP reads accept the existing SensorForge credentials
-through HTTP Basic/Digest or WS-Security UsernameToken/PasswordDigest. This does
-not change Integration profile 1.1 or the established media-transfer paths.
+WS-Discovery and the read-only `/onvif/device_service`, `/onvif/media_service` and
+`/onvif/imaging_service` SOAP endpoints expose the existing SensorForge network,
+JPEG/RTSP media and a minimal read-only view of the existing camera exposure mode.
+Device operations marked PRE_AUTH by the implemented ONVIF subset are available
+before authentication; protected SOAP reads accept the existing SensorForge
+credentials through HTTP Basic/Digest or WS-Security UsernameToken/PasswordDigest.
+This does not change Integration profile 1.1 or the established media-transfer paths.
 
-Field qualification status (v87 Beta 16): the implemented ONVIF basic/MVP scope
-was verified on real XIAO hardware with Android Onvier. Automatic WS-Discovery,
-protected Device/Media SOAP reads, snapshot access and RTSP/JPEG video playback
-all succeeded. The implementation is therefore frozen for the current product
-scope unless a concrete reproducible interoperability issue is found. This is
-not a claim of official ONVIF certification or full Profile-T conformance.
+Field qualification status: v87 Beta 16 verified automatic WS-Discovery, protected
+Device/Media SOAP reads, snapshot access and RTSP/JPEG playback on real XIAO
+hardware with Android Onvier. Beta 17 centralized the published product identity.
+Beta 18 extends only read-only interoperability: Device network/DNS/NTP/protocol
+queries, singular source/encoder configuration reads and a minimal Imaging service.
+It also adds SOAP diagnostics and `sensorforge_onvif_test.py` for repeatable
+Discovery/Auth/Device/Media/Imaging/Snapshot/RTSP regression checks. The media
+pipeline remains the field-qualified JPEG/RTSP implementation. This is not a claim
+of official ONVIF certification or full Profile-T conformance.
+
+H.264 remains disabled on the current XIAO and Freenove profiles. Separate board
+and streamer implementation gates are present so a future board may advertise a
+higher codec only after the hardware capability and a real qualified SensorForge
+encoder/streamer implementation both exist; setting a board capability alone must
+never make ONVIF advertise an unimplemented codec.
 
 Firmware upload, license management and generic factory reset are intentionally
 not exposed by this API expansion yet. Those operations remain on their existing

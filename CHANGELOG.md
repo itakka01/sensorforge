@@ -1,3 +1,34 @@
+## v87-beta19 — 2026-10-03
+
+- Documentation-only roadmap checkpoint; runtime source behavior remains unchanged from v87-beta18.
+- Added the planned optional WireGuard client as a future SensorForge remote-management transport. XIAO and Freenove ESP32-S3 profiles must default it to OFF, and firmware updates must never enable it implicitly.
+- Planned rollout is deliberately staged: management/WebConfig/API first, then board-specific CPU/heap/thermal/network qualification, and only afterwards optional RTSP/ONVIF/snapshot traffic through the tunnel.
+- WireGuard must remain a transport underneath the existing SensorForge services; it must not introduce a second camera/streaming pipeline, transcoding path or new media owner.
+- Future implementation must be board-gated and use additive configuration with secure defaults. Private WireGuard keys are secrets and must use the then-current SensorForge secret persistence path and never be exposed by GET APIs, Web UI reads, logs or diagnostics.
+- Initial scope is client-only: no generic VPN router, LAN gateway or WireGuard server on the device. The goal is safe remote access without direct Internet port forwarding.
+- Required future qualification includes WiFi reconnect, endpoint/DNS failure, bad-key/config recovery, reboot, Sleep/Wake interaction, long-term heap/thermal behavior and concurrent management/streamer load.
+- v87-beta19 is the new authoritative re-entry/documentation stand. Host API remains 1.21 and Integration/App profile remains 1.1.
+
+## v87-beta18 — 2026-10-03
+
+- Added ONVIF compatibility round 2 without changing the field-qualified camera/RTSP/RTP-JPEG, HTTP-MJPEG, audio, recording, storage or download pipelines. All new ONVIF operations are read-only.
+- Device service now answers `GetNetworkInterfaces`, `GetNetworkProtocols`, `GetDNS` and `GetNTP` from the live SensorForge WiFi/network state and the same NTP servers used by the firmware.
+- Media service now also supports singular `GetVideoSourceConfiguration` and `GetVideoEncoderConfiguration` requests in addition to the already supported list/profile/URI methods.
+- Added a read-only ONVIF Imaging service at `/onvif/imaging_service` with `GetServiceCapabilities`, `GetImagingSettings` and `GetOptions`. It reports the existing SensorForge exposure mode only; it does not add ONVIF camera-setting writes.
+- Added lightweight ONVIF SOAP diagnostics to `/streamer_status`: request count, SOAP fault count and maximum generated SOAP response size. These counters are control-plane only and add no per-frame work.
+- Added `sensorforge_onvif_test.py`, a dependency-free regression smoke test covering WS-Discovery, WS-Security SOAP reads, Device/Media/Imaging calls, snapshot JPEG retrieval and RTSP DESCRIBE.
+- Added separate board/streamer H.264 capability gates. XIAO and Freenove remain explicitly disabled; ONVIF must not advertise H.264 until both a board profile and a qualified SensorForge streamer implementation enable it. No H.264 encoder or transcoder was added in this release.
+- Tightened operation-name matching so singular read methods cannot accidentally match plural method names in unprefixed SOAP. Host API remains 1.21 and Integration/App profile remains 1.1.
+- Validation in this workspace: `onvif.cpp` passes an isolated C++17 syntax build against Arduino-compatible stubs and `sensorforge_onvif_test.py` passes Python bytecode compilation/help invocation. A full Arduino-ESP32 3.3.12 build and renewed XIAO/Freenove/Onvier/NVR hardware regression remain required.
+
+## v87-beta17 — 2026-10-03
+
+- Product-identity cleanup for the already field-qualified ONVIF integration; no discovery, authentication, snapshot, RTSP/RTP, HTTP-MJPEG, audio, recording or download behavior changed.
+- `GetDeviceInformation` no longer hard-codes the SensorForge product identity or exposes the development-board name as the ONVIF model. `Manufacturer` now comes from `Branding::APP_NAME`, and `Model` comes from `Branding::PLATFORM`.
+- Added the central `BOARD_DISPLAY_NAME` to each active profile in `board_config.h`. ONVIF `HardwareId` now reports that board-profile value (`Seeed XIAO ESP32S3 Sense` or `Freenove FNK0085 ESP32-S3 WROOM`) instead of the generic `ESP32-S3`.
+- With the current branding this yields `Manufacturer=SensorForge`, `Model=Fabric Node`, the actual board in `HardwareId`, and the current release tag in `FirmwareVersion`. Future product/board renames therefore follow the existing central headers instead of requiring ONVIF-specific edits.
+- v87-beta16 remains the field-qualification evidence for ONVIF interoperability; v87-beta17 is the new authoritative source/re-entry stand. Host API remains 1.21 and Integration/App profile remains 1.1.
+
 ## v87-beta16 — 2026-10-03
 
 - Documentation/version closeout for the ONVIF MVP after successful real Android/Onvier field qualification. Runtime source code is unchanged from v87-beta15.

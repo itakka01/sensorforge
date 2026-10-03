@@ -21,13 +21,13 @@
 // WebConfig, so a running device can be mapped back to the exact Git tag.
 
 #define SENSORFORGE_RELEASE_NUMBER 87
-#define SENSORFORGE_RELEASE_TAG "v87-beta16"
+#define SENSORFORGE_RELEASE_TAG "v87-beta19"
 #define SENSORFORGE_RELEASE_DATE "2026-10-03"
 #define SENSORFORGE_RELEASE_SUMMARY \
-    "Beta 16: ONVIF field qualification completed; discovery, authentication, snapshot and RTSP/JPEG video verified with Onvier."
+    "Beta 19: documentation-only roadmap for optional board-gated WireGuard remote management; runtime unchanged from Beta 18."
 
-// Current source-tree stage. v87 Beta 16 is the field-qualified ONVIF reference stand; runtime code is unchanged from Beta 15.
-#define SENSORFORGE_WORKTREE_STAGE "v87-beta16"
+// Current source-tree stage. v87 Beta 19 documents the optional WireGuard roadmap; runtime remains unchanged from Beta 18.
+#define SENSORFORGE_WORKTREE_STAGE "v87-beta19"
 #define SENSORFORGE_WORKTREE_DATE "2026-10-03"
 #define SENSORFORGE_WORKTREE_SUMMARY \
-    "v87 Beta 16: ONVIF MVP field-qualified with automatic discovery, authentication, snapshot and RTSP/JPEG video; ONVIF frozen unless a reproducible client issue appears."
+    "v87 Beta 19: optional WireGuard client roadmap, default off on ESP32-S3 and management-first qualification; no runtime change."

@@ -23,3 +23,7 @@ String onvifDiscoveryLastRemote();
 String onvifEndpointUuid();
 String onvifDeviceServiceUrl();
 String onvifMediaServiceUrl();
+String onvifImagingServiceUrl();
+uint32_t onvifSoapRequestCount();
+uint32_t onvifSoapFaultCount();
+size_t onvifSoapResponseMaxBytes();

@@ -1,7 +1,7 @@
 SENSORFORGE / ESP32-S3 CAMERA (XIAO + FREENOVE)
 PROJEKTBESCHREIBUNG, RELEASESTAND UND WIEDEREINSTIEGSPROMPT
 Stand: 2026-10-03
-Dokumentrevision: v87 BETA 16 - ONVIF Feldqualifikation abgeschlossen / Referenzstand
+Dokumentrevision: v87 BETA 19 - Roadmap: optionaler WireGuard-Client / boardabhaengiges Remote-Management
 
 
 ======================================================================
@@ -10,7 +10,7 @@ AKTUELLE RELEASE-TABELLE
 
 Release | Datum      | Status      | Schwerpunkt
 --------|------------|-------------|------------------------------------------------------------
-v87     | 2026-10-03 | BETA 16     | ONVIF-MVP feldqualifiziert: Auto-Discovery, Auth, Snapshot und RTSP/JPEG-Video erfolgreich
+v87     | 2026-10-03 | BETA 19     | Roadmap: optionaler WireGuard-Client; ESP32-S3 default AUS, Management zuerst; keine Runtime-Aenderung
 v86     | 2026-10-01 | OFFIZIELL   | Rollen/Zugriff, RTSP+HTTP-MJPEG Auth, Home Assistant, WiFi-Fixes
 v85     | 2026-10-01 | OFFIZIELL   | Image-Motion UI/Liveanalyse, Streamer-Frame-Analyse
 v84     | 2026-09-30 | OFFIZIELL   | Netzwerk-Streamer, Multi-WiFi, Kamera-/Preview-Workflow
@@ -19,11 +19,133 @@ v84     | 2026-09-30 | OFFIZIELL   | Netzwerk-Streamer, Multi-WiFi, Kamera-/Prev
 
 
 ======================================================================
+V87 BETA 19 2026-10-03 - ROADMAP: OPTIONALER WIREGUARD-CLIENT / REMOTE-MANAGEMENT
+======================================================================
+
+- SensorForge v87 Beta 19 ist der aktuelle autoritative Beta-, Test- und
+  Wiedereinstiegsstand. v86 bleibt der letzte stabile offizielle Release.
+- Release-ID: `v87-beta19`; Core-Version im Branding bleibt `7.1.0`.
+- Beta 19 ist ein reiner Roadmap-/Dokumentationsstand. Gegenueber Beta 18 wird
+  KEINE WireGuard-Runtime implementiert und kein bestehender Netzwerk-, Streamer-,
+  Recording-, Storage-, Sleep- oder API-Pfad geaendert.
+- Geplante spaetere Erweiterung: optionaler WireGuard-Client als zusaetzlicher
+  sicherer Remote-Management-Kanal. Auf den derzeitigen ESP32-S3-Boards XIAO und
+  Freenove bleibt WireGuard standardmaessig AUS und darf durch ein Firmwareupdate
+  niemals automatisch aktiviert werden.
+- Geplantes stufenweises Vorgehen:
+    1. WireGuard nur fuer WebConfig/API/Servicezugriffe qualifizieren.
+    2. CPU-, Heap-/PSRAM-, WiFi-, Latenz- und Langzeitverhalten auf jedem Board messen.
+    3. Erst danach RTSP/ONVIF/Snapshot ueber den Tunnel gezielt testen.
+    4. Videotransfer ueber VPN nur freigeben, wenn Durchsatz, Temperatur und
+       Streamerstabilitaet auf dem jeweiligen Board nachweislich ausreichen.
+- Architekturgrundsatz: keine zweite Medienpipeline und kein Transcoding fuer VPN.
+  WireGuard darf nur als Netzwerktransport unter den bestehenden SensorForge-
+  Diensten liegen. Kamera-/RTSP-/HTTP-/Recording-Ownership bleibt unveraendert.
+- Boardabhaengige Freigabe ist verbindlich. Ein spaeteres Board darf WireGuard bzw.
+  hoehere VPN-/Codec-Last nur anbieten, wenn das aktive Boardprofil die Faehigkeit
+  explizit freigibt und der konkrete SensorForge-Pfad hardwarequalifiziert ist.
+- Fuer eine spaetere Config-Implementierung sind additive Keys mit sicheren Defaults
+  vorgesehen, sinngemaess z. B. `wireguard_enabled=0` plus lokale Tunneladresse,
+  Peer-Public-Key, Endpoint und Allowed-IP-Konfiguration. Die exakten Keynamen sind
+  vor Implementierung gegen den dann aktuellen Config-Code festzulegen.
+- Private WireGuard-Schluessel sind Secrets. Sie duerfen in Web/API niemals lesbar
+  zurueckgegeben oder in Logs/Diagnose ausgegeben werden und muessen ueber den dann
+  aktuellen SensorForge-Secret-/Persistenzpfad geschuetzt werden.
+- Fuer die erste Implementierung ist SensorForge nur als WireGuard-CLIENT vorgesehen;
+  kein allgemeiner VPN-Router, kein LAN-Gateway und kein WireGuard-Server auf dem
+  Geraet. Dadurch bleiben Umfang, Angriffsoberflaeche und Ressourcenbedarf begrenzt.
+- Direkte Internet-Portweiterleitungen fuer WebConfig/ONVIF/RTSP bleiben weiterhin
+  nicht das vorgesehene Betriebsmodell. Ein spaeter qualifizierter VPN-Kanal soll
+  gerade den sicheren Remotezugriff ohne exponierte Managementports ermoeglichen.
+- Vor einer Aktivierung auf Produktionsgeraeten sind mindestens zu qualifizieren:
+  Reconnect nach WLAN-Abbruch, Endpoint-/DNS-Ausfall, Key-/Config-Fehler, Reboot,
+  Sleep/Wake-Wechsel, Langzeit-Heap, CPU-Temperatur sowie parallele Management- und
+  Streamerlast.
+
+
+======================================================================
+V87 BETA 18 2026-10-03 - ONVIF KOMPATIBILITAETSRUNDE 2 / READ-ONLY HARDENING
+======================================================================
+
+- SensorForge v87 Beta 18 war der ONVIF-Kompatibilitaetsstand und ist durch
+  Beta 19 als autoritativer Wiedereinstiegsstand abgeloest. v86 bleibt der letzte
+  stabile offizielle Release.
+- Release-ID: `v87-beta18`; Core-Version im Branding bleibt `7.1.0`.
+- Der in Beta 15/16 real mit Android Onvier qualifizierte ONVIF-Discovery-,
+  Authentifizierungs-, Snapshot- und RTSP/JPEG-Pfad bleibt unveraendert. Die
+  Erweiterung betrifft ausschliesslich die read-only ONVIF-Steuer-/Abfrageschicht.
+- Device-Service zusaetzlich read-only:
+    * `GetNetworkInterfaces` aus dem real aktiven STA/AP-Zustand
+    * `GetNetworkProtocols` fuer HTTP/HTTPS-Status und RTSP
+    * `GetDNS` aus dem aktuellen DHCP/DNS-Zustand
+    * `GetNTP` passend zu den von SensorForge verwendeten NTP-Servern
+- Media-Service zusaetzlich read-only:
+    * `GetVideoSourceConfiguration`
+    * `GetVideoEncoderConfiguration`
+  Bestehende Profiles, JPEG-Encoderinformationen, StreamUri und SnapshotUri
+  bleiben die autoritative Medienbeschreibung.
+- Neuer read-only Imaging-Service `/onvif/imaging_service`:
+    * `GetServiceCapabilities`
+    * `GetImagingSettings`
+    * `GetOptions`
+  Aktuell wird bewusst nur der vorhandene SensorForge-Autoexposure-Modus
+  abgebildet. Es gibt KEINE ONVIF-Set-Operation und keinen zweiten Kamera-Owner.
+- `/streamer_status` fuehrt additive ONVIF-Diagnosezaehler fuer SOAP-Requests,
+  SOAP-Faults und die groesste erzeugte SOAP-Antwort. Damit kann spaeter anhand
+  realer NVR-Pollinglast entschieden werden, ob ein statischer/PROGMEM-basierter
+  XML-Pfad ueberhaupt erforderlich ist. Kein per-Frame-Diagnoseaufwand.
+- `sensorforge_onvif_test.py` ist der neue dependency-freie Regressionstest fuer
+  WS-Discovery, UsernameToken, Device/Media/Imaging, Snapshot und RTSP DESCRIBE.
+- Zukunftsvorbereitung fuer leistungsfaehigere Boards: Boardprofil und Streamer
+  besitzen getrennte H.264-Capability-Gates. XIAO und Freenove bleiben auf 0/AUS.
+  H.264 darf spaeter erst advertised werden, wenn Boardhardware UND ein real
+  implementierter/qualifizierter SensorForge-Streamerpfad vorhanden sind.
+  Beta 18 fuegt keinerlei H.264-Encoder, Transcoding oder zusaetzliche Medienlast ein.
+- Keine Aenderung an Kamera-Capture, RTSP/RTP-JPEG, HTTP-MJPEG, Audio, Recording,
+  Storage, Sleep oder Downloads. Host-API bleibt 1.21; Integration-/App-Profil 1.1.
+- Teststatus in dieser Arbeitsumgebung: isolierter C++-Syntaxcheck des ONVIF-Moduls
+  und Python-Compile/Hilfecheck des Regressionstests erfolgreich. Vollstaendiger
+  Arduino-ESP32-3.3.12-Build sowie erneuter XIAO/Freenove-/Onvier-/NVR-Feldtest
+  bleiben vor einer stabilen Freigabe erforderlich.
+
+
+======================================================================
+V87 BETA 17 2026-10-03 - ONVIF PRODUKTIDENTITAET AUS BRANDING / BOARDPROFIL
+======================================================================
+
+- SensorForge v87 Beta 17 war der Produktidentitaets-Referenzstand und ist durch
+  Beta 18 als autoritativer Wiedereinstiegsstand abgeloest. v86 bleibt der letzte
+  stabile offizielle Release.
+- Release-ID: `v87-beta17`; Core-Version im Branding bleibt `7.1.0`.
+- Der in Beta 16 feldqualifizierte ONVIF-Transport-/Mediaumfang bleibt funktional
+  unveraendert. Discovery, Authentifizierung, Snapshot und RTSP/JPEG wurden fuer
+  diese Aenderung bewusst nicht umgebaut.
+- Die von ONVIF `GetDeviceInformation` gemeldete Produktidentitaet verwendet nun
+  die bereits vorhandenen zentralen Firmwarequellen statt ONVIF-spezifischer
+  Hardcodes:
+    * `Manufacturer` = `Branding::APP_NAME` (aktuell `SensorForge`)
+    * `Model` = `Branding::PLATFORM` (aktuell `Fabric Node`)
+    * `FirmwareVersion` = `SENSORFORGE_RELEASE_TAG`
+    * `HardwareId` = `BOARD_DISPLAY_NAME` aus `board_config.h`
+- `board_config.h` definiert dafuer pro Boardprofil den menschenlesbaren
+  Hardware-Namen. Aktuell: `Seeed XIAO ESP32S3 Sense` bzw.
+  `Freenove FNK0085 ESP32-S3 WROOM`.
+- Damit erscheinen Produkt/Plattform in ONVIF als SensorForge-Identitaet, waehrend
+  die reale Trägerhardware weiterhin separat und korrekt erkennbar bleibt. Eine
+  spaetere Umbenennung in `branding.h` bzw. im Boardprofil wird automatisch von
+  ONVIF uebernommen.
+- Keine Aenderung an API-Semantik, Kamera-, RTSP/RTP-, HTTP-MJPEG-, Audio-,
+  Recording-, Storage- oder Downloadpfaden. Host-API bleibt 1.21;
+  Integration-/App-Profil bleibt 1.1.
+
+
+======================================================================
 V87 BETA 16 2026-10-03 - ONVIF FELDQUALIFIKATION ABGESCHLOSSEN / REFERENZSTAND
 ======================================================================
 
-- SensorForge v87 Beta 16 ist der aktuelle autoritative Beta-, Test- und
-  Wiedereinstiegsstand. v86 bleibt der letzte stabile offizielle Release.
+- SensorForge v87 Beta 16 war der feldqualifizierte ONVIF-Abschlussstand und ist
+  durch Beta 17 als autoritativer Wiedereinstiegsstand abgeloest. v86 bleibt der
+  letzte stabile offizielle Release.
 - Release-ID: `v87-beta16`; Core-Version im Branding bleibt `7.1.0`.
 - Beta 16 ist ein Dokumentations-/Versionsabschluss. Die Firmware-Laufzeitlogik
   ist gegenueber Beta 15 unveraendert.

@@ -33,6 +33,9 @@ static bool discoveryActive = false;
 static uint32_t nextDiscoveryRetryMs = 0;
 static uint32_t discoveryProbeRx = 0;
 static uint32_t discoveryProbeMatchTx = 0;
+static uint32_t soapRequestCount = 0;
+static uint32_t soapFaultCount = 0;
+static size_t soapResponseMaxBytes = 0;
 static IPAddress discoveryLastRemoteIp;
 static uint16_t discoveryLastRemotePort = 0;
 static String lastError;
@@ -94,6 +97,66 @@ static bool ipIsUsable(const IPAddress &ip)
     return ip[0] || ip[1] || ip[2] || ip[3];
 }
 
+static uint8_t prefixLengthFromMask(const IPAddress &mask)
+{
+    uint8_t prefix = 0;
+    for (uint8_t i = 0; i < 4; ++i) {
+        uint8_t value = mask[i];
+        for (uint8_t bit = 0; bit < 8; ++bit) {
+            if (value & 0x80)
+                ++prefix;
+            value <<= 1;
+        }
+    }
+    return prefix;
+}
+
+static bool staInterfaceActive()
+{
+    const wifi_mode_t mode = WiFi.getMode();
+    return (mode == WIFI_STA || mode == WIFI_AP_STA) &&
+           WiFi.status() == WL_CONNECTED &&
+           ipIsUsable(WiFi.localIP());
+}
+
+static bool apInterfaceActive()
+{
+    const wifi_mode_t mode = WiFi.getMode();
+    return (mode == WIFI_AP || mode == WIFI_AP_STA) && ipIsUsable(WiFi.softAPIP());
+}
+
+static String networkInterfaceXml(
+    const char *token,
+    const char *name,
+    const String &mac,
+    const IPAddress &ip,
+    uint8_t prefixLength,
+    bool dhcp
+)
+{
+    String xml;
+    xml.reserve(520);
+    xml =
+        "<tds:NetworkInterfaces token=\"" + String(token) + "\">"
+        "<tt:Enabled>true</tt:Enabled>"
+        "<tt:Info><tt:Name>" + String(name) + "</tt:Name><tt:HwAddress>" +
+        xmlEscape(mac) + "</tt:HwAddress><tt:MTU>1500</tt:MTU></tt:Info>"
+        "<tt:IPv4><tt:Enabled>true</tt:Enabled><tt:Config>";
+    if (dhcp) {
+        xml +=
+            "<tt:FromDHCP><tt:Address>" + ip.toString() +
+            "</tt:Address><tt:PrefixLength>" + String(prefixLength) +
+            "</tt:PrefixLength></tt:FromDHCP><tt:DHCP>true</tt:DHCP>";
+    } else {
+        xml +=
+            "<tt:Manual><tt:Address>" + ip.toString() +
+            "</tt:Address><tt:PrefixLength>" + String(prefixLength) +
+            "</tt:PrefixLength></tt:Manual><tt:DHCP>false</tt:DHCP>";
+    }
+    xml += "</tt:Config></tt:IPv4></tds:NetworkInterfaces>";
+    return xml;
+}
+
 static String httpBaseUrl()
 {
     const IPAddress ip = activeNetworkIp();
@@ -113,17 +176,6 @@ static String rtspUrlForOnvif()
 static String snapshotUrlForOnvif()
 {
     return httpBaseUrl() + "/snapshot";
-}
-
-static String boardModel()
-{
-#if defined(BOARD_XIAO)
-    return "XIAO ESP32S3 Sense";
-#elif defined(BOARD_FREENOVE)
-    return "Freenove ESP32-S3 Camera";
-#else
-    return "ESP32-S3 Camera";
-#endif
 }
 
 static String factorySerial()
@@ -518,8 +570,16 @@ static bool requireOnvifAuthentication(
 static bool hasOperation(const String &body, const char *operation)
 {
     const String direct = "<" + String(operation);
-    if (body.indexOf(direct) >= 0)
-        return true;
+    int directPos = body.indexOf(direct);
+    while (directPos >= 0) {
+        const int after = directPos + direct.length();
+        if (after < (int)body.length()) {
+            const char c = body[after];
+            if (c == '>' || c == ' ' || c == '/' || c == '\t' || c == '\r' || c == '\n')
+                return true;
+        }
+        directPos = body.indexOf(direct, directPos + 1);
+    }
 
     const String needle = ":" + String(operation);
     int p = body.indexOf(needle);
@@ -542,6 +602,7 @@ static String soapEnvelope(const String &body)
         "<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" "
         "xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\" "
         "xmlns:trt=\"http://www.onvif.org/ver10/media/wsdl\" "
+        "xmlns:timg=\"http://www.onvif.org/ver20/imaging/wsdl\" "
         "xmlns:tt=\"http://www.onvif.org/ver10/schema\" "
         "xmlns:ter=\"http://www.onvif.org/ver10/error\">"
         "<s:Body>" + body + "</s:Body></s:Envelope>";
@@ -549,12 +610,16 @@ static String soapEnvelope(const String &body)
 
 static void sendSoap(WebServer &server, const String &body)
 {
+    const String response = soapEnvelope(body);
+    if (response.length() > soapResponseMaxBytes)
+        soapResponseMaxBytes = response.length();
     server.sendHeader("Cache-Control", "no-store");
-    server.send(200, "application/soap+xml; charset=utf-8", soapEnvelope(body));
+    server.send(200, "application/soap+xml; charset=utf-8", response);
 }
 
 static void sendSoapFault(WebServer &server, const String &reason)
 {
+    ++soapFaultCount;
     const String body =
         "<s:Fault>"
         "<s:Code><s:Value>s:Sender</s:Value>"
@@ -562,8 +627,11 @@ static void sendSoapFault(WebServer &server, const String &reason)
         "</s:Code>"
         "<s:Reason><s:Text xml:lang=\"en\">" + xmlEscape(reason) + "</s:Text></s:Reason>"
         "</s:Fault>";
+    const String response = soapEnvelope(body);
+    if (response.length() > soapResponseMaxBytes)
+        soapResponseMaxBytes = response.length();
     server.sendHeader("Cache-Control", "no-store");
-    server.send(400, "application/soap+xml; charset=utf-8", soapEnvelope(body));
+    server.send(400, "application/soap+xml; charset=utf-8", response);
 }
 
 static String deviceCapabilitiesXml()
@@ -595,6 +663,13 @@ static String mediaCapabilitiesXml()
         "<tt:RTP_RTSP_TCP>true</tt:RTP_RTSP_TCP>"
         "</tt:StreamingCapabilities>"
         "</tt:Media>";
+}
+
+static String imagingCapabilitiesXml()
+{
+    return
+        "<tt:Imaging><tt:XAddr>" + xmlEscape(onvifImagingServiceUrl()) +
+        "</tt:XAddr></tt:Imaging>";
 }
 
 static String profileXml()
@@ -650,6 +725,7 @@ static void handleDeviceService()
     }
 
     const String body = server.arg("plain");
+    ++soapRequestCount;
 
     if (!requireOnvifAuthentication(server, body, deviceOperationIsPreAuth(body)))
         return;
@@ -657,11 +733,11 @@ static void handleDeviceService()
     if (hasOperation(body, "GetDeviceInformation")) {
         sendSoap(server,
             "<tds:GetDeviceInformationResponse>"
-            "<tds:Manufacturer>SensorForge</tds:Manufacturer>"
-            "<tds:Model>" + xmlEscape(boardModel()) + "</tds:Model>"
+            "<tds:Manufacturer>" + xmlEscape(String(Branding::APP_NAME)) + "</tds:Manufacturer>"
+            "<tds:Model>" + xmlEscape(String(Branding::PLATFORM)) + "</tds:Model>"
             "<tds:FirmwareVersion>" + xmlEscape(String(SENSORFORGE_RELEASE_TAG)) + "</tds:FirmwareVersion>"
             "<tds:SerialNumber>" + xmlEscape(factorySerial()) + "</tds:SerialNumber>"
-            "<tds:HardwareId>ESP32-S3</tds:HardwareId>"
+            "<tds:HardwareId>" + xmlEscape(String(BOARD_DISPLAY_NAME)) + "</tds:HardwareId>"
             "</tds:GetDeviceInformationResponse>"
         );
         return;
@@ -670,7 +746,7 @@ static void handleDeviceService()
     if (hasOperation(body, "GetCapabilities")) {
         sendSoap(server,
             "<tds:GetCapabilitiesResponse><tds:Capabilities>" +
-            deviceCapabilitiesXml() + mediaCapabilitiesXml() +
+            deviceCapabilitiesXml() + mediaCapabilitiesXml() + imagingCapabilitiesXml() +
             "</tds:Capabilities></tds:GetCapabilitiesResponse>"
         );
         return;
@@ -679,12 +755,15 @@ static void handleDeviceService()
     if (hasOperation(body, "GetServices")) {
         const String deviceUrl = xmlEscape(onvifDeviceServiceUrl());
         const String mediaUrl = xmlEscape(onvifMediaServiceUrl());
+        const String imagingUrl = xmlEscape(onvifImagingServiceUrl());
         sendSoap(server,
             "<tds:GetServicesResponse>"
             "<tds:Service><tds:Namespace>http://www.onvif.org/ver10/device/wsdl</tds:Namespace>"
             "<tds:XAddr>" + deviceUrl + "</tds:XAddr><tds:Version><tt:Major>2</tt:Major><tt:Minor>6</tt:Minor></tds:Version></tds:Service>"
             "<tds:Service><tds:Namespace>http://www.onvif.org/ver10/media/wsdl</tds:Namespace>"
             "<tds:XAddr>" + mediaUrl + "</tds:XAddr><tds:Version><tt:Major>2</tt:Major><tt:Minor>3</tt:Minor></tds:Version></tds:Service>"
+            "<tds:Service><tds:Namespace>http://www.onvif.org/ver20/imaging/wsdl</tds:Namespace>"
+            "<tds:XAddr>" + imagingUrl + "</tds:XAddr><tds:Version><tt:Major>2</tt:Major><tt:Minor>5</tt:Minor></tds:Version></tds:Service>"
             "</tds:GetServicesResponse>"
         );
         return;
@@ -693,7 +772,7 @@ static void handleDeviceService()
     if (hasOperation(body, "GetServiceCapabilities")) {
         sendSoap(server,
             "<tds:GetServiceCapabilitiesResponse><tds:Capabilities>"
-            "<tds:Network IPFilter=\"false\" ZeroConfiguration=\"false\" IPVersion6=\"false\" DynDNS=\"false\"/>"
+            "<tds:Network IPFilter=\"false\" ZeroConfiguration=\"false\" IPVersion6=\"false\" DynDNS=\"false\" HostnameFromDHCP=\"false\"/>"
             "<tds:Security TLS1.0=\"false\" TLS1.1=\"false\" TLS1.2=\"false\" OnboardKeyGeneration=\"false\" AccessPolicyConfig=\"false\" "
             "DefaultAccessPolicy=\"false\" Dot1X=\"false\" RemoteUserHandling=\"false\" X.509Token=\"false\" SAMLToken=\"false\" KerberosToken=\"false\" "
             "RELToken=\"false\" UsernameToken=\"true\" HttpDigest=\"true\"/>"
@@ -753,6 +832,74 @@ static void handleDeviceService()
         return;
     }
 
+    if (hasOperation(body, "GetNetworkInterfaces")) {
+        String response = "<tds:GetNetworkInterfacesResponse>";
+        if (staInterfaceActive()) {
+            response += networkInterfaceXml(
+                "wlan0",
+                "WiFi STA",
+                WiFi.macAddress(),
+                WiFi.localIP(),
+                prefixLengthFromMask(WiFi.subnetMask()),
+                true
+            );
+        }
+        if (apInterfaceActive()) {
+            response += networkInterfaceXml(
+                "ap0",
+                "WiFi AP",
+                WiFi.softAPmacAddress(),
+                WiFi.softAPIP(),
+                WiFi.softAPSubnetCIDR(),
+                false
+            );
+        }
+        response += "</tds:GetNetworkInterfacesResponse>";
+        sendSoap(server, response);
+        return;
+    }
+
+    if (hasOperation(body, "GetNetworkProtocols")) {
+        sendSoap(server,
+            "<tds:GetNetworkProtocolsResponse>"
+            "<tds:NetworkProtocols><tt:Name>HTTP</tt:Name><tt:Enabled>true</tt:Enabled><tt:Port>80</tt:Port></tds:NetworkProtocols>"
+            "<tds:NetworkProtocols><tt:Name>HTTPS</tt:Name><tt:Enabled>false</tt:Enabled><tt:Port>443</tt:Port></tds:NetworkProtocols>"
+            "<tds:NetworkProtocols><tt:Name>RTSP</tt:Name><tt:Enabled>true</tt:Enabled><tt:Port>554</tt:Port></tds:NetworkProtocols>"
+            "</tds:GetNetworkProtocolsResponse>"
+        );
+        return;
+    }
+
+    if (hasOperation(body, "GetDNS")) {
+        const bool fromDhcp = staInterfaceActive();
+        String response =
+            "<tds:GetDNSResponse><tds:DNSInformation><tt:FromDHCP>" +
+            String(fromDhcp ? "true" : "false") + "</tt:FromDHCP>";
+        if (fromDhcp) {
+            for (uint8_t i = 0; i < 2; ++i) {
+                const IPAddress dns = WiFi.dnsIP(i);
+                if (!ipIsUsable(dns))
+                    continue;
+                response +=
+                    "<tt:DNSFromDHCP><tt:Type>IPv4</tt:Type><tt:IPv4Address>" +
+                    dns.toString() + "</tt:IPv4Address></tt:DNSFromDHCP>";
+            }
+        }
+        response += "</tds:DNSInformation></tds:GetDNSResponse>";
+        sendSoap(server, response);
+        return;
+    }
+
+    if (hasOperation(body, "GetNTP")) {
+        sendSoap(server,
+            "<tds:GetNTPResponse><tds:NTPInformation><tt:FromDHCP>false</tt:FromDHCP>"
+            "<tt:NTPManual><tt:Type>DNS</tt:Type><tt:DNSname>pool.ntp.org</tt:DNSname></tt:NTPManual>"
+            "<tt:NTPManual><tt:Type>DNS</tt:Type><tt:DNSname>time.google.com</tt:DNSname></tt:NTPManual>"
+            "</tds:NTPInformation></tds:GetNTPResponse>"
+        );
+        return;
+    }
+
     if (hasOperation(body, "GetDiscoveryMode")) {
         sendSoap(server,
             "<tds:GetDiscoveryModeResponse><tds:DiscoveryMode>Discoverable</tds:DiscoveryMode></tds:GetDiscoveryModeResponse>"
@@ -775,6 +922,7 @@ static void handleMediaService()
     }
 
     const String body = server.arg("plain");
+    ++soapRequestCount;
 
     if (!requireOnvifAuthentication(server, body, false))
         return;
@@ -819,6 +967,26 @@ static void handleMediaService()
         return;
     }
 
+    if (hasOperation(body, "GetVideoSourceConfiguration")) {
+        const String token = extractElementText(body, "ConfigurationToken");
+        if (token.length() && token != ONVIF_VIDEO_SOURCE_CONFIG_TOKEN) {
+            sendSoapFault(server, "Unknown video source configuration");
+            return;
+        }
+        uint16_t width = 0;
+        uint16_t height = 0;
+        configuredResolution(width, height);
+        sendSoap(server,
+            "<trt:GetVideoSourceConfigurationResponse>"
+            "<trt:Configuration token=\"" + String(ONVIF_VIDEO_SOURCE_CONFIG_TOKEN) + "\">"
+            "<tt:Name>SensorForge Camera</tt:Name><tt:UseCount>1</tt:UseCount>"
+            "<tt:SourceToken>" + String(ONVIF_VIDEO_SOURCE_TOKEN) + "</tt:SourceToken>"
+            "<tt:Bounds x=\"0\" y=\"0\" width=\"" + String(width) + "\" height=\"" + String(height) + "\"/>"
+            "</trt:Configuration></trt:GetVideoSourceConfigurationResponse>"
+        );
+        return;
+    }
+
     if (hasOperation(body, "GetVideoSourceConfigurations")) {
         uint16_t width = 0;
         uint16_t height = 0;
@@ -830,6 +998,29 @@ static void handleMediaService()
             "<tt:SourceToken>" + String(ONVIF_VIDEO_SOURCE_TOKEN) + "</tt:SourceToken>"
             "<tt:Bounds x=\"0\" y=\"0\" width=\"" + String(width) + "\" height=\"" + String(height) + "\"/>"
             "</trt:Configurations></trt:GetVideoSourceConfigurationsResponse>"
+        );
+        return;
+    }
+
+    if (hasOperation(body, "GetVideoEncoderConfiguration")) {
+        const String token = extractElementText(body, "ConfigurationToken");
+        if (token.length() && token != ONVIF_VIDEO_ENCODER_CONFIG_TOKEN) {
+            sendSoapFault(server, "Unknown video encoder configuration");
+            return;
+        }
+        uint16_t width = 0;
+        uint16_t height = 0;
+        configuredResolution(width, height);
+        sendSoap(server,
+            "<trt:GetVideoEncoderConfigurationResponse>"
+            "<trt:Configuration token=\"" + String(ONVIF_VIDEO_ENCODER_CONFIG_TOKEN) + "\">"
+            "<tt:Name>SensorForge JPEG</tt:Name><tt:UseCount>1</tt:UseCount><tt:Encoding>JPEG</tt:Encoding>"
+            "<tt:Resolution><tt:Width>" + String(width) + "</tt:Width><tt:Height>" + String(height) + "</tt:Height></tt:Resolution>"
+            "<tt:Quality>" + String(onvifQuality()) + "</tt:Quality>"
+            "<tt:RateControl><tt:FrameRateLimit>" + String(cfg_fps) + "</tt:FrameRateLimit><tt:EncodingInterval>1</tt:EncodingInterval><tt:BitrateLimit>0</tt:BitrateLimit></tt:RateControl>"
+            "<tt:Multicast><tt:Address><tt:Type>IPv4</tt:Type><tt:IPv4Address>0.0.0.0</tt:IPv4Address></tt:Address><tt:Port>0</tt:Port><tt:TTL>1</tt:TTL><tt:AutoStart>false</tt:AutoStart></tt:Multicast>"
+            "<tt:SessionTimeout>PT60S</tt:SessionTimeout>"
+            "</trt:Configuration></trt:GetVideoEncoderConfigurationResponse>"
         );
         return;
     }
@@ -900,6 +1091,67 @@ static void handleMediaService()
     }
 
     sendSoapFault(server, "Unsupported ONVIF media operation");
+}
+
+static bool imagingVideoSourceTokenValid(const String &body)
+{
+    const String token = extractElementText(body, "VideoSourceToken");
+    return !token.length() || token == ONVIF_VIDEO_SOURCE_TOKEN;
+}
+
+static void handleImagingService()
+{
+    if (!webServer)
+        return;
+
+    WebServer &server = *webServer;
+    if (!streamerModeEnabled() || !cfg_onvif_enabled || !cfg_streamer_rtsp_enabled) {
+        server.send(503, "text/plain; charset=utf-8", "ONVIF is not active");
+        return;
+    }
+
+    const String body = server.arg("plain");
+    ++soapRequestCount;
+    const bool preAuthAllowed = hasOperation(body, "GetServiceCapabilities");
+    if (!requireOnvifAuthentication(server, body, preAuthAllowed))
+        return;
+
+    if (hasOperation(body, "GetServiceCapabilities")) {
+        sendSoap(server,
+            "<timg:GetServiceCapabilitiesResponse><timg:Capabilities ImageStabilization=\"false\"/>"
+            "</timg:GetServiceCapabilitiesResponse>"
+        );
+        return;
+    }
+
+    if (hasOperation(body, "GetImagingSettings")) {
+        if (!imagingVideoSourceTokenValid(body)) {
+            sendSoapFault(server, "Unknown imaging video source");
+            return;
+        }
+        sendSoap(server,
+            "<timg:GetImagingSettingsResponse><timg:ImagingSettings>"
+            "<tt:Exposure><tt:Mode>" + String(cfg_camera_auto_exposure ? "AUTO" : "MANUAL") +
+            "</tt:Mode></tt:Exposure>"
+            "</timg:ImagingSettings></timg:GetImagingSettingsResponse>"
+        );
+        return;
+    }
+
+    if (hasOperation(body, "GetOptions")) {
+        if (!imagingVideoSourceTokenValid(body)) {
+            sendSoapFault(server, "Unknown imaging video source");
+            return;
+        }
+        sendSoap(server,
+            "<timg:GetOptionsResponse><timg:ImagingOptions>"
+            "<tt:Exposure><tt:Mode>AUTO</tt:Mode><tt:Mode>MANUAL</tt:Mode></tt:Exposure>"
+            "</timg:ImagingOptions></timg:GetOptionsResponse>"
+        );
+        return;
+    }
+
+    sendSoapFault(server, "Unsupported ONVIF imaging operation");
 }
 
 static String randomMessageUuid()
@@ -1086,6 +1338,7 @@ void onvifRegisterWebRoutes(WebServer &server)
     webServer = &server;
     server.on("/onvif/device_service", HTTP_POST, handleDeviceService);
     server.on("/onvif/media_service", HTTP_POST, handleMediaService);
+    server.on("/onvif/imaging_service", HTTP_POST, handleImagingService);
 }
 
 bool onvifBegin(String &error)
@@ -1124,7 +1377,8 @@ bool onvifBegin(String &error)
     logWrite(
         "ONVIF discovery started | uuid=" + stableEndpointUuid() +
         " | device=" + onvifDeviceServiceUrl() +
-        " | media=" + onvifMediaServiceUrl()
+        " | media=" + onvifMediaServiceUrl() +
+        " | imaging=" + onvifImagingServiceUrl()
     );
     return true;
 }
@@ -1228,4 +1482,24 @@ String onvifDeviceServiceUrl()
 String onvifMediaServiceUrl()
 {
     return httpBaseUrl() + "/onvif/media_service";
+}
+
+String onvifImagingServiceUrl()
+{
+    return httpBaseUrl() + "/onvif/imaging_service";
+}
+
+uint32_t onvifSoapRequestCount()
+{
+    return soapRequestCount;
+}
+
+uint32_t onvifSoapFaultCount()
+{
+    return soapFaultCount;
+}
+
+size_t onvifSoapResponseMaxBytes()
+{
+    return soapResponseMaxBytes;
 }

@@ -1,5 +1,9 @@
 #pragma once
 
+// Codec implementation capability. Keep separate from board hardware capability:
+// ONVIF may advertise H.264 only when both the board and streamer support it.
+#define SENSORFORGE_STREAMER_H264_IMPLEMENTED 0
+
 #include <Arduino.h>
 #include <WiFi.h>
 

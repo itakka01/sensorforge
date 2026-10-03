@@ -2377,6 +2377,9 @@ static void handleStreamerStatus()
         ",\"onvif_probe_rx\":" + String(onvifDiscoveryProbeCount()) +
         ",\"onvif_probe_match_tx\":" + String(onvifDiscoveryMatchCount()) +
         ",\"onvif_last_remote\":\"" + onvifDiscoveryLastRemote() + "\"" +
+        ",\"onvif_soap_requests\":" + String(onvifSoapRequestCount()) +
+        ",\"onvif_soap_faults\":" + String(onvifSoapFaultCount()) +
+        ",\"onvif_soap_response_max_bytes\":" + String((unsigned long long)onvifSoapResponseMaxBytes()) +
         ",\"rtsp_client\":" + (streamerRtspClientConnected() ? "true" : "false") +
         ",\"rtsp_clients\":" + String((unsigned)streamerRtspClientCount()) +
         ",\"http_client\":" + (streamerHttpClientConnected() ? "true" : "false") +
