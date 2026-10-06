@@ -1,15 +1,15 @@
 # SensorForge Local API v1
 
 Status: 2026-10-03  
-Firmware worktree: **v87 Beta 16**  
-Host protocol: **1.21**  
+Firmware worktree: **v87 Beta 21**  
+Host protocol: **1.22**  
 Integration profile: **1.1**
 
 This document defines the local HTTP API used by SensorForge Sync clients,
 Home Assistant-style integrations and the planned Android application.
 
 The API remains deliberately inside the existing `/api/v1` namespace. The
-1.21/1.1 expansion is additive: existing v1 routes and previously documented
+1.22/1.1 expansion is additive: existing v1 routes and previously documented
 fields remain valid.
 
 ## Security model
@@ -86,6 +86,7 @@ Machine-oriented API feature discovery. It explicitly reports support for:
 - config-storage management
 - reboot/shutdown
 - basic ONVIF interoperability capability (`onvif_basic`) and `onvif_enabled` state/configuration
+- optional WireGuard client capability/backend/configured/active status
 
 ONVIF itself is not transported through `/api/v1`: when enabled in streamer mode,
 WS-Discovery and the read-only `/onvif/device_service`, `/onvif/media_service` and
@@ -116,6 +117,51 @@ Firmware upload, license management and generic factory reset are intentionally
 not exposed by this API expansion yet. Those operations remain on their existing
 specialized WebConfig paths until their full safety/transaction semantics are
 wrapped rather than duplicated.
+
+
+## WireGuard client (Beta 24)
+
+WireGuard remains an optional transport design below the existing SensorForge
+services; it is not a new API namespace and it does not create another media
+pipeline. Current XIAO and Freenove board profiles retain the prepared single-peer
+configuration, but the authoritative Arduino-ESP32 3.3.12 / ESP-IDF 5.5.5 build
+deliberately selects **no WireGuard runtime backend**.
+
+Additive canonical config keys are retained for future continuation:
+
+- `wireguard_enabled`
+- `wireguard_address`
+- `wireguard_private_key` (**secret; write-only through API semantics**)
+- `wireguard_peer_endpoint`
+- `wireguard_peer_public_key`
+- `wireguard_peer_port`
+
+The private key continues to use the existing SensorForge secret/SFSEC1 path. GET
+config/status responses expose only configured/backend/runtime state and never key
+material.
+
+For Beta 24 the legacy `WireGuard-ESP32` 0.1.5 Arduino backend is explicitly not
+linked because it still depends on removed `tcpip_adapter` APIs on the current
+reference stack. Installing that library locally must not change or break a
+SensorForge build. Runtime activation therefore remains unavailable and persisted
+`wireguard_enabled` is forced OFF while no qualified backend is compiled in.
+
+`GET /api/v1/network` continues to include a `wireguard` object with enabled/active
+state, board capability, backend availability/name, tunnel address, endpoint/port,
+configured-key flags and runtime status. `/device`, `/state` and `/capabilities`
+retain their smaller additive WireGuard fields. Because backend availability is
+false in the Beta-24 reference build, the effective `wireguard_client` capability
+is false even though the current boards are architecturally allowed to support a
+future backend. Host API remains 1.22.
+
+Future implementation should resume with a maintained ESP-NETIF-compatible backend
+or after a separately qualified Arduino-ESP32 4.x / ESP-IDF 6.x migration. Local
+patching of third-party WireGuard source is not part of the supported SensorForge
+workflow. In WebConfig the parked feature is now presented only inside `WiFi
+Einstellungen` as a concise availability state; backend names, tunnel/key fields
+and other implementation details are intentionally not exposed while no qualified
+backend exists. RTSP/ONVIF/snapshot traffic over VPN remains unqualified until a
+real backend exists and passes separate load, heap, reconnect and thermal testing.
 
 ## Fast state and telemetry
 

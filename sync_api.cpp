@@ -19,6 +19,7 @@
 #include "webconfig.h"
 #include "webconfig_wifi.h"
 #include "sensorforge_version.h"
+#include "wireguard_manager.h"
 
 #include <Arduino.h>
 #include <FS.h>
@@ -73,7 +74,7 @@ static WebServer *syncServer = nullptr;
 // firmware compile timestamp, so every newly compiled API identifies itself
 // with a fresh, chronologically increasing build version.
 static const uint16_t SYNC_API_VERSION_MAJOR = 1;
-static const uint16_t SYNC_API_VERSION_MINOR = 21;
+static const uint16_t SYNC_API_VERSION_MINOR = 22;
 
 // Stable integration contract intended for Home Assistant and other local
 // automation clients. The transport/protocol version above may grow additively,
@@ -629,6 +630,10 @@ static void handleDevice()
         ",\"onvif_enabled\":" + String(cfg_onvif_enabled ? "true" : "false") +
         ",\"onvif_active\":" + String(onvifActive() ? "true" : "false") +
         ",\"onvif_device_service\":\"" + jsonEscape(onvifDeviceServiceUrl()) +
+        "\",\"wireguard_enabled\":" + String(cfg_wireguard_enabled ? "true" : "false") +
+        ",\"wireguard_active\":" + String(wireguardActive() ? "true" : "false") +
+        ",\"wireguard_backend_available\":" + String(wireguardBuildAvailable() ? "true" : "false") +
+        ",\"wireguard_backend\":\"" + jsonEscape(String(wireguardBackendName())) +
         "\",\"capabilities\":{" +
             "\"camera_snapshot\":true," +
             "\"motion_state\":true," +
@@ -650,6 +655,7 @@ static void handleDevice()
             "\"system_actions\":true," +
             "\"rtsp\":true," +
             "\"onvif_basic\":true," +
+            "\"wireguard_client\":" + String((wireguardBoardCapable() && wireguardBuildAvailable()) ? "true" : "false") + "," +
             "\"mqtt\":false" +
         "}}";
 
@@ -698,6 +704,9 @@ static void handleIntegrationState()
         ",\"operating_mode\":\"" + jsonEscape(cfg_operating_mode) +
         "\",\"streamer_ready\":" + String(streamerReady() ? "true" : "false") +
         ",\"onvif_enabled\":" + String(cfg_onvif_enabled ? "true" : "false") +
+        ",\"wireguard_enabled\":" + String(cfg_wireguard_enabled ? "true" : "false") +
+        ",\"wireguard_active\":" + String(wireguardActive() ? "true" : "false") +
+        ",\"wireguard_status\":\"" + jsonEscape(wireguardStatusText()) + "\"" +
         ",\"streamer_rtsp_client\":" + String(streamerRtspClientConnected() ? "true" : "false") +
         ",\"streamer_http_client\":" + String(streamerHttpClientConnected() ? "true" : "false") +
         ",\"streamer_audio_available\":" + String(streamerAudioAvailable() ? "true" : "false") +
@@ -2573,6 +2582,13 @@ static const ApiConfigFieldDef API_CONFIG_FIELDS[] = {
     {"streamer_http_mjpeg_enabled", "streamer", false, true},
     {"onvif_enabled", "streamer", false, true},
 
+    {"wireguard_enabled", "network", false, true},
+    {"wireguard_address", "network", false, true},
+    {"wireguard_private_key", "network", true, true},
+    {"wireguard_peer_endpoint", "network", false, true},
+    {"wireguard_peer_public_key", "network", false, true},
+    {"wireguard_peer_port", "network", false, true},
+
     {"sleep_mode", "power", false, true},
     {"sleep_delay_ms", "power", false, true},
     {"bootloop_protection", "power", false, true},
@@ -2808,6 +2824,7 @@ static void handleCapabilities()
         "\"image_motion_status\":true,\"image_motion_background_reset\":true," +
         "\"radar_status\":true,\"radar_config\":true,\"radar_calibration\":true," +
         "\"audio_status\":true,\"network_status\":true,\"network_scan\":true," +
+        "\"wireguard_client\":" + String((wireguardBoardCapable() && wireguardBuildAvailable()) ? "true" : "false") + "," +
         "\"streamer_status\":true,\"transport_control\":true," +
         "\"config_storage_control\":true,\"factory_reset\":false," +
         "\"system_reboot\":true,\"system_shutdown\":true," +
@@ -3269,7 +3286,19 @@ static void handleNetworkStatus()
         ",\"hotspot_enabled\":" + String(cfg_hotspot_enabled ? "true" : "false") +
         ",\"hotspot_fallback_enabled\":" + String(cfg_hotspot_fallback_enabled ? "true" : "false") +
         ",\"hotspot_hidden\":" + String(cfg_hotspot_hidden ? "true" : "false") +
-        ",\"profiles\":[";
+        ",\"wireguard\":{" +
+            "\"enabled\":" + String(cfg_wireguard_enabled ? "true" : "false") +
+            ",\"active\":" + String(wireguardActive() ? "true" : "false") +
+            ",\"board_capable\":" + String(wireguardBoardCapable() ? "true" : "false") +
+            ",\"backend_available\":" + String(wireguardBuildAvailable() ? "true" : "false") +
+            ",\"backend\":\"" + jsonEscape(String(wireguardBackendName())) +
+            "\",\"address\":\"" + jsonEscape(cfg_wireguard_address) +
+            "\",\"peer_endpoint\":\"" + jsonEscape(cfg_wireguard_peer_endpoint) +
+            "\",\"peer_port\":" + String(cfg_wireguard_peer_port) +
+            ",\"private_key_configured\":" + String(cfg_wireguard_private_key.length() ? "true" : "false") +
+            ",\"peer_public_key_configured\":" + String(cfg_wireguard_peer_public_key.length() ? "true" : "false") +
+            ",\"status\":\"" + jsonEscape(wireguardStatusText()) + "\"}," +
+        "\"profiles\":[";
 
     for (size_t i = 0; i < SENSORFORGE_WIFI_PROFILE_COUNT; ++i) {
         if (i > 0)
@@ -3325,7 +3354,11 @@ static void handleStreamerStatusExtended()
         ",\"http_mjpeg_enabled\":" + String(cfg_streamer_http_mjpeg_enabled ? "true" : "false") +
         ",\"onvif_enabled\":" + String(cfg_onvif_enabled ? "true" : "false") +
         ",\"onvif_active\":" + String(onvifActive() ? "true" : "false") +
-        ",\"onvif_device_service\":\"" + jsonEscape(onvifDeviceServiceUrl()) + "\"" +
+        ",\"onvif_device_service\":\"" + jsonEscape(onvifDeviceServiceUrl()) +
+        "\",\"wireguard_enabled\":" + String(cfg_wireguard_enabled ? "true" : "false") +
+        ",\"wireguard_active\":" + String(wireguardActive() ? "true" : "false") +
+        ",\"wireguard_backend_available\":" + String(wireguardBuildAvailable() ? "true" : "false") +
+        ",\"wireguard_backend\":\"" + jsonEscape(String(wireguardBackendName())) + "\"" +
         ",\"rtsp_clients\":" + String(streamerRtspClientCount()) +
         ",\"http_clients\":" + String(streamerHttpClientCount()) +
         ",\"audio_available\":" + String(streamerAudioAvailable() ? "true" : "false") +

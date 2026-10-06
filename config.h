@@ -94,6 +94,15 @@ extern int cfg_streamer_rtsp_enabled;           // 0/1
 extern int cfg_streamer_http_mjpeg_enabled;     // 0/1
 extern int cfg_onvif_enabled;                    // 0/1, basic ONVIF discovery/media integration
 
+// Optional WireGuard client tunnel. Safe default is OFF. The private key is a
+// config secret and is protected by the existing SFSEC1 persistence layer.
+extern int cfg_wireguard_enabled;
+extern String cfg_wireguard_address;
+extern String cfg_wireguard_private_key;
+extern String cfg_wireguard_peer_endpoint;
+extern String cfg_wireguard_peer_public_key;
+extern int cfg_wireguard_peer_port;
+
 // Sleep / power management
 extern String cfg_sleep_mode;         // "off", "light_sleep", "deep_sleep"
 extern int cfg_sleep_delay_ms;        // 0..60000 ms idle delay before sleep
@@ -413,6 +422,19 @@ ConfigSaveResult configSaveAccessSettings(
 
 // Persist only network/WiFi settings while preserving the complete active
 // config text and all unrelated/future keys. Used by the dedicated WiFi page.
+// Persist only WireGuard client settings while preserving unrelated keys/comments.
+// Changes are intentionally treated as reboot-applied by the runtime VPN layer.
+ConfigSaveResult configSaveWireGuardSettings(
+    int enabled,
+    const String &address,
+    const String &privateKey,
+    const String &peerEndpoint,
+    const String &peerPublicKey,
+    int peerPort,
+    bool writeToSd,
+    String &error
+);
+
 ConfigSaveResult configSaveWifiSettings(
     const String &hostname,
     const String &wifiOnSystemStart,

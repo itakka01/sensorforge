@@ -53,6 +53,7 @@
 #include "motion_diagnostics.h"
 #include "streamer.h"
 #include "firmware_security.h"
+#include "wireguard_manager.h"
 
 
 // =============================================================
@@ -14541,6 +14542,8 @@ void stopWebConfigWifi(
     const char *reason
 )
 {
+    wireguardStop(reason ? reason : "WiFi stop");
+
     if (webConfigStarted) {
 
         webConfigStop();
@@ -15351,6 +15354,11 @@ void setup() {
         sdReady
     );
 
+    // Freeze the VPN runtime configuration for this boot. WireGuard settings
+    // are intentionally reboot-applied so a remote configuration change cannot
+    // replace the live tunnel underneath an active management session.
+    wireguardSetup();
+
 
     // ---------------------------------------------------------
     // Low-power / boot-loop protection
@@ -15711,6 +15719,13 @@ void setup() {
 
     startWebConfig();
 
+    // WireGuard is optional and starts only on infrastructure WiFi with a
+    // valid wall clock. This boot-time attempt happens before streamer clients
+    // can connect, so a potentially slow endpoint DNS lookup cannot disturb an
+    // active media session.
+    if (webConfigStarted)
+        wireguardService(true);
+
     if (wifiAliveTimerWake && webConfigStarted) {
         // This boot exists specifically because the daily availability timer
         // fired. Treat the just-started network as schedule-owned so the
@@ -16014,6 +16029,7 @@ static void serviceStreamerNetworkRecovery()
     // network-facing services and the streamer transport; keep camera power and
     // all persisted configuration untouched.
     streamerStop();
+    wireguardStop("streamer network recovery");
 
     if (webConfigStarted) {
         webConfigStop();
@@ -16031,6 +16047,8 @@ static void serviceStreamerNetworkRecovery()
         streamerNoteNetworkRecoveryResult(false, "network/WebConfig restart failed");
         return;
     }
+
+    wireguardService(true);
 
     String streamerError;
     if (!streamerBegin(streamerError)) {
@@ -16063,6 +16081,10 @@ void loop() {
         thermalMonitorLoop();
         if (webConfigStarted)
             webConfigLoop();
+        wireguardService(
+            streamerRtspClientCount() == 0 &&
+            streamerHttpClientCount() == 0
+        );
         streamerLoop();
         serviceStreamerNetworkRecovery();
         delay(1);
@@ -16255,6 +16277,10 @@ void loop() {
 
     if (webConfigStarted)
         webConfigLoop();
+
+    // Retry VPN startup only while no recording owns the latency-sensitive
+    // product path. Once active, packet processing is handled by lwIP.
+    wireguardService(!recording && !recordingLoadTestIsActive());
 
     // Additive daily availability schedule. This can bring WiFi/WebConfig back
     // online after the ordinary inactivity timeout has switched the radio off.

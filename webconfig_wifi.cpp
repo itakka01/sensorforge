@@ -2,6 +2,7 @@
 
 #include "board_config.h"
 #include "config.h"
+#include "webconfig_wireguard.h"
 
 #include <WebServer.h>
 #include <WiFi.h>
@@ -297,7 +298,14 @@ String webconfigWifiSettingsHtml(const String &notice)
     }
 
     html +=
-        "</div></div></section>"
+        "</div></div></section>";
+
+    // VPN belongs to network configuration from the user perspective. Keep
+    // the parked WireGuard implementation visible here as a concise product
+    // capability state instead of exposing backend/runtime internals.
+    html += webconfigWireGuardWifiSectionHtml();
+
+    html +=
         "<div id='wifiScanBackdrop' class='wifi-scan-backdrop' role='dialog' aria-modal='true' aria-hidden='true'>"
         "<div class='wifi-scan-modal'><div class='wifi-scan-modal-head'><h3>Verfügbare WLANs</h3>"
         "<button type='button' id='wifiScanClose' class='wifi-scan-close' aria-label='Schließen'>×</button></div>"

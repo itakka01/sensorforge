@@ -113,3 +113,8 @@ config.txt muss im Root liegen
 Board-spezifische Pins werden automatisch gesetzt
 Webinterface ist nur aktiv, wenn WLAN verbunden ist
 
+WireGuard / VPN Status (v87-beta24)
+WireGuard/VPN bleibt als spaetere SensorForge-Erweiterung vorbereitet, ist auf den aktuellen Boards jedoch derzeit nicht verfuegbar.
+Die Benutzeroberflaeche zeigt diesen Status direkt unter WiFi Einstellungen; ein eigener WireGuard-Menuepunkt und technische Backend-/Debugdetails werden nicht mehr angezeigt.
+Die vorbereitete Config-/Secret-/API-Struktur bleibt fuer eine spaetere qualifizierte Standardimplementierung erhalten.
+Es wird keine Drittanbieter-WireGuard-Library gelinkt oder lokal gepatcht; der aktuelle Build bleibt davon unabhaengig.

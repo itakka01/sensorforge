@@ -139,6 +139,13 @@ int cfg_streamer_rtsp_enabled = 0;
 int cfg_streamer_http_mjpeg_enabled = 0;
 int cfg_onvif_enabled = 0;
 
+int cfg_wireguard_enabled = 0;
+String cfg_wireguard_address = "";
+String cfg_wireguard_private_key = "";
+String cfg_wireguard_peer_endpoint = "";
+String cfg_wireguard_peer_public_key = "";
+int cfg_wireguard_peer_port = 51820;
+
 String cfg_sleep_mode = "off";
 int cfg_sleep_delay_ms = 2000;
 int cfg_bootloop_protection = 1;
@@ -639,6 +646,13 @@ struct ConfigValues {
     int streamerHttpMjpegEnabled;
     int onvifEnabled;
 
+    int wireguardEnabled;
+    String wireguardAddress;
+    String wireguardPrivateKey;
+    String wireguardPeerEndpoint;
+    String wireguardPeerPublicKey;
+    int wireguardPeerPort;
+
     String sleepMode;
     int sleepDelayMs;
     int bootloopProtection;
@@ -757,6 +771,13 @@ struct ConfigSeen {
     bool streamerRtspEnabled;
     bool streamerHttpMjpegEnabled;
     bool onvifEnabled;
+
+    bool wireguardEnabled;
+    bool wireguardAddress;
+    bool wireguardPrivateKey;
+    bool wireguardPeerEndpoint;
+    bool wireguardPeerPublicKey;
+    bool wireguardPeerPort;
 
     bool sleepMode;
     bool sleepDelayMs;
@@ -1010,6 +1031,13 @@ static ConfigValues makeDefaultValues()
     values.onvifEnabled =
         0;
 
+    values.wireguardEnabled = 0;
+    values.wireguardAddress = "";
+    values.wireguardPrivateKey = "";
+    values.wireguardPeerEndpoint = "";
+    values.wireguardPeerPublicKey = "";
+    values.wireguardPeerPort = 51820;
+
     values.sleepMode =
         "off";
 
@@ -1219,6 +1247,13 @@ static bool serializeConfigValues(
     APPEND_CONFIG_VALUE("streamer_rtsp_enabled", String(values.streamerRtspEnabled));
     APPEND_CONFIG_VALUE("streamer_http_mjpeg_enabled", String(values.streamerHttpMjpegEnabled));
     APPEND_CONFIG_VALUE("onvif_enabled", String(values.onvifEnabled));
+
+    APPEND_CONFIG_VALUE("wireguard_enabled", String(values.wireguardEnabled));
+    APPEND_CONFIG_VALUE("wireguard_address", values.wireguardAddress);
+    APPEND_CONFIG_VALUE("wireguard_private_key", values.wireguardPrivateKey);
+    APPEND_CONFIG_VALUE("wireguard_peer_endpoint", values.wireguardPeerEndpoint);
+    APPEND_CONFIG_VALUE("wireguard_peer_public_key", values.wireguardPeerPublicKey);
+    APPEND_CONFIG_VALUE("wireguard_peer_port", String(values.wireguardPeerPort));
 
     APPEND_CONFIG_VALUE("sleep_mode", values.sleepMode);
     APPEND_CONFIG_VALUE("sleep_delay_ms", String(values.sleepDelayMs));
@@ -2757,6 +2792,68 @@ static bool validateValues(
         return false;
     }
 
+    if (values.wireguardEnabled != 0 && values.wireguardEnabled != 1) {
+        error = "wireguard_enabled must be 0 or 1";
+        return false;
+    }
+
+    auto wireguardKeyValid = [](const String &key) -> bool {
+        if (key.length() != 44 || key[43] != '=')
+            return false;
+        for (size_t i = 0; i < 43; ++i) {
+            const char c = key[i];
+            if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                  (c >= '0' && c <= '9') || c == '+' || c == '/'))
+                return false;
+        }
+        return true;
+    };
+
+    if (values.wireguardPeerPort < 1 || values.wireguardPeerPort > 65535) {
+        error = "wireguard_peer_port out of range (1..65535)";
+        return false;
+    }
+
+    if (values.wireguardAddress.length()) {
+        IPAddress vpnIp;
+        if (!vpnIp.fromString(values.wireguardAddress) ||
+            !(vpnIp[0] || vpnIp[1] || vpnIp[2] || vpnIp[3])) {
+            error = "wireguard_address must be a valid IPv4 address";
+            return false;
+        }
+    }
+
+    if (values.wireguardPrivateKey.length() && !wireguardKeyValid(values.wireguardPrivateKey)) {
+        error = "wireguard_private_key must be a 32-byte WireGuard Base64 key";
+        return false;
+    }
+
+    if (values.wireguardPeerPublicKey.length() && !wireguardKeyValid(values.wireguardPeerPublicKey)) {
+        error = "wireguard_peer_public_key must be a 32-byte WireGuard Base64 key";
+        return false;
+    }
+
+    if (values.wireguardPeerEndpoint.length() > 253 ||
+        values.wireguardPeerEndpoint.indexOf(' ') >= 0 ||
+        values.wireguardPeerEndpoint.indexOf('\t') >= 0) {
+        error = "wireguard_peer_endpoint is invalid";
+        return false;
+    }
+
+    if (values.wireguardEnabled) {
+        if (!values.wireguardAddress.length() ||
+            !values.wireguardPrivateKey.length() ||
+            !values.wireguardPeerEndpoint.length() ||
+            !values.wireguardPeerPublicKey.length()) {
+            error = "wireguard_enabled requires address, private key, peer endpoint and peer public key";
+            return false;
+        }
+        if (values.hotspotEnabled) {
+            error = "wireguard_enabled requires infrastructure WiFi (hotspot_enabled=0)";
+            return false;
+        }
+    }
+
 
     if (
         values.sleepMode != "off" &&
@@ -4028,6 +4125,38 @@ static bool parseConfigText(
 
                 values.onvifEnabled = (int)numericValue;
 
+            } else if (key == "wireguard_enabled") {
+                if (!markOnce(seen.wireguardEnabled, key, error) ||
+                    !parseIntegerStrict(value, numericValue)) {
+                    if (!error.length()) error = "invalid wireguard_enabled";
+                    return false;
+                }
+                values.wireguardEnabled = (int)numericValue;
+
+            } else if (key == "wireguard_address") {
+                if (!markOnce(seen.wireguardAddress, key, error)) return false;
+                values.wireguardAddress = value;
+
+            } else if (key == "wireguard_private_key") {
+                if (!markOnce(seen.wireguardPrivateKey, key, error)) return false;
+                values.wireguardPrivateKey = value;
+
+            } else if (key == "wireguard_peer_endpoint") {
+                if (!markOnce(seen.wireguardPeerEndpoint, key, error)) return false;
+                values.wireguardPeerEndpoint = value;
+
+            } else if (key == "wireguard_peer_public_key") {
+                if (!markOnce(seen.wireguardPeerPublicKey, key, error)) return false;
+                values.wireguardPeerPublicKey = value;
+
+            } else if (key == "wireguard_peer_port") {
+                if (!markOnce(seen.wireguardPeerPort, key, error) ||
+                    !parseIntegerStrict(value, numericValue)) {
+                    if (!error.length()) error = "invalid wireguard_peer_port";
+                    return false;
+                }
+                values.wireguardPeerPort = (int)numericValue;
+
             } else if (
                 key == "sleep_mode"
             ) {
@@ -5145,6 +5274,13 @@ static void applyValues(
     cfg_onvif_enabled =
         values.onvifEnabled;
 
+    cfg_wireguard_enabled = values.wireguardEnabled;
+    cfg_wireguard_address = values.wireguardAddress;
+    cfg_wireguard_private_key = values.wireguardPrivateKey;
+    cfg_wireguard_peer_endpoint = values.wireguardPeerEndpoint;
+    cfg_wireguard_peer_public_key = values.wireguardPeerPublicKey;
+    cfg_wireguard_peer_port = values.wireguardPeerPort;
+
     cfg_sleep_mode =
         values.sleepMode;
 
@@ -5608,6 +5744,7 @@ static bool configSecretFieldName(const String &key)
         key == "wifi_pass" ||
         key.startsWith("wifi_pass_") ||
         key == "hotspot_password" ||
+        key == "wireguard_private_key" ||
         key == "web_password" ||
         key.startsWith("stream_password_");
 }
@@ -6316,6 +6453,15 @@ config_loaded:
             ? "set"
             : "empty"
         )
+    );
+
+    Serial.println(
+        "Config WireGuard: enabled=" + String(cfg_wireguard_enabled) +
+        " address=" + (cfg_wireguard_address.length() ? cfg_wireguard_address : String("<empty>")) +
+        " endpoint=" + (cfg_wireguard_peer_endpoint.length() ? cfg_wireguard_peer_endpoint : String("<empty>")) +
+        " port=" + String(cfg_wireguard_peer_port) +
+        " private_key=" + String(cfg_wireguard_private_key.length() ? "set" : "empty") +
+        " peer_public_key=" + String(cfg_wireguard_peer_public_key.length() ? "set" : "empty")
     );
 
     Serial.println(
@@ -7982,6 +8128,84 @@ ConfigSaveResult configSaveAccessSettings(
         }
         cfg_stream_allow_annotation_edit = streamAllowAnnotationEdit;
         cfg_stream_allow_delete = streamAllowDelete;
+    }
+
+    return result;
+}
+
+
+ConfigSaveResult configSaveWireGuardSettings(
+    int enabled,
+    const String &address,
+    const String &privateKey,
+    const String &peerEndpoint,
+    const String &peerPublicKey,
+    int peerPort,
+    bool writeToSd,
+    String &error
+)
+{
+    error = "";
+
+    String normalizedAddress = address;
+    normalizedAddress.trim();
+    String normalizedPrivateKey = privateKey;
+    normalizedPrivateKey.trim();
+    String normalizedEndpoint = peerEndpoint;
+    normalizedEndpoint.trim();
+    String normalizedPublicKey = peerPublicKey;
+    normalizedPublicKey.trim();
+
+    if (enabled != 0 && enabled != 1) {
+        error = "wireguard_enabled must be 0 or 1";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (peerPort < 1 || peerPort > 65535) {
+        error = "wireguard_peer_port out of range (1..65535)";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String text;
+    bool sourceRead = false;
+    if (activeConfigSource == CONFIG_SOURCE_SD && sdAvailableState && STORAGE.exists("/config.txt"))
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    if (!sourceRead && internalAvailableState && LittleFS.exists("/config.txt"))
+        sourceRead = readTextFile(LittleFS, "/config.txt", text);
+    if (!sourceRead && sdAvailableState && STORAGE.exists("/config.txt"))
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+
+    if (!sourceRead) {
+        error = "no persistent config.txt available for WireGuard settings save";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        !replaceOrAppendConfigKey(text, "wireguard_enabled", String(enabled)) ||
+        !replaceOrAppendConfigKey(text, "wireguard_address", normalizedAddress) ||
+        !replaceOrAppendConfigKey(text, "wireguard_private_key", normalizedPrivateKey) ||
+        !replaceOrAppendConfigKey(text, "wireguard_peer_endpoint", normalizedEndpoint) ||
+        !replaceOrAppendConfigKey(text, "wireguard_peer_public_key", normalizedPublicKey) ||
+        !replaceOrAppendConfigKey(text, "wireguard_peer_port", String(peerPort))
+    ) {
+        error = "could not patch WireGuard setting keys";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String validationError;
+    if (!configValidateText(text, validationError)) {
+        error = "patched config invalid: " + validationError;
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    ConfigSaveResult result = configSaveText(text, writeToSd, error);
+    if (result == CONFIG_SAVE_BOTH || result == CONFIG_SAVE_INTERNAL_ONLY) {
+        cfg_wireguard_enabled = enabled;
+        cfg_wireguard_address = normalizedAddress;
+        cfg_wireguard_private_key = normalizedPrivateKey;
+        cfg_wireguard_peer_endpoint = normalizedEndpoint;
+        cfg_wireguard_peer_public_key = normalizedPublicKey;
+        cfg_wireguard_peer_port = peerPort;
     }
 
     return result;

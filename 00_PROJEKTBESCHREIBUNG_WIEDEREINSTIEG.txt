@@ -1,7 +1,7 @@
 SENSORFORGE / ESP32-S3 CAMERA (XIAO + FREENOVE)
 PROJEKTBESCHREIBUNG, RELEASESTAND UND WIEDEREINSTIEGSPROMPT
 Stand: 2026-10-03
-Dokumentrevision: v87 BETA 19 - Roadmap: optionaler WireGuard-Client / boardabhaengiges Remote-Management
+Dokumentrevision: v87 BETA 24 - VPN/WireGuard in WiFi integriert / Benutzeransicht bereinigt
 
 
 ======================================================================
@@ -10,7 +10,7 @@ AKTUELLE RELEASE-TABELLE
 
 Release | Datum      | Status      | Schwerpunkt
 --------|------------|-------------|------------------------------------------------------------
-v87     | 2026-10-03 | BETA 19     | Roadmap: optionaler WireGuard-Client; ESP32-S3 default AUS, Management zuerst; keine Runtime-Aenderung
+v87     | 2026-10-03 | BETA 24     | VPN/WireGuard in WiFi integriert; reduzierte professionelle Benutzeransicht
 v86     | 2026-10-01 | OFFIZIELL   | Rollen/Zugriff, RTSP+HTTP-MJPEG Auth, Home Assistant, WiFi-Fixes
 v85     | 2026-10-01 | OFFIZIELL   | Image-Motion UI/Liveanalyse, Streamer-Frame-Analyse
 v84     | 2026-09-30 | OFFIZIELL   | Netzwerk-Streamer, Multi-WiFi, Kamera-/Preview-Workflow
@@ -19,11 +19,191 @@ v84     | 2026-09-30 | OFFIZIELL   | Netzwerk-Streamer, Multi-WiFi, Kamera-/Prev
 
 
 ======================================================================
+V87 BETA 24 2026-10-03 - VPN/WIREGUARD IN WIFI / BENUTZERANSICHT BEREINIGT
+======================================================================
+
+- SensorForge v87 Beta 24 ist der aktuelle autoritative Beta-, Test- und
+  Wiedereinstiegsstand. v86 bleibt der letzte stabile offizielle Release.
+- Release-ID: `v87-beta24`; Core-Version im Branding bleibt `7.1.0`.
+- WireGuard/VPN bleibt technisch geparkt wie in Beta 23: kein externes Backend,
+  keine Drittanbieter-Patches und keine Build-Abhaengigkeit von WireGuard-ESP32.
+- Die Benutzerfuehrung wurde bewusst produktreif bereinigt:
+    * kein eigener `WireGuard VPN`-Eintrag mehr im Systemmenue
+    * VPN/WireGuard wird direkt in `WiFi Einstellungen` angezeigt
+    * die bisherige separate Status-/Konfigurationsseite wird nicht mehr angeboten
+    * alte `/wireguard`-Bookmarks werden auf `WiFi Einstellungen#vpn` umgeleitet
+    * solange kein qualifiziertes Backend vorhanden ist, zeigt die WebUI nur den
+      klaren Status `Derzeit nicht verfuegbar` und den Hinweis, dass WireGuard/VPN
+      auf diesem Board derzeit nicht verfuegbar ist
+    * Backendnamen, Runtime-/Debugzustand, Tunneladresse, Peer-/Key-Felder und
+      Implementierungsdetails werden Endbenutzern in diesem Zustand nicht gezeigt
+- Die vorbereitete interne Config-/Secret-/API-Struktur bleibt erhalten, damit
+  eine spaetere qualifizierte Standardimplementierung ohne erneuten Datenmodell-
+  Umbau fortgesetzt werden kann. Die aktive WebUI kann die geparkte Funktion
+  derzeit weder aktivieren noch konfigurieren.
+- Kamera-, RTSP-, ONVIF-, Audio-, Recording-, Storage-, WiFi-Runtime- und
+  Firmware-Updatepfade wurden nicht geaendert. Host-API bleibt 1.22.
+
+
+
+======================================================================
+V87 BETA 23 2026-10-03 - KONSISTENTER BUILD / WIREGUARD BACKEND GEPARKT
+======================================================================
+
+- SensorForge v87 Beta 23 ist der historische Bereinigungsstand nach dem
+  WireGuard-Backendversuch und wurde durch Beta 24 als autoritativer Beta-, Test-
+  und Wiedereinstiegsstand abgeloest. v86 bleibt der letzte stabile offizielle Release.
+- Release-ID: `v87-beta23`; Core-Version im Branding bleibt `7.1.0`.
+- Ausgangslage: Der reale Beta-21-Build hat gezeigt, dass die klassische
+  `WireGuard-ESP32` 0.1.5 Library auf Arduino-ESP32 3.3.12 / ESP-IDF 5.5.5
+  wegen `#include "tcpip_adapter.h"` nicht mehr kompilierbar ist. Das ist eine
+  Backend-Inkompatibilitaet, kein Fehler der SensorForge-Konfiguration.
+- Entscheidung: SensorForge patcht keinen fremden Library-Quellcode und fuehrt
+  keine lokale Sonderversion als Produktabhaengigkeit ein. Der fuer Beta 22
+  erwogene Patch-Tool-Weg wurde NICHT in den Feld-Source eingespielt und ist fuer
+  den autoritativen Build verworfen.
+- Bereinigung gegen Beta 21:
+    * XIAO und Freenove behalten `BOARD_WIREGUARD_CAPABLE=1` als Architektur-/
+      Roadmap-Faehigkeit.
+    * `BOARD_WIREGUARD_BACKEND_ARDUINO=0` auf beiden aktuellen Profilen.
+    * Dadurch gibt es KEINE `#include <WireGuard-ESP32.h>`-Abhaengigkeit mehr.
+    * Eine lokal installierte WireGuard-ESP32-0.1.5-Library wird vom Build ignoriert
+      und darf SensorForge nicht mehr am Kompilieren hindern.
+- Die bereits vorbereitete SensorForge-WireGuard-Infrastruktur bleibt erhalten:
+    * additive Config-Keys und WebConfig-Seite
+    * Private Key weiter ueber SFSEC1/Secret-Pfad
+    * API-/Statusfelder und Board-Capability
+    * Client-only / ein Peer als spaeter vorgesehener Scope
+- Solange kein qualifiziertes Backend einkompiliert ist, bleibt die Runtime
+  technisch gesperrt:
+    * WebConfig zeigt `Backend: none (zurueckgestellt)`
+    * Aktivierungs-Checkbox ist deaktiviert
+    * Save-POST erzwingt serverseitig `wireguard_enabled=0`
+    * `/capabilities` meldet effektiv `wireguard_client=false`
+- Fortsetzung erst mit einem gepflegten ESP-NETIF-kompatiblen Standard-/
+  standardnahen Backend. Alternativ erneute Bewertung nach separat qualifizierter
+  Arduino-ESP32-4.x/ESP-IDF-6.x-Migration. Kein Plattformwechsel zusammen mit
+  einem neuen VPN-Backend.
+- Kamera-, RTSP-, ONVIF-, Audio-, Recording-, Storage-, WiFi- und Updatepfade
+  wurden fuer Beta 23 nicht geaendert. Host-API bleibt 1.22.
+
+
+
+
+======================================================================
+V87 BETA 21 2026-10-03 - WIREGUARD BACKEND-LINKAGE-FIX
+======================================================================
+
+- SensorForge v87 Beta 21 ist ein historischer WireGuard-Backend-Linkage-Versuch
+  und durch Beta 23 als autoritativer Wiedereinstiegsstand abgeloest. v86 bleibt
+  der letzte stabile offizielle Release.
+- Release-ID: `v87-beta21`; Core-Version im Branding bleibt `7.1.0`.
+- Beta 20 konnte trotz installierter WireGuard-ESP32-Library im WebConfig
+  `Backend: none` melden. Ursache war kein Installationsfehler, sondern die
+  Build-Erkennung ueber `__has_include(<WireGuard-ESP32.h>)`: Arduino kann diesen
+  Test auswerten, bevor der externe Library-Include-Pfad durch die Dependency-
+  Discovery hinzugefuegt wurde.
+- Beta 21 waehlt deshalb den Arduino-WireGuard-Backendpfad explizit im aktiven
+  Boardprofil. XIAO und Freenove setzen `BOARD_WIREGUARD_BACKEND_ARDUINO=1`;
+  dadurch entsteht eine echte `#include <WireGuard-ESP32.h>`-Abhaengigkeit und
+  der Arduino-Builder kann die installierte Library deterministisch aufloesen.
+- WICHTIG: Das ist nur eine BUILD-Abhaengigkeit. WireGuard bleibt zur Laufzeit
+  optional und standardmaessig AUS. Ohne `wireguard_enabled=1` wird kein Tunnel
+  initialisiert. Kamera-, RTSP-, ONVIF-, Audio-, Recording- und Storagepfade
+  wurden nicht geaendert. Host-API bleibt 1.22.
+- Historische Konsequenz in Beta 21: WireGuard-ESP32 0.1.5 musste installiert
+  sein. Der reale Build scheiterte anschliessend am entfernten `tcpip_adapter.h`.
+  Beta 23 nimmt diese Build-Abhaengigkeit deshalb wieder vollstaendig heraus.
+- Der naechste reale Qualifikationspunkt ist nun absichtlich sichtbar: die
+  klassische WireGuard-ESP32 0.1.5 verwendet intern noch Legacy-`tcpip_adapter`-
+  Code. Falls Arduino-ESP32 3.3.12 beim jetzt tatsaechlich eingebundenen Backend
+  einen Compilefehler meldet, wird nicht wieder umgangen, sondern der Backendpfad
+  gezielt auf eine ESP-NETIF-kompatible Variante angehoben.
+
+
+======================================================================
+V87 BETA 20 2026-10-03 - OPTIONALER WIREGUARD-CLIENT / MANAGEMENT-TUNNELBASIS
+======================================================================
+
+- SensorForge v87 Beta 20 war der erste WireGuard-Runtimestand und ist durch
+  Beta 21 als autoritativer Wiedereinstiegsstand abgeloest. v86 bleibt der letzte
+  stabile offizielle Release.
+- Release-ID: `v87-beta20`; Core-Version im Branding bleibt `7.1.0`.
+- WireGuard ist jetzt als optionaler, bewusst kleiner Client-Transport implementiert:
+    * genau ein Client-Tunnel / ein Peer
+    * kein WireGuard-Server, kein LAN-Router und kein allgemeines VPN-Gateway
+    * auf XIAO und Freenove standardmaessig AUS
+    * alte Configs ohne WireGuard-Keys bleiben funktional unveraendert
+    * nur Infrastruktur-WLAN/STA; lokaler Hotspotbetrieb wird nicht als VPN-Uplink genutzt
+- Additive persistente Keys:
+    * `wireguard_enabled=0|1`
+    * `wireguard_address`
+    * `wireguard_private_key` (SECRET/SFSEC1)
+    * `wireguard_peer_endpoint`
+    * `wireguard_peer_public_key`
+    * `wireguard_peer_port`
+  Der Private Key darf weder in Web/API-GET-Antworten noch Logs/Diagnose ausgegeben
+  werden. Leeres Private-Key-Feld in der WebUI behaelt einen bereits gespeicherten
+  Key bei.
+- Einstellungen werden bewusst erst nach Reboot in die VPN-Runtime uebernommen.
+  Damit kann eine Remote-Sitzung nicht durch partielles Hot-Swapping ihrer eigenen
+  Tunnelparameter abgeschnitten oder in einen gemischten Laufzeitzustand gebracht werden.
+- Runtime-Gates:
+    * Start nur bei verbundenem STA-WLAN mit gueltiger IPv4
+    * Start erst bei gueltiger Systemzeit (WireGuard Handshake-Zeitbasis)
+    * VPN wird vor WiFi-Abschaltung/Streamer-Network-Recovery sauber gestoppt
+    * fehlgeschlagene Starts werden begrenzt wiederholt
+    * neue Start-/DNS-Versuche werden waehrend Recording bzw. aktiven RTSP/HTTP-
+      Streamerclients unterdrueckt, damit der neue Control-Transport keine
+      zeitkritischen Produktpfade stoert
+- `System -> WireGuard VPN` ist eine eigene Administratorseite. Der bestehende
+  Browser-CSRF-Schutz greift auf den Save-POST; Streaming-Benutzer erhalten keinen
+  allgemeinen Konfigurationszugriff.
+- Host-API ist additiv auf `1.22` angehoben. Device/State/Capabilities/Network
+  melden WireGuard-Faehigkeit, Backendstatus und aktiven Zustand, aber niemals den
+  Private Key. Persistente API-Config-Aenderungen laufen weiter ueber die zentrale
+  Config-/Secret-Kette und melden reboot-required.
+- Backendstrategie fuer den aktuellen Arduino-Build:
+    * Firmware bleibt auch ohne externe WireGuard-Bibliothek voll kompilier-/nutzbar;
+      dann meldet die VPN-Seite `backend unavailable` und der Tunnel bleibt aus.
+    * Der erste Arduino-Adapter erkennt `WireGuard-ESP32.h` build-time. Diese klassische
+      Bibliothek ist BSD-3-Clause, stammt aber aus der Arduino-2.x/alten IDF-Aera und
+      muss deshalb auf Arduino-ESP32 3.3.12 / IDF 5.5.5 real gegengeprueft werden.
+    * Fuer den spaeteren Produktionsfreeze ist ein ESP-NETIF-kompatibler, aktuell
+      gepflegter Backendpfad vorzuziehen; kein blinder Vendor-Lock auf eine alte
+      Library.
+- WICHTIG: VPN-Medientransport ist noch NICHT qualifiziert. RTSP/ONVIF/Snapshot
+  verwenden zwar technisch denselben IP-Stack und koennen spaeter durch den Tunnel
+  laufen, aber Freigabe erst nach CPU-/Heap-/Thermal-/Durchsatztests. Kamera-, RTP-,
+  HTTP-MJPEG-, Audio-, Recording- und Storage-Pipelines wurden in Beta 20 nicht
+  umgebaut.
+- Nebenfix: der in Beta 18 hinzugekommene read-only ONVIF-Imaging-Endpunkt wird nun
+  auch in zentralem Access-Control/CSRF konsistent wie Device/Media behandelt. Das
+  beseitigt einen Control-Plane-Interoperabilitaetsfehler ohne Medienpfadaenderung.
+- ESP-IDF-6.x-Strategie: KEIN gleichzeitiger Plattformwechsel. Referenz bleibt
+  Arduino-ESP32 3.3.12 / ESP-IDF 5.5.5. Arduino 4.x/IDF 6.x wird spaeter in einem
+  getrennten Migrationszweig bewertet. Grund: IDF 6 entfernt/aendert mehrere alte
+  FreeRTOS-, Netzwerk-, WiFi- und Peripherie-APIs (u. a. Legacy-I2S), was fuer
+  SensorForge einen breiten Regressionstest erfordert. Erwartete Vorteile sind
+  Plattformpflege, neue SoC-/Treiberfunktionen und teilweise geringerer IRAM-Bedarf;
+  ein automatischer Kamera-/Streamer-Performancegewinn ist dagegen nicht garantiert.
+- Offene Qualifikation fuer WireGuard vor Produktionsfreigabe:
+    * echter Arduino-3.3.12-Build mit gewaehltem Backend
+    * XIAO und Freenove: Start/Handshake, Remote-Web/API, Reboot
+    * falsche Keys, ungueltiger Endpoint, DNS-/Internet-Ausfall
+    * WLAN-Abbruch/Reconnect und Streamer-Network-Recovery
+    * Langzeit Heap/PSRAM/Temperatur
+    * Recording ohne VPN-Regressionswirkung
+    * danach getrennt RTSP/ONVIF/Snapshot ueber VPN unter Last
+
+
+======================================================================
 V87 BETA 19 2026-10-03 - ROADMAP: OPTIONALER WIREGUARD-CLIENT / REMOTE-MANAGEMENT
 ======================================================================
 
-- SensorForge v87 Beta 19 ist der aktuelle autoritative Beta-, Test- und
-  Wiedereinstiegsstand. v86 bleibt der letzte stabile offizielle Release.
+- SensorForge v87 Beta 19 war der WireGuard-Roadmapstand und ist durch Beta 20
+  als autoritativer Wiedereinstiegsstand abgeloest. v86 bleibt der letzte stabile
+  offizielle Release.
 - Release-ID: `v87-beta19`; Core-Version im Branding bleibt `7.1.0`.
 - Beta 19 ist ein reiner Roadmap-/Dokumentationsstand. Gegenueber Beta 18 wird
   KEINE WireGuard-Runtime implementiert und kein bestehender Netzwerk-, Streamer-,

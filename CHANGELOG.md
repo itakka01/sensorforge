@@ -1,3 +1,43 @@
+## v87-beta24 — 2026-10-03
+
+- Moved the user-facing VPN/WireGuard entry into `WiFi Einstellungen`; the separate navigation item and standalone configuration page are no longer exposed. Existing `/wireguard` bookmarks redirect to the VPN section inside WiFi settings.
+- Reworked the parked WireGuard presentation as a compact product-status card with a clear `Derzeit nicht verfügbar` state. Internal backend names, runtime/debug state, tunnel address, peer/key fields and implementation details are intentionally not shown to end users while the feature is unavailable.
+- Removed the WebConfig WireGuard save/configuration form and its POST route from the active UI. The prepared config/secret/API scaffolding remains in the source for later continuation, but the current Web UI cannot enable or edit an unqualified VPN backend.
+- WireGuard remains deliberately parked and no third-party WireGuard library is linked. Camera, RTSP, ONVIF, audio, recording, storage, WiFi runtime and firmware-update behavior are unchanged. Host API remains 1.22.
+
+## v87-beta23 — 2026-10-03
+
+- Restored a consistent, build-independent SensorForge reference state after the Beta-21 WireGuard backend experiment exposed that `WireGuard-ESP32` 0.1.5 still depends on removed `tcpip_adapter` APIs under Arduino-ESP32 3.3.12 / ESP-IDF 5.5.5.
+- Current XIAO and Freenove profiles deliberately set `BOARD_WIREGUARD_BACKEND_ARDUINO=0`. The installed legacy Arduino library is therefore not included or linked and cannot break the SensorForge build.
+- WireGuard architecture/configuration/UI/API scaffolding is retained for later continuation: board capability, single-peer settings, SFSEC1 private-key persistence, runtime status fields and the management page remain in the source.
+- Runtime activation is intentionally parked until a maintained ESP-NETIF-compatible backend is selected and qualified. The WebConfig activation control is disabled when no backend is present, and server-side save handling also forces `wireguard_enabled=0` so a forged/stale POST cannot activate an unavailable backend.
+- WebConfig now reports the backend as deliberately deferred rather than incorrectly suggesting that the user merely forgot to install a library. API capability continues to report `wireguard_client=false` while backend availability is false.
+- The local patch-tool approach considered for Beta 22 is explicitly rejected for the authoritative source line. Beta 22 was not applied to the field source and no third-party library source patch is required by Beta 23.
+- Future WireGuard work should resume only with a maintained standard/standard-near ESP-NETIF backend (or after the separately qualified Arduino-ESP32 4.x / ESP-IDF 6.x migration). The current Arduino-ESP32 3.3.12 / ESP-IDF 5.5.5 reference stack remains unchanged.
+- No camera, RTSP, ONVIF, audio, recording, storage, WiFi or firmware-update runtime path was changed. Host API remains 1.22.
+
+## v87-beta21 — 2026-10-03
+
+- Fixed WireGuard backend discovery with Arduino builds. Beta 20 used `__has_include(<WireGuard-ESP32.h>)`; Arduino library dependency discovery can evaluate that before the external library include path has been added, leaving a successfully compiled firmware reporting `Backend: none` even when WireGuard-ESP32 0.1.5 is installed.
+- Current XIAO and Freenove board profiles now explicitly select the `WireGuard-ESP32` Arduino backend. This creates a real `#include <WireGuard-ESP32.h>` dependency so the Arduino builder can resolve and link the installed library deterministically.
+- WireGuard remains optional at runtime and still defaults to OFF. No tunnel is created unless the existing `wireguard_enabled` configuration is explicitly enabled and all runtime gates pass.
+- For the current XIAO/Freenove profiles, WireGuard-ESP32 is therefore a build dependency when using the Beta-21 source. A future board/backend profile may set `BOARD_WIREGUARD_BACKEND_ARDUINO=0` to omit it.
+- No WireGuard handshake/routing logic, WebConfig config semantics, camera, RTSP, ONVIF, audio, recording or storage path was changed. Host API remains 1.22.
+- This change intentionally exposes the real compatibility test next: the classic WireGuard-ESP32 0.1.5 backend still contains legacy `tcpip_adapter` usage, so Arduino-ESP32 3.3.12 may now reveal a backend compile incompatibility that Beta 20 had hidden by not linking the library. If so, the next fix must address the backend itself rather than masking it again.
+
+## v87-beta20 — 2026-10-03
+
+- Implemented the first deliberately conservative SensorForge WireGuard client foundation. It is optional, single-peer/client-only and defaults to OFF on the current XIAO and Freenove ESP32-S3 profiles; old configurations therefore retain their previous behavior.
+- Added additive persistent configuration for tunnel address, private key, peer endpoint/public key and peer port. The private key is handled by the existing SensorForge secret/SFSEC1 persistence path and is never rendered back into the Web UI, GET APIs or logs.
+- Added a dedicated administrator-only `System -> WireGuard VPN` page. Changes are persist/reboot-applied rather than hot-swapping a live management tunnel underneath an active session.
+- The runtime VPN adapter starts only after infrastructure STA WiFi is connected and SensorForge has valid system time. It is stopped before WiFi teardown/recovery, and retry attempts are suppressed while recording or active streamer clients own latency-sensitive paths.
+- The source remains buildable with WireGuard disabled when no external backend library is present. The initial Arduino backend adapter is detected at build time through `WireGuard-ESP32.h`; absent backend means `backend unavailable`, not a firmware failure. Because the classic Arduino library predates Arduino-ESP32 3.x/ESP-IDF 5.x, real 3.3.12 compatibility must be hardware/build-qualified before production use; an ESP-NETIF-compatible maintained backend remains preferred for the later production freeze.
+- Host API is additively raised to 1.22. Device/state/capability/network telemetry reports the configured/active/backend state without exposing the private key. Generic API config writes use the same canonical config/secret path and remain reboot-applied.
+- Added board capability gates. Current XIAO/Freenove profiles are allowed to test WireGuard but runtime default remains OFF. RTSP/ONVIF/snapshot traffic through the tunnel is not yet qualified and no media/encoder pipeline was modified.
+- Fixed the Beta-18 read-only ONVIF Imaging endpoint integration in the common access-control/CSRF middleware: `/onvif/imaging_service` is now treated consistently with the existing Device/Media SOAP endpoints instead of being rejected as a browser POST.
+- ESP-IDF 6.x is intentionally NOT part of this change. SensorForge remains on the current Arduino-ESP32 3.3.12 / ESP-IDF 5.5.5 reference stack; a later Arduino-4/IDF-6 migration must be a separate branch/release with full camera, SD, I2S/audio, WiFi, sleep, OTA and streamer regression testing.
+- Validation in this workspace is limited to static/source-level checks and isolated adapter syntax tests. A real Arduino-ESP32 3.3.12 build plus XIAO/Freenove tunnel, reconnect, heap/thermal and failure-path tests are mandatory before calling WireGuard production-qualified.
+
 ## v87-beta19 — 2026-10-03
 
 - Documentation-only roadmap checkpoint; runtime source behavior remains unchanged from v87-beta18.

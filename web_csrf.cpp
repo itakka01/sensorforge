@@ -92,7 +92,11 @@ bool webCsrfRequestRequiresProtection(
     // ONVIF uses machine-to-machine SOAP POSTs and HTTP Digest auth, not
     // browser forms. Applying the per-boot browser CSRF token would break NVR
     // clients without adding meaningful protection.
-    if (uri == "/onvif/device_service" || uri == "/onvif/media_service")
+    if (
+        uri == "/onvif/device_service" ||
+        uri == "/onvif/media_service" ||
+        uri == "/onvif/imaging_service"
+    )
         return false;
 
     return true;

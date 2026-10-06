@@ -106,7 +106,8 @@ static bool streamReadOnlyPath(const String &uri)
     // SOAP reads, but SensorForge exposes no mutating ONVIF operations.
     if (
         uri == "/onvif/device_service" ||
-        uri == "/onvif/media_service"
+        uri == "/onvif/media_service" ||
+        uri == "/onvif/imaging_service"
     ) {
         return true;
     }
@@ -192,7 +193,11 @@ bool accessControlWebRequestAllowed(
     }
 
     if (method == HTTP_POST) {
-        if (uri == "/onvif/device_service" || uri == "/onvif/media_service")
+        if (
+            uri == "/onvif/device_service" ||
+            uri == "/onvif/media_service" ||
+            uri == "/onvif/imaging_service"
+        )
             return true;
 
         if (uri == "/player_annotation")

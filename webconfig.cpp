@@ -12612,6 +12612,14 @@ static void handleWifiSettingsSave()
 }
 
 
+static void handleWireGuardLegacyRedirect()
+{
+    // Keep old bookmarks functional after moving VPN/WireGuard into WiFi settings.
+    server.sendHeader("Location", "/wifi_settings#vpn");
+    server.send(303, "text/plain; charset=utf-8", "");
+}
+
+
 static void appendSystemOverviewSections(
     String &html,
     const WebPsramQuickTestResult &psramTest
@@ -19286,7 +19294,8 @@ void webConfigStart()
 
             const bool onvifRequest =
                 requestServer.uri() == "/onvif/device_service" ||
-                requestServer.uri() == "/onvif/media_service";
+                requestServer.uri() == "/onvif/media_service" ||
+                requestServer.uri() == "/onvif/imaging_service";
 
             // ONVIF owns authentication inside its SOAP handlers. Some Device
             // operations are PRE_AUTH by specification, while authenticated
@@ -19373,6 +19382,7 @@ void webConfigStart()
         server.on("/wifi_settings", HTTP_GET, handleWifiSettingsPage);
         server.on("/wifi_scan", HTTP_GET, handleWifiScan);
         server.on("/wifi_settings_save", HTTP_POST, handleWifiSettingsSave);
+        server.on("/wireguard", HTTP_GET, handleWireGuardLegacyRedirect);
         server.on("/access_settings", HTTP_GET, handleAccessSettingsPage);
         server.on("/access_settings_save", HTTP_POST, handleAccessSettingsSave);
         server.on("/streamer", HTTP_GET, handleStreamerPage);

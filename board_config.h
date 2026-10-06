@@ -49,6 +49,14 @@ static constexpr int16_t SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10 = 85;
 // ONVIF/RTSP codec; the streamer must also implement and qualify that codec.
 #define BOARD_VIDEO_H264_CAPABLE 0
 
+// Optional encrypted management tunnel capability. Runtime default remains OFF.
+#define BOARD_WIREGUARD_CAPABLE 1
+// WireGuard is architecturally allowed on this board, but no production-qualified
+// backend is selected on the current Arduino-ESP32 3.3.12 / ESP-IDF 5.5.5
+// reference stack. The legacy WireGuard-ESP32 0.1.5 backend still depends on
+// removed tcpip_adapter APIs and is intentionally NOT linked.
+#define BOARD_WIREGUARD_BACKEND_ARDUINO 0
+
 #include <SD_MMC.h>
 
 #define STORAGE SD_MMC
@@ -145,6 +153,14 @@ static constexpr int16_t BOARD_WIFI_TX_POWER_DEFAULT_X10 = 200;
 // Video-codec hardware capability only. This does NOT by itself enable an
 // ONVIF/RTSP codec; the streamer must also implement and qualify that codec.
 #define BOARD_VIDEO_H264_CAPABLE 0
+
+// Optional encrypted management tunnel capability. Runtime default remains OFF.
+#define BOARD_WIREGUARD_CAPABLE 1
+// WireGuard is architecturally allowed on this board, but no production-qualified
+// backend is selected on the current Arduino-ESP32 3.3.12 / ESP-IDF 5.5.5
+// reference stack. The legacy WireGuard-ESP32 0.1.5 backend still depends on
+// removed tcpip_adapter APIs and is intentionally NOT linked.
+#define BOARD_WIREGUARD_BACKEND_ARDUINO 0
 
 #include <SPI.h>
 #include <SD.h>
