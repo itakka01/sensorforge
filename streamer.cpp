@@ -6,6 +6,8 @@
 #include "access_control.h"
 #include "logger.h"
 #include "thermal.h"
+#include "license_usage.h"
+#include "license_policy.h"
 
 #include <WebServer.h>
 #include <esp_camera.h>
@@ -1280,6 +1282,16 @@ static void handleRtspRequest(uint8_t slotIndex, const String &request)
     }
 
     if (method == "PLAY") {
+        if (!licensePolicyStreamingAllowed()) {
+            logWrite(
+                "RTSP PLAY rejected | client=" +
+                String((unsigned)slotIndex + 1U) +
+                " | reason=DEMO streaming limit"
+            );
+            rtspReply(slot, 403, "Forbidden", cseq);
+            return;
+        }
+
         if (!slot.videoSetup) {
             rtspReply(slot, 455, "Method Not Valid in This State", cseq);
             return;
@@ -2257,6 +2269,19 @@ static void serviceHttpControl()
                     break;
                 }
 
+                if (!licensePolicyStreamingAllowed()) {
+                    writeText(slot.client,
+                        "HTTP/1.1 403 Forbidden\r\n"
+                        "Connection: close\r\n"
+                        "Content-Type: text/plain; charset=utf-8\r\n\r\n"
+                        "SensorForge DEMO: daily streaming limit reached.\n");
+                    logWrite(
+                        "HTTP-MJPEG stream rejected | reason=DEMO streaming limit"
+                    );
+                    closeHttpClientSlot(i);
+                    break;
+                }
+
                 if (!beginHttpStream(slot.client)) {
                     closeHttpClientSlot(i);
                     break;
@@ -2556,6 +2581,38 @@ void streamerLoop()
     serviceStreamerHealth();
     serviceStreamerStress();
 
+    // License/trial usage counts wall-clock time only while at least one real
+    // RTSP or HTTP-MJPEG consumer is active. This is a cheap state transition
+    // check; no per-frame accounting or NVS write happens here.
+    licenseUsageStreamingSetActive(anyActiveStreamClient());
+
+    // DEMO streaming is checked only every 10 seconds. A few seconds of
+    // overrun are intentionally accepted to keep policy work out of the frame
+    // fan-out path. TRIAL/FULL/SERVICE remain unrestricted.
+    {
+        static uint32_t lastLicenseStreamCheckMs = 0;
+        const uint32_t nowMs = millis();
+
+        if (
+            anyActiveStreamClient() &&
+            (
+                lastLicenseStreamCheckMs == 0 ||
+                (uint32_t)(nowMs - lastLicenseStreamCheckMs) >= 10000UL
+            )
+        ) {
+            lastLicenseStreamCheckMs = nowMs;
+
+            if (!licensePolicyStreamingAllowed()) {
+                logWrite(
+                    "STREAMER clients closed | DEMO daily streaming time reached"
+                );
+                closeAllRtspClients();
+                closeAllHttpClients();
+                licenseUsageStreamingSetActive(false);
+            }
+        }
+    }
+
     for (uint8_t i = 0; i < HTTP_CLIENT_SLOTS; ++i) {
         if (httpClients[i].client && !httpClients[i].client.connected())
             closeHttpClientSlot(i);
@@ -2609,6 +2666,11 @@ void streamerNoteNetworkRecoveryResult(bool success, const String &error)
 
 void streamerStop()
 {
+    // Close the streaming-usage interval before tearing clients down. The
+    // accumulated seconds stay in RTC-retained RAM and are persisted only by
+    // the coarse usage checkpoint logic.
+    licenseUsageStreamingSetActive(false);
+
     if (stressState.mode != StreamerStressMode::None)
         finishStreamerStress("streamer_stop");
     onvifStop();

@@ -1,9 +1,9 @@
 #pragma once
 
-// SensorForge license verification public key.
-// DEVELOPMENT/TEST KEY: replace this public key with a key generated offline
-// before the first commercial production release. Do not use the matching
-// private development key as the long-term production signing master.
+// SensorForge LEGACY SF1 license verification public key.
+// DEVELOPMENT/TEST KEY. SF2 uses license_keyring.h. This key remains only for
+// beta/migration compatibility and must be disabled for the commercial build
+// by SENSORFORGE_LICENSE_ACCEPT_LEGACY_SF1=0 in license_keyring.h.
 // Algorithm: ECDSA P-256 / SHA-256
 // Public-key SHA-256 fingerprint (DER):
 // 9a54183dba1cec60e09b59d274c5491a113d99926ed33050081495e25961b20e

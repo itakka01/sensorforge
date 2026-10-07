@@ -43,6 +43,9 @@
 #include "thermal.h"
 #include "sync_api.h"
 #include "license.h"
+#include "license_usage.h"
+#include "license_trial.h"
+#include "license_policy.h"
 #include "recording_crypto.h"
 #include "recording_storage.h"
 #include "audio_capture.h"
@@ -2616,6 +2619,11 @@ void wifiSyncTime() {
                     );
                 }
             }
+
+            // Successful NTP synchronization is an authoritative time anchor
+            // for local trial accounting and calendar expiry.
+            licenseUsageObserveTrustedTimeNow();
+            licenseTrialObserveTrustedTimeNow();
 
         } else {
 
@@ -8284,6 +8292,21 @@ bool startRecording() {
     if (streamerModeEnabled())
         return false;
 
+    // Commercial gate: factory/default devices start in a full TRIAL. After
+    // the local trial is consumed, DEMO allows only the configured daily
+    // recording quota. This check is intentionally before camera/SD work.
+    if (!licensePolicyRecordingStartAllowed()) {
+        consoleWrite(
+            "LICENSE",
+            "DEMO recording limit reached"
+        );
+        logWrite(
+            "LICENSE | recording start blocked | mode=" +
+            String(licenseProductModeName())
+        );
+        return false;
+    }
+
     const bool cameraInitializedAtEntry =
         cameraInitialized;
 
@@ -8660,6 +8683,10 @@ bool startRecording() {
 
     recording = true;
 
+    // Usage accounting starts only after recorderStart() succeeded. This hook
+    // is RAM-only and performs no flash/NVS write on the first-frame path.
+    licenseUsageRecordingStarted();
+
     // Consume the one-shot physical event only after the recorder has opened
     // successfully. A transient start failure may therefore retry.
     motionDiagnosticsConsumePresenceStartTrigger();
@@ -8726,6 +8753,12 @@ static bool rotateRecordingSegment(const String &reason)
             "segment_finalization_failed"
         );
 
+        if (!licenseUsageRecordingStopped()) {
+            logWrite(
+                "LICENSE USAGE | failed to persist interrupted recording counters"
+            );
+        }
+
         recording = false;
 
         if (cfg_led_enabled)
@@ -8741,6 +8774,15 @@ static bool rotateRecordingSegment(const String &reason)
         return false;
     }
 
+
+    // The container is fully finalized here, so this is a safe point to
+    // checkpoint cumulative trial/usage seconds without touching the per-frame
+    // recording path. Segment rotation does not increment recordingsTotal.
+    if (!licenseUsageRecordingCheckpoint()) {
+        logWrite(
+            "LICENSE USAGE | segment checkpoint persistence failed"
+        );
+    }
 
     recordingPerformanceLogSummary(
         "segment",
@@ -8768,6 +8810,12 @@ static bool rotateRecordingSegment(const String &reason)
         recordingThermalFinish(
             "segment_storage_blocked"
         );
+
+        if (!licenseUsageRecordingStopped()) {
+            logWrite(
+                "LICENSE USAGE | failed to persist recording counters after storage block"
+            );
+        }
 
         recording = false;
 
@@ -8816,6 +8864,12 @@ static bool rotateRecordingSegment(const String &reason)
         recordingThermalFinish(
             "next_segment_open_failed"
         );
+
+        if (!licenseUsageRecordingStopped()) {
+            logWrite(
+                "LICENSE USAGE | failed to persist recording counters after segment-open failure"
+            );
+        }
 
         recording = false;
 
@@ -8942,6 +8996,15 @@ void stopRecording() {
         ? "finalized"
         : "finalization_failed"
     );
+
+    // Persist one event count plus its cumulative monotonic duration only after
+    // the recorder has been finalized. A persistence error is diagnostic only
+    // in this first counter-only stage and never changes recorder behavior.
+    if (!licenseUsageRecordingStopped()) {
+        logWrite(
+            "LICENSE USAGE | recording counter persistence failed"
+        );
+    }
 
     // Camera lifetime policy:
     // - sleep_mode=off means the unit is intentionally kept awake, so retain
@@ -15414,11 +15477,13 @@ void setup() {
     //
     // Config loading mounts/recoveres the internal LittleFS shadow first.
     // License state is therefore available before any normal product
-    // functionality starts. V1 observes the license state but does not yet
-    // apply product restrictions.
+    // functionality starts. The local TRIAL/DEMO policy is initialized immediately
+    // afterwards; purchased FULL/SERVICE licenses override it.
     // ---------------------------------------------------------
 
     licenseBegin();
+    licenseUsageBegin();
+    licenseTrialBegin();
 
 
     // ---------------------------------------------------------
@@ -15481,6 +15546,13 @@ void setup() {
     // ---------------------------------------------------------
 
     rtcBegin();
+
+    // Usage accounting may retain the newest trustworthy wall-clock anchor.
+    // The helper uses non-blocking time(nullptr) and simply ignores an invalid
+    // clock, so no extra wait is added to offline/wake-critical boots.
+    // The observed RTC time also anchors/advances the local 14-day trial window.
+    licenseUsageObserveTrustedTimeNow();
+    licenseTrialObserveTrustedTimeNow();
 
     {
         time_t armDeadlineEpoch = 0;
@@ -15552,7 +15624,14 @@ void setup() {
             " | hardware_id=" +
             licenseHardwareId() +
             " | edition=" +
-            String(licenseEditionName())
+            String(licenseEditionName()) +
+            " | mode=" +
+            String(licenseProductModeName())
+        );
+
+        logWrite(
+            "LICENSE TRIAL | " +
+            licenseTrialDiagnosticSummary()
         );
 
         logTrackedNormalDeepSleepWake(
@@ -15659,6 +15738,13 @@ void setup() {
     maybeSyncTime(
         wifiAtSystemStart
     );
+
+    if (sdReady) {
+        logWrite(
+            "LICENSE USAGE | " +
+            licenseUsageDiagnosticSummary()
+        );
+    }
 
 
     // If the SD update happened before the clock was valid, use the first
@@ -16066,6 +16152,11 @@ static void serviceStreamerNetworkRecovery()
 void loop() {
 
     feedWatchdog();
+
+    // Extremely light usage bookkeeping: active uptime is accumulated in
+    // RTC-retained RAM and only reaches NVS after long intervals or together
+    // with an already required usage write. No license restriction is applied.
+    licenseUsagePeriodic();
 
     // A cold boot that survives the configured stabilization period is marked
     // healthy in NVS. This is intentionally tiny/non-blocking after arming.
@@ -16631,6 +16722,39 @@ void loop() {
 
         lastMotionMs =
             millis();
+    }
+
+
+    // ---------------------------------------------------------
+    // Commercial DEMO time limit.
+    //
+    // Check only every 10 seconds. Exact-to-the-second metering is not a
+    // product goal; keeping this out of the frame path is more important. A
+    // few seconds of overrun are therefore intentionally accepted.
+    // ---------------------------------------------------------
+
+    {
+        static uint32_t lastLicenseRecordingCheckMs = 0;
+        const uint32_t nowMs = millis();
+
+        if (
+            lastLicenseRecordingCheckMs == 0 ||
+            (uint32_t)(nowMs - lastLicenseRecordingCheckMs) >= 10000UL
+        ) {
+            lastLicenseRecordingCheckMs = nowMs;
+
+            if (!licensePolicyRecordingContinueAllowed()) {
+                consoleWrite(
+                    "LICENSE",
+                    "DEMO daily recording time reached"
+                );
+                logWrite(
+                    "LICENSE | recording stopped | DEMO daily recording time reached"
+                );
+                stopRecording();
+                return;
+            }
+        }
     }
 
 

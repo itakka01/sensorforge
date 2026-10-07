@@ -21,13 +21,13 @@
 // WebConfig, so a running device can be mapped back to the exact Git tag.
 
 #define SENSORFORGE_RELEASE_NUMBER 87
-#define SENSORFORGE_RELEASE_TAG "v87-beta24"
-#define SENSORFORGE_RELEASE_DATE "2026-10-03"
+#define SENSORFORGE_RELEASE_TAG "v87-beta30"
+#define SENSORFORGE_RELEASE_DATE "2026-10-06"
 #define SENSORFORGE_RELEASE_SUMMARY \
-    "Beta 24: integrate the parked VPN/WireGuard status into WiFi settings and simplify the user-facing presentation."
+    "Beta 30: SF2 role-separated license keyring with offline FULL/recovery trust."
 
-// Current source-tree stage. v87 Beta 24 keeps WireGuard parked and presents VPN status inside WiFi settings.
-#define SENSORFORGE_WORKTREE_STAGE "v87-beta24"
-#define SENSORFORGE_WORKTREE_DATE "2026-10-03"
+// Current source-tree stage. v87 Beta 30 adds SF2 issuer roles and production key-rotation infrastructure.
+#define SENSORFORGE_WORKTREE_STAGE "v87-beta30"
+#define SENSORFORGE_WORKTREE_DATE "2026-10-06"
 #define SENSORFORGE_WORKTREE_SUMMARY \
-    "v87 Beta 24: VPN/WireGuard moved into WiFi settings with a concise professional unavailable-state UI; runtime remains parked."
+    "v87 Beta 30: SF2 issuer key IDs/capabilities; online key can be trial-only, FULL/recovery keys stay offline; SF1 beta compatibility retained."

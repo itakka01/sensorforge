@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-"""Generate board-bound SensorForge SF1 activation codes.
+"""Generate board-bound SensorForge activation codes.
 
-Keep the private key offline. This tool is intentionally separate from the
-firmware project and never needs to be deployed to a SensorForge device.
+SF2 is the production-oriented format. It carries an issuer key ID so firmware
+can enforce key roles (for example, a web-server key may issue EVALUATION only,
+while FULL/SERVICE require a separate offline authority key).
+
+Keep private keys outside the firmware/source repository. For commercial use,
+FULL/SERVICE private keys should remain offline or inside a non-exportable
+HSM/KMS. The web application should not have direct access to them.
 """
 
 from __future__ import annotations
@@ -17,8 +22,10 @@ import uuid
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
-MAGIC = b"SFL1"
-FORMAT_VERSION = 1
+MAGIC_SF1 = b"SFL1"
+MAGIC_SF2 = b"SFL2"
+FORMAT_VERSION_SF1 = 1
+FORMAT_VERSION_SF2 = 2
 PRODUCT_SENSORFORGE = 1
 PAYLOAD_STRUCT = struct.Struct("<4sBBBBIII16s16s")
 
@@ -67,11 +74,30 @@ def parse_date(value: str) -> dt.date:
         raise argparse.ArgumentTypeError("date must be YYYY-MM-DD") from exc
 
 
+def load_p256_private_key(path: pathlib.Path) -> ec.EllipticCurvePrivateKey:
+    private_key = serialization.load_pem_private_key(path.read_bytes(), password=None)
+    if not isinstance(private_key, ec.EllipticCurvePrivateKey):
+        raise SystemExit("private key is not an EC key")
+    if private_key.curve.name not in {"secp256r1", "prime256v1"}:
+        raise SystemExit("private key must use P-256 / secp256r1")
+    return private_key
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate a SensorForge board activation code")
     parser.add_argument("hardware_id", help="SensorForge hardware ID shown by the device")
     parser.add_argument("--private-key", required=True, type=pathlib.Path)
     parser.add_argument("--edition", choices=sorted(EDITION), default="full")
+    parser.add_argument(
+        "--key-id",
+        type=int,
+        help="SF2 issuer key ID (1..255); must match license_keyring.h",
+    )
+    parser.add_argument(
+        "--legacy-sf1",
+        action="store_true",
+        help="generate legacy SF1 instead of SF2 (development/migration only)",
+    )
     parser.add_argument(
         "--features",
         nargs="+",
@@ -92,6 +118,21 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if args.legacy_sf1:
+        if args.key_id is not None:
+            parser.error("--key-id must not be used with --legacy-sf1")
+        magic = MAGIC_SF1
+        format_version = FORMAT_VERSION_SF1
+        issuer_key_id = 0
+        code_prefix = "SF1"
+    else:
+        if args.key_id is None or not 1 <= args.key_id <= 255:
+            parser.error("SF2 requires --key-id in range 1..255")
+        magic = MAGIC_SF2
+        format_version = FORMAT_VERSION_SF2
+        issuer_key_id = args.key_id
+        code_prefix = "SF2"
+
     hardware_id = decode_hardware_id(args.hardware_id)
     license_uuid = args.license_id or uuid.uuid4()
 
@@ -105,11 +146,11 @@ def main() -> int:
         parser.error("--expires must not be earlier than --issued")
 
     payload = PAYLOAD_STRUCT.pack(
-        MAGIC,
-        FORMAT_VERSION,
+        magic,
+        format_version,
         PRODUCT_SENSORFORGE,
         EDITION[args.edition],
-        0,
+        issuer_key_id,
         features,
         issued_days,
         expires_days,
@@ -118,23 +159,17 @@ def main() -> int:
     )
     assert len(payload) == 52
 
-    private_key = serialization.load_pem_private_key(
-        args.private_key.read_bytes(),
-        password=None,
-    )
-    if not isinstance(private_key, ec.EllipticCurvePrivateKey):
-        raise SystemExit("private key is not an EC key")
-    if private_key.curve.name not in {"secp256r1", "prime256v1"}:
-        raise SystemExit("private key must use P-256 / secp256r1")
-
+    private_key = load_p256_private_key(args.private_key)
     signature = private_key.sign(payload, ec.ECDSA(hashes.SHA256()))
 
     payload_code = base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
     signature_code = base64.urlsafe_b64encode(signature).rstrip(b"=").decode("ascii")
-    activation_code = f"SF1:{payload_code}.{signature_code}"
+    activation_code = f"{code_prefix}:{payload_code}.{signature_code}"
 
     print("SensorForge Activation Code")
     print()
+    print(f"format={code_prefix}")
+    print(f"issuer_key_id={issuer_key_id if issuer_key_id else 'legacy'}")
     print(f"hardware_id={args.hardware_id.upper()}")
     print(f"license_id={license_uuid}")
     print(f"edition={args.edition.upper()}")
@@ -148,4 +183,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

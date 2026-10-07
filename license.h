@@ -53,10 +53,12 @@ bool licenseFeatureEnabled(uint32_t featureMask);
 String licenseHardwareId();
 
 String licenseId();
+String licenseCodeFormatName();
+uint8_t licenseIssuerKeyId();
 String licenseIssuedDateText();
 String licenseExpiryDateText();
 
-// Validate an SF1 activation code and atomically store it in internal LittleFS.
+// Validate an SF1/SF2 activation code and atomically store it in internal LittleFS.
 // Only a code that is cryptographically valid for this board is accepted.
 // No reboot is required.
 bool licenseInstallCode(

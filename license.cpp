@@ -1,5 +1,6 @@
 #include "license.h"
 #include "license_public_key.h"
+#include "license_keyring.h"
 
 #include <FS.h>
 #include <LittleFS.h>
@@ -18,13 +19,16 @@ static const char *LICENSE_TMP_PATH = "/license.tmp";
 static const char *LICENSE_BAK_PATH = "/license.bak";
 static const size_t LICENSE_MAX_CODE_BYTES = 512U;
 static const size_t LICENSE_PAYLOAD_BYTES = 52U;
-static const uint8_t LICENSE_FORMAT_VERSION = 1U;
+static const uint8_t LICENSE_FORMAT_VERSION_SF1 = 1U;
+static const uint8_t LICENSE_FORMAT_VERSION_SF2 = 2U;
 static const uint8_t LICENSE_PRODUCT_SENSORFORGE = 1U;
 
 struct LicenseData {
+    uint8_t codeFormat;
     uint8_t formatVersion;
     uint8_t productId;
     LicenseEdition edition;
+    uint8_t issuerKeyId;
     uint32_t featureFlags;
     uint32_t issuedDays;
     uint32_t expiresDays;
@@ -258,6 +262,7 @@ static bool decodeBase64Url(
 
 static bool parseActivationCode(
     const String &input,
+    uint8_t &codeFormat,
     String &payloadText,
     String &signatureText,
     String &error
@@ -266,14 +271,22 @@ static bool parseActivationCode(
     String code = input;
     code.trim();
 
-    if (!code.startsWith("SF1:")) {
+    size_t prefixLength = 0;
+
+    if (code.startsWith("SF2:")) {
+        codeFormat = 2U;
+        prefixLength = 4U;
+    } else if (code.startsWith("SF1:")) {
+        codeFormat = 1U;
+        prefixLength = 4U;
+    } else {
         error =
-            "activation code must start with SF1:";
+            "activation code must start with SF2: or SF1:";
         return false;
     }
 
     String body =
-        code.substring(4);
+        code.substring(prefixLength);
 
     int separator =
         body.indexOf('.');
@@ -309,8 +322,8 @@ static bool parseActivationCode(
     return true;
 }
 
-
 static bool parsePayload(
+    uint8_t codeFormat,
     const uint8_t *payload,
     size_t payloadLength,
     LicenseData &data,
@@ -326,26 +339,41 @@ static bool parsePayload(
         return false;
     }
 
+    const bool sf1 = codeFormat == 1U;
+    const bool sf2 = codeFormat == 2U;
+
+    if (!sf1 && !sf2) {
+        status =
+            LICENSE_STATUS_UNSUPPORTED_VERSION;
+        error =
+            "unsupported activation code format";
+        return false;
+    }
+
+    const char expectedLastMagic = sf2 ? '2' : '1';
+
     if (
         payload[0] != 'S' ||
         payload[1] != 'F' ||
         payload[2] != 'L' ||
-        payload[3] != '1'
+        payload[3] != expectedLastMagic
     ) {
         status =
             LICENSE_STATUS_INVALID_FORMAT;
         error =
-            "invalid license payload magic";
+            "activation code prefix/payload format mismatch";
         return false;
     }
 
-    data.formatVersion =
-        payload[4];
+    data.codeFormat = codeFormat;
+    data.formatVersion = payload[4];
 
-    if (
-        data.formatVersion !=
-        LICENSE_FORMAT_VERSION
-    ) {
+    const uint8_t expectedVersion =
+        sf2
+        ? LICENSE_FORMAT_VERSION_SF2
+        : LICENSE_FORMAT_VERSION_SF1;
+
+    if (data.formatVersion != expectedVersion) {
         status =
             LICENSE_STATUS_UNSUPPORTED_VERSION;
         error =
@@ -371,16 +399,28 @@ static bool parsePayload(
         return false;
     }
 
-    if (payload[7] != 0) {
-        status =
-            LICENSE_STATUS_INVALID_FORMAT;
-        error =
-            "reserved license payload byte is not zero";
-        return false;
-    }
-
     data.edition =
         (LicenseEdition)editionValue;
+
+    if (sf1) {
+        if (payload[7] != 0) {
+            status =
+                LICENSE_STATUS_INVALID_FORMAT;
+            error =
+                "reserved SF1 payload byte is not zero";
+            return false;
+        }
+        data.issuerKeyId = 0U;
+    } else {
+        data.issuerKeyId = payload[7];
+        if (data.issuerKeyId == 0U) {
+            status =
+                LICENSE_STATUS_INVALID_FORMAT;
+            error =
+                "SF2 issuer key id must not be zero";
+            return false;
+        }
+    }
 
     data.featureFlags =
         readU32LE(payload + 8);
@@ -406,13 +446,17 @@ static bool parsePayload(
     return true;
 }
 
-static bool verifySignature(
+static bool verifySignatureWithPem(
+    const char *publicKeyPem,
     const uint8_t *payload,
     size_t payloadLength,
     const uint8_t *signature,
     size_t signatureLength
 )
 {
+    if (!publicKeyPem || !publicKeyPem[0])
+        return false;
+
     uint8_t digest[32] = {};
 
     if (!computeSha256(
@@ -429,11 +473,8 @@ static bool verifySignature(
     int parseResult =
         mbedtls_pk_parse_public_key(
             &publicKey,
-            (const unsigned char *)
-                SENSORFORGE_LICENSE_PUBLIC_KEY_PEM,
-            strlen(
-                SENSORFORGE_LICENSE_PUBLIC_KEY_PEM
-            ) + 1
+            (const unsigned char *)publicKeyPem,
+            strlen(publicKeyPem) + 1
         );
 
     if (parseResult != 0) {
@@ -454,6 +495,107 @@ static bool verifySignature(
     mbedtls_pk_free(&publicKey);
 
     return verifyResult == 0;
+}
+
+static const SensorForgeLicenseKeyEntry *findIssuerKey(uint8_t keyId)
+{
+    for (size_t i = 0; i < SENSORFORGE_LICENSE_KEYRING_COUNT; ++i) {
+        const SensorForgeLicenseKeyEntry &entry =
+            SENSORFORGE_LICENSE_KEYRING[i];
+
+        if (entry.keyId == keyId)
+            return &entry;
+    }
+
+    return nullptr;
+}
+
+static uint8_t editionCapability(LicenseEdition edition)
+{
+    switch (edition) {
+        case LICENSE_EDITION_EVALUATION:
+            return SENSORFORGE_LICENSE_KEY_CAP_EVALUATION;
+        case LICENSE_EDITION_FULL:
+            return SENSORFORGE_LICENSE_KEY_CAP_FULL;
+        case LICENSE_EDITION_SERVICE:
+            return SENSORFORGE_LICENSE_KEY_CAP_SERVICE;
+        case LICENSE_EDITION_UNLICENSED:
+        default:
+            return 0U;
+    }
+}
+
+static bool verifyLicenseTrust(
+    const LicenseData &data,
+    const uint8_t *payload,
+    size_t payloadLength,
+    const uint8_t *signature,
+    size_t signatureLength,
+    LicenseStatus &status,
+    String &error
+)
+{
+    if (data.codeFormat == 1U) {
+#if SENSORFORGE_LICENSE_ACCEPT_LEGACY_SF1
+        if (!verifySignatureWithPem(
+                SENSORFORGE_LICENSE_PUBLIC_KEY_PEM,
+                payload,
+                payloadLength,
+                signature,
+                signatureLength
+            )) {
+            status = LICENSE_STATUS_INVALID_SIGNATURE;
+            error = "legacy SF1 license signature verification failed";
+            return false;
+        }
+        return true;
+#else
+        status = LICENSE_STATUS_UNSUPPORTED_VERSION;
+        error = "legacy SF1 licenses are disabled in this firmware";
+        return false;
+#endif
+    }
+
+    if (data.codeFormat != 2U) {
+        status = LICENSE_STATUS_UNSUPPORTED_VERSION;
+        error = "unsupported activation code format";
+        return false;
+    }
+
+    const SensorForgeLicenseKeyEntry *issuer =
+        findIssuerKey(data.issuerKeyId);
+
+    if (!issuer || !issuer->enabled) {
+        status = LICENSE_STATUS_INVALID_SIGNATURE;
+        error = "SF2 issuer key is not trusted or has been disabled";
+        return false;
+    }
+
+    if (!verifySignatureWithPem(
+            issuer->publicKeyPem,
+            payload,
+            payloadLength,
+            signature,
+            signatureLength
+        )) {
+        status = LICENSE_STATUS_INVALID_SIGNATURE;
+        error = "SF2 license signature verification failed";
+        return false;
+    }
+
+    const uint8_t requiredCapability =
+        editionCapability(data.edition);
+
+    if (
+        requiredCapability == 0U ||
+        (issuer->capabilities & requiredCapability) == 0U
+    ) {
+        status = LICENSE_STATUS_INVALID_SIGNATURE;
+        error = "SF2 issuer key is not authorized for this license edition";
+        return false;
+    }
+
+    return true;
 }
 
 static bool evaluateActivationCode(
@@ -495,11 +637,13 @@ static bool evaluateActivationCode(
         return false;
     }
 
+    uint8_t codeFormat = 0U;
     String payloadText;
     String signatureText;
 
     if (!parseActivationCode(
             code,
+            codeFormat,
             payloadText,
             signatureText,
             error
@@ -542,6 +686,7 @@ static bool evaluateActivationCode(
     }
 
     if (!parsePayload(
+            codeFormat,
             payload,
             payloadLength,
             data,
@@ -551,16 +696,15 @@ static bool evaluateActivationCode(
         return false;
     }
 
-    if (!verifySignature(
+    if (!verifyLicenseTrust(
+            data,
             payload,
             payloadLength,
             signature,
-            signatureLength
+            signatureLength,
+            status,
+            error
         )) {
-        status =
-            LICENSE_STATUS_INVALID_SIGNATURE;
-        error =
-            "license signature verification failed";
         return false;
     }
 
@@ -589,9 +733,22 @@ static bool evaluateActivationCode(
         return false;
     }
 
+    time_t now = time(nullptr);
+
+    if (now >= (time_t)1609459200) {
+        uint32_t currentDays =
+            (uint32_t)((uint64_t)now / 86400ULL);
+
+        // A license must not claim to have been issued materially in the future.
+        // One day of tolerance avoids timezone/clock-edge surprises.
+        if (data.issuedDays > currentDays + 1U) {
+            status = LICENSE_STATUS_INVALID_FORMAT;
+            error = "license issue date is in the future";
+            return false;
+        }
+    }
+
     if (data.expiresDays != 0) {
-        time_t now =
-            time(nullptr);
 
         if (now < (time_t)1609459200) {
             status =
@@ -602,10 +759,7 @@ static bool evaluateActivationCode(
         }
 
         uint32_t currentDays =
-            (uint32_t)(
-                (uint64_t)now /
-                86400ULL
-            );
+            (uint32_t)((uint64_t)now / 86400ULL);
 
         if (currentDays > data.expiresDays) {
             status =
@@ -1049,6 +1203,26 @@ String licenseId()
         formatLicenseId(
             currentLicense.licenseId
         );
+}
+
+String licenseCodeFormatName()
+{
+    if (!licenseIsValid())
+        return String();
+
+    if (currentLicense.codeFormat == 2U)
+        return "SF2";
+    if (currentLicense.codeFormat == 1U)
+        return "SF1";
+    return String();
+}
+
+uint8_t licenseIssuerKeyId()
+{
+    if (!licenseIsValid())
+        return 0U;
+
+    return currentLicense.issuerKeyId;
 }
 
 String licenseIssuedDateText()

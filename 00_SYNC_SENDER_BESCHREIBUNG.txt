@@ -1,0 +1,1567 @@
+======================================================================
+IR-SYNC-SENDER FUER ESP32-S3 MULTI-KAMERA-SYSTEM
+======================================================================
+
+VERSION:
+Prototyp 1
+
+ZWECK:
+Kabellose optische Synchronisation mehrerer ESP32-S3 Kameras.
+
+Der Sender erzeugt sehr kurze unsichtbare Infrarot-Pulse bei
+940 nm.
+
+Alle Kamera-Empfaenger sehen denselben Puls nahezu gleichzeitig
+und verwenden ihn als gemeinsame Zeitreferenz.
+
+Der spaetere Fotozeitpunkt kann bereits mehrere Sekunden vorher
+per WLAN oder ESP-NOW angekuendigt werden.
+
+WICHTIG:
+
+Das WLAN bestimmt NICHT den exakten Aufnahmezeitpunkt.
+
+Die optischen IR-SYNC-Pulse liefern die gemeinsame Zeitbasis.
+
+
+======================================================================
+SYSTEMPRINZIP
+======================================================================
+
+
+                         IR-SYNC-SENDER
+                               |
+                +--------------+--------------+
+                |              |              |
+                v              v              v
+            KAMERA 1       KAMERA 2       KAMERA N
+            ESP32-S3       ESP32-S3       ESP32-S3
+                |              |              |
+                +--------------+--------------+
+                               |
+                               v
+                    GEMEINSAME ZEITBASIS
+
+
+Beispiel:
+
+Zeit -------------------------------------------------------------->
+
+       SYNC      SYNC      SYNC      SYNC      SYNC      SHOT
+        |         |         |         |         |         |
+        v         v         v         v         v         v
+--------|---------|---------|---------|---------|---------|---------
+
+
+Bereits vorher per WLAN:
+
+"SHOT BEI SYNC NUMMER 10542"
+
+
+Das WLAN-Kommando kann z.B. 10 Sekunden vorher eintreffen.
+
+Der genaue Aufnahmezeitpunkt wird lokal anhand der
+IR-SYNC-Zeitbasis bestimmt.
+
+
+======================================================================
+SENDEREIGENSCHAFTEN
+======================================================================
+
+Controller:
+
+Seeed Studio XIAO ESP32-S3
+
+
+Versorgung:
+
+5 V ueber USB-C des XIAO
+
+
+IR-LED:
+
+Kingbright L-934F3C
+
+
+Wellenlaenge:
+
+940 nm
+
+
+Abstrahlwinkel:
+
+ca. 50 Grad pro LED
+
+
+Anzahl LEDs:
+
+8
+
+
+Anordnung:
+
+jeweils ca. 45 Grad versetzt
+
+
+Horizontale Abdeckung:
+
+ca. 360 Grad
+
+
+Geplanter SYNC-Puls:
+
+10 us
+
+
+Geplante SYNC-Frequenz:
+
+10 Hz
+
+
+Das bedeutet:
+
+1 SYNC-Puls alle 100 ms
+
+
+======================================================================
+FARBCODIERUNG
+======================================================================
+
+ROT:
+
++5 V
++5V_IR
+
+
+SCHWARZ:
+
+GND
+
+
+BLAU:
+
+GPIO
+Steuersignale
+
+
+Diese Farbzuordnung konsequent beibehalten.
+
+
+======================================================================
+MECHANISCHE LED-ANORDNUNG
+======================================================================
+
+Ansicht von oben:
+
+
+                           LED1
+                            |
+                            |
+                   LED8     |     LED2
+                       \    |    /
+                        \   |   /
+                         \  |  /
+                          \ | /
+            LED7 ----------TX---------- LED3
+                          / | \
+                         /  |  \
+                        /   |   \
+                       /    |    \
+                   LED6     |     LED4
+                            |
+                            |
+                           LED5
+
+
+Ungefaehre Richtungen:
+
+LED1 =   0 Grad
+LED2 =  45 Grad
+LED3 =  90 Grad
+LED4 = 135 Grad
+LED5 = 180 Grad
+LED6 = 225 Grad
+LED7 = 270 Grad
+LED8 = 315 Grad
+
+
+Jede LED hat ungefaehr 50 Grad Abstrahlwinkel.
+
+Damit ueberlappen sich die benachbarten Bereiche leicht.
+
+
+======================================================================
+GESAMTSCHALTUNG - UEBERSICHT
+======================================================================
+
+
+                            USB-C
+                              |
+                              v
+                     +----------------+
+                     | XIAO ESP32-S3  |
+                     |                |
+                     | 5V         GND |
+                     +--+----------+--+
+                        |          |
+                        |          +------------------------ GND
+                        |
+                      [22R]
+                       1 W
+                        |
+                        |
+                        +------------------------------ +5V_IR
+                        |
+              +---------+---------+
+              |         |         |
+              |         |         |
+           1000uF      10uF      100nF
+              |         |         |
+              |         |         |
+              +---------+---------+
+                        |
+                       GND
+
+
+======================================================================
+LED-ENDSTUFE
+======================================================================
+
+
++5V_IR
+  |
+  +----[18R]----LED1----+
+  |                     |
+  +----[18R]----LED2----+
+  |                     |
+  +----[18R]----LED3----+
+  |                     |
+  +----[18R]----LED4----+
+  |                     |
+  +----[18R]----LED5----+
+  |                     |
+  +----[18R]----LED6----+
+  |                     |
+  +----[18R]----LED7----+
+  |                     |
+  +----[18R]----LED8----+
+                        |
+                        |
+                      DRAIN
+                        |
+                 +------+------+
+                 | IRLZ34NPBF |
+                 |            |
+                 | N-MOSFET   |
+                 +------+------+
+                        |
+                      SOURCE
+                        |
+                       GND
+
+
+WICHTIG:
+
+Jede LED bekommt ihren EIGENEN 18-Ohm-Widerstand.
+
+NICHT einen einzigen Widerstand fuer alle LEDs verwenden.
+
+
+======================================================================
+EIN LED-ZWEIG IM DETAIL
+======================================================================
+
+
+                    +5V_IR
+                       |
+                       |
+                     [18R]
+                  18 Ohm / 1 W
+                       |
+                       |
+                    ANODE
+                       |
+                  +----+----+
+                  |         |
+                  | IR-LED  |
+                  | L-934F3C|
+                  |         |
+                  +----+----+
+                       |
+                    KATHODE
+                       |
+                       |
+              GEMEINSAMER LED-PUNKT
+                       |
+                       |
+                     DRAIN
+                       |
+                   IRLZ34N
+                       |
+                     SOURCE
+                       |
+                      GND
+
+
+Diesen Zweig insgesamt 8-mal aufbauen.
+
+
+======================================================================
+MOSFET-STEUERUNG
+======================================================================
+
+
+XIAO D1 / GPIO2
+        |
+        |
+      [100R]
+        |
+        |
+        +-------------------------- GATE IRLZ34NPBF
+        |
+      [100k]
+        |
+        |
+       GND
+
+
+Der 100-Ohm-Widerstand liegt zwischen GPIO2 und Gate.
+
+Der 100-kOhm-Widerstand liegt zwischen Gate und GND.
+
+
+======================================================================
+MOSFET PINBELEGUNG
+======================================================================
+
+Bauteil:
+
+Infineon IRLZ34NPBF
+
+
+Blick auf die beschriftete flache Vorderseite.
+
+Beinchen zeigen nach unten:
+
+
+              +-------------+
+              |             |
+              | IRLZ34NPBF  |
+              |             |
+              +-------------+
+                 |   |   |
+                 |   |   |
+                 1   2   3
+
+                 G   D   S
+
+
+Pin 1 = GATE
+
+Pin 2 = DRAIN
+
+Pin 3 = SOURCE
+
+
+Anschluss:
+
+
+GPIO2 ----[100R]---- GATE
+                       |
+                     [100k]
+                       |
+                      GND
+
+
+LED-Kathoden ---------- DRAIN
+
+
+GND ------------------- SOURCE
+
+
+======================================================================
+WARUM 18 OHM PRO LED?
+======================================================================
+
+BAUTEIL:
+
+Weltron MFR1145
+
+18 Ohm
+1 Watt
+1 Prozent
+
+
+AUFGABE:
+
+Der Widerstand begrenzt den Strom durch jede einzelne IR-LED.
+
+Ohne Widerstand koennte die LED zu viel Strom aufnehmen und
+beschaedigt werden.
+
+Mit 18 Ohm liegt der kurze Pulsstrom grob im Bereich von
+ca. 0,2 A pro LED.
+
+Der Puls dauert nur etwa:
+
+10 us
+
+
+Dadurch entsteht ein kurzer und kraeftiger IR-Puls.
+
+
+MERKSATZ:
+
+18 Ohm = Strombegrenzung jeder einzelnen IR-LED
+
+
+======================================================================
+WARUM 22 OHM?
+======================================================================
+
+BAUTEIL:
+
+TRU COMPONENTS 1583782
+
+22 Ohm
+1 Watt
+
+
+POSITION:
+
+
+XIAO 5V
+   |
+   |
+ [22R]
+   |
+   |
++5V_IR
+   |
+   |
+1000uF
+   |
+  GND
+
+
+AUFGABE:
+
+Der 1000-uF-Kondensator ist beim Einschalten leer.
+
+Ohne Begrenzung koennte kurzzeitig ein hoher Ladestrom
+aus dem USB-Anschluss fliessen.
+
+Der 22-Ohm-Widerstand begrenzt diesen Ladestrom.
+
+
+MERKSATZ:
+
+22 Ohm = kontrolliertes Laden des Energietanks
+
+
+======================================================================
+WARUM 100 OHM?
+======================================================================
+
+BAUTEIL:
+
+Weltron 405132
+
+100 Ohm
+0,5 Watt
+
+
+POSITION:
+
+
+GPIO2 ----[100R]---- GATE
+
+
+AUFGABE:
+
+Das MOSFET-Gate verhaelt sich elektrisch wie ein kleiner
+Kondensator.
+
+Beim Umschalten muss es kurz geladen bzw. entladen werden.
+
+Der 100-Ohm-Widerstand:
+
+- begrenzt den kurzen GPIO-Strom
+- reduziert elektrische Stoerungen
+- reduziert moegliches Schwingen
+
+
+MERKSATZ:
+
+100 Ohm = saubere MOSFET-Ansteuerung
+
+
+======================================================================
+WARUM 100 kOHM?
+======================================================================
+
+BAUTEIL:
+
+Yageo MF0207FTE52-100K
+
+100 kOhm
+
+
+POSITION:
+
+
+                    GATE
+                      |
+                    [100k]
+                      |
+                     GND
+
+
+AUFGABE:
+
+Beim Einschalten des ESP32 ist GPIO2 fuer kurze Zeit noch
+nicht eindeutig definiert.
+
+Der 100-kOhm-Widerstand zieht das MOSFET-Gate sicher auf GND.
+
+Damit bleibt der MOSFET AUS und die IR-LEDs bleiben AUS.
+
+
+MERKSATZ:
+
+100 kOhm = MOSFET sicher AUS
+
+
+======================================================================
+WARUM 1000 uF?
+======================================================================
+
+BAUTEIL:
+
+Panasonic EEU-FR1C102L
+
+1000 uF
+16 V
+
+
+AUFGABE:
+
+Die acht LEDs brauchen gemeinsam fuer wenige Mikrosekunden
+einen relativ hohen Strom.
+
+Der 1000-uF-Elko speichert Energie direkt an der LED-Endstufe.
+
+Beim IR-Puls kommt ein grosser Teil des kurzen Spitzenstromes
+aus diesem Kondensator.
+
+
+MERKSATZ:
+
+1000 uF = Energietank fuer den IR-Puls
+
+
+======================================================================
+WARUM 10 uF?
+======================================================================
+
+BAUTEIL:
+
+Frolyt E-RF3058
+
+10 uF
+16 V
+
+
+AUFGABE:
+
+Zusaetzlicher Versorgungspuffer fuer mittlere
+Spannungsaenderungen.
+
+
+MERKSATZ:
+
+10 uF = mittlerer Versorgungspuffer
+
+
+======================================================================
+WARUM 100 nF?
+======================================================================
+
+BAUTEIL:
+
+TRU COMPONENTS TC-K100NF5
+
+100 nF
+50 V
+
+
+AUFGABE:
+
+Der Keramikkondensator reagiert sehr schnell auf kurze
+elektrische Stoerimpulse.
+
+Er ergaenzt den grossen 1000-uF-Elko.
+
+
+MERKSATZ:
+
+100 nF = schneller Stoerfilter
+
+
+======================================================================
+KONDENSATOREN - ELEKTRISCH
+======================================================================
+
+
+                       +5V_IR
+                          |
+              +-----------+-----------+
+              |           |           |
+              |           |           |
+           1000uF       10uF        100nF
+              |           |           |
+              |           |           |
+              +-----------+-----------+
+                          |
+                         GND
+
+
+Alle drei Kondensatoren liegen parallel zwischen
++5V_IR und GND.
+
+
+======================================================================
+POLARITAET DER KONDENSATOREN
+======================================================================
+
+1000-uF-Elko:
+
+PLUS  -> +5V_IR
+MINUS -> GND
+
+
+10-uF-Elko:
+
+PLUS  -> +5V_IR
+MINUS -> GND
+
+
+100-nF-Keramikkondensator:
+
+keine Polaritaet
+
+
+======================================================================
+KOMPLETTER ELEKTRISCHER UEBERBLICK
+======================================================================
+
+
+                            USB-C
+                              |
+                              v
+                     +----------------+
+                     | XIAO ESP32-S3  |
+                     |                |
+                     | 5V         GND +----------------------+
+                     |                |                      |
+                     | GPIO2          |                      |
+                     +--+----------+--+                      |
+                        |          |                         |
+                      [100R]     [22R]                       |
+                        |          |                         |
+                        |          +------------ +5V_IR      |
+                        |                       |             |
+                        |             +---------+---------+   |
+                        |             |         |         |   |
+                        |          1000uF      10uF     100nF |
+                        |             |         |         |   |
+                        |             +---------+---------+   |
+                        |                       |             |
+                        |                      GND------------+
+                        |
+                        +---------- GATE
+                                     |
+                                   [100k]
+                                     |
+                                    GND
+
+
++5V_IR
+  |
+  +----[18R]----LED1----+
+  |
+  +----[18R]----LED2----+
+  |
+  +----[18R]----LED3----+
+  |
+  +----[18R]----LED4----+
+  |
+  +----[18R]----LED5----+
+  |
+  +----[18R]----LED6----+
+  |
+  +----[18R]----LED7----+
+  |
+  +----[18R]----LED8----+
+                        |
+                        |
+                      DRAIN
+                        |
+                 +------+------+
+                 | IRLZ34NPBF |
+                 +------+------+
+                        |
+                      SOURCE
+                        |
+                       GND
+
+
+======================================================================
+LOCHRASTERPLATINE
+======================================================================
+
+Bauteil:
+
+Rademacher WR-Typ 811-2
+
+
+Groesse:
+
+100 mm x 75 mm
+
+
+Raster:
+
+2,54 mm
+
+
+Vor dem Aufbau kontrollieren, welche Kupferflaechen oder
+Leiterbahnen auf der Unterseite miteinander verbunden sind.
+
+Ungewollte Verbindungen muessen getrennt werden.
+
+Danach mit dem Multimeter auf Durchgang pruefen.
+
+
+======================================================================
+EMPFOHLENE BAUTEILANORDNUNG
+======================================================================
+
+
+                         100 mm
+
+     +--------------------------------------------------+
+     |                     LED1                         |
+     |                      |                           |
+     |        LED8          |          LED2             |
+     |            \         |         /                 |
+     |             \        |        /                  |
+     |              \       |       /                   |
+     | LED7          +-------------+              LED3  |
+     |               |             |                    |
+     |               | XIAO ESP32  |                    |
+     |               |     S3      |                    |
+     |               +-------------+                    |
+     |                                                    |
+     |             22R          1000uF                   |
+     |                                                    |
+     |             10uF         100nF                    |
+     |                                                    |
+     |                  IRLZ34N                           |
+     |                                                    |
+     |        LED6                     LED4               |
+     |                                                    |
+     |                      |                             |
+     |                     LED5                           |
+     +--------------------------------------------------+
+
+                         75 mm
+
+
+Diese Darstellung ist nur eine mechanische Empfehlung.
+
+Der elektrische Schaltplan ist entscheidend.
+
+
+======================================================================
+VERDRAHTUNGSFARBEN
+======================================================================
+
+ROT:
+
+XIAO 5V
++5V_IR
+Versorgung der LED-Zweige
+
+
+SCHWARZ:
+
+alle GND-Verbindungen
+MOSFET SOURCE
+Kondensator MINUS
+
+
+BLAU:
+
+GPIO2
+MOSFET Gate-Signal
+sonstige Signalleitungen
+
+
+======================================================================
+STROMFUEHRENDE VERBINDUNGEN
+======================================================================
+
+Folgende Verbindungen moeglichst kurz halten:
+
+1000-uF-Elko <-> +5V_IR
+
+1000-uF-Elko <-> GND
+
+LED-Zweige <-> MOSFET DRAIN
+
+MOSFET SOURCE <-> GND
+
+
+Auf der Platine gemeinsame Strompfade moeglichst kurz,
+breit und sauber verloetet ausfuehren.
+
+
+======================================================================
+SOFTWARE-GRUNDZUSTAND
+======================================================================
+
+Nach dem Start sofort:
+
+GPIO2 = LOW
+
+
+Damit gilt:
+
+MOSFET = AUS
+
+IR-LEDs = AUS
+
+
+======================================================================
+EIN SYNC-PULS
+======================================================================
+
+GPIO2:
+
+LOW
+
+dann:
+
+HIGH fuer 10 us
+
+danach:
+
+LOW
+
+
+ASCII-Darstellung:
+
+
+                10 us
+              <------>
+
+LOW __________          __________________________ LOW
+              |        |
+              |        |
+HIGH          +--------+
+
+
+======================================================================
+10-HZ-SYNC
+======================================================================
+
+SYNC-Frequenz:
+
+10 Hz
+
+
+Abstand:
+
+100 ms
+
+
+Zeit:
+
+0 ms        100 ms       200 ms       300 ms       400 ms
+ |            |            |            |            |
+ v            v            v            v            v
+
+SYNC         SYNC         SYNC         SYNC         SYNC
+
+
+Jeder einzelne Puls dauert:
+
+10 us
+
+
+======================================================================
+SPAETERER SHOT-ABLAUF
+======================================================================
+
+Beispiel:
+
+Master entscheidet:
+
+SHOT bei SYNC Nummer 10542
+
+
+Bereits mehrere Sekunden vorher wird per WLAN oder ESP-NOW
+gesendet:
+
+"SHOT = SYNC 10542"
+
+
+Danach:
+
+SYNC 10538
+    |
+    |
+SYNC 10539
+    |
+    |
+SYNC 10540
+    |
+    |
+SYNC 10541
+    |
+    |
+SYNC 10542
+    |
+    +----------> FOTO
+
+
+Die WLAN-Laufzeit ist dadurch nicht zeitkritisch.
+
+
+======================================================================
+ERSTER ELEKTRISCHER TEST
+======================================================================
+
+Nicht sofort alle acht LEDs anschliessen.
+
+
+SCHRITT 1:
+
+XIAO ueber USB anschliessen.
+
+
+SCHRITT 2:
+
+Spannung messen:
+
+XIAO 5V gegen GND
+
+Erwartung:
+
+ungefaehr 5 V
+
+
+SCHRITT 3:
+
+22-Ohm-Widerstand anschliessen.
+
+
+SCHRITT 4:
+
+1000-uF-Elko
+10-uF-Elko
+100-nF-Kondensator
+
+anschliessen.
+
+
+SCHRITT 5:
+
+Spannung messen:
+
++5V_IR gegen GND
+
+Nach kurzer Ladezeit:
+
+ungefaehr 5 V
+
+
+SCHRITT 6:
+
+MOSFET-Schaltung aufbauen.
+
+
+SCHRITT 7:
+
+GPIO2 sicher auf LOW setzen.
+
+
+SCHRITT 8:
+
+Nur EINEN LED-Zweig anschliessen:
+
+
++5V_IR
+  |
+ [18R]
+  |
+ LED
+  |
+ DRAIN
+  |
+ MOSFET
+  |
+ GND
+
+
+SCHRITT 9:
+
+10-us-Testpulse erzeugen.
+
+
+SCHRITT 10:
+
+Mit einer Smartphone-Kamera pruefen, ob die IR-LED sichtbar ist.
+
+Viele Smartphone-Kameras zeigen 940-nm-IR als weissen,
+rosa oder violetten Lichtpunkt.
+
+
+SCHRITT 11:
+
+Wenn alles funktioniert:
+
+restliche sieben LED-Zweige anschliessen.
+
+
+======================================================================
+SICHERHEIT
+======================================================================
+
+940-nm-Infrarotlicht ist fuer das menschliche Auge praktisch
+unsichtbar.
+
+Unsichtbar bedeutet NICHT, dass keine Strahlung vorhanden ist.
+
+Deshalb:
+
+- nicht direkt in die LEDs schauen
+
+- insbesondere nicht aus kurzer Entfernung
+
+- LEDs nicht dauerhaft einschalten
+
+- nur kurze Pulse verwenden
+
+- Sender nicht direkt auf Augenhoehe montieren
+
+- Software so schreiben, dass GPIO2 standardmaessig LOW ist
+
+
+======================================================================
+FINALE CONRAD-BESTELLLISTE
+======================================================================
+
+
+1.
+TRU COMPONENTS 1566830
+
+LiY Litze
+1 x 0,14 mm2
+Schwarz
+10 m
+
+Conrad Bestell-Nr.:
+
+1566830 - 62
+
+Verwendung:
+
+GND
+
+Bestellt:
+
+1 Rolle
+
+
+----------------------------------------------------------------------
+
+2.
+TRU COMPONENTS 1565154
+
+LiY Litze
+1 x 0,14 mm2
+Rot
+10 m
+
+Conrad Bestell-Nr.:
+
+1565154 - 62
+
+Verwendung:
+
++5 V
++5V_IR
+
+Bestellt:
+
+1 Rolle
+
+
+----------------------------------------------------------------------
+
+3.
+TRU COMPONENTS 1566831
+
+LiY Litze
+1 x 0,14 mm2
+Blau
+10 m
+
+Conrad Bestell-Nr.:
+
+1566831 - 62
+
+Verwendung:
+
+GPIO
+Signalleitungen
+
+Bestellt:
+
+1 Rolle
+
+
+----------------------------------------------------------------------
+
+4.
+Kingbright L-934F3C
+
+IR-Emitter
+940 nm
+50 Grad
+3 mm
+radial bedrahtet
+
+Conrad Bestell-Nr.:
+
+154394 - 62
+
+Bestellt:
+
+15 Stueck
+
+Benoetigt:
+
+8 Stueck
+
+Reserve:
+
+7 Stueck
+
+
+----------------------------------------------------------------------
+
+5.
+Frolyt E-RF3058
+
+Elektrolyt-Kondensator
+10 uF
+16 V
+radial
+
+Conrad Bestell-Nr.:
+
+3046377 - 62
+
+Bestellt:
+
+3 Stueck
+
+Benoetigt:
+
+1 Stueck
+
+
+----------------------------------------------------------------------
+
+6.
+Weltron 405132
+
+Kohleschicht-Widerstand
+100 Ohm
+0,5 Watt
+5 Prozent
+
+Conrad Bestell-Nr.:
+
+405132 - 62
+
+Bestellt:
+
+70 Stueck
+
+Benoetigt:
+
+1 Stueck
+
+Verwendung:
+
+GPIO2 -> MOSFET Gate
+
+
+----------------------------------------------------------------------
+
+7.
+TRU COMPONENTS 1583782
+TC-MOR01SJ0220A10203
+
+Widerstand
+22 Ohm
+1 Watt
+5 Prozent
+
+Conrad Bestell-Nr.:
+
+1583782 - 62
+
+Bestellt:
+
+100 Stueck
+
+Benoetigt:
+
+1 Stueck
+
+Verwendung:
+
+Ladestrombegrenzung des 1000-uF-Elkos
+
+
+----------------------------------------------------------------------
+
+8.
+Rademacher WR-Typ 811-2
+
+Lochrasterplatine
+100 mm x 75 mm
+Raster 2,54 mm
+Kupfer 35 um
+
+Conrad Bestell-Nr.:
+
+529580 - 62
+
+Bestellt:
+
+2 Stueck
+
+Benoetigt:
+
+1 Stueck
+
+Zweite Platine:
+
+Reserve
+
+
+----------------------------------------------------------------------
+
+9.
+TRU COMPONENTS TC-K100NF5
+
+Keramik-Kondensator
+100 nF
+50 V
+THT
+
+Conrad Bestell-Nr.:
+
+1589524 - 62
+
+Bestellt:
+
+30 Stueck
+
+Benoetigt:
+
+1 Stueck
+
+
+----------------------------------------------------------------------
+
+10.
+Panasonic EEU-FR1C102L
+
+Elektrolyt-Kondensator
+1000 uF
+16 V
+radial
+
+Conrad Bestell-Nr.:
+
+1475949 - 62
+
+Bestellt:
+
+7 Stueck
+
+Benoetigt:
+
+1 Stueck
+
+
+----------------------------------------------------------------------
+
+11.
+Yageo MF0207F100KH
+MF0207FTE52-100K
+
+Metallschicht-Widerstand
+100 kOhm
+0,6 Watt
+1 Prozent
+
+Conrad Bestell-Nr.:
+
+1417570 - 62
+
+Bestellt:
+
+50 Stueck
+
+Benoetigt:
+
+1 Stueck
+
+Verwendung:
+
+MOSFET Gate Pulldown
+
+
+----------------------------------------------------------------------
+
+12.
+Infineon IRLZ34NPBF
+
+N-Kanal MOSFET
+TO-220
+
+Conrad Bestell-Nr.:
+
+162873 - 62
+
+Bestellt:
+
+3 Stueck
+
+Benoetigt:
+
+1 Stueck
+
+
+----------------------------------------------------------------------
+
+13.
+Weltron MFR1145
+1W 1% 18R BF 0414
+
+Metallschicht-Widerstand
+18 Ohm
+1 Watt
+1 Prozent
+
+Conrad Bestell-Nr.:
+
+419354 - 62
+
+Bestellt:
+
+30 Stueck
+
+Benoetigt:
+
+8 Stueck
+
+Verwendung:
+
+je ein Widerstand pro IR-LED
+
+
+======================================================================
+WARENKORB-CHECK
+======================================================================
+
+Schwarze Litze                    OK
+
+Rote Litze                       OK
+
+Blaue Litze                      OK
+
+Kingbright L-934F3C              OK
+
+10 uF / 16 V                     OK
+
+100 Ohm / 0,5 W                  OK
+
+22 Ohm / 1 W                     OK
+
+Lochrasterplatine                OK
+
+100 nF / 50 V                    OK
+
+1000 uF / 16 V                   OK
+
+100 kOhm                         OK
+
+IRLZ34NPBF                       OK
+
+18 Ohm / 1 W                     OK
+
+
+ERGEBNIS:
+
+Der elektronische Warenkorb fuer den IR-SYNC-Sender
+ist vollstaendig.
+
+
+======================================================================
+BEREITS VORHANDEN
+======================================================================
+
+Seeed Studio XIAO ESP32-S3
+
+
+======================================================================
+ZUSAETZLICH BENOETIGTES WERKZEUG
+======================================================================
+
+USB-C-Kabel
+
+5-V-USB-Netzteil
+
+Loetkolben
+
+Loetzinn
+
+Seitenschneider
+
+Abisolierwerkzeug
+
+Multimeter
+
+
+Optional:
+
+Stiftleisten
+
+Buchsenleisten
+
+Platinenhalter
+
+Entloetlitze
+
+
+======================================================================
+CHECKLISTE VOR DEM ERSTEN EINSCHALTEN
+======================================================================
+
+[ ] XIAO korrekt angeschlossen
+
+[ ] +5V und GND nicht kurzgeschlossen
+
+[ ] +5V_IR und GND nicht kurzgeschlossen
+
+[ ] 1000-uF-Elko richtig gepolt
+
+[ ] 10-uF-Elko richtig gepolt
+
+[ ] MOSFET Pin 1 = Gate
+
+[ ] MOSFET Pin 2 = Drain
+
+[ ] MOSFET Pin 3 = Source
+
+[ ] MOSFET Source an GND
+
+[ ] 100-kOhm-Widerstand Gate nach GND
+
+[ ] 100-Ohm-Widerstand zwischen GPIO2 und Gate
+
+[ ] Jede LED besitzt eigenen 18-Ohm-Widerstand
+
+[ ] LED-Polaritaet kontrolliert
+
+[ ] GPIO2 startet LOW
+
+[ ] Erster Test nur mit einer LED
+
+[ ] Erst danach alle acht LEDs anschliessen
+
+
+======================================================================
+KURZFASSUNG SCHALTUNG
+======================================================================
+
+
+USB-C
+  |
+  v
+XIAO ESP32-S3
+  |
+  | 5V
+  |
+ [22R]
+  |
+  +------------------------- +5V_IR
+  |                            |
+1000uF                         +----18R----LED1----+
+  |                            +----18R----LED2----+
+ GND                           +----18R----LED3----+
+                               +----18R----LED4----+
+                               +----18R----LED5----+
+                               +----18R----LED6----+
+                               +----18R----LED7----+
+                               +----18R----LED8----+
+                                                    |
+                                                  DRAIN
+                                                    |
+                                                IRLZ34N
+                                                    |
+                                                  SOURCE
+                                                    |
+                                                   GND
+
+
+GPIO2 ----100R---- GATE
+                     |
+                   100k
+                     |
+                    GND
+
+
+10uF und 100nF ebenfalls parallel zwischen +5V_IR und GND.
+
+
+SYNC:
+
+GPIO2 HIGH fuer 10 us
+
+danach:
+
+GPIO2 LOW
+
+
+LED-Anordnung:
+
+8 LEDs
+
+45 Grad Abstand
+
+ca. 360 Grad horizontale Abdeckung
+
+
+======================================================================
+ENDE
+======================================================================

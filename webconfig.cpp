@@ -37,6 +37,9 @@
 #include "thermal.h"
 #include "sync_api.h"
 #include "license.h"
+#include "license_usage.h"
+#include "license_trial.h"
+#include "license_policy.h"
 #include "recording_crypto.h"
 #include "recording_storage.h"
 #include "image_motion.h"
@@ -1126,6 +1129,44 @@ static void recordingArmFormDefaults(
 }
 
 
+static const char *licenseUiEditionName()
+{
+    return licenseProductModeName();
+}
+
+
+static const char *licenseUiEditionPillClass()
+{
+    switch (licenseProductMode()) {
+        case LICENSE_PRODUCT_MODE_FULL:
+        case LICENSE_PRODUCT_MODE_SERVICE:
+            return "ok";
+        case LICENSE_PRODUCT_MODE_TRIAL:
+        case LICENSE_PRODUCT_MODE_DEMO:
+        default:
+            return "warn";
+    }
+}
+
+
+static String licenseDurationCompact(uint64_t seconds)
+{
+    const uint64_t days = seconds / 86400ULL;
+    seconds %= 86400ULL;
+    const uint64_t hours = seconds / 3600ULL;
+    seconds %= 3600ULL;
+    const uint64_t minutes = seconds / 60ULL;
+
+    if (days > 0)
+        return String((unsigned long long)days) + "d " + String((unsigned long long)hours) + "h";
+
+    if (hours > 0)
+        return String((unsigned long long)hours) + "h " + String((unsigned long long)minutes) + "m";
+
+    return String((unsigned long long)minutes) + "m";
+}
+
+
 static String htmlHeader()
 {
     const bool streamingAccess =
@@ -1178,6 +1219,13 @@ static String htmlHeader()
         ".module-clock.invalid{color:#aeb8c5;font-weight:600;}"
         ".module-clock.thermal-warning{color:#fbbf24;}"
         ".module-clock.thermal-emergency{color:#fca5a5;}"
+        ".usage-totals{width:100%;max-width:285px;text-align:right;color:#93a4b8;font-size:.58rem;"
+        "font-weight:600;letter-spacing:.02em;white-space:nowrap;font-variant-numeric:tabular-nums;}"
+        ".usage-totals span{color:#b9c5d3;}"
+        ".license-edition-inline{display:inline-block;margin-left:7px;padding:2px 6px;border-radius:999px;"
+        "font-size:.56em;line-height:1.2;vertical-align:middle;letter-spacing:.05em;background:#e8edf3;color:#344054;}"
+        ".license-edition-inline.ok{background:#e7f6e5;color:var(--ok);}"
+        ".license-edition-inline.warn{background:#fff1d6;color:var(--warn);}"
         ".system-meters{display:grid;gap:4px;width:100%;max-width:230px}"
         ".system-meter{display:grid;grid-template-columns:38px minmax(80px,1fr) 54px;align-items:center;gap:6px;width:100%}"
         ".system-meter-label{font-size:.72rem;font-weight:800;color:#dbe4ef;text-transform:uppercase;letter-spacing:.03em}"
@@ -1354,6 +1402,7 @@ static String htmlHeader()
         ".module-meta{width:100%;margin-left:0;padding:3px 2px 5px;align-items:flex-end;}"
         ".module-actions{width:100%;justify-content:flex-end;}"
         ".module-clock{width:100%;text-align:right;font-size:.82rem;white-space:normal;line-height:1.25;}"
+        ".usage-totals{max-width:260px;font-size:.56rem;}"
         ".system-meters{max-width:210px;}"
         ".recording-control{align-items:stretch;flex-direction:column;}"
         ".recording-control-actions{text-align:left;}"
@@ -1543,6 +1592,8 @@ static String htmlHeader()
         "' title='" +
         htmlText(UI_MODULE_TIME_TITLE) +
         "'>--.--.---- &middot; --:--:--</div>"
+        "<div class='usage-totals' title='Kumulierte aktive Systemlaufzeit, Aufnahmezeit und aktive Streaming-Zeit'>"
+        "SYS <span id='systemUptimeTotal'>--</span> &middot; FILM <span id='filmingTimeTotal'>--</span> &middot; STRM <span id='streamingTimeTotal'>--</span></div>"
         "<div class='system-meters'>"
         "<div id='thermalLoadMeter' class='system-meter invalid' title='CPU-Temperatur relativ zu den konfigurierten Thermal-Grenzen'>"
         "<span class='system-meter-label'>Temp</span><div id='thermalLoadTrack' class='thermal-load-track'><span id='thermalLoadMarker' class='thermal-load-marker'></span></div><span id='thermalLoadValue' class='thermal-load-value'>-- °C</span></div>"
@@ -1588,6 +1639,7 @@ static String htmlHeader()
         "if(!el)return;"
         "var baseMs=0,syncMs=0,pauseActive=false,cpuText='',rtcText='',loadText='',thermalState='OK';"
         "function pad(v){return String(v).padStart(2,'0');}"
+        "function fmtUsage(sec){sec=Math.max(0,Math.floor(Number(sec)||0));var d=Math.floor(sec/86400),h=Math.floor((sec%86400)/3600),m=Math.floor((sec%3600)/60);if(d>0)return d+'d '+h+'h';if(h>0)return h+'h '+m+'m';return m+'m';}"
         "function render(){"
         "if(!baseMs){el.textContent='--.--.---- · --:--:--';el.classList.add('invalid');return;}"
         "var d=new Date(baseMs+(Date.now()-syncMs));"
@@ -1610,6 +1662,7 @@ static String htmlHeader()
         "rtcText=(s&&s.rtc_temp_valid)?Number(s.rtc_temp_c).toFixed(1):'';loadText=(s&&s.system_load_valid)?(Number(s.system_load_pct).toFixed(0)+' %'):'';"
         "var tm=document.getElementById('thermalLoadMeter'),tt=document.getElementById('thermalLoadTrack'),tmk=document.getElementById('thermalLoadMarker'),tv=document.getElementById('thermalLoadValue');if(tm&&tt&&tmk&&tv){var tvalid=!!(s&&s.cpu_temp_valid);tm.classList.toggle('invalid',!tvalid);if(tvalid){var tc=Number(s.cpu_temp_c)||0,tw=Math.max(1,Number(s.thermal_warning_c)||70),te=Math.max(tw+1,Number(s.thermal_emergency_c)||80),tmax=Math.max(100,te+20),tp=Math.max(0,Math.min(100,(tc/tmax)*100)),wp=Math.max(0,Math.min(100,(tw/tmax)*100)),ep=Math.max(wp,Math.min(100,(te/tmax)*100));tt.style.background='linear-gradient(90deg,#22c55e 0%,#22c55e '+wp+'%,#f59e0b '+wp+'%,#f59e0b '+ep+'%,#ef4444 '+ep+'%,#ef4444 100%)';tmk.style.left='calc('+tp+'% - 1px)';tv.textContent=tc.toFixed(1)+' °C';tm.title='CPU-Temperatur: Warnung ab '+tw.toFixed(0)+' °C, Notfall ab '+te.toFixed(0)+' °C';}else{tmk.style.left='0%';tv.textContent='-- °C';}}var lm=document.getElementById('systemLoadMeter'),lmk=document.getElementById('systemLoadMarker'),lv=document.getElementById('systemLoadValue');"
         "if(lm&&lmk&&lv){var valid=!!(s&&s.system_load_valid);lm.classList.toggle('invalid',!valid);if(valid){var lp=Math.max(0,Math.min(100,Number(s.system_load_pct)||0));lmk.style.left='calc('+lp+'% - 1px)';lv.textContent=Math.round(lp)+'%';}else{lmk.style.left='0%';lv.textContent='--%';}}"
+        "var su=document.getElementById('systemUptimeTotal'),ft=document.getElementById('filmingTimeTotal'),st=document.getElementById('streamingTimeTotal');if(su&&s)su.textContent=fmtUsage(s.system_uptime_total_sec);if(ft&&s)ft.textContent=fmtUsage(s.filming_total_sec);if(st&&s)st.textContent=fmtUsage(s.streaming_total_sec);"
         "thermalState=(s&&s.thermal_state)||'OK';"
         "var ws=document.getElementById('webSessionCount');if(ws&&s)ws.textContent=String(s.web_ui_sessions||0);"
         "var hf=document.getElementById('heapFreeKb');if(hf&&s)hf.textContent=String(s.heap_free_kb||0)+' KB';"
@@ -1786,6 +1839,9 @@ static void handleUiStatus()
             rtcTempC
         );
 
+    LicenseUsageSnapshot usage =
+        licenseUsageSnapshot();
+
     String json =
         String("{\"recording\":") +
         (recording ? "true" : "false") +
@@ -1857,7 +1913,15 @@ static void handleUiStatus()
         String((unsigned long)(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024U)) +
         ",\"psram_free_kb\":" +
         String((unsigned long)(ESP.getFreePsram() / 1024U)) +
-        ",\"stream_rtsp_client\":" +
+        ",\"system_uptime_total_sec\":" +
+        String((unsigned long long)usage.systemUptimeSecondsTotal) +
+        ",\"filming_total_sec\":" +
+        String((unsigned long long)usage.recordedSecondsEffectiveTotal) +
+        ",\"streaming_total_sec\":" +
+        String((unsigned long long)usage.streamedSecondsEffectiveTotal) +
+        ",\"license_mode\":\"" +
+        String(licenseProductModeName()) +
+        "\",\"stream_rtsp_client\":" +
         (streamerRtspClientConnected() ? "true" : "false") +
         ",\"stream_rtsp_clients\":" + String((unsigned)streamerRtspClientCount()) +
         ",\"stream_http_client\":" +
@@ -2320,7 +2384,8 @@ static void handleRoot()
     if (streamerModeEnabled()) {
         String html = htmlHeader();
         html += "<div class='page-title'><div><h2>" + htmlText(UI_DASH_OVERVIEW) +
-                "</h2><p>" + htmlEscape(cfg_hostname) +
+                " <span class='license-edition-inline " + String(licenseUiEditionPillClass()) + "'>" +
+                String(licenseUiEditionName()) + "</span></h2><p>" + htmlEscape(cfg_hostname) +
                 " &middot; " SENSORFORGE_PLATFORM_LITERAL " &middot; Core v" SENSORFORGE_CORE_VERSION_LITERAL
                 "</p></div><span class='status-pill warn'>STREAMER</span></div>";
         html += webconfigStreamerDashboardHtml(activeWebUiSessionCount());
@@ -2557,7 +2622,9 @@ static void handleRoot()
     html +=
         "<div class='page-title'><div><h2>" +
         htmlText(UI_DASH_OVERVIEW) +
-        "</h2><p>" +
+        " <span class='license-edition-inline " + String(licenseUiEditionPillClass()) + "'>" +
+        String(licenseUiEditionName()) +
+        "</span></h2><p>" +
         htmlEscape(cfg_hostname) +
         " &middot; " SENSORFORGE_PLATFORM_LITERAL
         " &middot; Core v" SENSORFORGE_CORE_VERSION_LITERAL "</p></div>";
@@ -18780,7 +18847,7 @@ static void handleLicensePage()
         htmlText(UI_LICENSE_EDITION) +
         "</div><div class='card-value'>" +
         htmlEscape(
-            String(licenseEditionName())
+            String(licenseProductModeName())
         ) +
         "</div></div>";
 
@@ -18800,6 +18867,51 @@ static void handleLicensePage()
 
     html +=
         "</div>";
+
+    {
+        const LicenseProductMode mode =
+            licenseProductMode();
+
+        if (mode == LICENSE_PRODUCT_MODE_TRIAL) {
+            const LicenseTrialSnapshot trial =
+                licenseTrialSnapshot();
+
+            html +=
+                "<p class='muted'><b>TRIAL:</b> volle Funktionalität. Lokal verbleibend: " +
+                htmlEscape(licenseDurationCompact(trial.activeSecondsRemaining)) +
+                " aktive Systemzeit, " +
+                htmlEscape(licenseDurationCompact(trial.recordingSecondsRemaining)) +
+                " Aufnahmezeit (FILM) bzw. " +
+                htmlEscape(licenseDurationCompact(trial.streamingSecondsRemaining)) +
+                " Streamingzeit (STRM).";
+
+            if (trial.trustedCalendarAvailable) {
+                const uint64_t calendarRemaining =
+                    trial.trustedCalendarSecondsUsed >= SENSORFORGE_TRIAL_ACTIVE_SECONDS
+                    ? 0ULL
+                    : SENSORFORGE_TRIAL_ACTIVE_SECONDS - trial.trustedCalendarSecondsUsed;
+
+                html +=
+                    " Kalenderlimit verbleibend: " +
+                    htmlEscape(licenseDurationCompact(calendarRemaining)) +
+                    ".";
+            }
+
+            html += "</p>";
+        } else if (mode == LICENSE_PRODUCT_MODE_DEMO) {
+            const LicensePolicy policy =
+                licensePolicy();
+
+            html +=
+                "<p class='muted'><b>DEMO:</b> Trial verbraucht. Heute verbleibend: " +
+                String((unsigned long)policy.recordingsRemainingToday) +
+                " Aufnahmen, " +
+                htmlEscape(licenseDurationCompact(policy.recordingSecondsRemainingToday)) +
+                " Aufnahmezeit und " +
+                htmlEscape(licenseDurationCompact(policy.streamingSecondsRemainingToday)) +
+                " Streaming.</p>";
+        }
+    }
 
     if (licenseIsValid()) {
         String issued =
@@ -18833,6 +18945,14 @@ static void handleLicensePage()
             ":</b> " +
             licenseFeatureText() +
             "</p>";
+
+        html +=
+            "<p class='muted' style='font-size:.82rem'>Signature: " +
+            htmlEscape(licenseCodeFormatName()) +
+            (licenseIssuerKeyId()
+                ? String(" · issuer key ") + String((unsigned)licenseIssuerKeyId())
+                : String(" · legacy")) +
+            "</p>";
     }
 
     html +=
@@ -18852,7 +18972,7 @@ static void handleLicensePage()
         "<textarea id='licenseActivationCode' name='activation_code' rows='5' "
         "maxlength='512' required autocomplete='off' autocapitalize='off' "
         "spellcheck='false' style='width:100%;font-family:monospace;resize:vertical' "
-        "placeholder='SF1:...'></textarea>"
+        "placeholder='SF2:...'></textarea>"
         "<div style='margin-top:10px'><button class='primary' type='submit'>" +
         htmlText(UI_LICENSE_ACTIVATE_BUTTON) +
         "</button></div></form>";
@@ -18944,7 +19064,11 @@ static void handleLicenseActivate()
                 " | license_id=" +
                 licenseId() +
                 " | edition=" +
-                String(licenseEditionName())
+                String(licenseEditionName()) +
+                " | format=" +
+                licenseCodeFormatName() +
+                " | issuer_key=" +
+                String((unsigned)licenseIssuerKeyId())
             );
 
             server.sendHeader(
