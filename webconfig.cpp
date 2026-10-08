@@ -6524,6 +6524,31 @@ static void handleTransportPage()
         server.hasArg("notice") &&
         server.arg("notice") == "saved";
 
+    int transportCheckTotalMinutes =
+        (cfg_transport_check_seconds + 59) / 60;
+    if (transportCheckTotalMinutes < 1) transportCheckTotalMinutes = 1;
+    if (transportCheckTotalMinutes > 24 * 60) transportCheckTotalMinutes = 24 * 60;
+
+    int transportCheckHours =
+        transportCheckTotalMinutes / 60;
+    int transportCheckMinutes =
+        transportCheckTotalMinutes % 60;
+
+    int transportMaxTotalMinutes =
+        (cfg_transport_max_duration_seconds + 59) / 60;
+    if (transportMaxTotalMinutes < 1) transportMaxTotalMinutes = 1;
+    if (transportMaxTotalMinutes > 7 * 24 * 60)
+        transportMaxTotalMinutes = 7 * 24 * 60;
+
+    int transportMaxDays =
+        transportMaxTotalMinutes / (24 * 60);
+    int transportMaxRemainderMinutes =
+        transportMaxTotalMinutes % (24 * 60);
+    int transportMaxHours =
+        transportMaxRemainderMinutes / 60;
+    int transportMaxMinutes =
+        transportMaxRemainderMinutes % 60;
+
     String html = htmlHeader();
 
     html +=
@@ -6560,7 +6585,13 @@ static void handleTransportPage()
         "<p><span id='transportMeasureState' class='status-pill warn'>Messung wird vorbereitet ...</span></p>"
         "<p id='transportMeasureErrorText' class='muted' hidden></p>"
         "</section>"
-        "<form method='POST' action='/transport_save'>"
+        "<form id='transportSettingsForm' method='POST' action='/transport_save'>"
+        "<style>"
+        "#transportSettingsForm .transport-time-field{width:88px;min-width:88px;max-width:88px;box-sizing:border-box;}"
+        "#transportSettingsForm .transport-time-row{display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap;}"
+        "#transportSettingsForm .transport-time-part{display:flex;flex-direction:column;gap:4px;}"
+        "#transportSettingsForm .transport-time-part small{white-space:nowrap;}"
+        "</style>"
         "<section class='settings-section'>"
         "<h3>Grenzwerte und Zeiten</h3>"
         "<p class='muted'>Die aktuelle Config-Version verwendet einen gemeinsamen Schwarzwert. "
@@ -6578,42 +6609,100 @@ static void handleTransportPage()
 
     html +=
         "<div style='margin-bottom:16px'>"
-        "<label for='transportCheckSeconds'><b>Prüfintervall während des Transports</b></label><br>"
-        "<input id='transportCheckSeconds' name='transport_check_seconds' type='number' min='10' max='3600' value='" +
-        String(cfg_transport_check_seconds) +
-        "'> <small>Sekunden · Standard 120 s</small>"
+        "<label><b>Prüfintervall während des Transports</b></label>"
+        "<div class='transport-time-row' style='margin-top:6px'>"
+        "<label class='transport-time-part'><select class='transport-time-field' name='transport_check_minutes'>";
+
+    for (int minute = 0; minute <= 59; ++minute) {
+        html +=
+            "<option value='" + String(minute) + "'" +
+            String(minute == transportCheckMinutes ? " selected" : "") +
+            ">" + String(minute) + "</option>";
+    }
+
+    html +=
+        "</select><small>Minuten</small></label>"
+        "<label class='transport-time-part'><select class='transport-time-field' name='transport_check_hours'>";
+
+    for (int hour = 0; hour <= 24; ++hour) {
+        html +=
+            "<option value='" + String(hour) + "'" +
+            String(hour == transportCheckHours ? " selected" : "") +
+            ">" + String(hour) + "</option>";
+    }
+
+    html +=
+        "</select><small>Stunden</small></label>"
+        "</div>"
+        "<small>Standard: 10 Minuten</small>"
         "<div class='muted'>Nach diesem Abstand wacht SensorForge kurz auf und prüft, ob die Kamera weiterhin abgedeckt ist. "
         "Dazwischen bleibt das Gerät im stromsparenden Timer-Deep-Sleep.</div></div>";
 
     html +=
         "<div style='margin-bottom:16px'>"
         "<label for='transportLightConfirmSeconds'><b>Bestätigungszeit nach erkannter Helligkeit</b></label><br>"
-        "<input id='transportLightConfirmSeconds' name='transport_light_confirm_seconds' type='number' min='0' max='120' value='" +
+        "<input class='transport-time-field' id='transportLightConfirmSeconds' name='transport_light_confirm_seconds' type='number' min='0' max='120' value='" +
         String(cfg_transport_light_confirm_seconds) +
-        "'> <small>Sekunden</small>"
+        "'> <small>Sekunden · Standard: 10 Sekunden</small>"
         "<div class='muted'>Die Abdeckung gilt erst als entfernt, wenn die Kamera über diesen Zeitraum mehrfach hell bleibt. "
         "Kurze Lichtblitze lösen den Transportmodus dadurch nicht versehentlich.</div></div>";
 
     html +=
         "<div style='margin-bottom:16px'>"
-        "<label for='transportInstallDelaySeconds'><b>Montage-Wartezeit nach Entfernen der Abdeckung</b></label><br>"
-        "<input id='transportInstallDelaySeconds' name='transport_install_delay_seconds' type='number' min='0' max='86400' value='" +
+        "<label for='transportInstallDelaySeconds'><b>Wartezeit nach Entfernen der Abdeckung</b></label><br>"
+        "<input class='transport-time-field' id='transportInstallDelaySeconds' name='transport_install_delay_seconds' type='number' min='0' max='86400' value='" +
         String(cfg_transport_install_delay_seconds) +
         "'> <small>Sekunden</small>"
         "<div class='muted'>Zeit für Montage und Verlassen des Bildbereichs, bevor SensorForge wieder in den normalen Betrieb zurückkehrt.</div></div>";
 
     html +=
         "<div style='margin-bottom:16px'>"
-        "<label for='transportMaxDurationSeconds'><b>Maximale Transportdauer</b></label><br>"
-        "<input id='transportMaxDurationSeconds' name='transport_max_duration_seconds' type='number' min='3600' max='604800' value='" +
-        String(cfg_transport_max_duration_seconds) +
-        "'> <small>Sekunden · Standard 86400 s = 24 h</small>"
+        "<label><b>Maximale Transportdauer</b></label>"
+        "<div class='transport-time-row' style='margin-top:6px'>"
+        "<label class='transport-time-part'><select class='transport-time-field' name='transport_max_minutes'>";
+
+    for (int minute = 0; minute <= 59; ++minute) {
+        html +=
+            "<option value='" + String(minute) + "'" +
+            String(minute == transportMaxMinutes ? " selected" : "") +
+            ">" + String(minute) + "</option>";
+    }
+
+    html +=
+        "</select><small>Minuten</small></label>"
+        "<label class='transport-time-part'><select class='transport-time-field' name='transport_max_hours'>";
+
+    for (int hour = 0; hour <= 23; ++hour) {
+        html +=
+            "<option value='" + String(hour) + "'" +
+            String(hour == transportMaxHours ? " selected" : "") +
+            ">" + String(hour) + "</option>";
+    }
+
+    html +=
+        "</select><small>Stunden</small></label>"
+        "<label class='transport-time-part'><select class='transport-time-field' name='transport_max_days'>";
+
+    for (int day = 0; day <= 7; ++day) {
+        html +=
+            "<option value='" + String(day) + "'" +
+            String(day == transportMaxDays ? " selected" : "") +
+            ">" + String(day) + "</option>";
+    }
+
+    html +=
+        "</select><small>Tage</small></label>"
+        "</div>"
         "<div class='muted'>Harte Sicherheitsgrenze für die gesamte Transportphase. Nach Ablauf wechselt SensorForge unabhängig von der Lichtmessung in den Normalbetrieb.</div></div>";
 
     html +=
-        "<div class='form-actions'><button id='transportSaveButton' class='primary' type='submit'>Speichern</button>"
-        "<button id='transportRemeasureButton' type='button'>Neu messen</button></div>"
-        "</section></form>";
+        "<div class='form-actions'><button id='transportRemeasureButton' type='button'>Neu messen</button></div>"
+        "</section>"
+        "<div class='floating-save-space'></div>"
+        "<div id='transportSaveBar' class='floating-save-bar'>"
+        "<span id='transportSaveState' class='floating-save-state'>Keine ungespeicherten Änderungen</span>"
+        "<button id='transportSaveButton' type='submit' disabled>Speichern</button>"
+        "</div></form>";
 
     html +=
         "<section class='settings-section' style='border-left:5px solid #d97706'>"
@@ -6670,6 +6759,9 @@ static void handleTransportPage()
         "var title=document.getElementById('transportMeasureTitle');"
         "var text=document.getElementById('transportMeasureText');"
         "var closeBtn=document.getElementById('transportMeasureCloseButton');"
+        "var transportForm=document.getElementById('transportSettingsForm');"
+        "var saveBar=document.getElementById('transportSaveBar');"
+        "var saveState=document.getElementById('transportSaveState');"
         "var remeasureBtn=document.getElementById('transportRemeasureButton');"
         "var saveBtn=document.getElementById('transportSaveButton');"
         "var activateBtn=document.getElementById('transportActivateButton');"
@@ -6680,10 +6772,11 @@ static void handleTransportPage()
         "var thresholdInput=document.getElementById('transportBlackThreshold');"
         "var thresholdSuggestion=document.getElementById('transportThresholdSuggestion');"
         "var preserveSavedValues=" + String(justSaved ? "true" : "false") + ";"
-        "var measuring=false;"
+        "var measuring=false,dirty=false;"
+        "function markDirty(){dirty=true;if(saveBar)saveBar.classList.add('dirty');if(saveState)saveState.textContent='Ungespeicherte Änderungen';if(saveBtn&&!measuring)saveBtn.disabled=false;}"
         "function setControlsDisabled(v){"
         "if(remeasureBtn)remeasureBtn.disabled=v;"
-        "if(saveBtn)saveBtn.disabled=v;"
+        "if(saveBtn)saveBtn.disabled=v||!dirty;"
         "if(activateBtn)activateBtn.disabled=v;"
         "}"
         "function showBusy(){"
@@ -6697,13 +6790,13 @@ static void handleTransportPage()
         "function finishControls(){measuring=false;setControlsDisabled(false);}"
         "function hideModal(){if(modal)modal.hidden=true;}"
         "function applyMeasurement(d,applySuggestions){"
-        "var m=Number(d.reference_mean),p=Number(d.reference_p95),sm=Number(d.suggested_mean),sp=Number(d.suggested_p95);"
+        "var m=Number(d.reference_mean),p=Number(d.reference_p95),sm=Number(d.suggested_mean),sp=Number(d.suggested_p95),bright=!!d.suspiciously_bright;"
         "if(meanEl)meanEl.textContent=isFinite(m)?m.toFixed(1):'--';"
         "if(p95El)p95El.textContent=isFinite(p)?String(p):'--';"
-        "if(thresholdSuggestion)thresholdSuggestion.textContent='Automatischer Vorschlag: '+sm+' (gemessene Durchschnittshelligkeit + 10 Reserve)';"
-        "if(applySuggestions&&thresholdInput)thresholdInput.value=sm;"
-        "if(stateEl){stateEl.className='status-pill '+(d.suspiciously_bright?'warn':'ok');"
-        "stateEl.textContent=d.suspiciously_bright?'Abgedecktes Bild ungewöhnlich hell - Tape/Sitz prüfen':'Messung plausibel dunkel';}"
+        "if(thresholdSuggestion)thresholdSuggestion.textContent=bright?'Kein automatischer Vorschlag: Messung ungewöhnlich hell.':'Automatischer Vorschlag: '+sm+' (gemessene Durchschnittshelligkeit + 10 Reserve)';"
+        "if(applySuggestions&&!bright&&thresholdInput){var next=String(sm);if(thresholdInput.value!==next){thresholdInput.value=next;markDirty();}}"
+        "if(stateEl){stateEl.className='status-pill '+(bright?'warn':'ok');"
+        "stateEl.textContent=bright?'Abgedecktes Bild ungewöhnlich hell - gespeicherter Grenzwert bleibt unverändert':'Messung plausibel dunkel';}"
         "}"
         "function measurementFailed(message){"
         "if(stateEl){stateEl.className='status-pill danger';stateEl.textContent='Schwarzmessung fehlgeschlagen';}"
@@ -6727,6 +6820,7 @@ static void handleTransportPage()
         "}"
         "if(closeBtn)closeBtn.addEventListener('click',hideModal);"
         "if(remeasureBtn)remeasureBtn.addEventListener('click',function(){runMeasurement(true,'manual-remeasure');});"
+        "if(transportForm){transportForm.addEventListener('input',markDirty);transportForm.addEventListener('change',markDirty);transportForm.addEventListener('submit',function(){if(saveBtn)saveBtn.disabled=true;if(saveState)saveState.textContent='Speichert …';});}"
         // Unlike the normal maintenance pause, the transport preparation page
         // also renews while hidden. Closing/navigating away stops this timer and
         // the existing 35 s safety timeout resumes automatic recording.
@@ -6759,8 +6853,27 @@ static void handleTransportSave()
         return;
     }
 
-    int checkSeconds =
-        server.arg("transport_check_seconds").toInt();
+    int checkSeconds = 0;
+
+    if (
+        server.hasArg("transport_check_minutes") ||
+        server.hasArg("transport_check_hours")
+    ) {
+        int checkMinutes =
+            server.arg("transport_check_minutes").toInt();
+        int checkHours =
+            server.arg("transport_check_hours").toInt();
+
+        if (checkMinutes < 0) checkMinutes = 0;
+        if (checkHours < 0) checkHours = 0;
+
+        checkSeconds =
+            (checkHours * 60 + checkMinutes) * 60;
+    } else {
+        // Backward compatibility for an already open Beta-31 browser tab.
+        checkSeconds =
+            server.arg("transport_check_seconds").toInt();
+    }
 
     int lightConfirmSeconds =
         server.arg("transport_light_confirm_seconds").toInt();
@@ -6768,8 +6881,31 @@ static void handleTransportSave()
     int installDelaySeconds =
         server.arg("transport_install_delay_seconds").toInt();
 
-    int maxDurationSeconds =
-        server.arg("transport_max_duration_seconds").toInt();
+    int maxDurationSeconds = 0;
+
+    if (
+        server.hasArg("transport_max_minutes") ||
+        server.hasArg("transport_max_hours") ||
+        server.hasArg("transport_max_days")
+    ) {
+        int maxMinutes =
+            server.arg("transport_max_minutes").toInt();
+        int maxHours =
+            server.arg("transport_max_hours").toInt();
+        int maxDays =
+            server.arg("transport_max_days").toInt();
+
+        if (maxMinutes < 0) maxMinutes = 0;
+        if (maxHours < 0) maxHours = 0;
+        if (maxDays < 0) maxDays = 0;
+
+        maxDurationSeconds =
+            (maxDays * 24 * 60 + maxHours * 60 + maxMinutes) * 60;
+    } else {
+        // Backward compatibility for an already open Beta-31 browser tab.
+        maxDurationSeconds =
+            server.arg("transport_max_duration_seconds").toInt();
+    }
 
     int blackThreshold =
         server.arg("transport_black_threshold").toInt();

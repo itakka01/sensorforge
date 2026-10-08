@@ -62,6 +62,10 @@ String wifiUiJsonEscape(const String &value)
 String webconfigWifiSettingsHtml(const String &notice)
 {
     String html;
+    const int wifiTimeoutMinutes =
+        cfg_wifi_timeout_sec > 0
+        ? (cfg_wifi_timeout_sec + 59) / 60
+        : 0;
 
     WifiAliveScheduleEntry aliveEntries[SENSORFORGE_WIFI_ALIVE_SCHEDULE_MAX_ENTRIES];
     size_t aliveEntryCount = 0;
@@ -184,10 +188,10 @@ String webconfigWifiSettingsHtml(const String &notice)
         "<option value='on'" + String(cfg_wifi_on_system_start == "on" ? " selected" : "") + ">Immer beim Start synchronisieren</option>"
         "<option value='on_missing_time'" + String(cfg_wifi_on_system_start == "on_missing_time" ? " selected" : "") + ">Nur synchronisieren, wenn noch keine gültige Systemzeit vorhanden ist</option>"
         "</select></div>"
-        "<div class='config-label'>WLAN automatisch ausschalten nach<button type='button' class='wifi-info-btn' aria-label='Information' data-title='WLAN automatisch ausschalten' data-info='Diese Einstellung gilt im normalen SensorForge-Betrieb. Nach der eingestellten Zeit ohne WebConfig-Aktivität werden WLAN und WebConfig automatisch ausgeschaltet. 0 Sekunden bedeutet: nicht automatisch ausschalten. Im Netzwerk-Streamer wird diese Zeitbegrenzung nicht angewendet, damit RTSP und HTTP dauerhaft erreichbar bleiben.'>i</button></div>"
-        "<div class='config-control'><input name='wifi_timeout_sec' type='number' min='0' max='86400' value='" +
-        String(cfg_wifi_timeout_sec) + "'></div>"
-        "<div class='config-note'>Sekunden; 0 = nicht automatisch ausschalten.</div>"
+        "<div class='config-label'>WLAN automatisch ausschalten nach<button type='button' class='wifi-info-btn' aria-label='Information' data-title='WLAN automatisch ausschalten' data-info='Diese Einstellung gilt im normalen SensorForge-Betrieb. Nach der eingestellten Zeit ohne WebConfig-Aktivität werden WLAN und WebConfig automatisch ausgeschaltet. 0 Minuten bedeutet: nicht automatisch ausschalten. Im Netzwerk-Streamer wird diese Zeitbegrenzung nicht angewendet, damit RTSP und HTTP dauerhaft erreichbar bleiben.'>i</button></div>"
+        "<div class='config-control'><input name='wifi_timeout_minutes' type='number' min='0' max='1440' step='1' value='" +
+        String(wifiTimeoutMinutes) + "'></div>"
+        "<div class='config-note'>Minuten; 0 = nicht automatisch ausschalten.</div>"
         "</div></section>";
 
     html +=
@@ -407,7 +411,17 @@ bool webconfigWifiSaveRequest(
     wifiOnSystemStart.trim();
     wifiOnSystemStart.toLowerCase();
 
-    int wifiTimeoutSec = constrain(server.arg("wifi_timeout_sec").toInt(), 0, 86400);
+    int wifiTimeoutSec = 0;
+    if (server.hasArg("wifi_timeout_minutes")) {
+        const int wifiTimeoutMinutes =
+            constrain(server.arg("wifi_timeout_minutes").toInt(), 0, 1440);
+        wifiTimeoutSec = wifiTimeoutMinutes * 60;
+    } else {
+        // Backward-compatible with a browser tab that was opened before this
+        // firmware update and still submits the former seconds field.
+        wifiTimeoutSec =
+            constrain(server.arg("wifi_timeout_sec").toInt(), 0, 86400);
+    }
 
     int wifiAliveScheduleEnabled =
         server.arg("wifi_alive_schedule_enabled").toInt() ? 1 : 0;

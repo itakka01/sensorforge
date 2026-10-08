@@ -21,13 +21,13 @@
 // WebConfig, so a running device can be mapped back to the exact Git tag.
 
 #define SENSORFORGE_RELEASE_NUMBER 87
-#define SENSORFORGE_RELEASE_TAG "v87-beta30"
-#define SENSORFORGE_RELEASE_DATE "2026-10-06"
+#define SENSORFORGE_RELEASE_TAG "v87-beta32"
+#define SENSORFORGE_RELEASE_DATE "2026-10-08"
 #define SENSORFORGE_RELEASE_SUMMARY \
-    "Beta 30: SF2 role-separated license keyring with offline FULL/recovery trust."
+    "Beta 32: transport time controls standardized and transport check default set to 10 minutes."
 
-// Current source-tree stage. v87 Beta 30 adds SF2 issuer roles and production key-rotation infrastructure.
-#define SENSORFORGE_WORKTREE_STAGE "v87-beta30"
-#define SENSORFORGE_WORKTREE_DATE "2026-10-06"
+// Current source-tree stage. v87 Beta 32 refines transport time entry while keeping runtime storage in seconds.
+#define SENSORFORGE_WORKTREE_STAGE "v87-beta32"
+#define SENSORFORGE_WORKTREE_DATE "2026-10-08"
 #define SENSORFORGE_WORKTREE_SUMMARY \
-    "v87 Beta 30: SF2 issuer key IDs/capabilities; online key can be trial-only, FULL/recovery keys stay offline; SF1 beta compatibility retained."
+    "v87 Beta 32: transport durations use compact ordered time controls; default transport check interval is 10 minutes."

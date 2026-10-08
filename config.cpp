@@ -151,7 +151,7 @@ int cfg_sleep_delay_ms = 2000;
 int cfg_bootloop_protection = 1;
 
 int cfg_transport_mode = 0;
-int cfg_transport_check_seconds = 120;
+int cfg_transport_check_seconds = 600;
 int cfg_transport_light_confirm_seconds = 10;
 int cfg_transport_install_delay_seconds = 300;
 int cfg_transport_max_duration_seconds = 86400;
@@ -1051,7 +1051,7 @@ static ConfigValues makeDefaultValues()
         0;
 
     values.transportCheckSeconds =
-        120;
+        600;
 
     values.transportLightConfirmSeconds =
         10;
@@ -2906,11 +2906,11 @@ static bool validateValues(
 
     if (
         values.transportCheckSeconds < 10 ||
-        values.transportCheckSeconds > 3600
+        values.transportCheckSeconds > 86400
     ) {
 
         error =
-            "transport_check_seconds out of range (10..3600)";
+            "transport_check_seconds out of range (10..86400)";
 
         return false;
     }
@@ -2941,12 +2941,12 @@ static bool validateValues(
 
 
     if (
-        values.transportMaxDurationSeconds < 3600 ||
+        values.transportMaxDurationSeconds < 60 ||
         values.transportMaxDurationSeconds > 604800
     ) {
 
         error =
-            "transport_max_duration_seconds out of range (3600..604800)";
+            "transport_max_duration_seconds out of range (60..604800)";
 
         return false;
     }
@@ -8738,8 +8738,8 @@ ConfigSaveResult configSaveTransportSettings(
 {
     error = "";
 
-    if (checkSeconds < 10 || checkSeconds > 3600) {
-        error = "transport_check_seconds out of range (10..3600)";
+    if (checkSeconds < 10 || checkSeconds > 86400) {
+        error = "transport_check_seconds out of range (10..86400)";
         return CONFIG_SAVE_INTERNAL_FAILED;
     }
 
@@ -8753,8 +8753,8 @@ ConfigSaveResult configSaveTransportSettings(
         return CONFIG_SAVE_INTERNAL_FAILED;
     }
 
-    if (maxDurationSeconds < 3600 || maxDurationSeconds > 604800) {
-        error = "transport_max_duration_seconds out of range (3600..604800)";
+    if (maxDurationSeconds < 60 || maxDurationSeconds > 604800) {
+        error = "transport_max_duration_seconds out of range (60..604800)";
         return CONFIG_SAVE_INTERNAL_FAILED;
     }
 

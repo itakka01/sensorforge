@@ -114,10 +114,10 @@ extern int cfg_bootloop_protection;   // 0/1, persistent unstable-cold-boot prot
 // sampled periodically; once the cover is reliably removed an installation
 // delay runs before normal operation is enabled.
 extern int cfg_transport_mode;                    // 0/1
-extern int cfg_transport_check_seconds;           // 10..3600
+extern int cfg_transport_check_seconds;           // 10..86400
 extern int cfg_transport_light_confirm_seconds;   // 0..120
 extern int cfg_transport_install_delay_seconds;   // 0..86400
-extern int cfg_transport_max_duration_seconds;      // 3600..604800, hard fallback to normal mode
+extern int cfg_transport_max_duration_seconds;      // 60..604800, hard fallback to normal mode
 extern int cfg_transport_black_threshold;         // 0..255; P95 guard is derived internally as threshold + 10
 int configTransportBlackP95Limit();
 
