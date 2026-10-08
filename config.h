@@ -161,6 +161,17 @@ extern String cfg_wifi_ssids[SENSORFORGE_WIFI_PROFILE_COUNT];
 extern String cfg_wifi_passes[SENSORFORGE_WIFI_PROFILE_COUNT];
 extern float cfg_wifi_tx_power_dbm;   // board-supported TX power for STA/configured AP; fallback AP uses board default
 
+// Optional local SensorForge cluster. Disabled by default for full backward
+// compatibility. The password is protected by the existing SFSEC1 config
+// secret envelope when persisted. Runtime cluster networking is active only
+// while WiFi itself is active.
+extern int cfg_cluster_enabled;        // 0/1
+extern String cfg_cluster_id;          // stable public cluster identity, "cl-" + 32 lowercase hex
+extern String cfg_cluster_name;        // logical cluster name, 1..63 chars when enabled
+extern uint32_t cfg_cluster_credential_epoch; // public credential generation; increments on password rotation
+extern String cfg_cluster_password;    // 8..63 chars when enabled; never advertised
+extern String cfg_cluster_coordinator_policy; // "auto", "preferred" or "node"; default auto
+
 // Hotspot / access point
 extern int cfg_hotspot_enabled;       // 1 = local AP, 0 = configured infrastructure WiFi (STA)
 extern int cfg_hotspot_fallback_enabled; // 1 = use AP if all configured STA profiles fail
@@ -431,6 +442,20 @@ ConfigSaveResult configSaveWireGuardSettings(
     const String &peerEndpoint,
     const String &peerPublicKey,
     int peerPort,
+    bool writeToSd,
+    String &error
+);
+
+// Persist local cluster membership while preserving all unrelated config
+// keys/comments. Runtime network ownership is not restarted by this function;
+// changed membership is applied on the next normal WiFi restart/reboot.
+ConfigSaveResult configSaveClusterSettings(
+    int enabled,
+    const String &clusterId,
+    const String &clusterName,
+    uint32_t credentialEpoch,
+    const String &clusterPassword,
+    const String &coordinatorPolicy,
     bool writeToSd,
     String &error
 );

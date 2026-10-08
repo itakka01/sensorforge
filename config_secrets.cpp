@@ -27,18 +27,37 @@ static void secureWipe(void *pointer, size_t length)
         *p++ = 0;
 }
 
+static bool clusterProfilePasswordFieldSupported(const char *fieldName)
+{
+    static const char PREFIX[] = "cluster_profile_password:";
+    if (!fieldName || strncmp(fieldName, PREFIX, sizeof(PREFIX) - 1) != 0)
+        return false;
+
+    const char *id = fieldName + sizeof(PREFIX) - 1;
+    if (strlen(id) != 35 || strncmp(id, "cl-", 3) != 0)
+        return false;
+
+    for (const char *p = id + 3; *p; ++p) {
+        if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f')))
+            return false;
+    }
+    return true;
+}
+
 static bool fieldSupported(const char *fieldName)
 {
     if (!fieldName)
         return false;
 
     return
+        clusterProfilePasswordFieldSupported(fieldName) ||
         strcmp(fieldName, "wifi_pass") == 0 ||
         strcmp(fieldName, "wifi_pass_2") == 0 ||
         strcmp(fieldName, "wifi_pass_3") == 0 ||
         strcmp(fieldName, "wifi_pass_4") == 0 ||
         strcmp(fieldName, "wifi_pass_5") == 0 ||
         strcmp(fieldName, "hotspot_password") == 0 ||
+        strcmp(fieldName, "cluster_password") == 0 ||
         strcmp(fieldName, "web_password") == 0 ||
         strcmp(fieldName, "stream_password_1") == 0 ||
         strcmp(fieldName, "stream_password_2") == 0 ||

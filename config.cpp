@@ -180,6 +180,13 @@ String cfg_wifi_ssids[SENSORFORGE_WIFI_PROFILE_COUNT];
 String cfg_wifi_passes[SENSORFORGE_WIFI_PROFILE_COUNT];
 float cfg_wifi_tx_power_dbm = BOARD_WIFI_TX_POWER_DEFAULT_X10 / 10.0f;
 
+int cfg_cluster_enabled = 0;
+String cfg_cluster_id = "";
+String cfg_cluster_name = "";
+uint32_t cfg_cluster_credential_epoch = 1;
+String cfg_cluster_password = "";
+String cfg_cluster_coordinator_policy = "auto";
+
 int cfg_hotspot_enabled = 1;
 int cfg_hotspot_fallback_enabled = 0;
 String cfg_hotspot_password = "";
@@ -582,6 +589,20 @@ bool configParseWifiAliveSchedule(
     return true;
 }
 
+static bool configClusterIdValid(const String &id)
+{
+    if (id.length() != 35 || !id.startsWith("cl-"))
+        return false;
+
+    for (size_t i = 3; i < id.length(); ++i) {
+        const char c = id[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            return false;
+    }
+    return true;
+}
+
+
 struct ConfigValues {
     String camera;
     String resolution;
@@ -686,6 +707,13 @@ struct ConfigValues {
     String wifiSsids[SENSORFORGE_WIFI_PROFILE_COUNT];
     String wifiPasses[SENSORFORGE_WIFI_PROFILE_COUNT];
     float wifiTxPowerDbm;
+
+    int clusterEnabled;
+    String clusterId;
+    String clusterName;
+    uint32_t clusterCredentialEpoch;
+    String clusterPassword;
+    String clusterCoordinatorPolicy;
 
     int hotspotEnabled;
     int hotspotFallbackEnabled;
@@ -812,6 +840,13 @@ struct ConfigSeen {
     bool wifiSsids[SENSORFORGE_WIFI_PROFILE_COUNT];
     bool wifiPasses[SENSORFORGE_WIFI_PROFILE_COUNT];
     bool wifiTxPowerDbm;
+
+    bool clusterEnabled;
+    bool clusterId;
+    bool clusterName;
+    bool clusterCredentialEpoch;
+    bool clusterPassword;
+    bool clusterCoordinatorPolicy;
 
     bool hotspotEnabled;
     bool hotspotFallbackEnabled;
@@ -1112,6 +1147,24 @@ static ConfigValues makeDefaultValues()
     values.wifiTxPowerDbm =
         BOARD_WIFI_TX_POWER_DEFAULT_X10 / 10.0f;
 
+    values.clusterEnabled =
+        0;
+
+    values.clusterId =
+        "";
+
+    values.clusterName =
+        "";
+
+    values.clusterCredentialEpoch =
+        1;
+
+    values.clusterPassword =
+        "";
+
+    values.clusterCoordinatorPolicy =
+        "auto";
+
     values.hotspotEnabled =
         1;
 
@@ -1290,6 +1343,13 @@ static bool serializeConfigValues(
         APPEND_CONFIG_VALUE((String("wifi_pass_") + String(i + 1)).c_str(), values.wifiPasses[i]);
     }
     APPEND_CONFIG_VALUE("wifi_tx_power_dbm", String(values.wifiTxPowerDbm, 1));
+
+    APPEND_CONFIG_VALUE("cluster_enabled", String(values.clusterEnabled));
+    APPEND_CONFIG_VALUE("cluster_id", values.clusterId);
+    APPEND_CONFIG_VALUE("cluster_name", values.clusterName);
+    APPEND_CONFIG_VALUE("cluster_credential_epoch", String((unsigned long)values.clusterCredentialEpoch));
+    APPEND_CONFIG_VALUE("cluster_password", values.clusterPassword);
+    APPEND_CONFIG_VALUE("cluster_coordinator_policy", values.clusterCoordinatorPolicy);
 
     APPEND_CONFIG_VALUE("hotspot_enabled", String(values.hotspotEnabled));
     APPEND_CONFIG_VALUE("hotspot_fallback_enabled", String(values.hotspotFallbackEnabled));
@@ -2054,6 +2114,12 @@ static bool validateValues(
     values.timezone.trim();
     for (size_t i = 0; i < SENSORFORGE_WIFI_PROFILE_COUNT; ++i)
         values.wifiSsids[i].trim();
+
+    values.clusterId.trim();
+    values.clusterId.toLowerCase();
+    values.clusterName.trim();
+    values.clusterCoordinatorPolicy.trim();
+    values.clusterCoordinatorPolicy.toLowerCase();
 
     values.webLanguage.trim();
     values.webLanguage.toLowerCase();
@@ -3055,6 +3121,69 @@ static bool validateValues(
         }
     }
 
+
+    if (
+        values.clusterEnabled != 0 &&
+        values.clusterEnabled != 1
+    ) {
+        error =
+            "cluster_enabled must be 0 or 1";
+        return false;
+    }
+
+    if (values.clusterId.length() && !configClusterIdValid(values.clusterId)) {
+        error =
+            "cluster_id must be cl- followed by 32 lowercase hex characters";
+        return false;
+    }
+
+    if (values.clusterName.length() > 63) {
+        error =
+            "cluster_name exceeds 63 characters";
+        return false;
+    }
+
+    if (values.clusterCredentialEpoch == 0) {
+        error =
+            "cluster_credential_epoch must be >= 1";
+        return false;
+    }
+
+    if (
+        values.clusterPassword.length() != 0 &&
+        (
+            values.clusterPassword.length() < 8 ||
+            values.clusterPassword.length() > 63
+        )
+    ) {
+        error =
+            "cluster_password must be empty or 8..63 characters";
+        return false;
+    }
+
+    if (
+        values.clusterCoordinatorPolicy != "auto" &&
+        values.clusterCoordinatorPolicy != "preferred" &&
+        values.clusterCoordinatorPolicy != "node"
+    ) {
+        error =
+            "cluster_coordinator_policy must be auto, preferred or node";
+        return false;
+    }
+
+    if (values.clusterEnabled) {
+        if (!values.clusterName.length()) {
+            error =
+                "cluster_enabled requires cluster_name";
+            return false;
+        }
+
+        if (!values.clusterPassword.length()) {
+            error =
+                "cluster_enabled requires cluster_password";
+            return false;
+        }
+    }
 
     if (
         values.hotspotEnabled != 0 &&
@@ -4683,6 +4812,129 @@ static bool parseConfigText(
                     decimalValue;
 
             } else if (
+                key == "cluster_enabled"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.clusterEnabled,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid cluster_enabled";
+                    return false;
+                }
+
+                values.clusterEnabled =
+                    (int)numericValue;
+
+            } else if (
+                key == "cluster_id"
+            ) {
+
+                if (!markOnce(
+                        seen.clusterId,
+                        key,
+                        error
+                    )) {
+                    return false;
+                }
+
+                values.clusterId =
+                    value;
+
+            } else if (
+                key == "cluster_name"
+            ) {
+
+                if (!markOnce(
+                        seen.clusterName,
+                        key,
+                        error
+                    )) {
+                    return false;
+                }
+
+                values.clusterName =
+                    value;
+
+            } else if (
+                key == "cluster_credential_epoch"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.clusterCredentialEpoch,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    ) ||
+                    numericValue < 1 ||
+                    numericValue > 0xFFFFFFFFLL
+                ) {
+                    if (!error.length())
+                        error = "invalid cluster_credential_epoch";
+                    return false;
+                }
+
+                values.clusterCredentialEpoch =
+                    (uint32_t)numericValue;
+
+            } else if (
+                key == "cluster_password"
+            ) {
+
+                if (!markOnce(
+                        seen.clusterPassword,
+                        key,
+                        error
+                    )) {
+                    return false;
+                }
+
+                {
+                    bool wasEncrypted = false;
+                    String secretError;
+
+                    if (!configSecretDecode(
+                            "cluster_password",
+                            value,
+                            values.clusterPassword,
+                            wasEncrypted,
+                            secretError
+                        )) {
+                        error =
+                            "cluster_password: " +
+                            secretError;
+                        return false;
+                    }
+                }
+
+            } else if (
+                key == "cluster_coordinator_policy"
+            ) {
+
+                if (!markOnce(
+                        seen.clusterCoordinatorPolicy,
+                        key,
+                        error
+                    )) {
+                    return false;
+                }
+
+                values.clusterCoordinatorPolicy =
+                    value;
+
+            } else if (
                 key == "hotspot_enabled"
             ) {
 
@@ -5351,6 +5603,24 @@ static void applyValues(
     cfg_wifi_tx_power_dbm =
         values.wifiTxPowerDbm;
 
+    cfg_cluster_enabled =
+        values.clusterEnabled;
+
+    cfg_cluster_id =
+        values.clusterId;
+
+    cfg_cluster_name =
+        values.clusterName;
+
+    cfg_cluster_credential_epoch =
+        values.clusterCredentialEpoch;
+
+    cfg_cluster_password =
+        values.clusterPassword;
+
+    cfg_cluster_coordinator_policy =
+        values.clusterCoordinatorPolicy;
+
     cfg_hotspot_enabled =
         values.hotspotEnabled;
 
@@ -5745,6 +6015,7 @@ static bool configSecretFieldName(const String &key)
         key.startsWith("wifi_pass_") ||
         key == "hotspot_password" ||
         key == "wireguard_private_key" ||
+        key == "cluster_password" ||
         key == "web_password" ||
         key.startsWith("stream_password_");
 }
@@ -6431,6 +6702,21 @@ config_loaded:
     Serial.println(
         "Config WiFi: tx_power_dbm=" +
         String(cfg_wifi_tx_power_dbm, 1)
+    );
+
+    Serial.println(
+        "Config Cluster: enabled=" +
+        String(cfg_cluster_enabled) +
+        " id=" +
+        (cfg_cluster_id.length() ? cfg_cluster_id : String("<legacy-derived>")) +
+        " name=" +
+        (cfg_cluster_name.length() ? cfg_cluster_name : String("<empty>")) +
+        " credential_epoch=" +
+        String((unsigned long)cfg_cluster_credential_epoch) +
+        " password=" +
+        String(cfg_cluster_password.length() ? "set" : "empty") +
+        " coordinator_policy=" +
+        cfg_cluster_coordinator_policy
     );
 
     for (size_t i = 0; i < SENSORFORGE_WIFI_PROFILE_COUNT; ++i) {
@@ -8211,6 +8497,123 @@ ConfigSaveResult configSaveWireGuardSettings(
     return result;
 }
 
+
+
+ConfigSaveResult configSaveClusterSettings(
+    int enabled,
+    const String &clusterId,
+    const String &clusterName,
+    uint32_t credentialEpoch,
+    const String &clusterPassword,
+    const String &coordinatorPolicy,
+    bool writeToSd,
+    String &error
+)
+{
+    error = "";
+
+    String normalizedId = clusterId;
+    normalizedId.trim();
+    normalizedId.toLowerCase();
+
+    String normalizedName = clusterName;
+    normalizedName.trim();
+
+    String normalizedCoordinatorPolicy = coordinatorPolicy;
+    normalizedCoordinatorPolicy.trim();
+    normalizedCoordinatorPolicy.toLowerCase();
+
+    if (enabled != 0 && enabled != 1) {
+        error = "cluster_enabled must be 0 or 1";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (!normalizedId.length() || !configClusterIdValid(normalizedId)) {
+        error = "cluster_id must be cl- followed by 32 lowercase hex characters";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (normalizedName.length() > 63) {
+        error = "cluster_name exceeds 63 characters";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (credentialEpoch == 0) {
+        error = "cluster_credential_epoch must be >= 1";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        clusterPassword.length() != 0 &&
+        (clusterPassword.length() < 8 || clusterPassword.length() > 63)
+    ) {
+        error = "cluster_password must be empty or 8..63 characters";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        normalizedCoordinatorPolicy != "auto" &&
+        normalizedCoordinatorPolicy != "preferred" &&
+        normalizedCoordinatorPolicy != "node"
+    ) {
+        error = "cluster_coordinator_policy must be auto, preferred or node";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (enabled && !normalizedName.length()) {
+        error = "cluster_enabled requires cluster_name";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (enabled && !clusterPassword.length()) {
+        error = "cluster_enabled requires cluster_password";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String text;
+    bool sourceRead = false;
+    if (activeConfigSource == CONFIG_SOURCE_SD && sdAvailableState && STORAGE.exists("/config.txt"))
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    if (!sourceRead && internalAvailableState && LittleFS.exists("/config.txt"))
+        sourceRead = readTextFile(LittleFS, "/config.txt", text);
+    if (!sourceRead && sdAvailableState && STORAGE.exists("/config.txt"))
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+
+    if (!sourceRead) {
+        error = "no persistent config.txt available for cluster settings save";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        !replaceOrAppendConfigKey(text, "cluster_enabled", String(enabled)) ||
+        !replaceOrAppendConfigKey(text, "cluster_id", normalizedId) ||
+        !replaceOrAppendConfigKey(text, "cluster_name", normalizedName) ||
+        !replaceOrAppendConfigKey(text, "cluster_credential_epoch", String((unsigned long)credentialEpoch)) ||
+        !replaceOrAppendConfigKey(text, "cluster_password", clusterPassword) ||
+        !replaceOrAppendConfigKey(text, "cluster_coordinator_policy", normalizedCoordinatorPolicy)
+    ) {
+        error = "could not patch cluster setting keys";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String validationError;
+    if (!configValidateText(text, validationError)) {
+        error = "patched config invalid: " + validationError;
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    ConfigSaveResult result = configSaveText(text, writeToSd, error);
+    if (result == CONFIG_SAVE_BOTH || result == CONFIG_SAVE_INTERNAL_ONLY) {
+        cfg_cluster_enabled = enabled;
+        cfg_cluster_id = normalizedId;
+        cfg_cluster_name = normalizedName;
+        cfg_cluster_credential_epoch = credentialEpoch;
+        cfg_cluster_password = clusterPassword;
+        cfg_cluster_coordinator_policy = normalizedCoordinatorPolicy;
+    }
+
+    return result;
+}
 
 ConfigSaveResult configSaveWifiSettings(
     const String &hostname,

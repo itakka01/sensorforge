@@ -4,6 +4,7 @@
 #include "audio_capture.h"
 #include "branding.h"
 #include "config.h"
+#include "device_identity.h"
 #include "logger.h"
 #include "log_storage.h"
 #include "radar.h"
@@ -24,7 +25,6 @@
 #include <Arduino.h>
 #include <FS.h>
 #include <WiFi.h>
-#include <Preferences.h>
 #include <algorithm>
 #include <esp_camera.h>
 #include <esp_heap_caps.h>
@@ -547,52 +547,6 @@ static String activeIpAddress()
     return String("0.0.0.0");
 }
 
-// Home Assistant needs a stable, non-secret identity that does not depend on
-// the user-editable hostname. Never expose the license hardware ID or MAC here.
-// A random 128-bit public integration ID is generated once and stored in NVS.
-static const String &integrationId()
-{
-    static String id;
-    if (id.length())
-        return id;
-
-    uint8_t bytes[16] = {};
-    bool persistent = false;
-
-    Preferences prefs;
-    if (prefs.begin("sfapi", false)) {
-        size_t read = prefs.getBytes("iid", bytes, sizeof(bytes));
-        if (read != sizeof(bytes)) {
-            esp_fill_random(bytes, sizeof(bytes));
-            persistent =
-                prefs.putBytes("iid", bytes, sizeof(bytes)) == sizeof(bytes);
-        } else {
-            persistent = true;
-        }
-        prefs.end();
-    }
-
-    // NVS should normally be available. If it is not, still return a valid
-    // per-boot identifier rather than leaking a hardware-derived identifier.
-    if (!persistent) {
-        esp_fill_random(bytes, sizeof(bytes));
-    }
-
-    static const char HEX_DIGITS[] = "0123456789abcdef";
-    char text[3 + 32 + 1];
-    text[0] = 's';
-    text[1] = 'f';
-    text[2] = '-';
-    for (size_t i = 0; i < sizeof(bytes); ++i) {
-        text[3 + i * 2] = HEX_DIGITS[(bytes[i] >> 4) & 0x0F];
-        text[4 + i * 2] = HEX_DIGITS[bytes[i] & 0x0F];
-    }
-    text[35] = '\0';
-
-    id = text;
-    return id;
-}
-
 static void handleDevice()
 {
     if (!authenticate())
@@ -610,7 +564,7 @@ static void handleDevice()
         ",\"integration_api_version\":\"" +
             String(INTEGRATION_API_VERSION_MAJOR) + "." +
             String(INTEGRATION_API_VERSION_MINOR) +
-        "\",\"integration_id\":\"" + jsonEscape(integrationId()) +
+        "\",\"integration_id\":\"" + jsonEscape(deviceIntegrationId()) +
         "\",\"device_id\":\"" + jsonEscape(cfg_hostname) +
         "\",\"app\":\"" + jsonEscape(String(Branding::APP_NAME)) +
         "\",\"platform\":\"" + jsonEscape(String(Branding::PLATFORM)) +
@@ -680,7 +634,7 @@ static void handleIntegrationState()
         "\",\"integration_api_version\":\"" +
             String(INTEGRATION_API_VERSION_MAJOR) + "." +
             String(INTEGRATION_API_VERSION_MINOR) +
-        "\",\"integration_id\":\"" + jsonEscape(integrationId()) +
+        "\",\"integration_id\":\"" + jsonEscape(deviceIntegrationId()) +
         "\",\"device_id\":\"" + jsonEscape(cfg_hostname) +
         "\",\"uptime_ms\":" + String((unsigned long)millis()) +
         ",\"network_mode\":\"" + String(networkModeApiName()) +
@@ -740,7 +694,7 @@ static void handleShooterStatus()
 
     String json =
         "{\"ok\":true,\"api_version\":\"" + jsonEscape(syncApiVersionText()) +
-        "\",\"integration_id\":\"" + jsonEscape(integrationId()) +
+        "\",\"integration_id\":\"" + jsonEscape(deviceIntegrationId()) +
         "\",\"device_id\":\"" + jsonEscape(cfg_hostname) +
         "\",\"enabled\":" + String(cfg_shooter_enabled ? "true" : "false") +
         ",\"storage_format\":\"" + jsonEscape(cfg_shooter_storage_format) +

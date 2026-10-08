@@ -1,7 +1,7 @@
 # SensorForge Local API v1
 
-Status: 2026-10-03  
-Firmware worktree: **v87 Beta 21**  
+Status: 2026-10-08  
+Firmware worktree: **v87 Beta 34**  
 Host protocol: **1.22**  
 Integration profile: **1.1**
 

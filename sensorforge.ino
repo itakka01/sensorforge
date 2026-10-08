@@ -57,6 +57,7 @@
 #include "streamer.h"
 #include "firmware_security.h"
 #include "wireguard_manager.h"
+#include "cluster.h"
 
 
 // =============================================================
@@ -392,6 +393,7 @@ static bool wifiAliveScheduleOwnsSession = false;
 static uint32_t wifiAliveScheduleLastServiceMs = 0;
 static bool wifiAliveScheduleClockWarningLogged = false;
 static bool wifiAliveLightSleepWakeArmed = false;
+static time_t wifiAliveScheduleEndEpoch = 0;
 static const uint32_t WIFI_ALIVE_POST_WINDOW_IDLE_SECONDS = 30UL;
 
 // Runtime continuous-shooter scheduler and PSRAM queue.
@@ -2836,6 +2838,7 @@ static void serviceWifiAliveSchedule()
     if (streamerModeEnabled()) {
         wifiAliveScheduleWindowActive = false;
         wifiAliveScheduleOwnsSession = false;
+        wifiAliveScheduleEndEpoch = 0;
         return;
     }
 
@@ -2850,7 +2853,7 @@ static void serviceWifiAliveSchedule()
     wifiAliveScheduleLastServiceMs = nowMs;
 
     bool scheduleActive = false;
-    time_t scheduleEndEpoch = 0;
+    time_t evaluatedScheduleEndEpoch = 0;
     time_t nextStartEpoch = 0;
 
     if (cfg_wifi_alive_schedule_enabled) {
@@ -2867,13 +2870,18 @@ static void serviceWifiAliveSchedule()
             wifiAliveScheduleEvaluate(
                 nowEpoch,
                 scheduleActive,
-                scheduleEndEpoch,
+                evaluatedScheduleEndEpoch,
                 nextStartEpoch
             );
         }
     } else {
         wifiAliveScheduleClockWarningLogged = false;
     }
+
+    wifiAliveScheduleEndEpoch =
+        scheduleActive
+        ? evaluatedScheduleEndEpoch
+        : 0;
 
     const bool wasActive = wifiAliveScheduleWindowActive;
     wifiAliveScheduleWindowActive = scheduleActive;
@@ -13223,6 +13231,7 @@ static void enterThermalEmergencySleep(
             "Thermal emergency: WiFi OFF"
         );
     } else {
+        clusterNetworkStop();
         MDNS.end();
         WiFi.softAPdisconnect(true);
         WiFi.disconnect(true, false);
@@ -14563,6 +14572,10 @@ void startWebConfig()
         }
     }
 
+    // Cluster networking is optional and owns only its UDP multicast socket.
+    // The central mDNS responder stays owned by this WiFi lifecycle.
+    clusterNetworkStart();
+
     if (MDNS.begin(cfg_hostname.c_str())) {
         consoleWrite(
             "WIFI",
@@ -14572,6 +14585,8 @@ void startWebConfig()
         if (streamerModeEnabled() && cfg_streamer_rtsp_enabled) {
             MDNS.addService("rtsp", "tcp", 554);
         }
+
+        clusterMdnsAdvertise();
     }
 
     // Kamera bereits für Live-Preview initialisieren.
@@ -14615,6 +14630,7 @@ void stopWebConfigWifi(
             false;
     }
 
+    clusterNetworkStop();
     MDNS.end();
 
     WiFi.softAPdisconnect(true);
@@ -14794,6 +14810,50 @@ bool handleWifiInactivityTimeout()
     );
 
     return true;
+}
+
+
+static int32_t clusterApproxWifiRemainingSeconds()
+{
+    if (!webConfigStarted)
+        return 0;
+
+    // Streamer mode intentionally owns a continuously reachable network.
+    // There is no ordinary SensorForge auto-off deadline to announce.
+    if (streamerModeEnabled())
+        return -1;
+
+    if (
+        wifiAliveScheduleWindowActive &&
+        wifiAliveScheduleEndEpoch > 0 &&
+        timeIsValid()
+    ) {
+        const time_t nowEpoch = time(nullptr);
+        if (wifiAliveScheduleEndEpoch <= nowEpoch)
+            return 0;
+
+        const int64_t remaining =
+            (int64_t)wifiAliveScheduleEndEpoch -
+            (int64_t)nowEpoch;
+
+        if (remaining > INT32_MAX)
+            return INT32_MAX;
+
+        return (int32_t)remaining;
+    }
+
+    if (wifiAliveScheduleOwnsSession) {
+        return webConfigInactivityRemainingSeconds(
+            WIFI_ALIVE_POST_WINDOW_IDLE_SECONDS
+        );
+    }
+
+    if (cfg_wifi_timeout_sec <= 0)
+        return -1;
+
+    return webConfigInactivityRemainingSeconds(
+        (unsigned long)cfg_wifi_timeout_sec
+    );
 }
 
 
@@ -16122,6 +16182,7 @@ static void serviceStreamerNetworkRecovery()
         webConfigStarted = false;
     }
 
+    clusterNetworkStop();
     MDNS.end();
     WiFi.softAPdisconnect(true);
     WiFi.disconnect(true, false);
@@ -16164,6 +16225,17 @@ void loop() {
 
     // Non-blocking recording/fault LED state.
     updateStatusLed();
+
+    // Optional cluster service is deliberately independent of recorder/streamer
+    // policy and is a no-op unless cluster runtime started with WiFi. The
+    // remaining-WiFi estimate is status metadata only; the cluster never opens
+    // or prolongs the radio because of it.
+    if (clusterRuntimeActive()) {
+        clusterSetWifiRemainingSeconds(
+            clusterApproxWifiRemainingSeconds()
+        );
+    }
+    clusterLoop();
 
     if (streamerModeEnabled()) {
         // Streamer mode deliberately bypasses all recording, shooter and sleep

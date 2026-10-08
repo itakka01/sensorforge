@@ -32,6 +32,12 @@ bool webConfigRecordingPaused();
 // timeoutSec == 0 always returns false.
 bool webConfigInactiveFor(unsigned long timeoutSec);
 
+// Remaining seconds until the same inactivity timeout would currently fire.
+// Returns -1 when the timeout is not applicable/known (WebConfig inactive,
+// timeout disabled, maintenance hold active, etc.). This is read-only status
+// information and does not alter or prolong the WiFi/WebConfig lifecycle.
+int32_t webConfigInactivityRemainingSeconds(unsigned long timeoutSec);
+
 // Diagnostic tools
 void webSystemInfo();
 void webPSRAMTest();
