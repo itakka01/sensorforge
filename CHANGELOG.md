@@ -1,12 +1,93 @@
 # SensorForge Changelog
 
-Current development worktree: **v87-beta38**  
+Current development worktree: **v87-beta49**  
 Last stable official release: **v86**  
 Core branding version: **7.1.0**
 
 This changelog is intentionally concise. Detailed intermediate experiments and
 superseded implementation notes belong in Git history and the project re-entry
 document, not in an ever-growing release file.
+
+
+
+## v87-beta49 — 2026-10-08
+
+- Compile-only fix for the Beta 48 Cluster restart page. `webconfig.cpp` now includes `cluster.h`, which declares `clusterEffectiveId()`.
+- No runtime, Cluster protocol, WiFi, storage, recording, or configuration behavior changed.
+
+## v87-beta48 — 2026-10-08
+
+- Fixed first-use Known-Cluster profile lookup on new boards: the NVS namespace does not exist until the first profile is written, and opening it read-only was previously reported as `cluster profile storage unavailable`. Explicit join/save lookup now opens the profile namespace read-write so an empty namespace is initialized safely; a truly unavailable NVS backend still remains an error.
+- Cluster settings now follow the same boot-owned apply model as WiFi settings. After a successful persistent cluster save, WebConfig shows a dedicated restart notice and schedules a controlled reboot. This guarantees the newly saved membership/ID/password/policy is applied by a fresh `clusterNetworkStart()` instead of leaving `restart_required` with an inactive/old runtime.
+- Passive discovery behavior itself is unchanged: only active cluster members emit public `SFD1` discovery announcements every heartbeat, and a disabled device listens only while `/cluster` is actively open. The UI now states that only active Beta-38-or-newer members are discoverable.
+- No change to cluster authentication, election ordering, heartbeat/lease timing, resource announcements, WiFi ownership or recording/streaming paths.
+
+## v87-beta47 — 2026-10-08
+
+- Fixed a real no-SD boot crash observed after Beta 46: after the five expected SD mount retries, the ESP32-S3 entered config load/recovery and hit `Stack canary watchpoint triggered (loopTask)`, causing a reboot loop before WiFi could start.
+- The SD failure itself is not treated as fatal. The crash source was excessive nested stack use in config parsing/default/recovery: `ConfigValues` has grown with Camera/Audio/WiFi/Cluster/etc. and several paths created large local instances or return-value temporaries on Arduino's loopTask stack.
+- Reworked the config working-object lifetime without changing schema/semantics: defaults are filled into an existing object, validation/parsing/apply/factory-reset temporary `ConfigValues` objects are allocated with bounded temporary heap storage, and the boot load path no longer keeps large `ConfigValues` locals on the loopTask stack.
+- This also makes Beta-45 orphaned `/config.tmp` recovery safer, because its validation no longer adds another large `ConfigValues` frame underneath the boot/config call chain.
+- Config priority remains SD > internal LittleFS > firmware defaults. Missing SD remains a supported condition; WiFi, Cluster, recording policy and config contents are otherwise unchanged.
+
+## v87-beta46 — 2026-10-08
+
+- WiFi settings are now applied through a controlled reboot immediately after a successful, verified save. Previously the runtime config was updated while the old WiFi interface kept running; a later inactivity timeout could shut that old interface down without ever starting the newly configured STA/fallback path.
+- After saving, WebConfig redirects to a dedicated restart/reconnect notice showing the new device name, selected network mode and fallback policy before the old connection disappears.
+- The existing STA profile connection and hotspot fallback logic is unchanged; it is now deterministically re-entered by the reboot.
+- No change to recording, cluster, storage, config persistence format or WiFi timeout semantics.
+
+## v87-beta45 — 2026-10-08
+
+- Fixed a concrete atomic-config recovery bug exposed by a fresh board without SD: if the very first internal save was interrupted after a complete `/config.tmp` had been written but before `/config.txt` existed, boot recovery previously deleted that temporary file and the device fell back to firmware defaults.
+- `recoverAtomicFiles()` now reads and validates an orphaned `/config.tmp`; when valid and no older `/config.txt`/`/config.bak` exists, it reconstructs `/config.txt` from that candidate and only removes the temp file after the final path is verified. Invalid/incomplete temp files are still discarded.
+- `atomicWriteText()` no longer treats a successful `rename()` alone as a committed save. The final `/config.txt` is reopened, compared byte-for-byte with the intended text and validated before the backup is discarded or success is returned.
+- On a first-ever save, if the metadata rename cannot produce a verified final file, the same already-validated text is written directly to `/config.txt` and verified. Existing-config updates retain backup/rollback semantics.
+- This change is inside the shared config persistence layer; WiFi semantics, SD priority, Cluster, recording and streaming behavior are unchanged.
+
+
+## v87-beta44 — 2026-10-08
+
+- WiFi WebConfig display-only fix: the shown `Hotspot-Name` now updates immediately while the user edits `Gerätename` / `hostname` at the top of the same page.
+- The preview uses browser `textContent`; it does not save, restart, open or reconfigure WiFi. The actual hotspot name is still persisted only through the existing WiFi Save path and becomes active according to the existing network/reboot lifecycle.
+- No config format, WiFi runtime, fallback, Cluster, recording, storage or persistence behavior was changed.
+
+
+## v87-beta43 — 2026-10-08
+
+- Hardened the internal LittleFS configuration store after a real no-SD first-run test showed that a saved internal config could disappear or become unavailable after reboot and WebConfig then fell back to firmware defaults.
+- Removed destructive unconditional mount-failure recovery. SensorForge now retries a normal LittleFS mount and automatically formats only when the exact internal `spiffs` data partition is demonstrably blank/erased (fresh first-run case).
+- If LittleFS mount fails while flash data is already present, SensorForge preserves that data and does **not** format the filesystem. Runtime falls back safely, allowing the existing WiFi recovery behavior to keep the device reachable where possible.
+- Added exact internal-config diagnostics: `valid`, `missing`, `invalid`, `unavailable`, plus a detail string such as validation/decryption failure or mount-failure preservation. `/config` now shows this reason instead of the ambiguous `missing / invalid` text.
+- Internal config writes still use the existing validated atomic write + SFSEC1 protection path. SD priority, WiFi configuration semantics, Cluster, recording and storage behavior are otherwise unchanged.
+- This is a persistence hardening/diagnostic release; the reported fresh-board issue must be re-tested on real hardware before claiming the underlying LittleFS failure mode is fully closed.
+
+
+## v87-beta42 — 2026-10-08
+
+- Hardened WiFi provisioning after the Beta-40/41 first-run path. The dedicated WiFi save now rejects `hotspot_enabled=0` (infrastructure/STA mode) when no SSID profile is configured, instead of persisting a state that can never connect.
+- Added a narrow boot-time recovery for historical/partially provisioned configs that already contain STA mode with zero configured SSIDs: SensorForge starts the normal local hotspot as a recovery path even if the stored fallback flag is `0`.
+- This recovery does **not** override the explicit `Offline bleiben` choice when at least one actual infrastructure WiFi profile exists. If configured profiles exist but are unreachable and fallback is disabled, the established offline behavior remains authoritative.
+- Successful STA connection, normal hotspot mode, WiFi timeout, schedule, Cluster networking and all recording/storage paths are unchanged.
+
+## v87-beta41 — 2026-10-08
+
+- Changed only the factory/default value of `hotspot_fallback_enabled` from `0` to `1`.
+- When infrastructure WiFi is selected and no configured network is reachable, a factory/default configuration now falls back to the device hotspot instead of remaining offline.
+- Existing persisted configs remain authoritative: a device that already stores `hotspot_fallback_enabled=0` stays on `0` until the user changes it.
+- The normal hotspot/STA lifecycle, fallback implementation, WiFi timeout and Beta-40 first-run persistence path are otherwise unchanged.
+
+## v87-beta40 — 2026-10-08
+
+- Fixed first-run WiFi persistence on a freshly flashed board with no SD card and no existing internal `/config.txt`.
+- `configSaveWifiSettings()` now uses the existing canonical `configBuildFactoryDefaultText()` output as the complete initial baseline only when neither SD nor LittleFS contains a persistent config, then patches the requested WiFi keys and passes the result through the unchanged validation, SFSEC1 secret-protection and `configSaveText()` path.
+- The first successful save creates only the internal LittleFS `/config.txt`; it does not create an SD config. Existing SD > internal > defaults priority and later SD synchronization rules remain unchanged.
+- Existing boards that already have a persistent config follow the exact previous patch path; no camera, recording, Cluster, WiFi runtime or SD behavior was otherwise changed.
+
+## v87-beta39 — 2026-10-08
+
+- Fixed an Arduino-ESP32 3.3.12 compile error in `cluster.cpp`: Arduino defines `HEX` as a macro in `Print.h`, which collided with the local hexadecimal lookup-table name used by `textToHex()`.
+- Renamed only that local lookup table to `HEX_DIGITS`; Cluster protocol, configuration, networking, credentials, election and runtime behavior are unchanged from Beta 38.
 
 ## v87-beta38 — 2026-10-08
 

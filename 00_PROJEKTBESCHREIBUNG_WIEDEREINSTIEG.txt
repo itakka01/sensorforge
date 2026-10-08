@@ -1,7 +1,17 @@
+======================================================================
+V87 BETA 49 2026-10-08 - CLUSTER RESTART PAGE COMPILE FIX
+======================================================================
+
+- Reiner Compile-Fix auf Basis von Beta 48.
+- webconfig.cpp bindet cluster.h ein, damit clusterEffectiveId() auf der
+  Cluster-Neustartseite deklariert ist.
+- Keine Aenderung an Cluster-Protokoll, WiFi, Config, Storage, Recording oder
+  sonstigem Laufzeitverhalten.
+
 SENSORFORGE / ESP32-S3 CAMERA (XIAO + FREENOVE)
 PROJEKTBESCHREIBUNG, AKTUELLER RELEASESTAND UND WIEDEREINSTIEG
 Stand: 2026-10-08
-Autoritativer Arbeitsstand: v87 Beta 38
+Autoritativer Arbeitsstand: v87 Beta 48
 Letzter stabiler offizieller Release: v86 (2026-10-01)
 Core-Version / Branding: 7.1.0
 Host API: 1.22
@@ -11,7 +21,7 @@ Integration-/App-Profil: 1.1
 1. VERBINDLICHER WIEDEREINSTIEGSPUNKT
 ======================================================================
 
-Der vollstaendige Quellstand v87-beta38 ist die aktuelle autoritative Basis.
+Der vollstaendige Quellstand v87-beta49 ist die aktuelle autoritative Basis.
 Aeltere Arbeitsordner, Zwischen-ZIPs und historische Beta-Staende duerfen nicht
 als Ausgangspunkt fuer neue Aenderungen verwendet werden.
 
@@ -40,6 +50,16 @@ Bei jeder Aenderung gelten verbindlich diese Arbeitsregeln:
 
 Aktueller Entwicklungsstand:
 
+- v87-beta48: Cluster-Erstbenutzung/Apply-Lifecycle korrigiert. Ein fabrikneues Board besitzt noch keinen NVS-Namespace `sfclprof`; ein read-only Preferences-Open wurde bisher faelschlich als `cluster profile storage unavailable` behandelt. Beim expliziten Join/Save wird der leere Namespace nun sicher initialisiert; echte NVS-Fehler bleiben Fehler. Zusaetzlich werden Cluster-Einstellungen nach verifiziertem Save nicht mehr nur persistent geschrieben und mit `restart_required` stehen gelassen, sondern ueber eine sichtbare Neustartseite und kontrollierten Reboot in einen frischen Cluster-Runtime-Start ueberfuehrt. Passive Discovery bleibt unveraendert: nur aktive Cluster-Mitglieder ab Beta 38 senden SFD1; ein deaktiviertes Geraet hoert nur solange `/cluster` offen ist und sendet dabei nichts.
+- v87-beta47: realen No-SD-Bootcrash aus Beta 46 behoben. Nach den erwarteten fuenf SD-Mount-Fehlversuchen lief das System in `Stack canary watchpoint triggered (loopTask)` und rebootete, bevor Config/WiFi starten konnten. Die fehlende SD selbst bleibt ein erlaubter Zustand; Ursache war die inzwischen grosse `ConfigValues`-Struktur, die in verschachtelten Config-Validierungs-/Default-/Recovery-Pfaden mehrfach als lokale Stack-Arbeitsvariable/Temporary angelegt wurde. Beta 47 fuellt Defaults nun in bestehende Objekte und legt die grossen temporaeren ConfigValues fuer Validation/Parse/Apply/Factory-Pfade kurzlebig auf dem Heap statt auf dem Arduino-loopTask-Stack an. Besonders der Beta-45-Recoverypfad fuer `/config.tmp` kann dadurch beim Boot validieren, ohne den Task-Stack zu ueberlaufen. Config-Schema und Prioritaet SD > LittleFS > Defaults bleiben unveraendert.
+- v87-beta46: WiFi-Save/Apply-Lifecycle korrigiert. Ein erfolgreicher WiFi-Save aktualisierte zuvor bereits die Runtime-Config, liess aber das aktuell laufende Funkinterface im alten Modus weiterlaufen und plante keinen Neustart. Dadurch konnte der normale WiFi-Inaktivitaets-Timeout spaeter das alte Interface abschalten, ohne dass der neu konfigurierte STA-/Fallback-Pfad je gestartet wurde. Ab Beta 46 wird nach verifiziert erfolgreichem Save ein kontrollierter Reboot geplant und vorher eine eigene Reconnect-Seite mit neuem Geraetenamen, Netzwerkmodus und Fallback-Status angezeigt. STA-Verbindungsversuche und Hotspot-Fallback selbst bleiben unveraendert und werden nach dem Boot deterministisch ueber startWebConfig() angewendet.
+- v87-beta45: atomaren Config-Persistenzpfad nach erneutem No-SD-Hardwarebefund gehaertet. Konkreter Fehler: bei einem unterbrochenen allerersten internen Save konnte bereits eine vollstaendig geschriebene/valide `/config.tmp` existieren, waehrend `/config.txt` und `/config.bak` noch fehlten; die bisherige Boot-Recovery loeschte diese einzige gute Kopie blind und fiel danach auf Firmware-Defaults zurueck. Ab Beta 45 wird eine solche Temp-Datei gelesen/validiert und erst nach erfolgreich verifiziertem Wiederaufbau von `/config.txt` entfernt. Zusaetzlich gilt ein atomarer Save erst als erfolgreich, wenn die finale `/config.txt` nach dem Rename erneut gelesen, bytegleich verglichen und validiert wurde; beim ersten Save existiert ein direkter verifizierter Final-Write-Fallback. Bestehende Config-Updates behalten Backup/Rollback; WiFi-/SD-/Cluster-/Recording-Semantik bleibt unveraendert.
+- v87-beta44: reine WiFi-WebConfig-Anzeigeaenderung. Der unter `Eigener Hotspot` gezeigte Hotspot-Name folgt nun live dem noch ungespeicherten Feld `Geraetename`/`hostname`. Die Anzeige aendert keine Persistenz und startet/konfiguriert WiFi nicht; wirksam gespeichert wird weiterhin ausschliesslich ueber den bestehenden WiFi-Save-/Lifecycle-Pfad.
+- v87-beta43: internen LittleFS-Config-Speicher nach realem First-Run-Test ohne SD gehaertet. Ein LittleFS-Mountfehler fuehrt nicht mehr automatisch zu einem Formatieren bereits beschriebener Flash-Daten. Normaler Mount wird begrenzt wiederholt; automatisch formatiert wird nur, wenn die konkrete interne `spiffs`-Partition nachweislich blank/erased ist. Bei nicht-leerer Partition werden Daten bei Mountfehler erhalten. `/config` zeigt den internen Zustand nun getrennt als valid/missing/invalid/unavailable plus genaue Detailursache (z.B. Validierungs-/SFSEC1-Fehler oder Mountfehler). Speicherprioritaet SD > intern > Defaults bleibt unveraendert. Hardware-Re-Test des konkreten Fehlerbilds ist erforderlich, bevor der Low-Level-Fall als abgeschlossen gilt.
+- v87-beta42: WiFi-Provisioning gehaertet. Die dedizierte WiFi-Seite lehnt STA/externes WLAN ohne mindestens ein SSID-Profil ab. Historische/teilkonfigurierte Configs mit `hotspot_enabled=0` und gleichzeitig null SSIDs starten beim Boot den normalen lokalen Hotspot als Recovery-Pfad, auch wenn ein altes `hotspot_fallback_enabled=0` gespeichert ist. Sobald mindestens ein echtes STA-Profil existiert, bleibt die explizite Auswahl `Offline bleiben` unveraendert autoritativ. Keine Aenderung an erfolgreichem STA-Betrieb, Timeout, Schedule, Cluster, Recording oder Storage.
+- v87-beta41: Factory-/Firmware-Default `hotspot_fallback_enabled` von 0 auf 1 geaendert. Wenn Infrastruktur-WLAN gewaehlt ist und kein gespeichertes WLAN erreichbar ist, ist der Default nun Fallback auf den eigenen Hotspot statt offline bleiben. Bereits persistierte Configs werden nicht migriert oder ueberschrieben; ein dort explizit gespeichertes 0 bleibt 0.
+- v87-beta40: First-Run-Fix fuer fabrikneue Boards ohne SD und ohne internen Config-Shadow; der erste WiFi-Save baut die bestehende kanonische Factory-Default-Konfiguration als Basis, patcht nur die WiFi-Werte und persistiert sie ueber den normalen validierten/SFSEC1-geschuetzten LittleFS-Pfad. Es wird dabei keine SD-config.txt neu erzeugt; SD > intern > Defaults bleibt unveraendert.
+- v87-beta39: reiner Arduino-ESP32-3.3.12-Build-Fix in cluster.cpp; lokale HEX-Lookup-Tabelle wegen Kollision mit dem Arduino-Makro HEX in HEX_DIGITS umbenannt; keine Cluster-Laufzeitlogik geaendert
 - v87-beta38: passive Cluster-Suche nur waehrend geoeffneter /cluster-Seite, stabile cluster_id, Credential-Epoch und hardwareverschluesselter Known-Cluster-Cache
 - v87-beta37: automatische Coordinator-Wahl mit Auto/Preferred/Node-only-Policy, Coordinator-Epoch und signierten Node->Coordinator-Unicast-Heartbeats mit ACK
 - v87-beta36: Cluster-Liveness auf 10-s-Heartbeat / 60-s-Lease erweitert

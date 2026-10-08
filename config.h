@@ -229,6 +229,8 @@ bool configSdPresent();
 bool configSdValid();
 bool configInternalAvailable();
 bool configInternalValid();
+const char *configInternalStatusName();
+String configInternalStatusDetail();
 
 
 // Re-check the current SD /config.txt without changing the

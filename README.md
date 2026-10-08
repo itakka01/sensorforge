@@ -3,7 +3,7 @@
 SensorForge is an ESP32-S3 camera/sensor firmware for autonomous event recording
 and optional local network streaming.
 
-**Current development worktree:** `v87-beta38` (2026-10-08)  
+**Current development worktree:** `v87-beta49` (2026-10-08)  
 **Last stable official release:** `v86` (2026-10-01)  
 **Core branding version:** `7.1.0`  
 **Local API:** `1.22` / Integration profile `1.1`
@@ -38,9 +38,33 @@ profile.
 - local TRIAL / DEMO usage policy
 - optional authenticated local device cluster discovery/status and resource announcements
 
+WiFi provisioning safety in Beta 42: infrastructure/STA mode cannot be saved without at least one SSID profile. Historical configs that already contain STA mode with zero SSIDs boot into the local recovery hotspot; an explicit `Offline bleiben` setting remains authoritative when real STA profiles exist.
+
+Beta 44 changes only WiFi WebConfig presentation: the displayed hotspot-name preview follows edits to the device hostname immediately, before Save. The persisted/runtime hotspot behavior remains unchanged.
+
+
+Beta 46 makes WiFi configuration boot-consistent: after a verified save, SensorForge shows a reconnect/restart notice and performs a controlled reboot so hostname, STA/AP mode, WiFi profiles, fallback policy and TX power are applied together by the existing network startup path. This prevents the previous mixed state where new runtime values coexisted with the old active interface until the inactivity timeout shut it down.
+
+Beta 45 hardens the shared atomic configuration writer/recovery after the no-SD first-run persistence fault. A valid orphaned `/config.tmp` from an interrupted first commit is recovered instead of discarded, and a save is not reported successful until the final `/config.txt` path is reopened, byte-compared and validated.
+
 H.264 is not implemented on the current XIAO/Freenove profiles. WireGuard/VPN is
 architecturally prepared but has no qualified runtime backend in the current
 reference build.
+
+
+## Current Cluster activation/discovery fix
+
+`v87-beta49` is a compile-only follow-up to Beta 48: `webconfig.cpp` now includes `cluster.h` so the Cluster restart page can resolve `clusterEffectiveId()`. Runtime behavior is unchanged.
+
+`v87-beta48` fixes two first-use Cluster issues. A brand-new device no longer mistakes a not-yet-created Known-Cluster NVS namespace for failed storage when resolving a saved password. Cluster saves are now boot-consistent: after a verified save SensorForge shows a restart notice and performs a controlled reboot so the saved membership/credentials/policy become the active Cluster runtime. Passive discovery still sends nothing from a disabled device; it only listens while `/cluster` is open. A remote Cluster appears in the dropdown only when at least one remote member is actually running the Cluster runtime (Beta 38 or newer) on the same local WiFi.
+
+## Current no-SD boot fix
+
+`v87-beta47` fixes a hardware-observed `loopTask` stack-canary reboot immediately after the expected SD retry failure on a board with no SD card. Missing SD remains supported. Large temporary `ConfigValues` objects used by config validation/default/recovery are no longer nested on the Arduino loop-task stack; they use short-lived heap storage instead. Config schema, SD > LittleFS > defaults priority and WiFi behavior are unchanged.
+
+## Current beta persistence fix
+
+`v87-beta45` hardens the shared atomic config writer/recovery. On a first internal save, a complete validated `/config.tmp` is now recoverable after an interrupted commit instead of being discarded when `/config.txt` does not yet exist. A save is reported successful only after the final `/config.txt` path itself has been reopened, byte-compared and validated. This specifically protects fresh/no-SD provisioning while preserving the existing SD > internal > defaults priority.
 
 ## Product modes
 
@@ -92,6 +116,14 @@ Relevant tool:
 
 Secure Boot / Flash Encryption / anti-rollback remain separate future hardening
 projects and are not silently enabled by normal firmware or license work.
+
+## Configuration persistence
+
+Configuration priority remains **valid SD `/config.txt` → valid internal LittleFS shadow → firmware defaults**. A freshly flashed board may therefore boot and expose WebConfig without an SD card. From Beta 40, the first WiFi-settings save on such a board creates the initial complete internal `/config.txt` from the canonical factory-default serializer and then applies the requested WiFi changes through the normal validation/SFSEC1 save path. It does not create an SD config. Recording/storage features still require the corresponding storage hardware.
+
+Beta 43 hardens the internal LittleFS persistence boundary. A failed mount is no longer treated as permission to format arbitrary existing flash data. SensorForge retries a normal mount and may auto-format only when the exact filesystem partition is verifiably blank/erased. If non-blank flash cannot be mounted, its contents are preserved and `/config` reports an exact internal-shadow status/detail for diagnosis instead of silently erasing the previous configuration.
+
+From Beta 41, the factory/default WiFi fallback is enabled: when infrastructure WiFi is selected and none of the configured networks can be reached, SensorForge falls back to its own hotspot. Existing persisted configs keep their explicitly stored fallback value.
 
 ## WebConfig modules
 

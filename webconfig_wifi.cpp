@@ -167,7 +167,7 @@ String webconfigWifiSettingsHtml(const String &notice)
     html +=
         "<section id='hotspotBlock' class='settings-section wifi-mode-block'><h3>Eigener Hotspot</h3>"
         "<div class='config-field-grid'>"
-        "<div class='config-label'>Hotspot-Name</div><div class='config-control'><span class='mono'>" + wifiUiHtmlEscape(cfg_hostname) + "</span></div>"
+        "<div class='config-label'>Hotspot-Name</div><div class='config-control'><span id='wifiHotspotNamePreview' class='mono'>" + wifiUiHtmlEscape(cfg_hostname) + "</span></div>"
         "<div class='config-note'>Der Hotspot verwendet den oben eingestellten Gerätenamen.</div>"
         "<div class='config-label'>Hotspot-Passwort</div>"
         "<div class='config-control'><input type='password' name='hotspot_password' minlength='8' maxlength='63' autocomplete='new-password' value='' placeholder='Leer lassen = bestehende Einstellung behalten'></div>"
@@ -327,9 +327,9 @@ String webconfigWifiSettingsHtml(const String &notice)
 
     html +=
         "<script>(function(){"
-        "var f=document.getElementById('wifiSettingsForm'),b=document.getElementById('wifiSaveBar'),s=document.getElementById('wifiSaveState'),btn=document.getElementById('wifiSaveButton'),list=document.getElementById('wifiProfileList'),scanBtn=document.getElementById('wifiScanButton'),scanStatus=document.getElementById('wifiScanStatus'),scanResults=document.getElementById('wifiScanResults'),scanBackdrop=document.getElementById('wifiScanBackdrop'),scanClose=document.getElementById('wifiScanClose'),ext=document.getElementById('externalWifiBlock'),ap=document.getElementById('hotspotBlock'),ib=document.getElementById('wifiInfoBackdrop'),it=document.getElementById('wifiInfoTitle'),ic=document.getElementById('wifiInfoBody'),ix=document.getElementById('wifiInfoClose'),aliveTable=document.getElementById('wifiAliveTable'),aliveAdd=document.getElementById('wifiAliveAdd'),aliveSerialized=document.getElementById('wifiAliveSerialized');"
+        "var f=document.getElementById('wifiSettingsForm'),b=document.getElementById('wifiSaveBar'),s=document.getElementById('wifiSaveState'),btn=document.getElementById('wifiSaveButton'),list=document.getElementById('wifiProfileList'),scanBtn=document.getElementById('wifiScanButton'),scanStatus=document.getElementById('wifiScanStatus'),scanResults=document.getElementById('wifiScanResults'),scanBackdrop=document.getElementById('wifiScanBackdrop'),scanClose=document.getElementById('wifiScanClose'),ext=document.getElementById('externalWifiBlock'),ap=document.getElementById('hotspotBlock'),ib=document.getElementById('wifiInfoBackdrop'),it=document.getElementById('wifiInfoTitle'),ic=document.getElementById('wifiInfoBody'),ix=document.getElementById('wifiInfoClose'),aliveTable=document.getElementById('wifiAliveTable'),aliveAdd=document.getElementById('wifiAliveAdd'),aliveSerialized=document.getElementById('wifiAliveSerialized'),hostnameInput=f.querySelector(\"input[name='hostname']\"),hotspotNamePreview=document.getElementById('wifiHotspotNamePreview');"
         "if(!f||!b||!s||!btn||!list)return;"
-        "function dirty(){b.classList.add('dirty');s.textContent='Ungespeicherte Änderungen';btn.disabled=false;}function updateMode(){var m=f.querySelector(\"select[name='hotspot_enabled']\"),fb=f.querySelector(\"select[name='hotspot_fallback_enabled']\");var hotspot=m&&m.value==='1',fallback=fb&&fb.value==='1';if(ext)ext.hidden=hotspot;if(ap)ap.hidden=!hotspot&&!fallback;}"
+        "function dirty(){b.classList.add('dirty');s.textContent='Ungespeicherte Änderungen';btn.disabled=false;}function syncHotspotName(){if(hostnameInput&&hotspotNamePreview)hotspotNamePreview.textContent=hostnameInput.value;}if(hostnameInput){hostnameInput.addEventListener('input',syncHotspotName);syncHotspotName();}function updateMode(){var m=f.querySelector(\"select[name='hotspot_enabled']\"),fb=f.querySelector(\"select[name='hotspot_fallback_enabled']\");var hotspot=m&&m.value==='1',fallback=fb&&fb.value==='1';if(ext)ext.hidden=hotspot;if(ap)ap.hidden=!hotspot&&!fallback;}"
         "function rows(){return Array.prototype.slice.call(list.querySelectorAll('.wifi-profile'));}function updateProfileActions(){rows().forEach(function(r){var ssid=r.querySelector('.wifi-ssid'),filled=ssid&&ssid.value.trim();['.wifi-up','.wifi-down','.wifi-delete'].forEach(function(sel){var x=r.querySelector(sel);if(x)x.style.display=filled?'':'none';});});}"
         "function renumber(){rows().forEach(function(r,i){r.querySelector('.wifi-profile-title').textContent=(i+1);r.dataset.slot=i+1;['wifi-ssid','wifi-pass','wifi-source'].forEach(function(c){var e=r.querySelector('.'+c);if(e)e.name=(c==='wifi-ssid'?'wifi_ssid_':c==='wifi-pass'?'wifi_pass_':'wifi_source_')+(i+1);});});}"
         "function ensureBlankRow(){var rs=rows(),visible=rs.filter(function(r){return r.style.display!=='none';}),hasBlank=visible.some(function(r){return !r.querySelector('.wifi-ssid').value.trim();});if(!hasBlank&&visible.length<5){for(var i=0;i<rs.length;i++){if(rs[i].style.display==='none'){rs[i].style.display='';break;}}}updateProfileActions();}"
@@ -462,6 +462,17 @@ bool webconfigWifiSaveRequest(
         wifiPasses[i] = "";
     }
 
+    const int hotspotEnabled = server.arg("hotspot_enabled").toInt() ? 1 : 0;
+
+    // A persistent STA configuration without even one SSID cannot ever become
+    // reachable. Reject that state at the dedicated WiFi save boundary instead
+    // of allowing a user to lock a device out. Existing historical configs are
+    // not reinterpreted here; this guard applies only to a new WiFi save.
+    if (!hotspotEnabled && outputProfile == 0) {
+        error = "Für externe WLAN-Netzwerke muss mindestens ein WLAN-Profil mit SSID konfiguriert sein.";
+        return false;
+    }
+
     String txPowerText = server.arg("wifi_tx_power_dbm");
     txPowerText.trim();
     char *txPowerEnd = nullptr;
@@ -471,7 +482,6 @@ bool webconfigWifiSaveRequest(
         return false;
     }
 
-    int hotspotEnabled = server.arg("hotspot_enabled").toInt() ? 1 : 0;
     int hotspotFallbackEnabled = server.arg("hotspot_fallback_enabled").toInt() ? 1 : 0;
 
     String hotspotPassword = server.arg("hotspot_password");

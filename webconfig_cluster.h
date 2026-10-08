@@ -6,6 +6,7 @@
 struct WebConfigClusterUiHooks {
     String (*htmlHeader)();
     String (*htmlFooter)();
+    void (*scheduleReboot)(uint32_t delayMs);
 };
 
 // Dedicated cluster configuration/status surface. The module only registers

@@ -12,7 +12,7 @@
 namespace {
 
 static WebServer *g_server = nullptr;
-static WebConfigClusterUiHooks g_uiHooks = {nullptr, nullptr};
+static WebConfigClusterUiHooks g_uiHooks = {nullptr, nullptr, nullptr};
 
 static WebServer &serverRef()
 {
@@ -91,7 +91,7 @@ static String clusterPageHtml()
         "</select></div>"
         "<div class='cluster-label'>Cluster auswählen</div>"
         "<div><select id='clusterChoice'><option value=''>Manuell / neuer Cluster</option></select></div>"
-        "<div class='cluster-note'>Solange diese Seite geöffnet ist, hört das Gerät rein passiv nach sichtbaren Clustern. Bei deaktiviertem Cluster sendet es dabei selbst keine Cluster-Pakete.</div>"
+        "<div class='cluster-note'>Solange diese Seite geöffnet ist, hört das Gerät rein passiv nach sichtbaren Clustern. Sichtbar sind aktive Cluster-Mitglieder ab Beta 38; nach einer neuen Cluster-Konfiguration muss deren Cluster-Runtime bereits gestartet sein. Bei deaktiviertem Cluster sendet dieses Gerät dabei selbst keine Cluster-Pakete.</div>"
         "<div class='cluster-label'>Cluster-ID</div>"
         "<div><input name='cluster_id' id='clusterId' maxlength='35' autocomplete='off' value='" +
         htmlEscape(clusterEffectiveId()) + "' placeholder='wird bei neuem Cluster automatisch erzeugt'></div>"
@@ -380,7 +380,16 @@ static void handleClusterSave()
         " | restart_required=" + String(clusterRestartRequired() ? "yes" : "no")
     );
 
-    server.sendHeader("Location", "/cluster?notice=saved");
+    // Cluster runtime is owned by the WiFi/network lifecycle. Apply a saved
+    // membership/policy change only after a clean reboot so the current radio
+    // session can never run with old runtime credentials and new persisted
+    // settings mixed together. The config commit above has already completed.
+    if (g_uiHooks.scheduleReboot) {
+        g_uiHooks.scheduleReboot(4000UL);
+        server.sendHeader("Location", "/rebooting?reason=cluster_settings");
+    } else {
+        server.sendHeader("Location", "/cluster?notice=saved");
+    }
     server.send(303, "text/plain; charset=utf-8", "");
 }
 

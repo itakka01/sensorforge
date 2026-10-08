@@ -14553,7 +14553,31 @@ void startWebConfig()
         if (!startConfiguredHotspot(false))
             return;
     } else {
-        if (!wifiConnectConfiguredInfrastructure(8000UL, "Infrastructure WiFi")) {
+        bool anyInfrastructureProfile = false;
+        for (size_t i = 0; i < SENSORFORGE_WIFI_PROFILE_COUNT; ++i) {
+            if (cfg_wifi_ssids[i].length()) {
+                anyInfrastructureProfile = true;
+                break;
+            }
+        }
+
+        if (!anyInfrastructureProfile) {
+            // Historical or partially provisioned configs can contain
+            // hotspot_enabled=0 without a single SSID. Such a state has no
+            // possible infrastructure connection and would otherwise make the
+            // device unreachable, especially when fallback was also disabled.
+            // Treat this impossible STA configuration as a recovery condition
+            // and expose the normal configured hotspot. This does NOT override
+            // an intentional "offline when WLAN unavailable" choice when at
+            // least one real STA profile exists.
+            consoleWrite(
+                "WIFI",
+                "Infrastructure WiFi invalid | no configured profiles | starting recovery hotspot"
+            );
+
+            if (!startConfiguredHotspot(true))
+                return;
+        } else if (!wifiConnectConfiguredInfrastructure(8000UL, "Infrastructure WiFi")) {
             consoleWrite(
                 "WIFI",
                 "Infrastructure WiFi start failed | no configured profile reachable"

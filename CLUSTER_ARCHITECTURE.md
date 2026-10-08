@@ -1,6 +1,6 @@
 # SensorForge Cluster Architecture
 
-**Authoritative cluster foundation:** `v87-beta38`  
+**Authoritative cluster foundation:** `v87-beta48`  
 **Date:** 2026-10-08  
 **Status:** foundation frozen for now; next functional stage is time synchronization + scheduled multi-camera capture.
 
@@ -8,7 +8,7 @@ This document is the detailed re-entry reference for the SensorForge local devic
 
 ## 1. Scope and freeze point
 
-The current cluster layer provides discovery, authenticated peer membership, liveness, automatic Coordinator selection, passive cluster discovery for configuration, encrypted remembered credentials, and generic resource announcements.
+The current cluster layer provides discovery, authenticated peer membership, liveness, automatic Coordinator selection, passive cluster discovery for configuration, encrypted remembered credentials, and generic resource announcements. Beta 48 keeps the Beta-38+ wire model but fixes first-use Known-Cluster profile lookup and makes a saved Cluster configuration enter runtime deterministically through a controlled reboot.
 
 The following are deliberately **not implemented yet**:
 
@@ -603,3 +603,11 @@ The normal SensorForge rules apply without exception:
 - code changes are delivered only as one delta ZIP containing exactly changed/new files under their original project names/paths
 - do not add unrelated cleanup, patches, renamed copies or test-plan files to the code ZIP
 
+
+## Beta 48 activation and first-use clarification
+
+A configured Cluster is not considered discoverable merely because values exist in persistent configuration. Public `SFD1` discovery is emitted only while `clusterNetworkStart()` has successfully activated the Cluster runtime and WiFi is already open under the normal SensorForge lifecycle. Therefore a freshly saved membership/ID/password/policy must be applied before other devices can discover it. Starting with Beta 48, `/cluster_save` schedules a controlled reboot after the persistent commit and shows a dedicated restart page; after reboot the normal WiFi startup owns the subsequent Cluster runtime start.
+
+Known-Cluster credentials are cached in NVS namespace `sfclprof`. On a brand-new board that namespace legitimately does not exist yet. A read-only NVS open cannot distinguish this normal first-use state from a storage error. Beta 48 therefore creates/opens that namespace during an explicit join/save password lookup; an empty cache then means simply “no stored password”, while a real NVS open failure is still surfaced as storage unavailable.
+
+Passive scanner rules are unchanged: while `/cluster` is open, a disabled local node may join the multicast receive group and listen for public `SFD1` announcements, but it does not transmit Cluster packets and never starts or extends WiFi. Only active Beta-38-or-newer members publish `SFD1`; older Beta-37 nodes are not visible to this passive dropdown even though they may implement earlier authenticated Cluster traffic.

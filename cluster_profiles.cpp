@@ -155,7 +155,12 @@ bool clusterProfilesGetPassword(
     }
 
     Preferences prefs;
-    if (!prefs.begin(PROFILE_NAMESPACE, true)) {
+    // On a brand-new device the profile namespace does not exist yet.
+    // Opening NVS read-only reports that state as begin()==false, which is not
+    // a storage failure. This lookup is part of an explicit save/join action,
+    // so open read-write here to create the empty namespace if needed. A real
+    // NVS failure still makes begin() fail and remains an error.
+    if (!prefs.begin(PROFILE_NAMESPACE, false)) {
         error = "cluster profile storage unavailable";
         return false;
     }

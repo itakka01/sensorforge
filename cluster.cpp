@@ -177,13 +177,13 @@ static void bytesToHex(const uint8_t *bytes, size_t length, char *output)
 
 static String textToHex(const String &value)
 {
-    static const char HEX[] = "0123456789abcdef";
+    static const char HEX_DIGITS[] = "0123456789abcdef";
     String out;
     out.reserve(value.length() * 2);
     for (size_t i = 0; i < value.length(); ++i) {
         const uint8_t c = (uint8_t)value[i];
-        out += HEX[(c >> 4) & 0x0F];
-        out += HEX[c & 0x0F];
+        out += HEX_DIGITS[(c >> 4) & 0x0F];
+        out += HEX_DIGITS[c & 0x0F];
     }
     return out;
 }

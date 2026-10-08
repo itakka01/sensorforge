@@ -50,6 +50,7 @@
 #include "webconfig_wifi.h"
 #include "webconfig_transport.h"
 #include "webconfig_cluster.h"
+#include "cluster.h"
 #include "access_control.h"
 #include "firmware_security.h"
 #include "web_csrf.h"
@@ -4199,15 +4200,9 @@ static void handleConfig()
     html += "<p><b>Config source:</b> " +
             htmlEscape(String(configSourceName())) +
             "<br><b>Internal shadow:</b> " +
-            String(
-                configInternalValid()
-                ? "valid"
-                : (
-                    configInternalAvailable()
-                    ? "missing / invalid"
-                    : "unavailable"
-                )
-            ) +
+            htmlEscape(String(configInternalStatusName())) +
+            "<br><b>Internal detail:</b> " +
+            htmlEscape(configInternalStatusDetail()) +
             "</p>";
 
 
@@ -11984,7 +11979,20 @@ static void handleWifiSettingsSave()
         " tx_power_dbm=" + String(cfg_wifi_tx_power_dbm, 1)
     );
 
-    server.sendHeader("Location", "/wifi_settings?notice=saved");
+    // WiFi settings are boot-owned: hostname, STA/AP mode, profile selection,
+    // fallback policy and TX power are applied deterministically by
+    // startWebConfig(). Do not leave the currently running interface in the old
+    // mode while the runtime config already contains the new values. That mixed
+    // state can otherwise be shut down later by the ordinary WiFi timeout without
+    // ever starting the newly configured STA/fallback path.
+    //
+    // The save above has already completed the durable config commit. Leave a
+    // short grace period so the browser can follow the redirect and render the
+    // reboot notice before the old network connection disappears.
+    rebootScheduled = true;
+    rebootAtMs = millis() + 4000UL;
+
+    server.sendHeader("Location", "/rebooting?reason=wifi_settings");
     server.send(303, "text/plain; charset=utf-8", "");
 }
 
@@ -12765,6 +12773,12 @@ static void handleRebooting()
     bool afterOperatingModeChange =
         reason == "operating_mode";
 
+    bool afterWifiSettingsChange =
+        reason == "wifi_settings";
+
+    bool afterClusterSettingsChange =
+        reason == "cluster_settings";
+
     html +=
         "<div class='operation-card'>"
         "<span class='status-pill warn'>SYSTEM RESTART</span>";
@@ -12801,6 +12815,34 @@ static void handleRebooting()
             "<p class='muted'>Die neue Betriebsart und die gewählten Stream-Ausgaben wurden gespeichert. "
             "SensorForge startet jetzt automatisch neu, damit Kamera-, Audio- und Recording-Ownership sauber im neuen Modus initialisiert werden.</p>";
 
+    } else if (afterWifiSettingsChange) {
+        String targetName = htmlEscape(cfg_hostname.length() ? cfg_hostname : String("sensorforge"));
+        html +=
+            "<h2 style='margin-top:16px'>WiFi-Einstellungen gespeichert</h2>"
+            "<p class='muted'>SensorForge startet jetzt automatisch neu und übernimmt die neuen WiFi-Einstellungen.</p>"
+            "<div class='info-box' style='margin-top:14px'>"
+            "<strong>Neuer Gerätename:</strong> " + targetName + "<br>" +
+            (cfg_hotspot_enabled
+                ? String("<strong>Netzwerkmodus:</strong> eigener Hotspot")
+                : String("<strong>Netzwerkmodus:</strong> externes WLAN") +
+                  (cfg_hotspot_fallback_enabled
+                    ? String("<br><strong>Fallback:</strong> eigener Hotspot, falls kein gespeichertes WLAN erreichbar ist")
+                    : String("<br><strong>Fallback:</strong> offline bleiben, falls kein gespeichertes WLAN erreichbar ist"))) +
+            "</div>"
+            "<p class='muted' style='margin-top:14px'>Wenn sich SSID, Gerätename oder Netzwerkmodus geändert haben, muss sich dieses Browser-Gerät gegebenenfalls mit dem neuen WLAN verbinden. "
+            "Bei aktiviertem Fallback werden zuerst die gespeicherten externen WLAN-Profile versucht; der Fallback-Hotspot kann deshalb erst nach einigen Sekunden sichtbar werden.</p>";
+
+    } else if (afterClusterSettingsChange) {
+        html +=
+            "<h2 style='margin-top:16px'>Cluster-Einstellungen gespeichert</h2>"
+            "<p class='muted'>SensorForge startet jetzt automatisch neu. Danach wird die Cluster-Runtime nur dann aktiviert, wenn WiFi nach den normalen SensorForge-Regeln geöffnet ist.</p>"
+            "<div class='info-box' style='margin-top:14px'>"
+            "<strong>Cluster:</strong> " + htmlEscape(cfg_cluster_name.length() ? cfg_cluster_name : String("-")) + "<br>" +
+            "<strong>Cluster-ID:</strong> " + htmlEscape(clusterEffectiveId()) + "<br>" +
+            "<strong>Mitgliedschaft:</strong> " + String(cfg_cluster_enabled ? "aktiv" : "deaktiviert") +
+            "</div>"
+            "<p class='muted' style='margin-top:14px'>Ein aktives Cluster-Mitglied kündigt sich nach dem Neustart im lokalen WLAN automatisch an. Andere Geräte können es auf ihrer geöffneten Cluster-Seite passiv entdecken.</p>";
+
     } else {
         html +=
             "<h2 style='margin-top:16px'>SensorForge wird neu gestartet</h2>"
@@ -12809,8 +12851,10 @@ static void handleRebooting()
     }
 
     html +=
-        "<div id='rebootCountdown' class='countdown'>10</div>"
-        "<div class='muted'>Sekunden bis zur Rückkehr</div>"
+        "<div id='rebootCountdown' class='countdown'>10</div>" +
+        String(afterWifiSettingsChange
+            ? "<div class='muted'>Sekunden bis zum ersten Wiederverbindungsversuch</div>"
+            : "<div class='muted'>Sekunden bis zur Rückkehr</div>") +
         "</div>"
         "<script>"
         // Make a manual refresh safe immediately. The current document stays
@@ -18862,7 +18906,11 @@ void webConfigStart()
 
         WebConfigClusterUiHooks clusterHooks = {
             htmlHeader,
-            htmlFooter
+            htmlFooter,
+            [](uint32_t delayMs) {
+                rebootScheduled = true;
+                rebootAtMs = millis() + delayMs;
+            }
         };
         webconfigClusterRegisterRoutes(
             server,

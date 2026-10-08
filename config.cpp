@@ -8,10 +8,12 @@
 #include <FS.h>
 #include <LittleFS.h>
 #include <Preferences.h>
+#include <esp_partition.h>
 #include <time.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <new>
 
 
 // =============================================================
@@ -188,7 +190,7 @@ String cfg_cluster_password = "";
 String cfg_cluster_coordinator_policy = "auto";
 
 int cfg_hotspot_enabled = 1;
-int cfg_hotspot_fallback_enabled = 0;
+int cfg_hotspot_fallback_enabled = 1;
 String cfg_hotspot_password = "";
 int cfg_hotspot_hidden = 0;
 
@@ -241,6 +243,20 @@ static bool internalAvailableState =
 
 static bool internalValidState =
     false;
+
+enum InternalConfigState {
+    INTERNAL_CONFIG_UNCHECKED = 0,
+    INTERNAL_CONFIG_UNAVAILABLE,
+    INTERNAL_CONFIG_MISSING,
+    INTERNAL_CONFIG_INVALID,
+    INTERNAL_CONFIG_VALID
+};
+
+static InternalConfigState internalConfigState =
+    INTERNAL_CONFIG_UNCHECKED;
+
+static String internalConfigDetail =
+    "not checked";
 
 
 // Maximum accepted config size.
@@ -868,9 +884,10 @@ struct ConfigSeen {
 };
 
 
-static ConfigValues makeDefaultValues()
+static void setDefaultValues(
+    ConfigValues &values
+)
 {
-    ConfigValues values;
 
 #ifdef BOARD_FREENOVE
     values.camera =
@@ -1169,7 +1186,7 @@ static ConfigValues makeDefaultValues()
         1;
 
     values.hotspotFallbackEnabled =
-        0;
+        1;
 
     values.hotspotPassword =
         "";
@@ -1205,8 +1222,6 @@ static ConfigValues makeDefaultValues()
 
     values.logFile =
         "/log.txt";
-
-    return values;
 }
 
 
@@ -1828,7 +1843,7 @@ static bool allRequiredKeysSeen(
         {"fps", seen.fps},
         {"quality", seen.quality},
         // Upgrade-added camera fields are optional. Missing values use
-        // makeDefaultValues(), so older SD configs remain OTA-compatible.
+        // setDefaultValues(), so older SD configs remain OTA-compatible.
         {"rotation", seen.rotation},
         {"recording_format", seen.recordingFormat},
         {"timestamp_enabled", seen.timestampEnabled},
@@ -1839,7 +1854,7 @@ static bool allRequiredKeysSeen(
         {"wifi_on_system_start", seen.wifiOnSystemStart},
         {"hostname", seen.hostname},
         // timezone was added after the original config schema; if absent,
-        // makeDefaultValues() supplies the firmware default.
+        // setDefaultValues() supplies the firmware default.
         {"wifi_ssid", seen.wifiSsids[0]},
         {"wifi_pass", seen.wifiPasses[0]},
         {"debug_enabled", seen.debugEnabled},
@@ -3474,8 +3489,9 @@ static bool parseConfigText(
     }
 
 
-    values =
-        makeDefaultValues();
+    setDefaultValues(
+        values
+    );
 
     ConfigSeen seen;
 
@@ -5306,22 +5322,70 @@ static bool parseConfigText(
 }
 
 
+static void applyValues(
+    const ConfigValues &values
+);
+
+
 bool configValidateText(
     const String &text,
     String &error
 )
 {
-    ConfigValues values;
+    error = "";
 
-    error =
-        "";
+    // ConfigValues contains many Arduino String members and has grown with
+    // SensorForge's feature set. Do not place it on the loopTask stack from
+    // nested boot/recovery paths.
+    ConfigValues *values =
+        new (std::nothrow) ConfigValues;
 
-    return
+    if (!values) {
+        error =
+            "not enough memory for config validation";
+        return false;
+    }
+
+    bool valid =
         parseConfigText(
             text,
-            values,
+            *values,
             error
         );
+
+    delete values;
+    return valid;
+}
+
+
+static bool parseAndApplyConfigText(
+    const String &text,
+    String &error
+)
+{
+    error = "";
+
+    ConfigValues *values =
+        new (std::nothrow) ConfigValues;
+
+    if (!values) {
+        error =
+            "not enough memory for config parse";
+        return false;
+    }
+
+    bool valid =
+        parseConfigText(
+            text,
+            *values,
+            error
+        );
+
+    if (valid)
+        applyValues(*values);
+
+    delete values;
+    return valid;
 }
 
 
@@ -5336,16 +5400,30 @@ bool configBuildFactoryDefaultText(
     String &error
 )
 {
-    ConfigValues defaults =
-        makeDefaultValues();
+    error = "";
 
-    if (!serializeConfigValues(
-            defaults,
-            text,
-            error
-        )) {
+    ConfigValues *defaults =
+        new (std::nothrow) ConfigValues;
+
+    if (!defaults) {
+        error =
+            "not enough memory for factory config";
         return false;
     }
+
+    setDefaultValues(*defaults);
+
+    bool serialized =
+        serializeConfigValues(
+            *defaults,
+            text,
+            error
+        );
+
+    delete defaults;
+
+    if (!serialized)
+        return false;
 
     String validationError;
 
@@ -5739,6 +5817,62 @@ static bool readTextFile(
 }
 
 
+static bool writeConfigFileDirectVerified(
+    fs::FS &filesystem,
+    const char *path,
+    const String &text
+)
+{
+    filesystem.remove(path);
+
+    File file =
+        filesystem.open(
+            path,
+            FILE_WRITE
+        );
+
+    if (!file)
+        return false;
+
+    size_t written =
+        file.print(text);
+
+    file.flush();
+    file.close();
+
+    if (written != text.length()) {
+        filesystem.remove(path);
+        return false;
+    }
+
+    String verifyText;
+
+    if (
+        !readTextFile(
+            filesystem,
+            path,
+            verifyText
+        ) ||
+        verifyText != text
+    ) {
+        filesystem.remove(path);
+        return false;
+    }
+
+    String validationError;
+
+    if (!configValidateText(
+            verifyText,
+            validationError
+        )) {
+        filesystem.remove(path);
+        return false;
+    }
+
+    return true;
+}
+
+
 static void recoverAtomicFiles(
     fs::FS &filesystem
 )
@@ -5779,21 +5913,27 @@ static void recoverAtomicFiles(
         )
     ) {
 
-        filesystem.rename(
-            "/config.bak",
-            "/config.txt"
-        );
+        if (filesystem.rename(
+                "/config.bak",
+                "/config.txt"
+            )) {
 
-        if (
-            filesystem.exists(
-                "/config.tmp"
-            )
-        ) {
-            filesystem.remove(
-                "/config.tmp"
-            );
+            if (
+                filesystem.exists(
+                    "/config.tmp"
+                )
+            ) {
+                filesystem.remove(
+                    "/config.tmp"
+                );
+            }
+
+            return;
         }
 
+        // Do not destroy either recovery candidate when the restore itself
+        // fails. A later boot or explicit maintenance action may still be able
+        // to recover the filesystem.
         return;
     }
 
@@ -5803,7 +5943,47 @@ static void recoverAtomicFiles(
             "/config.tmp"
         )
     ) {
+        // First-ever saves have no /config.txt and no /config.bak. If power or
+        // a reset interrupts the transaction after /config.tmp was fully
+        // written/verified but before the final rename, the temporary file is
+        // the only durable copy. The old code deleted it unconditionally,
+        // which turned an interrupted first save into "config missing".
+        String candidate;
+        String validationError;
 
+        bool candidateValid =
+            readTextFile(
+                filesystem,
+                "/config.tmp",
+                candidate
+            ) &&
+            configValidateText(
+                candidate,
+                validationError
+            );
+
+        if (candidateValid) {
+            // Keep the validated temp file intact until the authoritative path
+            // has been written and verified. This is deliberately a copy, not
+            // a rename: if recovery itself is interrupted, /config.tmp remains
+            // available for the next boot instead of losing the only good copy.
+            if (writeConfigFileDirectVerified(
+                    filesystem,
+                    "/config.txt",
+                    candidate
+                )) {
+                filesystem.remove(
+                    "/config.tmp"
+                );
+                return;
+            }
+
+            // Valid recovery data must never be thrown away merely because a
+            // filesystem metadata/write operation failed.
+            return;
+        }
+
+        // Only an actually invalid/incomplete temp file is safe to discard.
         filesystem.remove(
             "/config.tmp"
         );
@@ -5928,13 +6108,73 @@ static bool atomicWriteText(
                 "/config.bak",
                 "/config.txt"
             );
+
+            filesystem.remove(
+                "/config.tmp"
+            );
+
+            return false;
         }
 
-        filesystem.remove(
-            "/config.tmp"
-        );
+        // On the first-ever config there is no previous file to protect. A
+        // direct verified write is a safe fallback if the metadata rename
+        // itself fails.
+        if (writeConfigFileDirectVerified(
+                filesystem,
+                "/config.txt",
+                text
+            )) {
+            filesystem.remove(
+                "/config.tmp"
+            );
+            return true;
+        }
 
         return false;
+    }
+
+
+    // Do not report a successful save merely because rename() returned true.
+    // The final authoritative path must itself be readable, byte-identical and
+    // valid before the transaction is committed and the backup is discarded.
+    String finalText;
+    String finalValidationError;
+
+    bool finalValid =
+        readTextFile(
+            filesystem,
+            "/config.txt",
+            finalText
+        ) &&
+        finalText == text &&
+        configValidateText(
+            finalText,
+            finalValidationError
+        );
+
+    if (!finalValid) {
+        if (hadOld) {
+            filesystem.remove(
+                "/config.txt"
+            );
+
+            filesystem.rename(
+                "/config.bak",
+                "/config.txt"
+            );
+
+            return false;
+        }
+
+        // No older config exists on a first-run device. Retry by writing the
+        // authoritative path directly and verify that exact path again.
+        if (!writeConfigFileDirectVerified(
+                filesystem,
+                "/config.txt",
+                text
+            )) {
+            return false;
+        }
     }
 
 
@@ -5951,56 +6191,169 @@ static bool atomicWriteText(
 // LITTLEFS SHADOW
 // =============================================================
 
-static bool initInternalConfigStorage()
+static bool internalConfigPartitionLooksErased(
+    bool &known
+)
 {
-    if (
-        LittleFS.begin(
-            false
-        )
-    ) {
+    known = false;
 
-        internalAvailableState =
-            true;
-
-        recoverAtomicFiles(
-            LittleFS
+    // Arduino-ESP32 LittleFS uses the "spiffs" data partition by default.
+    // We only permit automatic first-run formatting when that exact partition
+    // is demonstrably blank/erased. A mount failure on non-blank flash must
+    // never destroy a previously saved internal configuration.
+    const esp_partition_t *partition =
+        esp_partition_find_first(
+            ESP_PARTITION_TYPE_DATA,
+            ESP_PARTITION_SUBTYPE_DATA_SPIFFS,
+            "spiffs"
         );
 
-        return true;
+    if (!partition)
+        return false;
+
+    known = true;
+
+    const size_t probeBytes =
+        partition->size < (16U * 1024U)
+        ? partition->size
+        : (16U * 1024U);
+
+    uint8_t buffer[256];
+
+    for (size_t offset = 0; offset < probeBytes; offset += sizeof(buffer)) {
+        size_t chunk =
+            probeBytes - offset < sizeof(buffer)
+            ? probeBytes - offset
+            : sizeof(buffer);
+
+        if (
+            esp_partition_read(
+                partition,
+                offset,
+                buffer,
+                chunk
+            ) != ESP_OK
+        ) {
+            known = false;
+            return false;
+        }
+
+        for (size_t i = 0; i < chunk; ++i) {
+            if (buffer[i] != 0xFFU)
+                return false;
+        }
+    }
+
+    return true;
+}
+
+
+static bool initInternalConfigStorage()
+{
+    // Mount retries are intentionally short and bounded. They cover a
+    // transient VFS/LittleFS startup failure without ever changing flash
+    // contents.
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        if (
+            LittleFS.begin(
+                false
+            )
+        ) {
+            internalAvailableState =
+                true;
+
+            recoverAtomicFiles(
+                LittleFS
+            );
+
+            internalValidState =
+                false;
+
+            if (LittleFS.exists("/config.txt")) {
+                internalConfigState =
+                    INTERNAL_CONFIG_UNCHECKED;
+                internalConfigDetail =
+                    "mounted; /config.txt present, validation pending";
+            } else {
+                internalConfigState =
+                    INTERNAL_CONFIG_MISSING;
+                internalConfigDetail =
+                    "mounted; /config.txt missing";
+            }
+
+            return true;
+        }
+
+        LittleFS.end();
+
+        if (attempt < 2)
+            delay(25);
     }
 
 
-    Serial.println(
-        "Config: LittleFS mount failed - attempting format/recovery"
-    );
-
-
-    if (
-        !LittleFS.begin(
-            true
-        )
-    ) {
-
-        Serial.println(
-            "Config: LittleFS unavailable"
+    bool partitionStateKnown = false;
+    bool partitionErased =
+        internalConfigPartitionLooksErased(
+            partitionStateKnown
         );
 
-        internalAvailableState =
-            false;
 
-        return false;
+    // Fresh factory flash is the only automatic-format case. Once any data is
+    // present in the filesystem partition, a mount failure is treated as a
+    // preservation/recovery condition and never as permission to erase it.
+    if (
+        partitionStateKnown &&
+        partitionErased
+    ) {
+        Serial.println(
+            "Config: blank LittleFS partition detected - initializing first-run filesystem"
+        );
+
+        if (
+            LittleFS.begin(
+                true
+            )
+        ) {
+            internalAvailableState =
+                true;
+
+            internalValidState =
+                false;
+
+            recoverAtomicFiles(
+                LittleFS
+            );
+
+            internalConfigState =
+                INTERNAL_CONFIG_MISSING;
+            internalConfigDetail =
+                "fresh LittleFS initialized; /config.txt missing";
+
+            return true;
+        }
     }
 
 
     internalAvailableState =
-        true;
+        false;
 
-    recoverAtomicFiles(
-        LittleFS
+    internalValidState =
+        false;
+
+    internalConfigState =
+        INTERNAL_CONFIG_UNAVAILABLE;
+
+    internalConfigDetail =
+        partitionStateKnown
+        ? "LittleFS mount failed; existing flash data preserved (not formatted)"
+        : "LittleFS mount failed; partition state unknown, data preserved (not formatted)";
+
+    Serial.println(
+        "Config: " +
+        internalConfigDetail
     );
 
-
-    return true;
+    return false;
 }
 
 
@@ -6242,8 +6595,12 @@ static void migrateLoadedConfigSecrets()
             )
         ) {
             internalValidState = true;
+            internalConfigState = INTERNAL_CONFIG_VALID;
+            internalConfigDetail = "valid; SFSEC1 migration refreshed shadow";
         } else if (internalAvailableState) {
             internalValidState = false;
+            internalConfigState = INTERNAL_CONFIG_INVALID;
+            internalConfigDetail = "SFSEC1 migration internal shadow write failed";
             Serial.println(
                 "Config secrets: WARNING - SFSEC1 migration internal shadow write failed"
             );
@@ -6262,6 +6619,8 @@ static void migrateLoadedConfigSecrets()
             protectedText
         )) {
         internalValidState = false;
+        internalConfigState = INTERNAL_CONFIG_INVALID;
+        internalConfigDetail = "SFSEC1 migration internal write failed";
         Serial.println(
             "Config secrets: WARNING - SFSEC1 migration internal write failed"
         );
@@ -6269,6 +6628,8 @@ static void migrateLoadedConfigSecrets()
     }
 
     internalValidState = true;
+    internalConfigState = INTERNAL_CONFIG_VALID;
+    internalConfigDetail = "valid; SFSEC1 migration completed";
 
     Serial.println(
         "Config secrets: plaintext migrated to SFSEC1 | entries=" +
@@ -6304,6 +6665,12 @@ void loadConfig(
     internalValidState =
         false;
 
+    internalConfigState =
+        INTERNAL_CONFIG_UNCHECKED;
+
+    internalConfigDetail =
+        "not checked";
+
 
     initInternalConfigStorage();
 
@@ -6336,22 +6703,16 @@ void loadConfig(
                     sdText
                 )) {
 
-                ConfigValues values;
                 String error;
 
 
-                if (parseConfigText(
+                if (parseAndApplyConfigText(
                         sdText,
-                        values,
                         error
                     )) {
 
                     sdValidState =
                         true;
-
-                    applyValues(
-                        values
-                    );
 
                     activeConfigSource =
                         CONFIG_SOURCE_SD;
@@ -6373,6 +6734,12 @@ void loadConfig(
                             internalValidState =
                                 true;
 
+                            internalConfigState =
+                                INTERNAL_CONFIG_VALID;
+
+                            internalConfigDetail =
+                                "valid; refreshed from SD";
+
                             Serial.println(
                                 "Config: internal shadow updated"
                             );
@@ -6381,6 +6748,12 @@ void loadConfig(
 
                             internalValidState =
                                 false;
+
+                            internalConfigState =
+                                INTERNAL_CONFIG_INVALID;
+
+                            internalConfigDetail =
+                                "internal shadow update from SD failed";
 
                             Serial.println(
                                 "Config: WARNING - internal shadow update failed"
@@ -6430,22 +6803,22 @@ void loadConfig(
                 internalText
             )) {
 
-            ConfigValues values;
             String error;
 
 
-            if (parseConfigText(
+            if (parseAndApplyConfigText(
                     internalText,
-                    values,
                     error
                 )) {
 
                 internalValidState =
                     true;
 
-                applyValues(
-                    values
-                );
+                internalConfigState =
+                    INTERNAL_CONFIG_VALID;
+
+                internalConfigDetail =
+                    "valid";
 
                 activeConfigSource =
                     CONFIG_SOURCE_INTERNAL;
@@ -6460,11 +6833,43 @@ void loadConfig(
             }
 
 
+            internalValidState =
+                false;
+
+            internalConfigState =
+                INTERNAL_CONFIG_INVALID;
+
+            internalConfigDetail =
+                "validation failed: " +
+                error;
+
             Serial.println(
                 "Config: internal shadow INVALID: " +
                 error
             );
+        } else {
+            internalValidState =
+                false;
+
+            internalConfigState =
+                INTERNAL_CONFIG_INVALID;
+
+            internalConfigDetail =
+                "cannot read internal /config.txt";
+
+            Serial.println(
+                "Config: internal /config.txt cannot be read"
+            );
         }
+    } else if (internalAvailableState) {
+        internalValidState =
+            false;
+
+        internalConfigState =
+            INTERNAL_CONFIG_MISSING;
+
+        internalConfigDetail =
+            "mounted; /config.txt missing";
     }
 
 
@@ -6472,9 +6877,23 @@ void loadConfig(
     // 3. No usable external config -> firmware defaults.
     // ---------------------------------------------------------
 
-    applyValues(
-        makeDefaultValues()
-    );
+    {
+        ConfigValues *defaults =
+            new (std::nothrow) ConfigValues;
+
+        if (defaults) {
+            setDefaultValues(*defaults);
+            applyValues(*defaults);
+            delete defaults;
+        } else {
+            // Global cfg_* variables are initialized to the same firmware
+            // defaults before setup(). Keep those values rather than risking
+            // a large stack allocation if the heap is exhausted.
+            Serial.println(
+                "Config: WARNING - no heap for default ConfigValues; keeping compiled cfg defaults"
+            );
+        }
+    }
 
     activeConfigSource =
         CONFIG_SOURCE_DEFAULTS;
@@ -6520,14 +6939,13 @@ config_loaded:
     Serial.println(
         "Config internal shadow: " +
         String(
-            internalValidState
-            ? "valid"
-            : (
-                internalAvailableState
-                ? "missing/invalid"
-                : "unavailable"
-            )
+            configInternalStatusName()
         )
+    );
+
+    Serial.println(
+        "Config internal detail: " +
+        internalConfigDetail
     );
 
 
@@ -6832,6 +7250,31 @@ bool configInternalValid()
 }
 
 
+const char *configInternalStatusName()
+{
+    switch (internalConfigState) {
+        case INTERNAL_CONFIG_VALID:
+            return "valid";
+        case INTERNAL_CONFIG_MISSING:
+            return "missing";
+        case INTERNAL_CONFIG_INVALID:
+            return "invalid";
+        case INTERNAL_CONFIG_UNAVAILABLE:
+            return "unavailable";
+        case INTERNAL_CONFIG_UNCHECKED:
+        default:
+            return "unchecked";
+    }
+}
+
+
+String configInternalStatusDetail()
+{
+    return
+        internalConfigDetail;
+}
+
+
 void configRefreshSdStatus()
 {
     sdPresentState =
@@ -6910,7 +7353,8 @@ bool configReadInternalText(
         !initInternalConfigStorage()
     ) {
         error =
-            "internal LittleFS unavailable";
+            "internal LittleFS unavailable: " +
+            internalConfigDetail;
         return false;
     }
 
@@ -6919,6 +7363,12 @@ bool configReadInternalText(
         )) {
         internalValidState =
             false;
+
+        internalConfigState =
+            INTERNAL_CONFIG_MISSING;
+
+        internalConfigDetail =
+            "mounted; /config.txt missing";
 
         error =
             "internal /config.txt not found";
@@ -6932,6 +7382,12 @@ bool configReadInternalText(
         )) {
         internalValidState =
             false;
+
+        internalConfigState =
+            INTERNAL_CONFIG_INVALID;
+
+        internalConfigDetail =
+            "cannot read internal /config.txt";
 
         error =
             "cannot read internal /config.txt";
@@ -6947,6 +7403,13 @@ bool configReadInternalText(
         internalValidState =
             false;
 
+        internalConfigState =
+            INTERNAL_CONFIG_INVALID;
+
+        internalConfigDetail =
+            "validation failed: " +
+            validationError;
+
         error =
             "internal /config.txt validation failed: " +
             validationError;
@@ -6955,6 +7418,12 @@ bool configReadInternalText(
 
     internalValidState =
         true;
+
+    internalConfigState =
+        INTERNAL_CONFIG_VALID;
+
+    internalConfigDetail =
+        "valid";
 
     return true;
 }
@@ -7144,6 +7613,15 @@ ConfigSaveResult configSaveText(
             protectedText
         )) {
 
+        internalValidState =
+            false;
+
+        internalConfigState =
+            INTERNAL_CONFIG_INVALID;
+
+        internalConfigDetail =
+            "internal config write/verify failed";
+
         error =
             "internal config write failed";
 
@@ -7154,6 +7632,12 @@ ConfigSaveResult configSaveText(
 
     internalValidState =
         true;
+
+    internalConfigState =
+        INTERNAL_CONFIG_VALID;
+
+    internalConfigDetail =
+        "valid; saved and verified this boot";
 
 
     // Storage policy is derived exclusively from the physical presence of
@@ -7215,9 +7699,6 @@ ConfigSaveResult configResetToFactoryDefaults(
 {
     error = "";
 
-    ConfigValues defaults =
-        makeDefaultValues();
-
     String text;
 
     if (!configBuildFactoryDefaultText(
@@ -7251,13 +7732,25 @@ ConfigSaveResult configResetToFactoryDefaults(
     transportModePendingClear();
 
     // Keep the short interval before the scheduled reboot internally coherent.
-    applyValues(defaults);
+    String applyError;
+    if (!parseAndApplyConfigText(
+            text,
+            applyError
+        )) {
+        error =
+            "factory config saved, but runtime apply failed: " +
+            applyError;
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
     activeConfigSource =
         result == CONFIG_SAVE_BOTH
         ? CONFIG_SOURCE_SD
         : CONFIG_SOURCE_INTERNAL;
 
     internalValidState = true;
+    internalConfigState = INTERNAL_CONFIG_VALID;
+    internalConfigDetail = "valid; factory reset saved";
 
     if (result == CONFIG_SAVE_BOTH) {
         sdPresentState = true;
@@ -8752,9 +9245,27 @@ ConfigSaveResult configSaveWifiSettings(
         sourceRead = readTextFile(STORAGE, "/config.txt", text);
     }
 
+    bool initializedFromFactoryDefaults = false;
+
+    // First-run case: on a freshly flashed board without an SD card there is
+    // intentionally no persistent /config.txt yet. The dedicated WiFi page
+    // still has to be able to create the first durable configuration. Use the
+    // existing canonical factory-default serializer as the complete baseline,
+    // then patch only the WiFi keys below and pass the result through the same
+    // validation / SFSEC1 / configSaveText() path as every normal save.
+    //
+    // Do not create an SD config here. configSaveText() preserves the existing
+    // SensorForge storage policy: LittleFS is always written, while SD is only
+    // synchronized when /config.txt already exists there.
     if (!sourceRead) {
-        error = "no persistent config.txt available for WiFi settings save";
-        return CONFIG_SAVE_INTERNAL_FAILED;
+        String factoryError;
+
+        if (!configBuildFactoryDefaultText(text, factoryError)) {
+            error = "could not build initial config for WiFi settings save: " + factoryError;
+            return CONFIG_SAVE_INTERNAL_FAILED;
+        }
+
+        initializedFromFactoryDefaults = true;
     }
 
     if (
@@ -8799,6 +9310,19 @@ ConfigSaveResult configSaveWifiSettings(
         result == CONFIG_SAVE_BOTH ||
         result == CONFIG_SAVE_INTERNAL_ONLY
     ) {
+        // A first-run save turns the factory-default runtime state into a real
+        // persistent internal configuration immediately. Reflect that source
+        // now instead of reporting DEFAULTS until the next reboot.
+        if (initializedFromFactoryDefaults) {
+            activeConfigSource =
+                result == CONFIG_SAVE_BOTH
+                ? CONFIG_SOURCE_SD
+                : CONFIG_SOURCE_INTERNAL;
+            internalValidState = true;
+            internalConfigState = INTERNAL_CONFIG_VALID;
+            internalConfigDetail = "valid; initial WiFi config saved";
+        }
+
         cfg_hostname = normalizedHostname;
         cfg_wifi_on_system_start = normalizedStartup;
         cfg_wifi_timeout_sec = wifiTimeoutSec;
