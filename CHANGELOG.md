@@ -1,3 +1,17 @@
+## v87-beta69 (2026-10-09) – Coordinator: read-only Node Health
+
+- Signiertes SFH1-Zusatzpaket im bestehenden 10-s-Heartbeat: SD MiB, CPU-Temperatur, freier Heap.
+- SD-Werte werden maximal einmal pro Minute und nicht während aktiver Recorder-Dateioperationen gelesen.
+- Cluster-Steuerseite zeigt alle Nodes mit SD-Verbrauch/Freiplatz, Temperatur, Recording-Status und Heap.
+- Zentrale destruktive und Power-Aktionen bewusst noch gesperrt: pro Node quittierte, ownership-sichere Ausführung fehlt.
+- Keine Änderungen an Election, Time Sync, Recording oder bestehendem Wire-Format.
+
+## v87-beta68 (2026-10-09) – Cluster-Zeitstatus pro Node
+
+- Authentifizierte, kurze Unicast-Statusmeldung nach erfolgreicher WiFi-Zeitmessung; RAM-only am Coordinator.
+- Coordinator-Steuerungsseite mit Live-Tabelle für letzte Messung, gemeldete Zeit, geschätzte Uhrabweichung, RTT und Auftragsstatus.
+- Keine zusätzlichen periodischen Pakete; kein Eingriff in Systemuhr, Recording, Cluster-Election oder Heartbeat.
+
 ## v87-beta67 (2026-10-09) – Cluster overview navigation for all remote devices
 
 - Elected coordinator appears first in the cluster overview and detailed peer table.

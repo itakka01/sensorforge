@@ -1,6 +1,9 @@
 #include "cluster.h"
 
 #include "config.h"
+#include "board_config.h"
+#include "thermal.h"
+#include <math.h>
 #include "cluster_profiles.h"
 #include "device_identity.h"
 #include "logger.h"
@@ -9,6 +12,7 @@
 #include "streamer.h"
 
 #include <ESPmDNS.h>
+#include <FS.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <psa/crypto.h>
@@ -19,6 +23,9 @@
 #include <esp_timer.h>
 #include <stdlib.h>
 #include <string.h>
+
+// Owned by sensorforge.ino; read-only SD mount status.
+extern bool sdReady;
 
 namespace {
 
@@ -45,6 +52,8 @@ static const char *CLUSTER_PROTO = "udp";
 static const char *CLUSTER_DISCOVERY_MAGIC = "SFD1";
 static const char *CLUSTER_PACKET_MAGIC = "SFC1";
 static const char *CLUSTER_META_MAGIC = "SFM1";
+static const char *CLUSTER_HEALTH_MAGIC = "SFH1";
+static uint32_t healthLocalTotalMiB=0, healthLocalUsedMiB=0;
 static const char *CLUSTER_LEAVE_MAGIC = "SFL1";
 static const char *CLUSTER_RESOURCE_MAGIC = "SFR1";
 static const char *CLUSTER_COORDINATION_MAGIC = "SFCO1";
@@ -54,6 +63,7 @@ static const char *CLUSTER_NODE_ACK_MAGIC = "SFNA1";
 static const char *CLUSTER_TIME_REQUEST_MAGIC = "SFTQ1";
 static const char *CLUSTER_TIME_REPLY_MAGIC = "SFTR1";
 static const char *CLUSTER_TIME_SYNC_COMMAND_MAGIC = "SFTS1";
+static const char *CLUSTER_TIME_REPORT_MAGIC = "SFTD1";
 static const uint32_t CLUSTER_TIME_INTERVAL_MS = 900000UL; // 15 minutes
 static const uint32_t CLUSTER_TIME_RETRY_MS = 30000UL; // only before first valid sample
 static const uint32_t CLUSTER_TIME_HOLDOVER_MS = 1800000UL; // max 30 minutes without fresh sample
@@ -91,6 +101,21 @@ struct ClusterPeer {
     uint32_t directHeartbeatSequence;
     uint32_t lastDirectHeartbeatMs;
     uint32_t lastSeenMs;
+    // Latest authenticated time report from this peer (volatile only).
+    bool healthValid;
+    uint32_t healthUpdatedMs;
+    uint32_t sdTotalMiB;
+    uint32_t sdUsedMiB;
+    int32_t cpuTempDeciC;
+    uint32_t freeHeapBytes;
+    bool timeReportValid;
+    uint32_t timeReportMs;
+    uint32_t timeReportEpoch;
+    uint32_t timeReportCommandSeq;
+    int64_t timeReportUtcUs;
+    int64_t timeReportOffsetUs;
+    int64_t timeReportRttUs;
+    int64_t timeReportUncertaintyUs;
 };
 
 struct ClusterResource {
@@ -1530,6 +1555,20 @@ static void processPresence(
         sameBoot ? peer->directHeartbeatSequence : 0;
     const uint32_t preservedLastDirectHeartbeatMs =
         sameBoot ? peer->lastDirectHeartbeatMs : 0;
+    const bool preservedHealthValid = sameBoot && peer->healthValid;
+    const uint32_t preservedHealthUpdatedMs = preservedHealthValid ? peer->healthUpdatedMs : 0;
+    const uint32_t preservedSdTotalMiB = preservedHealthValid ? peer->sdTotalMiB : 0;
+    const uint32_t preservedSdUsedMiB = preservedHealthValid ? peer->sdUsedMiB : 0;
+    const int32_t preservedCpuTempDeciC = preservedHealthValid ? peer->cpuTempDeciC : 0;
+    const uint32_t preservedFreeHeapBytes = preservedHealthValid ? peer->freeHeapBytes : 0;
+    const bool preservedTimeReportValid = sameBoot && peer->timeReportValid;
+    const uint32_t preservedTimeReportMs = preservedTimeReportValid ? peer->timeReportMs : 0;
+    const uint32_t preservedTimeReportEpoch = preservedTimeReportValid ? peer->timeReportEpoch : 0;
+    const uint32_t preservedTimeReportCommandSeq = preservedTimeReportValid ? peer->timeReportCommandSeq : 0;
+    const int64_t preservedTimeReportUtcUs = preservedTimeReportValid ? peer->timeReportUtcUs : 0;
+    const int64_t preservedTimeReportOffsetUs = preservedTimeReportValid ? peer->timeReportOffsetUs : 0;
+    const int64_t preservedTimeReportRttUs = preservedTimeReportValid ? peer->timeReportRttUs : 0;
+    const int64_t preservedTimeReportUncertaintyUs = preservedTimeReportValid ? peer->timeReportUncertaintyUs : 0;
 
     *peer = ClusterPeer{};
     peer->used = true;
@@ -1560,6 +1599,20 @@ static void processPresence(
     peer->lastCoordinatorInfoMs = preservedLastCoordinatorInfoMs;
     peer->directHeartbeatSequence = preservedDirectHeartbeatSequence;
     peer->lastDirectHeartbeatMs = preservedLastDirectHeartbeatMs;
+    peer->healthValid = preservedHealthValid;
+    peer->healthUpdatedMs = preservedHealthUpdatedMs;
+    peer->sdTotalMiB = preservedSdTotalMiB;
+    peer->sdUsedMiB = preservedSdUsedMiB;
+    peer->cpuTempDeciC = preservedCpuTempDeciC;
+    peer->freeHeapBytes = preservedFreeHeapBytes;
+    peer->timeReportValid = preservedTimeReportValid;
+    peer->timeReportMs = preservedTimeReportMs;
+    peer->timeReportEpoch = preservedTimeReportEpoch;
+    peer->timeReportCommandSeq = preservedTimeReportCommandSeq;
+    peer->timeReportUtcUs = preservedTimeReportUtcUs;
+    peer->timeReportOffsetUs = preservedTimeReportOffsetUs;
+    peer->timeReportRttUs = preservedTimeReportRttUs;
+    peer->timeReportUncertaintyUs = preservedTimeReportUncertaintyUs;
     peer->lastSeenMs = now;
 
     if (!runtimeProfileRemembered) {
@@ -1624,6 +1677,31 @@ static void processMeta(
     peer->leaseSeconds = leaseSeconds;
     peer->wifiRemainingSeconds = wifiRemainingSeconds;
     peer->lastSeenMs = millis();
+}
+
+// Optional authenticated health sidecar: no remote actions or secrets.
+// SFH1|tag|id|boot|presence_seq|total_mib|used_mib|cpu_temp_deci_c|heap_bytes
+static void processHealth(char **fields, size_t count)
+{
+    if (count != 9 || strcmp(fields[0], CLUSTER_HEALTH_MAGIC) ||
+        strcmp(fields[1], runtimeClusterTag) || !integrationIdValid(fields[2])) return;
+    uint32_t boot=0,seq=0,total=0,used=0,heap=0;
+    int32_t temp=0;
+    if (!parseUint32Strict(fields[3],boot,16) ||
+        !parseUint32Strict(fields[4],seq) ||
+        !parseUint32Strict(fields[5],total) ||
+        !parseUint32Strict(fields[6],used) ||
+        !parseInt32Strict(fields[7],temp) ||
+        !parseUint32Strict(fields[8],heap) ||
+        (total && used>total) || total>1048576U || temp < -1000 || temp>2000) return;
+    ClusterPeer *peer=findPeer(fields[2]);
+    if (!peer || peer->bootNonce!=boot || seq != peer->sequence) return;
+    peer->healthValid=true;
+    peer->healthUpdatedMs=millis();
+    peer->sdTotalMiB=total;
+    peer->sdUsedMiB=used;
+    peer->cpuTempDeciC=temp;
+    peer->freeHeapBytes=heap;
 }
 
 static void processLeave(
@@ -2105,6 +2183,19 @@ static void processTimeReply(char **f, size_t n, const IPAddress &ip)
     strncpy(timeAuthorityId, currentCoordinatorId, sizeof(timeAuthorityId)-1);
     timeAuthorityEpoch = currentCoordinatorEpoch;
     ++timeAcceptedSamples;
+    // One compact signed report per accepted measurement; no periodic telemetry.
+    const int64_t wallUs = localUnixTimeUs();
+    const int64_t offsetUs = wallUs ? (referenceMidpoint + (t4 - localMidpoint) - wallUs) : -86400000000LL;
+    const int64_t uncertaintyUs = rtt / 2;
+    char ownBootText[9];
+    snprintf(ownBootText, sizeof(ownBootText), "%08lx", (unsigned long)bootNonce);
+    const String report = String(CLUSTER_TIME_REPORT_MAGIC) + "|" + runtimeClusterTag + "|" +
+        deviceIntegrationId() + "|" + ownBootText + "|" +
+        String((unsigned long)currentCoordinatorEpoch) + "|" +
+        String((unsigned long)timeSyncLastReceivedSeq) + "|" +
+        int64Text(referenceMidpoint) + "|" + int64Text(offsetUs) + "|" +
+        int64Text(rtt) + "|" + int64Text(uncertaintyUs);
+    sendSignedPayloadTo(report, currentCoordinatorIp, CLUSTER_COORDINATOR_PORT, "cluster time report");
 }
 
 static void requestClusterTime(uint32_t now)
@@ -2133,6 +2224,39 @@ static void requestClusterTime(uint32_t now)
 // Signed multicast command: only the currently elected coordinator, with the
 // current boot nonce and epoch, may request an immediate time sample.
 // This is an advisory trigger, NOT a remote system-clock change.
+// SFTD1 is HMAC-authenticated in processPacket, and additionally bound to
+// a live peer, its current boot nonce and the coordinator's current epoch.
+static void processTimeReport(char **f, size_t n, const IPAddress &ip)
+{
+    if (n != 10 || !runtimeActive || !localIsCoordinator ||
+        strcmp(f[1], runtimeClusterTag) != 0 || !integrationIdValid(f[2])) return;
+    uint32_t senderBoot=0, epoch=0, commandSeq=0;
+    int64_t utc=0, offset=0, rtt=0, uncertainty=0;
+    if (!parseUint32Strict(f[3], senderBoot, 16) ||
+        !parseUint32Strict(f[4], epoch) ||
+        !parseUint32Strict(f[5], commandSeq) ||
+        !parseInt64Strict(f[6], utc) || !parseInt64Strict(f[7], offset) ||
+        !parseInt64Strict(f[8], rtt) || !parseInt64Strict(f[9], uncertainty) ||
+        epoch != currentCoordinatorEpoch || senderBoot == 0 ||
+        utc < 1577836800000000LL || rtt < 0 || rtt > CLUSTER_TIME_MAX_RTT_US ||
+        uncertainty < 0 || uncertainty > CLUSTER_TIME_MAX_RTT_US ||
+        offset < -86400000000LL || offset > 86400000000LL ||
+        commandSeq > timeSyncCommandSeq) return;
+    ClusterPeer *peer = findPeer(f[2]);
+    if (!peer || peer->bootNonce != senderBoot || peer->ip != ip ||
+        (uint32_t)(millis() - peer->lastSeenMs) > 60000UL) return;
+    // A delayed report from a previous request may not overwrite a newer one.
+    if (peer->timeReportValid && peer->timeReportCommandSeq > commandSeq) return;
+    peer->timeReportValid = true;
+    peer->timeReportMs = millis();
+    peer->timeReportEpoch = epoch;
+    peer->timeReportCommandSeq = commandSeq;
+    peer->timeReportUtcUs = utc;
+    peer->timeReportOffsetUs = offset;
+    peer->timeReportRttUs = rtt;
+    peer->timeReportUncertaintyUs = uncertainty;
+}
+
 static void processTimeSyncCommand(char **f, size_t n, const IPAddress &ip)
 {
     // SFTS1|tag|coordinator_id|boot_hex|coordinator_epoch|sequence
@@ -2184,6 +2308,8 @@ static void processPacket(
         processPresence(fields, fieldCount, remoteIp);
     } else if (strcmp(fields[0], CLUSTER_META_MAGIC) == 0) {
         processMeta(fields, fieldCount);
+    } else if (strcmp(fields[0], CLUSTER_HEALTH_MAGIC) == 0) {
+        processHealth(fields, fieldCount);
     } else if (strcmp(fields[0], CLUSTER_LEAVE_MAGIC) == 0) {
         processLeave(fields, fieldCount);
     } else if (strcmp(fields[0], CLUSTER_RESOURCE_MAGIC) == 0) {
@@ -2200,6 +2326,8 @@ static void processPacket(
         processTimeSyncCommand(fields, fieldCount, remoteIp);
     } else if (strcmp(fields[0], CLUSTER_TIME_REPLY_MAGIC) == 0) {
         processTimeReply(fields, fieldCount, remoteIp);
+    } else if (strcmp(fields[0], CLUSTER_TIME_REPORT_MAGIC) == 0) {
+        processTimeReport(fields, fieldCount, remoteIp);
     }
 }
 
@@ -2323,6 +2451,31 @@ static void sendHeartbeat()
 
     // Public, unauthenticated discovery metadata is emitted only by active
     // cluster members. Passive scanners listen for it but never transmit.
+    // Cache SD accounting: filesystem operations are not performed every 10 s.
+    static uint32_t lastHealthReadMs=0;
+    static uint32_t totalMiB=0, usedMiB=0;
+    const uint32_t healthNow=millis();
+    if (lastHealthReadMs == 0 || (uint32_t)(healthNow-lastHealthReadMs) >= 60000UL) {
+        lastHealthReadMs=healthNow;
+        totalMiB=0; usedMiB=0;
+        if (sdReady && !recorderIsOpen()) {
+            const uint64_t total=STORAGE.totalBytes();
+            const uint64_t used=STORAGE.usedBytes();
+            if (total>0 && used<=total) {
+                totalMiB=(uint32_t)(total/(1024ULL*1024ULL));
+                usedMiB=(uint32_t)(used/(1024ULL*1024ULL));
+            }
+        }
+    }
+    const float cpuC=thermalCpuTemperatureC();
+    const int32_t tempDeci=isfinite(cpuC) ? (int32_t)roundf(cpuC*10.0f) : -1000;
+    String health=String(CLUSTER_HEALTH_MAGIC)+"|"+runtimeClusterTag+"|"+
+        deviceIntegrationId()+"|"+bootText+"|"+String(heartbeatSequence)+"|"+
+        String(totalMiB)+"|"+String(usedMiB)+"|"+String(tempDeci)+"|"+
+        String((unsigned long)ESP.getFreeHeap());
+    healthLocalTotalMiB=totalMiB;
+    healthLocalUsedMiB=usedMiB;
+    sendSignedPayload(health, "cluster health");
     sendDiscoveryAnnouncement();
 
     if (
@@ -3281,6 +3434,7 @@ String clusterStatusJson()
         (timeLastRttUs / 2 + (int64_t)sampleAgeMs * 50LL / 1000LL) : 0;
     json += ",\"uncertainty_estimate_us\":" + int64Text(estimatedUncertaintyUs);
     json += ",\"sync_interval_sec\":900";
+    json += ",\"manual_sync_sequence\":" + String((unsigned long)timeSyncCommandSeq);
     json += ",\"manual_sync_sent\":" + String((unsigned long)timeSyncCommandsSent);
     json += ",\"manual_sync_received\":" + String((unsigned long)timeSyncCommandsReceived);
     json += ",\"last_rtt_us\":" + int64Text(timeLastRttUs);
@@ -3347,6 +3501,11 @@ String clusterStatusJson()
     json += ",\"time_valid\":";
     json += localTimeValid ? "true" : "false";
     json += ",\"epoch\":" + String((long long)localEpoch);
+    json += ",\"health_valid\":true";
+    json += ",\"sd_total_mib\":" + String((unsigned long)healthLocalTotalMiB);
+    json += ",\"sd_used_mib\":" + String((unsigned long)healthLocalUsedMiB);
+    json += ",\"cpu_temp_deci_c\":" + String((long)(isfinite(thermalCpuTemperatureC()) ? roundf(thermalCpuTemperatureC()*10.0f) : -1000));
+    json += ",\"free_heap_bytes\":" + String((unsigned long)ESP.getFreeHeap());
     json += ",\"recording\":";
     json += localRecording ? "true" : "false";
     json += ",\"streaming\":";
@@ -3399,6 +3558,13 @@ String clusterStatusJson()
         json += ",\"time_valid\":";
         json += peer.timeValid ? "true" : "false";
         json += ",\"epoch\":" + String((long long)peer.epochSeconds);
+        const bool freshHealth=peer.healthValid && (uint32_t)(nowMs-peer.healthUpdatedMs)<90000UL;
+        json += ",\"health_valid\":";
+        json += freshHealth ? "true" : "false";
+        json += ",\"sd_total_mib\":" + String((unsigned long)(freshHealth?peer.sdTotalMiB:0));
+        json += ",\"sd_used_mib\":" + String((unsigned long)(freshHealth?peer.sdUsedMiB:0));
+        json += ",\"cpu_temp_deci_c\":" + String((long)(freshHealth?peer.cpuTempDeciC:-1000));
+        json += ",\"free_heap_bytes\":" + String((unsigned long)(freshHealth?peer.freeHeapBytes:0));
         json += ",\"recording\":";
         json += peer.recording ? "true" : "false";
         json += ",\"streaming\":";
@@ -3420,6 +3586,19 @@ String clusterStatusJson()
         else
             json += "-1";
         json += ",\"coordinator_ack_age_ms\":-1";
+        json += ",\"time_report_valid\":";
+        const bool reportValid = peer.timeReportValid &&
+            peer.timeReportEpoch == currentCoordinatorEpoch &&
+            (uint32_t)(nowMs - peer.timeReportMs) <= CLUSTER_TIME_HOLDOVER_MS;
+        json += reportValid ? "true" : "false";
+        json += ",\"time_report_command_seq\":" +
+            String((unsigned long)(reportValid ? peer.timeReportCommandSeq : 0UL));
+        json += ",\"time_report_age_ms\":" +
+            String((unsigned long)(reportValid ? (nowMs - peer.timeReportMs) : 0UL));
+        json += ",\"time_report_utc_us\":" + int64Text(reportValid ? peer.timeReportUtcUs : 0);
+        json += ",\"time_report_offset_us\":" + int64Text(reportValid ? peer.timeReportOffsetUs : 0);
+        json += ",\"time_report_rtt_us\":" + int64Text(reportValid ? peer.timeReportRttUs : 0);
+        json += ",\"time_report_uncertainty_us\":" + int64Text(reportValid ? peer.timeReportUncertaintyUs : 0);
         json += ",\"lease_sec\":" + String((unsigned long)leaseSeconds);
         json += ",\"lease_remaining_sec\":" +
             String((unsigned long)leaseRemainingSeconds);

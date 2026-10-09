@@ -263,6 +263,26 @@ static void handleClusterCoordinatePage()
     html += "<div class='page-title'><div><h2>Cluster koordinieren – " +
         htmlEscape(cfg_hostname.length() ? cfg_hostname : String("sensorforge")) +
         "</h2><p class='muted'>Aktionen für den lokalen Clusterverbund</p></div></div>";
+    html += R"__HEALTH__(<section class='settings-section'><h3>Cluster-Geräte</h3>
+<p class='muted'>Aktuelle Ressourcenwerte der verbundenen Geräte. SD-Daten werden etwa einmal pro Minute aktualisiert. Fehlende Werte werden nicht geschätzt.</p>
+<div class='cluster-table-wrap'><table class='cluster-table'><thead><tr><th>Gerät</th><th>Rolle</th><th>SD belegt</th><th>SD frei</th><th>CPU-Temperatur</th><th>Status</th></tr></thead>
+<tbody id='clusterHealthRows'><tr><td colspan='6'>Lädt …</td></tr></tbody></table></div>
+<details><summary>Weitere Systemwerte</summary><div id='clusterHealthExtra' class='muted'>Lädt …</div><p>CPU-Auslastung wird derzeit nicht gemessen. Temperatur ist der interne ESP32-Messwert, kein Sensor für die Umgebung.</p></details>
+<details><summary>Zentrale Geräteaktionen</summary><p>Aufnahmen löschen, Neustart und Herunterfahren werden erst verfügbar, wenn die einzelnen Geräte Aktionen sicher bestätigen und ihre Recording-/Storage-Schutzmechanismen einhalten. Derzeit keine Fernbefehle.</p></details>
+</section><script>
+(function(){
+function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+function fmt(n){return (Number(n)/1024).toFixed(1)+' GiB';}
+function renderHealth(d){var rows=document.getElementById('clusterHealthRows');if(!rows)return;
+var ns=Array.isArray(d.nodes)?d.nodes:[];ns.sort(function(a,b){return (a.cluster_role==='coordinator'?0:1)-(b.cluster_role==='coordinator'?0:1);});
+rows.innerHTML=ns.map(function(n){var ok=!!n.health_valid,total=Number(n.sd_total_mib||0),used=Number(n.sd_used_mib||0);
+return '<tr><td>'+esc(n.hostname||n.integration_id)+'</td><td>'+esc(n.cluster_role||'–')+'</td><td>'+(ok&&total?fmt(used):'–')+'</td><td>'+(ok&&total?fmt(Math.max(0,total-used)):'–')+'</td><td>'+(ok&&Number(n.cpu_temp_deci_c)>-1000?(Number(n.cpu_temp_deci_c)/10).toFixed(1)+' °C':'–')+'</td><td>'+esc(n.recording?'Recording':'Bereit')+'</td></tr>';}).join('');
+var extra=document.getElementById('clusterHealthExtra');if(extra)extra.textContent=ns.map(function(n){return (n.hostname||n.integration_id)+': freier Heap '+(n.health_valid?Math.round(Number(n.free_heap_bytes||0)/1024)+' KiB':'unbekannt');}).join(' · ');
+}
+function pollHealth(){fetch('/cluster_status?t='+Date.now(),{cache:'no-store',credentials:'same-origin'}).then(function(r){if(!r.ok)throw Error('status');return r.json();}).then(renderHealth).catch(function(){});}
+pollHealth();setInterval(pollHealth,10000);
+})();
+</script>)__HEALTH__";
     html += "<section class='settings-section'><h3>Zeit synchronisieren</h3>"
         "<p>Fordert die aktuell verbundenen Nodes auf, ihre Clusterzeit jetzt "
         "neu abzugleichen. Die Systemuhren und laufenden Aufnahmen werden nicht verändert.</p>"
@@ -270,11 +290,44 @@ static void handleClusterCoordinatePage()
         "<button class='primary' type='submit'>Zeit jetzt synchronisieren</button></form>"
         "<p class='muted'>Der Befehl wird authentifiziert übertragen. "
         "Einzelne offline Nodes oder verlorene Funkpakete werden nicht bestätigt. "
-        "Die Synchronisationsqualität ist auf der jeweiligen Cluster-Seite sichtbar.</p>"
+        "Eine bestätigte Messung wird hier pro Gerät angezeigt.</p>"
+        "<div id='clusterSyncSummary' class='muted'>Zeitstatus wird geladen …</div>"
+        "<div class='cluster-table-wrap'><table class='cluster-table'>"
+        "<thead><tr><th>Gerät</th><th>Sync-Status</th><th>Zeit beim Sync</th><th>Abweichung zur Geräteuhr</th><th>Messqualität</th><th>Letzte Messung</th></tr></thead>"
+        "<tbody id='clusterSyncRows'><tr><td colspan='6'>Lädt …</td></tr></tbody>"
+        "</table></div>"
+        "<details><summary>Was bedeuten die Werte?</summary><p>Die Abweichung vergleicht die geschätzte Clusterzeit mit der lokalen Geräteuhr. "
+        "Die Unsicherheit beruht auf der WLAN-Laufzeit und ist keine garantierte Genauigkeit. "
+        "Bei einem neuen Sync-Auftrag gilt ein Gerät erst dann als bestätigt, wenn eine neue, authentifizierte Messung gemeldet wurde. "
+        "Eine fehlende Rückmeldung bedeutet nicht zwingend, dass der Node den Befehl nicht erhalten hat.</p></details>"
         "</section>";
     if (server.arg("notice") == "sent")
         html += "<p class='flash-notice'>Synchronisation angefordert. "
                 "Der Empfang durch alle Nodes ist damit noch nicht bestätigt.</p>";
+    html += R"__SYNCJS__(<script>
+(function(){
+function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+function ms(v){return (Number(v||0)/1000).toFixed(2)+' ms';}
+function clock(v){var n=Number(v);return n>1577836800000000?new Date(n/1000).toLocaleString('de-DE'):'–';}
+function age(v){var n=Number(v||0);return n<60000?Math.round(n/1000)+' s':Math.round(n/60000)+' min';}
+function render(d){
+var rows=document.getElementById('clusterSyncRows'),sum=document.getElementById('clusterSyncSummary');
+if(!rows||!sum)return;
+var seq=Number((d.cluster_time||{}).manual_sync_sequence||0);
+var nodes=Array.isArray(d.nodes)?d.nodes:[];
+var done=0,expected=0;
+rows.innerHTML=nodes.map(function(n){
+var local=!!n.local,valid=!!n.time_report_valid,match=valid&&Number(n.time_report_command_seq)===seq;
+var status=local?'Zeitquelle (Coordinator)':(!seq?(valid?'Messung vorhanden':'Wartet auf erste Messung'):(match?'Sync bestätigt':'Antwort ausstehend'));
+if(!local){expected++;if(seq&&match)done++;}
+return '<tr><td><strong>'+esc(n.hostname||n.integration_id||'–')+'</strong></td><td>'+esc(status)+'</td><td>'+esc(local?clock((d.cluster_time||{}).utc_us):(valid?clock(n.time_report_utc_us):'–'))+'</td><td>'+esc(local?'Referenz':(valid?(Number(n.time_report_offset_us)===-86400000000?'nicht verfügbar':ms(n.time_report_offset_us)):'–'))+'</td><td>'+esc(local?'–':(valid?'RTT '+ms(n.time_report_rtt_us)+' · ±'+ms(n.time_report_uncertainty_us)+' (geschätzt)':'–'))+'</td><td>'+esc(local?'–':(valid?age(n.time_report_age_ms)+' her':'–'))+'</td></tr>';
+}).join('')||'<tr><td colspan="6">Keine Geräte aktiv.</td></tr>';
+sum.textContent=seq?('Aktueller Sync-Auftrag #'+seq+': '+done+' von '+expected+' Nodes haben eine passende Messung zurückgemeldet.'):('Noch kein manueller Sync-Auftrag seit dem Start. Automatische Messungen werden ebenfalls angezeigt.');
+}
+function poll(){fetch('/cluster_status?t='+Date.now(),{cache:'no-store',credentials:'same-origin'}).then(function(r){if(!r.ok)throw Error('status');return r.json();}).then(render).catch(function(){var e=document.getElementById('clusterSyncSummary');if(e)e.textContent='Zeitstatus derzeit nicht erreichbar.';});}
+poll();setInterval(poll,3000);document.addEventListener('visibilitychange',function(){if(!document.hidden)poll();});
+})();
+</script>)__SYNCJS__";
     html += htmlFooter();
     server.sendHeader("Cache-Control", "no-store");
     server.send(200, "text/html; charset=utf-8", html);
