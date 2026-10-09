@@ -22,10 +22,12 @@ void clusterNetworkStop();
 void clusterMdnsAdvertise();
 void clusterLoop();
 
+bool clusterRequestNodeWipe(const String &nodeId,String &error);
 bool clusterRuntimeActive();
 bool clusterLocalIsCoordinator();
 // Sends an authenticated advisory time-sync trigger; no system-clock changes.
 bool clusterRequestTimeSync(String &error);
+bool clusterRequestNodeTimeSync(const String &nodeId, String &error);
 bool clusterRestartRequired();
 const char *clusterLastError();
 
@@ -98,3 +100,11 @@ String clusterStatusJson();
 // Independent UTC estimate, not applied to system clock/RTC or recording.
 // false if authority time is missing or estimate too old.
 bool clusterTimeNowUs(int64_t &utcUs);
+
+// Beta72: harmless authenticated transport probe; coordinator only.
+bool clusterSendJobProbe(const String &nodeId, String &error);
+// Schedule a single remote restart. ACK confirms scheduling only.
+bool clusterRequestNodeRestart(const String &nodeId, String &error);
+
+// Schedule one remote protected shutdown; ACK only confirms scheduling.
+bool clusterRequestNodeShutdown(const String &nodeId, String &error);

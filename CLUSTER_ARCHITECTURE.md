@@ -1,3 +1,44 @@
+## v87-beta92 — SD health refresh and consolidated coordinator controls (2026-10-09)
+
+- On completion of the remote full SD wipe (success or failure), invalidate the node's cached SD usage and immediately emit a signed cluster heartbeat/health sample. If filesystem usage cannot be read, report unknown rather than stale pre-wipe usage. The ordinary at-most-once-per-minute filesystem usage policy remains in place for normal operation.
+- Remove redundant standalone reboot and shutdown sections from `/cluster_coordinate`. These functions remain accessible via node selection and per-node signed jobs, with the latest job/result in the main table.
+- Remove the redundant global manual time-sync action; preserve the detailed per-node time measurement display as a collapsible read-only diagnostic. Targeted sync stays in the node selection toolbar.
+- Update the preflight description to match the already enabled full wipe command.
+- Limitations: health emission depends on active cluster/WiFi; coordinator will not display new SD numbers until the health packet arrives. Successful wipe means maintenance returned success, not physical secure erasure. ESP32 compile and hardware verification pending.
+
+## Beta 89 – UX der Cluster-Aktionsauswahl
+Die Sammelaktion `runBulk` verlangt bei `cluster_node_restart` und `cluster_node_shutdown` weiterhin die explizite Browser-Bestätigung. Die nichtdestruktiven Aktionen `cluster_job_probe` und `cluster_node_sync_time` starten ohne redundante Bestätigung. Zielauswahl, authentifizierte POST-Endpunkte und Einzel-ACKs bleiben unverändert; insbesondere bleibt der Unterschied zwischen HTTP-Annahme und UDP-ACK bestehen.
+
+### Beta 82: Probe-UI und getrennte Diagnose
+
+- `ClusterJobs::Kind::Probe` ist Enum-Wert **5**, `Restart` ist **1**. Die Probe-Tabelle muss auf `kind===5` filtern; `job_probes` ist bewusst ein gemischter, auf 16 RAM-Einträge begrenzter Snapshot.
+- `job_probe_diagnostics.jobs_started`: monotoner uint32-Laufzeitzähler erfolgreicher Probe-Enqueues, reset beim Stop der Cluster-Runtime; nicht gleich Anzahl sichtbarer Einträge und nicht gleich Zahl bestätigter ACKs.
+- Ein Browser-Abbruch nach 2,5 Sekunden bedeutet **keinen** bestätigten UDP-/Node-Ausfall. Letztes erfolgreiches JSON bleibt als UI-Anzeige stehen und der Browser-Fehlerzähler läuft separat.
+- Hardware-Referenz Beta 81: Restart ACK nach 41 ms und nachfolgende geänderte Boot-ID; kein Beweis für auftragsspezifische Ausführung ohne persistierten Job-Beleg.
+- Vor zentralem Shutdown weiterhin mindestens Wiederholungstest mit Probe, Einzel-Restart, Recording-Sperre und Boot-Return auf zwei Geräten erforderlich.
+
+
+### Beta 81: ACK-/Timeout-Konsistenz
+Ein authentifiziertes und einem laufenden Restart-Job zugeordnetes ACK beendet die reine Zustellungswartezeit. Der Zustand `Accepted` darf nach der 15-s-Sendefrist nicht verfallen. Ein nie bestätigter `Sent`-Restart bleibt hingegen `TimedOut`, auch falls unabhängig ein Boot-Wechsel beobachtet wird. HTTP-Latenz ist nur browserseitige Abrufdauer, keine Cluster-Netzlatenz.
+
+### Beta 78: Coordinator-Webstatus / Diagnosegrenze
+
+Die Seite `/cluster_coordinate` bündelt ihre vier Status-Widgets über **eine** laufende `/cluster_status`-Abfrage (Single-Flight, Browser-Abbruch 2500 ms). Eine kurze Wiederverwendung des JSON reduziert Burstlast; HTTP-Fehler werden angezeigt. Das ist eine browserseitige Begrenzung, keine Garantie gegen serverseitig blockierende Netzwerkoperationen. Der Probe-POST wird per `fetch` mit 5000-ms-Abbruchgrenze statt Full-Page-POST ausgeführt. Ein Client-Timeout sagt nichts über eine mögliche serverseitige Ausführung; niemals automatisch destruktive Aufträge erneut senden. Der Cluster-Job selbst behält seine 15000-ms-Deadline und Beta-77-Wiederholungen ausschließlich für Probe.
+
+**Offen:** tatsächliche Ursache der Hänger mittels Browser-Netzwerkansicht/serieller Logs ermitteln; RAM-/HTTP-Heaplast und ACK-Rate auf zwei XIAOs prüfen. Firmware-Pool, Shutdown und SD-Massenlöschung bleiben gesperrt.
+
+
+## Beta 76: Neustartnachweis / Diagnose
+- `nodes[].uptime_seconds` wird erstmals auch in der Coordinator-Tabelle dargestellt; `nodes[].boot_id` ist die vorhandene signierte SFC1 Boot-Nonce (8 Hexzeichen), **kein** persistenter Hardware-Bootcounter.
+- Pro ausgehendem `SFJR1`-Restart merkt der Coordinator `(jobId, nodeId, alteBootNonce)` maximal 16-mal im RAM. Bei akzeptierter authentifizierter neuer Presence wird eine veränderte Boot-Nonce gemeldet als `job_probes[].boot_change_observed`.
+- Der Job-Zustandsautomat bleibt unverändert: `TimedOut` bleibt `TimedOut`, selbst wenn später eine andere Boot-Nonce erkannt wurde. Dadurch kein falsches Erfolgsergebnis und keine versehentliche Wiederholung.
+- Limitation: Zufälliger/anderweitiger Neustart kann ebenfalls Boot-ID wechseln; ohne beim Boot verlässlich persistierte Job-ID ist keine kausale Zuordnung möglich. Coordinator-Neustart und Cluster-Runtime-Reset verlieren RAM-Daten. 32-bit `millis()`-Uptime läuft nach ca. 49,7 Tagen über.
+- Nicht verändert: Signing, WLAN-/Sleep-Ownership, Recording-Gates, SD, Firmware und Systemzeit. Es wurde keine ACK-Neuübertragung eingeführt: echte Transport-Reliability ist noch nicht nachgewiesen.
+
+## Beta 72 – Authenticated job transport staging
+
+`clusterSendJobProbe(nodeId,error)` sends an explicitly invoked, non-destructive SFJP1 probe to a live authenticated peer over UDP 39428. Each packet uses existing cluster HMAC, current coordinator identity/boot/epoch, target identity/boot and a monotonic per-boot sequence. The remote node verifies the currently elected coordinator, source IP, peer boot and epoch and sends SFJA1 ACK. The coordinator verifies target and current job state before transitioning Sent -> Accepted -> Running -> Succeeded. Duplicate/late ACKs are ignored; incomplete jobs time out in RAM after 15 seconds. This stage intentionally exposes no WebConfig action and never executes reboot, shutdown, storage delete or OTA. It is a transport foundation, not completed remote administration.
+
 # SensorForge Cluster Architecture
 
 **Authoritative cluster foundation:** `v87-beta50`  
@@ -613,3 +654,135 @@ A configured Cluster is not considered discoverable merely because values exist 
 Known-Cluster credentials are cached in NVS namespace `sfclprof`. On a brand-new board that namespace legitimately does not exist yet. A read-only NVS open cannot distinguish this normal first-use state from a storage error. Beta 48 therefore creates/opens that namespace during an explicit join/save password lookup; an empty cache then means simply “no stored password”, while a real NVS open failure is still surfaced as storage unavailable.
 
 Passive scanner rules are unchanged: while `/cluster` is open, a disabled local node may join the multicast receive group and listen for public `SFD1` announcements, but it does not transmit Cluster packets and never starts or extends WiFi. Only active Beta-38-or-newer members publish `SFD1`; older Beta-37 nodes are not visible to this passive dropdown even though they may implement earlier authenticated Cluster traffic.
+
+
+## Beta 71: zentrale Job-Verwaltung – Wiedereinstieg / Sicherheitsgrenze
+
+Basis: kompletter Source-Tree v87-beta70 einschließlich Beta-69-Compile-Fix; Delta v87-beta71. **Beta 71 ist eine Infrastrukturvorstufe, kein ausführbarer Remote-Command-Release.**
+
+### Implementiert
+
+- `cluster_jobs.h/.cpp` enthält eine feste, dynamisch nicht wachsende RAM-Tabelle von höchstens 16 Einträgen. Es gibt keine NVS- oder SD-Persistenz.
+- Job-Felder: `jobId` (64 Bit), `coordinatorEpoch` (32 Bit), Ziel-Node-ID, Jobart, Status, Zeitlimit, Zeitpunkt der letzten Änderung und numerischer Resultatcode.
+- Erlaubter Ablauf: `Queued -> Sent -> Accepted -> Running -> Succeeded`; aus nichtterminalen Zuständen darf ein Job in `Failed`, `TimedOut` oder `Cancelled` wechseln. Terminale Jobs sind endgültig.
+- Die Job-ID ist während der gesamten Cluster-Runtime eindeutig und bleibt auch nach Erfolg reserviert. Keine Wiederausführung durch erneutes Einreihen derselben ID.
+- `transition()` verlangt die korrekte Coordinator-Epoch. Ein Timeout ist maximal 1 h; Vergleich der monotonen 32-Bit-Zeit ist überlaufverträglich im erlaubten Fenster.
+- `clusterNetworkStop()` ruft `ClusterJobs::reset()` auf; damit kann eine neue Runtime keine flüchtigen Altjobs übernehmen.
+
+### Absichtlich NICHT implementiert
+
+- Kein signierter, gegen Replay geschützter Job-Wire-Transport; kein Aufruf dieser Warteschlange von HTTP oder UDP.
+- Keine Ausführung oder Umgehung von Recording-, SD-, Shutdown- oder OTA-Ownership.
+- Kein Firmware-Pool, keine Downloads, kein Update-Scheduler.
+- Keine Freigabe für destruktive Aktionen. `enqueue()` ist eine interne Datenstruktur-API, **keine Berechtigung**, eine Aktion auszuführen.
+
+### Vor den nächsten Freigaben verbindlich
+
+1. Authentifizierte, versionierte Wire-Nachrichten mit konkreter Cluster-ID, Coordinator-ID, Coordinator-Boot-ID und Coordinator-Epoch binden. Alte Aufträge nach Failover strikt ablehnen.
+2. Empfangende Nodes benötigen eigene Deduplizierung und persistente/neu bewertete Idempotenz für destruktive Aktionen; coordinatorseitige RAM-IDs allein reichen bei Paketverlust und Reboot NICHT aus.
+3. Quittungen unterscheiden *angenommen*, *ausgeführt* und *auf neuem Boot wieder erreichbar*; ein ACK vor Reboot gilt nicht als Erfolg.
+4. Pro Node denselben Auftragslebenszyklus vollständig dokumentieren und seine Sicherheits-Owner-Funktionen (Storage-Guard, Recorder, OTA, WiFi/Sleep) vor dem Aufruf prüfen.
+5. Für Firmware-Upgrades Board-/Partition-/Version-Metadaten gegen das signierte Paket prüfen; Download-Slots strikt sequenziell vergeben; Coordinator zuletzt; ausfalltoleranter Fortschritt und Recovery.
+6. Negative Tests: doppelte Pakete, Replay, ungültige HMAC, falsche Epoch, Coordinator-Ausfall, leere/defekte SD, aktive Aufnahme, Stromverlust während OTA, Zeitüberschreitung und Node-Restart.
+
+### Verifikation
+
+Host-C++11-Zustandsautomat mit `-Wall -Wextra -Werror` kompiliert und getestet. Der vollständige Arduino-ESP32-3.3.12-Build und reale Hardwaretests sind noch offen. Keine Änderungen an dem hardwarebestätigten Cluster-Election-/ACK-/Zeit-/WiFi-Protokoll.
+
+
+## v87-beta73: Coordinator-Probeoberfläche
+
+`/cluster_coordinate` bietet je entferntem Node einen harmlosen Probeauftrag. Der POST-Endpunkt `/cluster_job_probe` wird von der zentralen Administrator-/CSRF-Prüfung geschützt und ruft ausschließlich `clusterSendJobProbe()` auf. Die Resultate kommen aus der flüchtigen `job_probes`-Tabelle von `/cluster_status`; ein ACK bestätigt lediglich die Verarbeitung eines signierten Probeauftrags, nicht die Ausführung einer Wartungsaktion. Keine Änderungen an Presence/Election/Recording/Storage/OTA. Reboot, Shutdown, Löschen und Firmware-Update sind weiterhin nicht freigeschaltet.
+
+## Beta 74 – Job-Transportdiagnose
+
+`job_probe_diagnostics` unter `/cluster_status` zeigt lokal seit Runtime-Start `received`, `ack_sent`, `rejected`, `last_reject`, `ack_received`, `ack_rejected`, `last_ack_reject`. Alle Zähler RAM-only und ohne Secrets. Eine HMAC-ungültige Nachricht gelangt nicht in diese Parser-Zähler. Coordinator-Timeout bei `received=0` am Ziel: Weg bis zur authentifizierten Job-Verarbeitung prüfen. Bei `received>0` / `rejected>0`: angezeigten Grund prüfen. Bei `ack_sent>0` und `ack_received=0` am Coordinator: Rückweg/Empfang untersuchen. Keine Remote-Aktionen implementiert.
+
+### v87-beta75 – Remote restart safety boundary
+
+- New unicast SFJR1 and reply SFJRA1 reuse the existing HMAC packet envelope. Target selection is per-node, never multicast.
+- The receiver checks coordinator identity, live authenticated peer and source IP, coordinator epoch, coordinator boot and its own boot before scheduling the restart.
+- Restart job replay counter is RAM-only, keyed to coordinator boot+epoch, and is not reset by repeated packets. Target boot nonce changes after a reboot so an old command cannot target a subsequent boot instance.
+- Acknowledgment means scheduling via the existing WebConfig reboot path, not proof of a completed reboot. No retries occur automatically, and unsuccessful outcomes need operator review.
+- Recording-active denial remains authoritative. Shutdown and all destructive filesystem/firmware jobs are deliberately not exposed.
+- Testing before use: both boards compile, probe still succeeds, individual restart while idle, denial while recording, confirm reboot/rejoin, replay/lost ACK, coordinator failover during command. Do not interpret timeouts as safe to resend automatically.
+
+### Beta 77: begrenzte, idempotente Probe-Wiederholung
+- Coordinator hält maximal 16 flüchtige Retry-Einträge parallel zu den vorhandenen ClusterJobs.
+- Nur `Kind::Probe` darf retransmittiert werden: nach 3 und 6 Sekunden, insgesamt höchstens drei Sendeversuche mit unveränderter Sequenz/Job-ID.
+- Ein laufender Retry wird bei Abschluss, Timeout, Epoch-/Rollenwechsel, Lease-Verlust oder geänderter Ziel-Boot-ID nicht erneut versendet.
+- `SFJP1` verarbeitet wiederholte **identische** Sequenzen erneut und sendet eine neue `SFJA1`-Antwort. Sicherheitsvalidierung unverändert. `SFJR1` (Reboot) bleibt strikt einmalig.
+- Diagnose: `/cluster_status` liefert `job_probe_diagnostics.retransmissions` als Anzahl zusätzlicher Sendeversuche (nicht bestätigter Empfang).
+- Grenzen: UDP-Zustellung nicht garantiert; ACK-Verlust und fehlender Auftrag lassen sich ohne Diagnosen des Zielgeräts nicht zuverlässig unterscheiden.
+
+
+### Beta79 Status-Frontend-Korrektur (2026-10-09)
+
+Der Coordinator-Status-Cache liefert ein bereits geparstes JSON-Objekt (kein `Response`). Vier Consumer in der Coordinator-Seite müssen `.then(render...)` direkt verwenden. Beta78 verursachte andernfalls JavaScript-Ausnahmen (`r.json is not a function`) und irreführende UI-Ausfälle. Beta79 korrigiert ausschließlich diese Consumer. Hardware-Verifizierung noch ausstehend.
+
+### Beta 80: Fernneustart diagnostizieren
+- `job_restart_diagnostics` im lokalen `/cluster_status`: `sent`, `received`, `accepted`, `rejected`, `last_reject`, `ack_received`, `ack_accepted`, `ack_rejected`, `last_ack_reject`.
+- Auf Coordinator: ACK-Zähler zeigen Eingang und Ablehnung; auf Ziel-Node: Empfang, Ausführungsplanung, Sendefehler/Ablehnung. Zähler sind RAM-lokal und resetten beim Boot.
+- Negative Restart-ACKs werden nicht neu eingeführt; verweigerte Ausführung bleibt ohne ACK und kann mit lokalen Zählern untersucht werden.
+- Auf devxiao1 vor Test `Cluster` öffnen, nach dem Test lokale Neustart-Diagnose ablesen. Bestätigter Job-ACK bedeutet weiterhin nur geplante Ausführung.
+- SD-Bootlogs bei absichtlich leerem devxiao2-Kartenslot sind für Cluster-Jobfehler nicht beweiskräftig.
+
+## Beta 83 – Einzelner Remote-Shutdown (Testbetrieb)
+
+- `SFJS1` und `SFJSA1` verwenden das bestehende HMAC-signierte Cluster-Unicast und dieselben Rollen-/Lease-/Epoch-/Boot-/Replay-Kriterien wie der Remote-Restart.
+- Ein Node quittiert erst nach erfolgreicher Planung über `webConfigScheduleShutdown(5000)`. Dies schützt offene Aufnahmen und sperrt neue Starts bis zum Power-Down.
+- Timeout 15 Sekunden für fehlendes ACK; **nie automatische Retries** für Shutdown. Gültiges ACK bleibt als `Accepted` erhalten.
+- Die Board-Abschaltung ist der vorhandene manuelle Deep-Sleep ohne Wake-Quellen. Nach dem Abschalten ist keine automatische Rückkehr zu erwarten; RESET oder Power-Cycle erforderlich.
+- Coordinator-UI erlaubt ausschließlich Einzelaktionen nach Bestätigung, zeigt Job-ID/ACK-Zeit und erklärt, dass ACK weder Ausführung noch Stromverlust beweist.
+- Probe-ACK-Zeit erscheint separat als `ack_latency_ms` für erfolgreiche Probe-Jobs.
+- Testplan: Probe-Aufträge; Shutdown nur eines ersetzbaren Nodes ohne laufende Aufnahme; ACK prüfen; offline nach Lease; Power-Cycle; Join prüfen. Gegenprobe bei laufender Aufnahme (muss gesperrt werden). ESP32-Compile und Hardwaretest offen.
+
+## Beta84 – Node-Auswahl und Serienausführung
+
+Die Coordinator-Node-Tabelle hält im Browser eine Auswahl nur für entfernte Nodes. Select all / deselect all verändern keine Firmware-Konfiguration. Die Auswahl wird beim Statusrefresh beibehalten, nicht mehr sichtbare Geräte werden entfernt. Reboot/Shutdown/Probe werden über die vorhandenen Administrator-POSTs individuell nacheinander abgesetzt; damit bleiben signierte Job-IDs, Boot/Epoch/Recording-Schranken und das 16-Slot-RAM-Limit gültig. Keine automatische Wiederholung, keine Rollback-Semantik, kein garantiertes Ausführen nach HTTP-202/303. Für große Cluster kann die Job-Tabelle frühere Einträge verdrängen: Auswertung pro Ziel, vor allem bei Shutdown, bleibt Pflicht.
+
+Gezielter Zeit-Sync verwendet identisches authentifiziertes SFTS1-Paket und sendet Unicast pro Ziel (keine Änderungen am Empfänger). Die alte manuelle Broadcast-Schaltfläche ist weiterhin vorhanden. Negative ACKs/Recording-Ablehnungsgründe sind als separate Protokollerweiterung offen; keinen verlorenen UDP-Befehl als Aufnahme-Sperre interpretieren.
+
+
+### Beta 85: signierte Ablehnung und zentrale Tabellenansicht
+- `SFJX1|tag|coordinator|coord_boot|epoch|node|node_boot|seq|kind|reason` ist ein signiertes Unicast-Refusal. Es wird **ausschließlich** gesendet, wenn ein vollständig authentifizierter und als neu erkannter Restart-/Shutdown-Befehl die lokale Recording-/Safety-Schedule-Prüfung nicht besteht.
+- Auf dem Coordinator gilt Refusal nur für einen noch `Sent`-Job von exakt demselben Node/Boot/Coordinator/Epoch/Kind und Quell-IP. Das Refusal ist endgültig; keine Retries und kein automatischer Zustandswechsel von `Accepted` nach `Failed`.
+- Reason Code `2` bedeutet *Recording oder sonstige lokale Sicherheitsbedingung*; keine Behauptung einer genaueren Ursache als durch die bestehenden Schedule-APIs nachgewiesen.
+- Gerätetabelle liest `release` aus dem bestehenden signierten Presence-Peer-Status. IP-Adressen sind vor Links auf die einzelne Node-WebConfig streng als IPv4 geprüft, keine frei kontrollierbaren Hosts im Link.
+- `manual_sync_sequence` ist der **Broadcast**-Sync-Zähler. Die gezielten Unicast-Sync-Aufträge besitzen in Beta 85 noch keinen eigenen aggregierten Ausführungsnachweis. Die Oberfläche darf diese Befehle nicht als bestätigten Broadcast darstellen.
+- Offene Verifikation: Arduino ESP32-S3 Kompilation, Hardwaretest einer bewusst blockierten Restart-/Shutdown-Annahme (z.B. laufendes Recording), 2-Node-Job-Korrelation, Mehrfachauswahl, Display auf Browsern mit wechselnder Node-Liste.
+
+### Beta 86 – HTTP-Fehlerbilder und Neustart-/Absturzdiagnose
+- Auf dem Coordinator im Browser ist `/cluster_status` ein GET, pro ausgewähltem Node ein separater POST zu `/cluster_job_probe`, `/cluster_node_restart`, `/cluster_node_shutdown` oder `/cluster_node_sync_time`. Die Probe und der manuelle Sync benutzen unterschiedliche Transportpfade.
+- Die Sammelaktion pausiert neue Status-Polls, damit der ESP32-WebServer den POST unter geringerem Browser-Konkurrenzdruck bearbeiten kann. Pro POST werden HTTP-Status bzw. Timeout je Node angezeigt. Achtung: bei HTTP-Timeout kann der Befehl bereits am Gerät angekommen sein. **Nie automatisch Restart/Shutdown erneut senden.**
+- POST 12-s-Browserlimit; Status-GET 8-s-Browserlimit. Diese Grenzen sind reine UI-Wartezeiten, keine UDP-ACK-Zeiten.
+- Die Beta-85-Beobachtung '42 HTTP-Fehler, 0 Probe-Jobs, unicast Sync 0 von 1 HTTP-Annahmen' weist auf HTTP-Transport-/Server-Belastung; sie beweist weder einen defekten UDP-Transport noch einen Firmware-Absturz. Resetursache nur aus neuem Serial-Bootlog inkl. ESP-Resetgrund und ggf. Watchdog-/Backtrace zu klären.
+- SD-Mount-Fehler an devxiao2 sind bei absichtlich leerem Slot erwartbar.
+
+### Beta 87: selected-node time sync and pending SD administration
+- `clusterRequestNodeTimeSync` sends the existing signed unicast `SFTS1`, and, after successful send, records the command sequence and request timestamp in the authenticated peer entry. These fields survive presence refresh only for the same peer boot.
+- The existing signed `SFTR1` report carries the received command sequence. `cluster_status` exposes `selected_sync_seq` and `selected_sync_age_ms`; the UI displays `Gezielter Sync bestätigt` only when `time_report_valid` and the signed report sequence equals the requested sequence.
+- This is per-node report correlation, NOT proof of precise time synchronization. RTT/2 remains only a heuristic and reports are not a precision bound. No system clock or recorder behavior changed.
+- Selected requests and broadcast requests use the same monotonic coordinator sequence counter. The UI keeps broadcast and selected statuses distinguishable.
+- SD deletion safety gate: current maintenance WIPE is NOT a recordings-only deletion: it traverses the entire card and rebuilds config. Do not wire that path to remote selected-node bulk actions. Implement a dedicated incremental recordings-only cleanup with explicit media path allowlist, open-recording and active-storage checks, crash-safe progress, durable deduplication, HMAC job validation, and independently acknowledged per-node results before enabling remote SD deletion.
+
+
+### Beta 88 – SD-unabhängiger Coordinator
+Ein Node darf im Modus „SD optional“ ohne periodisches Blockieren durch Mount-Recovery laufen. Die Einstellung liegt in NVS, damit sie schon vor dem Config-/SD-Boot-Abschnitt gelesen wird; bei jedem Boot erfolgt genau ein SD-Mount-Versuch. Bei Erfolg wird sie persistent zurückgesetzt. Die Netz-/Cluster-Semantik wurde nicht geändert.
+**Wiedereinstieg/Test:** SD-Wartung von devxiao2 öffnen, Option aktivieren, neu starten; Log auf nur einen Boot-Mount und keine Recovery pro Minute prüfen. Danach SD einsetzen und neu starten: Mount muss erfolgreich sein, Schalter automatisch auf AUS. Ohne SD keine Recording-Funktion.
+
+
+### Beta 90: SD-Bereitschaftsprüfung für ausgewählte Nodes
+
+Der Coordinator bewertet die bereits signiert übermittelten SD-Gesundheitsinformationen und den Recording-Status nur lesend. Die Vorprüfung besitzt **keinerlei Lösch- oder Formatierungswirkung** und kann keine vollständige Dateisystemprüfung ersetzen. Sie ist keine Freigabe für einen späteren Löschauftrag.
+
+Vor produktiver SD-Löschung muss ein dedizierter Node-lokaler Executor alle Aufnahmedatei- und Sidecar-Typen zuverlässig klassifizieren, offene Player-/Recorder-/Storage-Handles ausschließen, neue Aufnahmen atomar sperren, Löschvorgänge in kurzen, watchdog-freundlichen Etappen bearbeiten und terminale Ergebnisse signiert zurückmelden. Der Coordinator benötigt Nonce/Epoch/Boot/Job-ID und Schutz vor Replays/Mehrfachausführung sowie explizite Bestätigung für irreversible Aktionen. SD-Konfiguration und Systemdaten dürfen nie über die zentrale Medienbereinigung entfernt werden.
+
+
+## Beta 91 – Signierter Cluster-SD-Wipe
+- `SFJW1` ist ein auf Ziel-Boot-ID, Coordinator-Boot-ID und Epoch gebundener HMAC-signierter Unicast, kein Broadcast.
+- `webSdQueueClusterWipe()` reserviert nur den Auftrag und blockiert neue Aufnahmen. `webSdMaintenanceLoop()` ruft `stopRecording()` auf und nutzt den existierenden kompletten Wipe mit internem Config-Backup/Restore.
+- `SFJWR1` berichtet signiert ausschließlich nach Abschluss an den Coordinator; er verwechselt HTTP-Annahme nicht mit der tatsächlichen Dateilöschung.
+- Kein Retransmit. Ein nicht bestätigter Wipe muss vor jeglichem erneuten Versuch lokal geprüft werden. Der Auftrag ist RAM-only; verlorene Abschlussberichte werden nicht nachgeliefert.
+- SD-Wipe löscht gewöhnliche Dateien, **keine** garantiert forensische physische Medienvernichtung.
+- Bei Wipe-Dauer über 120 s, Netzwerkverlust oder Änderung der Peer-Lease kann der Coordinator ein nicht eindeutig bestätigtes Ergebnis zeigen, selbst wenn die SD bereits gelöscht wurde.

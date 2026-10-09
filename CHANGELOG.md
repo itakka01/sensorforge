@@ -1,3 +1,154 @@
+## v87-beta92 — SD health refresh and consolidated coordinator controls (2026-10-09)
+
+- On completion of the remote full SD wipe (success or failure), invalidate the node's cached SD usage and immediately emit a signed cluster heartbeat/health sample. If filesystem usage cannot be read, report unknown rather than stale pre-wipe usage. The ordinary at-most-once-per-minute filesystem usage policy remains in place for normal operation.
+- Remove redundant standalone reboot and shutdown sections from `/cluster_coordinate`. These functions remain accessible via node selection and per-node signed jobs, with the latest job/result in the main table.
+- Remove the redundant global manual time-sync action; preserve the detailed per-node time measurement display as a collapsible read-only diagnostic. Targeted sync stays in the node selection toolbar.
+- Update the preflight description to match the already enabled full wipe command.
+- Limitations: health emission depends on active cluster/WiFi; coordinator will not display new SD numbers until the health packet arrives. Successful wipe means maintenance returned success, not physical secure erasure. ESP32 compile and hardware verification pending.
+
+## v87-beta90 – 2026-10-09 – Cluster-SD-Löschung: Sicherheitsvorprüfung (noch kein Löschbefehl)
+
+- Coordinator: neuer Button „SD-Löschung prüfen (ohne Löschen)“ für ausgewählte Nodes.
+- Prüft signierte, bestehende Cluster-Statusdaten zu SD-Kapazität und Recording, ohne Schreibzugriffe.
+- Knoten ohne SD, mit aktiver Aufnahme oder ohne gültige SD-Daten werden als nicht löschbereit angezeigt.
+- Kein SD-Wipe, kein Lösch-Executor, kein Remote-Löschauftrag; bisherige Sicherheitsmechanismen unverändert.
+- TODO: isolierter Medien-Executor (Datumordner, Sidecars, offene Dateien, Storage-Sperren, Wiederanlauf) sowie signierte, eindeutige Job-ACKs vor Freischaltung.
+- Tests: JS-Syntax und ZIP-Integrität; ESP32-Compile/Hardwaretest ausstehend.
+
+## v87-beta89 (2026-10-09) – Bedienung der Cluster-Sammelaktionen
+- Browser-Confirm für harmlose Probeaufträge und gezielte Zeitsynchronisation entfernt. Ein Klick auf den entsprechenden Button löst nach vorhandener Node-Auswahl direkt die individuellen signierten Anfragen aus.
+- Bestätigungsdialog für Remote-Neustart und Remote-Shutdown weiterhin verpflichtend, einschließlich Shutdown-Warnhinweis.
+- Server-Endpunkte, CSRF-/Authentifizierung, UDP-Protokoll, Zeitmessung, SD-/Recording-/Sleep-Verhalten und Aktionsresultate unverändert.
+- JS-Syntax-/Archivprüfung durchgeführt; ESP32-Compile und Hardwaretest ausstehend.
+
+## v87-beta86 (2026-10-09) – HTTP-Sammelaktionen stabilisieren
+- Coordinator: während einer Sammelaktion werden neue Hintergrund-Statusabfragen pausiert, bereits laufende Abfragen dürfen enden. Danach sofortiger Statusrefresh. Keine Änderungen an UDP/Cluster-Wire.
+- Einzelner HTTP-POST pro Node weiterhin ohne automatische Wiederholung. Browser-Grenze pro POST von 5 auf 12 Sekunden erhöht, um fehlerhafte Client-Abbrüche bei kurzzeitig belastetem ESP32 seltener zu machen. Ein abgebrochener POST hat unklaren Ausführungsstatus; niemals blind wiederholen.
+- HTTP-Fehlercodes und knappe Serverfehlermeldungen werden je Node angezeigt; 409 z.B. Ablehnung, statt generischem 'unbestätigt'. Ein 303/opaquer Redirect zählt nur als HTTP-Annahme, **nicht** als signiertes ACK.
+- Status-GET-Timeout von 2,5 auf 8 Sekunden erhöht. Letzte gültige Daten bleiben sichtbar. Hintergrund-Polling nutzt weiterhin die gemeinsame Statusabfrage. Kein Hinweis auf Node-Ausfall aus reinem Browser-Timeout.
+- Die Meldungen über Coordinator-Reset/Absturz sind **nicht** als Ursache geklärt. Keine Änderung an Recording, SD-Recovery, WiFi, Sleep, Cluster Election, Auth, Restart oder Shutdown.
+- Abschluss: JS-Parse, ZIP-Integrität. ESP32-Compile und Hardwareprüfung ausstehend.
+
+## v87-beta85 (2026-10-09) – Coordinator-Tabelle / negative Job-ACKs
+- Node-Namen in der Coordinator-Tabelle verlinken direkt auf die WebConfig des jeweiligen Geräts; Ziel-IP wird vor Bildung des Links als IPv4 geprüft.
+- Firmwarestand pro Node (`release`, bereits aus dem authentifizierten Cluster-Presence-Protokoll), letzter bekannter Job-Status sowie ACK-Latenz erscheinen in der Haupttabelle.
+- Redundanter Bereich „Geräteverwaltung und Firmware“ entfernt. Bestehende Node-WebConfig-Seiten bleiben über den Gerätenamen erreichbar.
+- Neues HMAC-signiertes `SFJX1`-Ablehnungs-ACK für authentifizierte Restart-/Shutdown-Aufträge, wenn der lokale geschützte Planer ablehnt. Die Ablehnung wird nur nach vollständiger Identitäts-, Boot-, Epoch-, Lease- und Replay-Prüfung gesendet. Coordinator korreliert Node, IP, Boot, Epoch, Job-ID und Job-Art und setzt `Failed` (Code 2: Aufnahme oder Sicherheitsbedingung). Kein Retry.
+- Broadcast-Sync-Status klar als Broadcast-Status ausgewiesen. Ein gezielter Unicast-Sync wird nicht mehr irreführend in die globale Broadcast-Zählung eingerechnet. Eine individuelle Unicast-Ausführungsbestätigung ist noch nicht implementiert.
+- Keine Änderungen an Recording-, SD-, Sleep- oder Election-Lifecycle. Kein Firmware-Pool / keine SD-Massenlöschung.
+- JavaScript-Syntaxprüfung (7 Blöcke) und ZIP-Integrität: bestanden. ESP32-Compile / Zwei-Node-Hardwaretest: offen.
+
+## v87-beta84 – Koordinator-Mehrfachauswahl (2026-10-09)
+
+- Checkbox pro entferntem Node direkt in der Ressourcenübersicht. Alle auswählen, Auswahl aufheben, Auswahl bleibt bei Status-Polling erhalten; beim Verschwinden eines Nodes wird sie entfernt.
+- Sammelbuttons für Probe, Restart, Shutdown und gezielten Zeitsync. Aktionen senden pro Ziel einen **separaten** Administrator-POST und erzeugen individuelle signierte Einzelbefehle; kein Broadcast und kein Auto-Retry für Restart/Shutdown. HTTP-Lauf begrenzt auf 5 s je Ziel; Rückgabe ist **kein Ausführungsbeweis**.
+- Gezielt synchronisieren verwendet das bestehende signierte SFTS1-Format als Unicast an den ausgewählten Node; die bisherige Funktion 'Zeit jetzt synchronisieren' bleibt als Broadcast verfügbar.
+- Coordinator selbst nicht auswählbar. Shutdown-Warnung ausdrücklich vor Start; alle ausgewählten Ziele werden nacheinander angefordert, nicht transaktional. Bei einem Teilfehler laufen weitere Ziele weiter.
+- **Nicht enthalten:** negative ACKs für wegen Recording abgelehnte Befehle und sicherer Nachweis des Deep-Sleep. Bis zur nächsten Protokollstufe ist 'keine Bestätigung' mehrdeutig. Kein SD-Löschen oder Firmware-Pool.
+- Prüfungen: JavaScript-Syntax, statische Prüfung, ZIP-Integrität; ESP32-Compile/Hardwaretest offen.
+
+## v87-beta83 – Geschützter Remote-Shutdown und Probe-Latenz (2026-10-09)
+
+- Eigene signierte UDP-Nachrichten `SFJS1` / `SFJSA1` für **einzelnen** Remote-Shutdown mit Ziel-Node, Ziel-Boot-ID, Coordinator-ID/-Boot, Epoch und Sequenz. Kein Broadcast, keine automatische Wiederholung.
+- Empfänger prüft HMAC (bestehender Authentikator), IP, Rolle, Boot, Coordinator-Lease, Epoch, Replay-Sequenz und verwendet ausschließlich `webConfigScheduleShutdown(5000, error)` mit Recording-Sperre und Aufnahme-Neustartsperre. ACK bedeutet nur *Shutdown geplant*, nicht *ausgeführt*.
+- Coordinator zeigt Shutdown-Jobs getrennt und erfordert Browser-Bestätigung mit Hinweis: **Deep Sleep ohne Wake-Quellen, RESET/Stromversorgung nötig**.
+- ACK-Latenz (`ack_latency_ms`) wird nun auch für bestätigte Probeaufträge angezeigt. Keine Änderungen an Zeitsynchronisation oder bestehendem Neustarttransport.
+- Grenzen: keine auftragsspezifische persistente Shutdown-Bestätigung; ein verlorenes ACK wird nicht erneut gesendet. Der Coordinator bleibt eingeschaltet. Kein Massen-Shutdown.
+- Prüfungen: statische Source- und JS-Syntaxprüfung, ZIP-Prüfung. Vollständiger ESP32-Compile und Hardwaretest ausstehend.
+
+## v87-beta82 – Probe-Ergebnisliste und HTTP-Diagnose (2026-10-09)
+
+- **Behobene UI-Vermischung:** Die Probe-Ergebnisliste enthielt bisher sämtliche `job_probes`, darunter Neustartaufträge (`kind=1`), weshalb nach einem Restart fälschlich `Angenommen` unter den Verbindungstests erschien. Die Anzeige filtert jetzt strikt auf Probeaufträge (`kind=5`).
+- **Laufzeit-Gesamtzähler:** `job_probe_diagnostics.jobs_started` zählt erfolgreich angelegte Probeaufträge seit Cluster-Runtime-Start und ist unabhängig von den maximal 16 Einträgen des gemeinsamen RAM-Jobverlaufs. Gültige ACKs werden separat gezählt. Der Zähler wird bei Cluster-Runtime-Neustart zurückgesetzt.
+- **HTTP-Hinweise:** Ein einzelner 2,5-s-Abbruch gilt nicht mehr als Beweis für Cluster-Ausfall. Letzte bekannte Job- und Node-Daten bleiben sichtbar; Status-Fehler und anschließende Erholung werden verständlicher kommuniziert. Kein erhöhter Timeout und keine zusätzliche HTTP-Last.
+- **Referenztest Beta 81:** Einmaliger Einzel-Neustart devxiao1: gültiges ACK in 41 ms, anschließender Boot-ID-Wechsel, erfolgreiche Cluster-Rückkehr. Der Boot-Wechsel allein ist kein kausaler Nachweis.
+- Keine Änderungen an signiertem UDP-Wire, Heartbeat, Election, Recording, SD, Sleep, Restart-Ausführung oder Firmwareupdate.
+- Tests: JS-Syntax, ZIP-Integrität und Source-Prüfungen; vollständiger ESP32-Compile und Hardwaretests noch offen.
+
+## v87-beta81 – Neustart-ACK-Zustand und Web-Diagnose (2026-10-09)
+
+- **Behobener Fehler:** Ein per HMAC akzeptiertes Neustart-ACK setzte den Job auf `Accepted`, doch `ClusterJobs::expire()` überschrieb ihn nach 15 s mit `TimedOut`. Das erzeugte die widersprüchlichen Anzeigen „ACK akzeptiert“ und „Keine ACK-Bestätigung“. `Restart/Accepted` bleibt jetzt unverändert; das Transport-Timeout gilt weiter für unbestätigte `Sent`-Aufträge.
+- Der signierte ACK-Pfad prüft bereits Coordinator-Boot, Epoch, Ziel-Node, Ziel-Boot, Job-Sequenz sowie ausstehende Job-Art und -Zustand. Die UI zeigt jetzt Boot-/Sequenzanteil der Job-ID und, bei bestätigtem Neustartauftrag, die Dauer von Anlage bis ACK. Keine ungenaue 64-bit-JSON-Nummer.
+- Auf der Coordinator-Seite erscheinen Browser-Messwerte für erfolgreiche `/cluster_status`-Abrufe, Fehlschläge und die letzte HTTP-Dauer. Das ist **keine** UDP-RTT. Bestehende 2,5-s-Browsergrenze bleibt zunächst als Diagnosegrenze erhalten.
+- Bei Probe-Zeitüberschreitung wird im Ergebnisfeld „Timeout“ statt des irreführenden Codes 0 angezeigt.
+- Ein Boot-Wechsel bleibt ein separater Nachweis eines Neustarts, kein kausaler Beweis für genau diesen Fernauftrag. Kein nachträgliches Umschreiben von fehlgeschlagenen Jobs und **kein automatisches Wiederholen von Neustarts**.
+- Keine Änderungen an Election, Presence, Heartbeats, Recording, Storage, Sleep, Shutdown oder Firmwareupdate.
+- Host-Test für persistierenden `Restart/Accepted`-Zustand durchgeführt; Browser-JS-Syntax und ZIP geprüft. ESP32-Compile und Zwei-Node-Hardwaretest ausstehend.
+
+## v87-beta79 – Coordinator-Statusanzeige repariert (2026-10-09)
+
+- Fix: Vier Coordinator-Widgets behandelten das bereits dekodierte Ergebnis von `sfCoordinateStatus()` fälschlich als `Response` und riefen `.json()` erneut auf. Das ließ Node-Auswahl, Probe-Status, Neustart und Zeitstatus leer erscheinen.
+- Alle vier Aufrufer verwenden jetzt das gemeinsame JSON-Objekt direkt.
+- Keine Änderung an UDP-Transport, Cluster-Leases, Recording, SD oder Fernaktionen.
+- Browser-JavaScript-Syntax/Archiv geprüft; ESP32-Compile und Hardwaretest ausstehend.
+
+## v87-beta78 – Coordinator-Webstatus begrenzt (2026-10-09)
+
+- **Befund:** Die Coordinator-Ansicht startete vier unabhängige Abfragen desselben `/cluster_status`-Endpoints (drei davon alle drei Sekunden). Ohne Request-Deadline konnten HTTP-Abfragen bei einem langsamen ESP32 überlappen und eine scheinbar endlos laufende Probe anzeigen. Das ist eine plausible Ursache; ein Hardware-Nachweis steht aus.
+- **Korrektur:** Alle Coordinator-Widgets teilen sich nun eine einzige laufende Statusabfrage (Single-Flight) mit 2,5 Sekunden Browser-Abbruchgrenze und kurzer Cachefrist. Die Cluster-Status-API und das Cluster-Protokoll bleiben unverändert.
+- **Probeformular:** Absenden ohne Seitennavigation, maximal 5 Sekunden Browserwartezeit auf die HTTP-Antwort; unbestätigter HTTP-Abbruch wird **nicht** als sicher fehlgeschlagener UDP-Job interpretiert. Job-Ergebnisse bleiben vom 15-Sekunden-Timeout des Cluster-Job-Moduls abhängig.
+- **Diagnose:** Anzeige der Probe-Retransmissions. Keine automatische Wiederholung destruktiver Jobs, keine Änderungen an Election, Recording, Storage, Wifi, Sleep.
+- **Tests:** JavaScript-Syntax und ZIP-Integrität geprüft. ESP32-Compile und Zwei-Node-Hardwaretest ausstehend.
+- **Prüfplan:** Beide Nodes aktualisieren; Coordinator-Seite laden; 10 Probeaufträge nacheinander; kein Browser-Hängen, jedes Job-Ergebnis binnen 15 Sekunden plus Poll-Verzögerung; Browserstatus bei HTTP-Abbruch; danach optional Remote-Restart separat testen.
+
+## v87-beta77 — 2026-10-09 — Probe-Transport robuster machen
+- Nur harmlose SFJP1-Probeaufträge: max. zwei erneute Sendungen nach 3 bzw. 6 Sekunden; **dieselbe Job-ID**, dieselbe Coordinator-Epoch und dieselbe Ziel-Boot-ID.
+- Die ursprüngliche 15-Sekunden-Frist wird nicht verlängert; Sendungen enden bei ACK, geänderter Node-Boot-ID, Lease-Verlust oder Epoch-Wechsel.
+- Empfänger akzeptiert Duplikate derselben Probe-Sequenz und antwortet erneut; HMAC, Peer-IP, Boot-, Epoch- und Lease-Prüfungen bleiben aktiv.
+- Neuer Diagnosewert `job_probe_diagnostics.retransmissions`; bisherige Zähler und Neustartnachweis bleiben erhalten.
+- **Keine** Neustart-/Shutdown-/SD-/OTA-Retries; keine Änderung an Recording, Storage, Election oder Zeitsynchronisation.
+- Noch offen: vollständiger ESP32-Compile, Hardwaretest (beide XIAOs), Ursachenanalyse anhand beider Empfangsdiagnosen. Erfolgreiche Probeübertragung belegt keine allgemeine Netzzuverlässigkeit.
+
+
+## v87-beta76 — 2026-10-09 — Boot-Wechsel-Diagnose
+- Coordinator zeigt pro Node vorhandene Uptime und authentifizierte Boot-ID aus SFC1 Presence.
+- Ausgehende Einzel-Neustartaufträge speichern die ursprüngliche Boot-ID im begrenzten RAM.
+- Wenn danach eine signierte Presence desselben Nodes mit anderer Boot-ID empfangen wird, erscheint ein separater Boot-Wechsel-Nachweis. ACK-Status/Timeout wird dabei bewusst **nicht** umgedeutet.
+- Weder ein ACK noch eine geänderte Boot-ID beweist kausal die Ausführung exakt dieses Jobs. Kein Auto-Retry, keine neuen Remote-Aktionen.
+- Offene Punkte: Hardwaretest mit beiden XIAOs; gelegentliche Probe-Timeouts diagnostizieren; später persistierte Job-ID/Boot-Ursache für eindeutigen Neustartnachweis und robusteres ACK-Protokoll.
+
+## v87-beta74 — 2026-10-09 — Diagnose des Job-Transport-Timeouts
+
+- SFJP1/SFJA1-Parser um getrennte RAM-Zähler für Empfang, ACK-Versand, Ablehnung und den letzten Ablehnungsgrund erweitert.
+- Coordinator-Oberfläche zeigt lokale Transportdiagnose neben Probe-Ergebnissen; Ziel-Node-Diagnose über `/cluster_status` verfügbar.
+- Keine Lockerung von Authentifizierung, Boot-/Epoch-/IP-Prüfung oder Replay-Schutz. Keine Retries und keine Remote-Ausführung.
+- Zeitmessalgorithmus bewusst unverändert: einzelne RTT von 183 ms ist für belastbare Optimierung unzureichend. Nach Lokalisierung des Transportfehlers gezielter Messreihen-Test.
+- Prüfung: statische Quellprüfung/ZIP-Integrität. ESP32-Compile und Hardwaretest offen.
+
+## v87-beta73 — 2026-10-09 — Coordinator-Probeoberfläche
+
+- Auf `/cluster_coordinate` lassen sich authentifizierte, harmlose SFJP1-Probeaufträge pro entferntem Node auslösen.
+- `POST /cluster_job_probe` prüft die lokale Coordinator-Rolle und verwendet ausschließlich die vorhandene `clusterSendJobProbe()`-Validierung (authentifizierter Peer, Boot-/Epoch-Bindung, 15-s-Timeout).
+- Ergebnisse werden über das bestehende `/cluster_status`-JSON (`job_probes`) alle 3 Sekunden angezeigt: gesendet, bestätigt, fehlgeschlagen, Zeitüberschreitung.
+- Die globale bestehende Administrator-/CSRF-Middleware gilt auch für die neue POST-Route. Keine neue Web-Auth-Ausnahme.
+- **Keine Remote-Ausführung:** Reboot, Shutdown, SD-Löschen und Firmwareupdates bleiben ausdrücklich deaktiviert.
+- Überprüft: Delta-Dateien, ZIP-Integrität und statische Einbindung. Vollständiger ESP32-Compile und Hardwaretest offen.
+- Nächster Hardwaretest: beide Nodes starten, Probe auf dem Coordinator auslösen, individuelle Bestätigung und Timeout bei ausgeschaltetem Ziel testen.
+
+## v87-beta72 — 2026-10-09 — Authenticated job transport probe
+
+- Adds signed SFJP1/SFJA1 unicast probe/ACK over existing coordinator UDP socket.
+- Receiver validates coordinator ID, boot, epoch, target boot, authenticated peer IP and replay sequence.
+- Coordinator validates reply and matches it to the exact job/node before marking success.
+- Only `Probe` jobs are wired; no restart/shutdown/delete/update execution or UI action is enabled.
+- Probe results are exposed in read-only cluster status as `job_probes`; expired probes time out.
+- No retransmission in this stage. A sent packet is NOT considered completed without a matching ACK.
+- Real hardware compile/integration testing remains outstanding.
+
+## v87-beta71 (2026-10-09) – Cluster-Job-Grundlage, sichere Vorstufe
+- Neues separates `cluster_jobs.cpp/.h`: begrenzte RAM-Tabelle mit maximal 16 Job-Einträgen, Node-ID, Job-ID, Coordinator-Epoch, Zeitlimit, Ergebniscode und strengem Zustandsautomaten.
+- Doppelte Job-IDs, falsche Epochen, unzulässige Zustandsübergänge und verspätete Quittierungen werden abgewiesen. Monotone Millisekunden-Timeouts berücksichtigen `millis()`-Überlauf.
+- `clusterNetworkStop()` verwirft die flüchtige Job-Tabelle. Kein persistenter Auftrag wird nach Reboot versehentlich fortgesetzt.
+- **Bewusste Sicherheitsgrenze:** Diese Beta verschickt keinerlei Jobs und führt keinerlei Remote-Aktionen aus. Keine neuen Web-Routen, keine SD-Löschung, kein Power-Befehl, kein Firmwaredownload und keine Änderungen an bestehenden Cluster-Wire-Formaten.
+- Hostseitiger C++11-Test: Zustandsübergänge, ID-Duplikate, Epoch-Prüfung, Timeout inklusive Wraparound, Reset und Node-ID-Validierung bestanden. Vollständiger ESP32-Compile sowie Hardwaretests stehen aus.
+- Nächste Stufe: authentifizierter Job-Transport mit Coordinator-Bindung, unverwechselbarem Command-Nonce, Node-seitiger Deduplizierung und ausdrücklich bestätigtem Abschluss pro Gerät; erst danach Reboot/Shutdown.
+
+## v87-beta70 (2026-10-09) – sichere Verwaltungslinks (Zwischenstufe)
+- Coordinator listet Links zu bereits existierenden, lokal geschützten Verwaltungsseiten jedes sichtbaren Geräts: SD-Wartung, Neustart, Herunterfahren und signiertes Firmwareupdate.
+- Keine Remote-Ausführung, keine Massenlöschung, kein Firmware-Pool; diese bleiben gesperrt, bis bestätigte Jobs und Board-Mapping implementiert sind.
+- Redundanten Sync-Hinweis entfernt; Live-Status bleibt erhalten.
+- Keine Änderung an Cluster-Protokoll, Recording, Storage, Safety oder Firmware-Signaturprüfung.
+
 ## v87-beta69 (2026-10-09) – Coordinator: read-only Node Health
 
 - Signiertes SFH1-Zusatzpaket im bestehenden 10-s-Heartbeat: SD MiB, CPU-Temperatur, freier Heap.
@@ -391,3 +542,46 @@ Git history retains them.
 Older pre-v84 release details are intentionally omitted from this concise file.
 Use the Git history/tags and retained specialist project documents when a specific
 legacy regression must be reconstructed.
+
+## v87-beta75 (2026-10-09) – Single-Node Remote Restart (Testbetrieb)
+- Additive signed SFJR1 / SFJRA1 Unicast job pair for one explicitly selected remote Node.
+- Coordinator role, boot nonce, coordinator epoch, current peer lease, IP and target boot nonce required.
+- Node consumes accepted sequence once; duplicate/replayed commands are rejected.
+- Node uses existing webConfigScheduleReboot(3500), refusing active recordings; no direct ESP.restart in cluster code.
+- Signed ACK means **reboot scheduled**, not successful startup; Coordinator does not auto-retry.
+- New per-node confirmation button and RAM job status on /cluster_coordinate. Bulk restart, shutdown, deletion and firmware pool remain disabled.
+- No change to cluster heartbeat, election, SD recording, config or license protocols.
+- Scope: code prepared, full Arduino build and hardware test still required.
+
+## v87-beta80 — Neustart-Auftragsdiagnose (2026-10-09)
+- SD-Slot devxiao2 laut Hardwaretest leer. Die SD-Mount-Fehler sind daher erwartete Meldungen bei nicht vorhandener Karte und kein nachgewiesener Clusterfehler.
+- Remote-Restart auf devxiao1 war zuletzt nicht ausgeführt (Boot-ID unverändert, Uptime gestiegen); Probe-Transport 10/10 einmal erfolgreich, danach ein Timeout.
+- cluster.cpp: getrennte RAM-Zähler und begründete Diagnosen für empfangene/verworfene Neustartbefehle sowie empfangene/akzeptierte/verworfene Neustart-ACKs.
+- Serielle Logzeilen nur für Restart-Ereignisse mit Annahme/Ablehnungsgrund; keine Secrets oder Auth-Payloads.
+- Cluster-Seite jedes Nodes und Coordinator-Seite zeigen lokale Restart-Diagnosen. Die Werte der Nodes werden nicht automatisch zentral gesammelt: Zielgerät separat öffnen.
+- Kein Retry destruktiver Jobs, keine Änderung an Reboot-/Recording-Schutz, Cluster-Election, SD-Recovery oder WiFi-Lifecycle.
+- Host-Prüfung: JS-Parsing und Delta-Archiv. ESP32-Compile/Hardware-Verifikation ausstehend.
+
+## v87-beta87 — targeted cluster sync correlation (2026-10-09)
+- Authenticated selected-node time-sync requests remember their exact sequence per peer, scoped to the current node boot and coordinator runtime.
+- Signed node measurement reports are matched to that sequence in `/cluster_status`; the coordinator table now distinguishes selected sync confirmed/pending from broadcast sync.
+- No system-clock adjustment, recording timestamp, election, WLAN, or SD maintenance behavior changes.
+- **SD mass-delete NOT enabled:** existing SD maintenance WIPE recursively removes all files, including the SD config, then restores it; it is not a recordings-only operation. A distinct recordings-only cooperative executor, storage gate, exact media allowlist and per-node signed job/ACK are prerequisites.
+- Verification: JavaScript parse and ZIP integrity; ESP32 compile and hardware tests pending.
+
+
+### v87-beta88 – Optional-SD-Betrieb (2026-10-09)
+- Neuer Schalter auf SD-Wartung: „Betrieb ohne SD-Karte erwartet“. Persistenz in gerätelokalem NVS (`sfsdpolicy/optional`), bewusst vor Laden der SD-/LittleFS-Konfiguration verfügbar.
+- Bei aktivem Schalter: einmaliger Mount-Versuch bei jedem Boot, kein periodischer Runtime-Recovery-Versuch, keine Storage-Fault-WLAN-Abschaltung und kein Storage-Fault-Tiefschlaf allein wegen fehlender SD.
+- Bei erfolgreichem Boot-Mount: NVS-Schalter automatisch löschen und normale SD-Recovery wiederherstellen. Wenn die NVS-Speicherung fehlschlägt, wird dies gemeldet; der Mount wird nicht verworfen.
+- Bestehendes Verhalten im Standardmodus bleibt unverändert; Recording-/Storage-Recovery bei tatsächlichen Medienfehlern darf nicht umgangen werden.
+- Test offen: ESP32-Compile, Boot ohne SD, Boot mit nachträglich eingesetzter SD, Aufnahmeschutz, Reset/Power-Cycle.
+
+
+## v87-beta91 – 2026-10-09: Cluster-SD-Wipe (Hardwaretest ausstehend)
+- Der Coordinator kann signierte vollständige SD-Wipes pro markiertem Remote-Node starten. Keine Broadcasts, keine automatischen Retries.
+- Der Node nimmt den Auftrag nur vom authentifizierten aktuellen Coordinator an; Boot/Epoch/Replay-Prüfungen bleiben aktiv.
+- Sofortiger Recording-Start-Stopp, Abbruch des laufenden Recording-Events über den bestehenden stopRecording()-Finalize-Pfad, danach performSdMaintenance(SD_MAINT_WIPE): SD-Dateien löschen, Config aus interner Sicherung wiederherstellen, Logger neu öffnen.
+- Wipe findet im regulären Firmware-Loop statt, **nicht** im UDP-Paket-Handler. Per signiertem Endresultat wird Erfolg oder Fehler zurückgemeldet.
+- Einschränkungen: Bei Peer-Lease-Verlust während eines langen Wipes kann das Ergebnis verworfen werden; keine persistenten Aufträge, kein automatischer Retry. Fehlende SD/Besetzt meldet Fehler 100.
+- **Nicht getestet:** kompletter ESP32-Build und Zwei-Node-Hardwaretests. Erst mit Testkarten ohne wichtige Daten testen.

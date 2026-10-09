@@ -58,6 +58,7 @@
 #include "firmware_security.h"
 #include "wireguard_manager.h"
 #include "cluster.h"
+#include "sd_presence_policy.h"
 
 
 // =============================================================
@@ -13562,7 +13563,7 @@ static bool enterStorageFaultLowPowerSleep(
 
 static bool tryEnterStorageFaultLowPower()
 {
-    if (sdReady)
+    if (sdReady || sdPresenceExpectNoCard())
         return false;
 
     if (recording)
@@ -15433,11 +15434,23 @@ void setup() {
         );
     }
 
+    // In optional-SD mode still probe once on every boot. A successful
+    // mount automatically restores the normal recovery policy for future boots.
+    const bool optionalSdAtBoot = sdPresenceExpectNoCard();
     sdReady =
         initSDWithRetries(
             "boot",
-            sdBootAttempts
+            optionalSdAtBoot ? 1 : sdBootAttempts
         );
+    if (sdReady && optionalSdAtBoot) {
+        if (sdPresenceSetExpectNoCard(false)) {
+            Serial.println("SD found: optional-SD flag cleared; normal SD mode restored");
+        } else {
+            Serial.println("WARNING: SD mounted but optional-SD flag could not be saved");
+        }
+    } else if (!sdReady && optionalSdAtBoot) {
+        Serial.println("Optional-SD mode: no card mounted; runtime recovery suppressed");
+    }
 
 
     if (sdReady) {
@@ -15537,6 +15550,7 @@ void setup() {
     if (
         storageFaultTimerWake &&
         !sdReady &&
+        !sdPresenceExpectNoCard() &&
         cfg_transport_mode == 0 &&
         magnetWakeIsClear()
     ) {
@@ -16546,6 +16560,7 @@ void loop() {
             // much longer. An actively used browser keeps the session alive via
             // the existing heartbeat, so operator service is never cut off.
             if (
+                !sdPresenceExpectNoCard() &&
                 webConfigStarted &&
                 webConfigInactiveFor(
                     STORAGE_FAULT_WEB_IDLE_TIMEOUT_SECONDS
@@ -16562,6 +16577,7 @@ void loop() {
             // inactive, transition to periodic low-power retries instead of
             // remaining awake indefinitely.
             if (
+                !sdPresenceExpectNoCard() &&
                 !previewActive &&
                 millis() - lastSdRetryMs >
                 SD_RECOVERY_RETRY_MS

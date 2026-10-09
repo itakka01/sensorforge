@@ -9,6 +9,7 @@
 #include "recording_crypto.h"
 #include "recording_write_buffer.h"
 #include "storage_guard.h"
+#include "sd_presence_policy.h"
 #include "webplayer.h"
 
 #include <FS.h>
@@ -29,6 +30,8 @@
 extern bool recording;
 extern bool sdReady;
 extern bool recoverSD();
+extern void stopRecording();
+
 
 #if defined(STORAGE_SPI)
 extern bool sdManualReadOnlyRecovery(
@@ -52,6 +55,14 @@ extern bool sdManualReadOnlyRecovery(
 namespace {
 
 static WebServer *g_webServer = nullptr;
+struct ClusterWipePending {
+    bool active = false;
+    uint32_t coordinatorBoot = 0, coordinatorEpoch = 0, sequence = 0;
+    SdClusterWipeDone callback = nullptr;
+    bool priorRecordingBlocked = false;
+};
+static ClusterWipePending g_clusterWipe;
+
 static WebSdMaintenanceUiHooks g_uiHooks = { nullptr, nullptr, nullptr };
 
 static WebServer &webServer()
@@ -271,6 +282,24 @@ static SdBenchmarkRating sdBenchmarkEvaluateRating(
 static String sdMaintenancePage(
     const SdMaintenanceViewState &view
 );
+
+static void handleSdPresenceModeSave()
+{
+    if (rejectWhileRecording("SD presence policy save")) return;
+    // Never suppress recovery for a card that is currently mounted.
+    const bool enable = webServer().arg("expect_no_sd") == "1";
+    if (enable && sdReady) {
+        webServer().send(409, "text/plain; charset=utf-8",
+                         "SD is mounted; optional-SD mode is only for devices without SD");
+        return;
+    }
+    if (!sdPresenceSetExpectNoCard(enable)) {
+        webServer().send(500, "text/plain; charset=utf-8", "SD policy could not be saved");
+        return;
+    }
+    webServer().sendHeader("Location", "/sd_maintenance?notice=sd_policy_saved#sd-presence-mode");
+    webServer().send(303, "text/plain; charset=utf-8", "");
+}
 
 static void handleSDStorageSafetySave()
 {
@@ -2354,6 +2383,24 @@ static String sdMaintenancePage(
             "<div class='flash-notice'><strong>SD-Verschlüsselung gespeichert.</strong></div>"
             "<script>history.replaceState(null,'','/sd_maintenance#encryption');</script>";
     }
+
+    if (webServer().arg("notice") == "sd_policy_saved") {
+        html += "<div class='flash-notice'>SD-Betriebsmodus gespeichert. Beim nächsten Boot wird einmal auf SD geprüft.</div>";
+    }
+    html += "<section id='sd-presence-mode' class='settings-section'>"
+            "<h3>SD-Karte optional</h3>"
+            "<p>Dieses Gerät wird voraussichtlich ohne SD-Karte betrieben. "
+            "Beim Start wird trotzdem einmal nach einer SD gesucht. "
+            "Bei erfolgreichem Mount wird die Option automatisch deaktiviert. "
+            "Solange keine SD vorhanden ist, entfallen periodische Mount-/Recovery-Versuche. "
+            "Änderungen wirken nach einem Neustart vollständig.</p>"
+            "<form method='POST' action='/sd_presence_mode_save'>"
+            "<label><input type='checkbox' name='expect_no_sd' value='1'";
+    if (sdPresenceExpectNoCard()) html += " checked";
+    if (sdReady) html += " disabled";
+    html += "> Betrieb ohne SD-Karte erwartet</label><br><br>"
+            "<button class='primary' type='submit'>SD-Modus speichern</button>"
+            "</form></section>";
 
     html +=
         "<section id='storage-safety' class='settings-section'>"
@@ -6184,6 +6231,7 @@ void webSdMaintenanceRegisterRoutes(
 
     server.on("/sd_recovery_run", HTTP_POST, handleSDRecoveryRun);
     server.on("/sd_maintenance", HTTP_GET, handleSDMaintenance);
+    server.on("/sd_presence_mode_save", HTTP_POST, handleSdPresenceModeSave);
     server.on("/sd_storage_safety_save", HTTP_POST, handleSDStorageSafetySave);
     server.on("/sd_encryption_save", HTTP_POST, handleSDEncryptionSave);
     server.on("/sdformat", HTTP_GET, handleSDFormat);
@@ -6195,12 +6243,45 @@ void webSdMaintenanceRegisterRoutes(
     server.on("/sd_benchmark_run", HTTP_POST, handleSDBench);
 }
 
+bool webSdQueueClusterWipe(uint32_t coordinatorBoot, uint32_t coordinatorEpoch,
+                           uint32_t sequence, SdClusterWipeDone callback)
+{
+    if (!callback || !coordinatorBoot || !coordinatorEpoch || !sequence ||
+        g_clusterWipe.active || sdSecureJobActive || g_storageLocked || !sdReady)
+        return false;
+    g_clusterWipe.active = true;
+    g_clusterWipe.coordinatorBoot = coordinatorBoot;
+    g_clusterWipe.coordinatorEpoch = coordinatorEpoch;
+    g_clusterWipe.sequence = sequence;
+    g_clusterWipe.callback = callback;
+    g_clusterWipe.priorRecordingBlocked = g_recordingStartBlocked;
+    // Close the admission gate immediately; never start another recording.
+    g_recordingStartBlocked = true;
+    return true;
+}
+
 void webSdMaintenanceLoop()
 {
     processSecureEraseJob();
+    if (!g_clusterWipe.active) return;
+    const ClusterWipePending job = g_clusterWipe;
+    g_clusterWipe.active = false; // no nested executions
+    // Closing the current recorder is immediate (no wait for its event length).
+    // Its normal finalize path releases outstanding handles.
+    if (recording) stopRecording();
+    SdMaintenanceResult result = SD_MAINT_RESULT_RECORDING_ACTIVE;
+    if (!recording && !recorderIsOpen() && sdReady && !g_storageLocked)
+        result = performSdMaintenance(SD_MAINT_WIPE);
+    // performSdMaintenance saves/restores the recording gate, so remove the
+    // pending-job admission block only after all maintenance work has ended.
+    g_recordingStartBlocked = job.priorRecordingBlocked;
+    Serial.printf("[CLUSTER SD] wipe finished result=%u\n", (unsigned)result);
+    if (job.callback)
+        job.callback(job.coordinatorBoot, job.coordinatorEpoch,
+                     job.sequence, 0, (uint16_t)result);
 }
 
 bool webSdMaintenanceBusy()
 {
-    return sdSecureJobActive;
+    return sdSecureJobActive || g_clusterWipe.active;
 }

@@ -21,13 +21,13 @@
 // WebConfig, so a running device can be mapped back to the exact Git tag.
 
 #define SENSORFORGE_RELEASE_NUMBER 87
-#define SENSORFORGE_RELEASE_TAG "v87-beta69"
+#define SENSORFORGE_RELEASE_TAG "v87-beta92"
 #define SENSORFORGE_RELEASE_DATE "2026-10-09"
 #define SENSORFORGE_RELEASE_SUMMARY \
-    "Beta 69: authenticated cluster health dashboard."
+    "Beta 92: refresh cluster SD health immediately after wipe; remove duplicate coordinator action panels."
 
 // Current source-tree stage. v87 Beta 52 applies coordinator election updates promptly; retains Beta 51 join recovery.
-#define SENSORFORGE_WORKTREE_STAGE "v87-beta69"
+#define SENSORFORGE_WORKTREE_STAGE "v87-beta92"
 #define SENSORFORGE_WORKTREE_DATE "2026-10-09"
 #define SENSORFORGE_WORKTREE_SUMMARY \
-    "v87 Beta 69: read-only coordinator health overview."
+    "v87 Beta 92: refreshed SD health and consolidated coordinator controls."
