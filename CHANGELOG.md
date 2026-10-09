@@ -1,6 +1,55 @@
+## v87-beta67 (2026-10-09) – Cluster overview navigation for all remote devices
+
+- Elected coordinator appears first in the cluster overview and detailed peer table.
+- Remote coordinator links directly to `/cluster_coordinate`; remote nodes link to `/` (start page).
+- Local device deliberately has no navigation link. Invalid/offline addresses do not generate links.
+- Per-device WebConfig authentication remains unchanged; no credentials or tokens are forwarded.
+- Presentation-only update; cluster protocol, runtime, recording, and WiFi unchanged.
+
+## v87-beta66 (2026-10-09) – Coordinator navigation in cluster overview
+
+- Coordinator row links directly to `/cluster_coordinate` on the elected coordinator, including from another node.
+- Link is shown only for a currently online coordinator with a valid IPv4 address; local coordinator uses a relative URL.
+- Existing target-device authentication stays in force; no secrets or login tokens are forwarded.
+- Display-only change: cluster election, time sync, WiFi and recording remain unchanged.
+
+## v87-beta65 (2026-10-09) – Coordinator time sync command
+
+- Coordinator-only WebConfig menu “Cluster koordinieren” with a manual time-sync button.
+- Signed multicast SFTS1 trigger bound to current coordinator identity, boot, epoch and monotonic command sequence.
+- Receiver verifies active coordinator, known boot, matching IP/epoch and rejects replayed commands.
+- Nodes request time over existing authenticated SFTQ1/SFTR1 exchange immediately on trigger; 15-minute normal interval unchanged.
+- Does not modify RTC, system clock, recording ownership or WiFi lifecycle.
+- Best-effort command only: no per-node completion acknowledgement yet.
+
+# v87-beta64 (2026-10-09) — Cluster time interval and quality display
+
+- WiFi time polling every 15 minutes once a valid sample exists; 30-second retry before the first usable sample; immediate request after a coordinator/epoch change.
+- Cluster UTC holdover valid for up to 30 minutes only while the authority identity and epoch remain the same. No RTC changes.
+- Status estimates local system-clock offset in milliseconds and a rough RTT/2 plus nominal 50-ppm drift growth indicator. This is NOT a guaranteed uncertainty bound or microsecond/frame accuracy claim.
+- Coordinator-initiated time-sync command and independent IR precision source are not implemented in this beta.
+
+# v87-beta63 (2026-10-09) — WiFi cluster time foundation
+
+- Optional cluster-runtime sidecar: authenticated four-timestamp request/response over existing UDP 39428 every 30 s per non-coordinator; no broadcast payloads or additional sockets.
+- Coordinator answers only known authenticated cluster peers, only when its UTC clock is plausible, within elected coordinator epoch.
+- Node rejects stale/wrong-epoch/replayed responses and RTT >250 ms; status JSON includes validity, sample age and observed RTT.
+- Independent monotonic cluster UTC accessor; no system/RTC stepping, recording pause, licensing time changes or IR claims.
+- Experimental: coordinator source is its own RTC/system clock; automatic best-source selection, PLL/slew and hardware trigger alignment are not yet implemented.
+
+## v87-beta62 (2026-10-09)
+- Cluster-Teilnahme in verständlicher Sprache und zugehörige Konfigurationsfelder bei Nichtteilnahme ausgeblendet.
+- Cluster-Auswahl und Passwort zusammengeführt, technische Erklärungen in aufklappbare Hilfetexte verlagert.
+- Cluster-Übersicht bleibt unabhängig von der Teilnahme sichtbar; keine Änderung an Cluster-Runtime oder Speicherpfaden.
+
+## v87-beta61 (2026-10-09)
+- Cluster-Weboberfläche: Titel enthält den lokalen Hostnamen für Copy/Paste.
+- Kompakte Standard-Übersicht und aufklappbare technische Tabelle mit ACK-/Election-Diagnose.
+- Ressourcen und Discovery-/Protokollinformationen sind aufklappbar; keine Runtime-/Protokolländerung.
+
 # SensorForge Changelog
 
-Current development worktree: **v87-beta49**  
+Current development worktree: **v87-beta60**  
 Last stable official release: **v86**  
 Core branding version: **7.1.0**
 
@@ -8,6 +57,41 @@ This changelog is intentionally concise. Detailed intermediate experiments and
 superseded implementation notes belong in Git history and the project re-entry
 document, not in an ever-growing release file.
 
+
+
+## v87-beta60 — 2026-10-09
+
+- Process bounded queued Cluster multicast and direct UDP packets before expiring peer leases.
+- Refresh expiration/election time after packet processing. Accepted authenticated ACKs already renew coordinator liveness; preserve that behavior and prevent pending ACKs from losing a race against lease expiry.
+- Keep the actual 60-second failure lease, existing HMAC, replay/epoch checks, election order, and WiFi/recording ownership unchanged.
+- Hardware and larger-cluster validation remain required; this is not a stable release yet.
+
+## v87-beta59 — 2026-10-09
+
+- Fix a loop-start versus packet-reception clock mismatch in `clusterLoop()`:
+  election now uses a fresh `millis()` sample after processing UDP packets.
+- Clamp a peer's slightly future-dated `lastSeenMs` to age zero while choosing
+  the Coordinator, instead of allowing unsigned subtraction to wrap and
+  temporarily disqualify an otherwise live peer.
+- Preserve authenticated peer leases, policy order, Coordinator epoch semantics,
+  ACK validation, packet formats, WiFi ownership and recording behavior.
+- Hardware validation, especially failover and recovery, is still required.
+
+## v87-beta57 — 2026-10-09
+
+- Guard the current coordinator's ACK-authenticated identity and epoch against transient incomplete self-announcements while the same boot is live and the ACK is recent (maximum three heartbeat intervals).
+- Explicit nonzero coordinator epoch announcements, coordinator reboots and lease expiry remain authoritative; HMAC validation and the election order are unchanged.
+- Add a RAM-only diagnostic counter for guarded incomplete coordinator announcements to help distinguish the suspected cause from other epoch changes.
+- Hardware regression and compile verification are still required; this change is not yet a qualified cluster stability release.
+
+## v87-beta50 — 2026-10-08
+
+- Added pre-save credential validation when joining a currently discovered Cluster. The passive `/cluster` scanner now retains a small RAM-only cache of recent HMAC-signed `SFC1` Presence packets while the page is open.
+- A candidate Cluster password is checked locally against that signed traffic using the existing Beta-38 trust-domain derivation (`cluster_id + password`). The password and derived key are never transmitted. No new wire packet or protocol revision is introduced.
+- If the visible Cluster rejects the candidate password, WebConfig returns `Cluster-Passwort ist falsch`, does not modify `config.txt`, and does not schedule a reboot. If public discovery is visible but a signed proof has not yet arrived, save is also blocked and the user is asked to wait a few seconds and retry.
+- Recovery from a previously saved wrong password for the same visible Cluster ID keeps the remotely advertised credential epoch after successful proof instead of incorrectly advancing the local epoch and creating another authentication partition.
+- Manual creation of a genuinely new/offline Cluster remains possible because no remote proof exists by definition. Existing active membership with unchanged credentials is not revalidated on every settings save.
+- Cluster heartbeat, discovery, Coordinator election, WiFi ownership, recording, storage and config schema are otherwise unchanged.
 
 
 ## v87-beta49 — 2026-10-08

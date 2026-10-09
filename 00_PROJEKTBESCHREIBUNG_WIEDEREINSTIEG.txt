@@ -1,4 +1,26 @@
 ======================================================================
+V87 BETA 50 2026-10-08 - CLUSTER JOIN PASSWORT-VALIDIERUNG
+======================================================================
+
+- Bei einem aktuell per passiver Discovery sichtbaren bestehenden Cluster wird
+  das Kandidatenpasswort jetzt VOR jedem Config-Save lokal gegen ein kurzeitig
+  im RAM gehaltenes, HMAC-signiertes SFC1-Presence-Paket geprueft.
+- Falsches Passwort: klare Fehlermeldung, keine Aenderung an config.txt, kein
+  geplanter Reboot.
+- Ist SFD1 bereits sichtbar, aber noch kein signiertes SFC1-Paket eingetroffen,
+  wird ebenfalls nicht gespeichert; die Seite soll einige Sekunden offen bleiben
+  und Save erneut versucht werden.
+- Kein neues Wire-Protokoll und keine Challenge notwendig: bestehende Beta-38+
+  Presence-Signaturen werden wiederverwendet; Passwort/Key verlassen das Geraet
+  nicht.
+- Recovery-Fall fuer bereits falsch gespeichertes Passwort bei gleicher
+  Cluster-ID: nach erfolgreicher Pruefung gegen den sichtbaren Cluster bleibt
+  dessen angekuendigte Credential-Epoch erhalten, statt lokal hochgezaehlt zu
+  werden.
+- Manuelle Erstellung eines wirklich neuen/offline Clusters bleibt moeglich, da
+  dort definitionsgemaess keine Gegenstelle fuer eine Vorabpruefung existiert.
+
+======================================================================
 V87 BETA 49 2026-10-08 - CLUSTER RESTART PAGE COMPILE FIX
 ======================================================================
 
@@ -11,7 +33,7 @@ V87 BETA 49 2026-10-08 - CLUSTER RESTART PAGE COMPILE FIX
 SENSORFORGE / ESP32-S3 CAMERA (XIAO + FREENOVE)
 PROJEKTBESCHREIBUNG, AKTUELLER RELEASESTAND UND WIEDEREINSTIEG
 Stand: 2026-10-08
-Autoritativer Arbeitsstand: v87 Beta 48
+Autoritativer Arbeitsstand: v87 Beta 50
 Letzter stabiler offizieller Release: v86 (2026-10-01)
 Core-Version / Branding: 7.1.0
 Host API: 1.22
@@ -21,7 +43,7 @@ Integration-/App-Profil: 1.1
 1. VERBINDLICHER WIEDEREINSTIEGSPUNKT
 ======================================================================
 
-Der vollstaendige Quellstand v87-beta49 ist die aktuelle autoritative Basis.
+Der vollstaendige Quellstand v87-beta50 ist die aktuelle autoritative Basis.
 Aeltere Arbeitsordner, Zwischen-ZIPs und historische Beta-Staende duerfen nicht
 als Ausgangspunkt fuer neue Aenderungen verwendet werden.
 
@@ -50,6 +72,7 @@ Bei jeder Aenderung gelten verbindlich diese Arbeitsregeln:
 
 Aktueller Entwicklungsstand:
 
+- v87-beta50: Join-Validierung fuer sichtbare Cluster. Der passive Scanner haelt waehrend geoeffneter `/cluster`-Seite wenige aktuelle signierte SFC1-Presence-Pakete nur im RAM. Beim Save eines sichtbaren bestehenden Clusters wird das Kandidatenpasswort lokal mit der bestehenden Cluster-Key-Ableitung gegen diesen HMAC-Verkehr geprueft. Falsches Passwort oder noch fehlender signierter Proof blockiert den Save vor config.txt und vor dem Reboot. Ein erfolgreich gepruefter Recovery-Join zur gleichen Cluster-ID behaelt die vom sichtbaren Cluster gemeldete Credential-Epoch. Kein neues Wire-Paket, keine Passwortuebertragung; manuelle neue/offline Cluster bleiben moeglich.
 - v87-beta48: Cluster-Erstbenutzung/Apply-Lifecycle korrigiert. Ein fabrikneues Board besitzt noch keinen NVS-Namespace `sfclprof`; ein read-only Preferences-Open wurde bisher faelschlich als `cluster profile storage unavailable` behandelt. Beim expliziten Join/Save wird der leere Namespace nun sicher initialisiert; echte NVS-Fehler bleiben Fehler. Zusaetzlich werden Cluster-Einstellungen nach verifiziertem Save nicht mehr nur persistent geschrieben und mit `restart_required` stehen gelassen, sondern ueber eine sichtbare Neustartseite und kontrollierten Reboot in einen frischen Cluster-Runtime-Start ueberfuehrt. Passive Discovery bleibt unveraendert: nur aktive Cluster-Mitglieder ab Beta 38 senden SFD1; ein deaktiviertes Geraet hoert nur solange `/cluster` offen ist und sendet dabei nichts.
 - v87-beta47: realen No-SD-Bootcrash aus Beta 46 behoben. Nach den erwarteten fuenf SD-Mount-Fehlversuchen lief das System in `Stack canary watchpoint triggered (loopTask)` und rebootete, bevor Config/WiFi starten konnten. Die fehlende SD selbst bleibt ein erlaubter Zustand; Ursache war die inzwischen grosse `ConfigValues`-Struktur, die in verschachtelten Config-Validierungs-/Default-/Recovery-Pfaden mehrfach als lokale Stack-Arbeitsvariable/Temporary angelegt wurde. Beta 47 fuellt Defaults nun in bestehende Objekte und legt die grossen temporaeren ConfigValues fuer Validation/Parse/Apply/Factory-Pfade kurzlebig auf dem Heap statt auf dem Arduino-loopTask-Stack an. Besonders der Beta-45-Recoverypfad fuer `/config.tmp` kann dadurch beim Boot validieren, ohne den Task-Stack zu ueberlaufen. Config-Schema und Prioritaet SD > LittleFS > Defaults bleiben unveraendert.
 - v87-beta46: WiFi-Save/Apply-Lifecycle korrigiert. Ein erfolgreicher WiFi-Save aktualisierte zuvor bereits die Runtime-Config, liess aber das aktuell laufende Funkinterface im alten Modus weiterlaufen und plante keinen Neustart. Dadurch konnte der normale WiFi-Inaktivitaets-Timeout spaeter das alte Interface abschalten, ohne dass der neu konfigurierte STA-/Fallback-Pfad je gestartet wurde. Ab Beta 46 wird nach verifiziert erfolgreichem Save ein kontrollierter Reboot geplant und vorher eine eigene Reconnect-Seite mit neuem Geraetenamen, Netzwerkmodus und Fallback-Status angezeigt. STA-Verbindungsversuche und Hotspot-Fallback selbst bleiben unveraendert und werden nach dem Boot deterministisch ueber startWebConfig() angewendet.

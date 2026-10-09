@@ -55,7 +55,8 @@ static String clusterPageHtml()
     html.reserve(12000);
 
     html +=
-        "<div class='page-title'><div><h2>Cluster</h2>"
+        "<div class='page-title'><div><h2>Cluster-Status auf Gerät " +
+        htmlEscape(cfg_hostname.length() ? cfg_hostname : String("sensorforge")) + "</h2>"
         "<p class='muted'>Lokaler Geräteverbund für gemeinsame Statusdaten und spätere Multi-Kamera-Funktionen.</p>"
         "</div></div>";
 
@@ -68,11 +69,15 @@ static String clusterPageHtml()
     html +=
         "<style>"
         ".cluster-grid{display:grid;grid-template-columns:minmax(190px,240px) minmax(220px,1fr);gap:10px 16px;align-items:center}"
-        ".cluster-grid .cluster-label{font-weight:600}.cluster-grid input,.cluster-grid select{width:100%;max-width:430px;margin:0}"
+        ".cluster-join-fields{grid-column:1/-1;min-width:0}.cluster-grid .cluster-label{font-weight:600}.cluster-grid input,.cluster-grid select{width:100%;max-width:430px;margin:0}"
         ".cluster-note{grid-column:2;color:var(--muted);font-size:.86rem;margin-top:-5px;margin-bottom:4px}"
         ".cluster-id{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.9rem;word-break:break-all}"
         ".cluster-table-wrap{overflow:auto}.cluster-table{width:100%;border-collapse:collapse;min-width:1480px}"
         ".cluster-resource-table{min-width:980px}"
+        ".cluster-simple-table{min-width:500px}"
+        ".cluster-join-fields[hidden]{display:none}.cluster-note details{display:inline}.cluster-note summary{cursor:pointer;text-decoration:underline;text-underline-offset:2px}.cluster-tech-details{margin-top:16px}"
+        ".cluster-tech-details summary{cursor:pointer;font-weight:600;padding:10px 0}"
+        ".cluster-tech-details[open] summary{margin-bottom:8px}"
         ".cluster-table th,.cluster-table td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--border);white-space:nowrap;vertical-align:top}"
         ".cluster-table th{font-size:.82rem;color:var(--muted)}"
         ".cluster-runtime-line{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0 14px}"
@@ -84,34 +89,16 @@ static String clusterPageHtml()
         "<form id='clusterSettingsForm' method='POST' action='/cluster_save'>"
         "<section class='settings-section'><h3>Cluster-Mitgliedschaft</h3>"
         "<div class='cluster-grid'>"
-        "<div class='cluster-label'>Cluster</div>"
+        "<div class='cluster-label'>Teilnahme dieses Geräts</div>"
         "<div><select name='cluster_enabled' id='clusterEnabled'>"
-        "<option value='0'" + String(!cfg_cluster_enabled ? " selected" : "") + ">Nicht teilnehmen</option>"
-        "<option value='1'" + String(cfg_cluster_enabled ? " selected" : "") + ">Teil dieses Clusters</option>"
+        "<option value='0'" + String(!cfg_cluster_enabled ? " selected" : "") + ">Nicht am Clusterverbund teilnehmen</option>"
+        "<option value='1'" + String(cfg_cluster_enabled ? " selected" : "") + ">Gerät mit Clusterverbund verbinden</option>"
         "</select></div>"
+        "<div class='cluster-note'>Das Gerät nutzt den Cluster nur, wenn die Teilnahme aktiviert und gespeichert wurde. Die untenstehende Übersicht ist auch ohne Teilnahme verfügbar.</div>"
+        "<div id='clusterJoinFields' class='cluster-grid cluster-join-fields'>"
         "<div class='cluster-label'>Cluster auswählen</div>"
         "<div><select id='clusterChoice'><option value=''>Manuell / neuer Cluster</option></select></div>"
-        "<div class='cluster-note'>Solange diese Seite geöffnet ist, hört das Gerät rein passiv nach sichtbaren Clustern. Sichtbar sind aktive Cluster-Mitglieder ab Beta 38; nach einer neuen Cluster-Konfiguration muss deren Cluster-Runtime bereits gestartet sein. Bei deaktiviertem Cluster sendet dieses Gerät dabei selbst keine Cluster-Pakete.</div>"
-        "<div class='cluster-label'>Cluster-ID</div>"
-        "<div><input name='cluster_id' id='clusterId' maxlength='35' autocomplete='off' value='" +
-        htmlEscape(clusterEffectiveId()) + "' placeholder='wird bei neuem Cluster automatisch erzeugt'></div>"
-        "<div class='cluster-note'>Stabile öffentliche Cluster-Identität. Sie bleibt auch bei einem späteren Passwortwechsel gleich.</div>"
-        "<div class='cluster-label'>Cluster-Name</div>"
-        "<div><input name='cluster_name' id='clusterName' maxlength='63' autocomplete='off' value='" +
-        htmlEscape(cfg_cluster_name) + "'></div>"
-        "<input type='hidden' name='cluster_credential_epoch' id='clusterCredentialEpoch' value='" +
-        String((unsigned long)cfg_cluster_credential_epoch) + "'>"
-        "<div class='cluster-note'>Anzeigename des Clusters. Geräte verwenden zusätzlich die stabile Cluster-ID und dasselbe Passwort.</div>"
-        "<div class='cluster-label'>Coordinator-Policy</div>"
-        "<div><select name='cluster_coordinator_policy' id='clusterCoordinatorPolicy'>"
-        "<option value='auto'" + String(cfg_cluster_coordinator_policy == "auto" ? " selected" : "") + ">Automatisch (Standard)</option>"
-        "<option value='preferred'" + String(cfg_cluster_coordinator_policy == "preferred" ? " selected" : "") + ">Bevorzugter Coordinator</option>"
-        "<option value='node'" + String(cfg_cluster_coordinator_policy == "node" ? " selected" : "") + ">Nur Node (nie Coordinator)</option>"
-        "</select></div>"
-        "<div class='cluster-note'>Die Einstellung definiert nur die Kandidaten-Policy. Die tatsächliche Coordinator-Rolle wird automatisch gewählt; es gibt bewusst keinen erzwungenen Master-Schalter.</div>"
-        "<div class='cluster-label'>Gerätekennung</div>"
-        "<div class='cluster-id'>" + htmlEscape(deviceIntegrationId()) + "</div>"
-        "<div class='cluster-note'>Stabile interne 128-Bit Integration-ID. Sie ist unabhängig von Hostname, MAC-Adresse und Lizenz-Hardware-ID.</div>"
+        "<div class='cluster-note'>Wähle einen gefundenen Cluster oder lege einen neuen an. <details><summary>Info zur Clustersuche</summary>Die Suche hört nur bei geöffneter Seite mit. Ohne aktive Teilnahme sendet das Gerät keine Cluster-Pakete.</details></div>"
         "<div class='cluster-label'>Cluster-Passwort</div>"
         "<div><input name='cluster_password' id='clusterPassword' type='password' minlength='8' maxlength='63' autocomplete='new-password' placeholder='" +
         String(cfg_cluster_password.length() ? "Unverändert lassen" : "Mindestens 8 Zeichen") + "'></div>"
@@ -119,8 +106,30 @@ static String clusterPageHtml()
         String(cfg_cluster_password.length()
             ? "Ein Passwort ist gespeichert. Leeres Feld behält das bestehende bzw. ein bekanntes gespeichertes Passwort bei."
             : "Noch kein Passwort für die aktuelle Auswahl gespeichert. Bei aktiviertem Cluster ist ein Passwort erforderlich.") +
-        " Passwortänderungen eines laufenden Mehrgeräte-Clusters werden nicht lokal erzwungen; eine spätere zentrale Rotation ist Coordinator-Aufgabe.</div>"
-        "</div></section>"
+        "</div>"
+        "<div class='cluster-note'><details><summary>Info zur Passwortsicherheit</summary>Ein sichtbarer Cluster prüft das Passwort vor dem Speichern anhand signierter Pakete. Passwortänderungen eines laufenden Mehrgeräte-Clusters erfolgen später zentral.</details></div>"
+
+        "<div class='cluster-label'>Cluster-ID</div>"
+        "<div><input name='cluster_id' id='clusterId' maxlength='35' autocomplete='off' value='" +
+        htmlEscape(clusterEffectiveId()) + "' placeholder='wird bei neuem Cluster automatisch erzeugt'></div>"
+        "<div class='cluster-note'><details><summary>Info zur Cluster-ID</summary>Die eindeutige Cluster-ID bleibt auch bei einem Passwortwechsel gleich.</details></div>"
+        "<div class='cluster-label'>Cluster-Name</div>"
+        "<div><input name='cluster_name' id='clusterName' maxlength='63' autocomplete='off' value='" +
+        htmlEscape(cfg_cluster_name) + "'></div>"
+        "<input type='hidden' name='cluster_credential_epoch' id='clusterCredentialEpoch' value='" +
+        String((unsigned long)cfg_cluster_credential_epoch) + "'>"
+        "<div class='cluster-note'>Frei wählbarer Name für die Anzeige.</div>"
+        "<div class='cluster-label'>Koordination im Cluster</div>"
+        "<div><select name='cluster_coordinator_policy' id='clusterCoordinatorPolicy'>"
+        "<option value='auto'" + String(cfg_cluster_coordinator_policy == "auto" ? " selected" : "") + ">Automatisch (Standard)</option>"
+        "<option value='preferred'" + String(cfg_cluster_coordinator_policy == "preferred" ? " selected" : "") + ">Bevorzugter Coordinator</option>"
+        "<option value='node'" + String(cfg_cluster_coordinator_policy == "node" ? " selected" : "") + ">Nur Node (nie Coordinator)</option>"
+        "</select></div>"
+        "<div class='cluster-note'>Normalerweise ist „Automatisch“ richtig. <details><summary>Info zur Koordination</summary>Geräte bestimmen ihren Coordinator selbst. Bevorzugt erhöht die Priorität, Nur Node verhindert eine Coordinator-Rolle.</details></div>"
+        "<div class='cluster-label'>Technische Gerätekennung</div>"
+        "<div class='cluster-id'>" + htmlEscape(deviceIntegrationId()) + "</div>"
+        "<div class='cluster-note'><details><summary>Info zur Gerätekennung</summary>Stabile interne Integration-ID; unabhängig von Gerätename und Lizenz.</details></div>"
+        "</div></div></section>"
         "<div class='floating-save-space'></div>"
         "<div id='clusterSaveBar' class='floating-save-bar'>"
         "<span id='clusterSaveState' class='floating-save-state'>Keine ungespeicherten Änderungen</span>"
@@ -130,37 +139,48 @@ static String clusterPageHtml()
     html +=
         "<section class='settings-section'><h3>Cluster-Übersicht</h3>"
         "<div id='clusterRuntimeLine' class='cluster-runtime-line'><span class='status-pill'>Lädt …</span></div>"
+        "<div class='cluster-table-wrap'><table class='cluster-table cluster-simple-table'>"
+        "<thead><tr><th>Gerät</th><th>Rolle</th><th>Status</th><th>IP</th><th>Zuletzt gesehen</th></tr></thead>"
+        "<tbody id='clusterSimpleRows'><tr><td colspan='5' class='muted'>Status wird geladen …</td></tr></tbody>"
+        "</table></div>"
+        "<details class='cluster-tech-details'><summary>Technische Details anzeigen</summary>"
+        "<p id='clusterTimeDiagnostics' class='muted'>Clusterzeit: wartet auf Zeitquelle</p>"
         "<div class='cluster-table-wrap'><table class='cluster-table'>"
         "<thead><tr><th>Gerät</th><th>Cluster-Rolle</th><th>Policy</th><th>Integration-ID</th><th>IP</th><th>Mode</th><th>Status</th><th>Release</th><th>Zeit</th><th>Lease</th><th>Coordinator-Link</th><th>WiFi noch ca.</th><th>Zuletzt gesehen</th></tr></thead>"
         "<tbody id='clusterNodeRows'><tr><td colspan='13' class='muted'>Status wird geladen …</td></tr></tbody>"
         "</table></div>"
+        "<p class='muted' id='clusterAckDiagnostics' style='margin-top:10px'>ACK-Diagnose wird geladen …</p>"
+        "<pre class='muted' id='clusterElectionTrace' style='white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px'>Election-Verlauf wird geladen …</pre>"
         "<p class='muted' style='margin-top:12px'>Multicast-Presence standardmäßig alle 10 Sekunden, Lease 60 Sekunden. "
         "Zusätzlich sendet jeder Node dem gewählten Coordinator alle 10 Sekunden einen signierten Unicast-Heartbeat und erhält ein ACK. "
         "Beim geordneten WiFi-Abschalten sendet ein Gerät ein signiertes LEAVE; bei Strom- oder Funkverlust läuft die Lease aus. "
         "Der Cluster öffnet oder verlängert WiFi niemals selbst.</p>"
-        "</section>";
+        "</details></section>";
 
     html +=
-        "<section class='settings-section'><h3>Angekündigte Ressourcen</h3>"
+        "<details class='settings-section cluster-tech-details'><summary>Angekündigte Ressourcen</summary>"
         "<div class='cluster-table-wrap'><table class='cluster-table cluster-resource-table'>"
         "<thead><tr><th>Quelle</th><th>Resource-ID</th><th>Typ</th><th>Zeitstempel</th><th>Größe</th><th>TTL</th><th>Locator</th></tr></thead>"
         "<tbody id='clusterResourceRows'><tr><td colspan='7' class='muted'>Noch keine Ressourcen angekündigt.</td></tr></tbody>"
         "</table></div>"
         "<p class='muted' style='margin-top:12px'>Resource-Announcements enthalten nur kleine, HMAC-authentifizierte Metadaten. "
         "JPEGs, Videos oder andere Nutzdaten werden nicht per Multicast übertragen. Der automatische Peer-Download wird separat an den bestehenden Storage/API-Pfad angebunden.</p>"
-        "</section>";
+        "</details>";
 
     html +=
-        "<section class='settings-section'><h3>Discovery / Protokoll</h3>"
+        "<details class='settings-section cluster-tech-details'><summary>Discovery / Protokoll</summary>"
         "<p class='muted'>mDNS/DNS-SD <code>_sfcluster._udp</code> dient der Service-Ankündigung. Aktive Cluster senden zusätzlich eine kleine öffentliche Discovery-Metadatenmeldung mit Cluster-ID, Anzeigename und Credential-Epoch; sie enthält kein Passwort und ist keine Beitrittsberechtigung. "
         "Die laufende Presence, Lease-, LEAVE- und Resource-Metadaten bleiben HMAC-authentifiziert und verändern weder Recording noch Streaming.</p>"
-        "</section>";
+        "</details>";
 
     html += R"__JS__(
 <script>(function(){
 var f=document.getElementById('clusterSettingsForm'),b=document.getElementById('clusterSaveBar'),s=document.getElementById('clusterSaveState'),btn=document.getElementById('clusterSaveButton'),rows=document.getElementById('clusterNodeRows'),resRows=document.getElementById('clusterResourceRows'),line=document.getElementById('clusterRuntimeLine');
 var choice=document.getElementById('clusterChoice'),idField=document.getElementById('clusterId'),nameField=document.getElementById('clusterName'),epochField=document.getElementById('clusterCredentialEpoch'),passwordField=document.getElementById('clusterPassword'),credentialHint=document.getElementById('clusterCredentialHint');
 var choiceData={},choiceSignature='';
+var clusterEnabled=document.getElementById('clusterEnabled'),joinFields=document.getElementById('clusterJoinFields');
+function syncJoinFields(){if(joinFields&&clusterEnabled)joinFields.hidden=clusterEnabled.value!=='1';}
+if(clusterEnabled)clusterEnabled.addEventListener('change',syncJoinFields);syncJoinFields();
 function dirty(){if(!b||!s||!btn)return;b.classList.add('dirty');s.textContent='Ungespeicherte Änderungen';btn.disabled=false;}
 if(f&&b&&s&&btn){f.addEventListener('input',dirty);f.addEventListener('change',dirty);f.addEventListener('submit',function(){btn.disabled=true;s.textContent='Speichert …';});}
 function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
@@ -172,7 +192,25 @@ function sizeText(v){v=Number(v)||0;if(!v)return '-';if(v<1024)return v+' B';if(
 function statusText(n){var x=[];if(n.recording)x.push('Recording');if(n.streaming)x.push('Streaming');if(n.transport)x.push('Transport');return x.length?x.join(' · '):'Bereit';}
 function policyText(v){if(v==='preferred')return 'Bevorzugt';if(v==='node')return 'Nur Node';return 'Auto';}
 function roleText(v){return v==='coordinator'?'Coordinator':'Node';}
-function linkText(n,d){var a=Number(n.direct_heartbeat_age_ms),ack=Number(n.coordinator_ack_age_ms);if(d.local_role==='coordinator'&&!n.local&&a>=0)return 'Heartbeat '+age(a,false);if(n.local&&d.local_role!=='coordinator'&&ack>=0)return 'ACK '+age(ack,false);return '-';}
+function nodeNavigationLink(n,d){
+ if(n.local||!d.runtime_active||!n.online)return '';
+ var ip=String(n.ip||'');var parts=ip.split('.');
+ if(parts.length!==4||!parts.every(function(p){return /^\d{1,3}$/.test(p)&&Number(p)<=255;})||ip==='0.0.0.0'||ip==='255.255.255.255')return '';
+ var isCoordinator=n.cluster_role==='coordinator'&&String(n.integration_id||'')===String(d.coordinator_id||'');
+ var path=isCoordinator?'/cluster_coordinate':'/';
+ var label=isCoordinator?'Cluster steuern ↗':'Gerät öffnen ↗';
+ return ' <a href="http://'+esc(ip)+path+'" title="'+(isCoordinator?'Cluster-Steuerung':'Startseite')+' auf '+esc(n.hostname||ip)+' öffnen">'+label+'</a>';
+}
+function orderedNodes(nodes,d){
+ return nodes.slice().sort(function(a,b){
+  var ac=a.cluster_role==='coordinator'&&String(a.integration_id||'')===String(d.coordinator_id||'');
+  var bc=b.cluster_role==='coordinator'&&String(b.integration_id||'')===String(d.coordinator_id||'');
+  if(ac!==bc)return ac?-1:1;
+  if(!!a.local!==!!b.local)return a.local?-1:1;
+  return String(a.hostname||a.integration_id||'').localeCompare(String(b.hostname||b.integration_id||''));
+ });
+}
+function linkText(n,d){var a=Number(n.direct_heartbeat_age_ms),ack=Number(n.coordinator_ack_age_ms);if(d.local_role==='coordinator'&&!n.local&&a>=0)return 'Heartbeat '+age(a,false);if(n.local&&d.local_role!=='coordinator'){if(ack>=0)return 'ACK '+age(ack,false);var q=d.ack_diagnostics||{};var accepted=Number(q.ack_accepted)||0;return accepted>0?'ACK bestätigt ('+accepted+'× seit Start), aktuell kein ACK-Alter':'Noch kein ACK';}return '-';}
 function leaseText(n){var left=duration(n.lease_remaining_sec,'-'),total=duration(n.lease_sec,'-');return n.local?total:(left+' / '+total);}
 function wifiText(n){var v=Number(n.wifi_remaining_sec);if(v===-1)return 'offen / unbekannt';if(v===0)return 'endet';return duration(v,'unbekannt');}
 function renderChoices(d){
@@ -189,7 +227,7 @@ function renderChoices(d){
  if(sig===choiceSignature)return;choiceSignature=sig;var selected=choice.value||current;choice.innerHTML='<option value="">Manuell / neuer Cluster</option>'+entries.map(function(e){var label=e.name+' · '+e.id+(e.online?' · '+e.nodes+' online':' · bekannt/offline')+(e.coord?' · Coordinator':'')+(e.saved&&!e.stale?' · Passwort gespeichert':'')+(e.stale?' · Passwort geändert?':'')+(e.conflict?' · CREDENTIAL-EPOCH-KONFLIKT':'')+(e.authMismatch?' · NICHT AUTHENTIFIZIERT':'');return '<option value="'+esc(e.id)+'"'+(e.conflict?' disabled':'')+'>'+esc(label)+'</option>';}).join('');if(selected&&choiceData[selected]&&!choiceData[selected].conflict)choice.value=selected;}
  if(choice){choice.addEventListener('change',function(){var e=choiceData[choice.value];if(!e)return;if(idField)idField.value=e.id;if(nameField)nameField.value=e.name;if(epochField)epochField.value=String(e.epoch||1);if(passwordField){passwordField.value='';passwordField.placeholder=(e.saved&&!e.stale)?'Gespeichertes Passwort wird verwendet':(e.stale?'Passwort erneut eingeben':'Mindestens 8 Zeichen');}if(credentialHint)credentialHint.textContent=e.stale?'Der sichtbare Cluster meldet eine andere Credential-Epoch. Das gespeicherte Passwort wird nicht automatisch verwendet.':((e.saved&&!e.stale)?'Passwort für diesen Cluster ist auf diesem Gerät hardwaregebunden gespeichert. Leeres Feld verwendet es intern.':'Für diesen Cluster ist kein passendes Passwort gespeichert.');dirty();});}
  if(idField)idField.addEventListener('input',function(){if(choice)choice.value='';});if(nameField)nameField.addEventListener('input',function(){if(choice)choice.value='';});
-function render(d){if(!rows||!line)return;renderChoices(d);var pills=[];pills.push('<span class="status-pill '+(d.runtime_active?'ok':'warn')+'">Runtime '+(d.runtime_active?'AKTIV':'AUS')+'</span>');pills.push('<span class="status-pill">Presence '+esc(d.heartbeat_sec||10)+' s · Lease '+esc(d.default_lease_sec||60)+' s</span>');pills.push('<span class="status-pill '+(d.discovery_scanner_active?'ok':'warn')+'">Passive Suche '+(d.discovery_scanner_active?'AKTIV':'AUS')+'</span>');var coord=String(d.coordinator_id||'');pills.push('<span class="status-pill '+(coord?'ok':'warn')+'">Coordinator '+(coord?esc(coord):'keiner')+(d.coordinator_epoch?(' · Epoch '+esc(d.coordinator_epoch)):'')+'</span>');if(d.restart_required)pills.push('<span class="status-pill warn">NEUSTART ERFORDERLICH</span>');if(d.error)pills.push('<span class="status-pill danger">'+esc(d.error)+'</span>');line.innerHTML=pills.join(' ');var a=Array.isArray(d.nodes)?d.nodes:[];if(!a.length){rows.innerHTML='<tr><td colspan="13" class="muted">Keine Geräte sichtbar.</td></tr>';}else{rows.innerHTML=a.map(function(n){return '<tr><td><strong>'+esc(n.hostname||'-')+'</strong>'+(n.local?' <span class="status-pill ok">LOKAL</span>':'')+'</td><td><strong>'+esc(roleText(n.cluster_role))+'</strong></td><td>'+esc(policyText(n.coordinator_policy))+'</td><td class="cluster-id">'+esc(n.integration_id||'-')+'</td><td>'+esc(n.ip||'-')+'</td><td>'+esc(n.mode||'-')+'</td><td>'+esc(statusText(n))+'</td><td>'+esc(n.release||'-')+'</td><td>'+esc(timeText(n))+'</td><td>'+esc(leaseText(n))+'</td><td>'+esc(linkText(n,d))+'</td><td>'+esc(wifiText(n))+'</td><td>'+esc(age(n.age_ms,n.local))+'</td></tr>';}).join('');}
+function render(d){if(!rows||!line)return;renderChoices(d);var pills=[];pills.push('<span class="status-pill '+(d.runtime_active?'ok':'warn')+'">Runtime '+(d.runtime_active?'AKTIV':'AUS')+'</span>');var coord=String(d.coordinator_id||'');pills.push('<span class="status-pill '+(coord?'ok':'warn')+'">Coordinator '+(coord?esc(coord):'keiner')+(d.coordinator_epoch?(' · Epoch '+esc(d.coordinator_epoch)):'')+'</span>');var ct=d.cluster_time||{};pills.push('<span class="status-pill '+(ct.valid?'ok':'warn')+'">Clusterzeit '+(ct.valid?'aktiv':'wartet auf Zeitquelle')+'</span>');if(d.restart_required)pills.push('<span class="status-pill warn">NEUSTART ERFORDERLICH</span>');if(d.error)pills.push('<span class="status-pill danger">'+esc(d.error)+'</span>');line.innerHTML=pills.join(' ');var diag=document.getElementById('clusterAckDiagnostics'),q=d.ack_diagnostics||{};if(diag){diag.textContent='ACK-Diagnose (seit Runtime-Start, lokal): HB gesendet '+(q.hb_sent||0)+' / Sendefehler '+(q.hb_send_failed||0)+' · ACK-Sendeversuche '+(q.ack_send_attempted||0)+' / Sendefehler '+(q.ack_send_failed||0)+' · signierte ACK empfangen '+(q.ack_authenticated||0)+' / akzeptiert '+(q.ack_accepted||0)+' / abgelehnt '+(q.ack_rejected||0)+' · Coordinator-Wechsel '+(q.coordinator_changes||0)+' / Epoch-Wechsel '+(q.coordinator_epoch_changes||0)+' / ACK-Kontext-Resets '+(q.ack_context_resets||0)+' / unvollständige Coordinator-Meldungen '+(q.incomplete_coord_announcements||0)+' · letzter Ablehnungsgrund '+(q.last_reject||'none');}var td=document.getElementById('clusterTimeDiagnostics');if(td){var t=d.cluster_time||{};td.textContent='Clusterzeit: '+(t.valid?'gültig':'noch nicht verfügbar')+' · Quelle '+(t.source||'-')+' · Messungen '+(t.accepted||0)+' / verworfen '+(t.rejected||0)+' · RTT '+(t.last_rtt_us||0)+' µs · Alter '+(t.sample_age_ms||0)+' ms · Abweichung zur Geräteuhr '+(t.local_offset_available?((Number(t.local_offset_us||0)/1000).toFixed(2)+' ms'):'nicht messbar')+' · grobe Unsicherheit ±'+(Number(t.uncertainty_estimate_us||0)/1000).toFixed(2)+' ms (Schätzung, keine Garantie; keine Frame-Synchronität)';}var tr=document.getElementById('clusterElectionTrace');if(tr){var entries=Array.isArray(d.election_trace)?d.election_trace:[];tr.textContent='Letzte Election-Übergänge (RAM):\\n'+(entries.length?entries.join('\\n'):'keine');}var a=orderedNodes(Array.isArray(d.nodes)?d.nodes:[],d);var simple=document.getElementById('clusterSimpleRows');if(simple){simple.innerHTML=a.length?a.map(function(n){return '<tr><td><strong>'+esc(n.hostname||'-')+'</strong>'+(n.local?' <span class="status-pill ok">LOKAL</span>':'')+'</td><td>'+esc(roleText(n.cluster_role))+nodeNavigationLink(n,d)+'</td><td>'+esc(statusText(n))+'</td><td>'+esc(n.ip||'-')+'</td><td>'+esc(age(n.age_ms,n.local))+'</td></tr>';}).join(''):'<tr><td colspan="5" class="muted">Keine Geräte sichtbar.</td></tr>';}if(!a.length){rows.innerHTML='<tr><td colspan="13" class="muted">Keine Geräte sichtbar.</td></tr>';}else{rows.innerHTML=a.map(function(n){return '<tr><td><strong>'+esc(n.hostname||'-')+'</strong>'+(n.local?' <span class="status-pill ok">LOKAL</span>':'')+'</td><td><strong>'+esc(roleText(n.cluster_role))+'</strong></td><td>'+esc(policyText(n.coordinator_policy))+'</td><td class="cluster-id">'+esc(n.integration_id||'-')+'</td><td>'+esc(n.ip||'-')+'</td><td>'+esc(n.mode||'-')+'</td><td>'+esc(statusText(n))+'</td><td>'+esc(n.release||'-')+'</td><td>'+esc(timeText(n))+'</td><td>'+esc(leaseText(n))+'</td><td>'+esc(linkText(n,d))+'</td><td>'+esc(wifiText(n))+'</td><td>'+esc(age(n.age_ms,n.local))+'</td></tr>';}).join('');}
 if(resRows){var byId={};a.forEach(function(n){byId[String(n.integration_id||'')]=n.hostname||n.integration_id||'-';});var rr=Array.isArray(d.resources)?d.resources:[];if(!rr.length){resRows.innerHTML='<tr><td colspan="7" class="muted">Noch keine Ressourcen angekündigt.</td></tr>';}else{resRows.innerHTML=rr.map(function(r){var owner=byId[String(r.owner_integration_id||'')]||r.owner_integration_id||'-';return '<tr><td><strong>'+esc(owner)+'</strong><div class="cluster-subtle">'+esc(r.source_ip||'-')+'</div></td><td class="cluster-id">'+esc(r.resource_id||'-')+'</td><td>'+esc(r.type||'-')+'</td><td>'+esc(resourceTime(r.timestamp_us))+'</td><td>'+esc(sizeText(r.size_bytes))+'</td><td>'+esc(duration(r.ttl_remaining_sec,'-'))+'</td><td class="cluster-id">'+esc(r.locator||'-')+'</td></tr>';}).join('');}}}
 function poll(){fetch('/cluster_status?t='+Date.now(),{cache:'no-store',credentials:'same-origin'}).then(function(r){if(!r.ok)throw new Error();return r.json();}).then(render).catch(function(){if(line)line.innerHTML='<span class="status-pill danger">Status nicht erreichbar</span>';});}poll();setInterval(poll,3000);document.addEventListener('visibilitychange',function(){if(!document.hidden)poll();});
 })();</script>
@@ -213,6 +251,44 @@ static void handleClusterStatus()
     clusterDiscoveryTouch();
     server.sendHeader("Cache-Control", "no-store");
     server.send(200, "application/json; charset=utf-8", clusterStatusJson());
+}
+
+static void handleClusterCoordinatePage()
+{
+    if (!clusterLocalIsCoordinator()) {
+        server.send(403, "text/plain; charset=utf-8", "Nur am aktiven Coordinator verfügbar.");
+        return;
+    }
+    String html = htmlHeader();
+    html += "<div class='page-title'><div><h2>Cluster koordinieren – " +
+        htmlEscape(cfg_hostname.length() ? cfg_hostname : String("sensorforge")) +
+        "</h2><p class='muted'>Aktionen für den lokalen Clusterverbund</p></div></div>";
+    html += "<section class='settings-section'><h3>Zeit synchronisieren</h3>"
+        "<p>Fordert die aktuell verbundenen Nodes auf, ihre Clusterzeit jetzt "
+        "neu abzugleichen. Die Systemuhren und laufenden Aufnahmen werden nicht verändert.</p>"
+        "<form method='POST' action='/cluster_sync_time'>"
+        "<button class='primary' type='submit'>Zeit jetzt synchronisieren</button></form>"
+        "<p class='muted'>Der Befehl wird authentifiziert übertragen. "
+        "Einzelne offline Nodes oder verlorene Funkpakete werden nicht bestätigt. "
+        "Die Synchronisationsqualität ist auf der jeweiligen Cluster-Seite sichtbar.</p>"
+        "</section>";
+    if (server.arg("notice") == "sent")
+        html += "<p class='flash-notice'>Synchronisation angefordert. "
+                "Der Empfang durch alle Nodes ist damit noch nicht bestätigt.</p>";
+    html += htmlFooter();
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "text/html; charset=utf-8", html);
+}
+
+static void handleClusterSyncTime()
+{
+    String error;
+    if (!clusterRequestTimeSync(error)) {
+        server.send(409, "text/plain; charset=utf-8", error);
+        return;
+    }
+    server.sendHeader("Location", "/cluster_coordinate?notice=sent");
+    server.send(303, "text/plain; charset=utf-8", "");
 }
 
 static void handleClusterSave()
@@ -299,6 +375,56 @@ static void handleClusterSave()
     }
 
     uint32_t credentialEpoch = requestedEpoch;
+
+    // Joining an already visible cluster must prove the candidate password
+    // before anything is persisted. The passive scanner keeps a short-lived
+    // copy of an existing HMAC-signed SFC1 Presence packet and verifies it
+    // locally with the candidate credentials; the password never leaves this
+    // device. Existing active membership with unchanged credentials is already
+    // authenticated by the running cluster and does not need this join check.
+    const bool unchangedActiveMembership =
+        enabled && cfg_cluster_enabled && sameClusterId &&
+        password == cfg_cluster_password &&
+        requestedEpoch == cfg_cluster_credential_epoch &&
+        clusterRuntimeActive();
+
+    bool credentialsVerifiedAgainstVisibleCluster = false;
+    uint32_t verifiedRemoteEpoch = 0;
+    if (enabled && !unchangedActiveMembership) {
+        String credentialError;
+        const ClusterCredentialCheckResult credentialCheck =
+            clusterVerifyDiscoveredCredentials(
+                clusterId,
+                requestedEpoch,
+                password,
+                credentialError,
+                verifiedRemoteEpoch
+            );
+
+        credentialsVerifiedAgainstVisibleCluster =
+            credentialCheck == CLUSTER_CREDENTIAL_VERIFIED;
+        if (credentialsVerifiedAgainstVisibleCluster)
+            credentialEpoch = verifiedRemoteEpoch;
+
+        if (credentialCheck != CLUSTER_CREDENTIAL_NOT_DISCOVERED &&
+            credentialCheck != CLUSTER_CREDENTIAL_VERIFIED) {
+            int statusCode = 409;
+            if (credentialCheck == CLUSTER_CREDENTIAL_INVALID_PASSWORD)
+                statusCode = 403;
+            else if (credentialCheck == CLUSTER_CREDENTIAL_INTERNAL_ERROR)
+                statusCode = 500;
+
+            server.send(
+                statusCode,
+                "text/plain; charset=utf-8",
+                credentialError.length()
+                    ? credentialError
+                    : String("Cluster-Zugangsdaten konnten nicht bestätigt werden")
+            );
+            return;
+        }
+    }
+
     if (sameClusterId && passwordWasProvided && password != cfg_cluster_password) {
         // Never split a healthy multi-node cluster through a local form edit.
         // Central password rotation is a future Coordinator transaction.
@@ -311,13 +437,16 @@ static void handleClusterSave()
             return;
         }
 
-        // Local recovery/rejoin is allowed only when no authenticated peer is
-        // currently attached. If discovery supplied a newer epoch, keep it;
-        // otherwise advance the local credential generation.
-        if (credentialEpoch <= cfg_cluster_credential_epoch)
-            credentialEpoch = cfg_cluster_credential_epoch + 1U;
-        if (credentialEpoch == 0)
-            credentialEpoch = 1;
+        // If this is a recovery/rejoin to a currently visible cluster and the
+        // candidate password was proven against that cluster, keep the epoch it
+        // advertises. Only a truly local/offline password replacement advances
+        // the generation; such local rotation is not propagated to peers.
+        if (!credentialsVerifiedAgainstVisibleCluster) {
+            if (credentialEpoch <= cfg_cluster_credential_epoch)
+                credentialEpoch = cfg_cluster_credential_epoch + 1U;
+            if (credentialEpoch == 0)
+                credentialEpoch = 1;
+        }
     }
 
     String coordinatorPolicy = server.hasArg("cluster_coordinator_policy")
@@ -406,4 +535,6 @@ void webconfigClusterRegisterRoutes(
     serverInstance.on("/cluster", HTTP_GET, handleClusterPage);
     serverInstance.on("/cluster_status", HTTP_GET, handleClusterStatus);
     serverInstance.on("/cluster_save", HTTP_POST, handleClusterSave);
+    serverInstance.on("/cluster_coordinate", HTTP_GET, handleClusterCoordinatePage);
+    serverInstance.on("/cluster_sync_time", HTTP_POST, handleClusterSyncTime);
 }

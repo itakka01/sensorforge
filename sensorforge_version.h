@@ -21,13 +21,13 @@
 // WebConfig, so a running device can be mapped back to the exact Git tag.
 
 #define SENSORFORGE_RELEASE_NUMBER 87
-#define SENSORFORGE_RELEASE_TAG "v87-beta49"
-#define SENSORFORGE_RELEASE_DATE "2026-10-08"
+#define SENSORFORGE_RELEASE_TAG "v87-beta67"
+#define SENSORFORGE_RELEASE_DATE "2026-10-09"
 #define SENSORFORGE_RELEASE_SUMMARY \
-    "Beta 48: fix first-use cluster profile lookup and apply cluster settings through a controlled reboot so discovery runtime becomes active deterministically."
+    "Beta 67: cluster overview links to remote nodes and coordinator; coordinator first."
 
-// Current source-tree stage. v87 Beta 48 fixes cluster first-use profile lookup and deterministic runtime activation after save.
-#define SENSORFORGE_WORKTREE_STAGE "v87-beta49"
-#define SENSORFORGE_WORKTREE_DATE "2026-10-08"
+// Current source-tree stage. v87 Beta 52 applies coordinator election updates promptly; retains Beta 51 join recovery.
+#define SENSORFORGE_WORKTREE_STAGE "v87-beta67"
+#define SENSORFORGE_WORKTREE_DATE "2026-10-09"
 #define SENSORFORGE_WORKTREE_SUMMARY \
-    "v87 Beta 48: new devices treat an absent known-cluster NVS namespace as empty, and cluster saves reboot into the new runtime/discovery state."
+    "v87 Beta 67: node and coordinator navigation; cluster protocol unchanged."

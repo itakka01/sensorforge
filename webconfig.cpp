@@ -1521,7 +1521,8 @@ static String htmlHeader()
     html +=
         "<a href='/system'>" + htmlText(UI_NAV_SYSTEM) + "</a>"
         "<a href='/wifi_settings'>WiFi Einstellungen</a>"
-        "<a href='/cluster'>Cluster</a>"
+        "<a href='/cluster'>Cluster</a>" +
+        (clusterLocalIsCoordinator() ? String("<a href='/cluster_coordinate'>Cluster koordinieren</a>") : String()) +
         "<a href='/access_settings'>Benutzer &amp; Zugriff</a>"
         "<a href='/shooter'>Power Shooter</a>"
         "<a href='/sd_maintenance'>" + htmlText(UI_NAV_SD_MAINTENANCE) + "</a>"

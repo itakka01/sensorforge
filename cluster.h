@@ -23,6 +23,9 @@ void clusterMdnsAdvertise();
 void clusterLoop();
 
 bool clusterRuntimeActive();
+bool clusterLocalIsCoordinator();
+// Sends an authenticated advisory time-sync trigger; no system-clock changes.
+bool clusterRequestTimeSync(String &error);
 bool clusterRestartRequired();
 const char *clusterLastError();
 
@@ -41,6 +44,26 @@ bool clusterDiscoveryScannerActive();
 // Number of currently authenticated remote peers in the active cluster. Used
 // to block unsafe local password replacement of a healthy multi-node cluster.
 size_t clusterAuthenticatedPeerCount();
+
+// Result of validating candidate credentials against recent authenticated
+// multicast Presence traffic from a currently discovered remote cluster.
+// No password or derived key is transmitted; verification is entirely local.
+enum ClusterCredentialCheckResult : uint8_t {
+    CLUSTER_CREDENTIAL_NOT_DISCOVERED = 0,
+    CLUSTER_CREDENTIAL_VERIFIED = 1,
+    CLUSTER_CREDENTIAL_INVALID_PASSWORD = 2,
+    CLUSTER_CREDENTIAL_PROOF_PENDING = 3,
+    CLUSTER_CREDENTIAL_EPOCH_MISMATCH = 4,
+    CLUSTER_CREDENTIAL_INTERNAL_ERROR = 5
+};
+
+ClusterCredentialCheckResult clusterVerifyDiscoveredCredentials(
+    const String &clusterId,
+    uint32_t credentialEpoch,
+    const String &password,
+    String &error,
+    uint32_t &verifiedEpoch
+);
 
 
 // Approximate remaining lifetime of the current WiFi session as calculated by
@@ -71,3 +94,7 @@ bool clusterAnnounceResource(
 // Contains the local node, only authenticated peers from the same cluster and
 // currently valid resource announcements.
 String clusterStatusJson();
+
+// Independent UTC estimate, not applied to system clock/RTC or recording.
+// false if authority time is missing or estimate too old.
+bool clusterTimeNowUs(int64_t &utcUs);

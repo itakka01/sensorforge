@@ -15,6 +15,8 @@
 #include <esp_system.h>
 #include <errno.h>
 #include <time.h>
+#include <sys/time.h>
+#include <esp_timer.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -34,6 +36,9 @@ static const uint32_t CLUSTER_RESOURCE_TTL_MAX_SEC = 3600UL;
 static const size_t CLUSTER_MAX_PEERS = 16;
 static const size_t CLUSTER_MAX_RESOURCES = 24;
 static const size_t CLUSTER_MAX_DISCOVERY_NODES = 32;
+static const size_t CLUSTER_DISCOVERY_PROOF_SLOTS = 8;
+static const uint32_t CLUSTER_DISCOVERY_PROOF_TTL_MS = 35000UL;
+static const uint32_t CLUSTER_DISCOVERY_PROOF_PAIR_WINDOW_MS = 3000UL;
 static const size_t CLUSTER_PACKET_MAX = 511;
 static const char *CLUSTER_SERVICE = "sfcluster";
 static const char *CLUSTER_PROTO = "udp";
@@ -45,6 +50,14 @@ static const char *CLUSTER_RESOURCE_MAGIC = "SFR1";
 static const char *CLUSTER_COORDINATION_MAGIC = "SFCO1";
 static const char *CLUSTER_NODE_HEARTBEAT_MAGIC = "SFNH1";
 static const char *CLUSTER_NODE_ACK_MAGIC = "SFNA1";
+// Time is an OPTIONAL sidecar to the cluster: it never adjusts the system RTC.
+static const char *CLUSTER_TIME_REQUEST_MAGIC = "SFTQ1";
+static const char *CLUSTER_TIME_REPLY_MAGIC = "SFTR1";
+static const char *CLUSTER_TIME_SYNC_COMMAND_MAGIC = "SFTS1";
+static const uint32_t CLUSTER_TIME_INTERVAL_MS = 900000UL; // 15 minutes
+static const uint32_t CLUSTER_TIME_RETRY_MS = 30000UL; // only before first valid sample
+static const uint32_t CLUSTER_TIME_HOLDOVER_MS = 1800000UL; // max 30 minutes without fresh sample
+static const int64_t CLUSTER_TIME_MAX_RTT_US = 250000LL;
 
 enum CoordinatorPolicy : uint8_t {
     COORDINATOR_POLICY_NODE_ONLY = 0,
@@ -106,11 +119,23 @@ struct ClusterDiscoveryNode {
     uint32_t lastSeenMs;
 };
 
+// Short-lived proof cache for passive join validation. Only already-existing
+// signed SFC1 Presence datagrams are retained, never passwords or plaintext
+// cluster keys. Entries expire with the discovery lease and are RAM-only.
+struct ClusterDiscoveryProof {
+    bool used;
+    IPAddress sourceIp;
+    uint16_t packetLength;
+    uint32_t lastSeenMs;
+    char packet[CLUSTER_PACKET_MAX + 1];
+};
+
 static WiFiUDP clusterUdp;
 static WiFiUDP coordinatorUdp;
 static ClusterPeer peers[CLUSTER_MAX_PEERS] = {};
 static ClusterResource resources[CLUSTER_MAX_RESOURCES] = {};
 static ClusterDiscoveryNode discoveryNodes[CLUSTER_MAX_DISCOVERY_NODES] = {};
+static ClusterDiscoveryProof discoveryProofs[CLUSTER_DISCOVERY_PROOF_SLOTS] = {};
 static bool runtimeConfiguredEnabled = false;
 static bool runtimeActive = false;
 static bool mdnsServiceAdvertised = false;
@@ -123,7 +148,66 @@ static uint32_t nextHeartbeatMs = 0;
 static uint32_t nextCoordinatorHeartbeatMs = 0;
 static uint32_t directHeartbeatSequence = 0;
 static uint32_t lastCoordinatorAckMs = 0;
+static uint32_t lastAckCoordinatorBoot = 0;
 static uint32_t lastCoordinatorAckSequence = 0;
+// Volatile time authority. A future IR backend can provide an independent
+// high-precision clock source without changing the existing wall clock.
+static uint32_t timeRequestSeq = 0;
+static uint32_t timePendingSeq = 0;
+static int64_t timePendingMonoUs = 0;
+static uint32_t timeLastRequestMs = 0;
+static bool timeEstimateValid = false;
+static int64_t timeAnchorUtcUs = 0;
+static int64_t timeAnchorMonoUs = 0;
+static int64_t timeLastRttUs = 0;
+static uint32_t timeLastSampleMs = 0;
+static char timeAuthorityId[36] = {};
+static uint32_t timeAuthorityEpoch = 0;
+static uint32_t timeAcceptedSamples = 0;
+static uint32_t timeRejectedSamples = 0;
+// Coordinator-only manual sync: volatile monotonic command IDs per boot/epoch.
+static uint32_t timeSyncCommandSeq = 0;
+static uint32_t timeSyncLastReceivedSeq = 0;
+static uint32_t timeSyncLastCoordinatorBoot = 0;
+static uint32_t timeSyncLastCommandMs = 0;
+static uint32_t timeSyncCommandsReceived = 0;
+static uint32_t timeSyncCommandsSent = 0;
+
+static void resetClusterTimeEstimate()
+{
+    timeLastRequestMs = 0; // new coordinator/epoch: synchronize immediately
+    timeSyncLastReceivedSeq = 0;
+    timeSyncLastCoordinatorBoot = 0;
+    timePendingSeq = 0;
+    timeEstimateValid = false;
+    timeAnchorUtcUs = 0;
+    timeAnchorMonoUs = 0;
+    timeLastRttUs = 0;
+    timeLastSampleMs = 0;
+    timeAuthorityId[0] = '\0';
+    timeAuthorityEpoch = 0;
+}
+
+static uint32_t diagCoordinatorChanges = 0;
+static uint32_t diagCoordinatorEpochChanges = 0;
+static uint32_t diagAckContextResets = 0;
+static uint32_t diagIncompleteCoordinatorAnnouncements = 0;
+// Bounded, RAM-only election trace. Contains no cluster secret or key material.
+static constexpr size_t CLUSTER_ELECTION_TRACE_COUNT = 8;
+static char diagElectionTrace[CLUSTER_ELECTION_TRACE_COUNT][196] = {};
+static uint8_t diagElectionTraceNext = 0;
+static uint8_t diagElectionTraceUsed = 0;
+
+// Volatile diagnostic counters; never persisted and no secret data exposed.
+static uint32_t diagHbSent = 0;
+static uint32_t diagHbSendFailed = 0;
+static uint32_t diagAckSendAttempted = 0;
+static uint32_t diagAckSendFailed = 0;
+static uint32_t diagAckAuthenticated = 0;
+static uint32_t diagAckAccepted = 0;
+static uint32_t diagAckRejected = 0;
+static const char *diagAckLastReject = "none";
+
 static int32_t localWifiRemainingSeconds = -1;
 static CoordinatorPolicy runtimeCoordinatorPolicy = COORDINATOR_POLICY_AUTO;
 static bool localIsCoordinator = false;
@@ -366,6 +450,43 @@ static bool computePacketMac(
         32,
         &outputLength
     );
+
+    return status == PSA_SUCCESS && outputLength == 32;
+}
+
+static bool computePacketMacWithRawKey(
+    const uint8_t key[32],
+    const uint8_t *data,
+    size_t length,
+    uint8_t mac[32]
+)
+{
+    if (!key || (!data && length) || !mac)
+        return false;
+
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_MESSAGE);
+    psa_set_key_algorithm(&attributes, PSA_ALG_HMAC(PSA_ALG_SHA_256));
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_HMAC);
+    psa_set_key_bits(&attributes, 256);
+
+    psa_key_id_t keyId = 0;
+    psa_status_t status = psa_import_key(&attributes, key, 32, &keyId);
+    psa_reset_key_attributes(&attributes);
+    if (status != PSA_SUCCESS || keyId == 0)
+        return false;
+
+    size_t outputLength = 0;
+    status = psa_mac_compute(
+        keyId,
+        PSA_ALG_HMAC(PSA_ALG_SHA_256),
+        data,
+        length,
+        mac,
+        32,
+        &outputLength
+    );
+    psa_destroy_key(keyId);
 
     return status == PSA_SUCCESS && outputLength == 32;
 }
@@ -617,6 +738,76 @@ static void expireDiscoveryNodes(uint32_t now)
     }
 }
 
+static void clearDiscoveryProofs()
+{
+    for (size_t i = 0; i < CLUSTER_DISCOVERY_PROOF_SLOTS; ++i)
+        discoveryProofs[i] = ClusterDiscoveryProof{};
+}
+
+static void expireDiscoveryProofs(uint32_t now)
+{
+    for (size_t i = 0; i < CLUSTER_DISCOVERY_PROOF_SLOTS; ++i) {
+        ClusterDiscoveryProof &proof = discoveryProofs[i];
+        if (proof.used &&
+            (uint32_t)(now - proof.lastSeenMs) > CLUSTER_DISCOVERY_PROOF_TTL_MS) {
+            proof = ClusterDiscoveryProof{};
+        }
+    }
+}
+
+static ClusterDiscoveryProof *discoveryProofSlotFor(
+    const IPAddress &sourceIp,
+    uint32_t now
+)
+{
+    ClusterDiscoveryProof *unused = nullptr;
+    ClusterDiscoveryProof *oldest = nullptr;
+    uint32_t oldestAge = 0;
+
+    for (size_t i = 0; i < CLUSTER_DISCOVERY_PROOF_SLOTS; ++i) {
+        ClusterDiscoveryProof &proof = discoveryProofs[i];
+        if (proof.used && proof.sourceIp == sourceIp)
+            return &proof;
+        if (!proof.used && !unused)
+            unused = &proof;
+        if (proof.used) {
+            const uint32_t age = now - proof.lastSeenMs;
+            if (!oldest || age > oldestAge) {
+                oldest = &proof;
+                oldestAge = age;
+            }
+        }
+    }
+
+    return unused ? unused : oldest;
+}
+
+static void rememberDiscoveryPresenceProof(
+    const char *packet,
+    size_t packetLength,
+    const IPAddress &sourceIp,
+    uint32_t now
+)
+{
+    if (!packet ||
+        packetLength < 5 || packetLength > CLUSTER_PACKET_MAX ||
+        memcmp(packet, "SFC1|", 5) != 0) {
+        return;
+    }
+
+    ClusterDiscoveryProof *proof = discoveryProofSlotFor(sourceIp, now);
+    if (!proof)
+        return;
+
+    *proof = ClusterDiscoveryProof{};
+    proof->used = true;
+    proof->sourceIp = sourceIp;
+    proof->packetLength = (uint16_t)packetLength;
+    proof->lastSeenMs = now;
+    memcpy(proof->packet, packet, packetLength);
+    proof->packet[packetLength] = '\0';
+}
+
 static ClusterPeer *peerSlotFor(const char *integrationId, uint32_t now)
 {
     ClusterPeer *unused = nullptr;
@@ -795,8 +986,12 @@ static void recomputeCoordinator(uint32_t now)
             continue;
 
         const uint32_t leaseSeconds = peerLeaseSeconds(peer);
-        const uint64_t ageMs = (uint64_t)(uint32_t)(now - peer.lastSeenMs);
-        if (ageMs > (uint64_t)leaseSeconds * 1000ULL)
+        // A packet handled later in this loop may have a lastSeenMs newer
+        // than the loop-start timestamp. Treat a small negative age as zero,
+        // not as a wrapped 49-day-old lease.
+        const int32_t signedAgeMs = (int32_t)(now - peer.lastSeenMs);
+        const uint32_t ageMs = signedAgeMs < 0 ? 0U : (uint32_t)signedAgeMs;
+        if ((uint64_t)ageMs > (uint64_t)leaseSeconds * 1000ULL)
             continue;
 
         if (coordinatorCandidateBetter(
@@ -833,6 +1028,18 @@ static void recomputeCoordinator(uint32_t now)
             ) {
                 newCoordinatorEpoch = bestPeer->advertisedCoordinatorEpoch;
             }
+            // An authenticated coordination message may temporarily carry no
+            // Coordinator epoch while the peer is converging. Retain the last
+            // ACK-confirmed epoch only for the SAME live Coordinator/boot.
+            // Never carry it across a peer reboot or a Coordinator change.
+            else if (strcmp(currentCoordinatorId, bestPeer->integrationId) == 0 &&
+                     currentCoordinatorEpoch != 0 &&
+                     lastCoordinatorAckMs != 0 &&
+                     (uint32_t)(now - lastCoordinatorAckMs) <=
+                         CLUSTER_COORDINATOR_HEARTBEAT_MS * 3UL &&
+                     bestPeer->bootNonce == lastAckCoordinatorBoot) {
+                newCoordinatorEpoch = currentCoordinatorEpoch;
+            }
         }
     }
 
@@ -842,6 +1049,33 @@ static void recomputeCoordinator(uint32_t now)
         localIsCoordinator != newLocalIsCoordinator;
 
     if (changed) {
+        resetClusterTimeEstimate();
+        // Snapshot BEFORE changing state: distinguish loss of an advertised
+        // epoch from a real candidate/boot transition. No behavior change.
+        char *trace = diagElectionTrace[diagElectionTraceNext];
+        const uint32_t oldEpoch = currentCoordinatorEpoch;
+        const uint32_t peerEpoch = bestPeer ? bestPeer->advertisedCoordinatorEpoch : 0;
+        const bool selfAdvertised = bestPeer &&
+            strcmp(bestPeer->advertisedCoordinatorId, bestPeer->integrationId) == 0;
+        snprintf(trace, sizeof(diagElectionTrace[0]),
+                 "t=%lu %s:%lu>%s:%lu peerBoot=%08lx self=%u adv=%lu ackAge=%ld seq=%lu",
+                 (unsigned long)now,
+                 currentCoordinatorId[0] ? currentCoordinatorId : "none",
+                 (unsigned long)oldEpoch,
+                 newCoordinatorId[0] ? newCoordinatorId : "none",
+                 (unsigned long)newCoordinatorEpoch,
+                 (unsigned long)(bestPeer ? bestPeer->bootNonce : 0),
+                 (unsigned int)selfAdvertised,
+                 (unsigned long)peerEpoch,
+                 lastCoordinatorAckMs ? (long)(uint32_t)(now-lastCoordinatorAckMs) : -1L,
+                 (unsigned long)(bestPeer ? bestPeer->coordinationSequence : 0));
+        diagElectionTraceNext = (diagElectionTraceNext + 1) % CLUSTER_ELECTION_TRACE_COUNT;
+        if (diagElectionTraceUsed < CLUSTER_ELECTION_TRACE_COUNT) ++diagElectionTraceUsed;
+        ++diagCoordinatorChanges;
+        if (currentCoordinatorEpoch != newCoordinatorEpoch)
+            ++diagCoordinatorEpochChanges;
+        if (lastCoordinatorAckMs != 0)
+            ++diagAckContextResets;
         const bool wasLocalCoordinator = localIsCoordinator;
         strncpy(currentCoordinatorId, newCoordinatorId, sizeof(currentCoordinatorId) - 1);
         currentCoordinatorId[sizeof(currentCoordinatorId) - 1] = '\0';
@@ -849,8 +1083,10 @@ static void recomputeCoordinator(uint32_t now)
         currentCoordinatorEpoch = newCoordinatorEpoch;
         localIsCoordinator = newLocalIsCoordinator;
         coordinationDirty = true;
-        nextCoordinatorHeartbeatMs = 0;
+        // Keep the direct-HB periodic deadline across election updates.
+        // An epoch fluctuation must not trigger a heartbeat burst.
         lastCoordinatorAckMs = 0;
+        lastAckCoordinatorBoot = 0;
         lastCoordinatorAckSequence = 0;
 
         if (wasLocalCoordinator && !localIsCoordinator)
@@ -967,6 +1203,68 @@ static bool splitFields(
     }
 
     return token == nullptr;
+}
+
+static bool discoveryProofMatchesCredentials(
+    const ClusterDiscoveryProof &proof,
+    const ClusterDiscoveryNode &node,
+    const uint8_t key[32],
+    const char expectedTag[17]
+)
+{
+    if (!proof.used || !node.used || !key || !expectedTag ||
+        proof.packetLength == 0 || proof.packetLength > CLUSTER_PACKET_MAX) {
+        return false;
+    }
+
+    char packet[CLUSTER_PACKET_MAX + 1];
+    memcpy(packet, proof.packet, proof.packetLength);
+    packet[proof.packetLength] = '\0';
+
+    char *separator = strrchr(packet, '|');
+    if (!separator || separator == packet)
+        return false;
+
+    const char *signatureText = separator + 1;
+    if (strlen(signatureText) != 64)
+        return false;
+
+    uint8_t receivedMac[32] = {};
+    uint8_t expectedMac[32] = {};
+    if (!hexToBytes(signatureText, sizeof(receivedMac), receivedMac))
+        return false;
+
+    const size_t payloadLength = (size_t)(separator - packet);
+    *separator = '\0';
+    if (!computePacketMacWithRawKey(
+            key,
+            reinterpret_cast<const uint8_t *>(packet),
+            payloadLength,
+            expectedMac
+        )) {
+        secureWipe(receivedMac, sizeof(receivedMac));
+        secureWipe(expectedMac, sizeof(expectedMac));
+        return false;
+    }
+
+    const bool macMatches = constantTimeEqual(
+        receivedMac,
+        expectedMac,
+        sizeof(receivedMac)
+    );
+    secureWipe(receivedMac, sizeof(receivedMac));
+    secureWipe(expectedMac, sizeof(expectedMac));
+    if (!macMatches)
+        return false;
+
+    char *fields[12] = {};
+    size_t fieldCount = 0;
+    if (!splitFields(packet, fields, 12, fieldCount) || fieldCount != 12)
+        return false;
+
+    return strcmp(fields[0], CLUSTER_PACKET_MAGIC) == 0 &&
+        strcmp(fields[1], expectedTag) == 0 &&
+        strcmp(fields[2], node.integrationId) == 0;
 }
 
 static bool sendSignedPayload(
@@ -1494,7 +1792,9 @@ static void processCoordination(
     if (!peer)
         return;
 
-    if (peer->coordinationSequence != 0 && remoteSequence < peer->coordinationSequence)
+    // Reject replayed coordination announcements, including equal sequences.
+    // Presence and direct heartbeat liveness are tracked independently.
+    if (peer->coordinationSequence != 0 && remoteSequence <= peer->coordinationSequence)
         return;
 
     peer->coordinationSequence = remoteSequence;
@@ -1508,9 +1808,34 @@ static void processCoordination(
             sizeof(peer->advertisedCoordinatorId) - 1
         );
     }
-    peer->advertisedCoordinatorEpoch = advertisedEpoch;
+    // A coordinator may briefly announce an incomplete role/epoch during
+    // convergence. Do not discard a recently ACK-authenticated epoch for
+    // this same coordinator and boot on such an announcement. An explicit
+    // nonzero epoch is still processed normally (including real transitions).
+    const bool incompleteSelfAnnouncement =
+        strcmp(fields[2], fields[7]) != 0 || advertisedEpoch == 0;
+    const bool haveRecentConfirmedEpoch =
+        strcmp(currentCoordinatorId, peer->integrationId) == 0 &&
+        lastCoordinatorAckMs != 0 &&
+        (uint32_t)(now - lastCoordinatorAckMs) <=
+            CLUSTER_COORDINATOR_HEARTBEAT_MS * 3UL &&
+        peer->bootNonce == lastAckCoordinatorBoot &&
+        peer->advertisedCoordinatorEpoch == currentCoordinatorEpoch &&
+        currentCoordinatorEpoch != 0;
+    if (incompleteSelfAnnouncement && haveRecentConfirmedEpoch) {
+        ++diagIncompleteCoordinatorAnnouncements;
+        // Preserve both the self-identification and epoch proven by ACK.
+        strncpy(peer->advertisedCoordinatorId, peer->integrationId,
+                sizeof(peer->advertisedCoordinatorId) - 1);
+    } else {
+        peer->advertisedCoordinatorEpoch = advertisedEpoch;
+    }
     peer->lastCoordinatorInfoMs = now;
     peer->lastSeenMs = now;
+
+    // A newly authenticated peer policy may change the election winner.
+    // Apply it immediately instead of waiting for another main-loop pass.
+    recomputeCoordinator(now);
 }
 
 static void sendNodeAck(
@@ -1545,7 +1870,9 @@ static void sendNodeAck(
     payload += '|';
     payload += String((unsigned long)nodeHeartbeatSequence);
 
-    sendSignedPayloadTo(payload, remoteIp, CLUSTER_COORDINATOR_PORT, "cluster node ACK");
+    ++diagAckSendAttempted;
+    if (!sendSignedPayloadTo(payload, remoteIp, CLUSTER_COORDINATOR_PORT, "cluster node ACK"))
+        ++diagAckSendFailed;
 }
 
 static void processNodeHeartbeat(
@@ -1623,11 +1950,14 @@ static void processNodeAck(
 )
 {
     // SFNA1|tag|coordinator|coord_boot|epoch|node|node_boot|hb_sequence
+    ++diagAckAuthenticated;
     if (fieldCount != 8 ||
         strcmp(fields[0], CLUSTER_NODE_ACK_MAGIC) != 0 ||
         strcmp(fields[1], runtimeClusterTag) != 0 ||
         !integrationIdValid(fields[2]) ||
         !integrationIdValid(fields[5])) {
+        ++diagAckRejected;
+        diagAckLastReject = "format_or_tag";
         return;
     }
 
@@ -1639,6 +1969,8 @@ static void processNodeAck(
         !parseUint32Strict(fields[4], coordinatorEpoch) ||
         !parseUint32Strict(fields[6], nodeBoot, 16) ||
         !parseUint32Strict(fields[7], heartbeatSequence)) {
+        ++diagAckRejected;
+        diagAckLastReject = "number_format";
         return;
     }
 
@@ -1648,16 +1980,22 @@ static void processNodeAck(
         strcmp(fields[2], currentCoordinatorId) != 0 ||
         coordinatorEpoch == 0 ||
         coordinatorEpoch != currentCoordinatorEpoch) {
+        ++diagAckRejected;
+        diagAckLastReject = "identity_boot_or_epoch";
         return;
     }
 
     if (lastCoordinatorAckSequence != 0 &&
         heartbeatSequence <= lastCoordinatorAckSequence) {
+        ++diagAckRejected;
+        diagAckLastReject = "old_sequence";
         return;
     }
 
     const uint32_t now = millis();
+    ++diagAckAccepted;
     lastCoordinatorAckMs = now;
+    lastAckCoordinatorBoot = coordinatorBoot;
     lastCoordinatorAckSequence = heartbeatSequence;
     currentCoordinatorIp = remoteIp;
 
@@ -1677,6 +2015,148 @@ static void processNodeAck(
         coordinator->lastCoordinatorInfoMs = now;
         coordinator->lastSeenMs = now;
     }
+}
+
+static String int64Text(int64_t value)
+{
+    char buffer[32];
+    snprintf(buffer, sizeof(buffer), "%lld", (long long)value);
+    return String(buffer);
+}
+
+static int64_t localUnixTimeUs()
+{
+    struct timeval tv = {};
+    if (gettimeofday(&tv, nullptr) != 0 || tv.tv_sec < 1577836800LL)
+        return 0;
+    return (int64_t)tv.tv_sec * 1000000LL + tv.tv_usec;
+}
+
+// All packets pass through existing HMAC verification in processPacket().
+// Only the elected coordinator for this epoch may answer requests.
+static void processTimeRequest(char **f, size_t n, const IPAddress &ip)
+{
+    // SFTQ1|tag|node|node_boot|seq|coordinator|epoch|t1_mono_us
+    if (n != 8 || !localIsCoordinator || currentCoordinatorEpoch == 0 ||
+        strcmp(f[1], runtimeClusterTag) != 0 ||
+        strcmp(f[5], deviceIntegrationId().c_str()) != 0 ||
+        !integrationIdValid(f[2])) return;
+    uint32_t nodeBoot = 0, seq = 0, epoch = 0;
+    int64_t t1 = 0;
+    if (!parseUint32Strict(f[3], nodeBoot, 16) ||
+        !parseUint32Strict(f[4], seq) ||
+        !parseUint32Strict(f[6], epoch) ||
+        !parseInt64Strict(f[7], t1) || epoch != currentCoordinatorEpoch ||
+        t1 <= 0 || seq == 0) return;
+    const ClusterPeer *peer = findPeer(f[2]);
+    if (!peer || peer->bootNonce != nodeBoot || peer->ip != ip ||
+        (uint32_t)(millis() - peer->lastSeenMs) > 60000UL) return;
+    const int64_t t2 = localUnixTimeUs();
+    if (t2 == 0) return; // Never advertise an untrusted/unset wall clock.
+    const int64_t t3 = localUnixTimeUs();
+    char bootText[9];
+    snprintf(bootText, sizeof(bootText), "%08lx", (unsigned long)bootNonce);
+    String payload = String(CLUSTER_TIME_REPLY_MAGIC) + "|" + runtimeClusterTag + "|" +
+        deviceIntegrationId() + "|" + bootText + "|" +
+        String((unsigned long)currentCoordinatorEpoch) + "|" + f[2] + "|" +
+        f[3] + "|" + String((unsigned long)seq) + "|" +
+        int64Text(t1) + "|" + int64Text(t2) + "|" +
+        int64Text(t3);
+    sendSignedPayloadTo(payload, ip, CLUSTER_COORDINATOR_PORT, "cluster time reply");
+}
+
+static void processTimeReply(char **f, size_t n, const IPAddress &ip)
+{
+    // SFTR1|tag|coord|coord_boot|epoch|node|node_boot|seq|t1|t2_utc|t3_utc
+    if (n != 11 || localIsCoordinator || timePendingSeq == 0 ||
+        strcmp(f[1], runtimeClusterTag) != 0 ||
+        strcmp(f[2], currentCoordinatorId) != 0 ||
+        strcmp(f[5], deviceIntegrationId().c_str()) != 0 ||
+        ip != currentCoordinatorIp) return;
+    uint32_t remoteBoot=0, epoch=0, ownBoot=0, seq=0;
+    int64_t t1=0,t2=0,t3=0;
+    if (!parseUint32Strict(f[3], remoteBoot, 16) ||
+        !parseUint32Strict(f[4], epoch) ||
+        !parseUint32Strict(f[6], ownBoot, 16) ||
+        !parseUint32Strict(f[7], seq) ||
+        !parseInt64Strict(f[8], t1) ||
+        !parseInt64Strict(f[9], t2) ||
+        !parseInt64Strict(f[10], t3) ||
+        ownBoot != bootNonce || epoch != currentCoordinatorEpoch ||
+        seq != timePendingSeq || t1 != timePendingMonoUs ||
+        remoteBoot == 0 || t3 < t2 || t2 < 1577836800000000LL) return;
+    const ClusterPeer *peer = findPeer(f[2]);
+    if (!peer || peer->bootNonce != remoteBoot) return;
+    const int64_t t4 = esp_timer_get_time();
+    const int64_t elapsed = t4 - t1;
+    const int64_t serverWork = t3 - t2;
+    const int64_t rtt = elapsed - serverWork;
+    timePendingSeq = 0;
+    if (elapsed <= 0 || rtt < 0 || rtt > CLUSTER_TIME_MAX_RTT_US ||
+        serverWork > 100000LL) { ++timeRejectedSamples; return; }
+    // Symmetric path estimate; approximate network asymmetry by RTT/2.
+    const int64_t localMidpoint = t1 + elapsed / 2;
+    const int64_t referenceMidpoint = t2 + serverWork / 2;
+    timeAnchorUtcUs = referenceMidpoint;
+    timeAnchorMonoUs = localMidpoint;
+    timeLastRttUs = rtt;
+    timeLastSampleMs = millis();
+    timeEstimateValid = true;
+    strncpy(timeAuthorityId, currentCoordinatorId, sizeof(timeAuthorityId)-1);
+    timeAuthorityEpoch = currentCoordinatorEpoch;
+    ++timeAcceptedSamples;
+}
+
+static void requestClusterTime(uint32_t now)
+{
+    if (!runtimeActive || localIsCoordinator || !currentCoordinatorEpoch ||
+        !usableIp(currentCoordinatorIp) ||
+        (timeLastRequestMs && (uint32_t)(now-timeLastRequestMs) <
+            (timeEstimateValid ? CLUSTER_TIME_INTERVAL_MS : CLUSTER_TIME_RETRY_MS)))
+        return;
+    timeLastRequestMs = now;
+    const int64_t t1 = esp_timer_get_time();
+    char bootText[9];
+    snprintf(bootText, sizeof(bootText), "%08lx", (unsigned long)bootNonce);
+    const uint32_t seq = ++timeRequestSeq;
+    String payload = String(CLUSTER_TIME_REQUEST_MAGIC) + "|" + runtimeClusterTag + "|" +
+        deviceIntegrationId() + "|" + bootText + "|" +
+        String((unsigned long)seq) + "|" + currentCoordinatorId + "|" +
+        String((unsigned long)currentCoordinatorEpoch) + "|" + int64Text(t1);
+    timePendingSeq = seq;
+    timePendingMonoUs = t1;
+    if (!sendSignedPayloadTo(payload, currentCoordinatorIp,
+                             CLUSTER_COORDINATOR_PORT, "cluster time request"))
+        timePendingSeq = 0;
+}
+
+// Signed multicast command: only the currently elected coordinator, with the
+// current boot nonce and epoch, may request an immediate time sample.
+// This is an advisory trigger, NOT a remote system-clock change.
+static void processTimeSyncCommand(char **f, size_t n, const IPAddress &ip)
+{
+    // SFTS1|tag|coordinator_id|boot_hex|coordinator_epoch|sequence
+    if (n != 6 || !runtimeActive || localIsCoordinator ||
+        strcmp(f[1], runtimeClusterTag) != 0 ||
+        strcmp(f[2], currentCoordinatorId) != 0 ||
+        ip != currentCoordinatorIp) return;
+    uint32_t senderBoot = 0, epoch = 0, seq = 0;
+    if (!parseUint32Strict(f[3], senderBoot, 16) ||
+        !parseUint32Strict(f[4], epoch) ||
+        !parseUint32Strict(f[5], seq) || senderBoot == 0 || seq == 0 ||
+        epoch == 0 || epoch != currentCoordinatorEpoch) return;
+    const ClusterPeer *peer = findPeer(f[2]);
+    if (!peer || peer->bootNonce != senderBoot || peer->ip != ip ||
+        (uint32_t)(millis() - peer->lastSeenMs) > 60000UL) return;
+    if (timeSyncLastCoordinatorBoot == senderBoot &&
+        seq <= timeSyncLastReceivedSeq) return;
+    timeSyncLastCoordinatorBoot = senderBoot;
+    timeSyncLastReceivedSeq = seq;
+    timeSyncLastCommandMs = millis();
+    ++timeSyncCommandsReceived;
+    // Bypass the regular 15-minute interval. A failed request continues
+    // through the existing bounded 30-second retry path.
+    timeLastRequestMs = 0;
 }
 
 static void processPacket(
@@ -1714,6 +2194,12 @@ static void processPacket(
         processNodeHeartbeat(fields, fieldCount, remoteIp);
     } else if (strcmp(fields[0], CLUSTER_NODE_ACK_MAGIC) == 0) {
         processNodeAck(fields, fieldCount, remoteIp);
+    } else if (strcmp(fields[0], CLUSTER_TIME_REQUEST_MAGIC) == 0) {
+        processTimeRequest(fields, fieldCount, remoteIp);
+    } else if (strcmp(fields[0], CLUSTER_TIME_SYNC_COMMAND_MAGIC) == 0) {
+        processTimeSyncCommand(fields, fieldCount, remoteIp);
+    } else if (strcmp(fields[0], CLUSTER_TIME_REPLY_MAGIC) == 0) {
+        processTimeReply(fields, fieldCount, remoteIp);
     }
 }
 
@@ -1923,8 +2409,11 @@ static void sendCoordinatorHeartbeat()
             CLUSTER_COORDINATOR_PORT,
             "cluster coordinator heartbeat"
         )) {
+        ++diagHbSent;
         if (lastError.startsWith("cluster coordinator heartbeat"))
             lastError = "";
+    } else {
+        ++diagHbSendFailed;
     }
 }
 
@@ -2036,6 +2525,112 @@ size_t clusterAuthenticatedPeerCount()
     return count;
 }
 
+ClusterCredentialCheckResult clusterVerifyDiscoveredCredentials(
+    const String &clusterId,
+    uint32_t credentialEpoch,
+    const String &password,
+    String &error,
+    uint32_t &verifiedEpoch
+)
+{
+    error = "";
+    verifiedEpoch = 0;
+
+    String normalizedId = clusterId;
+    normalizedId.trim();
+    normalizedId.toLowerCase();
+    if (!clusterIdValid(normalizedId) || credentialEpoch == 0 || !password.length()) {
+        error = "Ungültige Cluster-Zugangsdaten";
+        return CLUSTER_CREDENTIAL_INTERNAL_ERROR;
+    }
+
+    const uint32_t now = millis();
+    expireDiscoveryNodes(now);
+    expireDiscoveryProofs(now);
+
+    bool clusterVisible = false;
+    uint32_t discoveredEpoch = 0;
+    bool conflictingEpochVisible = false;
+    for (size_t i = 0; i < CLUSTER_MAX_DISCOVERY_NODES; ++i) {
+        const ClusterDiscoveryNode &node = discoveryNodes[i];
+        if (!node.used ||
+            (uint32_t)(now - node.lastSeenMs) > CLUSTER_DISCOVERY_NODE_TTL_MS ||
+            normalizedId != node.clusterId) {
+            continue;
+        }
+        clusterVisible = true;
+        if (discoveredEpoch == 0)
+            discoveredEpoch = node.credentialEpoch;
+        else if (node.credentialEpoch != discoveredEpoch)
+            conflictingEpochVisible = true;
+    }
+
+    if (!clusterVisible)
+        return CLUSTER_CREDENTIAL_NOT_DISCOVERED;
+
+    // The browser/local credential epoch is not authoritative for a recovery
+    // join. Reject only contradictory epochs advertised by remote nodes.
+    if (conflictingEpochVisible) {
+        error = "Für diese Cluster-ID sind gleichzeitig unterschiedliche Credential-Epochen sichtbar. Join wurde aus Sicherheitsgründen abgelehnt.";
+        return CLUSTER_CREDENTIAL_EPOCH_MISMATCH;
+    }
+
+    uint8_t key[32] = {};
+    char tag[17] = {};
+    if (!deriveClusterKey(normalizedId, password, key, tag)) {
+        secureWipe(key, sizeof(key));
+        error = "Cluster-Passwort konnte nicht geprüft werden";
+        return CLUSTER_CREDENTIAL_INTERNAL_ERROR;
+    }
+
+    bool proofAvailable = false;
+    for (size_t i = 0; i < CLUSTER_MAX_DISCOVERY_NODES; ++i) {
+        const ClusterDiscoveryNode &node = discoveryNodes[i];
+        if (!node.used ||
+            (uint32_t)(now - node.lastSeenMs) > CLUSTER_DISCOVERY_NODE_TTL_MS ||
+            normalizedId != node.clusterId ||
+            node.credentialEpoch != discoveredEpoch) {
+            continue;
+        }
+
+        for (size_t p = 0; p < CLUSTER_DISCOVERY_PROOF_SLOTS; ++p) {
+            const ClusterDiscoveryProof &proof = discoveryProofs[p];
+            if (!proof.used || !(proof.sourceIp == node.sourceIp) ||
+                (uint32_t)(now - proof.lastSeenMs) > CLUSTER_DISCOVERY_PROOF_TTL_MS) {
+                continue;
+            }
+
+            // SFC1 and SFD1 are emitted back-to-back in one heartbeat cycle.
+            // Pair only packets close in time so a stale Presence from a node
+            // that just changed Cluster credentials cannot be mistaken for a
+            // current wrong-password proof.
+            const uint32_t pairSkewMs =
+                proof.lastSeenMs >= node.lastSeenMs
+                ? proof.lastSeenMs - node.lastSeenMs
+                : node.lastSeenMs - proof.lastSeenMs;
+            if (pairSkewMs > CLUSTER_DISCOVERY_PROOF_PAIR_WINDOW_MS)
+                continue;
+
+            proofAvailable = true;
+            if (discoveryProofMatchesCredentials(proof, node, key, tag)) {
+                secureWipe(key, sizeof(key));
+                verifiedEpoch = discoveredEpoch;
+                return CLUSTER_CREDENTIAL_VERIFIED;
+            }
+        }
+    }
+
+    secureWipe(key, sizeof(key));
+
+    if (proofAvailable) {
+        error = "Cluster-Passwort ist falsch. Einstellungen wurden nicht gespeichert.";
+        return CLUSTER_CREDENTIAL_INVALID_PASSWORD;
+    }
+
+    error = "Cluster erkannt, aber noch kein signiertes Presence-Paket zur Passwortprüfung empfangen. Seite einige Sekunden geöffnet lassen und erneut speichern.";
+    return CLUSTER_CREDENTIAL_PROOF_PENDING;
+}
+
 void clusterNetworkStart()
 {
     clusterNetworkStop();
@@ -2117,11 +2712,18 @@ void clusterNetworkStart()
     bootNonce = esp_random();
     if (bootNonce == 0)
         bootNonce = 1;
+    diagHbSent = diagHbSendFailed = 0;
+    diagAckSendAttempted = diagAckSendFailed = 0;
+    diagAckAuthenticated = diagAckAccepted = diagAckRejected = 0;
+    diagAckLastReject = "none";
+    memset(diagElectionTrace, 0, sizeof(diagElectionTrace));
+    diagElectionTraceNext = diagElectionTraceUsed = 0;
     sequenceNumber = 0;
     nextHeartbeatMs = 0;
     nextCoordinatorHeartbeatMs = 0;
     directHeartbeatSequence = 0;
     lastCoordinatorAckMs = 0;
+    lastAckCoordinatorBoot = 0;
     lastCoordinatorAckSequence = 0;
     localIsCoordinator = false;
     localCoordinatorEpoch = 0;
@@ -2166,6 +2768,7 @@ void clusterNetworkStop()
     nextCoordinatorHeartbeatMs = 0;
     directHeartbeatSequence = 0;
     lastCoordinatorAckMs = 0;
+    lastAckCoordinatorBoot = 0;
     lastCoordinatorAckSequence = 0;
     localWifiRemainingSeconds = -1;
     sequenceNumber = 0;
@@ -2184,11 +2787,17 @@ void clusterNetworkStop()
     clearPeers();
     clearResources();
     clearDiscoveryNodes();
+    clearDiscoveryProofs();
 
     if (runtimeHmacKey != 0) {
         psa_destroy_key(runtimeHmacKey);
         runtimeHmacKey = 0;
     }
+    resetClusterTimeEstimate();
+    timeSyncCommandSeq = 0;
+    timeSyncLastCommandMs = 0;
+    timeSyncCommandsReceived = 0;
+    timeSyncCommandsSent = 0;
 }
 
 void clusterMdnsAdvertise()
@@ -2288,17 +2897,17 @@ void clusterLoop()
         }
     }
 
-    if (discoveryScanLeaseUntilMs != 0)
+    if (discoveryScanLeaseUntilMs != 0) {
         expireDiscoveryNodes(now);
+        expireDiscoveryProofs(now);
+    }
 
     if (!runtimeActive && !discoverySocketActive)
         return;
 
-    if (runtimeActive) {
-        expirePeers(now);
-        expireResources(now);
-    }
-
+    // Process any already queued authenticated Presence/ACK traffic BEFORE
+    // expiring a peer. Otherwise a delayed loop can discard a live Coordinator
+    // just before consuming its waiting ACK, causing avoidable role churn.
     int processed = 0;
     while (processed < 4) {
         int packetSize = clusterUdp.parsePacket();
@@ -2315,6 +2924,20 @@ void clusterLoop()
         int readLength = clusterUdp.read(packet, (size_t)packetSize);
         if (readLength > 0) {
             const IPAddress remoteIp = clusterUdp.remoteIP();
+
+            // While the Cluster page is actively scanning, retain one recent
+            // signed Presence packet per sender as a RAM-only credential proof.
+            // Passive scanners still never transmit or join a cluster here.
+            if (discoveryScanWanted(now) && readLength >= 5 &&
+                memcmp(packet, "SFC1|", 5) == 0) {
+                rememberDiscoveryPresenceProof(
+                    packet,
+                    (size_t)readLength,
+                    remoteIp,
+                    now
+                );
+            }
+
             if (readLength >= 5 &&
                 memcmp(packet, "SFD1|", 5) == 0) {
                 processDiscoveryDatagram(
@@ -2362,9 +2985,14 @@ void clusterLoop()
         ++directProcessed;
     }
 
-    // Election is based only on currently leased authenticated nodes. A single
-    // missed multicast packet therefore cannot change the Coordinator.
-    recomputeCoordinator(now);
+    // Packet handlers have now refreshed authenticated liveness. Expire only
+    // after draining the bounded receive queues, using a fresh timestamp.
+    // This retains the 60-second lease on actual silence and does not let
+    // discovery-only packets or unauthenticated traffic renew membership.
+    const uint32_t electionNow = millis();
+    expirePeers(electionNow);
+    expireResources(electionNow);
+    recomputeCoordinator(electionNow);
 
     if (nextHeartbeatMs == 0 || (int32_t)(now - nextHeartbeatMs) >= 0) {
         sendHeartbeat();
@@ -2383,6 +3011,47 @@ void clusterLoop()
         sendCoordinatorHeartbeat();
         nextCoordinatorHeartbeatMs = now + CLUSTER_COORDINATOR_HEARTBEAT_MS;
     }
+    requestClusterTime(millis());
+
+}
+
+bool clusterLocalIsCoordinator()
+{
+    return runtimeActive && localIsCoordinator &&
+           currentCoordinatorEpoch != 0 &&
+           strcmp(currentCoordinatorId, deviceIntegrationId().c_str()) == 0;
+}
+
+bool clusterRequestTimeSync(String &error)
+{
+    if (!clusterLocalIsCoordinator()) {
+        error = "Dieses Gerät ist nicht der aktive Coordinator.";
+        return false;
+    }
+    if (!localUnixTimeUs()) {
+        error = "Coordinator hat noch keine gültige Systemzeit.";
+        return false;
+    }
+    // Limit interactive command rate. This affects only manual sync commands.
+    const uint32_t now = millis();
+    if (timeSyncLastCommandMs && (uint32_t)(now - timeSyncLastCommandMs) < 10000UL) {
+        error = "Zeit-Sync wurde gerade erst angefordert.";
+        return false;
+    }
+    char bootText[9];
+    snprintf(bootText, sizeof(bootText), "%08lx", (unsigned long)bootNonce);
+    const uint32_t seq = ++timeSyncCommandSeq;
+    const String payload = String(CLUSTER_TIME_SYNC_COMMAND_MAGIC) + "|" +
+        runtimeClusterTag + "|" + deviceIntegrationId() + "|" + bootText +
+        "|" + String((unsigned long)currentCoordinatorEpoch) + "|" +
+        String((unsigned long)seq);
+    if (!sendSignedPayload(payload, "manual cluster time sync")) {
+        error = String(lastError);
+        return false;
+    }
+    timeSyncLastCommandMs = now;
+    ++timeSyncCommandsSent;
+    return true;
 }
 
 bool clusterRuntimeActive()
@@ -2551,6 +3220,7 @@ bool clusterAnnounceResource(
 String clusterStatusJson()
 {
     const uint32_t nowMs = millis();
+    // Read-only snapshot: election and ACK ownership belong to clusterLoop().
     const bool localTimeValid = timeIsValid();
     const int64_t localEpoch = localTimeValid ? (int64_t)time(nullptr) : 0;
     const bool localRecording = recorderIsOpen();
@@ -2590,6 +3260,55 @@ String clusterStatusJson()
         String((unsigned long)CLUSTER_COORDINATOR_LEASE_SEC);
     json += ",\"coordinator_port\":" +
         String((unsigned long)CLUSTER_COORDINATOR_PORT);
+    int64_t clusterUtc = 0;
+    const bool clusterClockValid = clusterTimeNowUs(clusterUtc);
+    json += ",\"cluster_time\":{";
+    json += "\"valid\":";
+    json += clusterClockValid ? "true" : "false";
+    json += ",\"source\":\"";
+    json += localIsCoordinator ? "local_coordinator" : "wifi_coordinator";
+    json += "\"";
+    json += ",\"utc_us\":" + int64Text(clusterClockValid ? clusterUtc : 0);
+    // Offset is relative to the device's own wall clock, not independent
+    // proof of absolute correctness. The uncertainty is heuristic, NOT a bound.
+    const int64_t localWallUs = localUnixTimeUs();
+    json += ",\"local_offset_available\":";
+    json += (clusterClockValid && localWallUs != 0) ? "true" : "false";
+    json += ",\"local_offset_us\":" + int64Text(
+        (clusterClockValid && localWallUs != 0) ? (clusterUtc - localWallUs) : 0);
+    const uint32_t sampleAgeMs = timeEstimateValid ? (uint32_t)(nowMs - timeLastSampleMs) : 0;
+    const int64_t estimatedUncertaintyUs = timeEstimateValid ?
+        (timeLastRttUs / 2 + (int64_t)sampleAgeMs * 50LL / 1000LL) : 0;
+    json += ",\"uncertainty_estimate_us\":" + int64Text(estimatedUncertaintyUs);
+    json += ",\"sync_interval_sec\":900";
+    json += ",\"manual_sync_sent\":" + String((unsigned long)timeSyncCommandsSent);
+    json += ",\"manual_sync_received\":" + String((unsigned long)timeSyncCommandsReceived);
+    json += ",\"last_rtt_us\":" + int64Text(timeLastRttUs);
+    json += ",\"sample_age_ms\":" + String(timeEstimateValid ? (unsigned long)(nowMs-timeLastSampleMs) : 0UL);
+    json += ",\"accepted\":" + String((unsigned long)timeAcceptedSamples);
+    json += ",\"rejected\":" + String((unsigned long)timeRejectedSamples);
+    json += "}";
+    json += ",\"ack_diagnostics\":{";
+    json += "\"hb_sent\":" + String((unsigned long)diagHbSent);
+    json += ",\"hb_send_failed\":" + String((unsigned long)diagHbSendFailed);
+    json += ",\"ack_send_attempted\":" + String((unsigned long)diagAckSendAttempted);
+    json += ",\"ack_send_failed\":" + String((unsigned long)diagAckSendFailed);
+    json += ",\"ack_authenticated\":" + String((unsigned long)diagAckAuthenticated);
+    json += ",\"ack_accepted\":" + String((unsigned long)diagAckAccepted);
+    json += ",\"ack_rejected\":" + String((unsigned long)diagAckRejected);
+    json += ",\"coordinator_changes\":" + String((unsigned long)diagCoordinatorChanges);
+    json += ",\"coordinator_epoch_changes\":" + String((unsigned long)diagCoordinatorEpochChanges);
+    json += ",\"ack_context_resets\":" + String((unsigned long)diagAckContextResets);
+    json += ",\"incomplete_coord_announcements\":" + String((unsigned long)diagIncompleteCoordinatorAnnouncements);
+    json += ",\"last_reject\":\"" + String(diagAckLastReject) + "\"}";
+    json += ",\"election_trace\":[";
+    for (uint8_t i = 0; i < diagElectionTraceUsed; ++i) {
+        if (i) json += ',';
+        const uint8_t slot = (diagElectionTraceNext + CLUSTER_ELECTION_TRACE_COUNT -
+                              diagElectionTraceUsed + i) % CLUSTER_ELECTION_TRACE_COUNT;
+        json += "\"" + jsonEscape(String(diagElectionTrace[slot])) + "\"";
+    }
+    json += ']';
     json += ",\"coordinator_ack_age_ms\":";
     if (!localIsCoordinator && lastCoordinatorAckMs != 0)
         json += String((unsigned long)(nowMs - lastCoordinatorAckMs));
@@ -2802,3 +3521,19 @@ String clusterStatusJson()
     return json;
 }
 
+
+// Monotonic, independently synchronized cluster UTC (not the system RTC).
+// Never use this as trusted licensing time or claim microsecond accuracy.
+bool clusterTimeNowUs(int64_t &utcUs)
+{
+    if (!runtimeActive) return false;
+    if (localIsCoordinator) {
+        utcUs = localUnixTimeUs();
+        return utcUs != 0;
+    }
+    if (!timeEstimateValid || timeAuthorityEpoch != currentCoordinatorEpoch ||
+        strcmp(timeAuthorityId, currentCoordinatorId) != 0 ||
+        (uint32_t)(millis() - timeLastSampleMs) > CLUSTER_TIME_HOLDOVER_MS) return false;
+    utcUs = timeAnchorUtcUs + (esp_timer_get_time() - timeAnchorMonoUs);
+    return true;
+}

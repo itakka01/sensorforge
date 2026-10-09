@@ -3,7 +3,7 @@
 SensorForge is an ESP32-S3 camera/sensor firmware for autonomous event recording
 and optional local network streaming.
 
-**Current development worktree:** `v87-beta49` (2026-10-08)  
+**Current development worktree:** `v87-beta50` (2026-10-08)  
 **Last stable official release:** `v86` (2026-10-01)  
 **Core branding version:** `7.1.0`  
 **Local API:** `1.22` / Integration profile `1.1`
@@ -52,7 +52,9 @@ architecturally prepared but has no qualified runtime backend in the current
 reference build.
 
 
-## Current Cluster activation/discovery fix
+## Current Cluster join validation
+
+`v87-beta50` validates credentials before joining a Cluster that is currently visible in passive discovery. While `/cluster` is open, SensorForge keeps a small RAM-only copy of recent signed `SFC1` Presence traffic. On Save, the candidate password is used locally to verify that HMAC. A wrong password therefore produces an immediate error, does not alter persistent configuration and does not reboot the device. No password, candidate key or new challenge packet is transmitted. If only the public `SFD1` announcement has arrived but no signed Presence proof is cached yet, Save is blocked until signed traffic arrives. Manual creation of a new/offline Cluster remains allowed.
 
 `v87-beta49` is a compile-only follow-up to Beta 48: `webconfig.cpp` now includes `cluster.h` so the Cluster restart page can resolve `clusterEffectiveId()`. Runtime behavior is unchanged.
 

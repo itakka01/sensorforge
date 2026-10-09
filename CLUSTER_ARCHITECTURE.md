@@ -1,6 +1,6 @@
 # SensorForge Cluster Architecture
 
-**Authoritative cluster foundation:** `v87-beta48`  
+**Authoritative cluster foundation:** `v87-beta50`  
 **Date:** 2026-10-08  
 **Status:** foundation frozen for now; next functional stage is time synchronization + scheduled multi-camera capture.
 
@@ -8,7 +8,7 @@ This document is the detailed re-entry reference for the SensorForge local devic
 
 ## 1. Scope and freeze point
 
-The current cluster layer provides discovery, authenticated peer membership, liveness, automatic Coordinator selection, passive cluster discovery for configuration, encrypted remembered credentials, and generic resource announcements. Beta 48 keeps the Beta-38+ wire model but fixes first-use Known-Cluster profile lookup and makes a saved Cluster configuration enter runtime deterministically through a controlled reboot.
+The current cluster layer provides discovery, authenticated peer membership, liveness, automatic Coordinator selection, passive cluster discovery for configuration, encrypted remembered credentials, pre-save credential validation for visible Clusters, and generic resource announcements. Beta 50 keeps the Beta-38+ wire model and validates a join password locally against recent HMAC-signed `SFC1` Presence traffic before persistent membership is changed.
 
 The following are deliberately **not implemented yet**:
 
@@ -104,7 +104,7 @@ Current configuration fields:
 - `cluster_password=<shared secret>`
 - `cluster_coordinator_policy=auto|preferred|node` — default `auto`
 
-Cluster settings are saved through the normal config system. A saved change may require the next normal WiFi/device restart before the runtime is using the new credentials/role policy; the Cluster page does not force an immediate reboot.
+Cluster settings are saved through the normal config system. A successful Cluster save schedules a controlled reboot so the new membership/credentials/policy enter runtime through a fresh `clusterNetworkStart()`. For a currently visible existing Cluster, Beta 50 performs credential validation before this persistent save and reboot are allowed.
 
 ## 5. Network topology and ports
 
@@ -182,6 +182,8 @@ Properties:
 
 The UI can therefore offer a drop-down of visible Cluster IDs/names without making the device a cluster member.
 
+While this page-scoped scanner is active, Beta 50 also retains a very small RAM-only cache of recent signed `SFC1` Presence datagrams from visible senders. These cached packets are not treated as authenticated membership. They exist only so a candidate password can be checked locally before a join is persisted. They expire with the discovery window and are cleared when Cluster networking stops.
+
 ## 8. Public discovery versus authenticated membership
 
 A critical distinction:
@@ -200,7 +202,7 @@ Unauthenticated and intentionally public. Current payload concept:
 
 It contains no password and does not grant membership.
 
-A malicious LAN participant could advertise a fake `SFD1` entry. Therefore `SFD1` is only a user-interface/discovery hint. Election, membership, liveness and future control must use authenticated data.
+A malicious LAN participant could advertise a fake `SFD1` entry. Therefore `SFD1` is only a user-interface/discovery hint. Election, membership, liveness and future control must use authenticated data. Beta 50 additionally refuses to persist a join to a currently visible Cluster until the candidate password validates an actual signed `SFC1` Presence packet from a sender that advertised that Cluster ID/credential epoch.
 
 ### Authenticated traffic
 
@@ -321,7 +323,7 @@ Stored public metadata includes:
 
 The password itself is stored only as board-bound SFSEC1 ciphertext in NVS and is never exposed to the browser/status JSON.
 
-If a previously known Cluster is selected again and the visible/expected credential epoch still matches, firmware may reuse the remembered password internally without the user retyping it.
+If a previously known Cluster is selected again and the visible/expected credential epoch still matches, firmware may reuse the remembered password internally without the user retyping it. When that Cluster is currently visible, the reused password is subject to the same Beta-50 signed-Presence validation before the join is saved.
 
 If the epoch differs, the cached password is considered stale and automatic reuse is blocked. The user must provide the new password once; a later successful join can refresh the known-cluster cache.
 
@@ -348,7 +350,7 @@ Cluster ID and password are independent.
 
 A local password replacement for the same Cluster ID is blocked while authenticated remote peers are currently attached. This prevents one user action on one device from silently splitting a healthy cluster.
 
-An isolated/recovery device with no authenticated peers may be locally re-credentialed; credential epoch advances as needed.
+An isolated/recovery device with no authenticated peers may be locally re-credentialed. If the same Cluster ID is currently visible and the replacement password successfully validates its signed Presence traffic, the remotely advertised credential epoch is retained. Only a truly local/offline replacement without a visible authenticated proof advances the local credential epoch as needed.
 
 ### Future proper cluster-wide rotation
 
