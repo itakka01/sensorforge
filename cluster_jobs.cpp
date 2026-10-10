@@ -61,6 +61,22 @@ bool transition(uint64_t id, uint32_t epoch, State next, uint32_t now, uint16_t 
     }
     return false;
 }
+bool setCaptureMedia(uint64_t id,uint32_t epoch,const char *uuid,int64_t dispatch,uint32_t bytes){
+    if(!uuid||strlen(uuid)!=36||dispatch<=0||!bytes)return false;
+    for(size_t i=0;i<36;i++){
+        const char c=uuid[i];
+        if(i==8||i==13||i==18||i==23){if(c!='-')return false;}
+        else if(!((c>='0'&&c<='9')||(c>='a'&&c<='f')))return false;
+    }
+    for(size_t i=0;i<count;i++){
+        Entry &e=entries[i];
+        if(e.jobId==id&&e.coordinatorEpoch==epoch&&e.kind==Kind::Capture){
+            memcpy(e.mediaUuid,uuid,37);e.dispatchUtcUs=dispatch;e.mediaBytes=bytes;
+            return true;
+        }
+    }
+    return false;
+}
 void expire(uint32_t now) {
     for (size_t i = 0; i < count; ++i) {
         Entry &e = entries[i];

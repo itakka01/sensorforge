@@ -2,6 +2,7 @@
 #include "web_log_reader.h"
 #include "web_sd_maintenance.h"
 #include "config.h"
+#include "drone_mode.h"
 #include "audio_capture.h"
 #include "audio_wav.h"
 #include "recording_load_test.h"
@@ -12,6 +13,7 @@
 #include <LittleFS.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include "cluster_capture.h"
 #include <esp_camera.h>
 #include <esp_system.h>
 #include <esp_heap_caps.h>
@@ -1214,6 +1216,13 @@ static String htmlHeader()
         ".module-meta{margin-left:auto;display:flex;flex-direction:column;align-items:flex-end;"
         "justify-content:center;gap:3px;padding:4px 0 4px 10px;}"
         ".module-actions{display:flex;align-items:center;justify-content:flex-end;gap:5px;}"
+        ".mode-header-pill{display:inline-flex;flex-direction:column;align-items:flex-start;white-space:nowrap;"
+        "padding:4px 10px;border-radius:10px;background:#e8edf3;color:#344054;"
+        "line-height:1.15;gap:2px;}"
+        ".mode-header-label{font-size:.53rem;font-weight:700;letter-spacing:.06em;opacity:.78;}"
+        ".mode-header-value{font-size:.72rem;font-weight:800;}"
+        ".mode-header-pill.drone{background:#dbeafe;color:#1e40af;}"
+        ".mode-header-pill.streamer{background:#fef3c7;color:#92400e;}"
         ".language-switch{margin:0;padding:0;}"
         ".language-switch select{width:auto;min-width:58px;margin:0;padding:3px 6px;border:0;"
         "border-radius:999px;background:#fff;color:#1f2933;font-size:.72rem;font-weight:800;cursor:pointer;}"
@@ -1557,6 +1566,11 @@ static String htmlHeader()
         String(cfg_web_language == "en" ? " selected" : "") +
         ">EN</option></select></form>";
 
+    // Passive display: use the same live status as the rest of the header.
+    html += "<span id='operatingModeHeader' class='mode-header-pill' "
+            "title='Aktueller Betriebsmodus'><span class='mode-header-label'>BETRIEBSMODUS</span>"
+            "<span id='operatingModeValue' class='mode-header-value'>…</span></span>";
+
     if (!streamerModeEnabled()) {
     html +=
         "<button id='recordingPauseGlobal' class='module-recording-switch " +
@@ -1641,6 +1655,8 @@ static String htmlHeader()
         "(function(){"
         "var el=document.getElementById('moduleClock');"
         "var pauseEl=document.getElementById('recordingPauseGlobal');"
+        "var modeEl=document.getElementById('operatingModeHeader');"
+        "var modeValueEl=document.getElementById('operatingModeValue');"
         "if(!el)return;"
         "var baseMs=0,syncMs=0,pauseActive=false,cpuText='',rtcText='',loadText='',thermalState='OK';"
         "function pad(v){return String(v).padStart(2,'0');}"
@@ -1658,6 +1674,11 @@ static String htmlHeader()
         "credentials:'same-origin',keepalive:true}).catch(function(){});"
         "}"
         "function apply(s){"
+        "if(modeEl&&s&&typeof s.operating_mode==='string'){"
+        "var labels={drone:'Drone / Bereitschaft',off:'Aus',recording:'Recording',"
+        "powershooter:'Power Shooter',combined:'Recording + Power Shooter',streamer:'Netzwerk-Streamer'};"
+        "if(modeValueEl)modeValueEl.textContent=labels[s.operating_mode]||s.operating_mode;"
+        "modeEl.className='mode-header-pill'+(s.operating_mode==='drone'?' drone':(s.operating_mode==='streamer'?' streamer':''));}"
         "pauseActive=!!(s&&s.recording_paused);"
         "if(pauseEl){pauseEl.textContent=pauseActive?pauseEl.dataset.off:pauseEl.dataset.on;"
         "pauseEl.classList.toggle('off',pauseActive);pauseEl.classList.toggle('on',!pauseActive);"
@@ -1700,7 +1721,7 @@ static String htmlHeader()
         "});"
         "sync();"
         "setInterval(render,1000);"
-        "setInterval(sync,20000);"
+        "setInterval(sync,5000);"
         "setInterval(renewPauseLease,20000);"
         "document.addEventListener('visibilitychange',function(){if(!document.hidden)sync();});"
         "window.addEventListener('focus',sync);"
@@ -1876,8 +1897,16 @@ static void handleUiStatus()
     LicenseUsageSnapshot usage =
         licenseUsageSnapshot();
 
+    const char* operatingMode =
+        droneModeEnabled() ? "drone" :
+        streamerModeEnabled() ? "streamer" :
+        (cfg_motion_recording_enabled && cfg_shooter_enabled) ? "combined" :
+        cfg_motion_recording_enabled ? "recording" :
+        cfg_shooter_enabled ? "powershooter" : "off";
+
     String json =
-        String("{\"recording\":") +
+        String("{\"operating_mode\":\"") + operatingMode + "\"," +
+        "\"recording\":" +
         (recording ? "true" : "false") +
         ",\"recording_paused\":" +
         (recordingAutomationPaused ? "true" : "false") +
@@ -5090,7 +5119,13 @@ static void handleSave()
     int shooterEnabled =
         cfg_shooter_enabled;
 
-    if (operatingModeSelection == "streamer") {
+    const bool requestedDroneMode = hasOperatingModeUi && operatingModeSelection == "drone";
+
+    if (requestedDroneMode) {
+        // Drone is an exclusive UI choice, but the saved normal Recording/Shooter
+        // preferences remain intact for the next regular-mode selection.
+        operatingMode = "normal";
+    } else if (operatingModeSelection == "streamer") {
         // Streamer ownership is reboot-only. Preserve the user's normal-mode
         // recording/shooter choices so they return unchanged when switching
         // back from streamer mode later.
@@ -6112,6 +6147,11 @@ static void handleSave()
             );
             tzset();
 
+            if (hasOperatingModeUi && !droneModeSet(requestedDroneMode)) {
+                server.send(500, "text/plain; charset=utf-8", "Drone-Betriebsmodus konnte nicht im NVS gespeichert werden");
+                return;
+            }
+
             if (streamerRebootRequired) {
                 // Mode/stream transport ownership changes are reboot-only. The
                 // configuration has already been persisted at this point, so
@@ -6287,6 +6327,11 @@ static void handleSave()
                 1
             );
             tzset();
+
+            if (hasOperatingModeUi && !droneModeSet(requestedDroneMode)) {
+                server.send(500, "text/plain; charset=utf-8", "Drone-Betriebsmodus konnte nicht im NVS gespeichert werden");
+                return;
+            }
 
             if (streamerRebootRequired) {
                 // Mode/stream transport ownership changes are reboot-only. The
@@ -18847,6 +18892,22 @@ void webConfigStart()
             );
         });
 
+        server.on("/capture_media", HTTP_GET, [](){
+            // A UUID is an identifier, not authorization. Respect existing WebConfig login.
+            // Restrict to administrator even if media viewer accounts are configured.
+            if(cfg_web_auth_enabled && accessControlWebRole(server)!=SENSORFORGE_ACCESS_ADMIN){
+                server.send(403,"text/plain","Administrator access required");return;
+            }
+            const uint8_t *data=nullptr;size_t length=0;
+            if(!server.hasArg("uuid")||!clusterCaptureGetJpeg(server.arg("uuid"),data,length)){
+                server.send(404,"text/plain","Photo not available (expired, unknown or rebooted)");return;
+            }
+            server.sendHeader("Cache-Control","no-store");
+            server.sendHeader("Content-Disposition", "attachment; filename=\"" + server.arg("uuid") + ".jpg\"");
+            server.setContentLength(length);
+            server.send(200,"image/jpeg","");
+            server.client().write(data,length);
+        });
         server.on("/ui_status", HTTP_GET, handleUiStatus);
         server.on("/motion_status", HTTP_GET, handleMotionStatus);
         server.on("/language", HTTP_POST, handleLanguageChange);

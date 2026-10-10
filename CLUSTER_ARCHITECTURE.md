@@ -1,3 +1,30 @@
+## v87-beta103 – Download-Header-Korrektur
+
+Der `/capture_media`-Endpunkt verwendet für `Content-Disposition` einen gültig quotierten Dateinamen der Form `attachment; filename="<uuid>.jpg"`. Die Authentifizierung und die Media-Store-Logik sind unverändert.
+
+## Beta 101 – Capture-Abschlussbericht
+
+Die Coordinator-Webseite stellt pro gestarteter ausgewählter Node-Menge eine Tabelle dar und ordnet signierte Job-Zustände aus `job_probes` anhand `node`, `job_boot`, `job_seq` zu. Neue Aufträge werden von bereits vorhandenen Capture-Jobs abgegrenzt; die Zustände werden mit der existierenden gemeinsamen Status-Abfrage periodisch aktualisiert. HTTP-Annahme ist kein Capture-Erfolg. `Succeeded` steht ausschließlich für die vom Node bestätigte erfolgreiche JPEG-Erzeugung im lokalen PSRAM, nicht für präzisen Beginn der Belichtung oder dauerhafte Speicherung. Der Bericht ist flüchtige Browser-UI; die bounded Coordinator-Job-Tabelle begrenzt die rückwirkende Zuordnung.
+
+## v87-beta100 — Header-Anzeige
+
+Das Header-Badge zeigt nun eine feste Kennzeichnung „BETRIEBSMODUS“ über dem dynamischen Moduswert. Der Wert wird weiterhin aus `operating_mode` in `/ui_status` aktualisiert; Modusumschaltung, Transport und Recording bleiben unverändert.
+
+### v87-beta99 – Compile-Korrektur
+
+Eine alleinstehende `"`-Zeile im C++-generierten Header-JavaScript aus Beta 98 wurde entfernt. Keine Änderung der Protokolle oder Zustandsautomaten.
+
+### v87-beta98 – Lokale Betriebsmodus-Anzeige
+
+Die Header-Pille direkt nach der Sprachauswahl liest `operating_mode` aus `/ui_status` im lokalen Browser-Polling (5 s). Die Bedeutung folgt dem aktuellen NVS-Drone-Override, dann Netzwerk-Streamer, dann Recording/Power-Shooter-Konfiguration. Sie stellt keinen neuen Cluster-Modus oder entfernten Status-Endpunkt dar. Bei Wechseln durch signierte Drone-Jobs zeigt der betroffene Node seine aktuelle Einstellung beim nächsten erfolgreichen Poll. Beim Poll-Fehler bleibt der bisherige Wert stehen; das ist keine Bestätigung frischer Daten.
+
+## v87-beta94 – Capture-Eingabe und UTC-Countdown (2026-10-10)
+- Standard: Foto in 10 Sekunden, frei einstellbare ganzzahlige Sekunden und Minuten; optionaler expliziter UTC-Termin hat Vorrang. Bestehende Capture-Zielgrenze 5–120 s bleibt unverändert.
+- Eine einheitliche Hilfsfunktion berechnet den absoluten UTC-Zielzeitpunkt, unabhängig von der Eingabe. Spätere Action-Typen (GPIO, Sequenz, Video) sollen denselben UTC-Planungspfad nutzen; noch nicht implementiert.
+- Countdown auf Coordinator im Browser: pulsierender roter Punkt bis zur Soll-Zeit; grünes Pulsieren für ca. 2,8 s danach. Anzeige beweist weder Paket-ACK noch tatsächliche Sensorbelichtung.
+- Browser-Countdown nutzt monotone Performance-Zeit, um lokale Uhrsprünge während des Countdowns zu vermeiden. Planung selbst basiert auf Browser-Wanduhr; Abweichung zur Cluster-UTC muss für präzise Capture-Termine später berücksichtigt bzw. serverseitig berechnet werden.
+- Keine Änderung am Capture-UDP-Protokoll, der Node-Zeitbasis oder am Kamera-Owner. Arduino-Compile und Hardwaretest offen.
+
 ## v87-beta92 — SD health refresh and consolidated coordinator controls (2026-10-09)
 
 - On completion of the remote full SD wipe (success or failure), invalidate the node's cached SD usage and immediately emit a signed cluster heartbeat/health sample. If filesystem usage cannot be read, report unknown rather than stale pre-wipe usage. The ordinary at-most-once-per-minute filesystem usage policy remains in place for normal operation.
@@ -786,3 +813,30 @@ Vor produktiver SD-Löschung muss ein dedizierter Node-lokaler Executor alle Auf
 - Kein Retransmit. Ein nicht bestätigter Wipe muss vor jeglichem erneuten Versuch lokal geprüft werden. Der Auftrag ist RAM-only; verlorene Abschlussberichte werden nicht nachgeliefert.
 - SD-Wipe löscht gewöhnliche Dateien, **keine** garantiert forensische physische Medienvernichtung.
 - Bei Wipe-Dauer über 120 s, Netzwerkverlust oder Änderung der Peer-Lease kann der Coordinator ein nicht eindeutig bestätigtes Ergebnis zeigen, selbst wenn die SD bereits gelöscht wurde.
+
+## Beta 93 preliminary capture contract
+`SFJC1` authenticated command: cluster tag, coordinator ID/boot/epoch, target ID/boot, sequence, UTC microseconds. One shared UTC timestamp must be submitted by Coordinator for the full selection. Local cluster time estimate is the single timebase, whatever its discipline method.
+`SFJCR1` signed status: accepted(1), JPEG stored(2), refused/failed(3), error, bytes. JPEG stays in a volatile 3-slot PSRAM ring. Slots are overwritten cyclically and do not survive power loss. Transfer is intentionally not yet implemented.
+This is a first functional lab prototype: it schedules the driver call from the main loop. **No exposure-start measurement and no guaranteed jitter.** Streaming, ongoing recording and Sync API exclusive use are rejected rather than preempted. A later camera-owner integration and precise scheduler is necessary before multiview production capture.
+
+Beta93 main-loop prearm: initialize/wake camera approximately 2 s before target, then prioritize capture in cooperative firmware loop. Timing remains unverified; frame delivery may not equal exposure start.
+
+## v87-beta95: Drone readiness
+`drone_mode.h/.cpp` owns one NVS boolean (`sf_drone/enabled`) independent of `operating_mode` and shooter configuration. `tryEnterConfiguredSleep()` returns early when Drone Mode is active. The explicit thermal shutdown and SD-fault protection code remains separate.
+Coordinator sends signed `SFJD1` targeted unicast including coordinator boot/epoch, node boot, sequence, desired value. Node verifies active authenticated coordinator, lease, target identity and anti-replay sequence, persists the bit, and returns signed `SFJDA1` with actual value and error code. Coordinator validates the reply against peer boot/IP and pending job before recording terminal state. No automatic resend.
+Capture still uses a single UTC timebase. Drone Mode does not itself reserve exclusive camera ownership or guarantee exposure timing; sensor prewarm and safe streamer/recorder preemption are future work.
+
+## v87-beta96: Passive Drone standby semantics
+
+The persistent Drone flag is tested directly after `clusterLoop()` and the armed-capture early return in `sensorforge.ino::loop()`. If active, an ongoing recording is closed through `stopRecording()` once; the loop then services thermal safety, WebConfig and nonblocking WireGuard before returning. This avoids normal autonomous radar/PIR/motion, Power Shooter, background SD retry and recording start decision paths. The signed scheduled UTC capture remains in clusterLoop, and normal modes resume automatically when the flag is cleared. Drone is a policy overlay, not a new timebase or camera owner.
+
+Important limits: shutdown/reboot/web maintenance and explicitly requested operations still work; WebConfig may itself carry out explicit SD operations. Boot-time SD setup is not altered. A camera that is held by an explicit streaming/preview request is not forcibly preempted; scheduled shots can still be rejected by camera-owner checks. Thermal emergencies have priority over readiness.
+
+
+### v87-beta97: einheitliche Drone-Moduswahl
+
+Drone ist nun im regulären Konfigurationsformular unter Betriebsmodus auswählbar. `droneModeSet()` ist die persistente gemeinsame Zustandsquelle für lokalen UI-Speicherpfad und authentifizierten Coordinator-Auftrag. Die früher separate lokale Cluster-Checkbox wird nicht mehr gerendert (der alte HTTP-Endpunkt bleibt für Kompatibilität bestehen). Autonome Aufnahme- und Sensorroutinen werden wie in beta96 durch die bestehende Drone-Gate-Logik pausiert. Recording-/Shooter-Präferenzen werden bei Auswahl von Drone nicht überschrieben. Der Wechsel zum normalen Betriebsmodus deaktiviert den Drone-Zustand. Ein Wechsel von Streamer zu normalem Kamera-Owner erfolgt weiterhin über den bestehenden verzögerten Reboot.
+
+
+### Beta 102: RAM-Medienauslieferung
+Capture-Jobs bleiben an die einzige UTC-Zeitbasis gekoppelt. Der Node leert bei akzeptiertem Auftrag den vorhandenen PSRAM-Ring; der Ring überschreibt innerhalb des Auftrags niemals Bilder. Ein späterer Sequenzexecutor muss vor jedem Bild die freie Slot- und Bytekapazität prüfen und bei Erschöpfung die restlichen Bilder auslassen. HTTP JPEG-GET wird auf demselben Node bedient, durch den bestehenden Web-Authentifizierungsmechanismus geschützt; die UUID ist keine Berechtigung. Der Coordinator speichert nur UUID/Software-Dispatch/Bytezahl in seiner begrenzten RAM-Job-Tabelle, zusammen mit dem zuletzt bekannten IP-Link. Die Linkgültigkeit endet mit dem nächsten akzeptierten Capture-Auftrag oder einem Node-Neustart.

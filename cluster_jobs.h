@@ -9,7 +9,7 @@ namespace ClusterJobs {
 static const size_t kMaxJobs = 16;
 static const size_t kNodeIdLength = 36; // "sf-" + 32 hex + NUL
 
-enum class Kind : uint8_t { None, Restart, Shutdown, ClearRecordings, FirmwareUpdate, Probe };
+enum class Kind : uint8_t { None, Restart, Shutdown, ClearRecordings, FirmwareUpdate, Probe, Capture, Drone };
 enum class State : uint8_t { Empty, Queued, Sent, Accepted, Running, Succeeded, Failed, TimedOut, Cancelled };
 
 struct Entry {
@@ -22,6 +22,9 @@ struct Entry {
     State state;
     char nodeId[kNodeIdLength];
     uint16_t resultCode; // numeric only; never holds secrets or filenames
+    char mediaUuid[37]; // authenticated per-photo UUID, empty until successful completion
+    int64_t dispatchUtcUs; // software trigger, NOT measured exposure
+    uint32_t mediaBytes;
 };
 
 // Must be called on cluster runtime stop/start or coordinator epoch change.
@@ -34,6 +37,7 @@ bool enqueue(uint64_t jobId, uint32_t coordinatorEpoch, const char *nodeId,
 // the current runtime is active, even if an old entry is terminal.
 bool transition(uint64_t jobId, uint32_t coordinatorEpoch, State next,
                 uint32_t nowMs, uint16_t resultCode = 0);
+bool setCaptureMedia(uint64_t id,uint32_t epoch,const char *uuid,int64_t dispatch,uint32_t bytes);
 void expire(uint32_t nowMs);
 size_t snapshot(Entry *out, size_t capacity);
 const Entry *find(uint64_t jobId);

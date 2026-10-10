@@ -57,7 +57,9 @@
 #include "streamer.h"
 #include "firmware_security.h"
 #include "wireguard_manager.h"
+#include "drone_mode.h"
 #include "cluster.h"
+#include "cluster_capture.h"
 #include "sd_presence_policy.h"
 
 
@@ -14215,6 +14217,9 @@ static bool enterLightSleep()
 
 static bool tryEnterConfiguredSleep()
 {
+    // Readiness mode holds the node awake for UTC jobs. Explicit thermal
+    // emergencies and storage fault protections remain independent.
+    if (droneModeEnabled()) return false;
     if (!sleepModeEnabled()) {
 
         setSleepDiagState(
@@ -15145,6 +15150,7 @@ void setup() {
     sdSpiDeselect();
 
     Serial.begin(115200);
+    droneModeBegin();
 
     delay(300);
 
@@ -16274,6 +16280,28 @@ void loop() {
         );
     }
     clusterLoop();
+    // A prepared UTC Capture has precedence over noncritical loop services.
+    // UDP processing remains ahead of this guard; camera owner is not shared.
+    if (clusterCaptureArmed()) { delay(1); return; }
+
+    // Passive Drone Mode: keep the authenticated cluster/UTC scheduler alive,
+    // but do not enter the autonomous motion, shooter, SD-recovery or recording
+    // branches. This gate is evaluated after clusterLoop so remote ON/OFF jobs
+    // take effect in this very loop iteration.
+    if (droneModeEnabled()) {
+        // Transition is one-shot: a recording already in progress must release
+        // its file handles before the node starts its passive standby loop.
+        // Never truncate an AVI/MKV by bypassing the recorder finalizer.
+        if (recording) {
+            stopRecording();
+        }
+        thermalMonitorLoop();
+        if (webConfigStarted) webConfigLoop();
+        // Retain minimal networking service; no automatic SD reads/writes here.
+        wireguardService(false);
+        delay(1);
+        return;
+    }
 
     if (streamerModeEnabled()) {
         // Streamer mode deliberately bypasses all recording, shooter and sleep
@@ -17331,4 +17359,14 @@ void loop() {
         // loop decides later whether to enter light/deep sleep.
         return;
     }
+}
+
+// Beta93: existing camera subsystem remains the only camera initialisation
+// authority. Prewarm before the scheduled trigger; never start while recording.
+bool clusterCapturePrepareCamera() {
+    if (recording || recorderIsOpen() || streamerModeEnabled() ||
+        syncApiExclusiveActive() || thermalEmergencyState ||
+        (webConfigStarted && webConfigCameraPreviewActive())) return false;
+    if (!initCamera(cfg_camera,cfg_resolution,cfg_quality)) return false;
+    return cameraExitSoftPowerDown();
 }

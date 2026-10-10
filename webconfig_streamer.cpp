@@ -1,6 +1,7 @@
 #include "webconfig_streamer.h"
 
 #include "config.h"
+#include "drone_mode.h"
 #include "streamer.h"
 #include "onvif.h"
 
@@ -187,6 +188,7 @@ String webconfigStreamerOperatingModeHtml(
     String operatingModeInfo =
         "Hier legst du den zentralen Betriebsmodus von SensorForge fest. Die Aufnahmevarianten arbeiten wie bisher. "
         "Im Netzwerk-Streamer-Modus gehören Kamera und optionales Audio exklusiv dem Streamer; automatische Aufnahme, Power Shooter und normale Aufnahme-Sleep-Automatik bleiben inaktiv. "
+        "Im Drone-/Bereitschaftsmodus laufen keine automatischen Aufnahmen oder Bewegungsauswertungen; Cluster und UTC-Capture bleiben bereit. "
         "Ein Wechsel zum oder vom Netzwerk-Streamer wird gespeichert und erst nach einem Neustart wirksam.";
     String streamerSettingsInfo =
         "Der Netzwerk-Streamer verwendet die bereits vorhandenen Kamera- und Audioeinstellungen von SensorForge. "
@@ -233,11 +235,12 @@ String webconfigStreamerOperatingModeHtml(
         streamerUiInfoButton("Betriebsmodus", operatingModeInfo) +
         "</div>"
         "<select id='cfgOperatingMode' name='operating_mode_ui' style='min-width:320px;max-width:100%;margin-top:8px'>"
-        "<option value='off'" + String(!configuredStreamerMode && !cfg_motion_recording_enabled && !cfg_shooter_enabled ? " selected" : "") + ">Aus - keine automatische Aufnahme</option>"
-        "<option value='motion'" + String(!configuredStreamerMode && cfg_motion_recording_enabled && !cfg_shooter_enabled ? " selected" : "") + ">Normal Recording - Motion/Alarm</option>"
-        "<option value='shooter'" + String(!configuredStreamerMode && !cfg_motion_recording_enabled && cfg_shooter_enabled ? " selected" : "") + ">Power Shooter standalone</option>"
-        "<option value='motion_shooter'" + String(!configuredStreamerMode && cfg_motion_recording_enabled && cfg_shooter_enabled ? " selected" : "") + ">Normal Recording + Power Shooter</option>"
-        "<option value='streamer'" + String(configuredStreamerMode ? " selected" : "") + ">Netzwerk-Streamer</option>"
+        "<option value='drone'" + String(droneModeEnabled() ? " selected" : "") + ">Drone / Bereitschaft – nur Coordinator-Aufträge</option>"
+        "<option value='off'" + String(!droneModeEnabled() && !configuredStreamerMode && !cfg_motion_recording_enabled && !cfg_shooter_enabled ? " selected" : "") + ">Aus - keine automatische Aufnahme</option>"
+        "<option value='motion'" + String(!droneModeEnabled() && !configuredStreamerMode && cfg_motion_recording_enabled && !cfg_shooter_enabled ? " selected" : "") + ">Normal Recording - Motion/Alarm</option>"
+        "<option value='shooter'" + String(!droneModeEnabled() && !configuredStreamerMode && !cfg_motion_recording_enabled && cfg_shooter_enabled ? " selected" : "") + ">Power Shooter standalone</option>"
+        "<option value='motion_shooter'" + String(!droneModeEnabled() && !configuredStreamerMode && cfg_motion_recording_enabled && cfg_shooter_enabled ? " selected" : "") + ">Normal Recording + Power Shooter</option>"
+        "<option value='streamer'" + String(!droneModeEnabled() && configuredStreamerMode ? " selected" : "") + ">Netzwerk-Streamer</option>"
         "</select>"
         "<div id='cfgStreamerOptions' style='margin-top:14px;padding:14px;border:1px solid #8fb5c9;border-radius:8px;background:#f7fbfd'>"
         "<div style='display:flex;align-items:center;gap:6px;flex-wrap:wrap'><b>Netzwerk-Streamer</b>" +

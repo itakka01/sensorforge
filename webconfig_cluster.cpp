@@ -1,6 +1,7 @@
 #include "webconfig_cluster.h"
 
 #include "cluster.h"
+#include "drone_mode.h"
 #include "cluster_profiles.h"
 #include "config.h"
 #include "device_identity.h"
@@ -85,6 +86,8 @@ static String clusterPageHtml()
         "@media(max-width:720px){.cluster-grid{grid-template-columns:1fr;gap:5px}.cluster-note{grid-column:1;margin-top:-2px;margin-bottom:9px}.cluster-grid input,.cluster-grid select{max-width:none}}"
         "</style>";
 
+    // Drone is configured in Configuration > Betriebsmodus. Coordinator
+    // bulk commands use the same NVS flag via droneModeSet().
     html +=
         "<form id='clusterSettingsForm' method='POST' action='/cluster_save'>"
         "<section class='settings-section'><h3>Cluster-Mitgliedschaft</h3>"
@@ -287,7 +290,28 @@ window.sfCoordinateStatus=function(){
     html += R"__HEALTH__(<section class='settings-section'><h3>Cluster-Geräte</h3>
 <p class='muted'>Aktuelle Ressourcenwerte der verbundenen Geräte. SD-Daten werden normalerweise etwa einmal pro Minute aktualisiert, nach einem Cluster-Wipe unmittelbar erneut gemessen und signiert gemeldet. Fehlende Werte werden nicht geschätzt.</p>
 <div class='cluster-select-tools'><button type='button' id='clusterSelectAll'>Alle Nodes auswählen</button> <button type='button' id='clusterSelectNone'>Auswahl aufheben</button> <span id='clusterSelectionCount'>0 ausgewählt</span></div>
+<div class='cluster-select-tools'><button type='button' id='clusterBulkDroneOn'>Ausgewählte Nodes in Drone Mode</button> <button type='button' id='clusterBulkDroneOff'>Drone Mode ausschalten</button></div>
 <div class='cluster-select-tools'><button type='button' id='clusterBulkProbe'>Verbindung testen</button> <button type='button' id='clusterBulkRestart'>Ausgewählte neu starten</button> <button type='button' id='clusterBulkShutdown'>Ausgewählte herunterfahren</button> <button type='button' id='clusterBulkSync'>Zeit ausgewählter Nodes synchronisieren</button> <button type='button' id='clusterBulkWipe' class='danger'>SD ausgewählter Nodes vollständig löschen</button></div>
+<p class='muted'>Drone Mode hält Nodes passiv bereit: kein automatisches Recording, kein Power Shooter, keine Bewegungserkennung und keine Hintergrund-SD-Recovery. Laufende Aufnahmen werden beim Einschalten kontrolliert beendet. Clusterzeit, geplante Capture-Jobs, Webverwaltung und Temperaturschutz bleiben verfügbar.</p>
+<div class='cluster-select-tools'><label for='clusterCaptureSeconds'>Foto in</label> <input id='clusterCaptureSeconds' type='number' min='0' max='120' step='1' value='10' style='width:5.5em' aria-label='Sekunden bis zum Foto'> Sekunden <input id='clusterCaptureMinutes' type='number' min='0' max='2' step='1' value='0' style='width:4.5em' aria-label='Minuten bis zum Foto'> Minuten <button type='button' id='clusterBulkCapture'>Aufnahme planen</button></div>
+<div class='cluster-select-tools'><label for='clusterCaptureUtc'>Alternativ: fester UTC-Termin (optional)</label> <input id='clusterCaptureUtc' type='datetime-local' step='0.001'> <span class='muted'>Wenn ausgefüllt, hat UTC Vorrang.</span></div>
+<div id='clusterCaptureCountdown' role='timer' aria-label='Countdown zum geplanten Capture' style='display:none;margin:12px 0;padding:15px 17px;border-radius:12px;border:1px solid #64748b55;align-items:center;gap:16px'>
+ <span id='clusterCaptureLamp' aria-hidden='true' style='display:inline-block;flex:none;width:23px;height:23px;border-radius:50%;background:#dc2626;box-shadow:0 0 18px #dc262699'></span>
+ <div><div id='clusterCaptureClock' style='font-size:2.1rem;font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:.06em'>00:10.0</div><div id='clusterCaptureTargetText' class='muted' style='font-size:.85em'></div></div>
+</div>
+<style>
+@keyframes sfCaptureRedPulse{0%,42%{opacity:1;box-shadow:0 0 25px 9px #dc262655}55%,100%{opacity:.20;box-shadow:0 0 3px 0 #dc262622}}
+@keyframes sfCaptureGreenPulse{0%,22%,44%,66%,88%,100%{opacity:1;box-shadow:0 0 34px 12px #22c55e88}11%,33%,55%,77%{opacity:.28;box-shadow:0 0 8px 0 #22c55e55}}
+#clusterCaptureCountdown.sf-armed #clusterCaptureLamp{animation:sfCaptureRedPulse 1s infinite;background:#dc2626}
+#clusterCaptureCountdown.sf-fired #clusterCaptureLamp{animation:sfCaptureGreenPulse 2.8s ease-in-out 1;background:#16a34a}
+</style>
+<div id='clusterCaptureFeedback' class='muted' role='status'>Aufträge werden vorab verteilt. Zeitangaben gelten als UTC; gemeldet wird zunächst der Software-Dispatch, nicht der Belichtungsbeginn.</div>
+<div id='clusterCaptureReport' style='display:none;margin-top:14px;padding:14px;border:1px solid #64748b66;border-radius:12px' aria-live='polite'>
+ <h4 style='margin:0 0 8px'>Capture-Fertigstellungsbericht</h4>
+ <div id='clusterCaptureReportSummary' role='status'>Noch kein Auftrag gestartet.</div>
+ <div class='cluster-table-wrap'><table class='cluster-table'><thead><tr><th>Node</th><th>Auftrag</th><th>Ergebnis</th><th>Foto / Zeitpunkt / Abruf</th></tr></thead><tbody id='clusterCaptureReportRows'></tbody></table></div>
+ <p class='muted' style='margin-bottom:0'>„JPEG erfolgreich“ bestätigt die Kamera-Rückmeldung des Nodes; kein Nachweis für exakten Belichtungsbeginn oder langfristige Speicherung. Bericht nur während dieser Browser-Sitzung; Job-Verlauf im Coordinator-RAM ist begrenzt.</p>
+</div>
 <div class='cluster-select-tools'><button type='button' id='clusterSdPreflight'>SD-Löschung prüfen (ohne Löschen)</button></div><p class='muted' id='clusterSdPreflightResult' role='status'>Vorbereitung: Hier werden nur SD- und Recording-Status der ausgewählten Nodes geprüft. Es werden keine Dateien gelöscht.</p>
 <p class='muted'>Sammelaktionen werden pro Node einzeln mit eigenen signierten Befehlen ausgeführt; keine UDP-Broadcasts für Reboot oder Shutdown. Der Coordinator selbst ist nicht auswählbar. Remote-Shutdown benötigt RESET/Stromversorgung zum Wiederaufwachen.</p>
 <div id='clusterBulkFeedback' class='muted' role='status'>Keine Sammelaktion gestartet.</div>
@@ -301,7 +325,8 @@ function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,function(c){retur
 function fmt(n){return (Number(n)/1024).toFixed(1)+' GiB';}
 function up(s){s=Math.max(0,Number(s)||0);return Math.floor(s/86400)+'d '+Math.floor((s%86400)/3600)+'h '+Math.floor((s%3600)/60)+'m';}
 function nodeUrl(n){var ip=String(n.ip||''),p=ip.split('.');if(p.length!==4||!p.every(function(x){return /^\d{1,3}$/.test(x)&&Number(x)<=255;})||ip==='0.0.0.0'||ip==='255.255.255.255')return '';return 'http://'+ip+'/';}
-function latestJob(n,jobs){var id=String(n.integration_id||'');var a=jobs.filter(function(j){return String(j.node)===id&&Number(j.kind)!==4;});if(!a.length)return '–';var j=a[a.length-1], kind=Number(j.kind),state=Number(j.state);var action=kind===1?'Neustart':kind===2?'Shutdown':kind===3?'SD Wipe':'Verbindungstest';var stateText={1:'Wartet',2:'Gesendet',3:'ACK bestätigt',5:'Erfolgreich',6:'Abgelehnt',7:'Keine ACK'}[state]||'Status '+state;
+function latestJob(n,jobs){var id=String(n.integration_id||'');var a=jobs.filter(function(j){return String(j.node)===id&&Number(j.kind)!==4;});if(!a.length)return '–';var j=a[a.length-1], kind=Number(j.kind),state=Number(j.state);var action=kind===1?'Neustart':kind===2?'Shutdown':kind===3?'SD Wipe':kind===6?'Foto':kind===7?'Drone Mode':'Verbindungstest';var stateText={1:'Wartet',2:'Gesendet',3:'ACK bestätigt',5:'Erfolgreich',6:'Abgelehnt',7:'Keine ACK'}[state]||'Status '+state;
+if(kind===7&&state===5)stateText=Number(j.result)===1?'Eingeschaltet':'Ausgeschaltet';
 if(kind===3&&state===6)stateText=Number(j.result)===100?'Keine SD / Wartung belegt':('SD Wipe fehlgeschlagen (Code '+(j.result||0)+')');
 else if(state===6)stateText=Number(j.result)===2?'Abgelehnt: Aufnahme/Sicherheitsbedingung':(Number(j.result)===1?'Sendefehler':'Fehler (Code '+(j.result||0)+')');
 if(j.boot_change_observed&&kind===1)stateText+=' · neuer Boot erkannt';
@@ -312,10 +337,11 @@ var ns=Array.isArray(d.nodes)?d.nodes:[],jobs=Array.isArray(d.job_probes)?d.job_
 rows.innerHTML=ns.map(function(n){var ok=!!n.health_valid,total=Number(n.sd_total_mib||0),used=Number(n.sd_used_mib||0);
 return '<tr><td>'+(n.local?'–':'<input type="checkbox" class="cluster-node-choice" value="'+esc(n.integration_id)+'" '+(window.sfSelectedNodes&&window.sfSelectedNodes.has(String(n.integration_id))?'checked':'')+'>')+'</td><td>'+(nodeUrl(n)?'<a href="'+nodeUrl(n)+'" target="_blank" rel="noopener noreferrer">'+esc(n.hostname||n.integration_id)+'</a>':esc(n.hostname||n.integration_id))+'</td><td>'+esc(n.release||'–')+'</td><td>'+esc(n.cluster_role||'–')+'</td><td>'+esc(latestJob(n,jobs))+'</td><td>'+(ok&&total?fmt(used):'–')+'</td><td>'+(ok&&total?fmt(Math.max(0,total-used)):'–')+'</td><td>'+(ok&&Number(n.cpu_temp_deci_c)>-1000?(Number(n.cpu_temp_deci_c)/10).toFixed(1)+' °C':'–')+'</td><td>'+esc(up(n.uptime_seconds))+'</td><td><code>'+esc(n.boot_id||'–')+'</code></td><td>'+esc(n.recording?'Recording':'Bereit')+'</td></tr>';}).join('');
 var extra=document.getElementById('clusterHealthExtra');if(extra)extra.textContent=ns.map(function(n){return (n.hostname||n.integration_id)+': freier Heap '+(n.health_valid?Math.round(Number(n.free_heap_bytes||0)/1024)+' KiB':'unbekannt');}).join(' · ');
+if(window.sfCaptureReportUpdate)window.sfCaptureReportUpdate(d);
 if(window.sfSelectionUpdate)window.sfSelectionUpdate();
 
 }
-function pollHealth(){window.sfCoordinateStatus().then(renderHealth).catch(function(){});}
+function pollHealth(){window.sfCoordinateStatus().then(function(d){renderHealth(d);}).catch(function(){});}
 window.sfSelectedNodes=new Set();
 window.sfSelectionUpdate=function(){var els=Array.from(document.querySelectorAll('.cluster-node-choice'));var ids=new Set(els.map(function(x){return x.value;}));Array.from(window.sfSelectedNodes).forEach(function(id){if(!ids.has(id))window.sfSelectedNodes.delete(id);});var label=document.getElementById('clusterSelectionCount');if(label)label.textContent=window.sfSelectedNodes.size+' ausgewählt';};
 document.addEventListener('change',function(e){if(e.target.classList.contains('cluster-node-choice')){if(e.target.checked)window.sfSelectedNodes.add(e.target.value);else window.sfSelectedNodes.delete(e.target.value);window.sfSelectionUpdate();}});
@@ -325,11 +351,107 @@ document.getElementById('clusterSelectNone').addEventListener('click',function()
 var actionBusy=false;
 async function runBulk(path,label,danger){if(actionBusy)return;var ids=Array.from(window.sfSelectedNodes);var out=document.getElementById('clusterBulkFeedback');if(!ids.length){out.textContent='Bitte zuerst mindestens einen entfernten Node auswählen.';return;}
 var text=label+' für '+ids.length+' ausgewählte Nodes auslösen?';if(danger)text+=' ACHTUNG: Shutdown ohne Wake-Quellen; RESET oder Stromversorgung zum Wiederaufwachen erforderlich.';
-if((path==='/cluster_node_restart'||path==='/cluster_node_shutdown'||path==='/cluster_node_wipe')&&!confirm(path==='/cluster_node_wipe'?'ACHTUNG: Alle SD-Daten der ausgewählten Nodes unwiderruflich löschen? Laufende Aufnahmen werden SOFORT beendet und ebenfalls gelöscht. Konfiguration wird aus internem Backup wiederhergestellt.':text))return;actionBusy=true;window.sfCoordinatorBulkActive=true;var buttons=['clusterBulkProbe','clusterBulkRestart','clusterBulkShutdown','clusterBulkSync','clusterBulkWipe'];buttons.forEach(function(x){document.getElementById(x).disabled=true;});var done=0,errors=0,details=[];
-try{for(var i=0;i<ids.length;i++){out.textContent=label+': '+(i+1)+'/'+ids.length+' – '+ids[i];var fd=new FormData();fd.append('node_id',ids[i]);var ctrl=new AbortController(),timer=setTimeout(function(){ctrl.abort();},12000);
+if((path==='/cluster_node_restart'||path==='/cluster_node_shutdown'||path==='/cluster_node_wipe')&&!confirm(path==='/cluster_node_wipe'?'ACHTUNG: Alle SD-Daten der ausgewählten Nodes unwiderruflich löschen? Laufende Aufnahmen werden SOFORT beendet und ebenfalls gelöscht. Konfiguration wird aus internem Backup wiederhergestellt.':text))return;actionBusy=true;window.sfCoordinatorBulkActive=true;var buttons=['clusterBulkProbe','clusterBulkRestart','clusterBulkShutdown','clusterBulkSync','clusterBulkWipe','clusterBulkDroneOn','clusterBulkDroneOff'];buttons.forEach(function(x){document.getElementById(x).disabled=true;});var done=0,errors=0,details=[];
+try{for(var i=0;i<ids.length;i++){out.textContent=label+': '+(i+1)+'/'+ids.length+' – '+ids[i];var fd=new FormData();fd.append('node_id',ids[i]);if(path==='/cluster_node_drone')fd.append('enabled',label==='Drone Mode EIN'?'1':'0');var ctrl=new AbortController(),timer=setTimeout(function(){ctrl.abort();},12000);
 try{var res=await fetch(path,{method:'POST',body:fd,credentials:'same-origin',cache:'no-store',redirect:'manual',signal:ctrl.signal});if(!(res.ok||res.status===0||res.status===303)){errors++;var body='';try{body=(await res.text()).slice(0,100);}catch(ignored){}details.push(ids[i]+': HTTP '+res.status+(body?' '+body:''));}else{done++;details.push(ids[i]+': Auftrag vom HTTP-Endpunkt angenommen');}}catch(e){errors++;details.push(ids[i]+': HTTP-Anfrage fehlgeschlagen ('+(e.name==='AbortError'?'12-s-Zeitlimit':String(e.message||e))+'); Ausführung unbekannt');}finally{clearTimeout(timer);}await new Promise(function(resolve){setTimeout(resolve,250);});}
 out.textContent=label+': '+done+' HTTP-Annahmen, '+errors+' HTTP-Fehler. '+details.join(' | ')+'. HTTP-Erfolg bedeutet nicht ACK oder Ausführung; Einzelergebnisse im Status prüfen.';
 }finally{window.sfCoordinatorBulkActive=false;actionBusy=false;window.sfCoordinateStatus().catch(function(){});buttons.forEach(function(x){document.getElementById(x).disabled=false;});}}
+// Generic absolute-UTC schedule derivation: reuse for future actions such as GPIO/sequence/video.
+function sfPlanUtcTarget(utcValue,seconds,minutes,nowMs){
+ if(utcValue){var fixed=Date.parse(utcValue+'Z');return Number.isFinite(fixed)?fixed:NaN;}
+ if(!Number.isFinite(seconds)||!Number.isFinite(minutes)||seconds<0||minutes<0||!Number.isInteger(seconds)||!Number.isInteger(minutes))return NaN;
+ return nowMs+(minutes*60+seconds)*1000;
+}
+// Capture report tracks one specific submission set, not the last arbitrary Node action.
+// Job IDs in the bounded coordinator RAM table are authoritative after signature verification.
+var sfCaptureReport=null, sfLatestStatus=null;
+var sfSeenCaptureJobs=new Set();
+function sfCaptureJobKey(j){return String(j.node)+'/'+String(j.job_boot)+'/'+String(j.job_seq);}
+function sfCaptureState(row,now,target){
+ if(row.http==='error')return ['HTTP-Fehler','Übertragung fehlgeschlagen; Ausführung unbekannt',false];
+ var j=row.job;
+ if(!j){return now>target+200000?['Unbestätigt','Kein zugeordneter Capture-Job mehr sichtbar',false]:['Warten','Warte auf signierten Auftragsstatus',false];}
+ var st=Number(j.state),rc=Number(j.result||0);
+ if(st===5)return ['JPEG erfolgreich','Signierter Abschluss vom Node bestätigt',true];
+ if(st===6)return ['Fehlgeschlagen','Node meldet Fehlercode '+rc,false];
+ if(st===7)return ['Zeitüberschreitung','Keine bestätigte Fertigstellung',false];
+ if(st===8)return ['Abgebrochen','Auftrag abgebrochen',false];
+ if(st===3)return ['Vorbereitet','Node hat den Auftrag angenommen',false];
+ if(st===4)return ['In Ausführung','Warte auf JPEG-Abschluss',false];
+ if(st===2)return ['Gesendet','Warte auf Node-Bestätigung',false];
+ return ['Geplant','Auftrag im Coordinator vorgemerkt',false];
+}
+function sfRenderCaptureReport(){
+ var report=sfCaptureReport,box=document.getElementById('clusterCaptureReport');if(!report||!box)return;
+ box.style.display='block';var successes=0,failed=0,pending=0,now=Date.now();
+ var html=report.rows.map(function(r){
+  var v=sfCaptureState(r,now,report.target);
+  if(v[2])successes++;else if(v[0]==='Fehlgeschlagen'||v[0]==='Zeitüberschreitung'||v[0]==='Abgebrochen'||v[0]==='HTTP-Fehler')failed++;else pending++;
+  var color=v[2]?'#16a34a':failed&&['Fehlgeschlagen','Zeitüberschreitung','Abgebrochen','HTTP-Fehler'].indexOf(v[0])>=0?'#dc2626':'#b45309';
+  var j=r.job||{},uuid=String(j.media_uuid||''),u=String(j.media_url||'');
+  var isValid=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(uuid);
+  var safeUrl='';try{var parsed=new URL(u);if(parsed.protocol==='http:'&&parsed.pathname==='/capture_media'&&parsed.searchParams.get('uuid')===uuid)safeUrl=parsed.href;}catch(ignore){}
+  var time=String(j.dispatch_utc_us||'0'),utcText='';
+  if(/^\d{16}$/.test(time)){var millis=Number(time.slice(0,-3));if(Number.isFinite(millis))utcText=new Date(millis).toISOString();}
+  var media=isValid?'<div class=\"muted\">UUID: '+esc(uuid)+'</div><div class=\"muted\">Software-Trigger UTC: '+esc(utcText||'unbekannt')+'</div>'+(safeUrl?'<a href=\"'+esc(safeUrl)+'\" target=\"_blank\" rel=\"noopener\">JPEG abrufen</a>':'<span class=\"muted\">Link nicht verfügbar</span>'):'–';
+  return '<tr><td><strong>'+esc(r.name)+'</strong></td><td>'+esc(r.http==='error'?'HTTP ungeklärt':r.http==='accepted'?'HTTP angenommen':'Wird übertragen')+'</td><td><strong style=\"color:'+color+'\">'+esc(v[0])+'</strong><div class=\"muted\">'+esc(v[1])+'</div></td><td>'+media+'</td></tr>';
+ }).join('');
+ document.getElementById('clusterCaptureReportRows').innerHTML=html;
+ var overall=pending?'Läuft / ausstehend':failed?'Abgeschlossen mit Fehlern':'Alle JPEGs bestätigt';
+ document.getElementById('clusterCaptureReportSummary').textContent=overall+' · '+successes+'/'+report.rows.length+' erfolgreich · '+failed+' Fehler · '+pending+' ausstehend · UTC '+new Date(report.target).toISOString();
+}
+window.sfCaptureReportUpdate=function(d){
+ sfLatestStatus=d;var jobs=(Array.isArray(d.job_probes)?d.job_probes:[]).filter(function(j){return Number(j.kind)===6;});
+ if(sfCaptureReport){sfCaptureReport.rows.forEach(function(r){
+  if(r.job)return;var candidates=jobs.filter(function(j){return String(j.node)===r.id&&!sfSeenCaptureJobs.has(sfCaptureJobKey(j));});
+  if(candidates.length&&r.http!=='error'){r.job=candidates[candidates.length-1];sfSeenCaptureJobs.add(sfCaptureJobKey(r.job));}
+ });sfCaptureReport.rows.forEach(function(r){if(r.job){var update=jobs.find(function(j){return sfCaptureJobKey(j)===sfCaptureJobKey(r.job);});if(update)r.job=update;}});sfRenderCaptureReport();}
+};
+var sfCountdownTick=null,sfCountdownEnd=null;
+function sfShowCaptureCountdown(target){
+ if(sfCountdownTick!==null)clearInterval(sfCountdownTick);
+ if(sfCountdownEnd!==null)clearTimeout(sfCountdownEnd);
+ var panel=document.getElementById('clusterCaptureCountdown'),clock=document.getElementById('clusterCaptureClock'),lamp=document.getElementById('clusterCaptureLamp');
+ document.getElementById('clusterCaptureTargetText').textContent='Geplanter UTC-Termin: '+new Date(target).toISOString()+' · Anzeige nach Browseruhr';
+ panel.style.display='flex';panel.className='sf-armed';lamp.style.background='#dc2626';
+ // Countdown uses a monotonic elapsed duration so wall-clock corrections in the browser cannot jump it.
+ var startWall=Date.now(),startPerf=performance.now(),delay=Math.max(0,target-startWall);
+ function update(){var left=delay-(performance.now()-startPerf);
+  if(left<=0){if(sfCountdownTick!==null){clearInterval(sfCountdownTick);sfCountdownTick=null;}
+   clock.textContent='AUSLÖSEZEIT';panel.className='sf-fired';
+   sfCountdownEnd=setTimeout(function(){panel.className='';clock.textContent='Termin erreicht';sfCountdownEnd=null;},2900);return;}
+  var tenths=Math.ceil(left/100),secs=Math.floor(tenths/10),minutes=Math.floor(secs/60);
+  clock.textContent=String(minutes).padStart(2,'0')+':'+String(secs%60).padStart(2,'0')+'.'+String(tenths%10);
+ }
+ update();if(panel.className==='sf-armed')sfCountdownTick=setInterval(update,50);
+}
+document.getElementById('clusterBulkCapture').addEventListener('click',async function(){
+ var ids=Array.from(window.sfSelectedNodes),v=document.getElementById('clusterCaptureUtc').value,out=document.getElementById('clusterCaptureFeedback');
+ if(!ids.length){out.textContent='Bitte Nodes auswählen.';return;}
+ var seconds=Number(document.getElementById('clusterCaptureSeconds').value),minutes=Number(document.getElementById('clusterCaptureMinutes').value);
+ if(!v&&(!document.getElementById('clusterCaptureSeconds').value||!document.getElementById('clusterCaptureMinutes').value)){out.textContent='Sekunden und Minuten müssen ausgefüllt sein.';return;}
+ var target=sfPlanUtcTarget(v,seconds,minutes,Date.now());
+ if(!Number.isFinite(target)||target-Date.now()<5000||target-Date.now()>120000){out.textContent='Zielzeit muss 5 bis 120 Sekunden in der Zukunft liegen (auch bei Minuten-/Sekundeneingabe).';return;}
+ var button=this;button.disabled=true;window.sfCoordinatorBulkActive=true;var results=[],accepted=0;
+ // Snapshot old jobs to avoid mistaking a previous photo for this capture.
+ (Array.isArray((sfLatestStatus||{}).job_probes)?sfLatestStatus.job_probes:[]).forEach(function(j){if(Number(j.kind)===6)sfSeenCaptureJobs.add(sfCaptureJobKey(j));});
+ var names=Array.isArray((sfLatestStatus||{}).nodes)?sfLatestStatus.nodes:[];
+ sfCaptureReport={target:target,rows:ids.map(function(id){var n=names.find(function(x){return String(x.integration_id)===id;});return {id:id,name:n?(n.hostname||id):id,http:'pending',job:null};})};sfRenderCaptureReport();
+ try{for(var i=0;i<ids.length;i++){
+  var fd=new FormData();fd.append('node_id',ids[i]);fd.append('utc_ms',String(Math.round(target)));
+  var ctrl=new AbortController(),timer=setTimeout(function(){ctrl.abort();},12000);
+  try{var r=await fetch('/cluster_node_capture',{method:'POST',body:fd,credentials:'same-origin',redirect:'manual',cache:'no-store',signal:ctrl.signal});
+      if(r.ok||r.status===303||r.status===0){accepted++;sfCaptureReport.rows[i].http='accepted';results.push(ids[i]+': HTTP angenommen');}
+      else{sfCaptureReport.rows[i].http='error';var msg='';try{msg=(await r.text()).slice(0,110);}catch(ignored){}results.push(ids[i]+': HTTP '+r.status+(msg?' '+msg:''));}}
+  catch(e){sfCaptureReport.rows[i].http='error';results.push(ids[i]+': Übertragungsfehler ('+(e.name==='AbortError'?'Zeitlimit':String(e.message||e))+'); Ausführung unbekannt');}
+  finally{clearTimeout(timer);sfRenderCaptureReport();}
+ }
+ out.textContent='UTC '+new Date(target).toISOString()+' · '+accepted+'/'+ids.length+' HTTP angenommen. '+results.join(' | ')+'. Die grüne Anzeige kennzeichnet nur den geplanten Zeitpunkt; Capture-Ergebnisse stehen in der Node-Tabelle.';
+ if(accepted)sfShowCaptureCountdown(target);
+ }finally{window.sfCoordinatorBulkActive=false;button.disabled=false;sfRenderCaptureReport();window.sfCoordinateStatus().then(function(d){window.sfCaptureReportUpdate(d);}).catch(function(){});}
+});
+document.getElementById('clusterBulkDroneOn').addEventListener('click',function(){runBulk('/cluster_node_drone','Drone Mode EIN',false);});
+document.getElementById('clusterBulkDroneOff').addEventListener('click',function(){runBulk('/cluster_node_drone','Drone Mode AUS',false);});
 document.getElementById('clusterBulkProbe').addEventListener('click',function(){runBulk('/cluster_job_probe','Verbindungstest',false);});
 document.getElementById('clusterBulkRestart').addEventListener('click',function(){runBulk('/cluster_node_restart','Neustart',false);});
 document.getElementById('clusterBulkShutdown').addEventListener('click',function(){runBulk('/cluster_node_shutdown','Shutdown',true);});
@@ -467,6 +589,41 @@ static void handleClusterNodeShutdown()
     }
     server.sendHeader("Location","/cluster_coordinate");
     server.send(303,"text/plain; charset=utf-8","");
+}
+
+static void handleClusterLocalDrone(){
+    // Local explicit operator setting; cluster participation not required.
+    if(!droneModeSet(server.hasArg("enabled"))){
+        server.send(500,"text/plain; charset=utf-8","NVS-Speicherung fehlgeschlagen");return;
+    }
+    server.sendHeader("Location","/cluster_coordinate");
+    server.send(303,"text/plain","");
+}
+static void handleClusterNodeDrone(){
+    if(!clusterLocalIsCoordinator()){
+        server.send(403,"text/plain; charset=utf-8","Nur am Coordinator");return;
+    }
+    const String enabled=server.arg("enabled");
+    if(enabled!="0"&&enabled!="1"){
+        server.send(400,"text/plain; charset=utf-8","Ungültiger Drone-Wert");return;
+    }
+    String error;
+    if(!clusterRequestNodeDrone(server.arg("node_id"),enabled=="1",error)){
+        server.send(409,"text/plain; charset=utf-8",error);return;
+    }
+    server.sendHeader("Location","/cluster_coordinate");
+    server.send(303,"text/plain","");
+}
+static void handleClusterNodeCapture(){
+    if(!clusterLocalIsCoordinator()) {server.send(403,"text/plain","Nur am Coordinator");return;}
+    String raw=server.arg("utc_ms");char *end=nullptr;errno=0;
+    long long ms=strtoll(raw.c_str(),&end,10);
+    if(errno||!end||*end||ms<1600000000000LL||ms>4102444800000LL){server.send(400,"text/plain","Ungültige UTC-Zeit");return;}
+    String error;
+    if(!clusterRequestNodeCapture(server.arg("node_id"),(int64_t)ms*1000LL,error)){
+        server.send(409,"text/plain; charset=utf-8",error);return;
+    }
+    server.sendHeader("Location","/cluster_coordinate");server.send(303,"text/plain","");
 }
 
 static void handleClusterNodeWipe()
@@ -770,4 +927,7 @@ void webconfigClusterRegisterRoutes(
     serverInstance.on("/cluster_node_restart", HTTP_POST, handleClusterNodeRestart);
     serverInstance.on("/cluster_node_shutdown", HTTP_POST, handleClusterNodeShutdown);
     serverInstance.on("/cluster_node_wipe", HTTP_POST, handleClusterNodeWipe);
+    serverInstance.on("/cluster_node_capture", HTTP_POST, handleClusterNodeCapture);
+    serverInstance.on("/cluster_node_drone", HTTP_POST, handleClusterNodeDrone);
+    serverInstance.on("/cluster_local_drone", HTTP_POST, handleClusterLocalDrone);
 }

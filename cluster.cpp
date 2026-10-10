@@ -1,5 +1,7 @@
 #include "cluster.h"
 #include "cluster_jobs.h"
+#include "cluster_capture.h"
+#include "drone_mode.h"
 #include "webconfig.h"
 #include "web_sd_maintenance.h"
 
@@ -79,8 +81,21 @@ static const char *CLUSTER_JOB_SHUTDOWN_MAGIC = "SFJS1";
 static const char *CLUSTER_JOB_SHUTDOWN_ACK_MAGIC = "SFJSA1";
 // Signed negative ACKs only after full coordinator authentication and replay consumption.
 static const char *CLUSTER_JOB_REJECT_MAGIC = "SFJX1";
+static const char *CLUSTER_JOB_CAPTURE_MAGIC="SFJC1";
+static const char *CLUSTER_JOB_CAPTURE_RESULT_MAGIC="SFJCR1";
+static const char *CLUSTER_JOB_DRONE_MAGIC = "SFJD1";
+static const char *CLUSTER_JOB_DRONE_ACK_MAGIC = "SFJDA1";
+static uint32_t droneSeenBoot=0,droneSeenEpoch=0,droneSeenSeq=0;
 static const char *CLUSTER_JOB_WIPE_MAGIC = "SFJW1";
 static const char *CLUSTER_JOB_WIPE_RESULT_MAGIC = "SFJWR1";
+struct PendingCapture {bool active=false;uint32_t cb=0,epoch=0,seq=0;int64_t utc=0;};
+static PendingCapture pendingCapture;
+bool clusterCaptureArmedFlag=false;
+static uint32_t captureSeenBoot=0,captureSeenEpoch=0,captureSeenSeq=0;
+static uint32_t captureSent=0,captureAccepted=0,captureCompleted=0,captureFailed=0;
+static int64_t captureLastDispatchOffsetUs=0;
+static uint32_t captureLastSize=0;
+static uint16_t captureLastError=0;
 static uint32_t wipeSeenBoot=0, wipeSeenEpoch=0, wipeSeenSeq=0;
 static uint32_t wipeReceived=0, wipeQueued=0, wipeResultSent=0, wipeResultReceived=0;
 
@@ -2706,6 +2721,105 @@ static void processJobShutdownAck(char **f, size_t n, const IPAddress &ip)
     else rejectShutdownAck("job_transition");
 }
 
+// Signed scheduled capture: command SFJC1 and status SFJCR1.
+// Camera work occurs in the firmware main loop, never in the UDP callback.
+static void sendCaptureResult(uint32_t cb,uint32_t epoch,uint32_t seq,uint16_t status,uint16_t error,uint32_t bytes,const char *uuid="",int64_t dispatch=0) {
+    if(!runtimeActive || localIsCoordinator || epoch!=currentCoordinatorEpoch || !usableIp(currentCoordinatorIp))return;
+    char coordBoot[9],ownBoot[9];
+    snprintf(coordBoot,sizeof(coordBoot),"%08lx",(unsigned long)cb);
+    snprintf(ownBoot,sizeof(ownBoot),"%08lx",(unsigned long)bootNonce);
+    char dispatchText[30];snprintf(dispatchText,sizeof(dispatchText),"%lld",(long long)dispatch);
+    const String packet=String(CLUSTER_JOB_CAPTURE_RESULT_MAGIC)+"|"+runtimeClusterTag+"|"+currentCoordinatorId+
+        "|"+coordBoot+"|"+String((unsigned long)epoch)+"|"+deviceIntegrationId()+"|"+ownBoot+"|"+
+        String((unsigned long)seq)+"|"+String((unsigned int)status)+"|"+
+        String((unsigned int)error)+"|"+String((unsigned long)bytes)+"|"+String(uuid[0]?uuid:"-")+"|"+String(dispatchText);
+    sendSignedPayloadTo(packet,currentCoordinatorIp,CLUSTER_COORDINATOR_PORT,"capture status");
+}
+static void processJobCapture(char **f,size_t n,const IPAddress &ip) {
+    if(n!=9 || !runtimeActive || localIsCoordinator || strcmp(f[1],runtimeClusterTag)!=0 ||
+       strcmp(f[2],currentCoordinatorId)!=0 || strcmp(f[5],deviceIntegrationId().c_str())!=0 ||
+       ip!=currentCoordinatorIp)return;
+    uint32_t cb=0,epoch=0,nb=0,seq=0;
+    if(!parseUint32Strict(f[3],cb,16)||!parseUint32Strict(f[4],epoch)||
+       !parseUint32Strict(f[6],nb,16)||!parseUint32Strict(f[7],seq)||
+       !cb||!epoch||!seq||nb!=bootNonce||epoch!=currentCoordinatorEpoch)return;
+    const ClusterPeer *coord=findPeer(f[2]);
+    if(!coord||coord->bootNonce!=cb||coord->ip!=ip||(uint32_t)(millis()-coord->lastSeenMs)>60000UL)return;
+    // Always consume valid sequence before deciding readiness: no replay trigger.
+    if(captureSeenBoot==cb&&captureSeenEpoch==epoch&&seq<=captureSeenSeq)return;
+    captureSeenBoot=cb;captureSeenEpoch=epoch;captureSeenSeq=seq;
+    char *end=nullptr;errno=0;
+    int64_t utc=(int64_t)strtoll(f[8],&end,10);
+    int64_t nowUtc=0;
+    if(errno||!end||*end||utc<=0||!clusterTimeNowUs(nowUtc)||utc-nowUtc<1500000LL||
+       utc-nowUtc>120000000LL||pendingCapture.active) {
+        sendCaptureResult(cb,epoch,seq,3,1,0);return;
+    }
+    clusterCaptureBeginJob(((uint64_t)cb<<32)|seq);
+    pendingCapture={true,cb,epoch,seq,utc};
+    sendCaptureResult(cb,epoch,seq,1,0,0);
+}
+static void processJobCaptureResult(char **f,size_t n,const IPAddress &ip) {
+    if(n!=13||!runtimeActive||!localIsCoordinator||strcmp(f[1],runtimeClusterTag)!=0||
+       strcmp(f[2],deviceIntegrationId().c_str())!=0||!integrationIdValid(f[5]))return;
+    uint32_t cb=0,epoch=0,nb=0,seq=0,status=0,error=0,bytes=0;
+    if(!parseUint32Strict(f[3],cb,16)||!parseUint32Strict(f[4],epoch)||
+       !parseUint32Strict(f[6],nb,16)||!parseUint32Strict(f[7],seq)||
+       !parseUint32Strict(f[8],status)||!parseUint32Strict(f[9],error)||
+       !parseUint32Strict(f[10],bytes)||cb!=bootNonce||epoch!=currentCoordinatorEpoch||
+       !nb||!seq||status<1||status>3||error>65535)return;
+    char *dispatchEnd=nullptr;errno=0;
+    int64_t dispatch=(int64_t)strtoll(f[12],&dispatchEnd,10);
+    if(errno||!dispatchEnd||*dispatchEnd)return;
+    const ClusterPeer *peer=findPeer(f[5]);
+    if(!peer||peer->bootNonce!=nb||peer->ip!=ip||(uint32_t)(millis()-peer->lastSeenMs)>60000UL)return;
+    uint64_t id=((uint64_t)cb<<32)|seq;
+    const ClusterJobs::Entry *e=ClusterJobs::find(id);
+    if(!e||e->kind!=ClusterJobs::Kind::Capture||strcmp(e->nodeId,f[5])!=0)return;
+    if(status==2 && !ClusterJobs::setCaptureMedia(id,epoch,f[11],dispatch,bytes))return;
+    if(status==1&&e->state==ClusterJobs::State::Sent){
+        if(ClusterJobs::transition(id,epoch,ClusterJobs::State::Accepted,millis()))++captureAccepted;
+    } else if(status==2&&(e->state==ClusterJobs::State::Accepted||e->state==ClusterJobs::State::Sent)){
+        if(e->state==ClusterJobs::State::Sent)ClusterJobs::transition(id,epoch,ClusterJobs::State::Accepted,millis());
+        ClusterJobs::transition(id,epoch,ClusterJobs::State::Running,millis());
+        if(ClusterJobs::transition(id,epoch,ClusterJobs::State::Succeeded,millis()))++captureCompleted;
+        captureLastSize=bytes;
+    } else if(status==3&&(e->state==ClusterJobs::State::Sent||e->state==ClusterJobs::State::Accepted)){
+        if(ClusterJobs::transition(id,epoch,ClusterJobs::State::Failed,millis(),(uint16_t)error))++captureFailed;
+    }
+}
+// Called by clusterLoop during regular firmware main loop. Future high precision
+// backends must replace the dispatch mechanism, not the shared UTC contract.
+static void serviceScheduledCapture(){
+    if(!pendingCapture.active)return;
+    int64_t nowUtc=0;
+    if(!clusterTimeNowUs(nowUtc)){
+        PendingCapture p=pendingCapture;pendingCapture.active=false;clusterCaptureArmedFlag=false;
+        sendCaptureResult(p.cb,p.epoch,p.seq,3,4,0);return;
+    }
+    if(nowUtc<pendingCapture.utc){
+        if(pendingCapture.utc-nowUtc<=2000000LL && !clusterCaptureArmedFlag){
+            if(!clusterCapturePrepareCamera()){
+                PendingCapture p=pendingCapture;pendingCapture.active=false;
+                sendCaptureResult(p.cb,p.epoch,p.seq,3,1,0);return;
+            }
+            clusterCaptureArmedFlag=true;
+        }
+        return;
+    }
+    PendingCapture p=pendingCapture;pendingCapture.active=false;
+    uint32_t bytes=0;int64_t dispatch=0;
+    uint16_t rc=clusterCapturePhoto(((uint64_t)p.cb<<32)|p.seq,p.utc,dispatch,bytes);
+    captureLastDispatchOffsetUs=dispatch?dispatch-p.utc:0;
+    captureLastSize=bytes;captureLastError=rc;
+    clusterCaptureArmedFlag=false;
+    char mediaUuid[37]={};int64_t actualDispatch=0;
+    if(!rc&&!clusterCaptureLatestMedia(((uint64_t)p.cb<<32)|p.seq,mediaUuid,actualDispatch))rc=5;
+    sendCaptureResult(p.cb,p.epoch,p.seq,rc?3:2,rc,bytes,mediaUuid,actualDispatch);
+    Serial.printf("[CLUSTER CAPTURE] seq=%lu rc=%u jpeg=%lu dispatch_offset_us=%lld (NOT exposure)\n",
+        (unsigned long)p.seq,(unsigned)rc,(unsigned long)bytes,(long long)captureLastDispatchOffsetUs);
+}
+
 // SFJW1|tag|coordinator|coord_boot|epoch|target|target_boot|seq
 // Every accepted destructive command is consumed before queuing. No retries.
 static void sendHeartbeat();
@@ -2782,6 +2896,54 @@ static void processJobWipeResult(char **f,size_t n,const IPAddress &ip)
     }
 }
 
+// Persistent Drone readiness: authenticated unicast, replay-protected, no retry.
+// Payload SFJD1|tag|coordinator|coord_boot|epoch|node|node_boot|seq|enable
+// Reply   SFJDA1|tag|coordinator|coord_boot|epoch|node|node_boot|seq|enabled|result
+static void processJobDrone(char **f,size_t n,const IPAddress &ip){
+    if(n!=9||!runtimeActive||localIsCoordinator||
+       strcmp(f[1],runtimeClusterTag)!=0||strcmp(f[2],currentCoordinatorId)!=0||
+       strcmp(f[5],deviceIntegrationId().c_str())!=0||ip!=currentCoordinatorIp)return;
+    uint32_t cb=0,epoch=0,nb=0,seq=0,enable=0;
+    if(!parseUint32Strict(f[3],cb,16)||!parseUint32Strict(f[4],epoch)||
+       !parseUint32Strict(f[6],nb,16)||!parseUint32Strict(f[7],seq)||
+       !parseUint32Strict(f[8],enable)||enable>1||!cb||!epoch||!seq||
+       nb!=bootNonce||epoch!=currentCoordinatorEpoch)return;
+    const ClusterPeer *coord=findPeer(f[2]);
+    if(!coord||coord->bootNonce!=cb||coord->ip!=ip||
+       (uint32_t)(millis()-coord->lastSeenMs)>60000UL)return;
+    if(droneSeenBoot==cb&&droneSeenEpoch==epoch&&seq<=droneSeenSeq)return;
+    droneSeenBoot=cb;droneSeenEpoch=epoch;droneSeenSeq=seq;
+    const bool success=droneModeSet(enable!=0);
+    char own[9];snprintf(own,sizeof(own),"%08lx",(unsigned long)bootNonce);
+    String msg=String(CLUSTER_JOB_DRONE_ACK_MAGIC)+"|"+runtimeClusterTag+"|"+
+        currentCoordinatorId+"|"+f[3]+"|"+f[4]+"|"+deviceIntegrationId()+"|"+
+        own+"|"+f[7]+"|"+(droneModeEnabled()?"1":"0")+"|"+(success?"0":"1");
+    sendSignedPayloadTo(msg,ip,CLUSTER_COORDINATOR_PORT,"drone mode result");
+    Serial.printf("[CLUSTER DRONE] seq=%lu requested=%u result=%u\n",(unsigned long)seq,(unsigned)enable,success?0U:1U);
+}
+static void processJobDroneAck(char **f,size_t n,const IPAddress &ip){
+    if(n!=10||!runtimeActive||!localIsCoordinator||
+       strcmp(f[1],runtimeClusterTag)!=0||strcmp(f[2],deviceIntegrationId().c_str())!=0||
+       !integrationIdValid(f[5]))return;
+    uint32_t cb=0,epoch=0,nb=0,seq=0,enabled=0,result=0;
+    if(!parseUint32Strict(f[3],cb,16)||!parseUint32Strict(f[4],epoch)||
+       !parseUint32Strict(f[6],nb,16)||!parseUint32Strict(f[7],seq)||
+       !parseUint32Strict(f[8],enabled)||!parseUint32Strict(f[9],result)||
+       enabled>1||result>1||cb!=bootNonce||epoch!=currentCoordinatorEpoch||!nb||!seq)return;
+    const ClusterPeer *node=findPeer(f[5]);
+    if(!node||node->bootNonce!=nb||node->ip!=ip||
+       (uint32_t)(millis()-node->lastSeenMs)>60000UL)return;
+    const uint64_t id=((uint64_t)cb<<32)|seq;
+    const ClusterJobs::Entry *e=ClusterJobs::find(id);
+    if(!e||e->kind!=ClusterJobs::Kind::Drone||
+       strcmp(e->nodeId,f[5])!=0||e->state!=ClusterJobs::State::Sent)return;
+    if(result==0){
+        ClusterJobs::transition(id,epoch,ClusterJobs::State::Accepted,millis());
+        ClusterJobs::transition(id,epoch,ClusterJobs::State::Running,millis());
+        ClusterJobs::transition(id,epoch,ClusterJobs::State::Succeeded,millis(),(uint16_t)enabled);
+    }else ClusterJobs::transition(id,epoch,ClusterJobs::State::Failed,millis(),(uint16_t)result);
+}
+
 static void processPacket(
     char *packet,
     size_t packetLength,
@@ -2791,7 +2953,7 @@ static void processPacket(
     if (!authenticatePacket(packet, packetLength))
         return;
 
-    char *fields[12] = {};
+    char *fields[16] = {};
     size_t fieldCount = 0;
     if (!splitFields(
             packet,
@@ -2837,6 +2999,14 @@ static void processPacket(
         processJobShutdown(fields, fieldCount, remoteIp);
     } else if (strcmp(fields[0], CLUSTER_JOB_SHUTDOWN_ACK_MAGIC) == 0) {
         processJobShutdownAck(fields, fieldCount, remoteIp);
+    } else if (strcmp(fields[0], CLUSTER_JOB_CAPTURE_MAGIC) == 0) {
+        processJobCapture(fields,fieldCount,remoteIp);
+    } else if (strcmp(fields[0], CLUSTER_JOB_CAPTURE_RESULT_MAGIC) == 0) {
+        processJobCaptureResult(fields,fieldCount,remoteIp);
+    } else if (strcmp(fields[0], CLUSTER_JOB_DRONE_MAGIC) == 0) {
+        processJobDrone(fields,fieldCount,remoteIp);
+    } else if (strcmp(fields[0], CLUSTER_JOB_DRONE_ACK_MAGIC) == 0) {
+        processJobDroneAck(fields,fieldCount,remoteIp);
     } else if (strcmp(fields[0], CLUSTER_JOB_WIPE_MAGIC) == 0) {
         processJobWipe(fields,fieldCount,remoteIp);
     } else if (strcmp(fields[0], CLUSTER_JOB_WIPE_RESULT_MAGIC) == 0) {
@@ -3704,6 +3874,7 @@ void clusterLoop()
         nextCoordinatorHeartbeatMs = now + CLUSTER_COORDINATOR_HEARTBEAT_MS;
     }
     requestClusterTime(millis());
+    serviceScheduledCapture();
 
 }
 
@@ -3905,6 +4076,56 @@ bool clusterRequestNodeShutdown(const String &nodeId, String &error)
     }
     ++shutdownSent;
     ClusterJobs::transition(id,currentCoordinatorEpoch,ClusterJobs::State::Sent,millis());
+    return true;
+}
+
+bool clusterRequestNodeCapture(const String &nodeId,int64_t utcUs,String &error){
+    if(!clusterLocalIsCoordinator()){error="Nur am Coordinator.";return false;}
+    int64_t nowUtc=0;
+    if(!clusterTimeNowUs(nowUtc)||utcUs-nowUtc<2000000LL||utcUs-nowUtc>120000000LL){
+        error="Capture-Zeit muss 2 bis 120 Sekunden in der Zukunft liegen.";return false;
+    }
+    const ClusterPeer *peer=findPeer(nodeId.c_str());
+    if(!peer||!peer->used||!usableIp(peer->ip)||!peer->bootNonce||
+       (uint32_t)(millis()-peer->lastSeenMs)>60000UL){error="Node nicht erreichbar.";return false;}
+    if(++probeSeq==0)++probeSeq;
+    uint64_t id=((uint64_t)bootNonce<<32)|probeSeq;
+    if(!ClusterJobs::enqueue(id,currentCoordinatorEpoch,peer->integrationId,
+        ClusterJobs::Kind::Capture,millis(),180000UL)){error="Job-Liste voll.";return false;}
+    char cb[9],nb[9],when[30];
+    snprintf(cb,sizeof(cb),"%08lx",(unsigned long)bootNonce);
+    snprintf(nb,sizeof(nb),"%08lx",(unsigned long)peer->bootNonce);
+    snprintf(when,sizeof(when),"%lld",(long long)utcUs);
+    const String cmd=String(CLUSTER_JOB_CAPTURE_MAGIC)+"|"+runtimeClusterTag+"|"+
+        deviceIntegrationId()+"|"+cb+"|"+String((unsigned long)currentCoordinatorEpoch)+
+        "|"+nodeId+"|"+nb+"|"+String((unsigned long)probeSeq)+"|"+when;
+    ClusterJobs::transition(id,currentCoordinatorEpoch,ClusterJobs::State::Sent,millis());
+    if(!sendSignedPayloadTo(cmd,peer->ip,CLUSTER_COORDINATOR_PORT,"scheduled photo")){
+        ClusterJobs::transition(id,currentCoordinatorEpoch,ClusterJobs::State::Failed,millis(),1);
+        error="Capture-Auftrag nicht gesendet.";return false;
+    }
+    ++captureSent;return true;
+}
+
+bool clusterRequestNodeDrone(const String &nodeId,bool enabled,String &error){
+    if(!clusterLocalIsCoordinator()) {error="Nur am Coordinator.";return false;}
+    const ClusterPeer *peer=findPeer(nodeId.c_str());
+    if(!peer||!peer->used||!usableIp(peer->ip)||!peer->bootNonce||
+       (uint32_t)(millis()-peer->lastSeenMs)>60000UL){error="Node nicht erreichbar/authentifiziert.";return false;}
+    if(++probeSeq==0)++probeSeq;
+    const uint64_t id=((uint64_t)bootNonce<<32)|probeSeq;
+    if(!ClusterJobs::enqueue(id,currentCoordinatorEpoch,peer->integrationId,
+        ClusterJobs::Kind::Drone,millis(),20000UL)){error="Job-Tabelle voll.";return false;}
+    char cb[9],nb[9];snprintf(cb,sizeof(cb),"%08lx",(unsigned long)bootNonce);
+    snprintf(nb,sizeof(nb),"%08lx",(unsigned long)peer->bootNonce);
+    const String msg=String(CLUSTER_JOB_DRONE_MAGIC)+"|"+runtimeClusterTag+"|"+
+        deviceIntegrationId()+"|"+cb+"|"+String((unsigned long)currentCoordinatorEpoch)+
+        "|"+nodeId+"|"+nb+"|"+String((unsigned long)probeSeq)+"|"+(enabled?"1":"0");
+    ClusterJobs::transition(id,currentCoordinatorEpoch,ClusterJobs::State::Sent,millis());
+    if(!sendSignedPayloadTo(msg,peer->ip,CLUSTER_COORDINATOR_PORT,"drone mode")){
+        ClusterJobs::transition(id,currentCoordinatorEpoch,ClusterJobs::State::Failed,millis(),1);
+        error="Drone-Auftrag nicht gesendet.";return false;
+    }
     return true;
 }
 
@@ -4137,6 +4358,7 @@ String clusterStatusJson()
         jsonEscape(String(currentCoordinatorId)) + "\"";
     json += ",\"coordinator_epoch\":" +
         String((unsigned long)currentCoordinatorEpoch);
+    json += ",\"drone_mode_local\":" + String(droneModeEnabled()?"true":"false");
     json += ",\"local_role\":\"" +
         String(localIsCoordinator ? "coordinator" : "node") + "\"";
     json += ",\"coordinator_heartbeat_sec\":" +
@@ -4228,6 +4450,7 @@ String clusterStatusJson()
     }
     json += "\"";
     json += ",\"mode\":\"" + jsonEscape(cfg_operating_mode) + "\"";
+    json += ",\"drone_mode\":" + String(droneModeEnabled()?"true":"false");
     json += ",\"release\":\"" + jsonEscape(String(SENSORFORGE_RELEASE_TAG)) + "\"";
     json += ",\"uptime_seconds\":" + String((unsigned long)(nowMs / 1000UL));
     char localBootText[9];
@@ -4464,6 +4687,16 @@ String clusterStatusJson()
     json += ",\"ack_accepted\":" + String((unsigned long)shutdownAckAccepted);
     json += ",\"ack_rejected\":" + String((unsigned long)shutdownAckRejected);
     json += ",\"last_ack_reject\":\"" + String(shutdownAckLastReject) + "\"";
+    json += "},\"capture_diagnostics\":{";
+    json += "\"sent\":"+String((unsigned long)captureSent);
+    json += ",\"accepted\":"+String((unsigned long)captureAccepted);
+    json += ",\"completed\":"+String((unsigned long)captureCompleted);
+    json += ",\"failed\":"+String((unsigned long)captureFailed);
+    json += ",\"local_pending\":"+String(pendingCapture.active?"true":"false");
+    json += ",\"last_dispatch_offset_us\":"+String((long)captureLastDispatchOffsetUs);
+    json += ",\"last_size_bytes\":"+String((unsigned long)captureLastSize);
+    json += ",\"last_error\":"+String((unsigned)captureLastError);
+    json += ",\"local_frames\":"+clusterCaptureLocalJson();
     json += "},\"job_probes\":[";
     ClusterJobs::Entry probeEntries[ClusterJobs::kMaxJobs];
     const size_t probeCount = ClusterJobs::snapshot(probeEntries, ClusterJobs::kMaxJobs);
@@ -4478,6 +4711,19 @@ String clusterStatusJson()
         // cannot represent all uint64 identifiers exactly in JavaScript.
         json += ",\"job_boot\":" + String((unsigned long)(e.jobId >> 32));
         json += ",\"job_seq\":" + String((unsigned long)(uint32_t)e.jobId);
+        if(e.kind==ClusterJobs::Kind::Capture){
+            json += ",\"media_uuid\":\""+String(e.mediaUuid)+"\"";
+            json += ",\"media_bytes\":"+String((unsigned long)e.mediaBytes);
+            char dispatchText[30];snprintf(dispatchText,sizeof(dispatchText),"%lld",(long long)e.dispatchUtcUs);
+            json += ",\"dispatch_utc_us\":\""+String(dispatchText)+"\"";
+            if(e.mediaUuid[0]){
+                const ClusterPeer *mediaPeer=findPeer(e.nodeId);
+                if(mediaPeer && usableIp(mediaPeer->ip)){
+                    json += ",\"media_url\":\"http://"+mediaPeer->ip.toString()+
+                        "/capture_media?uuid="+String(e.mediaUuid)+"\"";
+                }
+            }
+        }
         json += ",\"ack_latency_ms\":";
         if ((e.kind == ClusterJobs::Kind::Restart ||
              e.kind == ClusterJobs::Kind::Shutdown ||
@@ -4518,3 +4764,6 @@ bool clusterTimeNowUs(int64_t &utcUs)
     utcUs = timeAnchorUtcUs + (esp_timer_get_time() - timeAnchorMonoUs);
     return true;
 }
+
+// Cooperative main-loop priority gate while a local capture is armed.
+bool clusterCaptureArmed(){return clusterCaptureArmedFlag;}

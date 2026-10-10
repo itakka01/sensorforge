@@ -1,3 +1,55 @@
+## v87-beta103 – Compilefix HTTP-Fotodownload
+
+- Korrigiert die fehlerhafte C++-Anführungszeichenfolge für `Content-Disposition` in `/capture_media` (`webconfig.cpp`, bisher Zeile 18906).
+- Keine Änderung der Medien-UUIDs, Aufträge oder Ringbuffer-Logik.
+- ZIP- und statische Stringprüfung; vollständiger ESP32-Build steht aus.
+
+## v87-beta101 — Capture-Fertigstellungsbericht
+
+- Coordinator erhält unter UTC-Countdown einen Live-Bericht für die Nodes des aktuellen Capture-Durchgangs: Gesamtfortschritt und Einzelstatus.
+- Authentifizierte Capture-Job-Statuswerte (`kind=6`, `state`, `result`) aus dem existierenden `/cluster_status`-Endpunkt; keine neuen UDP- oder Kameraoperationen.
+- Trennung zwischen HTTP-Annahme, Node-ACK und signierter JPEG-Erfolgsmeldung; Fehler, Zeitüberschreitungen und ungeklärte HTTP-Übertragung werden explizit angezeigt.
+- Der Browser verfolgt Job-ID (Coordinator-Boot + Sequenz), um andere Capture-Durchgänge nicht als Erfolg dieses Durchgangs zu zählen. Bericht bleibt auf Browser-Sitzung begrenzt; Coordinator-Job-RAM hat maximal 16 Einträge.
+- Einschränkungen: Der bestehende Status enthält noch keine JPEG-Größe pro Job und keinen nachgewiesenen Belichtungszeitpunkt; auch ein erfolgreiches JPEG kann später aus dem Ringpuffer verdrängt werden. Kein ESP32-Compile ausgeführt.
+
+## v87-beta100 — Betriebsmodus-Anzeige zweizeilig
+
+- Der Header zeigt klein „BETRIEBSMODUS“ und darunter den aktuellen Modus (z. B. „Recording“). Damit wird der Betriebsmodus nicht mit einer aktiven Aufnahme verwechselt.
+- Unveränderter /ui_status-Poll (5 Sekunden), keine neuen Endpunkte oder SD-/Kamera-Zugriffe.
+- Kein vollständiger ESP32-Build durchgeführt.
+
+## v87-beta99 – Compilerfix Betriebsmodus-Banner
+
+- Überflüssiges einzelnes `"` in `webconfig.cpp` direkt nach dem JavaScript-Moduswechsel-Block entfernt (vorher Zeile 1677).
+- Keine Änderung der Laufzeitlogik; Banner und 5-Sekunden-Statusaktualisierung aus Beta 98 bleiben unverändert.
+- Statische Prüfung der betroffenen C++-String-Verkettung durchgeführt; vollständiger ESP32-Compile nicht verfügbar.
+
+## v87-beta98 – Live-Betriebsmodus im Node-Banner
+
+- Auf allen Node-Seiten wird der aktuelle lokale Betriebsmodus rechts neben der Sprachauswahl angezeigt.
+- Die Anzeige übernimmt alle 5 Sekunden den Node-Status über den bereits vorhandenen `/ui_status`-Endpunkt. Auch ein Coordinator-Wechsel in/aus Drone Mode wird ohne Seitenreload sichtbar.
+- Die Statusantwort enthält `operating_mode`: `off`, `recording`, `powershooter`, `combined`, `streamer`, `drone` (lokal bestimmter Zustand; keine gesonderte Netzwerkabfrage).
+- Reiner Anzeigestatus, keine zusätzlichen Kamera-, SD- oder Cluster-Befehle.
+- Status-Polling im globalen Header von 20 auf 5 Sekunden erhöht; auf sehr stark belasteten Geräten beobachten.
+- Prüfstand: statische Code-/JavaScript-Kontrolle, kein vollständiger Firmware-Compile oder Hardwaretest.
+
+## v87-beta97 – Einheitlicher Betriebsmodus Drone / Bereitschaft
+
+- Konfiguration → Betriebsmodus enthält nun Drone / Bereitschaft als exklusive Auswahl.
+- Die bisherige separate Drone-Checkbox auf der Cluster-Seite wurde entfernt.
+- Lokaler Betriebsmodus und signierte Coordinator-Drone-Befehle verwenden denselben bestehenden NVS-Zustand (`droneModeSet`).
+- Auswahl von Drone erhält die bisherigen Recording-/Shooter-Präferenzen; Auswahl eines normalen Modus deaktiviert Drone.
+- Falls beim Wechsel der Kamera-Owner von Streamer auf Normal wechselt, gilt weiterhin der bestehende Reboot-Pfad.
+- Die Cluster-Seite bietet weiterhin Drone EIN/AUS für ausgewählte Nodes.
+- Hardware-Compile und Laufzeittest noch ausstehend.
+
+## v87-beta94 – Capture-Eingabe und UTC-Countdown (2026-10-10)
+- Standard: Foto in 10 Sekunden, frei einstellbare ganzzahlige Sekunden und Minuten; optionaler expliziter UTC-Termin hat Vorrang. Bestehende Capture-Zielgrenze 5–120 s bleibt unverändert.
+- Eine einheitliche Hilfsfunktion berechnet den absoluten UTC-Zielzeitpunkt, unabhängig von der Eingabe. Spätere Action-Typen (GPIO, Sequenz, Video) sollen denselben UTC-Planungspfad nutzen; noch nicht implementiert.
+- Countdown auf Coordinator im Browser: pulsierender roter Punkt bis zur Soll-Zeit; grünes Pulsieren für ca. 2,8 s danach. Anzeige beweist weder Paket-ACK noch tatsächliche Sensorbelichtung.
+- Browser-Countdown nutzt monotone Performance-Zeit, um lokale Uhrsprünge während des Countdowns zu vermeiden. Planung selbst basiert auf Browser-Wanduhr; Abweichung zur Cluster-UTC muss für präzise Capture-Termine später berücksichtigt bzw. serverseitig berechnet werden.
+- Keine Änderung am Capture-UDP-Protokoll, der Node-Zeitbasis oder am Kamera-Owner. Arduino-Compile und Hardwaretest offen.
+
 ## v87-beta92 — SD health refresh and consolidated coordinator controls (2026-10-09)
 
 - On completion of the remote full SD wipe (success or failure), invalidate the node's cached SD usage and immediately emit a signed cluster heartbeat/health sample. If filesystem usage cannot be read, report unknown rather than stale pre-wipe usage. The ordinary at-most-once-per-minute filesystem usage policy remains in place for normal operation.
@@ -585,3 +637,40 @@ legacy regression must be reconstructed.
 - Wipe findet im regulären Firmware-Loop statt, **nicht** im UDP-Paket-Handler. Per signiertem Endresultat wird Erfolg oder Fehler zurückgemeldet.
 - Einschränkungen: Bei Peer-Lease-Verlust während eines langen Wipes kann das Ergebnis verworfen werden; keine persistenten Aufträge, kein automatischer Retry. Fehlende SD/Besetzt meldet Fehler 100.
 - **Nicht getestet:** kompletter ESP32-Build und Zwei-Node-Hardwaretests. Erst mit Testkarten ohne wichtige Daten testen.
+
+## v87-beta93 – UTC scheduled single JPEG (experimental)
+- Coordinator can schedule one photo on selected nodes with a shared UTC timestamp.
+- Signed, node-specific command; replay protection, accepted/result statuses and bounded 3-JPEG PSRAM ring.
+- Dispatch timestamp recorded as **software dispatch**, not sensor shutter/exposure timestamp.
+- Camera capture refuses if recording/streamer/API camera owner active; no unsafe parallel camera access. Camera preparation starts approximately 2 s before target, temporarily deferring main-loop work.
+- No frame-download endpoint yet; no sequences or film start yet.
+- Main-loop cooperative scheduler can be late under blocking activity. Not production sync precision.
+- Build and hardware validation still required.
+
+## v87-beta95 — Drone Mode (experimental)
+- Persistent independent readiness flag in internal NVS, without overwriting recording/shooter configuration.
+- Blocks the normal configured sleep gate while enabled. Thermal emergency and storage-fault safety still apply; certain specialist sleep paths may require follow-up tests.
+- Signed, replay-protected unicast coordinator Drone ON/OFF jobs; one acknowledgment records the applied value. No retry.
+- Local Drone Mode toggle on cluster coordination page and bulk ON/OFF controls for selected nodes.
+- Drone Mode is **not** yet exclusive camera ownership/preemption, and does not guarantee sensor readiness, timing, or interrupt other camera owners.
+- No full Arduino ESP32 compile or hardware tests performed.
+
+## v87-beta96 — Passive Drone Mode
+
+- Drone Mode now bypasses autonomous motion/radar/presence diagnostics, Power Shooter, automatic recording starts and idle SD-recovery in the firmware main loop.
+- On transition to Drone ON, an ongoing recording is finalized once through the normal `stopRecording()` mechanism; its SD writes are a necessary one-time cleanup, not background activity. No automatic recording restarts while Drone is active.
+- Cluster command processing, scheduled UTC capture, web service, WireGuard service and thermal monitoring remain active. Scheduled capture retains the existing camera-owner safety guards. Normal recording/shooter configuration remains unchanged in NVS.
+- Local and coordinator Drone help text corrected. No change to signed Drone wire protocol.
+- Limitation: explicit manual web maintenance, preview/streaming requests and setup-time SD initialization can still access storage or camera; Drone Mode suppresses the **main-loop autonomous paths**, not every possible explicit service endpoint. No full Arduino/ESP32 build verified.
+
+
+## v87-beta102 – Capture-Medien und definierter Ringbuffer-Start
+- Bei Annahme jedes neuen Capture-Jobs wird der lokale PSRAM-JPEG-Ring geleert.
+- Innerhalb eines Jobs gibt es KEIN automatisches Überschreiben: bei drei Slots bzw. PSRAM-Mangel schlägt die Aufnahme mit Kapazitätsfehler fehl; frühere Bilder bleiben erhalten.
+- Jede erfolgreiche Aufnahme erhält eine RFC4122-v4-artige UUID (ESP32 Hardwarezufall), UTC-Software-Dispatch-Zeit und Größe.
+- Signierte Capture-Abschlussmeldung überträgt UUID, Zeitstempel und Länge; Coordinator bindet sie an die individuelle Job-ID.
+- GET /capture_media?uuid=... liefert JPEG vom betreffenden Node mit bestehender Web-Authentifizierung; kein SD-Zugriff.
+- Fertigstellungsbericht zeigt UUID, Software-Zeitstempel und direkten Link.
+- **Noch nicht implementiert:** Mehrbild-Sequenzen, Video, präziser Sensorshutter-Zeitstempel, persistent gespeicherte Medien.
+- **Risiko:** Vorherige RAM-Fotos werden unmittelbar beim nächsten angenommenen Job gelöscht; Links sind nicht dauerhaft.
+- Noch kein vollständiger ESP32-Build/Hardwaretest.
