@@ -273,10 +273,10 @@ static void handleClusterCoordinatePage()
 var pending=null, last=null, lastAt=0;
 window.sfCoordinateHttpStats={lastMs:null,lastError:'',success:0,fail:0};
 window.sfCoordinatorBulkActive=false;
-window.sfCoordinateStatus=function(){
+window.sfCoordinateStatus=function(force){
   if(pending)return pending;
   if(window.sfCoordinatorBulkActive){return last?Promise.resolve(last):Promise.reject(Error("Sammelaktion läuft; Statusabfrage pausiert"));}
-  if(last && Date.now()-lastAt<1200)return Promise.resolve(last);
+  if(!force && last && Date.now()-lastAt<1200)return Promise.resolve(last);
   var started=Date.now(),ctrl=new AbortController(), timer=setTimeout(function(){ctrl.abort();},8000);
   pending=fetch('/cluster_status?t='+Date.now(),{cache:'no-store',credentials:'same-origin',signal:ctrl.signal})
     .then(function(r){if(!r.ok)throw Error('HTTP '+r.status);return r.json();})
@@ -293,7 +293,7 @@ window.sfCoordinateStatus=function(){
 <div class='cluster-select-tools'><button type='button' id='clusterBulkDroneOn'>Ausgewählte Nodes in Drone Mode</button> <button type='button' id='clusterBulkDroneOff'>Drone Mode ausschalten</button></div>
 <div class='cluster-select-tools'><button type='button' id='clusterBulkProbe'>Verbindung testen</button> <button type='button' id='clusterBulkRestart'>Ausgewählte neu starten</button> <button type='button' id='clusterBulkShutdown'>Ausgewählte herunterfahren</button> <button type='button' id='clusterBulkSync'>Zeit ausgewählter Nodes synchronisieren</button> <button type='button' id='clusterBulkWipe' class='danger'>SD ausgewählter Nodes vollständig löschen</button></div>
 <p class='muted'>Drone Mode hält Nodes passiv bereit: kein automatisches Recording, kein Power Shooter, keine Bewegungserkennung und keine Hintergrund-SD-Recovery. Laufende Aufnahmen werden beim Einschalten kontrolliert beendet. Clusterzeit, geplante Capture-Jobs, Webverwaltung und Temperaturschutz bleiben verfügbar.</p>
-<div class='cluster-select-tools'><label for='clusterCaptureSeconds'>Foto in</label> <input id='clusterCaptureSeconds' type='number' min='0' max='120' step='1' value='10' style='width:5.5em' aria-label='Sekunden bis zum Foto'> Sekunden <input id='clusterCaptureMinutes' type='number' min='0' max='2' step='1' value='0' style='width:4.5em' aria-label='Minuten bis zum Foto'> Minuten <button type='button' id='clusterBulkCapture'>Aufnahme planen</button></div>
+<div class='cluster-select-tools'><label for='clusterCaptureSeconds'>Foto in</label> <input id='clusterCaptureSeconds' type='number' min='0' max='59' step='1' value='10' style='width:5.5em' aria-label='Sekunden bis zum Foto'> Sekunden <input id='clusterCaptureMinutes' type='number' min='0' max='30' step='1' value='0' style='width:4.5em' aria-label='Minuten bis zum Foto'> Minuten <button type='button' id='clusterBulkCapture'>Aufnahme planen</button></div>
 <div class='cluster-select-tools'><label for='clusterCaptureUtc'>Alternativ: fester UTC-Termin (optional)</label> <input id='clusterCaptureUtc' type='datetime-local' step='0.001'> <span class='muted'>Wenn ausgefüllt, hat UTC Vorrang.</span></div>
 <div id='clusterCaptureCountdown' role='timer' aria-label='Countdown zum geplanten Capture' style='display:none;margin:12px 0;padding:15px 17px;border-radius:12px;border:1px solid #64748b55;align-items:center;gap:16px'>
  <span id='clusterCaptureLamp' aria-hidden='true' style='display:inline-block;flex:none;width:23px;height:23px;border-radius:50%;background:#dc2626;box-shadow:0 0 18px #dc262699'></span>
@@ -407,15 +407,24 @@ window.sfCaptureReportUpdate=function(d){
   if(candidates.length&&r.http!=='error'){r.job=candidates[candidates.length-1];sfSeenCaptureJobs.add(sfCaptureJobKey(r.job));}
  });sfCaptureReport.rows.forEach(function(r){if(r.job){var update=jobs.find(function(j){return sfCaptureJobKey(j)===sfCaptureJobKey(r.job);});if(update)r.job=update;}});sfRenderCaptureReport();}
 };
+// Shared coordinator UTC reference, anchored to a monotonic browser clock.
+// This is a display/scheduling estimate, not proof of sensor exposure timing.
+var sfCaptureClock=null;
+function sfCaptureClockFromStatus(d,receivedPerf){
+ var t=(d||{}).cluster_time||{},us=Number(t.utc_us);
+ if(!t.valid||!Number.isFinite(us)||us<1600000000000000)return null;
+ return {utcMs:us/1000,perfMs:receivedPerf};
+}
+function sfCaptureUtcNow(){return sfCaptureClock?sfCaptureClock.utcMs+(performance.now()-sfCaptureClock.perfMs):NaN;}
 var sfCountdownTick=null,sfCountdownEnd=null;
 function sfShowCaptureCountdown(target){
  if(sfCountdownTick!==null)clearInterval(sfCountdownTick);
  if(sfCountdownEnd!==null)clearTimeout(sfCountdownEnd);
  var panel=document.getElementById('clusterCaptureCountdown'),clock=document.getElementById('clusterCaptureClock'),lamp=document.getElementById('clusterCaptureLamp');
- document.getElementById('clusterCaptureTargetText').textContent='Geplanter UTC-Termin: '+new Date(target).toISOString()+' · Anzeige nach Browseruhr';
+ document.getElementById('clusterCaptureTargetText').textContent='Geplanter UTC-Termin: '+new Date(target).toISOString()+' · Countdown nach geschätzter Coordinator-Clusterzeit';
  panel.style.display='flex';panel.className='sf-armed';lamp.style.background='#dc2626';
  // Countdown uses a monotonic elapsed duration so wall-clock corrections in the browser cannot jump it.
- var startWall=Date.now(),startPerf=performance.now(),delay=Math.max(0,target-startWall);
+ var startPerf=performance.now(),delay=Math.max(0,target-sfCaptureUtcNow());
  function update(){var left=delay-(performance.now()-startPerf);
   if(left<=0){if(sfCountdownTick!==null){clearInterval(sfCountdownTick);sfCountdownTick=null;}
    clock.textContent='AUSLÖSEZEIT';panel.className='sf-fired';
@@ -430,9 +439,15 @@ document.getElementById('clusterBulkCapture').addEventListener('click',async fun
  if(!ids.length){out.textContent='Bitte Nodes auswählen.';return;}
  var seconds=Number(document.getElementById('clusterCaptureSeconds').value),minutes=Number(document.getElementById('clusterCaptureMinutes').value);
  if(!v&&(!document.getElementById('clusterCaptureSeconds').value||!document.getElementById('clusterCaptureMinutes').value)){out.textContent='Sekunden und Minuten müssen ausgefüllt sein.';return;}
- var target=sfPlanUtcTarget(v,seconds,minutes,Date.now());
- if(!Number.isFinite(target)||target-Date.now()<5000||target-Date.now()>120000){out.textContent='Zielzeit muss 5 bis 120 Sekunden in der Zukunft liegen (auch bei Minuten-/Sekundeneingabe).';return;}
- var button=this;button.disabled=true;window.sfCoordinatorBulkActive=true;var results=[],accepted=0;
+ // Refresh coordinator time before computing a relative or absolute UTC job.
+ // Do not silently fall back to the browser clock if the cluster time is unavailable.
+ var snap;
+ try{var readStart=performance.now();snap=await window.sfCoordinateStatus(true);var readEnd=performance.now();sfCaptureClock=sfCaptureClockFromStatus(snap,(readStart+readEnd)/2);}
+ catch(e){out.textContent='Clusterzeit nicht abrufbar: Capture-Auftrag nicht gesendet.';return;}
+ if(!sfCaptureClock){out.textContent='Coordinator hat noch keine gültige Clusterzeit: Capture-Auftrag nicht gesendet.';return;}
+ var nowUtc=sfCaptureUtcNow(),target=sfPlanUtcTarget(v,seconds,minutes,nowUtc);
+ if(!Number.isFinite(target)||target-nowUtc<5000||target-nowUtc>1800000){out.textContent='Zielzeit muss 5 Sekunden bis 30 Minuten in der Cluster-Zukunft liegen.';return;}
+ var button=this;button.disabled=true;window.sfCoordinatorBulkActive=true;var results=[],accepted=0,shown=false;
  // Snapshot old jobs to avoid mistaking a previous photo for this capture.
  (Array.isArray((sfLatestStatus||{}).job_probes)?sfLatestStatus.job_probes:[]).forEach(function(j){if(Number(j.kind)===6)sfSeenCaptureJobs.add(sfCaptureJobKey(j));});
  var names=Array.isArray((sfLatestStatus||{}).nodes)?sfLatestStatus.nodes:[];
@@ -441,13 +456,13 @@ document.getElementById('clusterBulkCapture').addEventListener('click',async fun
   var fd=new FormData();fd.append('node_id',ids[i]);fd.append('utc_ms',String(Math.round(target)));
   var ctrl=new AbortController(),timer=setTimeout(function(){ctrl.abort();},12000);
   try{var r=await fetch('/cluster_node_capture',{method:'POST',body:fd,credentials:'same-origin',redirect:'manual',cache:'no-store',signal:ctrl.signal});
-      if(r.ok||r.status===303||r.status===0){accepted++;sfCaptureReport.rows[i].http='accepted';results.push(ids[i]+': HTTP angenommen');}
+      if(r.ok||r.status===303||r.status===0){accepted++;if(!shown){sfShowCaptureCountdown(target);shown=true;}sfCaptureReport.rows[i].http='accepted';results.push(ids[i]+': HTTP angenommen');}
       else{sfCaptureReport.rows[i].http='error';var msg='';try{msg=(await r.text()).slice(0,110);}catch(ignored){}results.push(ids[i]+': HTTP '+r.status+(msg?' '+msg:''));}}
   catch(e){sfCaptureReport.rows[i].http='error';results.push(ids[i]+': Übertragungsfehler ('+(e.name==='AbortError'?'Zeitlimit':String(e.message||e))+'); Ausführung unbekannt');}
   finally{clearTimeout(timer);sfRenderCaptureReport();}
  }
  out.textContent='UTC '+new Date(target).toISOString()+' · '+accepted+'/'+ids.length+' HTTP angenommen. '+results.join(' | ')+'. Die grüne Anzeige kennzeichnet nur den geplanten Zeitpunkt; Capture-Ergebnisse stehen in der Node-Tabelle.';
- if(accepted)sfShowCaptureCountdown(target);
+ if(accepted&&!shown)sfShowCaptureCountdown(target);
  }finally{window.sfCoordinatorBulkActive=false;button.disabled=false;sfRenderCaptureReport();window.sfCoordinateStatus().then(function(d){window.sfCaptureReportUpdate(d);}).catch(function(){});}
 });
 document.getElementById('clusterBulkDroneOn').addEventListener('click',function(){runBulk('/cluster_node_drone','Drone Mode EIN',false);});

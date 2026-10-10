@@ -4,6 +4,9 @@
 #include "streamer.h"
 #include "sync_api.h"
 #include "esp_camera.h"
+#include "esp_timer.h"
+#include "esp_timer.h"
+#include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
 #include <string.h>
@@ -40,7 +43,7 @@ void clusterCaptureBeginJob(uint64_t jobId){
     for(auto &f:slots){if(f.bytes)heap_caps_free(f.bytes);f=Frame{};}
     count=0;activeJob=jobId;
 }
-uint16_t clusterCapturePhoto(uint64_t jobId,int64_t targetUtcUs,int64_t &dispatchUtcUs,uint32_t &bytes) {
+uint16_t clusterCapturePhoto(uint64_t jobId,int64_t targetUtcUs,int64_t &dispatchUtcUs,uint32_t &bytes,int64_t anchorUtcUs,int64_t anchorMonoUs) {
     bytes=0;dispatchUtcUs=0;
     if(jobId!=activeJob)return 5;
     if(count>=kMaxFrames)return 6; // Job full: NEVER overwrite earlier synchronized images.
@@ -48,7 +51,7 @@ uint16_t clusterCapturePhoto(uint64_t jobId,int64_t targetUtcUs,int64_t &dispatc
         streamerModeEnabled() || syncApiExclusiveActive()) return 1;
     if(!psramFound())return 2;
     // Software dispatch, NOT sensor exposure-start timestamp.
-    clusterTimeNowUs(dispatchUtcUs);
+    dispatchUtcUs=anchorUtcUs+(esp_timer_get_time()-anchorMonoUs);
     camera_fb_t *fb=esp_camera_fb_get();
     if(!fb)return 3;
     if(fb->format!=PIXFORMAT_JPEG||!fb->buf||!fb->len){esp_camera_fb_return(fb);return 3;}

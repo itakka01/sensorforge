@@ -1,3 +1,26 @@
+## v87-beta105 – Unverrückbare monotone Capture-Deadline (2026-10-10)
+
+- Beim Empfang eines authentifizierten UTC-Capture-Jobs berechnet jeder Node **einmalig** aus seiner aktuell geschätzten Clusterzeit eine lokale monotone Deadline (`esp_timer_get_time()`). Diese wird während des Jobs **nicht mehr neu berechnet**. NTP-/SNTP-Sprünge, neue Cluster-Sync-Samples und Coordinator-Zeitkorrekturen verschieben den anstehenden Shot nicht.
+- Kamera-Vorbereitung bei höchstens 2 Sekunden Restzeit und Fälligkeit werden nur mit der eingefrorenen Deadline geprüft. Die UTC-Software-Dispatch-Zeit in JPEG-Metadaten wird aus derselben eingefrorenen Zeitabbildung berechnet; sie wird ausdrücklich **nicht** als tatsächlicher Belichtungsbeginn ausgewiesen.
+- Relative und absolute Termine jetzt maximal 30 Minuten voraus (zuvor 120 Sekunden). Coordinator-Job-Timeout 30 Minuten + 30 Sekunden; `clusterCaptureSeconds` 0–59 und Minuten 0–30. Standard weiterhin 10 Sekunden. Browser-Countdown aus Beta 104 bleibt auf Coordinator-Zeit basiert; er ist nur Anzeige, nicht der Hardware-Trigger.
+- Die eingefrorene Zeitbasis gilt **pro angenommenem Auftrag**; die allgemeine Clusterzeitsynchronisation und die ESP32-Systemuhr laufen unabhängig weiter. Beim nächsten Auftrag werden neue Zeitkorrekturen wieder berücksichtigt. Kein Versuch, externe NTP-Dienste global zu stoppen.
+- Grenzen: Unterschiedliche Uhrfehler zum Annahmezeitpunkt bleiben erhalten; spätere Verbesserungen der Synchronisation korrigieren den bereits angenommenen Shot absichtlich nicht. Kameratreiber-Latenz und tatsächlicher Belichtungsbeginn weiterhin nicht gemessen. Bereits vorbereitete Kamera kann aus anderen Gründen scheitern. Keine durchgängige Arduino-ESP32-Kompilierung oder Hardwareverifikation.
+
+## v87-beta104 – Clusterzeit für Capture-Countdown (2026-10-10)
+
+- Der Coordinator-Webclient liest für Zeitplanung die gültige `cluster_time.utc_us` aus `/cluster_status` statt `Date.now()` vom Computer. Gilt für relative Zeiten und die Prüfung fixer UTC-Zeiten. Bei fehlender/ungültiger Clusterzeit wird kein Auftrag verschickt.
+- Der Client verankert diese UTC-Zeit anhand der Mitte der HTTP-Laufzeit an `performance.now()`; der Countdown läuft monoton ohne Abhängigkeit von späteren PC-Uhränderungen. HTTP-Transport und ungewisse Abfragephase begrenzen die Anzeigepräzision; dies ist **nur eine Näherung der Coordinator-Clusterzeit**, kein gemessener Auslöse- oder Belichtungszeitpunkt.
+- Der Countdown startet bei der ersten erfolgreichen HTTP-Auftragsannahme; Grün markiert weiter nur den Soll-Termin. Der signierte Medienabschlussbericht ist davon unabhängig.
+- Kein Wechsel der Capture-Protokollfelder; Node-Firmware und Kamera werden nicht geändert. Auf Coordinator beta104 installieren; Node kann zunächst beta103 bleiben.
+- 5 eingebettete JS-Blöcke mit Node.js `--check` geprüft, ZIP-Integrität geprüft. Kein vollständiger Arduino/ESP32-Compile und kein Hardwaretest.
+
+## v87-beta103 – Dokumentationsübergabe (2026-10-10, nur Dokumentation)
+
+- `WIEDEREINSTIEG_SENSORFORGE.md` neu: verbindlicher Arbeitsstand, Systemaufbau, Build-/Delta-Anleitung, Capture-/Media-Ablauf, bekannte Grenzen, Testmatrix und Prioritäten.
+- `CLUSTER_ARCHITECTURE.md` um eine kompakte Einstiegskarte ergänzt.
+- Firmware, Weboberfläche, Protokolle und Versionskennung **unverändert**: weiterhin **v87-beta103**, keine beta104.
+- Dokumentation beruht auf Quelltext der ausgelieferten Deltas sowie bisher berichteten Hardwaretests; vollständiger Build und End-to-End-Capture-/Download-Test sind **nicht** nachgewiesen.
+
 ## v87-beta103 – Compilefix HTTP-Fotodownload
 
 - Korrigiert die fehlerhafte C++-Anführungszeichenfolge für `Content-Disposition` in `/capture_media` (`webconfig.cpp`, bisher Zeile 18906).

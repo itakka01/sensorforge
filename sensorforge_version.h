@@ -21,13 +21,13 @@
 // WebConfig, so a running device can be mapped back to the exact Git tag.
 
 #define SENSORFORGE_RELEASE_NUMBER 87
-#define SENSORFORGE_RELEASE_TAG "v87-beta103"
+#define SENSORFORGE_RELEASE_TAG "v87-beta105"
 #define SENSORFORGE_RELEASE_DATE "2026-10-10"
 #define SENSORFORGE_RELEASE_SUMMARY \
-    "Beta 103: fix capture media download filename quoting."
+    "Beta 105: frozen monotonic capture deadlines after command acceptance."
 
 // Current source-tree stage. v87 Beta 52 applies coordinator election updates promptly; retains Beta 51 join recovery.
-#define SENSORFORGE_WORKTREE_STAGE "v87-beta103"
+#define SENSORFORGE_WORKTREE_STAGE "v87-beta105"
 #define SENSORFORGE_WORKTREE_DATE "2026-10-10"
 #define SENSORFORGE_WORKTREE_SUMMARY \
-    "v87 Beta 102: coordinator capture report with signed outcomes."
+    "v87 Beta 104: capture countdown uses estimated coordinator UTC, not browser wall clock."

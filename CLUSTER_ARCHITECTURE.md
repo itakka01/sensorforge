@@ -1,3 +1,11 @@
+## Wiedereinstieg / maßgeblicher Stand: v87-beta103 (2026-10-10)
+
+**Zuerst `WIEDEREINSTIEG_SENSORFORGE.md` lesen.** Die Datei fasst Architektur, Grenzen, Versionsfolge, Geräteaufbau, Build-Prozess und konkret priorisierte Tests zusammen. Diese Architekturdatei enthält die ausführlichen historischen Designentscheidungen; `CHANGELOG.md` dokumentiert inkrementelle Änderungen.
+
+**Normative Capture-Regeln:** Genau **eine** gemeinsame Cluster-UTC-Zeitbasis; das Sync-Verfahren ist davon getrennt. Coordinator verteilt signierte Aufträge frühzeitig; Nodes lösen selbstständig zum angegebenen UTC-Termin aus. Software-Dispatchzeit ist **nicht** bewiesener Sensor-Belichtungsbeginn. Jeder neue akzeptierte Capture-Job leert den Node-PSRAM-Medienspeicher vor der Aufnahme. Innerhalb desselben Jobs **kein Rollover**, bei Kapazitätsende wird nicht weiter aufgenommen. Jede Aufnahme bekommt ihre eigene Medien-UUID; HTTP-Medienabruf direkt beim Node, Zugriffsprüfung via bestehender Web-Authentifizierung. Coordinator hält Metadaten/Ergebnis nur flüchtig vor. Noch keine Sequenz-, Video- oder GPIO-Timing-Ausführung.
+
+**Drone-Regeln:** Persistenter Betriebsmodus; keine selbstständige Aufnahme, Power-Shooter- oder Motion-Auslösung; automatischer SD-Recovery-Pfad im Hauptloop aus; keine gewöhnliche Sleep-Automatik; Cluster/Web/Zeitabgleich/Capture-Aufträge und thermischer Schutz aktiv. Laufender Recorder wird beim Eintritt regulär beendet; keine vollständige erzwungene Kamera-Verdrängung bei Stream/Vorschau.
+
 ## v87-beta103 – Download-Header-Korrektur
 
 Der `/capture_media`-Endpunkt verwendet für `Content-Disposition` einen gültig quotierten Dateinamen der Form `attachment; filename="<uuid>.jpg"`. Die Authentifizierung und die Media-Store-Logik sind unverändert.
@@ -840,3 +848,20 @@ Drone ist nun im regulären Konfigurationsformular unter Betriebsmodus auswählb
 
 ### Beta 102: RAM-Medienauslieferung
 Capture-Jobs bleiben an die einzige UTC-Zeitbasis gekoppelt. Der Node leert bei akzeptiertem Auftrag den vorhandenen PSRAM-Ring; der Ring überschreibt innerhalb des Auftrags niemals Bilder. Ein späterer Sequenzexecutor muss vor jedem Bild die freie Slot- und Bytekapazität prüfen und bei Erschöpfung die restlichen Bilder auslassen. HTTP JPEG-GET wird auf demselben Node bedient, durch den bestehenden Web-Authentifizierungsmechanismus geschützt; die UUID ist keine Berechtigung. Der Coordinator speichert nur UUID/Software-Dispatch/Bytezahl in seiner begrenzten RAM-Job-Tabelle, zusammen mit dem zuletzt bekannten IP-Link. Die Linkgültigkeit endet mit dem nächsten akzeptierten Capture-Auftrag oder einem Node-Neustart.
+
+
+### Capture-Uhr auf Coordinator-Webseite (beta104)
+- Der Coordinator-Webclient liest für Zeitplanung die gültige `cluster_time.utc_us` aus `/cluster_status` statt `Date.now()` vom Computer. Gilt für relative Zeiten und die Prüfung fixer UTC-Zeiten. Bei fehlender/ungültiger Clusterzeit wird kein Auftrag verschickt.
+- Der Client verankert diese UTC-Zeit anhand der Mitte der HTTP-Laufzeit an `performance.now()`; der Countdown läuft monoton ohne Abhängigkeit von späteren PC-Uhränderungen. HTTP-Transport und ungewisse Abfragephase begrenzen die Anzeigepräzision; dies ist **nur eine Näherung der Coordinator-Clusterzeit**, kein gemessener Auslöse- oder Belichtungszeitpunkt.
+- Der Countdown startet bei der ersten erfolgreichen HTTP-Auftragsannahme; Grün markiert weiter nur den Soll-Termin. Der signierte Medienabschlussbericht ist davon unabhängig.
+- Kein Wechsel der Capture-Protokollfelder; Node-Firmware und Kamera werden nicht geändert. Auf Coordinator beta104 installieren; Node kann zunächst beta103 bleiben.
+- 5 eingebettete JS-Blöcke mit Node.js `--check` geprüft, ZIP-Integrität geprüft. Kein vollständiger Arduino/ESP32-Compile und kein Hardwaretest.
+
+
+## Beta 105: Capture-Zeitanker nach Auftragseingang eingefroren
+
+**Verbindliche Regel:** Ein gültiger und akzeptierter signierter Capture-Auftrag (`SFJC1`) besitzt einen absoluten Soll-Termin in UTC-Mikrosekunden. Der Node liest dazu genau einmal seine aktuelle Cluster-UTC-Schätzung sowie `esp_timer_get_time()` und bildet `deadlineMonoUs = receivedMonoUs + (targetUtcUs - receivedClusterUtcUs)`. Danach verwendet die lokale Terminsteuerung bis zum Shot **ausschließlich** `deadlineMonoUs`. Weder ein neuer NTP-Wert noch eine geänderte Clusterzeit darf eine bereits angenommene Deadline nachführen. Gültige Folgeaufträge verwenden wieder die zu ihrem jeweiligen Annahmezeitpunkt beste Schätzung.
+
+Die Kamera wird höchstens zwei Sekunden vor der monotonic Deadline vorbereitet. Beim Software-Dispatch berechnet sie den berichteten UTC-Zeitstempel aus der **eingefrorenen** Abbildung `anchorUtcUs + (esp_timer_get_time() - anchorMonoUs)`; Abweichung zur geplanten UTC wird ebenso aus dieser Skala berechnet. Dieser Zeitstempel ist **kein Sensorshutter-/VSYNC-Nachweis**. Die gemeinsame Auslösung hängt von der Synchronisationsqualität beim jeweiligen Auftragseingang, Drift des monotonen Timers und Kamera-Latenz ab. Synchronisationsverbesserungen innerhalb eines bereits laufenden Jobs dürfen dessen Deadline nicht verändern. Eine fallende Netzwerkverbindung nach Annahme soll den lokalen Timer nicht verschieben; die Ergebniszustellung kann jedoch fehlschlagen.
+
+Geltungsbereich: Capture-Job (PHOTO), nicht globale Sperre von NTP oder der ESP32-Systemuhr. Bei Node-Neustart gehen RAM-Deadline und PSRAM-Medien verloren. Die aktuelle Kamera-Pipeline synchronisiert den **Software-Dispatch**, nicht nachweislich den Belichtungsbeginn. Maximal 30 Minuten Planungsvorlauf (zuvor 120 Sekunden); Job-Timeout 30 Minuten plus 30 Sekunden, keine automatischen Wiederholungen. Weitere Aktionen (Sequenz, Video, GPIO) müssen später denselben unveränderlichen Deadline-Vertrag übernehmen.

@@ -88,7 +88,15 @@ static const char *CLUSTER_JOB_DRONE_ACK_MAGIC = "SFJDA1";
 static uint32_t droneSeenBoot=0,droneSeenEpoch=0,droneSeenSeq=0;
 static const char *CLUSTER_JOB_WIPE_MAGIC = "SFJW1";
 static const char *CLUSTER_JOB_WIPE_RESULT_MAGIC = "SFJWR1";
-struct PendingCapture {bool active=false;uint32_t cb=0,epoch=0,seq=0;int64_t utc=0;};
+// UTC is resolved exactly once on acceptance. The deadline subsequently lives
+// exclusively in the local monotonic esp_timer domain; NTP and new cluster
+// synchronization samples cannot move an armed capture.
+struct PendingCapture {
+    bool active=false;
+    uint32_t cb=0,epoch=0,seq=0;
+    int64_t utc=0;
+    int64_t anchorUtcUs=0,anchorMonoUs=0,deadlineMonoUs=0;
+};
 static PendingCapture pendingCapture;
 bool clusterCaptureArmedFlag=false;
 static uint32_t captureSeenBoot=0,captureSeenEpoch=0,captureSeenSeq=0;
@@ -2752,11 +2760,16 @@ static void processJobCapture(char **f,size_t n,const IPAddress &ip) {
     int64_t utc=(int64_t)strtoll(f[8],&end,10);
     int64_t nowUtc=0;
     if(errno||!end||*end||utc<=0||!clusterTimeNowUs(nowUtc)||utc-nowUtc<1500000LL||
-       utc-nowUtc>120000000LL||pendingCapture.active) {
+       utc-nowUtc>1800000000LL||pendingCapture.active) {
         sendCaptureResult(cb,epoch,seq,3,1,0);return;
     }
+    // Freeze the mapping immediately, before sending the acceptance ACK.
+    // Future cluster/NTP adjustments only influence *future* jobs.
+    const int64_t acceptedMonoUs=esp_timer_get_time();
+    const int64_t remainingUs=utc-nowUtc;
     clusterCaptureBeginJob(((uint64_t)cb<<32)|seq);
-    pendingCapture={true,cb,epoch,seq,utc};
+    pendingCapture={true,cb,epoch,seq,utc,nowUtc,acceptedMonoUs,
+                    acceptedMonoUs+remainingUs};
     sendCaptureResult(cb,epoch,seq,1,0,0);
 }
 static void processJobCaptureResult(char **f,size_t n,const IPAddress &ip) {
@@ -2792,15 +2805,16 @@ static void processJobCaptureResult(char **f,size_t n,const IPAddress &ip) {
 // backends must replace the dispatch mechanism, not the shared UTC contract.
 static void serviceScheduledCapture(){
     if(!pendingCapture.active)return;
-    int64_t nowUtc=0;
-    if(!clusterTimeNowUs(nowUtc)){
-        PendingCapture p=pendingCapture;pendingCapture.active=false;clusterCaptureArmedFlag=false;
-        sendCaptureResult(p.cb,p.epoch,p.seq,3,4,0);return;
-    }
-    if(nowUtc<pendingCapture.utc){
-        if(pendingCapture.utc-nowUtc<=2000000LL && !clusterCaptureArmedFlag){
+    // Deliberately do not call clusterTimeNowUs() here. A capture accepted
+    // at UTC T owns a fixed monotonic deadline even if the coordinator's
+    // NTP clock jumps, the node receives a new sync sample, or WiFi drops.
+    const int64_t nowMonoUs=esp_timer_get_time();
+    const int64_t leftUs=pendingCapture.deadlineMonoUs-nowMonoUs;
+    if(leftUs>0){
+        if(leftUs<=2000000LL && !clusterCaptureArmedFlag){
             if(!clusterCapturePrepareCamera()){
                 PendingCapture p=pendingCapture;pendingCapture.active=false;
+                clusterCaptureArmedFlag=false;
                 sendCaptureResult(p.cb,p.epoch,p.seq,3,1,0);return;
             }
             clusterCaptureArmedFlag=true;
@@ -2809,14 +2823,15 @@ static void serviceScheduledCapture(){
     }
     PendingCapture p=pendingCapture;pendingCapture.active=false;
     uint32_t bytes=0;int64_t dispatch=0;
-    uint16_t rc=clusterCapturePhoto(((uint64_t)p.cb<<32)|p.seq,p.utc,dispatch,bytes);
+    uint16_t rc=clusterCapturePhoto(((uint64_t)p.cb<<32)|p.seq,p.utc,dispatch,bytes,
+                                    p.anchorUtcUs,p.anchorMonoUs);
     captureLastDispatchOffsetUs=dispatch?dispatch-p.utc:0;
     captureLastSize=bytes;captureLastError=rc;
     clusterCaptureArmedFlag=false;
     char mediaUuid[37]={};int64_t actualDispatch=0;
     if(!rc&&!clusterCaptureLatestMedia(((uint64_t)p.cb<<32)|p.seq,mediaUuid,actualDispatch))rc=5;
     sendCaptureResult(p.cb,p.epoch,p.seq,rc?3:2,rc,bytes,mediaUuid,actualDispatch);
-    Serial.printf("[CLUSTER CAPTURE] seq=%lu rc=%u jpeg=%lu dispatch_offset_us=%lld (NOT exposure)\n",
+    Serial.printf("[CLUSTER CAPTURE] seq=%lu rc=%u jpeg=%lu dispatch_offset_us=%lld (frozen clock; NOT exposure)\n",
         (unsigned long)p.seq,(unsigned)rc,(unsigned long)bytes,(long long)captureLastDispatchOffsetUs);
 }
 
@@ -4082,8 +4097,8 @@ bool clusterRequestNodeShutdown(const String &nodeId, String &error)
 bool clusterRequestNodeCapture(const String &nodeId,int64_t utcUs,String &error){
     if(!clusterLocalIsCoordinator()){error="Nur am Coordinator.";return false;}
     int64_t nowUtc=0;
-    if(!clusterTimeNowUs(nowUtc)||utcUs-nowUtc<2000000LL||utcUs-nowUtc>120000000LL){
-        error="Capture-Zeit muss 2 bis 120 Sekunden in der Zukunft liegen.";return false;
+    if(!clusterTimeNowUs(nowUtc)||utcUs-nowUtc<2000000LL||utcUs-nowUtc>1800000000LL){
+        error="Capture-Zeit muss 2 Sekunden bis 30 Minuten in der Zukunft liegen.";return false;
     }
     const ClusterPeer *peer=findPeer(nodeId.c_str());
     if(!peer||!peer->used||!usableIp(peer->ip)||!peer->bootNonce||
@@ -4091,7 +4106,7 @@ bool clusterRequestNodeCapture(const String &nodeId,int64_t utcUs,String &error)
     if(++probeSeq==0)++probeSeq;
     uint64_t id=((uint64_t)bootNonce<<32)|probeSeq;
     if(!ClusterJobs::enqueue(id,currentCoordinatorEpoch,peer->integrationId,
-        ClusterJobs::Kind::Capture,millis(),180000UL)){error="Job-Liste voll.";return false;}
+        ClusterJobs::Kind::Capture,millis(),1830000UL)){error="Job-Liste voll.";return false;}
     char cb[9],nb[9],when[30];
     snprintf(cb,sizeof(cb),"%08lx",(unsigned long)bootNonce);
     snprintf(nb,sizeof(nb),"%08lx",(unsigned long)peer->bootNonce);
