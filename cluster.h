@@ -26,6 +26,12 @@ bool clusterRequestNodeWipe(const String &nodeId,String &error);
 bool clusterRequestNodeDrone(const String &nodeId, bool enabled, String &error);
 // Capture time in UTC microseconds; shared across all selected nodes.
 bool clusterRequestNodeCapture(const String &nodeId, int64_t utcUs, String &error);
+// Transport-only SFHT1 sender; not enabled in WebConfig until measurement safety is complete.
+bool clusterRequestNodeHwTime(const String &nodeId, uint8_t channel, int64_t utcUs, String &error, uint32_t *sequenceOut = nullptr);
+// Three-node one-shot GPIO diagnostic, disabled by default hardware pin mapping.
+bool clusterHwTimeStart(const String nodeIds[3], String &error);
+String clusterHwTimeStatusJson();
+String clusterHwTimeCsv();
 bool clusterRuntimeActive();
 bool clusterLocalIsCoordinator();
 // Sends an authenticated advisory time-sync trigger; no system-clock changes.

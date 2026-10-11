@@ -30,6 +30,16 @@ struct RadarSettings {
 };
 
 
+// Exclusive UART handoff for a future Drone-Mode GPIO clock measurement.
+// Call only from the normal main-loop context, not from an ISR.
+// Returns false if the UART is busy or Drone Mode is not active.
+// On success GPIO RADAR_RX_PIN is no longer owned by HardwareSerial.
+// This does NOT reserve or initialize the measurement input by itself.
+bool radarReleaseUartForTimeMeasurement();
+// Reacquire the UART after the caller has released the measurement GPIO.
+// Reestablishes the report stream best-effort; remains in Drone Mode.
+void radarRestoreUartAfterTimeMeasurement();
+
 // Initialize the dedicated hardware UART.
 void radarBegin();
 

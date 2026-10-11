@@ -24,8 +24,8 @@ static constexpr int16_t SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10 = 85;
 // BOARD AUSWÄHLEN
 // =============================================================
 
-//#define BOARD_FREENOVE
-#define BOARD_XIAO
+#define BOARD_FREENOVE
+//#define BOARD_XIAO
 
 
 #if defined(BOARD_FREENOVE) && defined(BOARD_XIAO)
@@ -142,6 +142,24 @@ static constexpr size_t BOARD_WIFI_TX_POWER_LEVEL_COUNT =
 static constexpr int16_t BOARD_WIFI_TX_POWER_DEFAULT_X10 = 200;
 
 
+// Three provisional FNK0085 measurement input candidates for a dedicated test
+// setup: GPIO14 (magnet), GPIO21 (presence) and GPIO41 (radar UART RX).
+// ALL THREE conflict with existing SensorForge functions! They must remain
+// NONE until the measurement implementation can take exclusive ownership,
+// restore the pins afterwards, and verify physical wiring. No GPIO is touched.
+// GPIO35/36/37 are unavailable with OPI PSRAM; 38/39/40 are SD_MMC.
+#define CLUSTER_HW_TIME_CANDIDATE_IN_1 14
+#define CLUSTER_HW_TIME_CANDIDATE_IN_2 21
+#define CLUSTER_HW_TIME_CANDIDATE_IN_3 41
+#define CLUSTER_HW_TIME_IN_1 (-1)
+#define CLUSTER_HW_TIME_IN_2 (-1)
+#define CLUSTER_HW_TIME_IN_3 (-1)
+// Freenove diagnostic output candidate: GPIO48 (onboard RGB LED data).
+// This is NOT conflict-free; only use after explicit hardware verification
+// and exclusive control during a future, implemented measurement.
+// The current preparation code does not configure or drive this pin.
+#define CLUSTER_HW_TIME_OUT 48
+
 // =============================================================
 // XIAO ESP32S3 SENSE
 // =============================================================
@@ -149,6 +167,14 @@ static constexpr int16_t BOARD_WIFI_TX_POWER_DEFAULT_X10 = 200;
 #elif defined(BOARD_XIAO)
 
 #define BOARD_DISPLAY_NAME "Seeed XIAO ESP32S3 Sense"
+
+// Reserved diagnostic output D1 / GPIO2. Only use during explicit test.
+// XIAO has no three-channel coordinator input assignment by default.
+#define CLUSTER_HW_TIME_OUT 2
+#define CLUSTER_HW_TIME_IN_1 (-1)
+#define CLUSTER_HW_TIME_IN_2 (-1)
+#define CLUSTER_HW_TIME_IN_3 (-1)
+
 
 // Video-codec hardware capability only. This does NOT by itself enable an
 // ONVIF/RTSP codec; the streamer must also implement and qualify that codec.

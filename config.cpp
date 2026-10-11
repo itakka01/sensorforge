@@ -172,7 +172,7 @@ String cfg_camera_email = "";
 String cfg_camera_overlay_text = "";
 String cfg_camera_description = "";
 String cfg_timezone = "CET-1CEST,M3.5.0,M10.5.0/3";
-String cfg_wifi_on_system_start = "off";
+String cfg_wifi_on_system_start = "on";
 int cfg_wifi_timeout_sec = 0;
 int cfg_wifi_alive_schedule_enabled = 0;
 String cfg_wifi_alive_schedule = "";
@@ -1130,7 +1130,7 @@ static void setDefaultValues(
         "rollover";
 
     values.wifiOnSystemStart =
-        "off";
+        "on";
 
     values.wifiTimeoutSec =
         0;

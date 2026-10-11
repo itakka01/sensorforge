@@ -19010,7 +19010,7 @@ void webConfigStart()
                 server.send(404,"text/plain","Photo not available (expired, unknown or rebooted)");return;
             }
             server.sendHeader("Cache-Control","no-store");
-            server.sendHeader("Content-Disposition", "attachment; filename=\"" + server.arg("uuid") + ".jpg\"");
+            server.sendHeader("Content-Disposition", (server.hasArg("view") && server.arg("view") == "1" ? "inline; filename=\"" : "attachment; filename=\"") + server.arg("uuid") + ".jpg\"");
             server.setContentLength(length);
             server.send(200,"image/jpeg","");
             server.client().write(data,length);

@@ -1,5 +1,6 @@
 #include "radar.h"
 #include "board_config.h"
+#include "drone_mode.h"
 
 #include <HardwareSerial.h>
 #include <Preferences.h>
@@ -12,6 +13,11 @@
 // =============================================================
 
 static HardwareSerial radarSerial(1);
+// Tracks real UART ownership; no pins change during normal operation.
+static bool radarUartStarted = false;
+static bool radarUartReleasedForMeasurement = false;
+static bool radarTrackingBeforeMeasurement = false;
+static bool radarUartWasStartedBeforeMeasurement = false;
 
 static const uint32_t RADAR_BAUD =
     115200UL;
@@ -2679,6 +2685,41 @@ static void parseStandardByte(
 // PUBLIC API
 // =============================================================
 
+bool radarReleaseUartForTimeMeasurement()
+{
+    // Drone is a prerequisite, not a new persistent operating mode.
+    // Do not interrupt a command transaction that currently owns the UART.
+    if (!droneModeEnabled() || commandInProgress || radarUartReleasedForMeasurement)
+        return false;
+    radarTrackingBeforeMeasurement = motionTrackingConfigured;
+    radarUartWasStartedBeforeMeasurement = radarUartStarted;
+    radarUartReleasedForMeasurement = true;
+    if (radarUartStarted) {
+        radarSerial.end();
+        radarUartStarted = false;
+    }
+    motionTrackingConfigured = false;
+    return true;
+}
+
+void radarRestoreUartAfterTimeMeasurement()
+{
+    if (!radarUartReleasedForMeasurement) return;
+    const bool restoreTracking = radarTrackingBeforeMeasurement;
+    // The caller must first detach its GPIO input/interrupt.
+    radarUartReleasedForMeasurement = false;
+    if (!radarUartWasStartedBeforeMeasurement) return;
+    radarSerial.begin(RADAR_BAUD, SERIAL_8N1, RADAR_RX_PIN, RADAR_TX_PIN);
+    radarUartStarted = true;
+    resetReportParsers();
+    if (restoreTracking) {
+        String error;
+        if (!radarStartMotionTracking(error)) {
+            Serial.printf("Radar tracking restore failed: %s\n", error.c_str());
+        }
+    }
+}
+
 void radarBegin()
 {
     radarHardwareDetected =
@@ -2690,6 +2731,7 @@ void radarBegin()
         RADAR_RX_PIN,
         RADAR_TX_PIN
     );
+    radarUartStarted = true;
 
     resetReportParsers();
     radarCalibrationResetAll();
@@ -2939,6 +2981,7 @@ bool radarStartMotionTracking(
 
 void radarLoop()
 {
+    if (radarUartReleasedForMeasurement) return;
     if (commandInProgress)
         return;
 

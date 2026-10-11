@@ -1957,7 +1957,7 @@ static void handleExclusivePost()
         return;
     }
 
-    if (g_storageLocked || g_recordingStartBlocked || remountAdmissionBusy()) {
+    if (g_storageLocked || g_recordingStartBlocked || webSdAdmissionController().busy()) {
         sendBusy("storage_locked");
         return;
     }
