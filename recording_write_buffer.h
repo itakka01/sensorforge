@@ -66,6 +66,7 @@ public:
     void close();
 
     bool isOpen() const;
+    bool hasPendingIo() const;
     bool failed() const;
     const char *lastError() const;
     bool writeBehindEnabled() const;

@@ -112,9 +112,9 @@ String webconfigWifiSettingsHtml(const String &notice)
         "<form id='wifiSettingsForm' method='POST' action='/wifi_settings_save'>"
         "<section class='settings-section'>"
         "<div class='config-field-grid'>"
-        "<div class='config-label'>Gerätename</div>"
-        "<div class='config-control'><input name='hostname' maxlength='63' autocomplete='off' value='" +
-        wifiUiHtmlEscape(cfg_hostname) + "'></div>"
+        "<div class='config-label'>Gerätename / Hotspot</div>"
+        "<div class='config-control'><strong class='mono'>" + wifiUiHtmlEscape(cfg_hostname) + "</strong>"
+        "<div class='config-note'>Wird ausschließlich in der Systemkonfiguration festgelegt; gilt auch als Hotspot-SSID und WLAN-Hostname.</div></div>"
         "<div class='config-label'>Verbindungsart</div>"
         "<div class='config-control'><select name='hotspot_enabled' id='wifi-connection-mode'>"
         "<option value='0'" + String(!cfg_hotspot_enabled ? " selected" : "") + ">Externe WLAN-Netzwerke verwenden</option>"
@@ -327,9 +327,9 @@ String webconfigWifiSettingsHtml(const String &notice)
 
     html +=
         "<script>(function(){"
-        "var f=document.getElementById('wifiSettingsForm'),b=document.getElementById('wifiSaveBar'),s=document.getElementById('wifiSaveState'),btn=document.getElementById('wifiSaveButton'),list=document.getElementById('wifiProfileList'),scanBtn=document.getElementById('wifiScanButton'),scanStatus=document.getElementById('wifiScanStatus'),scanResults=document.getElementById('wifiScanResults'),scanBackdrop=document.getElementById('wifiScanBackdrop'),scanClose=document.getElementById('wifiScanClose'),ext=document.getElementById('externalWifiBlock'),ap=document.getElementById('hotspotBlock'),ib=document.getElementById('wifiInfoBackdrop'),it=document.getElementById('wifiInfoTitle'),ic=document.getElementById('wifiInfoBody'),ix=document.getElementById('wifiInfoClose'),aliveTable=document.getElementById('wifiAliveTable'),aliveAdd=document.getElementById('wifiAliveAdd'),aliveSerialized=document.getElementById('wifiAliveSerialized'),hostnameInput=f.querySelector(\"input[name='hostname']\"),hotspotNamePreview=document.getElementById('wifiHotspotNamePreview');"
+        "var f=document.getElementById('wifiSettingsForm'),b=document.getElementById('wifiSaveBar'),s=document.getElementById('wifiSaveState'),btn=document.getElementById('wifiSaveButton'),list=document.getElementById('wifiProfileList'),scanBtn=document.getElementById('wifiScanButton'),scanStatus=document.getElementById('wifiScanStatus'),scanResults=document.getElementById('wifiScanResults'),scanBackdrop=document.getElementById('wifiScanBackdrop'),scanClose=document.getElementById('wifiScanClose'),ext=document.getElementById('externalWifiBlock'),ap=document.getElementById('hotspotBlock'),ib=document.getElementById('wifiInfoBackdrop'),it=document.getElementById('wifiInfoTitle'),ic=document.getElementById('wifiInfoBody'),ix=document.getElementById('wifiInfoClose'),aliveTable=document.getElementById('wifiAliveTable'),aliveAdd=document.getElementById('wifiAliveAdd'),aliveSerialized=document.getElementById('wifiAliveSerialized'),hotspotNamePreview=document.getElementById('wifiHotspotNamePreview');"
         "if(!f||!b||!s||!btn||!list)return;"
-        "function dirty(){b.classList.add('dirty');s.textContent='Ungespeicherte Änderungen';btn.disabled=false;}function syncHotspotName(){if(hostnameInput&&hotspotNamePreview)hotspotNamePreview.textContent=hostnameInput.value;}if(hostnameInput){hostnameInput.addEventListener('input',syncHotspotName);syncHotspotName();}function updateMode(){var m=f.querySelector(\"select[name='hotspot_enabled']\"),fb=f.querySelector(\"select[name='hotspot_fallback_enabled']\");var hotspot=m&&m.value==='1',fallback=fb&&fb.value==='1';if(ext)ext.hidden=hotspot;if(ap)ap.hidden=!hotspot&&!fallback;}"
+        "function dirty(){b.classList.add('dirty');s.textContent='Ungespeicherte Änderungen';btn.disabled=false;}function updateMode(){var m=f.querySelector(\"select[name='hotspot_enabled']\"),fb=f.querySelector(\"select[name='hotspot_fallback_enabled']\");var hotspot=m&&m.value==='1',fallback=fb&&fb.value==='1';if(ext)ext.hidden=hotspot;if(ap)ap.hidden=!hotspot&&!fallback;}"
         "function rows(){return Array.prototype.slice.call(list.querySelectorAll('.wifi-profile'));}function updateProfileActions(){rows().forEach(function(r){var ssid=r.querySelector('.wifi-ssid'),filled=ssid&&ssid.value.trim();['.wifi-up','.wifi-down','.wifi-delete'].forEach(function(sel){var x=r.querySelector(sel);if(x)x.style.display=filled?'':'none';});});}"
         "function renumber(){rows().forEach(function(r,i){r.querySelector('.wifi-profile-title').textContent=(i+1);r.dataset.slot=i+1;['wifi-ssid','wifi-pass','wifi-source'].forEach(function(c){var e=r.querySelector('.'+c);if(e)e.name=(c==='wifi-ssid'?'wifi_ssid_':c==='wifi-pass'?'wifi_pass_':'wifi_source_')+(i+1);});});}"
         "function ensureBlankRow(){var rs=rows(),visible=rs.filter(function(r){return r.style.display!=='none';}),hasBlank=visible.some(function(r){return !r.querySelector('.wifi-ssid').value.trim();});if(!hasBlank&&visible.length<5){for(var i=0;i<rs.length;i++){if(rs[i].style.display==='none'){rs[i].style.display='';break;}}}updateProfileActions();}"
@@ -405,8 +405,8 @@ bool webconfigWifiSaveRequest(
     String &error
 )
 {
-    String hostname = server.arg("hostname");
-    hostname.trim();
+    // Ignore stale/forged WiFi-page hostname fields: this page never owns identity.
+    String hostname = cfg_hostname;
 
     String wifiOnSystemStart = server.arg("wifi_on_system_start");
     wifiOnSystemStart.trim();

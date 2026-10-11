@@ -33,8 +33,8 @@ void reset();
 // transport and explicit administrator consent are implemented.
 bool enqueue(uint64_t jobId, uint32_t coordinatorEpoch, const char *nodeId,
              Kind kind, uint32_t nowMs, uint32_t timeoutMs);
-// Never retries a completed job. Duplicate IDs cannot be enqueued again while
-// the current runtime is active, even if an old entry is terminal.
+// Never retries a completed job. A terminal history entry may be evicted
+// once the bounded table is full; IDs are unique per coordinator boot sequence.
 bool transition(uint64_t jobId, uint32_t coordinatorEpoch, State next,
                 uint32_t nowMs, uint16_t resultCode = 0);
 bool setCaptureMedia(uint64_t id,uint32_t epoch,const char *uuid,int64_t dispatch,uint32_t bytes);

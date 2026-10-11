@@ -4393,6 +4393,10 @@ static void handleConfig()
         pageInfoButton("Gerät / Kamera", cameraMetadataInfo) +
         "</div>"
         "<div style='display:grid;gap:12px;margin-top:14px'>"
+        "<div style='border:1px solid #e1e5ea;border-radius:10px;padding:12px 14px;background:#fafbfc'>"
+        "<strong>Gerätename (auch WLAN-Hotspot / Netzwerk-Hostname)</strong>"
+        "<input style='width:100%;box-sizing:border-box;margin-top:8px' name='hostname' maxlength='32' required pattern='[A-Za-z0-9](?:[A-Za-z0-9-]{0,30}[A-Za-z0-9])?' title='1–32 Zeichen: Buchstaben, Ziffern, Bindestrich; erster und letzter Buchstabe/Ziffer' value='" + htmlEscape(cfg_hostname) + "'>"
+        "<div class='muted'>Nur Buchstaben, Ziffern und Bindestriche (1–32 Zeichen), kein Bindestrich am Anfang oder Ende. WLAN-Name wird automatisch übernommen; wirksam nach Neustart.</div></div>"
 
         "<div style='border:1px solid #e1e5ea;border-radius:10px;padding:12px 14px;background:#fafbfc'>"
         "<div style='display:flex;align-items:center;gap:7px;margin-bottom:7px'><strong>Kameraname / Text im Streamingbild</strong>" +
@@ -5542,8 +5546,22 @@ static void handleSave()
         return;
     }
 
-    // Hostname and SSID are edited on the dedicated WiFi page.
-    String hostname = cfg_hostname;
+    // Single source of truth: edit the hostname only on this system page.
+    String hostname = server.arg("hostname");
+    hostname.trim();
+    bool validHostname = hostname.length() >= 1 && hostname.length() <= 32;
+    for (size_t i = 0; validHostname && i < hostname.length(); ++i) {
+        char c = hostname[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || (c == '-' && i > 0 && i + 1 < hostname.length()))) {
+            validHostname = false;
+        }
+    }
+    if (!validHostname) {
+        server.send(400, "text/plain; charset=utf-8",
+                    "Ungültiger Gerätename: 1–32 Zeichen (A–Z, a–z, 0–9, Bindestrich nur innen)");
+        return;
+    }
 
 
     String timezone =
@@ -5956,6 +5974,58 @@ static void handleSave()
     text += logFile;
     text += '\n';
 
+    // General settings must not remove cluster membership or credentials.
+    // Cluster settings are edited exclusively on the dedicated cluster page.
+    text += "cluster_enabled=" + String(cfg_cluster_enabled) + "\n";
+    text += "cluster_id=" + cfg_cluster_id + "\n";
+    text += "cluster_name=" + cfg_cluster_name + "\n";
+    text += "cluster_credential_epoch=" + String((unsigned long)cfg_cluster_credential_epoch) + "\n";
+    text += "cluster_password=" + cfg_cluster_password + "\n";
+    text += "cluster_coordinator_policy=" + cfg_cluster_coordinator_policy + "\n";
+
+    // General settings own only a subset of the persistent configuration.
+    // Preserve every other key from the validated internal copy, including
+    // additional WiFi profiles, schedules, VPN credentials and future keys.
+    // Never silently replace missing keys with boot defaults.
+    String previousConfig;
+    String readError;
+    if (!configReadInternalText(previousConfig, readError)) {
+        // First setup: no persistent config has ever been loaded and the
+        // internal file is genuinely absent. Creating it from firmware
+        // defaults plus submitted settings is intentional in this case.
+        // An unreadable/invalid file, or a file lost after a successful
+        // boot load, must still abort to avoid erasing existing settings.
+        const bool firstSetup =
+            configGetSource() == CONFIG_SOURCE_DEFAULTS &&
+            configInternalAvailable() &&
+            strcmp(configInternalStatusName(), "missing") == 0;
+        if (!firstSetup) {
+            server.send(500, "text/plain; charset=utf-8",
+                        "Existing config unavailable: " + readError);
+            return;
+        }
+    }
+
+    int lineStart = 0;
+    while (lineStart < (int)previousConfig.length()) {
+        int lineEnd = previousConfig.indexOf('\n', lineStart);
+        if (lineEnd < 0) lineEnd = previousConfig.length();
+        String line = previousConfig.substring(lineStart, lineEnd);
+        line.trim();
+        lineStart = lineEnd + 1;
+        if (!line.length() || line[0] == '#' || line[0] == ';') continue;
+
+        const int equalsAt = line.indexOf('=');
+        if (equalsAt <= 0) continue;
+        String key = line.substring(0, equalsAt);
+        key.trim();
+        const String prefix = key + "=";
+        if (!text.startsWith(prefix) &&
+            text.indexOf("\n" + prefix) < 0) {
+            text += line;
+            text += '\n';
+        }
+    }
 
     String validationError;
 
@@ -6122,6 +6192,7 @@ static void handleSave()
             cfg_motion_recording_enabled =
                 motionRecordingEnabled;
 
+            cfg_hostname = hostname;
             cfg_camera_display_name = cameraDisplayName;
             cfg_camera_location = cameraLocation;
             cfg_camera_gps_lat = cameraGpsLat;
@@ -6303,6 +6374,7 @@ static void handleSave()
             cfg_motion_recording_enabled =
                 motionRecordingEnabled;
 
+            cfg_hostname = hostname;
             cfg_camera_display_name = cameraDisplayName;
             cfg_camera_location = cameraLocation;
             cfg_camera_gps_lat = cameraGpsLat;
@@ -7628,6 +7700,16 @@ static String imageMotionInfoButton(
 static void handleImageMotionPage()
 {
     String html = htmlHeader();
+    if (droneModeEnabled()) {
+        stopCameraPreview();
+        html += "<h2>Image Motion</h2><p>Drone Mode aktiv – Live-Vorschau deaktiviert. "
+                "Die Kamera bleibt für Cluster-Aufträge verfügbar.</p>";
+        html += htmlFooter();
+        server.sendHeader("Cache-Control", "no-store");
+        server.send(200, "text/html; charset=utf-8", html);
+        return;
+    }
+
 
     html += "<div style='display:flex;align-items:center;gap:7px;flex-wrap:wrap'><h2 style='margin-right:0'>" +
         htmlText(UI_IMAGE_MOTION_TITLE) + "</h2>" +
@@ -7839,6 +7921,16 @@ function release(){fetch('/preview_stop?im=1',{method:'POST',keepalive:true}).ca
 static void handlePreview()
 {
     String html = htmlHeader();
+    if (droneModeEnabled()) {
+        stopCameraPreview();
+        html += "<h2>Kamera</h2><p>Drone Mode aktiv – Live-Vorschau deaktiviert. "
+                "Die Kamera bleibt für Cluster-Aufträge verfügbar.</p>";
+        html += htmlFooter();
+        server.sendHeader("Cache-Control", "no-store");
+        server.send(200, "text/html; charset=utf-8", html);
+        return;
+    }
+
 
     html += "<h2>Kamera</h2>";
 
@@ -8875,6 +8967,17 @@ static void analyzeStreamerSnapshotForImageMotion(
 
 static void handleSnapshot()
 {
+    // Drone readiness reserves the camera for coordinator capture commands.
+    // Reject browser polling before touching either capture pipeline.
+    if (droneModeEnabled()) {
+        // Avoid repeated sensor operations from a browser still polling.
+        if (cameraPreviewActive)
+            stopCameraPreview();
+        server.sendHeader("Cache-Control", "no-store");
+        server.send(503, "text/plain; charset=utf-8", "Drone Mode aktiv - Live-Vorschau deaktiviert");
+        return;
+    }
+
     if (streamerModeEnabled()) {
         // The camera settings page remains on the common /snapshot URL. In
         // streamer mode this request only raises demand on the existing shared

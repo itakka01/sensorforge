@@ -40,7 +40,23 @@ const Entry *find(uint64_t id) {
 bool enqueue(uint64_t id, uint32_t epoch, const char *node, Kind kind,
              uint32_t now, uint32_t timeout) {
     if (!id || !epoch || !validNode(node) || kind == Kind::None ||
-        count == kMaxJobs || timeout < 1000 || timeout > 3600000 || find(id)) return false;
+        timeout < 1000 || timeout > 3600000 || find(id)) return false;
+    // Expire outstanding jobs before evaluating capacity. Reuse only a
+    // terminal slot; an active job must never disappear from the table.
+    expire(now);
+    if (count == kMaxJobs) {
+        size_t oldest = kMaxJobs;
+        for (size_t i = 0; i < count; ++i) {
+            if (!terminal(entries[i].state)) continue;
+            if (oldest == kMaxJobs ||
+                static_cast<int32_t>(entries[i].updatedMs - entries[oldest].updatedMs) < 0)
+                oldest = i;
+        }
+        if (oldest == kMaxJobs) return false;
+        // Keep the remaining snapshot entries in chronological table order.
+        for (size_t i = oldest + 1; i < count; ++i) entries[i - 1] = entries[i];
+        --count;
+    }
     Entry &e = entries[count++];
     e = {};
     e.jobId = id; e.coordinatorEpoch = epoch; e.updatedMs = now; e.createdMs = now;

@@ -290,11 +290,15 @@ window.sfCoordinateStatus=function(force){
     html += R"__HEALTH__(<section class='settings-section'><h3>Cluster-Geräte</h3>
 <p class='muted'>Aktuelle Ressourcenwerte der verbundenen Geräte. SD-Daten werden normalerweise etwa einmal pro Minute aktualisiert, nach einem Cluster-Wipe unmittelbar erneut gemessen und signiert gemeldet. Fehlende Werte werden nicht geschätzt.</p>
 <div class='cluster-select-tools'><button type='button' id='clusterSelectAll'>Alle Nodes auswählen</button> <button type='button' id='clusterSelectNone'>Auswahl aufheben</button> <span id='clusterSelectionCount'>0 ausgewählt</span></div>
-<div class='cluster-select-tools'><button type='button' id='clusterBulkDroneOn'>Ausgewählte Nodes in Drone Mode</button> <button type='button' id='clusterBulkDroneOff'>Drone Mode ausschalten</button></div>
-<div class='cluster-select-tools'><button type='button' id='clusterBulkProbe'>Verbindung testen</button> <button type='button' id='clusterBulkRestart'>Ausgewählte neu starten</button> <button type='button' id='clusterBulkShutdown'>Ausgewählte herunterfahren</button> <button type='button' id='clusterBulkSync'>Zeit ausgewählter Nodes synchronisieren</button> <button type='button' id='clusterBulkWipe' class='danger'>SD ausgewählter Nodes vollständig löschen</button></div>
-<p class='muted'>Drone Mode hält Nodes passiv bereit: kein automatisches Recording, kein Power Shooter, keine Bewegungserkennung und keine Hintergrund-SD-Recovery. Laufende Aufnahmen werden beim Einschalten kontrolliert beendet. Clusterzeit, geplante Capture-Jobs, Webverwaltung und Temperaturschutz bleiben verfügbar.</p>
-<div class='cluster-select-tools'><label for='clusterCaptureSeconds'>Foto in</label> <input id='clusterCaptureSeconds' type='number' min='0' max='59' step='1' value='10' style='width:5.5em' aria-label='Sekunden bis zum Foto'> Sekunden <input id='clusterCaptureMinutes' type='number' min='0' max='30' step='1' value='0' style='width:4.5em' aria-label='Minuten bis zum Foto'> Minuten <button type='button' id='clusterBulkCapture'>Aufnahme planen</button></div>
-<div class='cluster-select-tools'><label for='clusterCaptureUtc'>Alternativ: fester UTC-Termin (optional)</label> <input id='clusterCaptureUtc' type='datetime-local' step='0.001'> <span class='muted'>Wenn ausgefüllt, hat UTC Vorrang.</span></div>
+<div class='cluster-select-tools'><label for='clusterActionChoice'>Aktion für ausgewählte Nodes:</label> <select id='clusterActionChoice'><option value=''>Aktion auswählen …</option><option value='clusterBulkProbe'>Verbindung testen</option><option value='clusterBulkDroneOn'>Drone Mode einschalten</option><option value='clusterBulkDroneOff'>Drone Mode ausschalten</option><option value='clusterBulkSync'>Zeit synchronisieren</option><option value='clusterBulkRestart'>Neu starten</option><option value='clusterBulkShutdown'>Herunterfahren</option><option value='clusterBulkWipe'>SD vollständig löschen</option></select> <button type='button' id='clusterActionRun'>Ausführen</button> <button type='button' id='clusterActionInfo' aria-label='Hinweise zu Cluster-Aktionen' title='Hinweise zu Cluster-Aktionen'>Info</button></div>
+<div id='clusterActionHandlers' style='display:none'><button type='button' id='clusterBulkDroneOn'>Drone Mode EIN</button><button type='button' id='clusterBulkDroneOff'>Drone Mode AUS</button><button type='button' id='clusterBulkProbe'>Verbindung testen</button><button type='button' id='clusterBulkRestart'>Neustart</button><button type='button' id='clusterBulkShutdown'>Shutdown</button><button type='button' id='clusterBulkSync'>Zeitsync</button><button type='button' id='clusterBulkWipe'>SD löschen</button></div>
+<dialog id='clusterActionDialog' style='max-width:min(90vw,650px);padding:24px;border-radius:14px'><h3>Cluster-Aktionen</h3><p>Drone Mode hält Nodes passiv bereit: kein automatisches Recording, kein Power Shooter, keine Bewegungserkennung und keine Hintergrund-SD-Recovery. Laufende Aufnahmen werden beim Einschalten kontrolliert beendet. Clusterzeit, geplante Capture-Jobs, Webverwaltung und Temperaturschutz bleiben verfügbar.</p><p>Sammelaktionen werden einzeln und signiert pro Node ausgeführt. Der Coordinator ist nicht auswählbar. Remote-Shutdown benötigt RESET oder Stromversorgung zum Wiederaufwachen.</p><p>HTTP-Annahme bestätigt nicht die Ausführung. Ergebnisse bitte im Status prüfen.</p><button type='button' id='clusterActionDialogClose'>Schließen</button></dialog>
+<div class='cluster-select-tools'><strong>Foto in</strong> <label for='clusterCaptureHours'>Stunden</label> <input id='clusterCaptureHours' type='number' min='0' max='23' step='1' value='0' style='width:4.5em'> <label for='clusterCaptureMinutes'>Minuten</label> <input id='clusterCaptureMinutes' type='number' min='0' max='59' step='1' value='0' style='width:4.5em'> <label for='clusterCaptureSeconds'>Sekunden</label> <input id='clusterCaptureSeconds' type='number' min='0' max='59' step='1' value='5' style='width:4.5em'> <button type='button' id='clusterBulkCapture'>Aufnahme planen</button> <output id='clusterPlannedTime' style='font-variant-numeric:tabular-nums;font-weight:700'>UTC-Zeit wird geladen …</output></div>
+<!-- Direkte UTC-Eingabe kann später wieder aktiviert werden. sfPlanUtcTarget() akzeptiert dafür einen optionalen UTC-ISO-Termin; aktuell nutzt das Formular ausschließlich relative Zeit. -->
+<div class='cluster-select-tools'><button type='button' id='sfSyncOpen'>Sync-Testbild im Vollbild öffnen</button> <span class='muted'>Beim Capture öffnet sich automatisch ein großes Vollbild-Popup. Countdown und Balken laufen bis 5 s nach dem Auslösezeitpunkt.</span></div>
+<div id='sfSyncScreen' aria-label='Visuelle Synchronisationsanzeige' style='display:none'>
+ <div class='sf-sync-stage'><div class='sf-sync-top'><strong>CLUSTER SYNC · BILDSCHIRMTEST</strong><button id='sfSyncClose' type='button'>Anzeige schließen</button></div><div id='sfSyncPhase' class='sf-sync-phase'>BEREIT</div><div id='sfSyncClock' class='sf-sync-clock'>--:--.---</div><div id='sfSyncTarget' class='sf-sync-target'>Noch kein Capture geplant</div><div id='sfSyncBars' class='sf-sync-bars'></div><div class='sf-sync-foot'>Bildschirm-Refresh und Browser-Timing begrenzen die Genauigkeit. Balken sind eine visuelle Orientierung, kein Millisekunden-Nachweis.</div></div>
+</div>
 <div id='clusterCaptureCountdown' role='timer' aria-label='Countdown zum geplanten Capture' style='display:none;margin:12px 0;padding:15px 17px;border-radius:12px;border:1px solid #64748b55;align-items:center;gap:16px'>
  <span id='clusterCaptureLamp' aria-hidden='true' style='display:inline-block;flex:none;width:23px;height:23px;border-radius:50%;background:#dc2626;box-shadow:0 0 18px #dc262699'></span>
  <div><div id='clusterCaptureClock' style='font-size:2.1rem;font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:.06em'>00:10.0</div><div id='clusterCaptureTargetText' class='muted' style='font-size:.85em'></div></div>
@@ -304,6 +308,21 @@ window.sfCoordinateStatus=function(force){
 @keyframes sfCaptureGreenPulse{0%,22%,44%,66%,88%,100%{opacity:1;box-shadow:0 0 34px 12px #22c55e88}11%,33%,55%,77%{opacity:.28;box-shadow:0 0 8px 0 #22c55e55}}
 #clusterCaptureCountdown.sf-armed #clusterCaptureLamp{animation:sfCaptureRedPulse 1s infinite;background:#dc2626}
 #clusterCaptureCountdown.sf-fired #clusterCaptureLamp{animation:sfCaptureGreenPulse 2.8s ease-in-out 1;background:#16a34a}
+#sfSyncScreen{position:fixed;inset:0;z-index:30000;background:#050816;color:#f8fafc;box-sizing:border-box;padding:clamp(12px,2vw,28px);overflow:auto;font-family:system-ui,sans-serif}
+.sf-sync-stage{min-height:100%;display:flex;flex-direction:column;justify-content:center;gap:clamp(14px,2vh,24px);max-width:1800px;margin:0 auto}
+.sf-sync-top{display:flex;align-items:center;justify-content:space-between;gap:16px;font-size:clamp(20px,2.4vw,38px);letter-spacing:.08em}
+#sfSyncClose{font-size:clamp(16px,1.7vw,24px);padding:12px 18px;flex-shrink:0;cursor:pointer}
+.sf-sync-phase{text-align:center;font-weight:900;font-size:clamp(28px,4vw,64px);color:#f87171}
+.sf-sync-clock{text-align:center;font-weight:900;font-size:clamp(88px,18vw,360px);line-height:1.02;font-variant-numeric:tabular-nums;letter-spacing:.02em;white-space:nowrap}
+.sf-sync-target{text-align:center;font-size:clamp(18px,2.1vw,34px);margin-bottom:1vh}
+.sf-sync-bars{display:grid;gap:clamp(12px,2vh,24px)}
+.sf-sync-row{display:flex;align-items:center;gap:18px}
+.sf-sync-label{width:clamp(90px,13vw,180px);flex:none;text-align:right;font-size:clamp(20px,2.6vw,38px);font-weight:800;font-variant-numeric:tabular-nums}
+.sf-sync-track{flex:1;height:clamp(34px,6vh,82px);background:#1f2937;position:relative;overflow:hidden;border:2px solid #64748b;border-radius:14px;box-shadow:inset 0 0 0 1px #0f172a,0 0 20px #02061766}
+.sf-sync-fill{height:100%;width:0;background:var(--bar-color);box-shadow:0 0 28px var(--bar-color)}
+.sf-sync-block{position:absolute;top:0;bottom:0;width:12%;left:0;background:var(--bar-color);box-shadow:0 0 28px var(--bar-color)}
+.sf-sync-foot{margin-top:1vh;text-align:center;font-size:clamp(14px,1.3vw,22px);color:#cbd5e1}
+@media(max-width:700px){.sf-sync-top{font-size:16px}.sf-sync-top strong{font-size:16px}.sf-sync-label{width:74px;font-size:15px}.sf-sync-track{height:28px}.sf-sync-clock{font-size:16vw}}
 </style>
 <div id='clusterCaptureFeedback' class='muted' role='status'>Aufträge werden vorab verteilt. Zeitangaben gelten als UTC; gemeldet wird zunächst der Software-Dispatch, nicht der Belichtungsbeginn.</div>
 <div id='clusterCaptureReport' style='display:none;margin-top:14px;padding:14px;border:1px solid #64748b66;border-radius:12px' aria-live='polite'>
@@ -312,12 +331,11 @@ window.sfCoordinateStatus=function(force){
  <div class='cluster-table-wrap'><table class='cluster-table'><thead><tr><th>Node</th><th>Auftrag</th><th>Ergebnis</th><th>Foto / Zeitpunkt / Abruf</th></tr></thead><tbody id='clusterCaptureReportRows'></tbody></table></div>
  <p class='muted' style='margin-bottom:0'>„JPEG erfolgreich“ bestätigt die Kamera-Rückmeldung des Nodes; kein Nachweis für exakten Belichtungsbeginn oder langfristige Speicherung. Bericht nur während dieser Browser-Sitzung; Job-Verlauf im Coordinator-RAM ist begrenzt.</p>
 </div>
-<div class='cluster-select-tools'><button type='button' id='clusterSdPreflight'>SD-Löschung prüfen (ohne Löschen)</button></div><p class='muted' id='clusterSdPreflightResult' role='status'>Vorbereitung: Hier werden nur SD- und Recording-Status der ausgewählten Nodes geprüft. Es werden keine Dateien gelöscht.</p>
-<p class='muted'>Sammelaktionen werden pro Node einzeln mit eigenen signierten Befehlen ausgeführt; keine UDP-Broadcasts für Reboot oder Shutdown. Der Coordinator selbst ist nicht auswählbar. Remote-Shutdown benötigt RESET/Stromversorgung zum Wiederaufwachen.</p>
-<div id='clusterBulkFeedback' class='muted' role='status'>Keine Sammelaktion gestartet.</div>
+<details><summary>SD-Wartung: Vorprüfung (ohne Löschen)</summary><p class='muted'>Prüft nur SD- und Recording-Status der ausgewählten Nodes. Es werden keine Dateien gelöscht.</p><button type='button' id='clusterSdPreflight'>SD-Löschung prüfen</button><p class='muted' id='clusterSdPreflightResult' role='status'>Noch nicht geprüft.</p></details>
+<div id='sfSyncNotice' role='status' aria-live='polite' style='display:none;position:fixed;z-index:31000;top:20px;left:50%;transform:translateX(-50%);width:min(90vw,640px);box-sizing:border-box;padding:20px 24px;border:2px solid #60a5fa;border-radius:16px;background:#101c33;color:#f8fafc;box-shadow:0 12px 55px #0009;font:600 clamp(16px,2vw,22px)/1.4 system-ui,sans-serif;text-align:center;white-space:normal'></div>
 <div class='cluster-table-wrap'><table class='cluster-table'><thead><tr><th>Auswahl</th><th>Gerät</th><th>Firmware</th><th>Rolle</th><th>Letzte Aktion</th><th>SD belegt</th><th>SD frei</th><th>CPU-Temperatur</th><th>Uptime</th><th>Boot-ID</th><th>Status</th></tr></thead>
 <tbody id='clusterHealthRows'><tr><td colspan='11'>Lädt …</td></tr></tbody></table></div>
-<details><summary>Weitere Systemwerte</summary><div id='clusterHealthExtra' class='muted'>Lädt …</div><p>CPU-Auslastung wird derzeit nicht gemessen. Temperatur ist der interne ESP32-Messwert, kein Sensor für die Umgebung.</p></details>
+<details><summary>Weitere Systemwerte und Aktionsprotokoll</summary><div id='clusterHealthExtra' class='muted'>Lädt …</div><p>CPU-Auslastung wird derzeit nicht gemessen. Temperatur ist der interne ESP32-Messwert, kein Sensor für die Umgebung.</p><div id='clusterBulkFeedback' class='muted' role='status'>Keine Sammelaktion gestartet.</div></details>
 
 </section><script>
 (function(){
@@ -348,19 +366,28 @@ document.addEventListener('change',function(e){if(e.target.classList.contains('c
 function setAll(v){document.querySelectorAll('.cluster-node-choice').forEach(function(e){e.checked=v;if(v)window.sfSelectedNodes.add(e.value);else window.sfSelectedNodes.delete(e.value);});window.sfSelectionUpdate();}
 document.getElementById('clusterSelectAll').addEventListener('click',function(){setAll(true);});
 document.getElementById('clusterSelectNone').addEventListener('click',function(){setAll(false);});
-var actionBusy=false;
-async function runBulk(path,label,danger){if(actionBusy)return;var ids=Array.from(window.sfSelectedNodes);var out=document.getElementById('clusterBulkFeedback');if(!ids.length){out.textContent='Bitte zuerst mindestens einen entfernten Node auswählen.';return;}
+var actionBusy=false,sfSyncNoticeTimer=null;
+function sfShowSyncNotice(message,autohide){
+ var el=document.getElementById('sfSyncNotice');
+ if(sfSyncNoticeTimer!==null){clearTimeout(sfSyncNoticeTimer);sfSyncNoticeTimer=null;}
+ el.textContent=message;el.style.display='block';
+ if(autohide)sfSyncNoticeTimer=setTimeout(function(){el.style.display='none';sfSyncNoticeTimer=null;},6500);
+}
+async function runBulk(path,label,danger){if(actionBusy)return;var ids=Array.from(window.sfSelectedNodes);var out=document.getElementById('clusterBulkFeedback');if(!ids.length){out.textContent='Bitte zuerst mindestens einen entfernten Node auswählen.';if(path==='/cluster_node_sync_time')sfShowSyncNotice('Keine Nodes ausgewählt – Zeitsynchronisierung nicht gestartet.',true);return;}
 var text=label+' für '+ids.length+' ausgewählte Nodes auslösen?';if(danger)text+=' ACHTUNG: Shutdown ohne Wake-Quellen; RESET oder Stromversorgung zum Wiederaufwachen erforderlich.';
 if((path==='/cluster_node_restart'||path==='/cluster_node_shutdown'||path==='/cluster_node_wipe')&&!confirm(path==='/cluster_node_wipe'?'ACHTUNG: Alle SD-Daten der ausgewählten Nodes unwiderruflich löschen? Laufende Aufnahmen werden SOFORT beendet und ebenfalls gelöscht. Konfiguration wird aus internem Backup wiederhergestellt.':text))return;actionBusy=true;window.sfCoordinatorBulkActive=true;var buttons=['clusterBulkProbe','clusterBulkRestart','clusterBulkShutdown','clusterBulkSync','clusterBulkWipe','clusterBulkDroneOn','clusterBulkDroneOff'];buttons.forEach(function(x){document.getElementById(x).disabled=true;});var done=0,errors=0,details=[];
+if(path==='/cluster_node_sync_time')sfShowSyncNotice('Zeitsynchronisierung: Aufträge an '+ids.length+' Node(s) werden gesendet …',false);
 try{for(var i=0;i<ids.length;i++){out.textContent=label+': '+(i+1)+'/'+ids.length+' – '+ids[i];var fd=new FormData();fd.append('node_id',ids[i]);if(path==='/cluster_node_drone')fd.append('enabled',label==='Drone Mode EIN'?'1':'0');var ctrl=new AbortController(),timer=setTimeout(function(){ctrl.abort();},12000);
 try{var res=await fetch(path,{method:'POST',body:fd,credentials:'same-origin',cache:'no-store',redirect:'manual',signal:ctrl.signal});if(!(res.ok||res.status===0||res.status===303)){errors++;var body='';try{body=(await res.text()).slice(0,100);}catch(ignored){}details.push(ids[i]+': HTTP '+res.status+(body?' '+body:''));}else{done++;details.push(ids[i]+': Auftrag vom HTTP-Endpunkt angenommen');}}catch(e){errors++;details.push(ids[i]+': HTTP-Anfrage fehlgeschlagen ('+(e.name==='AbortError'?'12-s-Zeitlimit':String(e.message||e))+'); Ausführung unbekannt');}finally{clearTimeout(timer);}await new Promise(function(resolve){setTimeout(resolve,250);});}
 out.textContent=label+': '+done+' HTTP-Annahmen, '+errors+' HTTP-Fehler. '+details.join(' | ')+'. HTTP-Erfolg bedeutet nicht ACK oder Ausführung; Einzelergebnisse im Status prüfen.';
+if(path==='/cluster_node_sync_time')sfShowSyncNotice('Zeitsynchronisierung: '+done+' von '+ids.length+' Aufträgen HTTP-angenommen, '+errors+' Fehler. Die tatsächliche Synchronisierung wird dadurch noch nicht bestätigt.',true);
 }finally{window.sfCoordinatorBulkActive=false;actionBusy=false;window.sfCoordinateStatus().catch(function(){});buttons.forEach(function(x){document.getElementById(x).disabled=false;});}}
 // Generic absolute-UTC schedule derivation: reuse for future actions such as GPIO/sequence/video.
-function sfPlanUtcTarget(utcValue,seconds,minutes,nowMs){
+function sfPlanUtcTarget(utcValue,seconds,minutes,hours,nowMs){
+ // Future direct UTC input: pass datetime-local UTC value as utcValue; null means relative.
  if(utcValue){var fixed=Date.parse(utcValue+'Z');return Number.isFinite(fixed)?fixed:NaN;}
- if(!Number.isFinite(seconds)||!Number.isFinite(minutes)||seconds<0||minutes<0||!Number.isInteger(seconds)||!Number.isInteger(minutes))return NaN;
- return nowMs+(minutes*60+seconds)*1000;
+ if(![seconds,minutes,hours].every(function(n){return Number.isInteger(n)&&n>=0;}))return NaN;
+ return nowMs+((hours*3600)+(minutes*60)+seconds)*1000;
 }
 // Capture report tracks one specific submission set, not the last arbitrary Node action.
 // Job IDs in the bounded coordinator RAM table are authoritative after signature verification.
@@ -416,40 +443,77 @@ function sfCaptureClockFromStatus(d,receivedPerf){
  return {utcMs:us/1000,perfMs:receivedPerf};
 }
 function sfCaptureUtcNow(){return sfCaptureClock?sfCaptureClock.utcMs+(performance.now()-sfCaptureClock.perfMs):NaN;}
-var sfCountdownTick=null,sfCountdownEnd=null;
+// Visual test uses the same monotonic target anchor as the compact countdown.
+// The overlay remains visible for five seconds after the scheduled capture.
+var sfCountdownTick=null,sfCountdownStartPerf=0,sfCountdownDelay=0,sfSyncRaf=null,sfSyncLastDraw=0,sfSyncAutoOpened=false,sfCountdownActive=false;
+var sfSyncPeriods=[['2 s',2000,'#ffffff'],['1 s',1000,'#ff4242'],['500 ms',500,'#00aaff'],['100 ms',100,'#00f070'],['50 ms',50,'#ffe600']];
+var sfSyncScreen=document.getElementById('sfSyncScreen'),sfSyncBarEls=[];
+(function(){var host=document.getElementById('sfSyncBars');sfSyncPeriods.forEach(function(spec,i){
+ var row=document.createElement('div');row.className='sf-sync-row';
+ var label=document.createElement('div');label.className='sf-sync-label';label.textContent=spec[0];
+ var track=document.createElement('div');track.className='sf-sync-track';track.style.setProperty('--bar-color',spec[2]);
+ var bar=document.createElement('div');bar.className=i===0?'sf-sync-block':'sf-sync-fill';track.appendChild(bar);row.appendChild(label);row.appendChild(track);host.appendChild(row);sfSyncBarEls.push(bar);
+});})();
+function sfSyncOpen(autoOpened){sfSyncAutoOpened=!!autoOpened;sfSyncScreen.style.display='block';sfSyncLastDraw=0;
+ if(sfSyncScreen.requestFullscreen)sfSyncScreen.requestFullscreen().catch(function(){});
+ sfSyncPaint(performance.now());}
+function sfSyncClose(){sfSyncAutoOpened=false;sfSyncScreen.style.display='none';if(document.fullscreenElement===sfSyncScreen&&document.exitFullscreen)document.exitFullscreen().catch(function(){});}
+document.getElementById('sfSyncOpen').addEventListener('click',function(){sfSyncOpen(false);});
+document.getElementById('sfSyncClose').addEventListener('click',sfSyncClose);
+document.addEventListener('fullscreenchange',function(){if(document.fullscreenElement!==sfSyncScreen&&sfSyncScreen.style.display==='block')sfSyncScreen.style.display='none';});
+function sfSyncFormatted(ms){var abs=Math.abs(ms),mins=Math.floor(abs/60000),secs=Math.floor(abs%60000/1000),milli=Math.floor(abs%1000);
+ return (ms<0?'-':'+')+String(mins).padStart(2,'0')+':'+String(secs).padStart(2,'0')+'.'+String(milli).padStart(3,'0');}
+function sfStopCaptureCountdown(){
+ if(sfCountdownTick!==null){clearInterval(sfCountdownTick);sfCountdownTick=null;}
+ sfCountdownActive=false;sfCountdownStartPerf=0;sfCountdownDelay=0;
+ document.getElementById('clusterCaptureCountdown').style.display='none';
+ if(sfSyncAutoOpened||sfSyncScreen.style.display==='block')sfSyncClose();
+}
+function sfSyncPaint(now){
+ if(!sfCountdownStartPerf)return;
+ var elapsed=now-sfCountdownStartPerf,relative=elapsed-sfCountdownDelay,after=relative>=0;
+ if(relative>5000){sfStopCaptureCountdown();return;}
+ var clock=document.getElementById('clusterCaptureClock'),panel=document.getElementById('clusterCaptureCountdown');
+ var abs=Math.abs(relative),tenths=Math.floor(abs/100),secs=Math.floor(tenths/10);
+ clock.textContent=(after?'+':'-')+String(Math.floor(secs/60)).padStart(2,'0')+':'+String(secs%60).padStart(2,'0')+'.'+String(tenths%10);
+ if(panel.className!==(after?'sf-fired':'sf-armed'))panel.className=after?'sf-fired':'sf-armed';
+ if(sfSyncScreen.style.display!=='block'||now-sfSyncLastDraw<15)return;
+ sfSyncLastDraw=now;
+ document.getElementById('sfSyncClock').textContent=sfSyncFormatted(relative);
+ var phase=document.getElementById('sfSyncPhase');phase.textContent=after?'NACH DEM SOLL-ZEITPUNKT (+5 s Fenster)':'BIS ZUM SOLL-ZEITPUNKT';phase.style.color=after?'#4ade80':'#f87171';
+ // Phase is anchored to the target, not to when the overlay was opened.
+ sfSyncPeriods.forEach(function(spec,i){var cycle=((relative%spec[1])+spec[1])%spec[1],triangle=1-Math.abs(2*cycle/spec[1]-1),el=sfSyncBarEls[i];
+ if(i===0)el.style.left=(88*triangle).toFixed(2)+'%';else el.style.width=(100*triangle).toFixed(2)+'%';});
+}
 function sfShowCaptureCountdown(target){
- if(sfCountdownTick!==null)clearInterval(sfCountdownTick);
- if(sfCountdownEnd!==null)clearTimeout(sfCountdownEnd);
- var panel=document.getElementById('clusterCaptureCountdown'),clock=document.getElementById('clusterCaptureClock'),lamp=document.getElementById('clusterCaptureLamp');
+ if(sfCountdownTick!==null){clearInterval(sfCountdownTick);sfCountdownTick=null;}
+ var panel=document.getElementById('clusterCaptureCountdown');
  document.getElementById('clusterCaptureTargetText').textContent='Geplanter UTC-Termin: '+new Date(target).toISOString()+' · Countdown nach geschätzter Coordinator-Clusterzeit';
- panel.style.display='flex';panel.className='sf-armed';lamp.style.background='#dc2626';
- // Countdown uses a monotonic elapsed duration so wall-clock corrections in the browser cannot jump it.
- var startPerf=performance.now(),delay=Math.max(0,target-sfCaptureUtcNow());
- function update(){var left=delay-(performance.now()-startPerf);
-  if(left<=0){if(sfCountdownTick!==null){clearInterval(sfCountdownTick);sfCountdownTick=null;}
-   clock.textContent='AUSLÖSEZEIT';panel.className='sf-fired';
-   sfCountdownEnd=setTimeout(function(){panel.className='';clock.textContent='Termin erreicht';sfCountdownEnd=null;},2900);return;}
-  var tenths=Math.ceil(left/100),secs=Math.floor(tenths/10),minutes=Math.floor(secs/60);
-  clock.textContent=String(minutes).padStart(2,'0')+':'+String(secs%60).padStart(2,'0')+'.'+String(tenths%10);
- }
- update();if(panel.className==='sf-armed')sfCountdownTick=setInterval(update,50);
+ document.getElementById('sfSyncTarget').textContent='SOLL UTC '+new Date(target).toISOString()+' · Anzeige endet 5 s danach';
+ panel.style.display='flex';panel.className='sf-armed';
+ sfCountdownStartPerf=performance.now();sfCountdownDelay=Math.max(0,target-sfCaptureUtcNow());sfCountdownActive=true;
+ sfSyncOpen(true);
+ sfSyncPaint(sfCountdownStartPerf);
+ // Keep the compact timer and the fullscreen test image running until +5 s.
+ sfCountdownTick=setInterval(function(){sfSyncPaint(performance.now());},50);
 }
 document.getElementById('clusterBulkCapture').addEventListener('click',async function(){
- var ids=Array.from(window.sfSelectedNodes),v=document.getElementById('clusterCaptureUtc').value,out=document.getElementById('clusterCaptureFeedback');
+ var ids=Array.from(window.sfSelectedNodes),out=document.getElementById('clusterCaptureFeedback');
  if(!ids.length){out.textContent='Bitte Nodes auswählen.';return;}
- var seconds=Number(document.getElementById('clusterCaptureSeconds').value),minutes=Number(document.getElementById('clusterCaptureMinutes').value);
- if(!v&&(!document.getElementById('clusterCaptureSeconds').value||!document.getElementById('clusterCaptureMinutes').value)){out.textContent='Sekunden und Minuten müssen ausgefüllt sein.';return;}
+ var seconds=Number(document.getElementById('clusterCaptureSeconds').value),minutes=Number(document.getElementById('clusterCaptureMinutes').value),hours=Number(document.getElementById('clusterCaptureHours').value);
+ if(['clusterCaptureHours','clusterCaptureMinutes','clusterCaptureSeconds'].some(function(id){return document.getElementById(id).value==='';})){out.textContent='Stunden, Minuten und Sekunden müssen ausgefüllt sein.';return;}
  // Refresh coordinator time before computing a relative or absolute UTC job.
  // Do not silently fall back to the browser clock if the cluster time is unavailable.
  var snap;
  try{var readStart=performance.now();snap=await window.sfCoordinateStatus(true);var readEnd=performance.now();sfCaptureClock=sfCaptureClockFromStatus(snap,(readStart+readEnd)/2);}
  catch(e){out.textContent='Clusterzeit nicht abrufbar: Capture-Auftrag nicht gesendet.';return;}
  if(!sfCaptureClock){out.textContent='Coordinator hat noch keine gültige Clusterzeit: Capture-Auftrag nicht gesendet.';return;}
- var nowUtc=sfCaptureUtcNow(),target=sfPlanUtcTarget(v,seconds,minutes,nowUtc);
+ var nowUtc=sfCaptureUtcNow(),target=sfPlanUtcTarget(null,seconds,minutes,hours,nowUtc);
  if(!Number.isFinite(target)||target-nowUtc<5000||target-nowUtc>1800000){out.textContent='Zielzeit muss 5 Sekunden bis 30 Minuten in der Cluster-Zukunft liegen.';return;}
  var button=this;button.disabled=true;window.sfCoordinatorBulkActive=true;var results=[],accepted=0,shown=false;
- // Snapshot old jobs to avoid mistaking a previous photo for this capture.
- (Array.isArray((sfLatestStatus||{}).job_probes)?sfLatestStatus.job_probes:[]).forEach(function(j){if(Number(j.kind)===6)sfSeenCaptureJobs.add(sfCaptureJobKey(j));});
+ // Use the freshly fetched pre-submit status, not the possibly stale UI poll status.
+ // Otherwise an old completed JPEG can be assigned to the next capture report.
+ (Array.isArray(snap.job_probes)?snap.job_probes:[]).forEach(function(j){if(Number(j.kind)===6)sfSeenCaptureJobs.add(sfCaptureJobKey(j));});
  var names=Array.isArray((sfLatestStatus||{}).nodes)?sfLatestStatus.nodes:[];
  sfCaptureReport={target:target,rows:ids.map(function(id){var n=names.find(function(x){return String(x.integration_id)===id;});return {id:id,name:n?(n.hostname||id):id,http:'pending',job:null};})};sfRenderCaptureReport();
  try{for(var i=0;i<ids.length;i++){
@@ -465,6 +529,14 @@ document.getElementById('clusterBulkCapture').addEventListener('click',async fun
  if(accepted&&!shown)sfShowCaptureCountdown(target);
  }finally{window.sfCoordinatorBulkActive=false;button.disabled=false;sfRenderCaptureReport();window.sfCoordinateStatus().then(function(d){window.sfCaptureReportUpdate(d);}).catch(function(){});}
 });
+var sfActionDialog=document.getElementById('clusterActionDialog');
+document.getElementById('clusterActionInfo').addEventListener('click',function(){if(sfActionDialog.showModal)sfActionDialog.showModal();else sfActionDialog.setAttribute('open','');});
+document.getElementById('clusterActionDialogClose').addEventListener('click',function(){if(sfActionDialog.close)sfActionDialog.close();else sfActionDialog.removeAttribute('open');});
+document.getElementById('clusterActionRun').addEventListener('click',function(){var choice=document.getElementById('clusterActionChoice').value;if(!choice)return;document.getElementById(choice).click();});
+// Estimate uses coordinator UTC reference, not the browser's unsynchronized wall clock.
+function sfUpdatePlannedTime(){var h=document.getElementById('clusterCaptureHours').value,m=document.getElementById('clusterCaptureMinutes').value,s=document.getElementById('clusterCaptureSeconds').value,out=document.getElementById('clusterPlannedTime');var t=sfPlanUtcTarget(null,Number(s),Number(m),Number(h),sfCaptureUtcNow());out.textContent=(h===''||m===''||s===''||!Number.isFinite(t))?'UTC-Zeit nicht verfügbar':('Geplant: '+new Date(t).toLocaleString('de-DE',{timeZone:'UTC',hour12:false})+' UTC'+(t-sfCaptureUtcNow()>1800000?' (max. 30 min)':''));}
+['clusterCaptureHours','clusterCaptureMinutes','clusterCaptureSeconds'].forEach(function(id){document.getElementById(id).addEventListener('input',sfUpdatePlannedTime);});
+setInterval(sfUpdatePlannedTime,1000);sfUpdatePlannedTime();
 document.getElementById('clusterBulkDroneOn').addEventListener('click',function(){runBulk('/cluster_node_drone','Drone Mode EIN',false);});
 document.getElementById('clusterBulkDroneOff').addEventListener('click',function(){runBulk('/cluster_node_drone','Drone Mode AUS',false);});
 document.getElementById('clusterBulkProbe').addEventListener('click',function(){runBulk('/cluster_job_probe','Verbindungstest',false);});
@@ -491,14 +563,14 @@ document.getElementById('clusterSdPreflight').addEventListener('click',function(
 pollHealth();setInterval(pollHealth,10000);
 })();
 </script>)__HEALTH__";
-    html += R"__PROBE__(<section class='settings-section'><h3>Verbindung zu Nodes testen</h3>
+    html += R"__PROBE__(<details class='settings-section'><summary>Verbindungsdiagnose und Einzeltests</summary>
 <p class='muted'>Ein signierter, harmloser Probeauftrag prüft die Zustellung und die individuelle Antwort. Er startet keine Geräte neu und verändert keine Dateien.</p>
 <div id='clusterProbeTargets'>Verfügbare Nodes werden geladen …</div>
 <div id='clusterProbeFeedback' class='muted' role='status'></div><div id='clusterProbeSummary' class='muted'></div><div id='clusterProbeDiagnostics' class='muted'></div><div id='clusterHttpDiagnostics' class='muted'></div>
 <details><summary>Letzte Probe-Ergebnisse (begrenzter RAM-Verlauf)</summary>
 <div class='cluster-table-wrap'><table class='cluster-table'><thead><tr><th>Node</th><th>Ergebnis</th><th>Code</th></tr></thead><tbody id='clusterProbeResults'><tr><td colspan='3'>Noch keine Probeaufträge.</td></tr></tbody></table></div>
 <p class='muted'>„Bestätigt“ bedeutet nur: Der Empfänger hat den Probeauftrag authentifiziert und beantwortet. Es ist keine Bestätigung für Reboot, Löschen oder andere Aktionen.</p></details>
-</section><script>
+</details><script>
 (function(){
 function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 var busy=false;

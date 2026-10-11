@@ -192,6 +192,9 @@ bool recorderStart(
 )
 {
     lastRecorderError = "";
+    // A failed finalization can leave an old writer owning SD I/O even
+    // after activeRecorder was cleared. Never reuse that storage.
+    if (activeRecorder == RECORDER_NONE && recorderIsOpen()) return false;
     // Central start gates. Storage maintenance and the live camera preview
     // may block NEW recording starts. Check before touching recorder state so
     // an already-running recording is never interrupted by a new gate.
@@ -497,6 +500,7 @@ bool recorderEnd()
 
     if (
         !finalized &&
+        !recorderIsOpen() &&
         activeTempPath.length() &&
         STORAGE.exists(
             activeTempPath.c_str()
@@ -521,18 +525,10 @@ bool recorderEnd()
 
 bool recorderIsOpen()
 {
-    switch (activeRecorder) {
-        case RECORDER_AVI:
-            return aviIsOpen();
-
-        case RECORDER_MKV:
-            return mkvIsOpen();
-
-        default:
-            return false;
-    }
+    // Inspect physical ownership, not just activeRecorder: finalization can
+    // fail after the logical recorder has already transitioned to NONE.
+    return aviIsOpen() || mkvIsOpen();
 }
-
 
 bool recorderIsHealthy()
 {

@@ -1172,11 +1172,9 @@ bool aviEnd()
 
 bool aviIsOpen()
 {
-    return
-        (bool)aviFile &&
-        !writeFailed;
+    // A failed writer may still own the underlying SD handle.
+    return aviFile.isOpen();
 }
-
 
 bool aviIsHealthy()
 {

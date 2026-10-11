@@ -2,6 +2,7 @@
 #include "cluster.h"
 #include "recorder.h"
 #include "streamer.h"
+#include "drone_mode.h"
 #include "sync_api.h"
 #include "esp_camera.h"
 #include "esp_timer.h"
@@ -11,6 +12,8 @@
 
 extern bool recording;
 extern bool cameraInitialized;
+// Configured by the existing camera initialization path.
+extern uint8_t clusterCaptureFrameBufferCount();
 namespace {
 struct Frame {
     uint8_t *bytes=nullptr;
@@ -46,8 +49,22 @@ uint16_t clusterCapturePhoto(uint64_t jobId,int64_t targetUtcUs,int64_t &dispatc
     if(jobId!=activeJob)return 5;
     if(count>=kMaxFrames)return 6; // Job full: NEVER overwrite earlier synchronized images.
     if (!cameraInitialized || !esp_camera_sensor_get() || recording || recorderIsOpen() ||
-        streamerModeEnabled() || syncApiExclusiveActive()) return 1;
+        (streamerModeEnabled() && !droneModeEnabled()) || streamerReady() || syncApiExclusiveActive()) return 1;
     if(!psramFound())return 2;
+    // CAMERA_GRAB_WHEN_EMPTY can leave up to two completed, older frames
+    // queued after an idle period. Hold all configured buffers simultaneously
+    // before returning any: the subsequent get must wait for a new frame.
+    camera_fb_t *stale[2]={nullptr,nullptr};
+    uint8_t n=clusterCaptureFrameBufferCount();
+    if(n<1 || n>2)return 3; // Current camera setup uses one or two buffers.
+    for(uint8_t i=0;i<n;++i){
+        stale[i]=esp_camera_fb_get();
+        if(!stale[i]){
+            for(uint8_t j=0;j<i;++j)esp_camera_fb_return(stale[j]);
+            return 3;
+        }
+    }
+    for(uint8_t i=0;i<n;++i)esp_camera_fb_return(stale[i]);
     // Software dispatch, NOT sensor exposure-start timestamp.
     dispatchUtcUs=anchorUtcUs+(esp_timer_get_time()-anchorMonoUs);
     camera_fb_t *fb=esp_camera_fb_get();

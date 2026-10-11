@@ -783,6 +783,11 @@ bool RecordingWriteBufferedFile::isOpen() const
     return file_.isOpen();
 }
 
+bool RecordingWriteBufferedFile::hasPendingIo() const
+{
+    return file_.isOpen() || taskHandle_ != nullptr;
+}
+
 bool RecordingWriteBufferedFile::failed() const
 {
     return

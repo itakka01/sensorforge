@@ -2412,7 +2412,7 @@ bool mkvEnd()
         (void)mkvFile.closeChecked();
 
 
-        if (mkvPath.length()) {
+        if (!mkvFile.hasPendingIo() && mkvPath.length()) {
             STORAGE.remove(
                 mkvPath.c_str()
             );
@@ -2614,7 +2614,7 @@ bool mkvIsOpen()
 {
     // Open-state and health-state are deliberately separate. A failed writer
     // still owns an SD handle/resources until mkvEnd() performs cleanup.
-    return mkvFile.isOpen();
+    return mkvFile.hasPendingIo();
 }
 
 bool mkvIsHealthy()

@@ -9050,7 +9050,10 @@ void stopRecording() {
         statusLedWriteLevel(LED_OFF_LEVEL);
 
     if (!finalized) {
-        recoverSD();
+        // A timed-out drain worker may still be writing to the old mount.
+        // Never reset/remount SD until its handle and worker are gone.
+        if (!recorderIsOpen()) recoverSD();
+        else logWrite("SD recovery deferred: recorder I/O still owned");
     }
 
 
@@ -15943,7 +15946,7 @@ void setup() {
     // Dedicated network-streamer mode
     // ---------------------------------------------------------
 
-    if (streamerModeEnabled()) {
+    if (streamerModeEnabled() && !droneModeEnabled()) {
         if (!webConfigStarted) {
             logWrite("STREAMER startup failed | WiFi/WebConfig unavailable");
             Serial.println("STREAMER: WiFi/WebConfig unavailable");
@@ -16294,6 +16297,9 @@ void loop() {
     // branches. This gate is evaluated after clusterLoop so remote ON/OFF jobs
     // take effect in this very loop iteration.
     if (droneModeEnabled()) {
+        // Drone Mode takes camera ownership away from the runtime streamer.
+        // Preserve cfg_operating_mode so streaming can resume on Drone OFF.
+        if (streamerReady()) streamerStop();
         // Transition is one-shot: a recording already in progress must release
         // its file handles before the node starts its passive standby loop.
         // Never truncate an AVI/MKV by bypassing the recorder finalizer.
@@ -16309,6 +16315,16 @@ void loop() {
     }
 
     if (streamerModeEnabled()) {
+        // Resume the configured streamer after Drone Mode is disabled.
+        // streamerBegin() is idempotent while the streamer is already running.
+        if (!streamerReady()) {
+            String streamerError;
+            if (!streamerBegin(streamerError)) {
+                logWrite("STREAMER resume failed | " + streamerError);
+                delay(100);
+                return;
+            }
+        }
         // Streamer mode deliberately bypasses all recording, shooter and sleep
         // automation. WebConfig, reboot/OTA handling and thermal protection stay
         // alive; streamerLoop owns the camera frame cadence.
@@ -17368,8 +17384,16 @@ void loop() {
 
 // Beta93: existing camera subsystem remains the only camera initialisation
 // authority. Prewarm before the scheduled trigger; never start while recording.
+uint8_t clusterCaptureFrameBufferCount() {
+    return cameraInitialized ? cameraFramebufferCount : 0;
+}
+
 bool clusterCapturePrepareCamera() {
-    if (recording || recorderIsOpen() || streamerModeEnabled() ||
+    // A Drone-enabled streamer must release its transport/preview before
+    // clusterLoop can prepare the camera (clusterLoop runs before loop gate).
+    if (droneModeEnabled() && streamerReady()) streamerStop();
+    if (recording || recorderIsOpen() || streamerReady() ||
+        (streamerModeEnabled() && !droneModeEnabled()) ||
         syncApiExclusiveActive() || thermalEmergencyState ||
         (webConfigStarted && webConfigCameraPreviewActive())) return false;
     if (!initCamera(cfg_camera,cfg_resolution,cfg_quality)) return false;
