@@ -83,6 +83,7 @@ static const char *CLUSTER_JOB_SHUTDOWN_ACK_MAGIC = "SFJSA1";
 static const char *CLUSTER_JOB_REJECT_MAGIC = "SFJX1";
 static const char *CLUSTER_JOB_CAPTURE_MAGIC="SFJC1";
 static const char *CLUSTER_JOB_CAPTURE_RESULT_MAGIC="SFJCR1";
+static const char *CLUSTER_JOB_CAPTURE_RECEIPT_MAGIC="SFJCA1";
 static const char *CLUSTER_JOB_DRONE_MAGIC = "SFJD1";
 static const char *CLUSTER_JOB_DRONE_ACK_MAGIC = "SFJDA1";
 static uint32_t droneSeenBoot=0,droneSeenEpoch=0,droneSeenSeq=0;
@@ -104,6 +105,21 @@ static uint32_t captureSent=0,captureAccepted=0,captureCompleted=0,captureFailed
 static int64_t captureLastDispatchOffsetUs=0;
 static uint32_t captureLastSize=0;
 static uint16_t captureLastError=0;
+// At most one unacknowledged terminal result per node. A newly accepted
+// capture invalidates any older result, matching PSRAM job ownership.
+struct CaptureResultRetry {
+    bool active=false;
+    uint32_t cb=0,epoch=0,seq=0;
+    uint16_t status=0,error=0;
+    uint32_t bytes=0, lastSendMs=0;
+    uint8_t attempts=0;
+    char uuid[37]={};
+    int64_t dispatch=0;
+};
+static CaptureResultRetry captureResultRetry;
+static uint32_t captureResultRetrySent=0,captureResultReceiptReceived=0;
+static uint32_t captureResultRetryExhausted=0;
+
 static uint32_t wipeSeenBoot=0, wipeSeenEpoch=0, wipeSeenSeq=0;
 static uint32_t wipeReceived=0, wipeQueued=0, wipeResultSent=0, wipeResultReceived=0;
 
@@ -2743,6 +2759,58 @@ static void sendCaptureResult(uint32_t cb,uint32_t epoch,uint32_t seq,uint16_t s
         String((unsigned int)error)+"|"+String((unsigned long)bytes)+"|"+String(uuid[0]?uuid:"-")+"|"+String(dispatchText);
     sendSignedPayloadTo(packet,currentCoordinatorIp,CLUSTER_COORDINATOR_PORT,"capture status");
 }
+// Only terminal outcomes are retried. Retransmission is status-only and
+// cannot invoke the camera. The coordinator deduplicates by job ID/state.
+static void queueCaptureTerminalResult(uint32_t cb,uint32_t epoch,uint32_t seq,
+                                      uint16_t status,uint16_t error,uint32_t bytes,
+                                      const char *uuid="",int64_t dispatch=0){
+    captureResultRetry=CaptureResultRetry{};
+    CaptureResultRetry &r=captureResultRetry;
+    r.active=true;r.cb=cb;r.epoch=epoch;r.seq=seq;r.status=status;
+    r.error=error;r.bytes=bytes;r.dispatch=dispatch;
+    if(uuid){strncpy(r.uuid,uuid,sizeof(r.uuid)-1);}
+    sendCaptureResult(cb,epoch,seq,status,error,bytes,r.uuid,dispatch);
+    r.attempts=1;r.lastSendMs=millis();
+}
+static void serviceCaptureResultRetry(uint32_t now){
+    CaptureResultRetry &r=captureResultRetry;
+    if(!r.active)return;
+    if(!runtimeActive||localIsCoordinator||r.epoch!=currentCoordinatorEpoch||
+       !usableIp(currentCoordinatorIp)){
+        r=CaptureResultRetry{};return;
+    }
+    if((uint32_t)(now-r.lastSendMs)<2000UL)return;
+    if(r.attempts>=10){++captureResultRetryExhausted;r=CaptureResultRetry{};return;}
+    sendCaptureResult(r.cb,r.epoch,r.seq,r.status,r.error,r.bytes,r.uuid,r.dispatch);
+    ++r.attempts;++captureResultRetrySent;r.lastSendMs=now;
+}
+static void sendCaptureReceipt(uint32_t cb,uint32_t epoch,uint32_t seq,
+                               uint32_t nodeBoot,uint16_t status,const IPAddress &ip){
+    char cbText[9],nbText[9];
+    snprintf(cbText,sizeof(cbText),"%08lx",(unsigned long)cb);
+    snprintf(nbText,sizeof(nbText),"%08lx",(unsigned long)nodeBoot);
+    const String packet=String(CLUSTER_JOB_CAPTURE_RECEIPT_MAGIC)+"|"+runtimeClusterTag+"|"+
+        deviceIntegrationId()+"|"+cbText+"|"+String((unsigned long)epoch)+"|"+
+        String(nbText)+"|"+String((unsigned long)seq)+"|"+String((unsigned)status);
+    sendSignedPayloadTo(packet,ip,CLUSTER_COORDINATOR_PORT,"capture result receipt");
+}
+static void processCaptureReceipt(char **f,size_t n,const IPAddress &ip){
+    if(n!=8||!runtimeActive||localIsCoordinator||!captureResultRetry.active||
+       strcmp(f[1],runtimeClusterTag)!=0||strcmp(f[2],currentCoordinatorId)!=0||
+       ip!=currentCoordinatorIp)return;
+    uint32_t cb=0,epoch=0,nb=0,seq=0,status=0;
+    if(!parseUint32Strict(f[3],cb,16)||!parseUint32Strict(f[4],epoch)||
+       !parseUint32Strict(f[5],nb,16)||!parseUint32Strict(f[6],seq)||
+       !parseUint32Strict(f[7],status)||nb!=bootNonce||
+       cb!=captureResultRetry.cb||epoch!=captureResultRetry.epoch||
+       seq!=captureResultRetry.seq||status!=captureResultRetry.status||
+       epoch!=currentCoordinatorEpoch)return;
+    const ClusterPeer *coord=findPeer(f[2]);
+    if(!coord||coord->bootNonce!=cb||coord->ip!=ip||
+       (uint32_t)(millis()-coord->lastSeenMs)>60000UL)return;
+    ++captureResultReceiptReceived;
+    captureResultRetry=CaptureResultRetry{};
+}
 static void processJobCapture(char **f,size_t n,const IPAddress &ip) {
     if(n!=9 || !runtimeActive || localIsCoordinator || strcmp(f[1],runtimeClusterTag)!=0 ||
        strcmp(f[2],currentCoordinatorId)!=0 || strcmp(f[5],deviceIntegrationId().c_str())!=0 ||
@@ -2767,6 +2835,7 @@ static void processJobCapture(char **f,size_t n,const IPAddress &ip) {
     // Future cluster/NTP adjustments only influence *future* jobs.
     const int64_t acceptedMonoUs=esp_timer_get_time();
     const int64_t remainingUs=utc-nowUtc;
+    captureResultRetry=CaptureResultRetry{};
     clusterCaptureBeginJob(((uint64_t)cb<<32)|seq);
     pendingCapture={true,cb,epoch,seq,utc,nowUtc,acceptedMonoUs,
                     acceptedMonoUs+remainingUs};
@@ -2789,17 +2858,33 @@ static void processJobCaptureResult(char **f,size_t n,const IPAddress &ip) {
     uint64_t id=((uint64_t)cb<<32)|seq;
     const ClusterJobs::Entry *e=ClusterJobs::find(id);
     if(!e||e->kind!=ClusterJobs::Kind::Capture||strcmp(e->nodeId,f[5])!=0)return;
-    if(status==2 && !ClusterJobs::setCaptureMedia(id,epoch,f[11],dispatch,bytes))return;
+    // Only a still-open capture may accept its one immutable media result.
+    // Check the job deadline using one timestamp shared with transitions.
+    const uint32_t resultNowMs=millis();
+    if(status==2){
+        if((e->state!=ClusterJobs::State::Accepted && e->state!=ClusterJobs::State::Sent) ||
+           static_cast<int32_t>(resultNowMs-e->deadlineMs)>=0 ||
+           !ClusterJobs::setCaptureMedia(id,epoch,f[11],dispatch,bytes))return;
+    }
     if(status==1&&e->state==ClusterJobs::State::Sent){
-        if(ClusterJobs::transition(id,epoch,ClusterJobs::State::Accepted,millis()))++captureAccepted;
+        if(ClusterJobs::transition(id,epoch,ClusterJobs::State::Accepted,resultNowMs))++captureAccepted;
     } else if(status==2&&(e->state==ClusterJobs::State::Accepted||e->state==ClusterJobs::State::Sent)){
-        if(e->state==ClusterJobs::State::Sent)ClusterJobs::transition(id,epoch,ClusterJobs::State::Accepted,millis());
-        ClusterJobs::transition(id,epoch,ClusterJobs::State::Running,millis());
-        if(ClusterJobs::transition(id,epoch,ClusterJobs::State::Succeeded,millis()))++captureCompleted;
+        if(e->state==ClusterJobs::State::Sent)ClusterJobs::transition(id,epoch,ClusterJobs::State::Accepted,resultNowMs);
+        ClusterJobs::transition(id,epoch,ClusterJobs::State::Running,resultNowMs);
+        if(ClusterJobs::transition(id,epoch,ClusterJobs::State::Succeeded,resultNowMs))++captureCompleted;
         captureLastSize=bytes;
     } else if(status==3&&(e->state==ClusterJobs::State::Sent||e->state==ClusterJobs::State::Accepted)){
-        if(ClusterJobs::transition(id,epoch,ClusterJobs::State::Failed,millis(),(uint16_t)error))++captureFailed;
+        if(ClusterJobs::transition(id,epoch,ClusterJobs::State::Failed,resultNowMs,(uint16_t)error))++captureFailed;
     }
+    // ACK both first delivery and exact duplicates. Terminal state, immutable
+    // media and result-code checks prevent forged/late status from changing a job.
+    const ClusterJobs::Entry *after=ClusterJobs::find(id);
+    if(after && ((status==2&&after->state==ClusterJobs::State::Succeeded&&
+                  after->mediaBytes==bytes&&after->dispatchUtcUs==dispatch&&
+                  strcmp(after->mediaUuid,f[11])==0)||
+                 (status==3&&after->state==ClusterJobs::State::Failed&&
+                  after->resultCode==(uint16_t)error)))
+        sendCaptureReceipt(cb,epoch,seq,nb,(uint16_t)status,ip);
 }
 // Called by clusterLoop during regular firmware main loop. Future high precision
 // backends must replace the dispatch mechanism, not the shared UTC contract.
@@ -2815,7 +2900,7 @@ static void serviceScheduledCapture(){
             if(!clusterCapturePrepareCamera()){
                 PendingCapture p=pendingCapture;pendingCapture.active=false;
                 clusterCaptureArmedFlag=false;
-                sendCaptureResult(p.cb,p.epoch,p.seq,3,1,0);return;
+                queueCaptureTerminalResult(p.cb,p.epoch,p.seq,3,1,0);return;
             }
             clusterCaptureArmedFlag=true;
         }
@@ -2830,7 +2915,7 @@ static void serviceScheduledCapture(){
     clusterCaptureArmedFlag=false;
     char mediaUuid[37]={};int64_t actualDispatch=0;
     if(!rc&&!clusterCaptureLatestMedia(((uint64_t)p.cb<<32)|p.seq,mediaUuid,actualDispatch))rc=5;
-    sendCaptureResult(p.cb,p.epoch,p.seq,rc?3:2,rc,bytes,mediaUuid,actualDispatch);
+    queueCaptureTerminalResult(p.cb,p.epoch,p.seq,rc?3:2,rc,bytes,mediaUuid,actualDispatch);
     Serial.printf("[CLUSTER CAPTURE] seq=%lu rc=%u jpeg=%lu dispatch_offset_us=%lld (frozen clock; NOT exposure)\n",
         (unsigned long)p.seq,(unsigned)rc,(unsigned long)bytes,(long long)captureLastDispatchOffsetUs);
 }
@@ -3018,6 +3103,8 @@ static void processPacket(
         processJobCapture(fields,fieldCount,remoteIp);
     } else if (strcmp(fields[0], CLUSTER_JOB_CAPTURE_RESULT_MAGIC) == 0) {
         processJobCaptureResult(fields,fieldCount,remoteIp);
+    } else if (strcmp(fields[0], CLUSTER_JOB_CAPTURE_RECEIPT_MAGIC) == 0) {
+        processCaptureReceipt(fields,fieldCount,remoteIp);
     } else if (strcmp(fields[0], CLUSTER_JOB_DRONE_MAGIC) == 0) {
         processJobDrone(fields,fieldCount,remoteIp);
     } else if (strcmp(fields[0], CLUSTER_JOB_DRONE_ACK_MAGIC) == 0) {
@@ -3606,6 +3693,12 @@ void clusterNetworkStart()
 
 void clusterNetworkStop()
 {
+    // A deliberate cluster lifecycle stop cancels the pending local dispatch.
+    // Keep already produced PSRAM media until a new accepted capture job.
+    pendingCapture = PendingCapture{};
+    captureResultRetry = CaptureResultRetry{};
+    clusterCaptureArmedFlag = false;
+    captureSeenBoot = captureSeenEpoch = captureSeenSeq = 0;
     // Invalidate volatile job bookkeeping on every runtime/credential lifecycle reset.
     ClusterJobs::reset();
     probeSeq = probeSeenBoot = probeSeenEpoch = probeSeenSeq = 0;
@@ -3761,6 +3854,19 @@ void clusterMdnsAdvertise()
 
 void clusterLoop()
 {
+    // A previously accepted capture has an immutable monotonic deadline.
+    // Service it BEFORE potentially expensive UDP authentication, peer expiry,
+    // heartbeat and clock-maintenance work. Packet handling must never be
+    // permitted to push an armed photo past its local deadline.
+    if (runtimeActive && pendingCapture.active) {
+        serviceScheduledCapture();
+        if (pendingCapture.active && clusterCaptureArmedFlag &&
+            pendingCapture.deadlineMonoUs - esp_timer_get_time() <= 50000LL) {
+            // Reserve the last 50 ms for the local camera dispatcher.
+            // No busy-wait: loopTask yields as usual in sensorforge.ino.
+            return;
+        }
+    }
     const uint32_t now = millis();
 
     if (discoveryScanLeaseUntilMs != 0 &&
@@ -3889,7 +3995,9 @@ void clusterLoop()
         nextCoordinatorHeartbeatMs = now + CLUSTER_COORDINATOR_HEARTBEAT_MS;
     }
     requestClusterTime(millis());
-    serviceScheduledCapture();
+    // Newly accepted jobs are handled on the next loop iteration. Do not
+    // spend additional UDP/clock work before dispatching an armed capture.
+    serviceCaptureResultRetry(millis());
 
 }
 
@@ -4708,6 +4816,11 @@ String clusterStatusJson()
     json += ",\"completed\":"+String((unsigned long)captureCompleted);
     json += ",\"failed\":"+String((unsigned long)captureFailed);
     json += ",\"local_pending\":"+String(pendingCapture.active?"true":"false");
+    json += ",\"result_retry_pending\":"+String(captureResultRetry.active?"true":"false");
+    json += ",\"result_retry_attempts\":"+String((unsigned)captureResultRetry.attempts);
+    json += ",\"result_retransmissions\":"+String((unsigned long)captureResultRetrySent);
+    json += ",\"result_receipts\":"+String((unsigned long)captureResultReceiptReceived);
+    json += ",\"result_retry_exhausted\":"+String((unsigned long)captureResultRetryExhausted);
     json += ",\"last_dispatch_offset_us\":"+String((long)captureLastDispatchOffsetUs);
     json += ",\"last_size_bytes\":"+String((unsigned long)captureLastSize);
     json += ",\"last_error\":"+String((unsigned)captureLastError);

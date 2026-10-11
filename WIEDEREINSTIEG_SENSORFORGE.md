@@ -1,3 +1,60 @@
+## Audit-Paket 5p (2026-10-11) – SPI-Remount-Admission
+- Der Sync-API-SPI-Remount (exklusiver Clock-Wechsel und Diagnose) reserviert jetzt die gemeinsame atomare `SdAdmissionController::SpiRemount`-Lease; Cluster-Wipe, Secure Erase, Formatierung und Benchmark können während der Lease keine eigene Wartungs-Lease erhalten.
+- Exklusivmodus-Aktivierung/-Deaktivierung und Lease-Ablauf prüfen auch die aktive SD-Admission. Diagnose reserviert vor dem ersten Dateizugriff und hält die Lease bis nach dem Restore. Die bestehenden kooperativen SD-/Recording-Sperren bleiben erhalten.
+- Restgefahr: Bereits laufende Recorder-/SD-I/O nutzt noch keine gemeinsame Lease; nicht vollständig atomare globale Sperrflags. ESP32-Compile und Hardwarevalidierung ausstehend.
+
+## Audit-Paket 5l – vorbereiteter SD-Besitzmechanismus (2026-10-11)
+- Neu: `sd_admission_controller.h` und `tests/sd_admission_controller_test.cpp` als isolierter Host-Prototyp, ohne Abhängigkeit zu Arduino.
+- Bewusst **keine produktive Integration**: Die zentralen Gates `g_storageLocked` und `g_recordingStartBlocked` sind weiterhin ungeschützt und benötigen vollständige Migration; die neue Reservierung verhindert keine bereits laufende SD-I/O.
+- Host-Kompilierung und Tests sind separat nachgewiesen; vollständiger ESP32-Compile und Hardwaretests stehen aus.
+
+## Audit-Paket 5j – Sync-API-SD-Eintrittspunkte (2026-10-11)
+
+- **P1:** Die Sync-API blockiert jetzt `handleTestSdSpi`, `handleConfigPost`, `handleTransportControl` und `handleConfigStoragePost` auch bei `g_recordingStartBlocked`. So kann eine allein durch eine Cluster-Wipe-Reservierung aktive Recording-Startsperre diese SD-/Konfigurationsaktionen abweisen, bevor der eigentliche Storage-Lock gesetzt wird.
+- **Grenzen:** Die globalen Flags bleiben kooperativ und nicht atomar als gemeinsamer Besitzmechanismus. Kein Ersatz für eine zentrale SD-Arbitrierung. Keine Hardwaretests oder vollständiger ESP32-Compile; Prüfung der vier Guard-Stellen und ZIP-Integrität.
+
+## Audit-Paket 5c – Power Shooter und SD-Wipe-Reservierung (2026-10-11)
+
+- **Behobener P1-Konflikt:** Vier Power-Shooter-Einstiegspfade beachten ab jetzt zusätzlich `g_recordingStartBlocked`: Capture, JPEG-Schreiben, Sparse-MKV-Schreiben und PSRAM-Flush. Ein bereits angenommener Cluster-Wipe blockiert so auch neue Shooter-Medienzugriffe, bevor `g_storageLocked` für den eigentlichen Wipe gesetzt ist.
+- Weiter offen: vollständige SD-Client-Inventur, Power-Shooter-Zustands-/Sleep-Regression, ESP32-S3-Compile, Tests mit paralleler Last und Hardware. **Keine stabile Freigabe**.
+
+## Audit-Paket 5a – Destruktor-Lifecycle / Recording (2026-10-11)
+
+- **Hoch:** `RecordingWriteBufferedFile` kann beim SD-Benchmark als lokales Objekt existieren. Nach einem zeitlich begrenzten `closeChecked()`-Fehler darf der Stack-Destruktor nicht zurückkehren, solange der Drain-Task noch auf `this` zugreift. Der Destruktor wartet jetzt in diesem Sonderfall ohne Timeout auf die Fertigmeldung, beendet den Worker und versucht das Schließen erneut. Dies verhindert den Use-after-free-Pfad beim Verlassen des Scopes.
+- **Bewusster Trade-off:** Ein auf Dauer blockierter SD-Treiber kann den betroffenen Task dadurch auf Dauer blockieren. Das ist kein allgemeiner Hang-Fix. Für Produktionsfreigabe bleiben Watchdog-/Recovery-Konzept und Hardware-Störtests erforderlich; keine unkontrollierte Task-Terminierung während `file_.write()`.
+- Keine Änderungen an Recordingformat, Power Shooter, Drone, Zeitbasis oder Clusterprotokoll. Statische Prüfung; kein vollständiger ESP32-Build oder Hardwaretest.
+
+## Audit-Korrekturpaket 4b – Recording-Task-Lifecycle (2026-10-11)
+
+- `recording_write_buffer.cpp/.h`: Die Drain-Task-Beendigung wird jetzt über eine binäre Fertigmeldung synchronisiert. Der Worker meldet das Ende **nach** seinen letzten Storage-/Mutex-Zugriffen, parkt sich; anschließend löscht der schließende Task den Worker explizit mittels `vTaskDelete(handle)` und gibt erst danach Speicher und Semaphore frei. `taskHandle_` wird nicht mehr vorzeitig aus dem Worker gelöscht.
+- Timeout bleibt ein harter Fehler: kein Löschen des Workers und keine Freigabe seiner Ressourcen während möglicher SD-Operationen. Kein neuer Capture-Trigger, keine Änderung an UTC, Drone Mode oder Recordingformat.
+- **Restgefahr:** Wenn ein SD-Treiber dauerhaft blockiert und der besitzende C++-Objektträger trotz fehlgeschlagenem `closeChecked()` zerstört wird, braucht es eine höhere Lifecycle-Sperre. Kein vollständiger ESP32-Build oder Hardwaretest; statische Prüfung und ZIP-Integritätsprüfung. SD-Wipe-/Power-Shooter-/PSRAM-Lasttests sind noch nicht abgeschlossen.
+
+
+## Audit-Korrekturpaket 3 – Capture-Scheduler / Kamerapriorität (2026-10-10)
+
+- `clusterLoop()` prüft bereits angenommene UTC-Capture-Jobs jetzt **vor** dem Empfang und der kryptografischen Verarbeitung von UDP-Paketen, Peer-Ablaufprüfungen, Heartbeats und Zeitabgleich. Die **bereits eingefrorene monotone Deadline** wird dabei nicht neu berechnet.
+- Bei bereits vorgewärmter/armierter Kamera werden in den letzten **50 ms** vor der Deadline nichtkritische Cluster-Aufgaben bis nach dem Auslösen verschoben. Der ESP32-Loop bleibt kooperativ (`delay(1)` in `sensorforge.ino`), kein Busy-Spin und kein zusätzlicher Task oder ungeschützter Kamerazugriff.
+- Der ehemalige zweite Scheduler-Aufruf am Ende von `clusterLoop()` entfällt, sodass ein Job pro Loop-Durchlauf nur an einer Stelle geprüft wird. Neu empfangene Jobs werden ab dem nächsten Durchlauf behandelt. Aufnahme-/SD-/Recorder-/Power-Shooter-Code, Signaturprotokolle und PSRAM-Jobregeln bleiben unverändert. Dreifacher `esp_timer.h`-Include bereinigt.
+- **Grenze:** Ein Aufruf von `esp_camera_fb_get()` misst *nicht* den realen Sensor-Belichtungsbeginn. Auch hoher Scheduling-Vorrang bietet keine harte Echtzeitgarantie bei Interrupts, WiFi-Tasks, Kamera-Treiberwartezeiten oder anderen Threads. Die Kamera wird erst in den letzten 2 Sekunden vorbereitet; echtes Kamera-Owner-/Ressourcen-Reservieren und passende Task-Prioritäten sind **noch offen**.
+- **Verifikation:** Quelltext- und strukturelle Assertions; kein vollständiger Arduino-/ESP32-Compile, keine Messung auf beiden Geräten. Hardwaretests: 10/30-Minuten-Termine, UDP-Last unmittelbar vor Auslösung, parallel aktive Vorschau/Recorder/Streamer, Auslöseoffset und Result-Retry-Verhalten.
+
+## Audit-Korrekturpaket 2 auf Basis v87-beta105 (2026-10-10)
+
+- Paket 1 ist enthalten; Delta 2 wird **auf den Originalstand plus Paket 1** angewendet, nicht auf eine veraltete beta105-Datei. Firmware-Version unverändert.
+- Node sendet **nur terminale** Capture-Ergebnisse (`SFJCR1`, Status 2/3) maximal 10-mal, anfänglich sofort, danach in 2-s-Abständen, sofern keine signierte `SFJCA1`-Bestätigung eintrifft. Retries führen **nie** `SFJC1` oder einen Kameratrigger erneut aus.
+- Coordinator sendet eine signierte Empfangsbestätigung für einen erfolgreichen oder fehlgeschlagenen Capture-Job nur dann, wenn das gespeicherte terminale Ergebnis zu Job-/Medienmetadaten bzw. Fehlercode passt. Gleiche spätere Meldungen erzeugen nur ein erneutes Receipt, keine Metadatenänderung.
+- Receipt-Verifikation am Node: HMAC-Transport plus aktuelle Coordinator-ID/IP, Boot, Epoch, Job-Sequenz und Status. RAM-only, Stop/Epoch-Wechsel invalidieren Retries. Zusatzdiagnostik unter `capture_diagnostics`: `result_retry_pending`, `result_retry_attempts`, `result_retransmissions`, `result_receipts`, `result_retry_exhausted`.
+- **Grenzen:** Bei 10 verlorenen Meldungen/ACKs bleibt der Auftrag ggf. `TimedOut`; kein Exactly-once-Netzversprechen. Bei einem später neu akzeptierten Capture-Job wird der alte Retry verworfen (ein RAM-Retry-Slot pro Node, passend zur PSRAM-Job-Lebensdauer). Ablehnung bereits bei der Annahme wird weiterhin nur einmal gesendet. Rollenwechsel/Neustart können Ergebnisse verlieren. `SFJCA1` verlangt die aktualisierte Coordinator-Firmware; gemischte Versionen funktionieren für Captures weiter, aber bestätigen Retries nicht.
+- **Prüfstatus:** statische Code- und Protokollprüfung; kein kompletter Arduino-ESP32-Build und keine reale Verlustsimulation auf zwei Boards. Vor Nutzung: OTA beider Boards, Test mit 0/1/mehreren absichtlich verlorenen Ergebnis-/Receipt-Paketen, Epoch-/Node-Neustart und 30-Minuten-Deadline-Grenze.
+
+## Audit-Korrekturpaket 1 auf Basis v87-beta105 (2026-10-10)
+
+- **Delta, Versionskennung weiterhin beta105:** `cluster.cpp`, `cluster_jobs.cpp` und die drei Pflichtdokumente. Nicht als vollständigen Sketch installieren.
+- Expliziter Cluster-Runtime-Stopp storniert einen ausstehenden Capture-Auftrag und entfernt dessen Armierung. Ein Cluster-Neustart kann dadurch keinen alten lokalen Fototermin ausführen. Bereits erzeugte PSRAM-Bilder bleiben bis zur nächsten **akzeptierten** Capture-Aufgabe abrufbar.
+- Signierte Capture-Abschlussmeldung: Nur ein offener, noch nicht abgelaufener Job darf Medienfelder übernehmen; abgeschlossenes Ergebnis ist unveränderlich. Replay- und Signaturprüfung sowie 30-Minuten-Deadline-Vertrag bleiben erhalten.
+- **Nicht nachgewiesen:** kompletter Arduino/ESP32-S3-Build, reale Cluster-Neustarttests, Kamerahardware und verlorene UDP-Meldungen. Nächstes Paket: zuverlässige Completion-Kommunikation und Fehler-/Timeoutpfade.
+
 # SensorForge – Wiedereinstieg und technischer Übergabestand
 
 **Stand:** 2026-10-10 · **Firmware:** v87-beta105 · **Basis:** beta104 + beta105-Delta; beta103-Handover historisch
@@ -114,3 +171,69 @@ Neuen Chat mit diesem Paket beginnen; möglichst den **vollen Sketch auf beta103
 **Aktueller Stand: v87-beta105** (Delta auf beta104). Annahme eines UTC-Capture-Auftrags: Zeit einmalig aus lokaler Cluster-UTC nach monotonic ESP-Timer umrechnen; danach für diesen Job **keine** Uhr-/Sync-Nachregelung. NTP/SNTP und Cluster-Sync bleiben global unabhängig aktiv, verschieben aber den schon geplanten Shot nicht. Zeitstempel aus eingefrorener Abbildung, kein Belichtungsbeginn. Standard 10 Sekunden; gültiger Vorausbereich 5 Sekunden bis 30 Minuten im Browser, 2 Sekunden bis 30 Minuten Coordinator, 1,5 Sekunden bis 30 Minuten Node (Netzwerklaufzeit berücksichtigt). Job-Timeout 30 Minuten 30 Sekunden. Für einen künftigen gemeinsamen Capture von GPIO/Video/Sequenzen monotone Deadline wiederverwenden.
 
 **Empfohlener Test:** Beide Geräte aktualisieren; 10-Sekunden- und 3-Minuten-Capture testen; während Wartephase kontrolliert NTP-/Cluster-Zeitänderungen beobachten und überprüfen, dass die geplante monotone Triggerzeit nicht springt. Report/JPEG/UUID prüfen. Aufnahme-Zeitgleichheit und Shutter-Genauigkeit sind damit noch nicht physisch nachgewiesen. Vollständiger ESP32-Build offen.
+
+### Audit-Paket 4 – Zwischenstand
+- Recording-Write-Behind: Startup-Race zwischen `xTaskCreatePinnedToCore()` und dem Setzen von `taskHandle_` durch einen Start-Handshake behoben (`recording_write_buffer.cpp`).
+- Nicht als geprüft markieren: Task-Ende-Freigabe, SD-Wipe unter aktiver Recorder-Last, Power-Shooter-Abläufe und PSRAM-Limits auf Hardware. Weiterer Audit und ESP32-Compile erforderlich.
+- Verbindliche Basis: Original v87-beta105 **plus kumulative Pakete 1–3 und Paket 4**; vorhandene Funktionen bleiben erhalten.
+
+
+### Audit-Paket 5b – SD-Wartungsreservierung (2026-10-11)
+- `web_sd_maintenance.cpp`: Ein angenommener Cluster-Wipe reserviert den SD-Wartungspfad nun auch gegenüber lokalem Wipe/Format, Secure-Erase und SD-Benchmark. Zuvor sperrte `g_recordingStartBlocked` lediglich neue Aufnahmen, aber nicht die lokalen Wartungsstarts.
+- Die Cluster-Ausführung räumt `g_clusterWipe.active` vor dem eigenen `performSdMaintenance(SD_MAINT_WIPE)` ab; dadurch blockiert die zusätzliche Admission-Sperre nicht den reservierten Auftrag.
+- Statische Prüfung durchgeführt; ein vollständiger ESP32-Build und Hardwaretests sind weiterhin ausständig. Allgemeine Parallelzugriffe, Recovery-Operationen, Power-Shooter-Zustände und PSRAM-Lastverhalten bleiben Prüfgegenstand.
+
+
+### Audit-Paket 5d – aktueller Stabilisierungsstand (2026-10-11)
+- Ausgangsbasis unverändert v87-beta105 + kumuliertes Paket 5c.
+- `web_sd_maintenance.cpp`: SD-Benchmark bei gesetzter Wartungssperre **vor** SD-Metadatenzugriff mit HTTP 409 abweisen; Busy-Status berücksichtigt auch `g_storageLocked`.
+- Noch offen: vollständiger ESP32-S3-Compile, SD-Parallellast/Power-Shooter-Zustandswechsel, PSRAM-Grenzwerte und echte Hardwaretests. Keine Stable-Freigabe.
+
+### Stabilisierung Audit 5e (2026-10-11)
+- `sensorforge.ino`: interner Sparse-MKV-Pufferflush hat jetzt selbst einen SD-/Recording-Startsperren-Guard. Bei Ablehnung bleiben gepufferte Bilder im RAM.
+- **Offen:** vollständiger ESP32-Compile; Task-/PSRAM-Stresstests, konkurrierende SD-Leser/Schreiber, Power-Shooter-Moduswechsel, Drone-/API-Sicherheitsprüfung. Keine Stable-Freigabe.
+
+### Fortsetzung Audit Paket 5f (2026-10-11)
+- **Korrigiert (P1):** Cluster-Wipe-Reservierung wird während Recorder-Finalisierung und Ausführung nicht mehr vorzeitig gelöscht. Lokale Wartung wird dadurch nicht zwischen Reservierung und `g_storageLocked` zugelassen.
+- **Nicht erledigt:** vollständige Analyse paralleler SD-Nutzer und Blockade-Recovery für SD-Drain-Task; danach Power Shooter/PSRAM sowie Cluster/Drone/API prüfen.
+- **Validierung:** statische Quelltext- und Archivprüfung; weder vollständiger ESP32-S3-Compile noch Hardwaretest.
+
+
+### Audit-Paket 5g (2026-10-11)
+- `webconfig.cpp`: Schutz gegen pauschales Löschen der SD-Sperre durch den Mikrofon-Test bei zwischenzeitlich gesetzter Cluster-Wipe-Reservierung.
+- Offen (P1): atomare Koordination sämtlicher SD-Zugriffe; blockierte Drain-I/O; Power Shooter und PSRAM unter Last.
+- Noch nicht durchgeführt: vollständiger ESP32-Compile, Integrations- und Hardwaretests.
+
+### Audit-Paket 5h (2026-10-11)
+- `web_sd_maintenance.cpp`: Cluster-Wipe wird nicht mehr angenommen, während `g_recordingStartBlocked` bereits durch andere Abläufe gesetzt ist.
+- Weiter offen (P1): atomare SD-Ressourcenkoordination über alle Tasks, begrenzte Recovery bei dauerhaft blockierter SD-I/O. Als nächste Prüfgegenstände Power Shooter/PSRAM sowie API/Drone Mode.
+- Auslieferung als kumulatives Delta auf Original v87-beta105; noch keine ESP32-Kompilation/Hardwaretests.
+
+
+### Paket 5i: Sync-API-SD-SPI-Remount gegen Cluster-Wipe-Reservierung abgesichert. Offen: atomare SD-Ressourcenkoordination, blockierende I/O, Power Shooter/PSRAM, Vollbuild und Hardwaretests.
+
+### Paket 5m (2026-10-11): SD-Besitzmechanismus – erste Anbindung
+- Cluster-Wipe nutzt jetzt zusätzlich ein atomisches Lease-Ticket; Freigabe erfolgt erst nach dem Wipe. Die Legacy-Sperren bleiben bestehen.
+- Offene P1-Aufgaben: alle SD-Clients migrieren, laufende I/O und blockierte Drain-Tasks absichern; Power-Shooter/PSRAM prüfen.
+- Kein vollständiger ESP32-Compile oder Hardwaretest; **keine stabile Freigabe**.
+
+
+### Stabilisierung Paket 5n (2026-10-11)
+Secure Erase und Cluster-Wipe besitzen jetzt konkurrierende atomare Leases; der Secure-Erase-Job gibt sein Ticket bei Abschluss und im Start-Rollback frei. Paket 5n setzt Paket 5m voraus. Offen: alle übrigen SD-Clients migrieren, Race-/Recovery-Tests, Power Shooter, PSRAM, ESP32-Compile und Hardwaretests.
+
+## Paket 5o – Zwischenstand
+Lokale Formatierung/Wipe und SD-Benchmark wurden in den Lease-Controller eingebunden. Im Konfliktfall werden Operationen abgelehnt; Scoped-Leases verhindern Leaks auch bei vorzeitigem Rücksprung. Weiter offen: SPI-Remount, übrige SD-Nutzer, Recovery und vollständiger ESP32-Build plus Hardwaretests.
+
+### Audit-Paket 5q – Recorder-Start und SD-Lease (2026-10-11)
+- `recorder.cpp`: `recorderStart()` verweigert neue Aufnahmen auch bei aktiver atomarer SD-Wartungslease (`webSdAdmissionController().busy()`). Vorher wurden nur die kooperativen Flags geprüft; die Reihenfolge Lease-vor-Flag ließ ein kurzes Zulassungsfenster.
+- Diese Ergänzung ist **Defense-in-Depth**, kein vollständiger Ausschluss laufender Recorder-I/O: der Start prüft die Lease bislang nur einmal vor den Dateisystemzugriffen. Eine atomare Recorder-Besitzerlease bzw. Drain-/Finalize-Quiescence bleibt P1.
+- Keine Änderungen an bestehendem Aufnahmeformat, Capture-Timing oder Power Shooter. Nur statische Strukturprüfung; ESP32-Compile und Hardwaretests offen.
+
+### Audit-Paket 5r – atomarer Recorder-Dateistart (2026-10-11)
+- `recorderStart()` reserviert jetzt vor jeglichem Dateisystemzugriff eine kurzlebige `RecorderStart`-Lease und hält sie bis zum Ende des Startpfads, auch bei Fehlern. Dadurch kann keine bereits migrierte Wartung/Remount-Operation zwischen Admission-Prüfung und Dateiöffnung reservieren.
+- Die bisherigen Flags werden nach Erwerb der Lease erneut geprüft. Bereits laufende Aufnahmen und ihre Schreib-/Finalize-Pfade werden **noch nicht** durch dieselbe Lease geschützt. Die Änderung ist bewusst auf den Start begrenzt; ein atomarer Schutz der gesamten I/O-Lebensdauer und die Migration weiterer SD-Nutzer bleiben P1.
+- Host-C++-Test des Admission-Controllers; vollständiger ESP32-Compile und Hardwaretests offen.
+
+### Stand Audit 5s (2026-10-11)
+- P1 weiter offen: gemeinsamer atomarer Übergang vom aktiven Recorder zu exklusiver SD-Wartung einschließlich Drain-Task-Quiescence. Die Start-Lease allein reicht nicht. Eine langfristige exklusive Recorder-Lease wäre mit vorab akzeptierten Cluster-Wipes unvereinbar. Ausarbeitung: `SD_RECORDER_HANDOFF_AUDIT.md`.
+- Paket 5s enthält ausschließlich Dokumentation, keine Laufzeitänderung. Firmware-Compile/HW-Tests weiter offen.

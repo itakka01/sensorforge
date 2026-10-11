@@ -6,6 +6,7 @@
 #include "mkv_writer.h"
 #include "logger.h"
 #include "storage_guard.h"
+#include "web_sd_maintenance.h"
 #include "recording_storage.h"
 #include "webconfig.h"
 
@@ -197,11 +198,31 @@ bool recorderStart(
     if (
         g_recordingStartBlocked ||
         g_storageLocked ||
+        webSdAdmissionController().busy() ||
         webConfigCameraPreviewActive()
     ) {
         return false;
     }
 
+
+    // Hold admission through file creation: a busy() check alone races with
+    // a maintenance reservation occurring before STORAGE.open().  The lease
+    // is intentionally short-lived; regular frame writing is NOT protected
+    // by this start-only lease.
+    struct RecorderStartAdmission {
+        SdAdmissionController &controller;
+        SdAdmissionController::Lease lease;
+        explicit RecorderStartAdmission(SdAdmissionController &c)
+            : controller(c), lease(c.tryReserve(SdAdmissionController::RecorderStart)) {}
+        ~RecorderStartAdmission() { if (lease) controller.release(lease); }
+        RecorderStartAdmission(const RecorderStartAdmission &) = delete;
+        RecorderStartAdmission &operator=(const RecorderStartAdmission &) = delete;
+    } startAdmission(webSdAdmissionController());
+    if (!startAdmission.lease) return false;
+    // Recheck legacy gates after acquiring the atomic lease.  Their owners
+    // are not all migrated yet, so they remain independent safety gates.
+    if (g_recordingStartBlocked || g_storageLocked || webConfigCameraPreviewActive())
+        return false;
 
     if (activeRecorder != RECORDER_NONE) {
         recorderEnd();

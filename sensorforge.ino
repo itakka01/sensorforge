@@ -10832,7 +10832,7 @@ static bool continuousShooterWriteJpeg(
         recording ||
         recorderIsOpen() ||
         !sdReady ||
-        g_storageLocked ||
+        g_storageLocked || g_recordingStartBlocked ||
         syncApiExclusiveActive() ||
         thermalEmergencyState
     ) {
@@ -10943,7 +10943,7 @@ static bool continuousShooterWriteSparseMkvSingle(
         return false;
 
     if (
-        recording || recorderIsOpen() || !sdReady || g_storageLocked ||
+        recording || recorderIsOpen() || !sdReady || g_storageLocked || g_recordingStartBlocked ||
         syncApiExclusiveActive() || thermalEmergencyState ||
         continuousShooterAlarmHasPriority()
     ) {
@@ -11025,6 +11025,11 @@ static bool continuousShooterWriteSparseMkvFromBuffer(
     motionHint = false;
 
     if (shooterBufferUsed < sizeof(ShooterBufferedFrameHeader))
+        return false;
+
+    // A reserved cluster SD wipe blocks new Power-Shooter flush operations,
+    // even if this internal helper is invoked without its usual caller guard.
+    if (g_storageLocked || g_recordingStartBlocked)
         return false;
 
     if (!storagePrepareForRecording())
@@ -11402,7 +11407,7 @@ static bool continuousShooterFlushBuffer(
         recording ||
         recorderIsOpen() ||
         !sdReady ||
-        g_storageLocked ||
+        g_storageLocked || g_recordingStartBlocked ||
         syncApiExclusiveActive() ||
         thermalEmergencyState ||
         (
@@ -11982,7 +11987,7 @@ static bool continuousShooterCapture(
         recording ||
         recorderIsOpen() ||
         !sdReady ||
-        g_storageLocked ||
+        g_storageLocked || g_recordingStartBlocked ||
         syncApiExclusiveActive() ||
         thermalEmergencyState
     ) {

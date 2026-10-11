@@ -19,6 +19,7 @@
 #include "onvif.h"
 #include "webconfig.h"
 #include "webconfig_wifi.h"
+#include "web_sd_maintenance.h"
 #include "sensorforge_version.h"
 #include "wireguard_manager.h"
 
@@ -201,6 +202,22 @@ struct SpiClockSwitchResult {
 // because exclusive lease handling also uses the same proven remount primitive.
 static bool remountSpiStorageAtHz(uint32_t frequencyHz);
 
+static bool remountAdmissionBusy() { return webSdAdmissionController().busy(); }
+
+struct ScopedSyncSdRemount {
+    SdAdmissionController::Lease lease;
+    ScopedSyncSdRemount()
+        : lease(webSdAdmissionController().tryReserve(SdAdmissionController::SpiRemount)) {}
+    ~ScopedSyncSdRemount() {
+        if (lease && !webSdAdmissionController().release(lease))
+            Serial.println("[SYNC SD] remount lease release failed");
+    }
+    explicit operator bool() const { return static_cast<bool>(lease); }
+    ScopedSyncSdRemount(const ScopedSyncSdRemount&) = delete;
+    ScopedSyncSdRemount& operator=(const ScopedSyncSdRemount&) = delete;
+};
+
+
 static SpiClockSwitchResult switchSpiStorageClock(
     uint32_t targetHz,
     uint32_t fallbackHz,
@@ -209,6 +226,9 @@ static SpiClockSwitchResult switchSpiStorageClock(
 )
 {
     SpiClockSwitchResult result = {false, false, false};
+    ScopedSyncSdRemount admission;
+    if (!admission) return result; // Concurrent SD maintenance owns the card.
+
 
     bool previousStorageLock = g_storageLocked;
     bool previousRecordingBlock = g_recordingStartBlocked;
@@ -265,7 +285,7 @@ static void serviceExclusiveLease()
 #if defined(STORAGE_SPI)
     // Keep the established lease/storage coordination even when NORMAL and MAX
     // use the same clock. If the clocks differ, expiry also needs a safe remount.
-    if (g_storageLocked || recording || recorderIsOpen())
+    if (g_storageLocked || g_recordingStartBlocked || remountAdmissionBusy() || recording || recorderIsOpen())
         return;
 
 #if SD_SPI_NORMAL_FREQUENCY_HZ != SD_SPI_MAX_FREQUENCY_HZ
@@ -1885,7 +1905,7 @@ static void handleExclusivePost()
         }
 
 #if defined(STORAGE_SPI)
-        if (g_storageLocked) {
+        if (g_storageLocked || g_recordingStartBlocked || remountAdmissionBusy()) {
             sendBusy("storage_locked");
             return;
         }
@@ -1937,7 +1957,7 @@ static void handleExclusivePost()
         return;
     }
 
-    if (g_storageLocked) {
+    if (g_storageLocked || g_recordingStartBlocked || remountAdmissionBusy()) {
         sendBusy("storage_locked");
         return;
     }
@@ -2059,7 +2079,7 @@ static void handleTestSdSpi()
         return;
     }
 
-    if (g_storageLocked) {
+    if (g_storageLocked || g_recordingStartBlocked || remountAdmissionBusy()) {
         sendBusy("storage_locked");
         return;
     }
@@ -2088,6 +2108,9 @@ static void handleTestSdSpi()
         sendJsonError(400, "invalid_bytes", "bytes_must_be_a_positive_integer");
         return;
     }
+
+    ScopedSyncSdRemount admission;
+    if (!admission) { sendBusy("storage_locked"); return; }
 
     // Verify the source file before touching the mount.
     File verifyFile = STORAGE.open(path.c_str(), FILE_READ);
@@ -2897,7 +2920,7 @@ static void handleConfigPost()
         return;
     }
 
-    if (g_storageLocked) {
+    if (g_storageLocked || g_recordingStartBlocked) {
         sendBusy("storage_locked");
         return;
     }
@@ -3837,7 +3860,7 @@ static void handleTransportControl()
         sendBusy("recording_active");
         return;
     }
-    if (g_storageLocked) {
+    if (g_storageLocked || g_recordingStartBlocked) {
         sendBusy("storage_locked");
         return;
     }
@@ -3905,7 +3928,7 @@ static void handleConfigStoragePost()
         sendBusy("recording_active");
         return;
     }
-    if (g_storageLocked) {
+    if (g_storageLocked || g_recordingStartBlocked) {
         sendBusy("storage_locked");
         return;
     }

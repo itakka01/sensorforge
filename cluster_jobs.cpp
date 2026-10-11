@@ -70,7 +70,8 @@ bool setCaptureMedia(uint64_t id,uint32_t epoch,const char *uuid,int64_t dispatc
     }
     for(size_t i=0;i<count;i++){
         Entry &e=entries[i];
-        if(e.jobId==id&&e.coordinatorEpoch==epoch&&e.kind==Kind::Capture){
+        if(e.jobId==id&&e.coordinatorEpoch==epoch&&e.kind==Kind::Capture&&
+           (e.state==State::Sent||e.state==State::Accepted)&&!e.mediaUuid[0]){
             memcpy(e.mediaUuid,uuid,37);e.dispatchUtcUs=dispatch;e.mediaBytes=bytes;
             return true;
         }

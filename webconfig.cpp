@@ -16834,7 +16834,7 @@ static void handleAudioTestRecord()
         return;
     }
 
-    if (g_storageLocked || recording || recorderIsOpen()) {
+    if (g_storageLocked || g_recordingStartBlocked || recording || recorderIsOpen()) {
         server.send(409, "text/plain; charset=utf-8", "Mikrofontest ist während Aufnahme oder Storage-Wartung nicht möglich.");
         return;
     }
@@ -16868,7 +16868,11 @@ static void handleAudioTestRecord()
         error,
         audioMicTestService
     );
-    g_storageLocked = false;
+    // Do not clear a storage reservation established by the cluster while
+    // audioMicTestService() yielded to other firmware services.
+    // The initial lock was false (checked above). Keep it asserted if a
+    // concurrent cluster wipe has since blocked new recording starts.
+    g_storageLocked = g_recordingStartBlocked;
 
     if (!ok) {
         server.send(500, "text/plain; charset=utf-8", error.length() ? error : "Mikrofontest fehlgeschlagen.");

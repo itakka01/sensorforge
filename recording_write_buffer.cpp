@@ -70,7 +70,17 @@ RecordingWriteBufferedFile::RecordingWriteBufferedFile()
 
 RecordingWriteBufferedFile::~RecordingWriteBufferedFile()
 {
-    close();
+    // A failed timed close must never leave a worker referencing an object
+    // whose lifetime has ended (in particular the stack-local SD benchmark).
+    // Wait for the worker, even if the SD backend is permanently blocked.
+    // This intentionally fails closed: a hard SD I/O hang may prevent return.
+    if (!closeChecked() && taskHandle_) {
+        Serial.println(
+            "Recording drain still active at destruction; waiting for safe shutdown"
+        );
+        (void)stopDrainTask(0);  // 0 = portMAX_DELAY, not a zero-time poll
+        (void)closeChecked();
+    }
 }
 
 
@@ -139,6 +149,14 @@ bool RecordingWriteBufferedFile::prepareWriteBehind()
         return false;
     }
 
+    drainExited_ = xSemaphoreCreateBinary();
+    if (!drainExited_) {
+        initStatus_ = RECORDING_WRITE_BUFFER_MUTEX_ALLOC_FAILED;
+        reportWriteBehindInitFailure(initStatus_);
+        releaseWriteBehind();
+        return false;
+    }
+
     capacity_ = WRITE_BEHIND_BYTES;
     writePos_ = 0;
     readPos_ = 0;
@@ -172,14 +190,22 @@ bool RecordingWriteBufferedFile::startDrainTask()
         return false;
     }
 
+    // The new task waits for this startup notification. Without the handshake,
+    // it may exit and clear taskHandle_ before the creator publishes the handle.
     taskHandle_ = task;
     initStatus_ = RECORDING_WRITE_BUFFER_READY;
+    xTaskNotifyGive(task);
     return true;
 }
 
 
 void RecordingWriteBufferedFile::releaseWriteBehind()
 {
+    if (drainExited_) {
+        vSemaphoreDelete(drainExited_);
+        drainExited_ = nullptr;
+    }
+
     if (mutex_) {
         vSemaphoreDelete(
             mutex_
@@ -405,10 +431,15 @@ void RecordingWriteBufferedFile::drainTaskThunk(void *arg)
     RecordingWriteBufferedFile *self =
         static_cast<RecordingWriteBufferedFile *>(arg);
 
+    // Do not touch the owner until startDrainTask() has published taskHandle_.
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     if (self)
         self->drainTask();
 
-    vTaskDelete(nullptr);
+    // Once the worker signals completion it must not access its owner again.
+    // The closing task owns vTaskDelete(worker) and resource disposal.
+    vTaskSuspend(nullptr);
+    for (;;) { vTaskDelay(portMAX_DELAY); }
 }
 
 
@@ -547,7 +578,7 @@ void RecordingWriteBufferedFile::drainTask()
     }
 
     taskRunning_ = false;
-    taskHandle_ = nullptr;
+    xSemaphoreGive(drainExited_);
 }
 
 
@@ -623,27 +654,24 @@ bool RecordingWriteBufferedFile::stopDrainTask(
     if (task)
         xTaskNotifyGive(task);
 
-    uint32_t startMs = millis();
-
-    while (taskHandle_) {
-        if (
-            timeoutMs > 0 &&
-            (uint32_t)(millis() - startMs) >=
-                timeoutMs
-        ) {
-            snprintf(
-                lastError_,
-                sizeof(lastError_),
-                "write-behind task stop timeout | timeout_ms=%lu",
-                (unsigned long)timeoutMs
-            );
-            asyncFailed_ = true;
-            return false;
-        }
-
-        delay(1);
+    // Completion is signalled after the last storage/mutex access.
+    // The worker parks itself; only the closer deletes its task handle.
+    if (xSemaphoreTake(
+            drainExited_,
+            timeoutMs == 0 ? portMAX_DELAY : pdMS_TO_TICKS(timeoutMs)
+        ) != pdTRUE) {
+        snprintf(
+            lastError_,
+            sizeof(lastError_),
+            "write-behind task stop timeout | timeout_ms=%lu",
+            (unsigned long)timeoutMs
+        );
+        asyncFailed_ = true;
+        return false;
     }
 
+    vTaskDelete(task);
+    taskHandle_ = nullptr;
     return true;
 }
 

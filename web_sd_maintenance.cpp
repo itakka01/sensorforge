@@ -9,6 +9,7 @@
 #include "recording_crypto.h"
 #include "recording_write_buffer.h"
 #include "storage_guard.h"
+#include "sd_admission_controller.h"
 #include "sd_presence_policy.h"
 #include "webplayer.h"
 
@@ -62,6 +63,26 @@ struct ClusterWipePending {
     bool priorRecordingBlocked = false;
 };
 static ClusterWipePending g_clusterWipe;
+// Phase-one migration: only ClusterWipe uses the atomic admission lane.
+static SdAdmissionController g_sdAdmission;
+static SdAdmissionController::Lease g_clusterWipeLease;
+static SdAdmissionController::Lease g_secureEraseLease;
+
+// Scoped admission for synchronous SD operations. Never releases another
+// owner's ticket, including on an early error return.
+struct ScopedSdAdmission {
+    SdAdmissionController::Lease lease;
+    explicit ScopedSdAdmission(SdAdmissionController::Owner owner)
+        : lease(g_sdAdmission.tryReserve(owner)) {}
+    ~ScopedSdAdmission() {
+        if (lease && !g_sdAdmission.release(lease))
+            Serial.println("[SD] scoped admission release failed");
+    }
+    explicit operator bool() const { return static_cast<bool>(lease); }
+    ScopedSdAdmission(const ScopedSdAdmission&) = delete;
+    ScopedSdAdmission& operator=(const ScopedSdAdmission&) = delete;
+};
+
 
 static WebSdMaintenanceUiHooks g_uiHooks = { nullptr, nullptr, nullptr };
 
@@ -1572,6 +1593,10 @@ static void releaseSecureEraseLocks()
 
     g_storageLocked =
         sdSecurePreviousStorageLock;
+    // Release only the reservation actually owned by this secure erase job.
+    if (!g_sdAdmission.release(g_secureEraseLease))
+        Serial.println("[SD] secure erase admission release failed");
+    g_secureEraseLease = {};
 }
 
 
@@ -1597,7 +1622,7 @@ static bool secureEraseCoverageSufficient()
 
 static SdMaintenanceResult beginSecureEraseJob()
 {
-    if (sdSecureJobActive) {
+    if (sdSecureJobActive || g_clusterWipe.active) {
         return
             SD_MAINT_RESULT_STORAGE_LOCKED;
     }
@@ -1638,6 +1663,18 @@ static SdMaintenanceResult beginSecureEraseJob()
             SD_MAINT_RESULT_CONFIG_SOURCE_FAILED;
     }
 
+    // Atomic admission is shared with the cluster wipe. Take the lease
+    // only after all non-destructive preparation has succeeded.
+    const auto lease = g_sdAdmission.tryReserve(SdAdmissionController::SecureErase);
+    if (!lease) return SD_MAINT_RESULT_STORAGE_LOCKED;
+    // Recheck legacy gates after acquisition: a client not yet migrated
+    // could have entered during the preparation phase.
+    if (g_clusterWipe.active || g_storageLocked || g_recordingStartBlocked || recorderIsOpen()) {
+        g_sdAdmission.release(lease);
+        return SD_MAINT_RESULT_STORAGE_LOCKED;
+    }
+    g_secureEraseLease = lease;
+
     sdSecurePreviousRecordingBlock =
         g_recordingStartBlocked;
 
@@ -1654,6 +1691,8 @@ static SdMaintenanceResult beginSecureEraseJob()
             sdSecurePreviousRecordingBlock;
         g_storageLocked =
             sdSecurePreviousStorageLock;
+        g_sdAdmission.release(g_secureEraseLease);
+        g_secureEraseLease = {};
         return
             SD_MAINT_RESULT_RECORDING_ACTIVE;
     }
@@ -1981,12 +2020,23 @@ static bool sdFormatBackendSupported()
 
 
 static SdMaintenanceResult performSdMaintenance(
-    SdMaintenanceMode mode
+    SdMaintenanceMode mode,
+    bool admittedClusterWipe = false
 )
 {
+    // A scheduled cluster wipe already owns its reservation. Local operations
+    // must acquire a distinct lease before accessing SD or configuration.
+    ScopedSdAdmission localAdmission(admittedClusterWipe
+        ? SdAdmissionController::None : SdAdmissionController::Format);
+    if (!admittedClusterWipe && !localAdmission)
+        return SD_MAINT_RESULT_STORAGE_LOCKED;
+    if (admittedClusterWipe && !g_sdAdmission.owns(g_clusterWipeLease))
+        return SD_MAINT_RESULT_STORAGE_LOCKED;
+
     // Another module may reserve the SD for a future critical operation.
     // Never start nested maintenance while the global storage gate is held.
-    if (g_storageLocked) {
+    if (g_storageLocked ||
+        (g_clusterWipe.active && !admittedClusterWipe)) {
         return
             SD_MAINT_RESULT_STORAGE_LOCKED;
     }
@@ -5210,13 +5260,33 @@ static void handleSDBench()
     if (rejectWhileRecording("SD benchmark"))
         return;
 
+    // Do not even query card metadata while an erase, wipe or another
+    // storage maintenance operation owns the SD bus. A prior error message
+    // alone did not prevent the diagnostic code below from accessing STORAGE.
+    if (g_storageLocked || g_recordingStartBlocked ||
+        g_clusterWipe.active || sdSecureJobActive) {
+        webServer().send(
+            409,
+            "text/plain; charset=utf-8",
+            "SD benchmark unavailable - storage maintenance in progress"
+        );
+        return;
+    }
+    ScopedSdAdmission benchmarkAdmission(SdAdmissionController::Benchmark);
+    if (!benchmarkAdmission || g_storageLocked || g_recordingStartBlocked ||
+        g_clusterWipe.active || sdSecureJobActive) {
+        webServer().send(409, "text/plain; charset=utf-8",
+                         "SD benchmark unavailable - storage reservation busy");
+        return;
+    }
+
     SdMaintenanceViewState view = {};
     view.benchmarkAttempted = true;
 
     if (!sdReady) {
         view.benchmarkError =
             "SD is not ready";
-    } else if (g_storageLocked) {
+    } else if (g_storageLocked || g_clusterWipe.active) {
         view.benchmarkError =
             "Storage is currently locked by another operation";
     }
@@ -6221,6 +6291,8 @@ static void handleSDBench()
 
 } // namespace
 
+SdAdmissionController& webSdAdmissionController() { return g_sdAdmission; }
+
 void webSdMaintenanceRegisterRoutes(
     WebServer &server,
     const WebSdMaintenanceUiHooks &uiHooks
@@ -6247,8 +6319,14 @@ bool webSdQueueClusterWipe(uint32_t coordinatorBoot, uint32_t coordinatorEpoch,
                            uint32_t sequence, SdClusterWipeDone callback)
 {
     if (!callback || !coordinatorBoot || !coordinatorEpoch || !sequence ||
-        g_clusterWipe.active || sdSecureJobActive || g_storageLocked || !sdReady)
+        g_clusterWipe.active || sdSecureJobActive || g_storageLocked ||
+        g_recordingStartBlocked || !sdReady)
         return false;
+    // Atomic lease prevents a second reservation from replacing this owner.
+    // Legacy gates are retained until all other SD clients are migrated.
+    const auto lease = g_sdAdmission.tryReserve(SdAdmissionController::ClusterWipe);
+    if (!lease) return false;
+    g_clusterWipeLease = lease;
     g_clusterWipe.active = true;
     g_clusterWipe.coordinatorBoot = coordinatorBoot;
     g_clusterWipe.coordinatorEpoch = coordinatorEpoch;
@@ -6265,16 +6343,22 @@ void webSdMaintenanceLoop()
     processSecureEraseJob();
     if (!g_clusterWipe.active) return;
     const ClusterWipePending job = g_clusterWipe;
-    g_clusterWipe.active = false; // no nested executions
+    // Keep the cluster reservation active during recorder finalization and
+    // the wipe. This closes the admission gap before storageLocked is raised.
     // Closing the current recorder is immediate (no wait for its event length).
     // Its normal finalize path releases outstanding handles.
     if (recording) stopRecording();
     SdMaintenanceResult result = SD_MAINT_RESULT_RECORDING_ACTIVE;
     if (!recording && !recorderIsOpen() && sdReady && !g_storageLocked)
-        result = performSdMaintenance(SD_MAINT_WIPE);
+        result = performSdMaintenance(SD_MAINT_WIPE, true);
     // performSdMaintenance saves/restores the recording gate, so remove the
     // pending-job admission block only after all maintenance work has ended.
     g_recordingStartBlocked = job.priorRecordingBlocked;
+    g_clusterWipe.active = false;
+    // Release exactly the lease acquired on queueing; never clear another owner's ticket.
+    const bool released = g_sdAdmission.release(g_clusterWipeLease);
+    if (!released) Serial.println("[CLUSTER SD] admission lease release failed");
+    g_clusterWipeLease = {};
     Serial.printf("[CLUSTER SD] wipe finished result=%u\n", (unsigned)result);
     if (job.callback)
         job.callback(job.coordinatorBoot, job.coordinatorEpoch,
@@ -6283,5 +6367,7 @@ void webSdMaintenanceLoop()
 
 bool webSdMaintenanceBusy()
 {
-    return sdSecureJobActive || g_clusterWipe.active;
+    // Keep the cluster reservation visible through recorder shutdown and wipe.
+    // g_storageLocked additionally covers the destructive phase.
+    return sdSecureJobActive || g_clusterWipe.active || g_storageLocked || g_sdAdmission.busy();
 }

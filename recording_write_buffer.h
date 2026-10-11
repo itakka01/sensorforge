@@ -89,6 +89,7 @@ private:
     uint8_t *ring_ = nullptr;
     uint8_t *drainScratch_ = nullptr;
     SemaphoreHandle_t mutex_ = nullptr;
+    SemaphoreHandle_t drainExited_ = nullptr;
     TaskHandle_t taskHandle_ = nullptr;
 
     volatile bool stopRequested_ = false;

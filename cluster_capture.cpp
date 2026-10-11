@@ -5,8 +5,6 @@
 #include "sync_api.h"
 #include "esp_camera.h"
 #include "esp_timer.h"
-#include "esp_timer.h"
-#include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
 #include <string.h>

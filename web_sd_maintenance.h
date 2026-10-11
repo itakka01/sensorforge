@@ -31,3 +31,7 @@ using SdClusterWipeDone = void (*)(uint32_t coordinatorBoot, uint32_t coordinato
 bool webSdQueueClusterWipe(uint32_t coordinatorBoot, uint32_t coordinatorEpoch,
                            uint32_t sequence, SdClusterWipeDone callback);
 
+
+// Shared admission lane for SD maintenance and SPI remount operations.
+#include "sd_admission_controller.h"
+SdAdmissionController& webSdAdmissionController();
