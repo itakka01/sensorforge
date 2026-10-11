@@ -56,6 +56,8 @@
 #include "motion_diagnostics.h"
 #include "streamer.h"
 #include "firmware_security.h"
+#include "firmware_ota_activation.h"
+#include "firmware_auto_scheduler.h"
 #include "wireguard_manager.h"
 #include "drone_mode.h"
 #include "cluster.h"
@@ -16274,6 +16276,7 @@ void loop() {
     // A cold boot that survives the configured stabilization period is marked
     // healthy in NVS. This is intentionally tiny/non-blocking after arming.
     bootloopProtectionLoop();
+    FirmwareOtaActivation::reportStableBootOnce();
 
     // Non-blocking recording/fault LED state.
     updateStatusLed();
@@ -16308,6 +16311,9 @@ void loop() {
         }
         thermalMonitorLoop();
         if (webConfigStarted) webConfigLoop();
+        // Node OTA checks use the Drone Mode maintenance window only.
+        // Compiled fail-closed until OTA/rollback tests are complete.
+        firmwareAutoSchedulerLoop();
         // Retain minimal networking service; no automatic SD reads/writes here.
         wireguardService(false);
         delay(1);

@@ -5,6 +5,7 @@
 #include "cluster_hw_time_gpio_lease.h"
 #include "cluster_hw_time_series.h"
 #include "cluster_capture.h"
+#include "firmware_update_admission.h"
 #include "drone_mode.h"
 #include "webconfig.h"
 #include "web_sd_maintenance.h"
@@ -2675,6 +2676,11 @@ static void processJobRestart(char **f, size_t n, const IPAddress &ip)
     }
     // Even a refused, otherwise authenticated command consumes its sequence.
     restartSeenBoot=cb; restartSeenEpoch=epoch; restartSeenSeq=seq;
+    if (FirmwareUpdateAdmission::active()) {
+        rejectRestart("ota_reserved");
+        sendJobRefusal((const char *const *)f, ip, bootNonce, 1, 2);
+        return;
+    }
     String error;
     if (!webConfigScheduleReboot(3500UL, error)) {
         Serial.printf("[CLUSTER JOB] restart schedule blocked: %s\n", error.c_str());
@@ -2757,6 +2763,11 @@ static void processJobShutdown(char **f, size_t n, const IPAddress &ip)
         rejectShutdown("replay"); return;
     }
     shutdownSeenBoot=cb; shutdownSeenEpoch=epoch; shutdownSeenSeq=seq;
+    if (FirmwareUpdateAdmission::active()) {
+        rejectShutdown("ota_reserved");
+        sendJobRefusal((const char *const *)f, ip, bootNonce, 2, 2);
+        return;
+    }
     String error;
     // 5 seconds gives the signed ACK time to leave before WiFi is stopped.
     if (!webConfigScheduleShutdown(5000UL, error)) {
@@ -2894,6 +2905,7 @@ static void processHwTimeRequest(char **f,size_t n,const IPAddress &ip) {
     // Consume authenticated sequences before any future GPIO/resource operation.
     // Retransmissions must never produce a second impulse.
     if(!hwTimeSeen.accept(req))return;
+    if (FirmwareUpdateAdmission::active()) return; // No pulse and no false ARM ACK.
     // Only XIAO GPIO2 currently has a dedicated output. Freenove GPIO48
     // shares the RGB LED and must NOT be driven before an explicit handoff.
     // The arm function freezes the UTC->monotonic mapping at acceptance.
@@ -2955,7 +2967,8 @@ static void processJobCapture(char **f,size_t n,const IPAddress &ip) {
     int64_t utc=(int64_t)strtoll(f[8],&end,10);
     int64_t nowUtc=0;
     if(errno||!end||*end||utc<=0||!clusterTimeNowUs(nowUtc)||utc-nowUtc<1500000LL||
-       utc-nowUtc>1800000000LL||pendingCapture.active) {
+       utc-nowUtc>1800000000LL||pendingCapture.active||
+       FirmwareUpdateAdmission::active()) {
         sendCaptureResult(cb,epoch,seq,3,1,0);return;
     }
     // Freeze the mapping immediately, before sending the acceptance ACK.
@@ -3087,6 +3100,10 @@ static void processJobWipe(char **f,size_t n,const IPAddress &ip)
     if (wipeSeenBoot==cb && wipeSeenEpoch==epoch && seq<=wipeSeenSeq) return;
     // Consume even when not ready. Repeated signed commands MUST NOT rewipe.
     wipeSeenBoot=cb;wipeSeenEpoch=epoch;wipeSeenSeq=seq;
+    if (FirmwareUpdateAdmission::active()) {
+        sendClusterWipeResult(cb,epoch,seq,0,100); // Explicit busy refusal.
+        return;
+    }
     if (!webSdQueueClusterWipe(cb,epoch,seq,sendClusterWipeResult)) {
         // One authenticated terminal refusal: unavailable/busy.
         sendClusterWipeResult(cb,epoch,seq,0,100);
@@ -3140,7 +3157,8 @@ static void processJobDrone(char **f,size_t n,const IPAddress &ip){
        (uint32_t)(millis()-coord->lastSeenMs)>60000UL)return;
     if(droneSeenBoot==cb&&droneSeenEpoch==epoch&&seq<=droneSeenSeq)return;
     droneSeenBoot=cb;droneSeenEpoch=epoch;droneSeenSeq=seq;
-    const bool success=droneModeSet(enable!=0);
+    // An OTA lease must not be invalidated by a Drone Mode command.
+    const bool success = !FirmwareUpdateAdmission::active() && droneModeSet(enable!=0);
     char own[9];snprintf(own,sizeof(own),"%08lx",(unsigned long)bootNonce);
     String msg=String(CLUSTER_JOB_DRONE_ACK_MAGIC)+"|"+runtimeClusterTag+"|"+
         currentCoordinatorId+"|"+f[3]+"|"+f[4]+"|"+deviceIntegrationId()+"|"+

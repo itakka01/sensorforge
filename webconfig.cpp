@@ -12,6 +12,7 @@
 #include <FS.h>
 #include <LittleFS.h>
 #include <WiFi.h>
+#include <Preferences.h>
 #include <WebServer.h>
 #include "cluster_capture.h"
 #include <esp_camera.h>
@@ -52,9 +53,12 @@
 #include "webconfig_wifi.h"
 #include "webconfig_transport.h"
 #include "webconfig_cluster.h"
+#include "webconfig_firmware_auto.h"
 #include "cluster.h"
 #include "access_control.h"
 #include "firmware_security.h"
+#include "firmware_compat_matcher.h"
+#include "firmware_ota_verify.h"
 #include "web_csrf.h"
 #include "onvif.h"
 
@@ -11188,7 +11192,6 @@ static void handleRadarConfigDefaults()
 // A failed/interrupted/unsigned upload therefore never becomes bootable.
 
 static const uint8_t WEB_FW_ESP_IMAGE_MAGIC = 0xE9U;
-static const size_t WEB_FW_MARKER_MAX_BYTES = 96U;
 
 static bool webFirmwareUploadAttempted = false;
 static bool webFirmwareUploadSucceeded = false;
@@ -11223,10 +11226,7 @@ static String webFirmwareReadyFilename;
 // Streaming SensorForge compatibility-marker matcher. The prefix table allows
 // matches to span arbitrary HTTP upload chunk boundaries without buffering the
 // complete firmware image in RAM.
-static size_t webFirmwareMarkerLength = 0;
-static size_t webFirmwareMarkerMatched = 0;
-static size_t webFirmwareMarkerPrefix[WEB_FW_MARKER_MAX_BYTES] = {};
-static bool webFirmwareMarkerFound = false;
+static FirmwareCompatibilityMatcher webFirmwareMarkerMatcher;
 static bool webFirmwareImageMagicChecked = false;
 
 
@@ -11339,120 +11339,20 @@ static void webFirmwareFailUpload(
 }
 
 
-static bool webFirmwarePrepareMarkerMatcher(
-    String &error
-)
+static bool webFirmwarePrepareMarkerMatcher(String &error)
 {
+    const char *marker = firmwareExpectedCompatibilityMarker();
+    if (!webFirmwareMarkerMatcher.begin(marker)) {
+        error = "Firmware compatibility marker is unavailable or too long.";
+        return false;
+    }
     error = "";
-
-    const char *marker =
-        firmwareExpectedCompatibilityMarker();
-
-    if (!marker || marker[0] == '\0') {
-        error =
-            "Firmware compatibility marker is unavailable.";
-        return false;
-    }
-
-    webFirmwareMarkerLength =
-        strlen(marker);
-
-    if (
-        webFirmwareMarkerLength == 0 ||
-        webFirmwareMarkerLength > WEB_FW_MARKER_MAX_BYTES
-    ) {
-        error =
-            "Firmware compatibility marker has an unsupported length.";
-        return false;
-    }
-
-    memset(
-        webFirmwareMarkerPrefix,
-        0,
-        sizeof(webFirmwareMarkerPrefix)
-    );
-
-    for (
-        size_t i = 1, prefix = 0;
-        i < webFirmwareMarkerLength;
-        ++i
-    ) {
-        while (
-            prefix > 0 &&
-            marker[i] != marker[prefix]
-        ) {
-            prefix =
-                webFirmwareMarkerPrefix[
-                    prefix - 1
-                ];
-        }
-
-        if (marker[i] == marker[prefix])
-            ++prefix;
-
-        webFirmwareMarkerPrefix[i] =
-            prefix;
-    }
-
-    webFirmwareMarkerMatched = 0;
-    webFirmwareMarkerFound = false;
     return true;
 }
 
-
-static void webFirmwareScanCompatibilityMarker(
-    const uint8_t *data,
-    size_t length
-)
+static void webFirmwareScanCompatibilityMarker(const uint8_t *data, size_t length)
 {
-    if (
-        webFirmwareMarkerFound ||
-        !data ||
-        length == 0 ||
-        webFirmwareMarkerLength == 0
-    ) {
-        return;
-    }
-
-    const char *marker =
-        firmwareExpectedCompatibilityMarker();
-
-    if (!marker)
-        return;
-
-    for (size_t i = 0; i < length; ++i) {
-        char current =
-            (char)data[i];
-
-        while (
-            webFirmwareMarkerMatched > 0 &&
-            current != marker[webFirmwareMarkerMatched]
-        ) {
-            webFirmwareMarkerMatched =
-                webFirmwareMarkerPrefix[
-                    webFirmwareMarkerMatched - 1
-                ];
-        }
-
-        if (
-            current ==
-            marker[webFirmwareMarkerMatched]
-        ) {
-            ++webFirmwareMarkerMatched;
-        }
-
-        if (
-            webFirmwareMarkerMatched ==
-            webFirmwareMarkerLength
-        ) {
-            webFirmwareMarkerFound = true;
-            webFirmwareMarkerMatched =
-                webFirmwareMarkerPrefix[
-                    webFirmwareMarkerMatched - 1
-                ];
-            return;
-        }
-    }
+    webFirmwareMarkerMatcher.feed(data, length);
 }
 
 
@@ -11535,9 +11435,7 @@ static void handleFirmwareUploadData()
             );
         webFirmwareUploadError = "";
         webFirmwareImageMagicChecked = false;
-        webFirmwareMarkerFound = false;
-        webFirmwareMarkerMatched = 0;
-        webFirmwareMarkerLength = 0;
+        webFirmwareMarkerMatcher.reset();
         webFirmwarePackageHeaderBytes = 0;
         webFirmwarePackageHeaderParsed = false;
         webFirmwarePackageInfo =
@@ -11883,49 +11781,18 @@ static void handleFirmwareUploadData()
             return;
         }
 
-        const size_t expectedPackageBytes =
-            SENSORFORGE_FIRMWARE_PACKAGE_HEADER_SIZE +
-            (size_t)webFirmwarePackageInfo.firmwareSize;
-
-        if (
-            webFirmwareUploadBytes !=
-                webFirmwarePackageInfo.firmwareSize ||
-            webFirmwarePackageBytes !=
-                expectedPackageBytes ||
-            (
-                upload.totalSize != 0 &&
-                upload.totalSize !=
-                    webFirmwarePackageBytes
-            )
-        ) {
-            webFirmwareFailUpload(
-                "Firmware upload size mismatch - upload may have been interrupted or malformed."
-            );
-            webFirmwareCleanupPartial();
-            webFirmwareReleaseUploadLocks();
-            return;
-        }
-
-        if (!webFirmwareMarkerFound) {
-            webFirmwareFailUpload(
-                "Firmware rejected: compatibility marker missing or wrong board."
-            );
-            webFirmwareCleanupPartial();
-            webFirmwareReleaseUploadLocks();
-            return;
-        }
-
-        String signatureError;
-
-        if (!firmwareSecurityHashFinishAndVerify(
-                webFirmwareHashContext,
+        // Shared final validation, also usable by a future HTTPS downloader.
+        String verificationError;
+        if (!firmwareOtaVerifyCompletePackage(
                 webFirmwarePackageInfo,
-                signatureError
+                webFirmwareHashContext,
+                webFirmwareMarkerMatcher.found(),
+                webFirmwareUploadBytes,
+                webFirmwarePackageBytes,
+                upload.totalSize,
+                verificationError
             )) {
-            webFirmwareFailUpload(
-                "Firmware rejected: " +
-                signatureError + "."
-            );
+            webFirmwareFailUpload(verificationError);
             webFirmwareCleanupPartial();
             webFirmwareReleaseUploadLocks();
             return;
@@ -12547,6 +12414,39 @@ static void sendSystemPage(
             ) +
             "</span></div>";
     }
+
+    // Preferences shown here are deliberately not an active updater yet.
+    // No firmware is fetched or installed by saving these values.
+    bool autoUpdateEnabled = false;
+    String autoUpdateSource;
+    const bool autoUpdateConfigOk = webFirmwareAutoRead(
+        autoUpdateEnabled, autoUpdateSource
+    );
+    if (!autoUpdateConfigOk) autoUpdateSource = WEB_FW_AUTO_DEFAULT_MANIFEST;
+    html +=
+        "<div class='settings-section'>"
+        "<h4>Automatische Node-Updates (Vorbereitung)</h4>"
+        "<p class='muted'>Noch nicht aktiv: Konfiguration gespeichert, "
+        "aber automatischer Download und Installation sind nicht implementiert. "
+        "Standard ist AUS.</p>"
+        "<form method='POST' action='/firmware_auto_settings'>"
+        "<input type='hidden' name='token' value='" +
+        String(webBootSessionId) + "'>"
+        "<label><input type='checkbox' name='enabled' value='1' " +
+        String(autoUpdateEnabled ? "checked" : "") +
+        "> Automatische Updates erlauben (erst nach Fertigstellung wirksam)</label>"
+        "<p><label for='c1UpdateManifest'>Manifest-URL (HTTPS)</label><br>"
+        "<input id='c1UpdateManifest' type='url' name='manifest' "
+        "required maxlength='240' style='width:100%;max-width:640px' value='" +
+        htmlEscape(autoUpdateSource) + "'></p>"
+        "<button type='submit'>Einstellungen speichern</button></form>"
+        "<form method='POST' action='/firmware_auto_check' target='_blank'>"
+        "<input type='hidden' name='token' value='" + String(webBootSessionId) + "'>"
+        "<button type='submit'>Manifest pruefen (nur lesen)</button></form>"
+        "<p class='muted'>Liest ausschliesslich JSON-Metadaten. Keine Installation; "
+        "Eintraege sind noch nicht kryptografisch als Releases geprueft.</p>" +
+        String(autoUpdateConfigOk ? "" : "<p>Speicher nicht verfügbar.</p>") +
+        "</div>";
 
     if (blockedByRecording) {
         html +=
@@ -19139,6 +19039,7 @@ void webConfigStart()
     );
     server.on("/firmware_install", HTTP_POST, handleFirmwareInstall);
     server.on("/firmware_discard", HTTP_POST, handleFirmwareDiscard);
+    webFirmwareAutoRegisterRoutes(server, webBootSessionId);
 
     server.on("/reboot", HTTP_GET, handleReboot);
     server.on("/rebooting", HTTP_GET, handleRebooting);

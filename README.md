@@ -109,6 +109,8 @@ on a trusted/offline system before commercial release.
 
 ## Firmware update security
 
+The automatic Node OTA design, settings, safety limitations, manifest format and test checklist are documented in [`OTA_AUTO_UPDATE.md`](OTA_AUTO_UPDATE.md). **The unattended-update build switch may be enabled for testing, but this does not constitute a validated release.**
+
 SensorForge SD and WiFi update paths accept signed `.sfw` packages using a
 dedicated firmware ECDSA P-256 / SHA-256 trust anchor.
 
