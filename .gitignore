@@ -20,6 +20,8 @@ build/
 *.log
 consolelog.txt
 
+*.zip
+
 # Video recordings / downloads
 #*.avi
 #*.mp4

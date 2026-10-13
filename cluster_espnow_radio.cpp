@@ -191,6 +191,8 @@ uint32_t qualityRetryDelayMs() {
     return kRetryBaseMs + ((mixed ^ (mixed>>15)) % kRetryJitterMs);
 }
 uint32_t failedSeries=0;
+uint32_t successfulSeries=0, lastCompletedSeriesMs=0, nextSeriesStatsReportMs=0;
+uint8_t lastCompletedSeriesResult=0;
 uint8_t lastSeriesFailure=0; // 1=invalid/insufficient; 2=spread; 3=RTT; 4=series deadline
 ClusterEspNowTwoWay::Estimate lastRejectedEstimate;
 uint8_t consecutiveFailures=0;
@@ -232,6 +234,8 @@ void loadDriftPrior(const char *id) {
 void acceptEstimate(const ClusterEspNowTwoWay::Estimate &e) {
     stats.lastExchangeValid = e.valid;
     seriesPrecisionAccepted=false;
+    lastCompletedSeriesMs=millis();
+    lastCompletedSeriesResult=2;
     if (!e.valid) { ++failedSeries; lastSeriesFailure=1; lastRejectedEstimate=e; consecutiveFailures=static_cast<uint8_t>(std::min(8U,unsigned(consecutiveFailures)+1U)); return; }
     stats.lastOffsetUs = e.offsetUs;
     stats.lastRttUs = e.medianRttUs;
@@ -245,6 +249,8 @@ void acceptEstimate(const ClusterEspNowTwoWay::Estimate &e) {
         return;
     }
     lastSeriesFailure=0;
+    ++successfulSeries;
+    lastCompletedSeriesResult=1;
     consecutiveFailures=0;
     latestQualityEstimate=e;
     seriesPrecisionAccepted=true;
@@ -373,6 +379,17 @@ void acceptNodeReport(const EspNowTimePackets::Frame &f) {
     if(r.bootNonce!=boot)r={};
     r.bootNonce=boot;
     const uint64_t bits=static_cast<uint64_t>(f.timeUs);
+    // Extra report type marker, carried inside the existing authenticated frame.
+    // Checked before the legacy success/failure formats; never changes the clock model.
+    if(f.type==EspNowTimePackets::Type::NodeSyncReport && (f.nonce&0x1000U)!=0) {
+        r.successfulSeries=static_cast<uint32_t>(bits>>32);
+        r.rejectedSeries=static_cast<uint32_t>(bits);
+        r.lastSeriesResult=static_cast<uint8_t>((f.nonce>>16)&0x0fU);
+        const uint32_t ageSeconds=(f.nonce>>20)&0x0fffU;
+        r.lastSeriesAgeMs=ageSeconds*1000UL;
+        r.hasSeriesStatistics=true;
+        remoteReceivedAt[slot]=millis();++reportCount;return;
+    }
     if(f.type==EspNowTimePackets::Type::NodeDriftReport && (f.nonce&0x800U)!=0){
         r.failedMinRttOffsetUs=static_cast<int32_t>(static_cast<uint32_t>(bits>>32));
         r.failedSelectedOffsetUs=static_cast<int32_t>(static_cast<uint32_t>(bits));
@@ -417,6 +434,17 @@ void acceptNodeReport(const EspNowTimePackets::Frame &f) {
         r.hasDriftReport=true;
     }
     remoteReceivedAt[slot]=millis();++reportCount;
+}
+void sendSeriesStatistics(uint32_t epoch,uint64_t tag,uint32_t boot) {
+    // One additional small authenticated frame per 15 s. No SD/NVS writes.
+    EspNowTimePackets::Frame f;
+    f.type=EspNowTimePackets::Type::NodeSyncReport;
+    f.epoch=epoch;f.coordinatorTag=tag;f.senderBoot=boot;
+    f.timeUs=static_cast<int64_t>((static_cast<uint64_t>(successfulSeries)<<32)|failedSeries);
+    const uint32_t ageSeconds=lastCompletedSeriesMs ?
+        std::min(4095UL,static_cast<unsigned long>((millis()-lastCompletedSeriesMs)/1000UL)) : 0;
+    f.nonce=0x1000U | (static_cast<uint32_t>(lastCompletedSeriesResult)<<16) | (ageSeconds<<20);
+    sendFrame(f,kBroadcastMac);
 }
 void sendNodeReports(uint32_t epoch,uint64_t tag,uint32_t boot) {
     if(!lastPrecisionMs){
@@ -552,6 +580,7 @@ void stop() {
     for(auto &p:slotPeers)p={};slotNextIndex=0;slotOwner=-1;
     slotStartedMs=slotGuardUntilMs=0;slotGrantsSent=slotRotations=0;
     previousEstimate={};latestQualityEstimate={};lastPrecisionMs=0;failedSeries=0;lastSeriesFailure=0;lastRejectedEstimate={};consecutiveFailures=0;
+    successfulSeries=0;lastCompletedSeriesMs=0;lastCompletedSeriesResult=0;nextSeriesStatsReportMs=0;
     referenceUtcUs=0;referenceMonoLow=0;referenceReceivedNodeMono=0;
     referenceId=String();goodDriftPairs=0;driftHistoryCount=0;
     for(auto &r:remoteReports)r={};for(auto &x:remoteReceivedAt)x=0;remoteNext=0;reportCount=0;
@@ -735,6 +764,10 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
         nextReportMs=now+5000UL;
         sendNodeReports(epoch,tag,localBootNonce);
     }
+    if(static_cast<int32_t>(now-nextSeriesStatsReportMs)>=0){
+        nextSeriesStatsReportMs=now+15000UL;
+        sendSeriesStatistics(epoch,tag,localBootNonce);
+    }
     if(!syncPermissionValid()) {
         // Keep the receiver active and the last calibrated clock in holdover.
         pending={};seriesCount=0;seriesTarget=kInitialSamples;seriesStartedMs=0;nextSeriesMs=now+1000UL;
@@ -747,7 +780,9 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
     if(seriesCount>0 && uint32_t(now-seriesStartedMs)>kMaxSeriesDurationMs) {
         // Never extend a busy/failed measurement series indefinitely.
         seriesCount=0;seriesTarget=kInitialSamples;seriesStartedMs=0;
-        pending={};++failedSeries;lastSeriesFailure=4;consecutiveFailures=static_cast<uint8_t>(std::min(8U,unsigned(consecutiveFailures)+1U));
+        pending={};++failedSeries;lastSeriesFailure=4;
+        lastCompletedSeriesMs=now;lastCompletedSeriesResult=3;
+        consecutiveFailures=static_cast<uint8_t>(std::min(8U,unsigned(consecutiveFailures)+1U));
         nextSeriesMs=now+qualityRetryDelayMs();return;
     }
     if(seriesCount==0 && !pending.active && seriesStartedMs==0)

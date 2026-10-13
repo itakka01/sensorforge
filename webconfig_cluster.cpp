@@ -498,6 +498,15 @@ function sfRenderEspNowDiag(d){
    var a=Array.isArray(d.nodes)?d.nodes.filter(function(n){return n.cluster_role!=='coordinator';}):[];
    var reports=Array.isArray(d.espnow_node_reports)?d.espnow_node_reports:[];
    function num(v,unit,digits){return Number.isFinite(Number(v))?Number(v).toFixed(digits||0)+' '+unit:'–';}
+   function seriesStatsRows(r){
+     if(!r.has_series_statistics)return '<tr><td>Serienstatistik</td><td>Noch kein Statistikbericht empfangen</td></tr>';
+     var good=Number(r.series_successful)||0,bad=Number(r.series_rejected)||0,total=good+bad;
+     var result=({0:'Noch keine abgeschlossene Serie',1:'Erfolgreich',2:'Verworfen',3:'Zeitlimit überschritten'})[Number(r.last_series_result)]||'Unbekannt';
+     var since=Number(r.last_series_result)?num((Number(r.last_series_age_ms)+Number(r.received_age_ms))/1000,'s',1):'–';
+     return '<tr><td>Messserien erfolgreich / verworfen</td><td>'+good+' / '+bad+'</td></tr>'+
+       '<tr><td>Erfolgsquote (abgeschlossene Serien)</td><td>'+(total?(100*good/total).toFixed(1)+' %':'–')+'</td></tr>'+
+       '<tr><td>Letzter abgeschlossener Messversuch</td><td>'+esc(result)+' · vor '+esc(since)+'</td></tr>';
+   }
    var opened={};nodes.querySelectorAll('details[data-sync-node]').forEach(function(el){if(el.open)opened[el.getAttribute('data-sync-node')]=true;});
    nodes.innerHTML='<p class="muted">Authentifizierte ESP-NOW-Ergebnisberichte, nach Node-Boot-ID zugeordnet. Alter und Qualität sind keine Garantie für GPIO-Genauigkeit.</p>'+
      a.map(function(n){
@@ -509,7 +518,8 @@ function sfRenderEspNowDiag(d){
          return '<details data-sync-node="'+esc(String(n.boot_id||n.hostname||''))+'"><summary><strong>'+name+'</strong> · ESP-NOW: Diagnose aktiv, noch kein gültiger Sync</summary>'+
           '<table><tr><td>Probes gesendet</td><td>'+esc(r.probes_sent||0)+'</td></tr>'+
           '<tr><td>Vollständige Exchanges</td><td>'+esc(r.exchanges_complete||0)+'</td></tr>'+
-          '<tr><td>Fehlgeschlagene Serien</td><td>'+esc(r.failed_series||0)+'</td></tr>'+
+          seriesStatsRows(r)+
+          '<tr><td>Fehlgeschlagene Serien (Legacy, max. 255)</td><td>'+esc(r.failed_series||0)+'</td></tr>'+
           '<tr><td>Letzter Ablehnungsgrund</td><td>'+esc(reason)+'</td></tr>'+
           '<tr><td>Letzte verworfene Serie</td><td>'+(r.has_failure_metrics?'RTT '+num(r.failed_rtt_us,'µs')+' · Streuung '+num(r.failed_spread_us,'µs'):'noch nicht gemeldet')+'</td></tr>'+
           '<tr><td>Min-RTT vs. Quartilsmedian</td><td>'+(r.has_failure_offsets?num(r.failed_min_rtt_offset_us,'µs')+' / '+num(r.failed_selected_offset_us,'µs'):'–')+'</td></tr>'+
@@ -526,6 +536,7 @@ function sfRenderEspNowDiag(d){
         '<tr><td>Median-RTT</td><td>'+num(r.rtt_us,'µs',0)+'</td></tr>'+
         '<tr><td>Akzeptierte Samples</td><td>'+esc(String(r.accepted_samples))+'</td></tr>'+
         '<tr><td>Offset-Streuung</td><td>'+num(r.spread_us,'µs',0)+'</td></tr>'+
+        seriesStatsRows(r)+
         '<tr><td>Drift</td><td>'+(r.has_drift_report&&r.drift_valid?num(r.drift_ppm,'ppm',3):'noch nicht kalibriert')+'</td></tr>'+
         '<tr><td>ESP-NOW-Bericht</td><td>'+ (r.precision_accepted?'authentifiziert':'ungültig')+'</td></tr>'+
         '<tr><td>Aktive Zeitquelle</td><td>'+(r.has_time_source?(r.using_espnow_time?'ESP-NOW-Präzision':'ESP-NOW nicht gewählt (Fallback/keine UTC)'):'nicht zentral gemeldet')+'</td></tr></table></details>';

@@ -55,6 +55,11 @@ struct NodeSyncReport {
     // Only meaningful when precisionAccepted=false and diagnostic frame flag set.
     uint32_t probesSent=0, exchangesComplete=0;
     uint8_t failureCode=0, failedSeries=0;
+    // Authenticated, additive telemetry; per-node radio runtime, reset on radio restart.
+    uint32_t successfulSeries=0, rejectedSeries=0;
+    uint32_t lastSeriesAgeMs=0;
+    uint8_t lastSeriesResult=0; // 0=no completed series, 1=accepted, 2=rejected, 3=deadline
+    bool hasSeriesStatistics=false;
     uint32_t failedSpreadUs=0, failedRttUs=0;
     uint8_t failedAccepted=0, failedSelected=0;
     int32_t failedMinRttOffsetUs=0, failedSelectedOffsetUs=0;

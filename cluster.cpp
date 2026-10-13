@@ -4930,6 +4930,11 @@ String clusterStatusJson()
         json += ",\"exchanges_complete\":"+String((unsigned long)r.exchangesComplete);
         json += ",\"failure_code\":"+String((unsigned int)r.failureCode);
         json += ",\"failed_series\":"+String((unsigned int)r.failedSeries);
+        json += ",\"has_series_statistics\":";json+=r.hasSeriesStatistics?"true":"false";
+        json += ",\"series_successful\":"+String((unsigned long)r.successfulSeries);
+        json += ",\"series_rejected\":"+String((unsigned long)r.rejectedSeries);
+        json += ",\"last_series_result\":"+String((unsigned int)r.lastSeriesResult);
+        json += ",\"last_series_age_ms\":"+String((unsigned long)r.lastSeriesAgeMs);
         json += ",\"has_failure_metrics\":";json+=r.hasFailureMetrics?"true":"false";
         json += ",\"failed_spread_us\":"+String((unsigned long)r.failedSpreadUs);
         json += ",\"failed_rtt_us\":"+String((unsigned long)r.failedRttUs);
