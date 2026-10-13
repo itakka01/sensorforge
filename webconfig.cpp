@@ -3,6 +3,7 @@
 #include "web_sd_maintenance.h"
 #include "config.h"
 #include "drone_mode.h"
+#include "reset_diagnostics.h"
 #include "audio_capture.h"
 #include "audio_wav.h"
 #include "recording_load_test.h"
@@ -1624,6 +1625,15 @@ static String htmlHeader()
         "<span class='system-meter-label'>CPU</span><div class='system-load-track'><span id='systemLoadMarker' class='system-load-marker'></span></div><span id='systemLoadValue' class='system-load-value'>--%</span></div>"
         "</div></div></div></nav>";
 
+    // Only alert on the current boot's last reset, not an old historical entry.
+    if (resetDiagnosticsAbnormal()) {
+        html += "<div role='status' style='margin:8px 12px;padding:9px 12px;"
+                "border:1px solid #b45309;background:#fff1d6;color:#713f12;"
+                "border-radius:6px'><strong>Neustartwarnung:</strong> letzter Reset " +
+                String(resetDiagnosticsReasonName()) +
+                ". Details im Systemstatus.</div>";
+    }
+
     // Central browser-session keepalive. Every normal SensorForge page uses
     // this common header/menu, so an open web UI keeps WiFi alive even if the
     // page itself is otherwise idle. API traffic never calls htmlHeader().
@@ -1910,6 +1920,10 @@ static void handleUiStatus()
 
     String json =
         String("{\"operating_mode\":\"") + operatingMode + "\"," +
+        "\"reset_reason\":\"" + String(resetDiagnosticsReasonName()) + "\"," +
+        "\"reset_abnormal\":" + String(resetDiagnosticsAbnormal() ? "true" : "false") + "," +
+        "\"brownout_count\":" + String(resetDiagnosticsBrownoutCount()) + "," +
+        "\"abnormal_reset_count\":" + String(resetDiagnosticsAbnormalCount()) + "," +
         "\"recording\":" +
         (recording ? "true" : "false") +
         ",\"recording_paused\":" +
@@ -2728,6 +2742,12 @@ static void handleRoot()
 
     html +=
         "<section class='settings-section'><h3>Systemstatus</h3>"
+        "<p><strong>Letzter Neustart:</strong> " +
+        String(resetDiagnosticsReasonName()) +
+        " · Brownouts gespeichert: " + String(resetDiagnosticsBrownoutCount()) +
+        " · Abnormale Neustarts gespeichert: " + String(resetDiagnosticsAbnormalCount()) +
+        "</p><details><summary>Reset-Verlauf (letzte 8 abnormale Resets)</summary><p>" +
+        resetDiagnosticsHistoryHtml() + "</p></details>"
         "<p><strong>Aktive Web-Oberflächen:</strong> <span id='webSessionCount'>" +
         String((unsigned)activeWebUiSessionCount()) +
         "</span></p>"
@@ -12097,6 +12117,11 @@ static void appendSystemOverviewSections(
 #endif
 
     html +=
+        "Letzter Resetgrund: <b>" + String(resetDiagnosticsReasonName()) +
+        "</b><br>Brownouts (persistenter Zähler): <b>" +
+        String(resetDiagnosticsBrownoutCount()) + "</b><br>" +
+        "Abnormale Neustarts (persistenter Zähler): <b>" +
+        String(resetDiagnosticsAbnormalCount()) + "</b><br><br>" +
         "Flash Size: " +
         String(ESP.getFlashChipSize() / 1024 / 1024) +
         " MB<br>"

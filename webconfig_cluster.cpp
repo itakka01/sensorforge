@@ -1,6 +1,7 @@
 #include "webconfig_cluster.h"
 
 #include "cluster.h"
+#include "cluster_espnow_radio.h"
 #include "drone_mode.h"
 #include "cluster_profiles.h"
 #include "config.h"
@@ -256,6 +257,7 @@ static void handleClusterHwTimeStart() {
     }
     String ids[3] = {server.arg("node1"), server.arg("node2"), server.arg("node3")};
     String error;
+    ClusterEspNowRadio::pauseForCapture(10000UL);
     if (!clusterHwTimeStart(ids, error)) {
         server.send(409, "text/plain; charset=utf-8", error); return;
     }
@@ -335,6 +337,7 @@ window.sfCoordinateStatus=function(force){
 <p class='muted'>Aktuelle Ressourcenwerte der verbundenen Geräte. SD-Daten werden normalerweise etwa einmal pro Minute aktualisiert, nach einem Cluster-Wipe unmittelbar erneut gemessen und signiert gemeldet. Fehlende Werte werden nicht geschätzt.</p>
 <div class='cluster-select-tools'><button type='button' id='clusterSelectAll'>Alle Nodes auswählen</button> <button type='button' id='clusterSelectNone'>Auswahl aufheben</button> <span id='clusterSelectionCount'>0 ausgewählt</span></div>
 <div class='cluster-select-tools'><label for='clusterActionChoice'>Aktion für ausgewählte Nodes:</label> <select id='clusterActionChoice'><option value=''>Aktion auswählen …</option><option value='clusterBulkProbe'>Verbindung testen</option><option value='clusterBulkDroneOn'>Drone Mode einschalten</option><option value='clusterBulkDroneOff'>Drone Mode ausschalten</option><option value='clusterBulkSync'>Zeit synchronisieren</option><option value='clusterBulkRestart'>Neu starten</option><option value='clusterBulkShutdown'>Herunterfahren</option><option value='clusterBulkWipe'>SD vollständig löschen</option><option value='clusterHardwareTime'>Hardware-Zeitmessung</option></select> <button type='button' id='clusterActionRun'>Ausführen</button> <button type='button' id='clusterActionInfo' aria-label='Hinweise zu Cluster-Aktionen' title='Hinweise zu Cluster-Aktionen'>Info</button></div>
+<details class='settings-section'><summary>ESP-NOW: lokale Funkdiagnose und Node-Sync</summary><p class='muted'>Coordinator-Funkstatus sowie authentifizierte Node-Mess- oder Fehlerberichte. Nicht eingetroffene Ergebnisse werden nicht geschätzt.</p><div id='sfEspNowActionDiag' role='status'>Warte auf Status …</div><div id='sfEspNowNodeDiag'></div></details>
 <div id='clusterHardwareTimeFeedback' role='status' style='display:none;padding:10px 12px;border:1px solid #b45309;border-radius:8px;margin:8px 0'></div>
 <div id='clusterHardwareTimeInfo' style='display:none;margin:10px 0;padding:12px 14px;border:1px solid #64748b66;border-radius:10px;background:#0f172a08'>
  <div style='display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap'><div><strong>Hardware-Zeitmessung</strong><div class='muted'>Misst die relative Uhrabweichung von bis zu drei Nodes über direkte Messleitungen am Coordinator. Kamera- und Belichtungsverzögerungen sind ausdrücklich nicht Teil dieser Messung.</div></div></div>
@@ -421,6 +424,7 @@ var ns=Array.isArray(d.nodes)?d.nodes:[],jobs=Array.isArray(d.job_probes)?d.job_
 rows.innerHTML=ns.map(function(n){var ok=!!n.health_valid,total=Number(n.sd_total_mib||0),used=Number(n.sd_used_mib||0);
 return '<tr><td>'+(n.local?'–':'<input type="checkbox" class="cluster-node-choice" value="'+esc(n.integration_id)+'" '+(window.sfSelectedNodes&&window.sfSelectedNodes.has(String(n.integration_id))?'checked':'')+'>')+'</td><td>'+(nodeUrl(n)?'<a href="'+nodeUrl(n)+'" target="_blank" rel="noopener noreferrer">'+esc(n.hostname||n.integration_id)+'</a>':esc(n.hostname||n.integration_id))+'</td><td>'+esc(n.release||'–')+'</td><td>'+esc(n.cluster_role||'–')+'</td><td>'+esc(latestJob(n,jobs))+'</td><td>'+(ok&&total?fmt(used):'–')+'</td><td>'+(ok&&total?fmt(Math.max(0,total-used)):'–')+'</td><td>'+(ok&&Number(n.cpu_temp_deci_c)>-1000?(Number(n.cpu_temp_deci_c)/10).toFixed(1)+' °C':'–')+'</td><td>'+esc(up(n.uptime_seconds))+'</td><td><code>'+esc(n.boot_id||'–')+'</code></td><td>'+esc(n.recording?'Recording':'Bereit')+'</td></tr>';}).join('');
 var extra=document.getElementById('clusterHealthExtra');if(extra)extra.textContent=ns.map(function(n){return (n.hostname||n.integration_id)+': freier Heap '+(n.health_valid?Math.round(Number(n.free_heap_bytes||0)/1024)+' KiB':'unbekannt');}).join(' · ');
+sfRenderEspNowDiag(d);
 if(window.sfCaptureReportUpdate)window.sfCaptureReportUpdate(d);
 if(window.sfSelectionUpdate)window.sfSelectionUpdate();
 
@@ -481,6 +485,53 @@ function sfShowPowerNotice(message,autohide){
  if(sfPowerNoticeTimer!==null){clearTimeout(sfPowerNoticeTimer);sfPowerNoticeTimer=null;}
  el.textContent=message;el.style.display='block';
  if(autohide)sfPowerNoticeTimer=setTimeout(function(){el.style.display='none';sfPowerNoticeTimer=null;},7000);
+}
+function sfRenderEspNowDiag(d){
+ var local=document.getElementById('sfEspNowActionDiag'),nodes=document.getElementById('sfEspNowNodeDiag');
+ var s=(d||{}).espnow_time_local||{};
+ if(local){
+  var fresh=s.precision_recently_accepted===true;
+  var last=fresh?'vor '+(Number(s.last_accepted_age_ms)/1000).toFixed(1)+' s':'kein aktuell gültiger Präzisions-Sync';
+  local.textContent='Coordinator-Funk: '+(s.active?'aktiv':'inaktiv')+' · Kanal '+(s.channel||'-')+' · gültige Pakete '+(s.authenticated||0)+' · abgelehnt '+(s.rejected||0)+' · beantwortete Probes '+(s.probes_answered||0)+' · Coordinator beantwortet Messprobes (eigener Node-Offset nicht anwendbar) · Aktionspause '+Math.ceil((Number(s.action_pause_remaining_ms)||0)/1000)+' s';
+ }
+ if(nodes){
+   var a=Array.isArray(d.nodes)?d.nodes.filter(function(n){return n.cluster_role!=='coordinator';}):[];
+   var reports=Array.isArray(d.espnow_node_reports)?d.espnow_node_reports:[];
+   function num(v,unit,digits){return Number.isFinite(Number(v))?Number(v).toFixed(digits||0)+' '+unit:'–';}
+   var opened={};nodes.querySelectorAll('details[data-sync-node]').forEach(function(el){if(el.open)opened[el.getAttribute('data-sync-node')]=true;});
+   nodes.innerHTML='<p class="muted">Authentifizierte ESP-NOW-Ergebnisberichte, nach Node-Boot-ID zugeordnet. Alter und Qualität sind keine Garantie für GPIO-Genauigkeit.</p>'+
+     a.map(function(n){
+       var r=reports.find(function(x){return String(x.boot_id||'').toLowerCase()===String(n.boot_id||'').toLowerCase();});
+       var name=esc(n.hostname||n.integration_id||'Node');
+       if(!r)return '<details data-sync-node="'+esc(String(n.boot_id||n.hostname||''))+'"><summary><strong>'+name+'</strong> · ESP-NOW: keine Messung gemeldet</summary><p class="muted">Kein authentifizierter Ergebnisbericht mit passender aktueller Boot-ID. Bitte Drone Mode, Sync-Freigabe und Node-Verbindung prüfen.</p></details>';
+       if(!r.precision_accepted){
+         var reason=({0:'Noch kein vollständiger, akzeptierter Sync',1:'Zu wenige/ungültige Samples',2:'Offset-Streuung zu groß',3:'RTT zu hoch',4:'Zeitlimit der Serie überschritten'})[Number(r.failure_code)]||'Unbekannt';
+         return '<details data-sync-node="'+esc(String(n.boot_id||n.hostname||''))+'"><summary><strong>'+name+'</strong> · ESP-NOW: Diagnose aktiv, noch kein gültiger Sync</summary>'+
+          '<table><tr><td>Probes gesendet</td><td>'+esc(r.probes_sent||0)+'</td></tr>'+
+          '<tr><td>Vollständige Exchanges</td><td>'+esc(r.exchanges_complete||0)+'</td></tr>'+
+          '<tr><td>Fehlgeschlagene Serien</td><td>'+esc(r.failed_series||0)+'</td></tr>'+
+          '<tr><td>Letzter Ablehnungsgrund</td><td>'+esc(reason)+'</td></tr>'+
+          '<tr><td>Letzte verworfene Serie</td><td>'+(r.has_failure_metrics?'RTT '+num(r.failed_rtt_us,'µs')+' · Streuung '+num(r.failed_spread_us,'µs'):'noch nicht gemeldet')+'</td></tr>'+
+          '<tr><td>Min-RTT vs. Quartilsmedian</td><td>'+(r.has_failure_offsets?num(r.failed_min_rtt_offset_us,'µs')+' / '+num(r.failed_selected_offset_us,'µs'):'–')+'</td></tr>'+
+          '<tr><td>Samples gültig / nach RTT gewählt</td><td>'+(r.has_failure_metrics?esc(String(r.failed_accepted))+' / '+esc(String(r.failed_selected)):'–')+'</td></tr>'+
+          '<tr><td>Bericht empfangen</td><td>vor '+num(Number(r.received_age_ms)/1000,'s',1)+'</td></tr></table></details>';
+       }
+       var age=(Number(r.received_age_ms)||0)+(Number(r.sample_age_ms)||0);
+       var recent=age<=120000&&Number(r.accepted_samples)>=8&&r.precision_accepted===true&&Number(r.received_age_ms)<=15000;
+       var head=recent?'gültige Messung vor '+Math.round(age/1000)+' s':'veraltet / nicht bestätigt (Alter '+Math.round(age/1000)+' s)';
+       return '<details data-sync-node="'+esc(String(n.boot_id||n.hostname||''))+'"><summary><strong>'+name+'</strong> · ESP-NOW: '+esc(head)+' · RTT '+num(r.rtt_us,'µs')+'</summary>'+
+        '<table><tr><td>Letzte gültige Messung (Alter)</td><td>'+num(age/1000,'s',1)+'</td></tr>'+
+        '<tr><td>Letzter Bericht empfangen</td><td>'+num(Number(r.received_age_ms)/1000,'s',1)+' her</td></tr>'+
+        '<tr><td>Offset (Node → Coordinator)</td><td>'+num(r.offset_us,'µs',0)+'</td></tr>'+
+        '<tr><td>Median-RTT</td><td>'+num(r.rtt_us,'µs',0)+'</td></tr>'+
+        '<tr><td>Akzeptierte Samples</td><td>'+esc(String(r.accepted_samples))+'</td></tr>'+
+        '<tr><td>Offset-Streuung</td><td>'+num(r.spread_us,'µs',0)+'</td></tr>'+
+        '<tr><td>Drift</td><td>'+(r.has_drift_report&&r.drift_valid?num(r.drift_ppm,'ppm',3):'noch nicht kalibriert')+'</td></tr>'+
+        '<tr><td>ESP-NOW-Bericht</td><td>'+ (r.precision_accepted?'authentifiziert':'ungültig')+'</td></tr>'+
+        '<tr><td>Aktive Zeitquelle</td><td>'+(r.has_time_source?(r.using_espnow_time?'ESP-NOW-Präzision':'ESP-NOW nicht gewählt (Fallback/keine UTC)'):'nicht zentral gemeldet')+'</td></tr></table></details>';
+     }).join('');
+   nodes.querySelectorAll('details[data-sync-node]').forEach(function(el){if(opened[el.getAttribute('data-sync-node')])el.open=true;});
+ }
 }
 function sfIsPowerAction(path){return path==='/cluster_node_restart'||path==='/cluster_node_shutdown'||path==='/cluster_node_drone';}
 function sfShowSyncNotice(message,autohide){
@@ -581,6 +632,10 @@ function sfRenderCaptureReport(){
  document.getElementById('clusterCaptureReportSummary').textContent=overall+' · '+successes+'/'+report.rows.length+' erfolgreich · '+failed+' Fehler · '+pending+' ausstehend · UTC '+new Date(report.target).toISOString();
 }
 window.sfCaptureReportUpdate=function(d){
+ // Refresh the preview clock from each authenticated coordinator status snapshot.
+ // Never use the browser wall clock as a fallback when cluster UTC is invalid.
+ sfCaptureClock=sfCaptureClockFromStatus(d,performance.now());
+ sfUpdatePlannedTime();
  sfLatestStatus=d;var jobs=(Array.isArray(d.job_probes)?d.job_probes:[]).filter(function(j){return Number(j.kind)===6;});
  if(sfCaptureReport){sfCaptureReport.rows.forEach(function(r){
   if(r.job)return;var candidates=jobs.filter(function(j){return String(j.node)===r.id&&!sfSeenCaptureJobs.has(sfCaptureJobKey(j));});
@@ -853,6 +908,7 @@ static void handleClusterJobProbe()
     }
     const String nodeId = server.arg("node_id");
     String error;
+    ClusterEspNowRadio::pauseForCapture(10000UL);
     if (!clusterSendJobProbe(nodeId, error)) {
         server.send(409, "text/plain; charset=utf-8", error);
         return;
@@ -867,6 +923,7 @@ static void handleClusterNodeShutdown()
         server.send(403,"text/plain; charset=utf-8","Nur am aktiven Coordinator."); return;
     }
     String error;
+    ClusterEspNowRadio::pauseForCapture(10000UL);
     if (!clusterRequestNodeShutdown(server.arg("node_id"),error)) {
         server.send(409,"text/plain; charset=utf-8",error); return;
     }
@@ -891,6 +948,7 @@ static void handleClusterNodeDrone(){
         server.send(400,"text/plain; charset=utf-8","Ungültiger Drone-Wert");return;
     }
     String error;
+    ClusterEspNowRadio::pauseForCapture(10000UL);
     if(!clusterRequestNodeDrone(server.arg("node_id"),enabled=="1",error)){
         server.send(409,"text/plain; charset=utf-8",error);return;
     }
@@ -903,6 +961,7 @@ static void handleClusterNodeCapture(){
     long long ms=strtoll(raw.c_str(),&end,10);
     if(errno||!end||*end||ms<1600000000000LL||ms>4102444800000LL){server.send(400,"text/plain","Ungültige UTC-Zeit");return;}
     String error;
+    ClusterEspNowRadio::pauseForCapture(10000UL);
     if(!clusterRequestNodeCapture(server.arg("node_id"),(int64_t)ms*1000LL,error)){
         server.send(409,"text/plain; charset=utf-8",error);return;
     }
@@ -915,7 +974,8 @@ static void handleClusterNodeWipe()
         server.send(403,"text/plain; charset=utf-8","Nur am aktiven Coordinator.");return;
     }
     String error;
-    if (!clusterRequestNodeWipe(server.arg("node_id"),error)) {
+    ClusterEspNowRadio::pauseForCapture(10000UL);
+    if(!clusterRequestNodeWipe(server.arg("node_id"),error)) {
         server.send(409,"text/plain; charset=utf-8",error);return;
     }
     server.sendHeader("Location","/cluster_coordinate");
@@ -928,6 +988,7 @@ static void handleClusterNodeRestart()
         server.send(403, "text/plain; charset=utf-8", "Nur am aktiven Coordinator."); return;
     }
     String error;
+    ClusterEspNowRadio::pauseForCapture(10000UL);
     if (!clusterRequestNodeRestart(server.arg("node_id"), error)) {
         server.send(409, "text/plain; charset=utf-8", error); return;
     }
@@ -941,6 +1002,7 @@ static void handleClusterNodeSyncTime()
         server.send(403, "text/plain; charset=utf-8", "Nur am aktiven Coordinator verfügbar."); return;
     }
     String error;
+    ClusterEspNowRadio::pauseForCapture(10000UL);
     if (!clusterRequestNodeTimeSync(server.arg("node_id"), error)) {
         server.send(409, "text/plain; charset=utf-8", error); return;
     }
@@ -951,6 +1013,7 @@ static void handleClusterNodeSyncTime()
 static void handleClusterSyncTime()
 {
     String error;
+    ClusterEspNowRadio::pauseForCapture(10000UL);
     if (!clusterRequestTimeSync(error)) {
         server.send(409, "text/plain; charset=utf-8", error);
         return;

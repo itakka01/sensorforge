@@ -44,6 +44,7 @@ static constexpr int16_t SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10 = 85;
 #if defined(BOARD_FREENOVE)
 
 #define BOARD_DISPLAY_NAME "Freenove FNK0085 ESP32-S3 WROOM"
+#define BOARD_HAS_ESP_NOW 1
 
 // Video-codec hardware capability only. This does NOT by itself enable an
 // ONVIF/RTSP codec; the streamer must also implement and qualify that codec.
@@ -167,6 +168,7 @@ static constexpr int16_t BOARD_WIFI_TX_POWER_DEFAULT_X10 = 200;
 #elif defined(BOARD_XIAO)
 
 #define BOARD_DISPLAY_NAME "Seeed XIAO ESP32S3 Sense"
+#define BOARD_HAS_ESP_NOW 1
 
 // Reserved diagnostic output D1 / GPIO2. Only use during explicit test.
 // XIAO has no three-channel coordinator input assignment by default.

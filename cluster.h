@@ -117,3 +117,15 @@ bool clusterRequestNodeRestart(const String &nodeId, String &error);
 
 // Schedule one remote protected shutdown; ACK only confirms scheduling.
 bool clusterRequestNodeShutdown(const String &nodeId, String &error);
+
+// ESP-NOW time authentication adapters, using a dedicated domain-separated
+// HMAC key derived from the active authenticated cluster runtime.
+// Crypto work must not run directly in an ESP-NOW radio callback.
+bool clusterEspNowTimeSign(const uint8_t *data, size_t length,
+                           uint8_t mac[32], void *user);
+bool clusterEspNowTimeVerify(const uint8_t *data, size_t length,
+                             const uint8_t mac[32], void *user);
+
+// True from accepting/planning a shot through its protected deadline.
+// Storage/OTA admission must treat this as stronger than the 2s armed flag.
+bool clusterCaptureProtectionActive();

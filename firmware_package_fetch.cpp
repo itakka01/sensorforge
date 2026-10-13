@@ -8,6 +8,7 @@
 #include <WiFi.h>
 #include <esp_http_client.h>
 #include <mbedtls/sha256.h>
+#include <mbedtls/version.h>
 #include <string.h>
 #if defined(CONFIG_MBEDTLS_CERTIFICATE_BUNDLE) && CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
 #include <esp_crt_bundle.h>
@@ -16,6 +17,32 @@
 extern const char *firmwareExpectedCompatibilityMarker();
 
 namespace {
+// mbedTLS 2.x exposes *_ret (int result); mbedTLS 3.x exposes the
+// unsuffixed SHA-256 functions (void result). Keep failures fail-closed.
+static bool sha256Start(mbedtls_sha256_context *ctx) {
+#if MBEDTLS_VERSION_MAJOR >= 3
+    mbedtls_sha256_starts(ctx, 0);
+    return true;
+#else
+    return mbedtls_sha256_starts_ret(ctx, 0) == 0;
+#endif
+}
+static bool sha256Update(mbedtls_sha256_context *ctx, const unsigned char *buf, size_t len) {
+#if MBEDTLS_VERSION_MAJOR >= 3
+    mbedtls_sha256_update(ctx, buf, len);
+    return true;
+#else
+    return mbedtls_sha256_update_ret(ctx, buf, len) == 0;
+#endif
+}
+static bool sha256Finish(mbedtls_sha256_context *ctx, unsigned char out[32]) {
+#if MBEDTLS_VERSION_MAJOR >= 3
+    mbedtls_sha256_finish(ctx, out);
+    return true;
+#else
+    return mbedtls_sha256_finish_ret(ctx, out) == 0;
+#endif
+}
 constexpr uint32_t kMaxPackageSize = 16U * 1024U * 1024U;
 constexpr int kChunk = 2048;
 
@@ -144,7 +171,7 @@ bool firmwarePackageDownloadInternal(const FirmwareManifestCandidate &candidate,
     String packageError;
     mbedtls_sha256_context sha;
     mbedtls_sha256_init(&sha);
-    bool ok = mbedtls_sha256_starts_ret(&sha, 0) == 0;
+    bool ok = sha256Start(&sha);
     uint32_t count = 0;
     uint8_t chunk[kChunk];
     // An overall elapsed-time guard prevents a server from keeping a download
@@ -155,7 +182,7 @@ bool firmwarePackageDownloadInternal(const FirmwareManifestCandidate &candidate,
         const int want = candidate.packageSize - count > kChunk ? kChunk : static_cast<int>(candidate.packageSize - count);
         const int n = esp_http_client_read(client, reinterpret_cast<char *>(chunk), want);
         if (n <= 0) { ok = false; result = "Paket unvollstaendig oder Verbindung abgebrochen."; break; }
-        ok = mbedtls_sha256_update_ret(&sha, chunk, static_cast<size_t>(n)) == 0;
+        ok = sha256Update(&sha, chunk, static_cast<size_t>(n));
         // .sfw = 128-byte signed header followed by the raw ESP application.
         size_t pos = 0;
         if (ok && !headerOk) {
@@ -218,7 +245,7 @@ bool firmwarePackageDownloadInternal(const FirmwareManifestCandidate &candidate,
         marker.found(), payloadUsed, count, candidate.packageSize, packageError);
     if (payloadHash.active) firmwareSecurityHashAbort(payloadHash);
     unsigned char digest[32] = {};
-    if (ok) ok = mbedtls_sha256_finish_ret(&sha, digest) == 0;
+    if (ok) ok = sha256Finish(&sha, digest);
     mbedtls_sha256_free(&sha);
     esp_http_client_close(client);
     esp_http_client_cleanup(client);

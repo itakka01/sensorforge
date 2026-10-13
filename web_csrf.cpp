@@ -152,6 +152,12 @@ String webCsrfBrowserBootstrap(
         "if(of)window.fetch=function(input,init){"
         "var m=(init&&init.method)||(input&&input.method)||'GET';"
         "if(String(m).toUpperCase()==='POST'){"
+        // ESP32 WebServer may parse multipart form arguments independently
+        // of URL query arguments. Carry the same per-boot CSRF token in both
+        // places for FormData POSTs; do not weaken the server-side gate.
+        "if(init&&typeof FormData!=='undefined'&&init.body instanceof FormData){"
+        "if(!init.body.has('_csrf'))init.body.append('_csrf',T);"
+        "}"
         "if(typeof input==='string'||(typeof URL!=='undefined'&&input instanceof URL)){input=add(input);}"
         "else if(typeof Request!=='undefined'&&input instanceof Request){try{input=new Request(add(input.url),input);}catch(e){}}"
         "}return of.call(this,input,init);};"

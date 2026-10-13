@@ -1,4 +1,5 @@
 #include "web_sd_maintenance.h"
+#include "cluster.h"
 
 #include "board_config.h"
 #include "config.h"
@@ -1665,6 +1666,7 @@ static SdMaintenanceResult beginSecureEraseJob()
 
     // Atomic admission is shared with the cluster wipe. Take the lease
     // only after all non-destructive preparation has succeeded.
+    if (clusterCaptureProtectionActive()) return SD_MAINT_RESULT_STORAGE_LOCKED;
     const auto lease = g_sdAdmission.tryReserve(SdAdmissionController::SecureErase);
     if (!lease) return SD_MAINT_RESULT_STORAGE_LOCKED;
     // Recheck legacy gates after acquisition: a client not yet migrated
@@ -2026,6 +2028,7 @@ static SdMaintenanceResult performSdMaintenance(
 {
     // A scheduled cluster wipe already owns its reservation. Local operations
     // must acquire a distinct lease before accessing SD or configuration.
+    if (clusterCaptureProtectionActive()) return SD_MAINT_RESULT_STORAGE_LOCKED;
     ScopedSdAdmission localAdmission(admittedClusterWipe
         ? SdAdmissionController::None : SdAdmissionController::Format);
     if (!admittedClusterWipe && !localAdmission)
@@ -5272,6 +5275,11 @@ static void handleSDBench()
         );
         return;
     }
+    if (clusterCaptureProtectionActive()) {
+        webServer().send(409, "text/plain; charset=utf-8",
+                         "SD benchmark blocked by scheduled cluster capture");
+        return;
+    }
     ScopedSdAdmission benchmarkAdmission(SdAdmissionController::Benchmark);
     if (!benchmarkAdmission || g_storageLocked || g_recordingStartBlocked ||
         g_clusterWipe.active || sdSecureJobActive) {
@@ -6319,6 +6327,7 @@ bool webSdQueueClusterWipe(uint32_t coordinatorBoot, uint32_t coordinatorEpoch,
                            uint32_t sequence, SdClusterWipeDone callback)
 {
     if (!callback || !coordinatorBoot || !coordinatorEpoch || !sequence ||
+        clusterCaptureProtectionActive() ||
         g_clusterWipe.active || sdSecureJobActive || g_storageLocked ||
         g_recordingStartBlocked || !sdReady)
         return false;

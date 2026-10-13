@@ -29,7 +29,7 @@ bool tryAcquire(String &reason) {
       webSdAdmissionController().busy() || syncApiExclusiveActive()) {
     reason = "Storage or exclusive operation busy"; return false;
   }
-  if (clusterCaptureArmed() || clusterHwTimePulseActive() ||
+  if (clusterCaptureProtectionActive() || clusterHwTimePulseActive() ||
       ClusterHwTimeGpioLease::active()) {
     reason = "Cluster capture or time measurement active"; return false;
   }
@@ -41,7 +41,7 @@ bool tryAcquire(String &reason) {
   if (recording || recorderIsOpen() || recordingLoadTestIsActive() ||
       g_storageLocked || webSdMaintenanceBusy() ||
       webSdAdmissionController().busy() || syncApiExclusiveActive() ||
-      clusterCaptureArmed() || clusterHwTimePulseActive() ||
+      clusterCaptureProtectionActive() || clusterHwTimePulseActive() ||
       ClusterHwTimeGpioLease::active() || !droneModeEnabled()) {
     g_recordingStartBlocked = previousRecordingBlock;
     reason = "System became busy during reservation";

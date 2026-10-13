@@ -60,6 +60,7 @@
 #include "firmware_auto_scheduler.h"
 #include "wireguard_manager.h"
 #include "drone_mode.h"
+#include "reset_diagnostics.h"
 #include "cluster.h"
 #include "cluster_capture.h"
 #include "sd_presence_policy.h"
@@ -15160,6 +15161,7 @@ void setup() {
     sdSpiDeselect();
 
     Serial.begin(115200);
+    resetDiagnosticsBegin();
     droneModeBegin();
 
     delay(300);

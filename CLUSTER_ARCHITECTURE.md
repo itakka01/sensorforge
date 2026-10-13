@@ -1,3 +1,9 @@
+## ESP-NOW-Zeitsynchronisierung – aktueller Stand (2026-10-13, v87-beta105)
+
+Normatives Detaildokument: `ESPNOW_TIME_ARCHITECTURE.md`; Schätzer v2: `ESPNOW_ESTIMATOR_V2.md`. Coordinator-Broadcast und Node-Zweiwege-Messungen verwenden HMAC-authentifizierte ESP-NOW-Pakete. Aktive Präzisionsmessserien sind durch kurz gültige SyncControl-Freigaben und Widerrufe reguliert; Capture- und Coordinator-Aktionen haben Vorrang. Widerruf-Empfang ist auf Funk nicht garantiert; eine Lease kann noch bis zu 12 s gültig sein. Die lokale Listenaktionspause ist derzeit teils noch zeitbasiert und nicht an einen bestätigten Jobabschluss gekoppelt.
+
+Der Schätzer berechnet drei Offset-Vergleichswerte und verwendet den Median des niedrigsten RTT-Quartils für die Zeitkorrektur. Pro Serie adaptive 16/32/maximal 64 vollständige Austausche; Abbruchgrenze 12 s. Drift aus gewichteter Regression bis zu 24 gültiger Serien, akzeptiert frühestens nach 4 Serien über 3 Minuten. Gespeicherter Drift ist keine nach Reboot nachgewiesene Kalibrierung. Wi-Fi-Zeit bleibt Fallback. Die zentrale Node-spezifische ESP-NOW-Ergebnisdarstellung ist **nicht** fertig; lokal verfügbare Diagnosewerte sind nicht mit verifizierten Node-Berichten gleichzusetzen. Kein vollständiger ESP32-Build oder Hardware-Genauigkeitsnachweis.
+
 ## Audit-Paket 5p (2026-10-11) – SPI-Remount-Admission
 - Der Sync-API-SPI-Remount (exklusiver Clock-Wechsel und Diagnose) reserviert jetzt die gemeinsame atomare `SdAdmissionController::SpiRemount`-Lease; Cluster-Wipe, Secure Erase, Formatierung und Benchmark können während der Lease keine eigene Wartungs-Lease erhalten.
 - Exklusivmodus-Aktivierung/-Deaktivierung und Lease-Ablauf prüfen auch die aktive SD-Admission. Diagnose reserviert vor dem ersten Dateizugriff und hält die Lease bis nach dem Restore. Die bestehenden kooperativen SD-/Recording-Sperren bleiben erhalten.

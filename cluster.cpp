@@ -1,11 +1,12 @@
 #include "cluster.h"
+#include "cluster_espnow_packets.h"
+#include "cluster_espnow_radio.h"
 #include "cluster_jobs.h"
 #include "cluster_hw_time_pulse.h"
 #include "cluster_hw_time_protocol.h"
 #include "cluster_hw_time_gpio_lease.h"
 #include "cluster_hw_time_series.h"
 #include "cluster_capture.h"
-#include "firmware_update_admission.h"
 #include "drone_mode.h"
 #include "webconfig.h"
 #include "web_sd_maintenance.h"
@@ -110,6 +111,8 @@ struct PendingCapture {
 };
 static PendingCapture pendingCapture;
 bool clusterCaptureArmedFlag=false;
+// Coordinator protection extends from first dispatched shot until 5 s after its deadline.
+static uint32_t coordinatorCaptureGuardUntilMs=0;
 static uint32_t captureSeenBoot=0,captureSeenEpoch=0,captureSeenSeq=0;
 static uint32_t captureSent=0,captureAccepted=0,captureCompleted=0,captureFailed=0;
 static int64_t captureLastDispatchOffsetUs=0;
@@ -703,6 +706,20 @@ static bool constantTimeEqual(const uint8_t *a, const uint8_t *b, size_t length)
     for (size_t i = 0; i < length; ++i)
         difference |= (uint8_t)(a[i] ^ b[i]);
     return difference == 0;
+}
+
+// ESP-NOW time packets use a domain-separated key rather than the normal
+// cluster packet MAC directly. No raw cluster secret leaves this translation.
+static bool espNowTimeMac(const uint8_t *data, size_t len, uint8_t mac[32])
+{
+    if (!runtimeActive || !runtimeHmacKey || !data || !mac ||
+        len != EspNowTimePackets::kPayloadSize) return false;
+    static const uint8_t context[] = "SensorForge/ESP-NOW/time/HMAC/v1";
+    uint8_t subkey[32] = {};
+    if (!computePacketMac(context, sizeof(context) - 1, subkey)) return false;
+    const bool ok = computePacketMacWithRawKey(subkey, data, len, mac);
+    secureWipe(subkey, sizeof(subkey));
+    return ok;
 }
 
 static bool usableIp(const IPAddress &ip)
@@ -2676,11 +2693,6 @@ static void processJobRestart(char **f, size_t n, const IPAddress &ip)
     }
     // Even a refused, otherwise authenticated command consumes its sequence.
     restartSeenBoot=cb; restartSeenEpoch=epoch; restartSeenSeq=seq;
-    if (FirmwareUpdateAdmission::active()) {
-        rejectRestart("ota_reserved");
-        sendJobRefusal((const char *const *)f, ip, bootNonce, 1, 2);
-        return;
-    }
     String error;
     if (!webConfigScheduleReboot(3500UL, error)) {
         Serial.printf("[CLUSTER JOB] restart schedule blocked: %s\n", error.c_str());
@@ -2763,11 +2775,6 @@ static void processJobShutdown(char **f, size_t n, const IPAddress &ip)
         rejectShutdown("replay"); return;
     }
     shutdownSeenBoot=cb; shutdownSeenEpoch=epoch; shutdownSeenSeq=seq;
-    if (FirmwareUpdateAdmission::active()) {
-        rejectShutdown("ota_reserved");
-        sendJobRefusal((const char *const *)f, ip, bootNonce, 2, 2);
-        return;
-    }
     String error;
     // 5 seconds gives the signed ACK time to leave before WiFi is stopped.
     if (!webConfigScheduleShutdown(5000UL, error)) {
@@ -2905,7 +2912,6 @@ static void processHwTimeRequest(char **f,size_t n,const IPAddress &ip) {
     // Consume authenticated sequences before any future GPIO/resource operation.
     // Retransmissions must never produce a second impulse.
     if(!hwTimeSeen.accept(req))return;
-    if (FirmwareUpdateAdmission::active()) return; // No pulse and no false ARM ACK.
     // Only XIAO GPIO2 currently has a dedicated output. Freenove GPIO48
     // shares the RGB LED and must NOT be driven before an explicit handoff.
     // The arm function freezes the UTC->monotonic mapping at acceptance.
@@ -2967,10 +2973,13 @@ static void processJobCapture(char **f,size_t n,const IPAddress &ip) {
     int64_t utc=(int64_t)strtoll(f[8],&end,10);
     int64_t nowUtc=0;
     if(errno||!end||*end||utc<=0||!clusterTimeNowUs(nowUtc)||utc-nowUtc<1500000LL||
-       utc-nowUtc>1800000000LL||pendingCapture.active||
-       FirmwareUpdateAdmission::active()) {
+       utc-nowUtc>1800000000LL||pendingCapture.active) {
         sendCaptureResult(cb,epoch,seq,3,1,0);return;
     }
+    // Capture is more important than an in-progress precision series.
+    // Pause BEFORE accepting the shot; retain the last calibrated time model.
+    ClusterEspNowRadio::pauseForCapture(
+        static_cast<uint32_t>((utc - nowUtc) / 1000LL) + 5000UL);
     // Freeze the mapping immediately, before sending the acceptance ACK.
     // Future cluster/NTP adjustments only influence *future* jobs.
     const int64_t acceptedMonoUs=esp_timer_get_time();
@@ -3100,10 +3109,6 @@ static void processJobWipe(char **f,size_t n,const IPAddress &ip)
     if (wipeSeenBoot==cb && wipeSeenEpoch==epoch && seq<=wipeSeenSeq) return;
     // Consume even when not ready. Repeated signed commands MUST NOT rewipe.
     wipeSeenBoot=cb;wipeSeenEpoch=epoch;wipeSeenSeq=seq;
-    if (FirmwareUpdateAdmission::active()) {
-        sendClusterWipeResult(cb,epoch,seq,0,100); // Explicit busy refusal.
-        return;
-    }
     if (!webSdQueueClusterWipe(cb,epoch,seq,sendClusterWipeResult)) {
         // One authenticated terminal refusal: unavailable/busy.
         sendClusterWipeResult(cb,epoch,seq,0,100);
@@ -3157,8 +3162,7 @@ static void processJobDrone(char **f,size_t n,const IPAddress &ip){
        (uint32_t)(millis()-coord->lastSeenMs)>60000UL)return;
     if(droneSeenBoot==cb&&droneSeenEpoch==epoch&&seq<=droneSeenSeq)return;
     droneSeenBoot=cb;droneSeenEpoch=epoch;droneSeenSeq=seq;
-    // An OTA lease must not be invalidated by a Drone Mode command.
-    const bool success = !FirmwareUpdateAdmission::active() && droneModeSet(enable!=0);
+    const bool success=droneModeSet(enable!=0);
     char own[9];snprintf(own,sizeof(own),"%08lx",(unsigned long)bootNonce);
     String msg=String(CLUSTER_JOB_DRONE_ACK_MAGIC)+"|"+runtimeClusterTag+"|"+
         currentCoordinatorId+"|"+f[3]+"|"+f[4]+"|"+deviceIntegrationId()+"|"+
@@ -3842,12 +3846,14 @@ void clusterNetworkStart()
 
 void clusterNetworkStop()
 {
+    ClusterEspNowRadio::stop();
     hwTimeSessionFinish("network_stopped", false);
     // A deliberate cluster lifecycle stop cancels the pending local dispatch.
     // Keep already produced PSRAM media until a new accepted capture job.
     pendingCapture = PendingCapture{};
     captureResultRetry = CaptureResultRetry{};
     clusterCaptureArmedFlag = false;
+    coordinatorCaptureGuardUntilMs=0;
     captureSeenBoot = captureSeenEpoch = captureSeenSeq = 0;
     // Invalidate volatile job bookkeeping on every runtime/credential lifecycle reset.
     ClusterJobs::reset();
@@ -4005,6 +4011,14 @@ void clusterMdnsAdvertise()
 
 void clusterLoop()
 {
+    // Diagnostic ESP-NOW time transport only; never changes cluster clock.
+    // Capture deadline takes precedence over any radio work.
+    if (!clusterCaptureProtectionActive()) {
+        ClusterEspNowRadio::service(runtimeActive && (localIsCoordinator || droneModeEnabled()),
+                                   localIsCoordinator, currentCoordinatorEpoch,
+                                   localIsCoordinator ? deviceIntegrationId().c_str() : currentCoordinatorId,
+                                   bootNonce);
+    }
     hwTimeSessionService();
     // Never keep a measurement output scheduled after Drone Mode has ended.
     if (clusterHwTimePulseActive() && (!runtimeActive || localIsCoordinator ||
@@ -4538,6 +4552,16 @@ bool clusterRequestNodeCapture(const String &nodeId,int64_t utcUs,String &error)
     snprintf(cb,sizeof(cb),"%08lx",(unsigned long)bootNonce);
     snprintf(nb,sizeof(nb),"%08lx",(unsigned long)peer->bootNonce);
     snprintf(when,sizeof(when),"%lld",(long long)utcUs);
+    // Local admission guard protects SD/OTA as well as ESP-NOW from dispatch onward.
+    const uint32_t guardMs=static_cast<uint32_t>((utcUs-nowUtc)/1000LL)+5000UL;
+    const uint32_t guardUntil=millis()+guardMs;
+    if (!coordinatorCaptureGuardUntilMs ||
+        static_cast<int32_t>(guardUntil-coordinatorCaptureGuardUntilMs)>0)
+        coordinatorCaptureGuardUntilMs=guardUntil;
+    // Suppress coordinator broadcasts/probe replies immediately on dispatch.
+    // Later requests may extend the hold, never shorten it.
+    ClusterEspNowRadio::pauseForCapture(
+        static_cast<uint32_t>((utcUs - nowUtc) / 1000LL) + 5000UL);
     const String cmd=String(CLUSTER_JOB_CAPTURE_MAGIC)+"|"+runtimeClusterTag+"|"+
         deviceIntegrationId()+"|"+cb+"|"+String((unsigned long)currentCoordinatorEpoch)+
         "|"+nodeId+"|"+nb+"|"+String((unsigned long)probeSeq)+"|"+when;
@@ -4815,7 +4839,11 @@ String clusterStatusJson()
     json += "\"valid\":";
     json += clusterClockValid ? "true" : "false";
     json += ",\"source\":\"";
-    json += localIsCoordinator ? "local_coordinator" : "wifi_coordinator";
+    uint32_t sourceAge=0; double sourceRtt=0; int64_t sourceUtc=0;
+    const bool espSource=!localIsCoordinator && droneModeEnabled() &&
+        ClusterEspNowRadio::precisionUtcNow(currentCoordinatorEpoch,currentCoordinatorId,
+                                              sourceUtc,sourceAge,sourceRtt);
+    json += localIsCoordinator ? "local_coordinator" : (espSource ? "espnow_precision" : "wifi_coordinator");
     json += "\"";
     json += ",\"utc_us\":" + int64Text(clusterClockValid ? clusterUtc : 0);
     // Offset is relative to the device's own wall clock, not independent
@@ -4826,8 +4854,10 @@ String clusterStatusJson()
     json += ",\"local_offset_us\":" + int64Text(
         (clusterClockValid && localWallUs != 0) ? (clusterUtc - localWallUs) : 0);
     const uint32_t sampleAgeMs = timeEstimateValid ? (uint32_t)(nowMs - timeLastSampleMs) : 0;
-    const int64_t estimatedUncertaintyUs = timeEstimateValid ?
-        (timeLastRttUs / 2 + (int64_t)sampleAgeMs * 50LL / 1000LL) : 0;
+    // The historical RTT/2 diagnostic refers only to Wi-Fi synchronization.
+    // Do not advertise it as the ESP-NOW clock's uncertainty.
+    const int64_t estimatedUncertaintyUs = espSource ? 0 : (timeEstimateValid ?
+        (timeLastRttUs / 2 + (int64_t)sampleAgeMs * 50LL / 1000LL) : 0);
     json += ",\"uncertainty_estimate_us\":" + int64Text(estimatedUncertaintyUs);
     json += ",\"sync_interval_sec\":900";
     json += ",\"manual_sync_sequence\":" + String((unsigned long)timeSyncCommandSeq);
@@ -4838,6 +4868,85 @@ String clusterStatusJson()
     json += ",\"accepted\":" + String((unsigned long)timeAcceptedSamples);
     json += ",\"rejected\":" + String((unsigned long)timeRejectedSamples);
     json += "}";
+    // Local radio diagnostics only. Node-specific ESP-NOW estimates are NOT
+    // present in coordinator discovery reports and must not be fabricated.
+    const ClusterEspNowRadio::Diagnostics esn = ClusterEspNowRadio::diagnostics();
+    json += ",\"espnow_time_local\":{";
+    json += "\"active\":"; json += esn.active ? "true" : "false";
+    json += ",\"channel\":" + String((unsigned int)esn.channel);
+    json += ",\"sent\":" + String((unsigned long)esn.sent);
+    json += ",\"received\":" + String((unsigned long)esn.received);
+    json += ",\"authenticated\":" + String((unsigned long)esn.authenticated);
+    json += ",\"rejected\":" + String((unsigned long)esn.rejected);
+    json += ",\"replay\":" + String((unsigned long)esn.replay);
+    json += ",\"dropped\":" + String((unsigned long)esn.dropped);
+    json += ",\"probes_sent\":" + String((unsigned long)esn.probesSent);
+    json += ",\"probes_answered\":" + String((unsigned long)esn.probesAnswered);
+    json += ",\"exchanges_complete\":" + String((unsigned long)esn.exchangesComplete);
+    json += ",\"exchange_timeouts\":" + String((unsigned long)esn.exchangeTimeouts);
+    json += ",\"rx_queue_delay_last_us\":" + String((unsigned long)esn.rxQueueDelayLastUs);
+    json += ",\"rx_queue_delay_max_us\":" + String((unsigned long)esn.rxQueueDelayMaxUs);
+    json += ",\"reply_final_dispatch_gap_last_us\":" + String((unsigned long)esn.replyFinalDispatchGapLastUs);
+    json += ",\"reply_final_dispatch_gap_max_us\":" + String((unsigned long)esn.replyFinalDispatchGapMaxUs);
+    json += ",\"tx_callback_delay_last_us\":" + String((unsigned long)esn.txCallbackLatencyLastUs);
+    json += ",\"tx_callback_delay_max_us\":" + String((unsigned long)esn.txCallbackLatencyMaxUs);
+    json += ",\"tx_callback_samples\":" + String((unsigned long)esn.txCallbackSamples);
+    json += ",\"tx_callback_failed\":" + String((unsigned long)esn.txCallbackFailed);
+    json += ",\"tx_pending_overflow\":" + String((unsigned long)esn.txPendingOverflow);
+    json += ",\"tx_callback_unmatched\":" + String((unsigned long)esn.txCallbackUnmatched);
+    json += ",\"last_exchange_valid\":"; json += esn.lastExchangeValid ? "true" : "false";
+    json += ",\"last_offset_us\":" + String(esn.lastOffsetUs, 3);
+    json += ",\"last_rtt_us\":" + String(esn.lastRttUs, 3);
+    json += ",\"drift_valid\":"; json += esn.driftValid ? "true" : "false";
+    json += ",\"stored_drift_available\":"; json += esn.storedDriftAvailable ? "true" : "false";
+    json += ",\"drift_ppm\":" + String(esn.driftPpm, 4);
+    json += ",\"drift_uncertainty_ppm\":" + String(esn.driftUncertaintyPpm, 4);
+    json += ",\"drift_samples\":" + String((unsigned long)esn.driftSamples);
+    json += ",\"drift_persisted\":" + String((unsigned long)esn.driftPersisted);
+    json += ",\"last_accepted_age_ms\":" + String((unsigned long)esn.lastAcceptedAgeMs);
+    json += ",\"precision_recently_accepted\":"; json += esn.precisionRecentlyAccepted ? "true" : "false";
+    json += ",\"action_pause_remaining_ms\":" + String((unsigned long)esn.capturePauseRemainingMs);
+    json += ",\"precision_clock_active\":";json += espSource ? "true" : "false";
+    json += ",\"precision_sample_age_ms\":" + String(espSource ? (unsigned long)sourceAge : 0UL);
+    json += ",\"precision_rtt_us\":" + String(espSource ? sourceRtt : 0.0, 3);
+    json += '}';
+    // ESP-NOW result frames are verified by the radio HMAC and replay gate.
+    // Bind to the node boot nonce at presentation time; do not infer identity from MAC.
+    json += ",\"espnow_node_reports\":[";
+    ClusterEspNowRadio::NodeSyncReport reports[12];
+    const size_t reportCount=ClusterEspNowRadio::nodeSyncReports(reports,12);
+    for(size_t i=0;i<reportCount;++i){
+        if(i)json+=',';
+        const auto &r=reports[i];
+        char bootText[9];snprintf(bootText,sizeof(bootText),"%08lx",(unsigned long)r.bootNonce);
+        json += "{\"boot_id\":\""+String(bootText)+"\"";
+        json += ",\"received_age_ms\":"+String((unsigned long)r.receivedAgeMs);
+        json += ",\"sample_age_ms\":"+String((unsigned long)r.sampleAgeMs);
+        json += ",\"offset_us\":"+String((long)r.offsetUs);
+        json += ",\"rtt_us\":"+String((unsigned long)r.rttUs);
+        json += ",\"accepted_samples\":"+String((unsigned int)r.acceptedSamples);
+        json += ",\"precision_accepted\":";json+=r.precisionAccepted?"true":"false";
+        json += ",\"probes_sent\":"+String((unsigned long)r.probesSent);
+        json += ",\"exchanges_complete\":"+String((unsigned long)r.exchangesComplete);
+        json += ",\"failure_code\":"+String((unsigned int)r.failureCode);
+        json += ",\"failed_series\":"+String((unsigned int)r.failedSeries);
+        json += ",\"has_failure_metrics\":";json+=r.hasFailureMetrics?"true":"false";
+        json += ",\"failed_spread_us\":"+String((unsigned long)r.failedSpreadUs);
+        json += ",\"failed_rtt_us\":"+String((unsigned long)r.failedRttUs);
+        json += ",\"has_failure_offsets\":";json+=r.hasFailureOffsets?"true":"false";
+        json += ",\"failed_min_rtt_offset_us\":"+String((long)r.failedMinRttOffsetUs);
+        json += ",\"failed_selected_offset_us\":"+String((long)r.failedSelectedOffsetUs);
+        json += ",\"failed_accepted\":"+String((unsigned int)r.failedAccepted);
+        json += ",\"failed_selected\":"+String((unsigned int)r.failedSelected);
+        json += ",\"has_time_source\":";json+=r.hasTimeSource?"true":"false";
+        json += ",\"using_espnow_time\":";json+=r.usingEspNowTime?"true":"false";
+        json += ",\"has_drift_report\":";json+=r.hasDriftReport?"true":"false";
+        json += ",\"drift_valid\":";json+=r.driftValid?"true":"false";
+        json += ",\"drift_ppm\":"+String(r.driftMilliPpm/1000.0,3);
+        json += ",\"spread_us\":"+String((unsigned int)r.spreadUs);
+        json += '}';
+    }
+    json += ']';
     json += ",\"ack_diagnostics\":{";
     json += "\"hb_sent\":" + String((unsigned long)diagHbSent);
     json += ",\"hb_send_failed\":" + String((unsigned long)diagHbSendFailed);
@@ -5205,6 +5314,13 @@ bool clusterTimeNowUs(int64_t &utcUs)
         utcUs = localUnixTimeUs();
         return utcUs != 0;
     }
+    // ESP-NOW provides an independent authenticated UTC estimate. A planned
+    // capture must use the same time model even while radio service is paused.
+    uint32_t espAgeMs=0;
+    double espRttUs=0;
+    if (droneModeEnabled() &&
+        ClusterEspNowRadio::precisionUtcNow(currentCoordinatorEpoch,currentCoordinatorId,
+                                            utcUs, espAgeMs, espRttUs)) return true;
     if (!timeEstimateValid || timeAuthorityEpoch != currentCoordinatorEpoch ||
         strcmp(timeAuthorityId, currentCoordinatorId) != 0 ||
         (uint32_t)(millis() - timeLastSampleMs) > CLUSTER_TIME_HOLDOVER_MS) return false;
@@ -5214,3 +5330,32 @@ bool clusterTimeNowUs(int64_t &utcUs)
 
 // Cooperative main-loop priority gate while a local capture is armed.
 bool clusterCaptureArmed(){return clusterCaptureArmedFlag;}
+
+// A planned cluster shot is protected from dispatch/acceptance until post-shot.
+// This is a local admission gate; it does not stop all third-party Wi-Fi traffic.
+bool clusterCaptureProtectionActive() {
+    if (clusterCaptureArmedFlag || pendingCapture.active) return true;
+    return localIsCoordinator && coordinatorCaptureGuardUntilMs &&
+           static_cast<int32_t>(millis()-coordinatorCaptureGuardUntilMs)<0;
+}
+
+// Callbacks for EspNowTimePackets::encode/decode. Never call from the
+// ESP-NOW WiFi task: queue frames and verify in the ordinary cluster loop.
+bool clusterEspNowTimeSign(const uint8_t *data, size_t len,
+                           uint8_t mac[32], void *user)
+{
+    (void)user;
+    return espNowTimeMac(data, len, mac);
+}
+
+bool clusterEspNowTimeVerify(const uint8_t *data, size_t len,
+                             const uint8_t mac[32], void *user)
+{
+    (void)user;
+    if (!mac) return false;
+    uint8_t expected[32] = {};
+    if (!espNowTimeMac(data, len, expected)) return false;
+    const bool valid = constantTimeEqual(expected, mac, sizeof(expected));
+    secureWipe(expected, sizeof(expected));
+    return valid;
+}
