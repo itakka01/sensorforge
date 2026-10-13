@@ -25,8 +25,17 @@ namespace ClusterEspNowRadio {
 namespace {
 constexpr uint32_t kBroadcastEveryMs=10000;
 constexpr uint32_t kProbeEveryMs=60000;
-constexpr uint32_t kGrantEveryMs=5000;
-constexpr uint32_t kGrantLeaseMs=12000;
+// Failed quality checks must not suspend retries longer than the precision
+// clock lifetime (120 s). Jitter desynchronizes competing nodes.
+constexpr uint32_t kRetryBaseMs=12000;
+constexpr uint32_t kRetryJitterMs=12000;
+// Single-owner precision measurement slots.  Short leases and a guard interval
+// avoid overlapping permissions even if an authenticated revoke is lost.
+constexpr uint32_t kGrantEveryMs=1000;
+constexpr uint32_t kGrantLeaseMs=3000;
+constexpr uint32_t kOwnerSlotMs=14000;
+constexpr uint32_t kSlotGuardMs=3500;
+constexpr uint32_t kPeerActiveMs=30000;
 constexpr uint32_t kProbeGapMs=45; // Shorter series; quality gate unchanged
 constexpr uint32_t kExchangeTimeoutMs=1200;
 constexpr uint8_t kInitialSamples=16;
@@ -92,6 +101,68 @@ uint32_t nextBroadcastMs=0,nextSeriesMs=0,nextProbeMs=0,txSequence=0,lastEpoch=0
 uint32_t captureGuardUntilMs=0;
 uint32_t permissionUntilMs=0, nextGrantMs=0;
 bool coordinatorPermissionIssued=false;
+bool sendFrame(EspNowTimePackets::Frame& f,const uint8_t mac[6]);
+struct SlotPeer { uint8_t mac[6]={}; uint32_t boot=0; uint32_t seenMs=0; };
+SlotPeer slotPeers[12];
+uint8_t slotNextIndex=0;
+int8_t slotOwner=-1;
+uint32_t slotStartedMs=0, slotGuardUntilMs=0;
+uint32_t slotGrantsSent=0, slotRotations=0;
+void noteSlotPeer(const uint8_t mac[6], uint32_t boot) {
+    if(!boot) return;
+    const uint32_t now=millis();
+    for(auto &p:slotPeers) {
+        if(p.boot && memcmp(p.mac,mac,6)==0) {
+            // A different boot on the same MAC is a different owner.
+            if(p.boot!=boot && slotOwner==(&p-slotPeers)) {
+                slotOwner=-1;slotGuardUntilMs=now+kSlotGuardMs;
+            }
+            p.boot=boot; p.seenMs=now; return;
+        }
+    }
+    for(auto &p:slotPeers) if(!p.boot || uint32_t(now-p.seenMs)>kPeerActiveMs) {
+        p={};memcpy(p.mac,mac,6);p.boot=boot;p.seenMs=now;return;
+    }
+}
+bool slotIsOwner(const uint8_t mac[6], uint32_t boot) {
+    return slotOwner>=0 && slotPeers[slotOwner].boot==boot &&
+           memcmp(slotPeers[slotOwner].mac,mac,6)==0 &&
+           uint32_t(millis()-slotStartedMs)<kOwnerSlotMs;
+}
+void sendSlotControl(uint32_t epoch,uint64_t tag,uint32_t boot,
+                     uint32_t targetBoot,uint32_t leaseMs) {
+    EspNowTimePackets::Frame f;
+    f.type=EspNowTimePackets::Type::SyncControl;
+    f.epoch=epoch;f.coordinatorTag=tag;f.senderBoot=boot;
+    f.nonce=targetBoot;f.timeUs=leaseMs;
+    if(sendFrame(f,kBroadcastMac) && leaseMs) ++slotGrantsSent;
+}
+void endSlot(uint32_t epoch,uint64_t tag,uint32_t boot) {
+    if(slotOwner>=0) {
+        sendSlotControl(epoch,tag,boot,slotPeers[slotOwner].boot,0);
+        slotNextIndex=static_cast<uint8_t>((slotOwner+1)%12);
+        ++slotRotations;
+    }
+    slotOwner=-1;
+    slotGuardUntilMs=millis()+kSlotGuardMs;
+}
+void serviceSlots(uint32_t now,uint32_t epoch,uint64_t tag,uint32_t boot) {
+    if(slotOwner>=0 && (uint32_t(now-slotStartedMs)>=kOwnerSlotMs ||
+       uint32_t(now-slotPeers[slotOwner].seenMs)>kPeerActiveMs)) endSlot(epoch,tag,boot);
+    if(slotOwner<0) {
+        if(static_cast<int32_t>(now-slotGuardUntilMs)<0) return;
+        for(unsigned offset=0;offset<12;++offset) {
+            const uint8_t i=static_cast<uint8_t>((slotNextIndex+offset)%12);
+            if(slotPeers[i].boot && uint32_t(now-slotPeers[i].seenMs)<=kPeerActiveMs) {
+                slotOwner=i;slotStartedMs=now;nextGrantMs=now;break;
+            }
+        }
+    }
+    if(slotOwner>=0 && static_cast<int32_t>(now-nextGrantMs)>=0) {
+        nextGrantMs=now+kGrantEveryMs;
+        sendSlotControl(epoch,tag,boot,slotPeers[slotOwner].boot,kGrantLeaseMs);
+    }
+}
 uint32_t localBootNonceForControl=0;
 uint64_t lastTag=0;
 EspNowTimePackets::ReplayWindow coordinatorReplay;
@@ -111,6 +182,14 @@ NodeSyncReport remoteReports[12];
 uint32_t remoteReceivedAt[12]={};
 uint8_t remoteNext=0;
 uint32_t reportCount=0;
+uint32_t retrySerial=0;
+uint32_t qualityRetryDelayMs() {
+    // Different node boots and successive failures use different retry phases.
+    // Only affects retry scheduling, not clock estimates or quality thresholds.
+    const uint32_t x=localBootNonceForControl ^ (++retrySerial*0x9e3779b9UL);
+    const uint32_t mixed=(x ^ (x>>16))*0x7feb352dUL;
+    return kRetryBaseMs + ((mixed ^ (mixed>>15)) % kRetryJitterMs);
+}
 uint32_t failedSeries=0;
 uint8_t lastSeriesFailure=0; // 1=invalid/insufficient; 2=spread; 3=RTT; 4=series deadline
 ClusterEspNowTwoWay::Estimate lastRejectedEstimate;
@@ -241,6 +320,9 @@ bool start(uint8_t channel) {
     initialized=true;boundChannel=channel;stats.active=true;stats.channel=channel;
     nextBroadcastMs=millis()+1000;nextSeriesMs=millis()+2000;nextGrantMs=millis();
     permissionUntilMs=0;coordinatorPermissionIssued=false;nextReportMs=millis()+1500UL;
+    for(auto &p:slotPeers)p={};slotNextIndex=0;slotOwner=-1;
+    slotStartedMs=0;slotGuardUntilMs=millis()+kSlotGuardMs;
+    slotGrantsSent=slotRotations=0;
     return true;
 }
 uint32_t nextSequence(){++txSequence;if(!txSequence)++txSequence;return txSequence;}
@@ -412,7 +494,7 @@ void finishSample(int64_t t3) {
         } else {
             acceptEstimate(e);
             seriesCount=0;seriesTarget=kInitialSamples;seriesStartedMs=0;
-            nextSeriesMs=millis()+kProbeEveryMs*(consecutiveFailures>=3 ? 3UL : (consecutiveFailures>=2 ? 2UL : 1UL));
+            nextSeriesMs=millis()+(seriesPrecisionAccepted ? 45000UL : qualityRetryDelayMs());
         }
     }
 }
@@ -429,7 +511,7 @@ void revokePermissionBroadcast() {
     // Uses the same authenticated, per-boot replay-protected packet framing.
     f.senderBoot=localBootNonceForControl;
     f.timeUs=0; // Zero = revoke. Positive = lease duration in milliseconds.
-    f.nonce=0;
+    f.nonce=(slotOwner>=0 ? slotPeers[slotOwner].boot : 0);
     sendFrame(f,kBroadcastMac);
 }
 void pauseForCapture(uint32_t holdMs) {
@@ -442,6 +524,11 @@ void pauseForCapture(uint32_t holdMs) {
         captureGuardUntilMs = until;
     // Coordinator notifies nodes immediately; expiry also protects against lost packets.
     revokePermissionBroadcast();
+    if(wasCoordinator && slotOwner>=0) {
+        slotNextIndex=static_cast<uint8_t>((slotOwner+1)%12);
+        slotOwner=-1;
+        slotGuardUntilMs=captureGuardUntilMs+kSlotGuardMs;
+    }
     coordinatorPermissionIssued=false;
     permissionUntilMs=0;
     // Drop incomplete samples immediately, but preserve valid holdover state.
@@ -462,6 +549,8 @@ void stop() {
     boundChannel=0;lastEpoch=0;lastTag=0;stats.active=false;
     stats.lastExchangeValid=false;stats.lastOffsetUs=0;stats.lastRttUs=0;
     resetTiming();clearQueue();
+    for(auto &p:slotPeers)p={};slotNextIndex=0;slotOwner=-1;
+    slotStartedMs=slotGuardUntilMs=0;slotGrantsSent=slotRotations=0;
     previousEstimate={};latestQualityEstimate={};lastPrecisionMs=0;failedSeries=0;lastSeriesFailure=0;lastRejectedEstimate={};consecutiveFailures=0;
     referenceUtcUs=0;referenceMonoLow=0;referenceReceivedNodeMono=0;
     referenceId=String();goodDriftPairs=0;driftHistoryCount=0;
@@ -560,8 +649,12 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
             ++stats.authenticated;
             if(f.type==EspNowTimePackets::Type::NodeSyncReport ||
                f.type==EspNowTimePackets::Type::NodeDriftReport){
+                noteSlotPeer(item.mac,static_cast<uint32_t>(f.senderBoot));
                 acceptNodeReport(f);continue;
             }
+            // Only the slot owner may receive timestamp replies. Authentication
+            // and replay validation above still apply for every received packet.
+            if(!slotIsOwner(item.mac,static_cast<uint32_t>(f.senderBoot))) continue;
             // Four-timestamp exchange: t1=Node Probe TX, t2=Coordinator Probe RX,
             // t3=Coordinator REPLY TX call, t4=Node REPLY RX callback.
             // Final delivers t3 metadata only; Final RX is NEVER t4.
@@ -592,6 +685,7 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
         ++stats.authenticated;
         if(f.type==EspNowTimePackets::Type::SyncControl) {
             // timeUs is a bounded lease length. Stop is immediate on authenticated receipt.
+            if(f.nonce!=localBootNonceForControl) continue;
             if(f.timeUs==0) {
                 permissionUntilMs=0;pending={};seriesCount=0;seriesTarget=kInitialSamples;seriesStartedMs=0;
                 nextSeriesMs=millis()+1000UL;
@@ -618,14 +712,7 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
     }
     uint32_t now=millis();
     if(coordinator){
-        if(static_cast<int32_t>(now-nextGrantMs)>=0){
-            nextGrantMs=now+kGrantEveryMs;
-            EspNowTimePackets::Frame grant;
-            grant.type=EspNowTimePackets::Type::SyncControl;
-            grant.epoch=epoch;grant.coordinatorTag=tag;grant.senderBoot=localBootNonce;
-            grant.timeUs=kGrantLeaseMs;
-            coordinatorPermissionIssued=sendFrame(grant,kBroadcastMac);
-        }
+        serviceSlots(now,epoch,tag,localBootNonce);
         if(static_cast<int32_t>(now-nextBroadcastMs)>=0){
             nextBroadcastMs=now+kBroadcastEveryMs;
             EspNowTimePackets::Frame b;
@@ -661,7 +748,7 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
         // Never extend a busy/failed measurement series indefinitely.
         seriesCount=0;seriesTarget=kInitialSamples;seriesStartedMs=0;
         pending={};++failedSeries;lastSeriesFailure=4;consecutiveFailures=static_cast<uint8_t>(std::min(8U,unsigned(consecutiveFailures)+1U));
-        nextSeriesMs=now+kProbeEveryMs*(consecutiveFailures>=3?3UL:2UL);return;
+        nextSeriesMs=now+qualityRetryDelayMs();return;
     }
     if(seriesCount==0 && !pending.active && seriesStartedMs==0)
         seriesStartedMs=now;
