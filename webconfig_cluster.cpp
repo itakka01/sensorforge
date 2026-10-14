@@ -1,3 +1,4 @@
+#include <cmath>
 #include "webconfig_cluster.h"
 
 #include "cluster.h"
@@ -839,6 +840,12 @@ pollHealth();setInterval(pollHealth,10000);
 <label>Nodes: <select id='sfBenchTarget'><option value=''>Alle Nodes</option></select></label> <label>Abstand: <select id='sfBenchGap'><option value='50'>50 ms (Referenz)</option><option value='10'>10 ms</option><option value='5'>5 ms (Lasttest)</option></select></label> <button type='button' id='sfBenchStart'>ESP-NOW-Benchmark starten</button> <button type='button' id='sfBenchAbort'>Abbrechen</button> <a href='/cluster_espnow_benchmark_csv'>CSV nach Testende</a> <a href='/cluster_espnow_benchmark_status'>JSON</a>
 <p>Vier-Zeitstempel Rohdaten (auf jedem Node): <span id='sfBenchRawLinks'>Links werden geladen</span></p><p>Uplink-ACK-RTT und Downlink-Empfang: <span id='sfBenchTransportLinks'>Links werden geladen</span></p><pre id='sfBenchStatus' class='muted'>Noch kein Benchmark gestartet.</pre>
 </details>
+<details><summary>ESP-NOW Broadcast-Intervalltest (nur Diagnose)</summary>
+<p class='muted'>Sendet 15 Sekunden lang zusätzliche authentifizierte Zeitbeacons. Optional werden individuelle ESP-NOW-Sync-Slots pausiert (bestehende Leases laufen innerhalb weniger Sekunden ab). WLAN-Verbindung und Cluster bleiben aktiv. Kein Einfluss auf die Capture-Zeitquelle. Die CSV-Messwerte anschließend auf den Nodes herunterladen.</p>
+<label>Intervall: <select id='sfBeaconGap'><option value='200'>200 ms</option><option value='500'>500 ms</option><option value='100'>100 ms</option><option value='50'>50 ms</option></select></label>
+<label><input type='checkbox' id='sfBeaconQuiet'> Individuelle ESP-NOW-Sync-Slots während des Tests pausieren</label> <button type='button' id='sfBeaconStart'>Test starten</button> <button type='button' id='sfBeaconAbort'>Abbrechen</button>
+<pre id='sfBeaconStatus' class='muted' role='status'>Bereit.</pre>
+</details>
 <div id='clusterProbeTargets'>Verfügbare Nodes werden geladen …</div>
 <div id='clusterProbeFeedback' class='muted' role='status'></div><div id='clusterProbeSummary' class='muted'></div><details><summary>Technische Übertragungszähler</summary><div id='clusterProbeDiagnostics' class='muted'></div><div id='clusterHttpDiagnostics' class='muted'></div></details>
 <details><summary>Letzte Probe-Ergebnisse (begrenzter RAM-Verlauf)</summary>
@@ -848,6 +855,11 @@ pollHealth();setInterval(pollHealth,10000);
 (function(){
 function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 var busy=false;
+function sfBeaconPoll(){fetch('/cluster_espnow_beacon_test_status',{cache:'no-store',credentials:'same-origin'}).then(function(r){if(!r.ok)throw Error('Status: HTTP '+r.status);return r.json();}).then(function(d){document.getElementById('sfBeaconStatus').textContent=d.active?('Test läuft: '+d.interval_ms+' ms'+(d.quiet?' · Sync-Slots pausiert':'')+' · gesendet '+d.sent+' · verbleibend '+Math.ceil(d.remaining_ms/1000)+' s'):('Test inaktiv · zuletzt gesendet '+d.sent);}).catch(function(e){document.getElementById('sfBeaconStatus').textContent=String(e.message||e);});}
+function sfBeaconCommand(path){fetch(path,{method:'POST',credentials:'same-origin'}).then(function(r){if(!r.ok)return r.text().then(function(t){throw Error('HTTP '+r.status+': '+t);});return r.json();}).then(sfBeaconPoll).catch(function(e){document.getElementById('sfBeaconStatus').textContent=String(e.message||e);});}
+document.getElementById('sfBeaconStart').addEventListener('click',function(){sfBeaconCommand('/cluster_espnow_beacon_test_start?interval_ms='+encodeURIComponent(document.getElementById('sfBeaconGap').value)+'&quiet='+(document.getElementById('sfBeaconQuiet').checked?'1':'0'));});
+document.getElementById('sfBeaconAbort').addEventListener('click',function(){sfBeaconCommand('/cluster_espnow_beacon_test_abort');});
+sfBeaconPoll();setInterval(sfBeaconPoll,2000);
 function sfBenchCommand(path){fetch(path,{method:'POST',credentials:'same-origin'}).then(function(r){if(!r.ok)return r.text().then(function(t){throw Error(t);});return r.json();}).then(sfBenchPoll).catch(function(e){document.getElementById('sfBenchStatus').textContent=String(e.message||e);});}
 function sfBenchPoll(){fetch('/cluster_espnow_benchmark_status',{cache:'no-store',credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
 var o=['Test '+(d.running?'läuft':(d.aborted?'abgebrochen':(d.finished?'beendet':'nicht gestartet'))),'Run '+d.run_id+' · Node '+(d.node_index+1)+' · Phase '+d.phase];
@@ -972,6 +984,32 @@ static void handleEspNowBenchmarkNodeTransportCsv(){
     }
     server.sendContent("");
 }
+static void handleEspNowBeaconExperimentStart(){
+    if(!clusterLocalIsCoordinator()){server.send(403,"text/plain","Nur Coordinator");return;}
+    const String interval=server.arg("interval_ms");
+    if(interval!="50" && interval!="100" && interval!="200" && interval!="500"){
+        server.send(400,"text/plain","interval_ms: 50, 100, 200 oder 500");return;
+    }
+    if(!ClusterEspNowRadio::beaconExperimentStart(static_cast<uint32_t>(interval.toInt()),server.arg("quiet")=="1")){
+        server.send(409,"text/plain","Radio nicht bereit, Capture-Pause, Benchmark oder Experiment aktiv");return;
+    }
+    server.send(200,"application/json","{\"ok\":true,\"duration_ms\":15000}");
+}
+static void handleEspNowBeaconExperimentAbort(){
+    if(!clusterLocalIsCoordinator()){server.send(403,"text/plain","Nur Coordinator");return;}
+    ClusterEspNowRadio::beaconExperimentAbort();
+    server.send(200,"application/json","{\"ok\":true}");
+}
+static void handleEspNowBeaconExperimentStatus(){
+    const auto st=ClusterEspNowRadio::beaconExperimentSnapshot();
+    String json="{\"active\":";
+    json+=(st.active?"true":"false");
+    json+=",\"interval_ms\":"+String(st.intervalMs);
+    json+=",\"quiet\":"+String(st.quiet?"true":"false");
+    json+=",\"sent\":"+String(st.sent);
+    json+=",\"remaining_ms\":"+String(st.remainingMs)+"}";
+    server.send(200,"application/json",json);
+}
 static void handleEspNowBenchmarkStart(){
     if(!clusterLocalIsCoordinator()){
         server.send(403,"text/plain; charset=utf-8","Nur am Coordinator");return;
@@ -1026,6 +1064,75 @@ static void handleEspNowBenchmarkStatus(){
     out+="]}";
     server.sendHeader("Cache-Control","no-store");
     server.send(200,"application/json; charset=utf-8",out);
+}
+// Deliberately no UI element; diagnostics use existing authentication gates.
+static void handleEspNowBeaconCsv(){
+    server.sendHeader("Content-Disposition","attachment; filename=espnow_beacon_observations.csv");
+    server.sendHeader("Cache-Control","no-store");
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200,"text/csv; charset=utf-8","");
+    server.sendContent("sequence,epoch,coordinator_boot,coordinator_mono_low,coordinator_utc_us,node_rx_callback_us,prediction_samples,prediction_error_us,drift_ppm_x100,prediction_status\n");
+    const size_t count=ClusterEspNowRadio::beaconObservationCount();
+    for(size_t i=0;i<count;++i){
+        ClusterEspNowRadio::BeaconObservation sample;
+        if(!ClusterEspNowRadio::beaconObservationAt(i,sample))continue;
+        char line[200];
+        snprintf(line,sizeof(line),"%lu,%lu,%llu,%lu,%lld,%lld,%u,%ld,%ld,%u\n",
+            (unsigned long)sample.sequence,(unsigned long)sample.epoch,
+            (unsigned long long)sample.coordinatorBoot,
+            (unsigned long)sample.coordinatorMonoLow,
+            (long long)sample.coordinatorUtcUs,(long long)sample.nodeRxCallbackUs,
+            (unsigned)sample.predictionSamples,(long)sample.predictionErrorUs,(long)sample.driftPpmX100,
+            (unsigned)sample.predictionStatus);
+        server.sendContent(line);
+    }
+    server.sendContent("");
+}
+// O(1) CSV export: no long-lived HTTP connection and no large HTML/String.
+// Bounded shared-event trace; streaming CSV avoids constructing a large String.
+static void handleEspNowSharedEventsCsv(){
+    server.sendHeader("Content-Disposition","attachment; filename=espnow_shared_events.csv");
+    server.sendHeader("Cache-Control","no-store");
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200,"text/csv; charset=utf-8","");
+    server.sendContent("sequence,epoch,coordinator_boot,coordinator_mono_low,node_rx_callback_us\n");
+    const size_t count=ClusterEspNowRadio::beaconSharedEventCount();
+    const uint64_t boot=ClusterEspNowRadio::beaconSharedEventBoot();
+    for(size_t i=0;i<count;++i){
+        ClusterEspNowRadio::BeaconSharedEvent event;
+        if(!ClusterEspNowRadio::beaconSharedEventAt(i,event))continue;
+        // Trace resets across coordinator restarts; avoid mixing old/new boot IDs.
+        if(static_cast<uint32_t>(boot)!=event.coordinatorBootLow)continue;
+        char line[112];
+        snprintf(line,sizeof(line),"%lu,%lu,%llu,%lu,%llu\n",
+            (unsigned long)event.sequence,(unsigned long)event.epoch,
+            (unsigned long long)boot,(unsigned long)event.coordinatorMonoLow,
+            (unsigned long long)event.nodeRxCallbackUs);
+        server.sendContent(line);
+    }
+    server.sendContent("");
+}
+static void handleEspNowBeaconStatsCsv(){
+    const auto st=ClusterEspNowRadio::beaconPredictionStats();
+    server.sendHeader("Cache-Control","no-store");
+    server.sendHeader("Content-Disposition","attachment; filename=espnow_beacon_statistics.csv");
+    String csv="received,valid,first_sequence,last_sequence,epoch,coordinator_boot,mean_error_us,stddev_error_us,rmse_error_us,mean_abs_error_us,min_error_us,max_error_us,mean_drift_ppm,status_0,status_1,status_2,status_3,status_4,status_5,status_6,status_7,status_8\n";
+    char line[320];
+    const double variance=st.valid>1 ? st.errorM2/static_cast<double>(st.valid-1) : 0.0;
+    const double rmse=st.valid ? sqrt((st.errorM2+st.valid*st.meanErrorUs*st.meanErrorUs)/st.valid) : 0.0;
+    snprintf(line,sizeof(line),"%lu,%lu,%lu,%lu,%lu,%llu,%.2f,%.2f,%.2f,%.2f,%ld,%ld,%.4f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
+        (unsigned long)st.received,(unsigned long)st.valid,
+        (unsigned long)st.firstSequence,(unsigned long)st.lastSequence,
+        (unsigned long)st.epoch,(unsigned long long)st.coordinatorBoot,
+        st.meanErrorUs,sqrt(variance),rmse,st.meanAbsErrorUs,
+        (long)st.minErrorUs,(long)st.maxErrorUs,st.meanDriftPpm,
+        (unsigned long)st.statusCounts[0],(unsigned long)st.statusCounts[1],
+        (unsigned long)st.statusCounts[2],(unsigned long)st.statusCounts[3],
+        (unsigned long)st.statusCounts[4],(unsigned long)st.statusCounts[5],
+        (unsigned long)st.statusCounts[6],(unsigned long)st.statusCounts[7],
+        (unsigned long)st.statusCounts[8]);
+    csv+=line;
+    server.send(200,"text/csv; charset=utf-8",csv);
 }
 static void handleEspNowBenchmarkCsv(){
     const auto b=ClusterEspNowRadio::benchmarkSnapshot();
@@ -1422,10 +1529,16 @@ void webconfigClusterRegisterRoutes(
     serverInstance.on("/cluster_node_sync_time", HTTP_POST, handleClusterNodeSyncTime);
     serverInstance.on("/cluster_espnow_benchmark_exchanges", HTTP_GET, handleEspNowBenchmarkExchangeCsv);
     serverInstance.on("/cluster_espnow_benchmark_node_transport", HTTP_GET, handleEspNowBenchmarkNodeTransportCsv);
+    serverInstance.on("/cluster_espnow_beacon_test_start", HTTP_POST, handleEspNowBeaconExperimentStart);
+    serverInstance.on("/cluster_espnow_beacon_test_abort", HTTP_POST, handleEspNowBeaconExperimentAbort);
+    serverInstance.on("/cluster_espnow_beacon_test_status", HTTP_GET, handleEspNowBeaconExperimentStatus);
     serverInstance.on("/cluster_espnow_benchmark_start", HTTP_POST, handleEspNowBenchmarkStart);
     serverInstance.on("/cluster_espnow_benchmark_abort", HTTP_POST, handleEspNowBenchmarkAbort);
     serverInstance.on("/cluster_espnow_benchmark_status", HTTP_GET, handleEspNowBenchmarkStatus);
     serverInstance.on("/cluster_espnow_benchmark_csv", HTTP_GET, handleEspNowBenchmarkCsv);
+    serverInstance.on("/cluster_espnow_beacons_csv", HTTP_GET, handleEspNowBeaconCsv);
+    serverInstance.on("/cluster_espnow_beacon_stats_csv", HTTP_GET, handleEspNowBeaconStatsCsv);
+    serverInstance.on("/cluster_espnow_shared_events_csv", HTTP_GET, handleEspNowSharedEventsCsv);
     serverInstance.on("/cluster_job_probe", HTTP_POST, handleClusterJobProbe);
     serverInstance.on("/cluster_node_restart", HTTP_POST, handleClusterNodeRestart);
     serverInstance.on("/cluster_node_shutdown", HTTP_POST, handleClusterNodeShutdown);

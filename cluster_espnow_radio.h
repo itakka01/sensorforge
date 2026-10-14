@@ -16,6 +16,42 @@ bool syncPermissionValid();
 // Authenticated UTC anchored to coordinator monotonic clock. False = use Wi-Fi.
 bool precisionUtcNow(uint32_t epoch, const char *coordinatorId,
                      int64_t &utcUs, uint32_t &sampleAgeMs, double &rttUs);
+// Passive diagnostic snapshots of existing authenticated beacons; not a clock source.
+struct BeaconObservation {
+    uint32_t sequence=0, epoch=0, coordinatorMonoLow=0;
+    uint64_t coordinatorBoot=0;
+    int64_t coordinatorUtcUs=0, nodeRxCallbackUs=0;
+    // One-step-ahead, trained only on earlier beacons. Not a capture clock.
+    int32_t predictionErrorUs=0;
+    int32_t driftPpmX100=0;
+    uint8_t predictionSamples=0; // 0 = no valid prediction
+    uint8_t predictionStatus=0; // 0=valid, 1=warmup, 2=identity, 3=span, 4=node time, 5=history, 6=regression, 7=slope, 8=range
+
+};
+// Constant-memory lifetime statistics of passive beacon predictions.
+// Aggregated values cannot replace synchronized per-beacon raw traces.
+struct BeaconPredictionStats {
+    uint32_t received=0, valid=0, firstSequence=0, lastSequence=0;
+    uint32_t epoch=0;
+    uint64_t coordinatorBoot=0;
+    int32_t minErrorUs=0, maxErrorUs=0;
+    double meanErrorUs=0, errorM2=0, meanAbsErrorUs=0;
+    double meanDriftPpm=0;
+    uint32_t statusCounts[9]={};
+};
+// Compact, passive, authenticated shared-event trace (last 128 beacons).
+// Timestamp is ESP-NOW RX callback time, NOT PHY arrival or camera exposure.
+struct BeaconSharedEvent {
+    uint32_t sequence=0, epoch=0, coordinatorMonoLow=0;
+    uint64_t nodeRxCallbackUs=0;
+    uint32_t coordinatorBootLow=0;
+};
+size_t beaconSharedEventCount();
+bool beaconSharedEventAt(size_t index, BeaconSharedEvent &out);
+uint64_t beaconSharedEventBoot();
+BeaconPredictionStats beaconPredictionStats();
+size_t beaconObservationCount();
+bool beaconObservationAt(size_t index, BeaconObservation &out);
 struct Diagnostics {
     uint32_t sent=0, received=0, authenticated=0, rejected=0, replay=0, dropped=0;
     uint32_t probesSent=0, probesAnswered=0, exchangesComplete=0, exchangeTimeouts=0;
@@ -55,6 +91,11 @@ struct Diagnostics {
     uint32_t syncPermissionRemainingMs=0;
 };
 Diagnostics diagnostics();
+// Coordinator-only, manual beacon interval experiment; max 15 s, no Wi-Fi disconnect.
+struct BeaconExperimentState { bool active=false, quiet=false; uint32_t intervalMs=0, sent=0, remainingMs=0; };
+bool beaconExperimentStart(uint32_t intervalMs, bool quiet=false);
+void beaconExperimentAbort();
+BeaconExperimentState beaconExperimentSnapshot();
 // Controlled authenticated bidirectional transport benchmark. Only the coordinator
 // may start a run; Capture always aborts it. One discovered node at a time.
 struct BenchmarkPeer {

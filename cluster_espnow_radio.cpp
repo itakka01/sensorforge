@@ -24,6 +24,70 @@
 namespace ClusterEspNowRadio {
 namespace {
 constexpr uint32_t kBroadcastEveryMs=10000;
+// No active broadcast traffic: retain only the last 12 authenticated beacons.
+// About 480 bytes static; no heap allocation, no callback-side changes.
+constexpr size_t kBeaconObservations=12;
+BeaconObservation beaconObservations[kBeaconObservations];
+size_t beaconObsCount=0, beaconObsWrite=0;
+BeaconPredictionStats beaconStats{};
+// ~3 KiB static. Collected in the existing service task, never RX callback.
+// Distinct coordinator identities reset the trace; no RF traffic is added.
+constexpr size_t kSharedEventCapacity=128;
+BeaconSharedEvent sharedEvents[kSharedEventCapacity];
+size_t sharedEventCount=0, sharedEventWrite=0;
+uint64_t sharedEventBoot=0;
+uint32_t sharedEventEpoch=0;
+void appendSharedEvent(const BeaconObservation &o) {
+    if (sharedEventCount &&
+        (sharedEventBoot!=o.coordinatorBoot || sharedEventEpoch!=o.epoch)) {
+        sharedEventCount=sharedEventWrite=0;
+    }
+    sharedEventBoot=o.coordinatorBoot;
+    sharedEventEpoch=o.epoch;
+    BeaconSharedEvent &entry=sharedEvents[sharedEventWrite];
+    entry.sequence=o.sequence;
+    entry.epoch=o.epoch;
+    entry.coordinatorMonoLow=o.coordinatorMonoLow;
+    entry.nodeRxCallbackUs=static_cast<uint64_t>(o.nodeRxCallbackUs);
+    entry.coordinatorBootLow=static_cast<uint32_t>(o.coordinatorBoot);
+    sharedEventWrite=(sharedEventWrite+1)%kSharedEventCapacity;
+    if(sharedEventCount<kSharedEventCapacity)++sharedEventCount;
+}
+
+// Accumulate every authenticated beacon in O(1) time, without storing samples.
+void accumulateBeaconStats(const BeaconObservation &o) {
+    if (beaconStats.received &&
+        (beaconStats.coordinatorBoot!=o.coordinatorBoot || beaconStats.epoch!=o.epoch)) {
+        beaconStats={}; // Never mix different coordinator clock epochs.
+    }
+    if (!beaconStats.received) {
+        beaconStats.coordinatorBoot=o.coordinatorBoot;
+        beaconStats.epoch=o.epoch;
+        beaconStats.firstSequence=o.sequence;
+    }
+    ++beaconStats.received;
+    beaconStats.lastSequence=o.sequence;
+    const uint8_t status=o.predictionStatus;
+    if(status<9)++beaconStats.statusCounts[status];
+    if(status!=0 || o.predictionSamples==0)return;
+    const double err=static_cast<double>(o.predictionErrorUs);
+    ++beaconStats.valid;
+    if(beaconStats.valid==1){
+        beaconStats.minErrorUs=o.predictionErrorUs;
+        beaconStats.maxErrorUs=o.predictionErrorUs;
+    }else{
+        if(o.predictionErrorUs<beaconStats.minErrorUs)beaconStats.minErrorUs=o.predictionErrorUs;
+        if(o.predictionErrorUs>beaconStats.maxErrorUs)beaconStats.maxErrorUs=o.predictionErrorUs;
+    }
+    const double delta=err-beaconStats.meanErrorUs;
+    beaconStats.meanErrorUs+=delta/static_cast<double>(beaconStats.valid);
+    beaconStats.errorM2+=delta*(err-beaconStats.meanErrorUs);
+    beaconStats.meanAbsErrorUs+=(fabs(err)-beaconStats.meanAbsErrorUs)/static_cast<double>(beaconStats.valid);
+    const double drift=static_cast<double>(o.driftPpmX100)/100.0;
+    beaconStats.meanDriftPpm+=(drift-beaconStats.meanDriftPpm)/static_cast<double>(beaconStats.valid);
+}
+
+
 constexpr uint32_t kProbeEveryMs=60000;
 // Failed quality checks must not suspend retries longer than the precision
 // clock lifetime (120 s). Jitter desynchronizes competing nodes.
@@ -98,6 +162,12 @@ void onSent(const uint8_t* mac,esp_now_send_status_t status) {
 bool initialized=false, wasCoordinator=false;
 uint8_t boundChannel=0;
 uint32_t nextBroadcastMs=0,nextSeriesMs=0,nextProbeMs=0,txSequence=0,lastEpoch=0;
+// Manual short-rate experiment. No heap and no automatic startup.
+uint32_t beaconExperimentUntilMs=0;
+uint32_t beaconExperimentIntervalMs=0;
+uint32_t beaconExperimentSent=0;
+uint32_t beaconExperimentLastDurationMs=0;
+bool beaconExperimentQuiet=false;
 uint32_t captureGuardUntilMs=0;
 uint32_t permissionUntilMs=0, nextGrantMs=0;
 bool coordinatorPermissionIssued=false;
@@ -796,6 +866,7 @@ bool capturePaused() {
 void stop() {
     benchAbortInternal(true);
     benchRawCount=0;
+    beaconExperimentUntilMs=beaconExperimentIntervalMs=beaconExperimentSent=0;
     captureGuardUntilMs = 0;
     permissionUntilMs=0;coordinatorPermissionIssued=false;localBootNonceForControl=0;
     if(initialized){esp_now_deinit();initialized=false;}
@@ -812,10 +883,63 @@ void stop() {
     previousEstimate={};latestQualityEstimate={};lastPrecisionMs=0;failedSeries=0;lastSeriesFailure=0;lastRejectedReason=0;lastRejectedSeriesMs=0;lastRejectedHasMetrics=false;lastRejectedEstimate={};consecutiveFailures=0;
     successfulSeries=0;lastCompletedSeriesMs=0;lastCompletedSeriesResult=0;nextSeriesStatsReportMs=0;lastEstimateMs=0;
     referenceUtcUs=0;referenceMonoLow=0;referenceReceivedNodeMono=0;
+    beaconObsCount=beaconObsWrite=0;beaconStats={};sharedEventCount=sharedEventWrite=0;sharedEventBoot=0;sharedEventEpoch=0;
     referenceId=String();goodDriftPairs=0;driftHistoryCount=0;
     for(auto &r:remoteReports)r={};for(auto &x:remoteReceivedAt)x=0;remoteNext=0;reportCount=0;
     stats.driftValid=false;stats.storedDriftAvailable=false;stats.driftPpm=0;
     stats.driftUncertaintyPpm=0;stats.driftSamples=0;
+}
+// One-step-ahead least-squares model. It uses only earlier authenticated
+// beacons from the same sender boot/epoch, and leaves the capture clock alone.
+// Offsets are intentionally local: this models intervals, not absolute UTC.
+void predictBeacon(const EspNowTimePackets::Frame &f,int64_t nodeRx,BeaconObservation &out){
+    if(beaconObsCount<4){out.predictionStatus=1;return;}
+    const size_t first=(beaconObsWrite+kBeaconObservations-beaconObsCount)%kBeaconObservations;
+    const BeaconObservation &origin=beaconObservations[first];
+    const uint32_t span=static_cast<uint32_t>(f.nonce-origin.coordinatorMonoLow);
+    if(f.senderBoot!=origin.coordinatorBoot || f.epoch!=origin.epoch){out.predictionStatus=2;return;}
+    if(span>600000000UL){out.predictionStatus=3;return;}
+    if(nodeRx<=origin.nodeRxCallbackUs){out.predictionStatus=4;return;}
+    double sx=0,sy=0,sxx=0,sxy=0;
+    for(size_t i=0;i<beaconObsCount;++i){
+        const auto &o=beaconObservations[(first+i)%kBeaconObservations];
+        if(o.coordinatorBoot!=f.senderBoot || o.epoch!=f.epoch){out.predictionStatus=5;return;}
+        const uint32_t dx=static_cast<uint32_t>(o.coordinatorMonoLow-origin.coordinatorMonoLow);
+        if(dx>span){out.predictionStatus=5;return;}
+        const double x=static_cast<double>(dx);
+        const double y=static_cast<double>(o.nodeRxCallbackUs-origin.nodeRxCallbackUs);
+        sx+=x;sy+=y;sxx+=x*x;sxy+=x*y;
+    }
+    const double n=static_cast<double>(beaconObsCount);
+    const double denominator=n*sxx-sx*sx;
+    if(denominator<1.0){out.predictionStatus=6;return;}
+    const double slope=(n*sxy-sx*sy)/denominator;
+    if(!std::isfinite(slope) || fabs(slope-1.0)>0.0005){out.predictionStatus=7;return;}
+    const double intercept=(sy-slope*sx)/n;
+    const double predicted=static_cast<double>(origin.nodeRxCallbackUs)+
+        intercept+slope*static_cast<double>(span);
+    const double error=static_cast<double>(nodeRx)-predicted;
+    const double ppm=(slope-1.0)*100000000.0;
+    if(!std::isfinite(error) || fabs(error)>2147483647.0 || !std::isfinite(ppm)){out.predictionStatus=8;return;}
+    out.predictionErrorUs=static_cast<int32_t>(llround(error));
+    out.driftPpmX100=static_cast<int32_t>(llround(ppm));
+    out.predictionSamples=static_cast<uint8_t>(beaconObsCount);
+}
+size_t beaconSharedEventCount(){return sharedEventCount;}
+bool beaconSharedEventAt(size_t index, BeaconSharedEvent &out){
+    if(index>=sharedEventCount)return false;
+    const size_t first=(sharedEventWrite+kSharedEventCapacity-sharedEventCount)%kSharedEventCapacity;
+    out=sharedEvents[(first+index)%kSharedEventCapacity];
+    return true;
+}
+uint64_t beaconSharedEventBoot(){return sharedEventBoot;}
+BeaconPredictionStats beaconPredictionStats(){return beaconStats;}
+size_t beaconObservationCount(){return beaconObsCount;}
+bool beaconObservationAt(size_t index, BeaconObservation &out){
+    if(index>=beaconObsCount)return false;
+    const size_t first=(beaconObsWrite+kBeaconObservations-beaconObsCount)%kBeaconObservations;
+    out=beaconObservations[(first+index)%kBeaconObservations];
+    return true;
 }
 bool precisionUtcNow(uint32_t epoch, const char *coordinatorId,
                     int64_t &utcUs, uint32_t &sampleAgeMs, double &rttUs) {
@@ -866,8 +990,33 @@ Diagnostics diagnostics(){Diagnostics out=stats;
     out.txCallbackUnmatched=txCallbackUnmatched;
     portEXIT_CRITICAL(&txMux);
     out.lastSeriesEstimateAgeMs=lastEstimateMs ? uint32_t(millis()-lastEstimateMs) : 0;    out.lastAcceptedAgeMs=lastPrecisionMs ? uint32_t(millis()-lastPrecisionMs) : 0;out.precisionRecentlyAccepted=lastPrecisionMs && out.lastAcceptedAgeMs<=kPrecisionLifetimeMs;out.capturePauseRemainingMs=capturePaused() ? uint32_t(captureGuardUntilMs-millis()) : 0;out.syncPermission=syncPermissionValid();out.syncPermissionRemainingMs=out.syncPermission?uint32_t(permissionUntilMs-millis()):0;portENTER_CRITICAL(&queueMux);out.dropped=drops;portEXIT_CRITICAL(&queueMux);return out;}
+bool beaconExperimentStart(uint32_t intervalMs, bool quiet){
+    if(intervalMs!=50 && intervalMs!=100 && intervalMs!=200 && intervalMs!=500)return false;
+    if(!initialized || !wasCoordinator || capturePaused() || bench.running || beaconExperimentUntilMs)return false;
+    // A single phase is deliberately bounded; the Node's 128-event ring
+    // retains its latest events, even at the fastest interval.
+    beaconExperimentIntervalMs=intervalMs;
+    beaconExperimentQuiet=quiet;
+    // Revoke the current owner once. No further grants during quiet mode.
+    if(quiet && slotOwner>=0)endSlot(lastEpoch,lastTag,localBootNonceForControl);
+    beaconExperimentLastDurationMs=15000;
+    beaconExperimentSent=0;
+    beaconExperimentUntilMs=millis()+beaconExperimentLastDurationMs;
+    nextBroadcastMs=millis();
+    return true;
+}
+void beaconExperimentAbort(){beaconExperimentUntilMs=0;beaconExperimentIntervalMs=0;beaconExperimentQuiet=false;nextBroadcastMs=millis()+kBroadcastEveryMs;}
+BeaconExperimentState beaconExperimentSnapshot(){
+    BeaconExperimentState out{};
+    out.active=beaconExperimentUntilMs!=0;
+    out.quiet=out.active && beaconExperimentQuiet;
+    out.intervalMs=beaconExperimentIntervalMs;
+    out.sent=beaconExperimentSent;
+    out.remainingMs=out.active ? static_cast<uint32_t>(beaconExperimentUntilMs-millis()) : 0;
+    return out;
+}
 bool benchmarkStart(uint32_t intervalMs,uint32_t targetBoot){
-    if(!initialized||!wasCoordinator||capturePaused()||bench.running||
+    if(!initialized||!wasCoordinator||capturePaused()||bench.running||beaconExperimentUntilMs||
        (intervalMs!=5 && intervalMs!=10 && intervalMs!=50))return false;
     bench={};bench.intervalMs=intervalMs;
     // Keep the packed signed 64-bit control payload positive.
@@ -922,7 +1071,10 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
         if(!coordinator)loadDriftPrior(id);
     }
     wasCoordinator=coordinator;lastEpoch=epoch;lastTag=tag;localBootNonceForControl=localBootNonce;
-    if (capturePaused()) return; // Never send Reply, Final, Probe or Beacon during a capture hold.
+    if (capturePaused()) {
+        if(beaconExperimentUntilMs)beaconExperimentAbort();
+        return; // Capture always wins.
+    }
     if (captureGuardUntilMs) {
         captureGuardUntilMs = 0;
         clearQueue(); // Discard frames received while processing was paused.
@@ -1093,6 +1245,21 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
             referenceUtcUs=f.timeUs;
             referenceMonoLow=f.nonce;
             referenceReceivedNodeMono=item.rxUs;
+            // Passive only; item.rxUs was sampled in the existing RX callback.
+            // Predict before touching the ring: overwriting the oldest slot
+            // previously corrupted the model once all 12 slots were full.
+            BeaconObservation nextObs{};
+            predictBeacon(f,item.rxUs,nextObs);
+            BeaconObservation &obs=beaconObservations[beaconObsWrite];
+            obs=nextObs;
+            obs.sequence=f.sequence;obs.epoch=f.epoch;
+            obs.coordinatorMonoLow=f.nonce;obs.coordinatorBoot=f.senderBoot;
+            obs.coordinatorUtcUs=f.timeUs;obs.nodeRxCallbackUs=item.rxUs;
+            beaconObsWrite=(beaconObsWrite+1)%kBeaconObservations;
+            if(beaconObsCount<kBeaconObservations)++beaconObsCount;
+            accumulateBeaconStats(obs);
+            appendSharedEvent(obs);
+
         }
         if(f.type==EspNowTimePackets::Type::Reply&&pending.active&&f.nonce==pending.nonce) {
             pending.t2=f.timeUs;
@@ -1102,12 +1269,13 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
             finishSample(f.timeUs);
     }
     uint32_t now=millis();
+    if(beaconExperimentUntilMs && static_cast<int32_t>(now-beaconExperimentUntilMs)>=0)beaconExperimentAbort();
     if(coordinator && bench.running){benchTick(now);return;}
     if(!coordinator && benchNodePhase){benchNodeTick(now);return;}
     if(coordinator){
-        serviceSlots(now,epoch,tag,localBootNonce);
+        if(!(beaconExperimentUntilMs && beaconExperimentQuiet))serviceSlots(now,epoch,tag,localBootNonce);
         if(static_cast<int32_t>(now-nextBroadcastMs)>=0){
-            nextBroadcastMs=now+kBroadcastEveryMs;
+            nextBroadcastMs=now+(beaconExperimentUntilMs?beaconExperimentIntervalMs:kBroadcastEveryMs);
             EspNowTimePackets::Frame b;
             b.type=EspNowTimePackets::Type::Beacon;b.epoch=epoch;
             b.coordinatorTag=tag;b.senderBoot=localBootNonce;
@@ -1119,7 +1287,7 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
             if(clockOk && monoAfter-monoBefore<2000) {
                 b.timeUs=static_cast<int64_t>(tv.tv_sec)*1000000LL+tv.tv_usec;
                 b.nonce=static_cast<uint32_t>(monoBefore+(monoAfter-monoBefore)/2);
-                sendFrame(b,kBroadcastMac);
+                if(sendFrame(b,kBroadcastMac) && beaconExperimentUntilMs)++beaconExperimentSent;
             }
         }
         return;
@@ -1175,7 +1343,16 @@ void pauseForCapture(uint32_t){}
 bool capturePaused(){return false;}
 bool syncPermissionValid(){return false;}
 bool precisionUtcNow(uint32_t,const char*,int64_t&,uint32_t&,double&){return false;}
+size_t beaconSharedEventCount(){return 0;}
+bool beaconSharedEventAt(size_t, BeaconSharedEvent&){return false;}
+uint64_t beaconSharedEventBoot(){return 0;}
+BeaconPredictionStats beaconPredictionStats(){return {};}
+size_t beaconObservationCount(){return 0;}
+bool beaconObservationAt(size_t,BeaconObservation&){return false;}
 Diagnostics diagnostics(){return {};}
+bool beaconExperimentStart(uint32_t,bool){return false;}
+void beaconExperimentAbort(){}
+BeaconExperimentState beaconExperimentSnapshot(){return {};}
 bool benchmarkStart(uint32_t intervalMs,uint32_t targetBoot){return false;}
 void benchmarkAbort(){}
 BenchmarkState benchmarkSnapshot(){return {};}

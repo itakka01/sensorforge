@@ -46,6 +46,10 @@ static const uint16_t CLUSTER_COORDINATOR_PORT = 39428;
 static const uint32_t CLUSTER_HEARTBEAT_MS = 10000UL;
 static const uint32_t CLUSTER_DEFAULT_LEASE_SEC = 60UL;
 static const uint32_t CLUSTER_COORDINATOR_HEARTBEAT_MS = 10000UL;
+// Wait for three authenticated cluster announcement periods before self-election.
+static const uint32_t CLUSTER_SELF_ELECTION_MIN_WAIT_MS = 15000UL;
+static const uint32_t CLUSTER_SELF_ELECTION_CYCLES = 3UL;
+
 static const uint32_t CLUSTER_COORDINATOR_LEASE_SEC = 60UL;
 static const uint32_t CLUSTER_DISCOVERY_SCAN_LEASE_MS = 12000UL;
 static const uint32_t CLUSTER_DISCOVERY_NODE_TTL_MS = 35000UL;
@@ -370,6 +374,8 @@ static const char *diagAckLastReject = "none";
 static int32_t localWifiRemainingSeconds = -1;
 static CoordinatorPolicy runtimeCoordinatorPolicy = COORDINATOR_POLICY_AUTO;
 static bool localIsCoordinator = false;
+// 0 means a remote candidate was seen; otherwise first moment self-election became possible.
+static uint32_t selfElectionCandidateSinceMs = 0;
 static uint32_t localCoordinatorEpoch = 0;
 static char currentCoordinatorId[36] = {};
 static IPAddress currentCoordinatorIp;
@@ -1223,6 +1229,27 @@ static void recomputeCoordinator(uint32_t now)
             bestId = peer.integrationId;
             bestPolicy = peer.coordinatorPolicy;
             bestPeer = &peer;
+        }
+    }
+
+    // Suppress transient self-coordinator announcements during discovery and
+    // after a coordinator lease expires. Delay only a NEW local election:
+    // established coordinators and authenticated remote winners are unchanged.
+    const bool selfIsBest = bestId &&
+        strcmp(bestId, deviceIntegrationId().c_str()) == 0;
+    if (!selfIsBest) {
+        selfElectionCandidateSinceMs = 0;
+    } else if (!localIsCoordinator) {
+        if (selfElectionCandidateSinceMs == 0)
+            selfElectionCandidateSinceMs = now ? now : 1U;
+        const uint32_t threeCyclesMs = CLUSTER_HEARTBEAT_MS *
+                                        CLUSTER_SELF_ELECTION_CYCLES;
+        const uint32_t waitMs = threeCyclesMs > CLUSTER_SELF_ELECTION_MIN_WAIT_MS
+                                    ? threeCyclesMs
+                                    : CLUSTER_SELF_ELECTION_MIN_WAIT_MS;
+        if ((uint32_t)(now - selfElectionCandidateSinceMs) < waitMs) {
+            bestId = nullptr;
+            bestPeer = nullptr;
         }
     }
 
@@ -3822,6 +3849,7 @@ void clusterNetworkStart()
     lastAckCoordinatorBoot = 0;
     lastCoordinatorAckSequence = 0;
     localIsCoordinator = false;
+    selfElectionCandidateSinceMs = 0;
     localCoordinatorEpoch = 0;
     currentCoordinatorId[0] = '\0';
     currentCoordinatorIp = IPAddress();
@@ -3898,6 +3926,7 @@ void clusterNetworkStop()
     localWifiRemainingSeconds = -1;
     sequenceNumber = 0;
     localIsCoordinator = false;
+    selfElectionCandidateSinceMs = 0;
     localCoordinatorEpoch = 0;
     currentCoordinatorId[0] = '\0';
     currentCoordinatorIp = IPAddress();

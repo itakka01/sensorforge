@@ -1,3 +1,61 @@
+## v87-beta114 — 2026-10-14
+- Optionaler 15-s-Diagnosemodus: Beim bestehenden 100-ms-Beacontest keine neuen individuellen ESP-NOW-Sync-Slot-Leases ausgeben. Aktive Lease wird widerrufen; Nodes laufen nach Lease-Ablauf in Holdover.
+- Checkbox im Coordinator-Testbereich und Statusfeld. Automatisches Ende/Abbruch/Capture-Pause stellen die normale Slotvergabe wieder her.
+- **Kein Router-WLAN-Disconnect:** Der ESP-NOW-Radiodienst setzt eine aktive WLAN-STA-Verbindung voraus. Cluster-/Web-Traffic wird nicht unterbunden; dieser Versuch isoliert nur die individuelle ESP-NOW-Slotbelastung.
+- Capture-Zeitquelle, HMAC, Benchmark und ESP-NOW-Paketformat unverändert. Erste Hardwareprüfung ausschließlich an devfreenove1, Gesamtbuild ungeprüft.
+
+## v87-beta113 — 2026-10-14
+- Coordinator-Clusteroberfläche: kleiner Bedienbereich für den bestehenden 15-Sekunden-Beacon-Test (50/100/200/500 ms), Start/Abbruch und Status.
+- Vorhandenen CSRF-geschützten Browser-POST-Pfad verwenden; keine Änderungen an CSRF-Prüfung, Funkprotokoll, Zeitmodell oder Capture.
+- Kein automatischer Abruf der Node-Dateien (Browser-Sicherheits- und Authentifizierungsgrenzen); CSV-Links bleiben auf den Nodes verfügbar.
+- Arduino-ESP32-Gesamtbuild und Hardwaretest ausstehend.
+
+## v87-beta112 — 2026-10-14
+- Manuelles, coordinatorseitiges ESP-NOW-Beacon-Intervall-Experiment (50/100/200/500 ms), jeweils maximal 15 s; automatische Rückkehr zu 10-s-Beacons.
+- Kleine POST-Start-/Abbruch- und GET-Status-Endpunkte; keine neuen HTML-Seiten, Funkpakettypen oder Node-Änderungen.
+- Capture-Pause, Benchmark und Rollenwechsel beenden/verhindern den Versuch. Produktive Capture-Zeitquelle bleibt unverändert.
+- Ohne vollständigen Arduino-ESP32-Build; nur auf einem Testgerät prüfen.
+
+## v87-beta111 (2026-10-14) – Wartefrist vor lokaler Coordinator-Wahl
+- Lokale Selbstwahl bei Start oder nach Verlust des bisherigen Coordinators erst nach drei Cluster-Advertising-Zyklen (3 × 10 s = 30 s; Mindestwartezeit 15 s). Start der Frist nach erfolgreichem Start des Cluster-Empfangs.
+- Authentifizierte fremde Coordinator-Kandidaten werden weiterhin ohne Wartefrist berücksichtigt; bestehende lokale Coordinator-Rolle und Prioritätsregeln bleiben unverändert.
+- Keine Änderungen an ESP-NOW-Funkpaketen, Capture-Zeitquelle, HMAC oder Weboberfläche. Bei Netzwerkpartitionen sind parallele Coordinatoren weiterhin möglich.
+- Quelltext- und ZIP-Prüfung durchgeführt; Arduino-ESP32-Gesamtbuild und Hardwaretest ausstehend.
+
+## v87-beta110 – 2026-10-14
+- ESP-NOW: passiver Ringpuffer mit 128 kompakten, authentifizierten Beacon-Ereignissen (~3 KiB RAM); kein neues Funkpaket.
+- Neuer CSV-Export `/cluster_espnow_shared_events_csv` für gemeinsame Sequenznummern, Coordinator-Boot/Epoch und lokale RX-Callback-Zeitstempel.
+- Cluster/Capture/HMAC, produktive Zeitquelle und bisherige CSV-Endpunkte unverändert; keine Änderung der Weboberfläche.
+- Export dient nur dem relativen Zeitvergleich, nicht als Nachweis einer Sensor- oder PHY-Synchronität.
+- Arduino-ESP32-Gesamtbuild **nicht durchgeführt**. Zuerst nur `devxiao2` testen.
+
+## v87-beta109 (2026-10-14) – Beacon-Langzeitstatistik mit konstantem Speicher
+- Alle authentifizierten Beacons werden inkrementell gezählt; gültige Ein-Schritt-Vorhersagen mit Mittelwert, Stichproben-Standardabweichung, RMSE, MAE, Minimum/Maximum und mittlerer Drift aggregiert. Statuscodes werden mitgezählt.
+- Neuer, kleiner CSV-Endpunkt: `/cluster_espnow_beacon_stats_csv`; bisheriger 12er-Rohdatenexport bleibt unverändert.
+- Bei Wechsel von Coordinator-Boot-ID oder Epoch werden die Langzeitstatistiken zurückgesetzt. Keine neue Funkkommunikation, keine zusätzlichen großen RAM-Puffer oder UI-Elemente.
+- **Grenze:** Die 100+ Messungen sind als Statistik auswertbar, nicht als vollständige 100er-Rohdatenreihe; keine Korrelation individueller Beacon-Ereignisse zwischen Nodes aus dem Statistikexport möglich. Statistik wird bei Neustart gelöscht.
+- Capture-Zeitquelle, HMAC und vorhandener Benchmark bleiben unverändert. **Arduino-ESP32-Gesamtbuild und Hardwaretest nicht durchgeführt**; zunächst nur `devxiao2` testen.
+
+## v87-beta108 (2026-10-14) – Beacon-Vorhersage: Fehlersichtbarkeit und Ringspeicher-Korrektur
+- `prediction_status` im bestehenden CSV ergänzt (0=gültig, 1=Aufwärmen, 2=Sender-/Epoch-Wechsel, 3=Zeitspanne, 4=Node-Zeit, 5=Historie, 6=Regression, 7=unplausible Drift, 8=Wertebereich). Nullwerte mit anderem Status als 0 sind keine gültigen Vorhersagen.
+- Ringpuffer-Korrektur: Vorhersage wird berechnet, **bevor** der älteste Eintrag überschrieben wird. Verhindert eine beschädigte Regression ab dem 13. Beacon.
+- Der bisherige Nullwerte-Befund bei nur zwölf Beacons wird dadurch **nicht vollständig erklärt**; Statuscode soll die andere Abbruchbedingung offenlegen.
+- Keine Änderungen an Funkübertragung, Capture-Zeitquelle, Cluster oder Web-UI-HTML. Arduino-ESP32-Gesamtbuild noch nicht durchgeführt; zunächst nur devxiao2 testen.
+
+## v87-beta107 (2026-10-14) – Broadcast-Vorhersagemodell, ausschließlich Diagnose
+- Passives lineares Clock-Modell aus 4–12 vorherigen authentifizierten Beacons; neuer Beacon wird **vor** Aufnahme in den Puffer vorhergesagt (echter zeitlicher Holdout).
+- CSV ergänzt um `prediction_samples`, `prediction_error_us`, `drift_ppm_x100` (Drift in 1/100 ppm). Bei 0 Samples sind die Modellwerte ungültig, nicht als Nullfehler interpretieren.
+- Nur vorhandener 12er-Beacon-Ringpuffer erweitert; keine Funkpakete, Web-UI-HTML-Erweiterungen oder zusätzlichen Tasks. Sender-Boot/Epoch, monotone Zeit und Plausibilität werden geprüft.
+- Produktive Capture-Zeitquelle, HMAC, Cluster und Benchmark bleiben unverändert. 250-µs-Nachweis weiterhin offen; unabhängiger Kameratest erforderlich.
+- **Prüfstatus:** statischer Vergleich; vollständige Arduino-ESP32-Kompilierung und Hardwaretest nicht durchgeführt. Zuerst ein Canary-Gerät; alle anderen auf beta106 belassen.
+
+## v87-beta106 (2026-10-14) – Passiver ESP-NOW-Broadcast-Diagnosepfad
+- Rollback-Basis v87-beta105 unverändert als Capture-/Cluster-/HMAC-Referenz erhalten.
+- Bereits bestehende authentifizierte ESP-NOW-Beacons werden auf Nodes passiv erfasst (12 Beobachtungen, ca. 480 B statischer RAM). Kein neuer Pakettyp, keine zusätzlichen Sendungen oder HTML-Blöcke.
+- CSV-Export: `/cluster_espnow_beacons_csv` (pro Node); Sequenz, Epoch, Sender-Boot, Coordinator-Zeitpaar und Node-Callback-Empfangszeit.
+- Kein neuer Clock-Schätzer und **keine Änderung der produktiven Capture-Zeitquelle**. Kein Nachweis für 250 µs; externe Validierung erforderlich.
+- Quelltext-/Differenzprüfung durchgeführt; **kein vollständiger Arduino-ESP32-Build und kein Hardwaretest**. Ein einzelner Canary-Flash zwingend vor Rollout.
+
 ## Audit-Paket 5p (2026-10-11) – SPI-Remount-Admission
 - Der Sync-API-SPI-Remount (exklusiver Clock-Wechsel und Diagnose) reserviert jetzt die gemeinsame atomare `SdAdmissionController::SpiRemount`-Lease; Cluster-Wipe, Secure Erase, Formatierung und Benchmark können während der Lease keine eigene Wartungs-Lease erhalten.
 - Exklusivmodus-Aktivierung/-Deaktivierung und Lease-Ablauf prüfen auch die aktive SD-Admission. Diagnose reserviert vor dem ersten Dateizugriff und hält die Lease bis nach dem Restore. Die bestehenden kooperativen SD-/Recording-Sperren bleiben erhalten.
