@@ -70,6 +70,13 @@ Estimate estimate(const Exchange* samples,size_t count,int64_t maxRttUs) {
   result.valid=std::isfinite(median);
   result.offsetUs=median;
   result.spreadUs=offsets[subset-1]-offsets[0];
+  result.selectedRttMinUs=accepted[0].rtt;
+  result.selectedRttMaxUs=accepted[subset-1].rtt;
+  // Robust interior range; retain full range as the unchanged quality gate.
+  const size_t lo=(subset-1)/10;
+  const size_t hi=((subset-1)*9+9)/10;
+  result.selectedOffsetP10Us=offsets[lo]-median;
+  result.selectedOffsetP90Us=offsets[hi]-median;
   result.medianRttUs=accepted[(subset-1)/2].rtt;
   result.nodeReferenceUs=accepted[0].nodeMid;
   return result;

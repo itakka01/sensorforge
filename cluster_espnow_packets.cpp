@@ -8,7 +8,7 @@ void put(uint8_t* b, size_t pos, uint64_t value, unsigned count) {
 uint64_t get(const uint8_t* b, size_t pos, unsigned count) {
   uint64_t v=0; for(unsigned i=0;i<count;++i) v |= uint64_t(b[pos+i]) << (8*i); return v;
 }
-bool typeValid(Type t) { return t==Type::Beacon || t==Type::Probe || t==Type::Reply || t==Type::Final || t==Type::SyncControl || t==Type::NodeSyncReport || t==Type::NodeDriftReport; }
+bool typeValid(Type t) { return t==Type::Beacon || t==Type::Probe || t==Type::Reply || t==Type::Final || t==Type::SyncControl || t==Type::NodeSyncReport || t==Type::NodeDriftReport || t==Type::BenchControl || t==Type::BenchDown || t==Type::BenchUp || t==Type::BenchAck; }
 }
 bool encode(const Frame &f, uint8_t out[kPacketSize], SignMac sign, void* user) {
   if (!out || !sign || !typeValid(f.type) || !f.epoch || !f.coordinatorTag || !f.senderBoot || !f.sequence) return false;

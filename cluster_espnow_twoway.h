@@ -22,6 +22,11 @@ struct Estimate {
   double offsetUs = 0;          // coordinator clock - node clock
   double medianRttUs = 0;
   double spreadUs = 0;          // range of retained offsets, not an accuracy bound
+  // Diagnostics for the selected lowest-RTT quartile, not quality thresholds.
+  double selectedRttMinUs = 0;
+  double selectedRttMaxUs = 0;
+  double selectedOffsetP10Us = 0; // relative to the selected median
+  double selectedOffsetP90Us = 0; // relative to the selected median
   int64_t nodeReferenceUs = 0;
 };
 

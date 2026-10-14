@@ -101,7 +101,8 @@ uint32_t nextBroadcastMs=0,nextSeriesMs=0,nextProbeMs=0,txSequence=0,lastEpoch=0
 uint32_t captureGuardUntilMs=0;
 uint32_t permissionUntilMs=0, nextGrantMs=0;
 bool coordinatorPermissionIssued=false;
-bool sendFrame(EspNowTimePackets::Frame& f,const uint8_t mac[6]);
+bool sendFrame(EspNowTimePackets::Frame& f,const uint8_t mac[6],
+               int64_t* txStampOut=nullptr, bool replyStamp=false);
 struct SlotPeer { uint8_t mac[6]={}; uint32_t boot=0; uint32_t seenMs=0; };
 SlotPeer slotPeers[12];
 uint8_t slotNextIndex=0;
@@ -165,17 +166,149 @@ void serviceSlots(uint32_t now,uint32_t epoch,uint64_t tag,uint32_t boot) {
 }
 uint32_t localBootNonceForControl=0;
 uint64_t lastTag=0;
+// Shared exchange state is declared before benchmark service helpers.
+struct Pending { bool active=false; uint32_t nonce=0; int64_t t1=0,t2=0,t4ReplyRx=0; uint32_t startedMs=0; } pending;
+uint32_t nonceSeed=0;
+// Transport benchmark: 100 downlink packets and 100 uplink packets per peer.
+// The result is *transport* delivery/ACK latency, not an absolute one-way time.
+constexpr uint32_t kBenchGapMs=50;
+constexpr uint32_t kBenchPhaseHoldMs=7500;
+constexpr uint32_t kBenchRunLimitMs=125000;
+BenchmarkState bench;
+uint8_t benchMac[3][6]={};
+uint32_t benchPhaseStart=0, benchLastSend=0, benchCtrlLastMs=0;
+uint32_t benchQuietUntilMs=0;
+bool benchCtrlAck=false;
+uint16_t benchNextSeq=0;
+uint32_t benchTxUs[100]={};
+uint32_t benchNodeBoot=0, benchNodeRun=0, benchNodeNextMs=0;
+uint16_t benchNodeNextSeq=0;
+uint32_t benchNodeGapMs=50;
+uint8_t benchNodePhase=0;
+uint32_t benchNodeDeadlineMs=0;
+uint32_t benchNodeUpAck=0,benchNodeDownReceived=0;
+uint32_t benchNodeTxUs[100]={},benchNodeAckRttUs[100]={};
+uint8_t benchNodeUpAckSeen[100]={},benchNodeDownSeen[100]={};
+// Per-node 100-exchange ring; survives completion until the next run/reboot.
+struct BenchExchange { uint32_t run=0; uint16_t seq=0; ClusterEspNowTwoWay::Exchange x; };
+BenchExchange benchRaw[100];
+uint16_t benchRawCount=0;
+uint16_t benchTimeProbes=0;
+uint32_t benchTimeNextMs=0;
+
+bool benchSend(EspNowTimePackets::Type type,uint32_t nonce,int64_t payload,const uint8_t *mac) {
+    EspNowTimePackets::Frame f;
+    f.type=type; f.epoch=lastEpoch; f.coordinatorTag=lastTag;
+    f.senderBoot=localBootNonceForControl; f.nonce=nonce; f.timeUs=payload;
+    return sendFrame(f,mac);
+}
+int64_t benchControlValue(uint32_t phase);
+void benchClearNode(){benchNodePhase=0;benchNodeBoot=0;benchNodeNextSeq=0;benchNodeUpAck=0;benchNodeDownReceived=0;pending={};}
+void benchAbortInternal(bool mark){
+    if(bench.running){
+        // Revoke the test on every selected node before entering a capture hold.
+        for(uint8_t i=0;i<bench.peerCount;++i)
+            benchSend(EspNowTimePackets::Type::BenchControl,bench.peers[i].boot,
+                      benchControlValue(0),kBroadcastMac);
+        bench.running=false;bench.finished=true;bench.aborted=mark;bench.completedMs=millis();
+    }
+    benchClearNode();
+}
+int64_t benchControlValue(uint32_t phase){
+    return static_cast<int64_t>((uint64_t(bench.runId)<<32)|((bench.intervalMs&0xffffu)<<16)|(phase&0xffffu));
+}
+void benchControlPhase(uint8_t phase,uint32_t now){
+    bench.phase=phase;benchPhaseStart=now;benchCtrlLastMs=now;benchCtrlAck=false;
+    benchSend(EspNowTimePackets::Type::BenchControl,bench.peers[bench.peerIndex].boot,
+              benchControlValue(phase),kBroadcastMac);
+}
+void benchAdvance(uint32_t now) {
+    benchLastSend=now-bench.intervalMs;
+    benchNextSeq=0;
+    for(auto &t:benchTxUs)t=0;
+    // Reset local sync slot ownership, don't let the normal scheduler compete.
+    slotOwner=-1;slotGuardUntilMs=now+kSlotGuardMs;
+    benchControlPhase(1,now);
+}
+void benchTick(uint32_t now){
+    if(!bench.running)return;
+    if(uint32_t(now-bench.startedMs)>kBenchRunLimitMs){benchAbortInternal(true);return;}
+    if(bench.phase==0){
+        if(static_cast<int32_t>(now-benchQuietUntilMs)>=0)benchAdvance(now);
+        return;
+    }
+    if(!benchCtrlAck){
+        // Explicit signed acknowledgement avoids mistaking a missing phase command
+        // for 100 lost test packets. Retry until accepted or mark the run aborted.
+        if(uint32_t(now-benchPhaseStart)>4500UL){benchAbortInternal(true);return;}
+        if(uint32_t(now-benchCtrlLastMs)>=400UL){
+            benchCtrlLastMs=now;
+            benchSend(EspNowTimePackets::Type::BenchControl,bench.peers[bench.peerIndex].boot,
+                      benchControlValue(bench.phase),kBroadcastMac);
+        }
+        return;
+    }
+    if(bench.phase==1){
+        if(benchNextSeq<100 && uint32_t(now-benchLastSend)>=bench.intervalMs){
+            const uint16_t idx=benchNextSeq++;
+            benchLastSend=now;
+            benchTxUs[idx]=static_cast<uint32_t>(esp_timer_get_time());
+            benchSend(EspNowTimePackets::Type::BenchDown,idx,
+                      bench.peers[bench.peerIndex].boot,kBroadcastMac);
+        }
+        if(benchNextSeq==100 && uint32_t(now-benchPhaseStart)>bench.intervalMs*100+3000UL){
+            benchControlPhase(2,now);
+        }
+    } else if(bench.phase==2 && uint32_t(now-benchPhaseStart)>bench.intervalMs*100+3000UL){
+        benchControlPhase(3,now);
+    } else if(bench.phase==3 && uint32_t(now-benchPhaseStart)>bench.intervalMs*100+4000UL){
+        benchSend(EspNowTimePackets::Type::BenchControl,bench.peers[bench.peerIndex].boot,
+                  benchControlValue(0),kBroadcastMac);
+        ++bench.peerIndex;
+        if(bench.peerIndex>=bench.peerCount){bench.running=false;bench.finished=true;bench.completedMs=now;}
+        else benchAdvance(now);
+    }
+}
+void benchNodeTick(uint32_t now){
+    if(!benchNodePhase)return;
+    if(static_cast<int32_t>(now-benchNodeDeadlineMs)>=0){benchClearNode();return;}
+    if(benchNodePhase==3){
+        // A real four-timestamp exchange, independent of the precision estimator.
+        if(pending.active && uint32_t(now-pending.startedMs)>kExchangeTimeoutMs){pending={};++stats.exchangeTimeouts;}
+        if(benchTimeProbes<100 && !pending.active && static_cast<int32_t>(now-benchTimeNextMs)>=0){
+            if(!nonceSeed)nonceSeed=static_cast<uint32_t>(esp_timer_get_time())^localBootNonceForControl;
+            nonceSeed=nonceSeed*1664525u+1013904223u;
+            EspNowTimePackets::Frame probe;
+            probe.type=EspNowTimePackets::Type::Probe;probe.epoch=lastEpoch;
+            probe.coordinatorTag=lastTag;probe.senderBoot=localBootNonceForControl;
+            probe.nonce=nonceSeed?nonceSeed:1;
+            if(sendFrame(probe,kBroadcastMac,&probe.timeUs,false)){
+                pending.active=true;pending.nonce=probe.nonce;pending.t1=probe.timeUs;
+                pending.startedMs=now;++stats.probesSent;
+                ++benchTimeProbes;
+            }
+            benchTimeNextMs=now+benchNodeGapMs;
+        }
+        return;
+    }
+    if(benchNodePhase!=2)return;
+    if(benchNodeNextSeq<100 && static_cast<int32_t>(now-benchNodeNextMs)>=0){
+        const uint16_t seq=benchNodeNextSeq++;
+        benchNodeTxUs[seq]=static_cast<uint32_t>(esp_timer_get_time());
+        benchSend(EspNowTimePackets::Type::BenchUp,seq,benchNodeRun,kBroadcastMac);
+        benchNodeNextMs=now+benchNodeGapMs;
+    }
+}
+
 EspNowTimePackets::ReplayWindow coordinatorReplay;
 struct PeerReplay { bool used=false; uint8_t mac[6]={}; EspNowTimePackets::ReplayWindow replay; };
 PeerReplay peerReplay[12];
-struct Pending { bool active=false; uint32_t nonce=0; int64_t t1=0,t2=0,t4ReplyRx=0; uint32_t startedMs=0; } pending;
 ClusterEspNowTwoWay::Exchange exchanges[kMaxSamplesPerSeries];
 uint8_t seriesCount=0;
 uint8_t seriesTarget=kInitialSamples;
 uint32_t seriesStartedMs=0;
 ClusterEspNowRegression::Point driftHistory[ClusterEspNowRegression::kHistory];
 size_t driftHistoryCount=0;
-uint32_t nonceSeed=0;
 uint32_t nextReportMs=0;
 bool seriesPrecisionAccepted=false;
 NodeSyncReport remoteReports[12];
@@ -192,8 +325,12 @@ uint32_t qualityRetryDelayMs() {
 }
 uint32_t failedSeries=0;
 uint32_t successfulSeries=0, lastCompletedSeriesMs=0, nextSeriesStatsReportMs=0;
+uint32_t lastEstimateMs=0;
 uint8_t lastCompletedSeriesResult=0;
 uint8_t lastSeriesFailure=0; // 1=invalid/insufficient; 2=spread; 3=RTT; 4=series deadline
+uint8_t lastRejectedReason=0;
+uint32_t lastRejectedSeriesMs=0;
+bool lastRejectedHasMetrics=false;
 ClusterEspNowTwoWay::Estimate lastRejectedEstimate;
 uint8_t consecutiveFailures=0;
 uint32_t nextReportDebugMs=0;
@@ -232,11 +369,20 @@ void loadDriftPrior(const char *id) {
     }
 }
 void acceptEstimate(const ClusterEspNowTwoWay::Estimate &e) {
+    lastEstimateMs=millis();
     stats.lastExchangeValid = e.valid;
+    // Diagnostic snapshot only; no effect on estimate acceptance, retries or slots.
+    stats.lastSeriesEstimateAvailable = e.valid && e.selected > 0;
+    stats.lastSeriesSelected=e.selected;
+    stats.lastSeriesSpreadUs=e.spreadUs;
+    stats.lastSeriesRttMinUs=e.selectedRttMinUs;
+    stats.lastSeriesRttMaxUs=e.selectedRttMaxUs;
+    stats.lastSeriesOffsetP10Us=e.selectedOffsetP10Us;
+    stats.lastSeriesOffsetP90Us=e.selectedOffsetP90Us;
     seriesPrecisionAccepted=false;
     lastCompletedSeriesMs=millis();
     lastCompletedSeriesResult=2;
-    if (!e.valid) { ++failedSeries; lastSeriesFailure=1; lastRejectedEstimate=e; consecutiveFailures=static_cast<uint8_t>(std::min(8U,unsigned(consecutiveFailures)+1U)); return; }
+    if (!e.valid) { ++failedSeries; lastSeriesFailure=1; lastRejectedReason=1; lastRejectedSeriesMs=millis(); lastRejectedHasMetrics=false; lastRejectedEstimate=e; consecutiveFailures=static_cast<uint8_t>(std::min(8U,unsigned(consecutiveFailures)+1U)); return; }
     stats.lastOffsetUs = e.offsetUs;
     stats.lastRttUs = e.medianRttUs;
     // A wide offset range indicates RF/software timing jitter, not calibrated drift.
@@ -245,6 +391,7 @@ void acceptEstimate(const ClusterEspNowTwoWay::Estimate &e) {
         ++failedSeries;
         lastSeriesFailure=(e.accepted<8?1:(e.spreadUs>250.0?2:3));
         lastRejectedEstimate=e;
+        lastRejectedReason=lastSeriesFailure; lastRejectedSeriesMs=millis(); lastRejectedHasMetrics=true;
         consecutiveFailures=static_cast<uint8_t>(std::min(8U,unsigned(consecutiveFailures)+1U));
         return;
     }
@@ -323,6 +470,9 @@ bool start(uint8_t channel) {
     if(esp_now_add_peer(&peer)!=ESP_OK){esp_now_deinit();return false;}
     stats.rxQueueDelayLastUs=stats.rxQueueDelayMaxUs=0;
     stats.replyFinalDispatchGapLastUs=stats.replyFinalDispatchGapMaxUs=0;
+    stats.probeTxPreSendLastUs=stats.probeTxPreSendMaxUs=stats.probeTxPreSendSamples=0;
+    stats.replyTxPreSendLastUs=stats.replyTxPreSendMaxUs=stats.replyTxPreSendSamples=0;
+    stats.probeTxPreSendTotalUs=stats.replyTxPreSendTotalUs=0;
     initialized=true;boundChannel=channel;stats.active=true;stats.channel=channel;
     nextBroadcastMs=millis()+1000;nextSeriesMs=millis()+2000;nextGrantMs=millis();
     permissionUntilMs=0;coordinatorPermissionIssued=false;nextReportMs=millis()+1500UL;
@@ -332,29 +482,60 @@ bool start(uint8_t channel) {
     return true;
 }
 uint32_t nextSequence(){++txSequence;if(!txSequence)++txSequence;return txSequence;}
-bool sendFrame(EspNowTimePackets::Frame& f,const uint8_t mac[6]) {
+bool sendFrame(EspNowTimePackets::Frame& f,const uint8_t mac[6],
+               int64_t* txStampOut, bool replyStamp) {
     f.sequence=nextSequence();
-    uint8_t b[EspNowTimePackets::kPacketSize];
-    if(!EspNowTimePackets::encode(f,b,clusterEspNowTimeSign,nullptr))return false;
-    // Keep instrumentation bounded and non-blocking even under callback loss.
-    const int64_t now=esp_timer_get_time();
+    // Prepare callback bookkeeping BEFORE sampling the transmission timestamp.
+    // Otherwise queue bookkeeping unnecessarily biases t1/t3.
+    const int64_t queuedAtUs=esp_timer_get_time();
     size_t slot=kTxPendingCapacity;
     portENTER_CRITICAL(&txMux);
     for(size_t i=0;i<kTxPendingCapacity;++i) {
-        if(txPending[i].used && now-txPending[i].enqueueUs>2000000LL)txPending[i].used=false;
+        if(txPending[i].used && queuedAtUs-txPending[i].enqueueUs>2000000LL)txPending[i].used=false;
         if(!txPending[i].used && slot==kTxPendingCapacity)slot=i;
     }
     if(slot!=kTxPendingCapacity) {
         txPending[slot].used=true;
         memcpy(txPending[slot].mac,mac,6);
-        txPending[slot].enqueueUs=now;
+        txPending[slot].enqueueUs=queuedAtUs;
     } else ++txPendingOverflow;
     portEXIT_CRITICAL(&txMux);
+    // Reply transmits t2; t3 is delivered later by Final. Probe transmits t1.
+    // The timestamp must precede HMAC signing because Probe.timeUs is authenticated.
+    // This remains a software (pre-driver), not RF airtime, timestamp.
+    int64_t stampUs=0;
+    if(txStampOut) {
+        stampUs=esp_timer_get_time();
+        *txStampOut=stampUs;
+        if(!replyStamp)f.timeUs=stampUs;
+    }
+    uint8_t b[EspNowTimePackets::kPacketSize];
+    if(!EspNowTimePackets::encode(f,b,clusterEspNowTimeSign,nullptr)) {
+        if(slot!=kTxPendingCapacity) {
+            portENTER_CRITICAL(&txMux);
+            if(txPending[slot].used && txPending[slot].enqueueUs==queuedAtUs)txPending[slot].used=false;
+            portEXIT_CRITICAL(&txMux);
+        }
+        return false;
+    }
+    if(txStampOut) {
+        const int64_t preSendUs=esp_timer_get_time()-stampUs;
+        if(preSendUs>=0 && preSendUs<=UINT32_MAX) {
+            const uint32_t delta=static_cast<uint32_t>(preSendUs);
+            uint32_t &last=replyStamp ? stats.replyTxPreSendLastUs : stats.probeTxPreSendLastUs;
+            uint32_t &max=replyStamp ? stats.replyTxPreSendMaxUs : stats.probeTxPreSendMaxUs;
+            uint32_t &count=replyStamp ? stats.replyTxPreSendSamples : stats.probeTxPreSendSamples;
+            uint64_t &total=replyStamp ? stats.replyTxPreSendTotalUs : stats.probeTxPreSendTotalUs;
+            last=delta;
+            if(delta>max)max=delta;
+            ++count;
+            total+=delta;
+        }
+    }
     if(esp_now_send(mac,b,sizeof(b))!=ESP_OK) {
         if(slot!=kTxPendingCapacity){
             portENTER_CRITICAL(&txMux);
-            // Do not clear a slot that has already been reused.
-            if(txPending[slot].used && txPending[slot].enqueueUs==now)txPending[slot].used=false;
+            if(txPending[slot].used && txPending[slot].enqueueUs==queuedAtUs)txPending[slot].used=false;
             portEXIT_CRITICAL(&txMux);
         }
         return false;
@@ -381,6 +562,15 @@ void acceptNodeReport(const EspNowTimePackets::Frame &f) {
     const uint64_t bits=static_cast<uint64_t>(f.timeUs);
     // Extra report type marker, carried inside the existing authenticated frame.
     // Checked before the legacy success/failure formats; never changes the clock model.
+    if(f.type==EspNowTimePackets::Type::NodeSyncReport && (f.nonce&0x2000U)!=0) {
+        r.hasLastRejectedSeries=true;
+        r.lastRejectedReason=static_cast<uint8_t>((f.nonce>>16)&0x0fU);
+        r.lastRejectedAgeMs=((f.nonce>>20)&0x0fffU)*1000UL;
+        r.lastRejectedMetricsValid=r.lastRejectedReason!=1 && r.lastRejectedReason!=4;
+        r.lastRejectedSpreadUs=static_cast<uint32_t>(bits>>32);
+        r.lastRejectedRttUs=static_cast<uint32_t>(bits);
+        remoteReceivedAt[slot]=millis();++reportCount;return;
+    }
     if(f.type==EspNowTimePackets::Type::NodeSyncReport && (f.nonce&0x1000U)!=0) {
         r.successfulSeries=static_cast<uint32_t>(bits>>32);
         r.rejectedSeries=static_cast<uint32_t>(bits);
@@ -445,6 +635,30 @@ void sendSeriesStatistics(uint32_t epoch,uint64_t tag,uint32_t boot) {
         std::min(4095UL,static_cast<unsigned long>((millis()-lastCompletedSeriesMs)/1000UL)) : 0;
     f.nonce=0x1000U | (static_cast<uint32_t>(lastCompletedSeriesResult)<<16) | (ageSeconds<<20);
     sendFrame(f,kBroadcastMac);
+    // Additive authenticated last-rejection telemetry. Never affects grants,
+    // timestamp math, slot ownership or the current successful clock model.
+    if(lastRejectedSeriesMs && failedSeries){
+        EspNowTimePackets::Frame reject=f;
+        const uint32_t ageSeconds=std::min(4095UL,static_cast<unsigned long>((millis()-lastRejectedSeriesMs)/1000UL));
+        reject.nonce=0x2000U | (static_cast<uint32_t>(lastRejectedReason)<<16) | (ageSeconds<<20);
+        // Metrics may be unavailable for deadlines and invalid estimators.
+        const uint32_t spread=lastRejectedHasMetrics && std::isfinite(lastRejectedEstimate.spreadUs) ?
+            static_cast<uint32_t>(llround(std::max(0.0,std::min(4294967295.0,lastRejectedEstimate.spreadUs)))) : 0;
+        const uint32_t rtt=lastRejectedHasMetrics && std::isfinite(lastRejectedEstimate.medianRttUs) ?
+            static_cast<uint32_t>(llround(std::max(0.0,std::min(4294967295.0,lastRejectedEstimate.medianRttUs)))) : 0;
+        reject.timeUs=static_cast<int64_t>((static_cast<uint64_t>(spread)<<32)|rtt);
+        sendFrame(reject,kBroadcastMac);
+        if(lastRejectedHasMetrics){
+            // Existing offset-pair report format; only its publication timing changes.
+            EspNowTimePackets::Frame offsets=f;
+            offsets.type=EspNowTimePackets::Type::NodeDriftReport;
+            offsets.nonce=0x800U;
+            const int32_t minOff=static_cast<int32_t>(llround(std::max(-2147483647.0,std::min(2147483647.0,lastRejectedEstimate.minRttOffsetUs))));
+            const int32_t selectedOff=static_cast<int32_t>(llround(std::max(-2147483647.0,std::min(2147483647.0,lastRejectedEstimate.offsetUs))));
+            offsets.timeUs=static_cast<int64_t>((static_cast<uint64_t>(static_cast<uint32_t>(minOff))<<32)|static_cast<uint32_t>(selectedOff));
+            sendFrame(offsets,kBroadcastMac);
+        }
+    }
 }
 void sendNodeReports(uint32_t epoch,uint64_t tag,uint32_t boot) {
     if(!lastPrecisionMs){
@@ -509,6 +723,15 @@ void resetTiming(){pending={};seriesCount=0;seriesTarget=kInitialSamples;seriesS
 void finishSample(int64_t t3) {
     const int64_t t4=pending.t4ReplyRx;
     if(!pending.active||!pending.t2||!t4||t3<pending.t2||t4<pending.t1)return;
+    if(benchNodePhase==3){
+        if(benchRawCount<100){
+            BenchExchange &r=benchRaw[benchRawCount];
+            r.run=benchNodeRun;r.seq=benchTimeProbes;r.x={pending.t1,pending.t2,t3,t4};
+            ++benchRawCount;
+        }
+        pending={};++stats.exchangesComplete;
+        return; // Do not update the production estimator or drift model.
+    }
     if(seriesCount<kMaxSamplesPerSeries)
        exchanges[seriesCount++]={pending.t1,pending.t2,t3,t4};
     pending={};++stats.exchangesComplete;
@@ -543,6 +766,7 @@ void revokePermissionBroadcast() {
     sendFrame(f,kBroadcastMac);
 }
 void pauseForCapture(uint32_t holdMs) {
+    benchAbortInternal(true);
     // Timer arithmetic remains unambiguous for holds shorter than 2^31 ms.
     if (holdMs > 1805000UL) holdMs = 1805000UL;
     if (holdMs < 1000UL) holdMs = 1000UL;
@@ -570,17 +794,23 @@ bool capturePaused() {
            static_cast<int32_t>(millis() - captureGuardUntilMs) < 0;
 }
 void stop() {
+    benchAbortInternal(true);
+    benchRawCount=0;
     captureGuardUntilMs = 0;
     permissionUntilMs=0;coordinatorPermissionIssued=false;localBootNonceForControl=0;
     if(initialized){esp_now_deinit();initialized=false;}
     txTimingReset();
     boundChannel=0;lastEpoch=0;lastTag=0;stats.active=false;
     stats.lastExchangeValid=false;stats.lastOffsetUs=0;stats.lastRttUs=0;
+    stats.lastSeriesEstimateAvailable=false;stats.lastSeriesEstimateAgeMs=0;
+    stats.lastSeriesSelected=0;stats.lastSeriesSpreadUs=0;
+    stats.lastSeriesRttMinUs=stats.lastSeriesRttMaxUs=0;
+    stats.lastSeriesOffsetP10Us=stats.lastSeriesOffsetP90Us=0;
     resetTiming();clearQueue();
     for(auto &p:slotPeers)p={};slotNextIndex=0;slotOwner=-1;
     slotStartedMs=slotGuardUntilMs=0;slotGrantsSent=slotRotations=0;
-    previousEstimate={};latestQualityEstimate={};lastPrecisionMs=0;failedSeries=0;lastSeriesFailure=0;lastRejectedEstimate={};consecutiveFailures=0;
-    successfulSeries=0;lastCompletedSeriesMs=0;lastCompletedSeriesResult=0;nextSeriesStatsReportMs=0;
+    previousEstimate={};latestQualityEstimate={};lastPrecisionMs=0;failedSeries=0;lastSeriesFailure=0;lastRejectedReason=0;lastRejectedSeriesMs=0;lastRejectedHasMetrics=false;lastRejectedEstimate={};consecutiveFailures=0;
+    successfulSeries=0;lastCompletedSeriesMs=0;lastCompletedSeriesResult=0;nextSeriesStatsReportMs=0;lastEstimateMs=0;
     referenceUtcUs=0;referenceMonoLow=0;referenceReceivedNodeMono=0;
     referenceId=String();goodDriftPairs=0;driftHistoryCount=0;
     for(auto &r:remoteReports)r={};for(auto &x:remoteReceivedAt)x=0;remoteNext=0;reportCount=0;
@@ -635,7 +865,51 @@ Diagnostics diagnostics(){Diagnostics out=stats;
     out.txPendingOverflow=txPendingOverflow;
     out.txCallbackUnmatched=txCallbackUnmatched;
     portEXIT_CRITICAL(&txMux);
-    out.lastAcceptedAgeMs=lastPrecisionMs ? uint32_t(millis()-lastPrecisionMs) : 0;out.precisionRecentlyAccepted=lastPrecisionMs && out.lastAcceptedAgeMs<=kPrecisionLifetimeMs;out.capturePauseRemainingMs=capturePaused() ? uint32_t(captureGuardUntilMs-millis()) : 0;out.syncPermission=syncPermissionValid();out.syncPermissionRemainingMs=out.syncPermission?uint32_t(permissionUntilMs-millis()):0;portENTER_CRITICAL(&queueMux);out.dropped=drops;portEXIT_CRITICAL(&queueMux);return out;}
+    out.lastSeriesEstimateAgeMs=lastEstimateMs ? uint32_t(millis()-lastEstimateMs) : 0;    out.lastAcceptedAgeMs=lastPrecisionMs ? uint32_t(millis()-lastPrecisionMs) : 0;out.precisionRecentlyAccepted=lastPrecisionMs && out.lastAcceptedAgeMs<=kPrecisionLifetimeMs;out.capturePauseRemainingMs=capturePaused() ? uint32_t(captureGuardUntilMs-millis()) : 0;out.syncPermission=syncPermissionValid();out.syncPermissionRemainingMs=out.syncPermission?uint32_t(permissionUntilMs-millis()):0;portENTER_CRITICAL(&queueMux);out.dropped=drops;portEXIT_CRITICAL(&queueMux);return out;}
+bool benchmarkStart(uint32_t intervalMs,uint32_t targetBoot){
+    if(!initialized||!wasCoordinator||capturePaused()||bench.running||
+       (intervalMs!=5 && intervalMs!=10 && intervalMs!=50))return false;
+    bench={};bench.intervalMs=intervalMs;
+    // Keep the packed signed 64-bit control payload positive.
+    bench.runId=static_cast<uint32_t>(esp_timer_get_time()) & 0x7fffffffU;
+    if(!bench.runId)bench.runId=1;
+    const uint32_t now=millis();
+    for(const auto &p:slotPeers){
+        if(bench.peerCount>=3)break;
+        if(!p.boot || uint32_t(now-p.seenMs)>kPeerActiveMs ||
+           (targetBoot && p.boot!=targetBoot))continue;
+        const uint8_t index=bench.peerCount++;
+        bench.peers[index].boot=p.boot;
+        memcpy(benchMac[index],p.mac,6);
+    }
+    if(!bench.peerCount)return false;
+    bench.running=true;bench.startedMs=now;bench.phase=0;
+    if(slotOwner>=0)endSlot(lastEpoch,lastTag,localBootNonceForControl);
+    // Let all outstanding 3-s sync permission leases expire before measuring.
+    benchQuietUntilMs=now+kGrantLeaseMs+500UL;
+    return true;
+}
+void benchmarkAbort(){benchAbortInternal(true);}
+BenchmarkState benchmarkSnapshot(){return bench;}
+size_t benchmarkExchangeCount(){return benchRawCount;}
+bool benchmarkExchangeAt(size_t index, BenchmarkExchange &out){
+    if(index>=benchRawCount)return false;
+    const auto &e=benchRaw[index];
+    out={e.run,e.seq,e.x.nodeTxUs,e.x.coordinatorRxUs,e.x.coordinatorTxUs,e.x.nodeRxUs};
+    return true;
+}
+uint32_t benchmarkNodeRun(){return benchNodeRun;}
+void benchmarkLocalTransport(uint32_t &runId,uint32_t &downReceived,uint32_t &upAcknowledged){
+    runId=benchNodeRun;downReceived=0;upAcknowledged=0;
+    for(size_t i=0;i<100;++i){downReceived+=benchNodeDownSeen[i]!=0;upAcknowledged+=benchNodeUpAckSeen[i]!=0;}
+}
+bool benchmarkLocalPacket(size_t seq,bool &downReceived,bool &upAcked,uint32_t &upAckRttUs){
+    if(seq>=100)return false;
+    downReceived=benchNodeDownSeen[seq]!=0;upAcked=benchNodeUpAckSeen[seq]!=0;
+    upAckRttUs=benchNodeAckRttUs[seq];return true;
+}
+
+
 void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_t localBootNonce) {
     if(!allowed||!epoch||!localBootNonce||!id||!*id||WiFi.status()!=WL_CONNECTED||
        WiFi.getMode()!=WIFI_MODE_STA){if(initialized)stop();return;}
@@ -670,6 +944,33 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
         if(!EspNowTimePackets::decode(item.bytes,sizeof(item.bytes),f,clusterEspNowTimeVerify,nullptr)||
            f.coordinatorTag!=tag||f.epoch!=epoch){++stats.rejected;continue;}
         if(coordinator) {
+            if((f.type==EspNowTimePackets::Type::BenchUp || f.type==EspNowTimePackets::Type::BenchAck) &&
+               acceptPeer(item.mac,f)) {
+                ++stats.authenticated;
+                if(bench.running && bench.peerIndex<bench.peerCount &&
+                   f.senderBoot==bench.peers[bench.peerIndex].boot &&
+                   memcmp(item.mac,benchMac[bench.peerIndex],6)==0) {
+                    if(f.type==EspNowTimePackets::Type::BenchAck && f.nonce==UINT32_MAX &&
+                       f.timeUs==benchControlValue(bench.phase)) {
+                        if(!benchCtrlAck){benchCtrlAck=true;benchPhaseStart=millis();}
+                        continue;
+                    }
+                    if(f.nonce>=100 || !benchCtrlAck)continue;
+                    BenchmarkPeer &b=bench.peers[bench.peerIndex];
+                    if(f.type==EspNowTimePackets::Type::BenchAck && bench.phase==1 && f.timeUs==bench.runId && !b.downSeen[f.nonce]) {
+                        b.downSeen[f.nonce]=1;++b.downReceived;
+                        const uint32_t elapsed=static_cast<uint32_t>(esp_timer_get_time())-benchTxUs[f.nonce];
+                        b.downRttUs[f.nonce]=elapsed;
+                        b.downRttTotalUs+=elapsed;
+                        if(!b.downRttMinUs||elapsed<b.downRttMinUs)b.downRttMinUs=elapsed;
+                        if(elapsed>b.downRttMaxUs)b.downRttMaxUs=elapsed;
+                    } else if(f.type==EspNowTimePackets::Type::BenchUp && bench.phase==2) {
+                        if(!b.upSeen[f.nonce]){b.upSeen[f.nonce]=1;++b.upReceived;}
+                        benchSend(EspNowTimePackets::Type::BenchAck,f.nonce,bench.runId,kBroadcastMac);
+                    }
+                }
+                continue;
+            }
             if((f.type!=EspNowTimePackets::Type::Probe &&
                 f.type!=EspNowTimePackets::Type::NodeSyncReport &&
                 f.type!=EspNowTimePackets::Type::NodeDriftReport)||!acceptPeer(item.mac,f)){
@@ -683,7 +984,10 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
             }
             // Only the slot owner may receive timestamp replies. Authentication
             // and replay validation above still apply for every received packet.
-            if(!slotIsOwner(item.mac,static_cast<uint32_t>(f.senderBoot))) continue;
+            if(!slotIsOwner(item.mac,static_cast<uint32_t>(f.senderBoot)) &&
+               !(bench.running && bench.phase==3 && bench.peerIndex<bench.peerCount &&
+                 f.senderBoot==bench.peers[bench.peerIndex].boot &&
+                 memcmp(item.mac,benchMac[bench.peerIndex],6)==0)) continue;
             // Four-timestamp exchange: t1=Node Probe TX, t2=Coordinator Probe RX,
             // t3=Coordinator REPLY TX call, t4=Node REPLY RX callback.
             // Final delivers t3 metadata only; Final RX is NEVER t4.
@@ -692,9 +996,10 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
             EspNowTimePackets::Frame r;
             r.type=EspNowTimePackets::Type::Reply;r.epoch=epoch;r.coordinatorTag=tag;
             r.senderBoot=localBootNonce;r.nonce=f.nonce;r.timeUs=item.rxUs;
-            const int64_t replyDispatchBeforeUs=esp_timer_get_time();
-            // t3 denotes the Reply send call, NOT the later Final send call.
-            if(!sendFrame(r,item.mac))continue;
+            int64_t replyDispatchBeforeUs=0;
+            // t3 denotes the Reply send path, NOT the later Final send call.
+            // Reply.timeUs continues to carry t2 unchanged.
+            if(!sendFrame(r,item.mac,&replyDispatchBeforeUs,true))continue;
             const int64_t finalDispatchUs=esp_timer_get_time();
             if(finalDispatchUs>=replyDispatchBeforeUs){
                 const uint64_t delta=static_cast<uint64_t>(finalDispatchUs-replyDispatchBeforeUs);
@@ -707,11 +1012,68 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
             continue;
         }
         if(f.type!=EspNowTimePackets::Type::SyncControl&&
+           f.type!=EspNowTimePackets::Type::BenchControl&&
+           f.type!=EspNowTimePackets::Type::BenchDown&&
+           f.type!=EspNowTimePackets::Type::BenchAck&&
            f.type!=EspNowTimePackets::Type::Beacon&&
            f.type!=EspNowTimePackets::Type::Reply&&
            f.type!=EspNowTimePackets::Type::Final){++stats.rejected;continue;}
         if(!EspNowTimePackets::acceptSequence(coordinatorReplay,f)){++stats.replay;continue;}
         ++stats.authenticated;
+        if(f.type==EspNowTimePackets::Type::BenchControl) {
+            // Target boot prevents other nodes from participating. The coordinator
+            // epoch and replay window have already been authenticated above.
+            if(f.nonce!=localBootNonceForControl)continue;
+            const uint32_t phase=static_cast<uint16_t>(f.timeUs);
+            const uint32_t gap=(static_cast<uint32_t>(f.timeUs)>>16)&0xffffu;
+            if(gap!=5 && gap!=10 && gap!=50)continue;
+            if(phase==0){benchClearNode();continue;}
+            const uint32_t incomingRun=static_cast<uint32_t>(static_cast<uint64_t>(f.timeUs)>>32);
+            if((phase==benchNodePhase && incomingRun==benchNodeRun) ||
+               (phase==1) ||
+               (phase==2 && benchNodePhase==1 && incomingRun==benchNodeRun) ||
+               (phase==3 && benchNodePhase==2 && incomingRun==benchNodeRun)) {
+                // Acknowledge before data traffic; duplicates do not restart a phase.
+                benchSend(EspNowTimePackets::Type::BenchAck,UINT32_MAX,f.timeUs,kBroadcastMac);
+                if(phase==benchNodePhase && incomingRun==benchNodeRun)continue;
+            } else continue;
+            if(phase==1){
+                benchNodeRun=static_cast<uint32_t>(static_cast<uint64_t>(f.timeUs)>>32);
+                benchNodeGapMs=gap;
+                benchNodeBoot=static_cast<uint32_t>(f.senderBoot);
+                benchNodePhase=1;benchNodeDeadlineMs=millis()+benchNodeGapMs*100+4500;
+                benchNodeDownReceived=0;benchNodeNextSeq=0;benchNodeUpAck=0;
+                for(auto &v:benchNodeUpAckSeen)v=0;
+                for(auto &v:benchNodeDownSeen)v=0;
+                for(auto &v:benchNodeTxUs)v=0;
+                for(auto &v:benchNodeAckRttUs)v=0;
+                benchRawCount=0;benchTimeProbes=0;
+                permissionUntilMs=0;pending={};seriesCount=0;seriesStartedMs=0;
+            } else if(phase==3 && benchNodePhase==2 &&
+                      benchNodeRun==static_cast<uint32_t>(static_cast<uint64_t>(f.timeUs)>>32)) {
+                benchNodePhase=3;benchNodeDeadlineMs=millis()+benchNodeGapMs*100+4500;
+                benchTimeProbes=0;benchTimeNextMs=millis();pending={};
+            } else if(phase==2 && benchNodePhase==1 &&
+                      benchNodeRun==static_cast<uint32_t>(static_cast<uint64_t>(f.timeUs)>>32)) {
+                benchNodePhase=2;benchNodeDeadlineMs=millis()+benchNodeGapMs*100+4500;
+                benchNodeNextMs=millis();benchNodeNextSeq=0;
+            }
+            continue;
+        }
+        if(f.type==EspNowTimePackets::Type::BenchDown){
+            if(benchNodePhase==1 && f.timeUs==localBootNonceForControl && f.nonce<100){
+                if(!benchNodeDownSeen[f.nonce]){benchNodeDownSeen[f.nonce]=1;++benchNodeDownReceived;}
+                benchSend(EspNowTimePackets::Type::BenchAck,f.nonce,benchNodeRun,kBroadcastMac);
+            }
+            continue;
+        }
+        if(f.type==EspNowTimePackets::Type::BenchAck){
+            if(benchNodePhase==2 && f.nonce<100 && f.timeUs==benchNodeRun && !benchNodeUpAckSeen[f.nonce]){
+                benchNodeUpAckSeen[f.nonce]=1;++benchNodeUpAck;
+                benchNodeAckRttUs[f.nonce]=static_cast<uint32_t>(esp_timer_get_time())-benchNodeTxUs[f.nonce];
+            }
+            continue;
+        }
         if(f.type==EspNowTimePackets::Type::SyncControl) {
             // timeUs is a bounded lease length. Stop is immediate on authenticated receipt.
             if(f.nonce!=localBootNonceForControl) continue;
@@ -740,6 +1102,8 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
             finishSample(f.timeUs);
     }
     uint32_t now=millis();
+    if(coordinator && bench.running){benchTick(now);return;}
+    if(!coordinator && benchNodePhase){benchNodeTick(now);return;}
     if(coordinator){
         serviceSlots(now,epoch,tag,localBootNonce);
         if(static_cast<int32_t>(now-nextBroadcastMs)>=0){
@@ -780,7 +1144,7 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
     if(seriesCount>0 && uint32_t(now-seriesStartedMs)>kMaxSeriesDurationMs) {
         // Never extend a busy/failed measurement series indefinitely.
         seriesCount=0;seriesTarget=kInitialSamples;seriesStartedMs=0;
-        pending={};++failedSeries;lastSeriesFailure=4;
+        pending={};++failedSeries;lastSeriesFailure=4;lastRejectedReason=4;lastRejectedSeriesMs=now;lastRejectedHasMetrics=false;
         lastCompletedSeriesMs=now;lastCompletedSeriesResult=3;
         consecutiveFailures=static_cast<uint8_t>(std::min(8U,unsigned(consecutiveFailures)+1U));
         nextSeriesMs=now+qualityRetryDelayMs();return;
@@ -794,8 +1158,9 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
     if(!nonceSeed)++nonceSeed;
     EspNowTimePackets::Frame p;
     p.type=EspNowTimePackets::Type::Probe;p.epoch=epoch;p.coordinatorTag=tag;
-    p.senderBoot=localBootNonce;p.timeUs=esp_timer_get_time();p.nonce=nonceSeed;
-    if(sendFrame(p,kBroadcastMac)) {
+    p.senderBoot=localBootNonce;p.nonce=nonceSeed;
+    int64_t probeStampUs=0;
+    if(sendFrame(p,kBroadcastMac,&probeStampUs,false)) {
         pending.active=true;pending.nonce=p.nonce;pending.t1=p.timeUs;
         pending.startedMs=now;++stats.probesSent;
     }
@@ -811,6 +1176,15 @@ bool capturePaused(){return false;}
 bool syncPermissionValid(){return false;}
 bool precisionUtcNow(uint32_t,const char*,int64_t&,uint32_t&,double&){return false;}
 Diagnostics diagnostics(){return {};}
+bool benchmarkStart(uint32_t intervalMs,uint32_t targetBoot){return false;}
+void benchmarkAbort(){}
+BenchmarkState benchmarkSnapshot(){return {};}
+size_t benchmarkExchangeCount(){return 0;}
+bool benchmarkExchangeAt(size_t,BenchmarkExchange&){return false;}
+uint32_t benchmarkNodeRun(){return 0;}
+void benchmarkLocalTransport(uint32_t &runId,uint32_t &downReceived,uint32_t &upAcknowledged){runId=downReceived=upAcknowledged=0;}
+bool benchmarkLocalPacket(size_t,bool&,bool&,uint32_t&){return false;}
+
 size_t nodeSyncReports(NodeSyncReport*,size_t){return 0;}
 }
 #endif

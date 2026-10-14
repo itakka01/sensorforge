@@ -505,7 +505,14 @@ function sfRenderEspNowDiag(d){
      var since=Number(r.last_series_result)?num((Number(r.last_series_age_ms)+Number(r.received_age_ms))/1000,'s',1):'–';
      return '<tr><td>Messserien erfolgreich / verworfen</td><td>'+good+' / '+bad+'</td></tr>'+
        '<tr><td>Erfolgsquote (abgeschlossene Serien)</td><td>'+(total?(100*good/total).toFixed(1)+' %':'–')+'</td></tr>'+
-       '<tr><td>Letzter abgeschlossener Messversuch</td><td>'+esc(result)+' · vor '+esc(since)+'</td></tr>';
+       '<tr><td>Letzter abgeschlossener Messversuch</td><td>'+esc(result)+' · vor '+esc(since)+'</td></tr>'+
+       (r.has_last_rejected_series ? (function(){
+          var reason=({1:'Ungültige/zu wenige Samples',2:'Offset-Streuung zu groß',3:'RTT zu hoch',4:'Zeitlimit der Serie überschritten'})[Number(r.last_rejected_reason)]||'Unbekannt';
+          var failAge=(Number(r.last_rejected_age_ms||0)+Number(r.received_age_ms||0))/1000;
+          return '<tr><td>Letzte verworfene Serie (auch nach Erfolg)</td><td>'+esc(reason)+' · vor '+num(failAge,'s',1)+'</td></tr>'+
+           '<tr><td>Letzte verworfene Qualitätswerte</td><td>'+(r.last_rejected_metrics_valid?'RTT '+num(r.last_rejected_rtt_us,'µs')+' · Streuung '+num(r.last_rejected_spread_us,'µs'):'Keine vollständige Schätzung')+'</td></tr>'+
+           (r.last_rejected_metrics_valid && r.has_failure_offsets ? '<tr><td>Verworfene Offset-Schätzer</td><td>'+num(r.failed_min_rtt_offset_us,'µs')+' / '+num(r.failed_selected_offset_us,'µs')+'</td></tr>':'');
+        })() : '');
    }
    var opened={};nodes.querySelectorAll('details[data-sync-node]').forEach(function(el){if(el.open)opened[el.getAttribute('data-sync-node')]=true;});
    nodes.innerHTML='<p class="muted">Authentifizierte ESP-NOW-Ergebnisberichte, nach Node-Boot-ID zugeordnet. Alter und Qualität sind keine Garantie für GPIO-Genauigkeit.</p>'+
@@ -827,6 +834,11 @@ pollHealth();setInterval(pollHealth,10000);
 </script>)__HEALTH__";
     html += R"__PROBE__(<details class='settings-section'><summary>Verbindungsdiagnose und Einzeltests</summary>
 <p class='muted'>Ein signierter, harmloser Probeauftrag prüft die Zustellung und die individuelle Antwort. Er startet keine Geräte neu und verändert keine Dateien.</p>
+<details><summary>ESP-NOW Benchmark: 100 Pakete je Richtung und Node</summary>
+<p class='muted'>Aktiver, HMAC-geschützter Transporttest. Alle aktuell über ESP-NOW bekannten Nodes werden nacheinander getestet; reguläre Sync-Messungen pausieren vorübergehend. 100 Pakete bei 50 ms Abstand je Richtung. Der Test misst Paketankunft und ACK-RTT, keine absolute Kamera-Synchronität.</p>
+<label>Nodes: <select id='sfBenchTarget'><option value=''>Alle Nodes</option></select></label> <label>Abstand: <select id='sfBenchGap'><option value='50'>50 ms (Referenz)</option><option value='10'>10 ms</option><option value='5'>5 ms (Lasttest)</option></select></label> <button type='button' id='sfBenchStart'>ESP-NOW-Benchmark starten</button> <button type='button' id='sfBenchAbort'>Abbrechen</button> <a href='/cluster_espnow_benchmark_csv'>CSV nach Testende</a> <a href='/cluster_espnow_benchmark_status'>JSON</a>
+<p>Vier-Zeitstempel Rohdaten (auf jedem Node): <span id='sfBenchRawLinks'>Links werden geladen</span></p><p>Uplink-ACK-RTT und Downlink-Empfang: <span id='sfBenchTransportLinks'>Links werden geladen</span></p><pre id='sfBenchStatus' class='muted'>Noch kein Benchmark gestartet.</pre>
+</details>
 <div id='clusterProbeTargets'>Verfügbare Nodes werden geladen …</div>
 <div id='clusterProbeFeedback' class='muted' role='status'></div><div id='clusterProbeSummary' class='muted'></div><details><summary>Technische Übertragungszähler</summary><div id='clusterProbeDiagnostics' class='muted'></div><div id='clusterHttpDiagnostics' class='muted'></div></details>
 <details><summary>Letzte Probe-Ergebnisse (begrenzter RAM-Verlauf)</summary>
@@ -836,6 +848,16 @@ pollHealth();setInterval(pollHealth,10000);
 (function(){
 function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 var busy=false;
+function sfBenchCommand(path){fetch(path,{method:'POST',credentials:'same-origin'}).then(function(r){if(!r.ok)return r.text().then(function(t){throw Error(t);});return r.json();}).then(sfBenchPoll).catch(function(e){document.getElementById('sfBenchStatus').textContent=String(e.message||e);});}
+function sfBenchPoll(){fetch('/cluster_espnow_benchmark_status',{cache:'no-store',credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+var o=['Test '+(d.running?'läuft':(d.aborted?'abgebrochen':(d.finished?'beendet':'nicht gestartet'))),'Run '+d.run_id+' · Node '+(d.node_index+1)+' · Phase '+d.phase];
+(d.peers||[]).forEach(function(p){o.push(p.boot_id+': C→N '+p.down_ack+'/100 ACK, N→C '+p.up_received+'/100 empfangen; Down-ACK RTT Ø '+(p.down_rtt_mean_us==null?'-':p.down_rtt_mean_us)+' µs');});
+document.getElementById('sfBenchStatus').textContent=o.join('\n');
+}).catch(function(){});}
+document.getElementById('sfBenchStart').addEventListener('click',function(){sfBenchCommand('/cluster_espnow_benchmark_start?interval_ms='+encodeURIComponent(document.getElementById('sfBenchGap').value)+'&boot_id='+encodeURIComponent(document.getElementById('sfBenchTarget').value));});
+document.getElementById('sfBenchAbort').addEventListener('click',function(){sfBenchCommand('/cluster_espnow_benchmark_abort');});
+window.sfCoordinateStatus().then(function(d){var ns=(d.nodes||[]).filter(function(n){return !n.local&&n.ip;});document.getElementById('sfBenchTarget').innerHTML='<option value="">Alle Nodes</option>'+ns.filter(function(n){return n.boot_id;}).map(function(n){return '<option value="'+esc(n.boot_id)+'">'+esc(n.hostname||n.ip)+'</option>';}).join('');document.getElementById('sfBenchRawLinks').innerHTML=ns.map(function(n){return '<a href="http://'+esc(n.ip)+'/cluster_espnow_benchmark_exchanges">'+esc(n.hostname||n.ip)+'</a>';}).join(' · ');document.getElementById('sfBenchTransportLinks').innerHTML=ns.map(function(n){return '<a href="http://'+esc(n.ip)+'/cluster_espnow_benchmark_node_transport">'+esc(n.hostname||n.ip)+'</a>';}).join(' · ');}).catch(function(){});
+sfBenchPoll();setInterval(sfBenchPoll,2000);
 var probeStartMs=0;
 document.addEventListener('submit',function(ev){
  var form=ev.target;
@@ -909,6 +931,121 @@ poll();setInterval(poll,3000);document.addEventListener('visibilitychange',funct
     html += htmlFooter();
     server.sendHeader("Cache-Control", "no-store");
     server.send(200, "text/html; charset=utf-8", html);
+}
+
+static void handleEspNowBenchmarkExchangeCsv(){
+    // Avoid a duplicate 100-exchange buffer on memory-constrained ESP32-S3.
+    // The radio service and synchronous WebServer handler share the main loop.
+    const size_t count=ClusterEspNowRadio::benchmarkExchangeCount();
+    server.sendHeader("Cache-Control","no-store");
+    server.sendHeader("Content-Disposition","attachment; filename=espnow_4timestamp.csv");
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200,"text/csv; charset=utf-8","");
+    server.sendContent("run_id,sequence,t1_node_us,t2_coordinator_us,t3_coordinator_us,t4_node_us,rtt_us,offset_us\n");
+    for(size_t i=0;i<count;++i){
+        ClusterEspNowRadio::BenchmarkExchange r;
+        if(!ClusterEspNowRadio::benchmarkExchangeAt(i,r))break;
+        const int64_t rtt=(r.t4-r.t1)-(r.t3-r.t2);
+        const int64_t offset=((r.t2-r.t1)+(r.t3-r.t4))/2;
+        char line[210];
+        snprintf(line,sizeof(line),"%lu,%u,%lld,%lld,%lld,%lld,%lld,%lld\n",
+                 (unsigned long)r.run,(unsigned)r.seq,
+                 (long long)r.t1,(long long)r.t2,(long long)r.t3,(long long)r.t4,
+                 (long long)rtt,(long long)offset);
+        server.sendContent(line);
+    }
+    server.sendContent("");
+}
+static void handleEspNowBenchmarkNodeTransportCsv(){
+    uint32_t run=0,down=0,up=0;
+    ClusterEspNowRadio::benchmarkLocalTransport(run,down,up);
+    server.sendHeader("Content-Disposition","attachment; filename=espnow_node_transport.csv");
+    server.sendHeader("Cache-Control","no-store");
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200,"text/csv; charset=utf-8","");
+    server.sendContent("run_id,sequence,down_received,up_acknowledged,up_ack_rtt_us\n");
+    for(size_t seq=0;seq<100;++seq){
+        bool downSeen=false,upAck=false;uint32_t upRtt=0;
+        if(!ClusterEspNowRadio::benchmarkLocalPacket(seq,downSeen,upAck,upRtt))break;
+        server.sendContent(String(run)+","+String(seq)+","+String(downSeen?1:0)+","+
+                           String(upAck?1:0)+","+String(upRtt)+"\n");
+    }
+    server.sendContent("");
+}
+static void handleEspNowBenchmarkStart(){
+    if(!clusterLocalIsCoordinator()){
+        server.send(403,"text/plain; charset=utf-8","Nur am Coordinator");return;
+    }
+    const uint32_t interval=static_cast<uint32_t>(server.arg("interval_ms").toInt());
+    const String targetText=server.arg("boot_id");
+    if(targetText.length()!=0 && targetText.length()!=8){
+        server.send(400,"text/plain; charset=utf-8","Ungültige Node-Boot-ID");return;
+    }
+    for(size_t i=0;i<targetText.length();++i){
+        const char c=targetText[i];
+        if(!((c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F'))){
+            server.send(400,"text/plain; charset=utf-8","Ungültige Node-Boot-ID");return;
+        }
+    }
+    const uint32_t target=targetText.length()==8 ? static_cast<uint32_t>(strtoul(targetText.c_str(),nullptr,16)) : 0;
+    if(!ClusterEspNowRadio::benchmarkStart(interval,target)){
+        server.send(409,"text/plain; charset=utf-8","Benchmark nicht startbar: Radio inaktiv, Capture-Pause, Test bereits aktiv oder noch keine ESP-NOW-Node entdeckt.");return;
+    }
+    server.send(200,"application/json; charset=utf-8","{\"ok\":true}");
+}
+static void handleEspNowBenchmarkAbort(){
+    if(!clusterLocalIsCoordinator()){
+        server.send(403,"text/plain; charset=utf-8","Nur am Coordinator");return;
+    }
+    ClusterEspNowRadio::benchmarkAbort();
+    server.send(200,"application/json; charset=utf-8","{\"ok\":true}");
+}
+static void handleEspNowBenchmarkStatus(){
+    const auto b=ClusterEspNowRadio::benchmarkSnapshot();
+    String out;out.reserve(1200);
+    out+="{\"running\":";out+=(b.running?"true":"false");
+    out+=",\"finished\":";out+=(b.finished?"true":"false");
+    out+=",\"aborted\":";out+=(b.aborted?"true":"false");
+    out+=",\"run_id\":";out+=String(b.runId);
+    out+=",\"interval_ms\":";out+=String(b.intervalMs);
+    out+=",\"node_index\":";out+=String(b.peerIndex);
+    out+=",\"phase\":";out+=String(b.phase);
+    out+=",\"peers\":[";
+    for(uint8_t i=0;i<b.peerCount;++i){
+        if(i)out+=",";
+        const auto &n=b.peers[i];
+        out+="{\"boot_id\":\""; char id[9];snprintf(id,sizeof(id),"%08lx",(unsigned long)n.boot);out+=id;
+        out+="\",\"down_ack\":";out+=String(n.downReceived);
+        out+=",\"up_received\":";out+=String(n.upReceived);
+        out+=",\"down_rtt_min_us\":";out+=String(n.downRttMinUs);
+        out+=",\"down_rtt_max_us\":";out+=String(n.downRttMaxUs);
+        out+=",\"down_rtt_mean_us\":";
+        out+=(n.downReceived?String((double)n.downRttTotalUs/n.downReceived,1):String("null"));
+        out+="}";
+    }
+    out+="]}";
+    server.sendHeader("Cache-Control","no-store");
+    server.send(200,"application/json; charset=utf-8",out);
+}
+static void handleEspNowBenchmarkCsv(){
+    const auto b=ClusterEspNowRadio::benchmarkSnapshot();
+    if(!b.finished){server.send(409,"text/plain; charset=utf-8","Benchmark noch nicht beendet");return;}
+    server.sendHeader("Content-Disposition","attachment; filename=espnow_benchmark.csv");
+    server.sendHeader("Cache-Control","no-store");
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200,"text/csv; charset=utf-8","");
+    server.sendContent("run_id,boot_id,direction,sequence,received,ack_rtt_us\n");
+    for(uint8_t i=0;i<b.peerCount;++i){
+        const auto &n=b.peers[i];
+        char id[9];snprintf(id,sizeof(id),"%08lx",(unsigned long)n.boot);
+        for(unsigned seq=0;seq<100;++seq){
+            String row=String(b.runId)+","+id+",coordinator_to_node,"+String(seq)+","+String(n.downSeen[seq])+","+String(n.downRttUs[seq])+"\n";
+            server.sendContent(row);
+            row=String(b.runId)+","+id+",node_to_coordinator,"+String(seq)+","+String(n.upSeen[seq])+",0"+"\n";
+            server.sendContent(row);
+        }
+    }
+    server.sendContent("");
 }
 
 static void handleClusterJobProbe()
@@ -1283,6 +1420,12 @@ void webconfigClusterRegisterRoutes(
     serverInstance.on("/cluster_coordinate", HTTP_GET, handleClusterCoordinatePage);
     serverInstance.on("/cluster_sync_time", HTTP_POST, handleClusterSyncTime);
     serverInstance.on("/cluster_node_sync_time", HTTP_POST, handleClusterNodeSyncTime);
+    serverInstance.on("/cluster_espnow_benchmark_exchanges", HTTP_GET, handleEspNowBenchmarkExchangeCsv);
+    serverInstance.on("/cluster_espnow_benchmark_node_transport", HTTP_GET, handleEspNowBenchmarkNodeTransportCsv);
+    serverInstance.on("/cluster_espnow_benchmark_start", HTTP_POST, handleEspNowBenchmarkStart);
+    serverInstance.on("/cluster_espnow_benchmark_abort", HTTP_POST, handleEspNowBenchmarkAbort);
+    serverInstance.on("/cluster_espnow_benchmark_status", HTTP_GET, handleEspNowBenchmarkStatus);
+    serverInstance.on("/cluster_espnow_benchmark_csv", HTTP_GET, handleEspNowBenchmarkCsv);
     serverInstance.on("/cluster_job_probe", HTTP_POST, handleClusterJobProbe);
     serverInstance.on("/cluster_node_restart", HTTP_POST, handleClusterNodeRestart);
     serverInstance.on("/cluster_node_shutdown", HTTP_POST, handleClusterNodeShutdown);

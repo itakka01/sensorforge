@@ -10,7 +10,7 @@ constexpr size_t kPayloadSize = 44;
 constexpr size_t kMacSize = 32;
 constexpr size_t kPacketSize = kPayloadSize + kMacSize;
 constexpr uint8_t kVersion = 1;
-enum class Type : uint8_t { Beacon=1, Probe=2, Reply=3, Final=4, SyncControl=5, NodeSyncReport=6, NodeDriftReport=7 };
+enum class Type : uint8_t { Beacon=1, Probe=2, Reply=3, Final=4, SyncControl=5, NodeSyncReport=6, NodeDriftReport=7, BenchControl=8, BenchDown=9, BenchUp=10, BenchAck=11 };
 struct Frame {
   Type type = Type::Beacon;
   uint32_t epoch = 0;
