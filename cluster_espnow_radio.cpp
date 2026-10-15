@@ -130,6 +130,7 @@ uint8_t diagnosticHead=0,diagnosticTail=0;
 DiagnosticBeaconRxStats diagnosticRx{};
 uint64_t diagnosticLastTag=0,diagnosticLastBoot=0;
 uint32_t diagnosticLastEpoch=0,diagnosticLastSequence=0;
+uint32_t diagnosticLastReceivedMs=0,diagnosticConsecutive=0;
 
 // Callback-safe TX latency sampling. Entries are inserted before esp_now_send().
 // Match by destination MAC and FIFO; no per-packet sequence is supplied to TX callbacks.
@@ -924,6 +925,7 @@ void stop() {
     stats.lastSeriesOffsetP10Us=stats.lastSeriesOffsetP90Us=0;
     resetTiming();clearQueue();diagnosticRx={};
     diagnosticLastTag=diagnosticLastBoot=0;diagnosticLastEpoch=diagnosticLastSequence=0;
+    diagnosticLastReceivedMs=diagnosticConsecutive=0;
     for(auto &p:slotPeers)p={};slotNextIndex=0;slotOwner=-1;
     slotStartedMs=slotGuardUntilMs=0;slotGrantsSent=slotRotations=0;
     previousEstimate={};latestQualityEstimate={};lastPrecisionMs=0;failedSeries=0;lastSeriesFailure=0;lastRejectedReason=0;lastRejectedSeriesMs=0;lastRejectedHasMetrics=false;lastRejectedEstimate={};consecutiveFailures=0;
@@ -1026,7 +1028,15 @@ size_t nodeSyncReports(NodeSyncReport* out,size_t capacity){
     }
     return count;
 }
-DiagnosticBeaconRxStats diagnosticBeaconRxStats(){return diagnosticRx;}
+DiagnosticBeaconRxStats diagnosticBeaconRxStats(){
+    DiagnosticBeaconRxStats out=diagnosticRx;
+    if(diagnosticLastReceivedMs){
+        out.candidateAgeMs=static_cast<uint32_t>(millis()-diagnosticLastReceivedMs);
+        out.candidateFresh=diagnosticConsecutive>=3 && out.candidateAgeMs<=3500U;
+    }
+    out.candidateConsecutive=diagnosticConsecutive;
+    return out;
+}
 void serviceDiagnosticReceive() {
     if(!initialized || diagnosticMode || capturePaused())return;
     DiagnosticQueued item{};
@@ -1048,6 +1058,13 @@ void serviceDiagnosticReceive() {
         }
         const bool sameDiagnosticSource=(msg.senderTag==diagnosticLastTag &&
             msg.senderBoot==diagnosticLastBoot && msg.epoch==diagnosticLastEpoch);
+        const uint32_t nowMs=millis();
+        const bool contiguous=sameDiagnosticSource &&
+            msg.sequence==diagnosticLastSequence+1U && diagnosticLastReceivedMs &&
+            static_cast<uint32_t>(nowMs-diagnosticLastReceivedMs)<=3500U;
+        diagnosticConsecutive=contiguous ?
+            (diagnosticConsecutive<UINT32_MAX ? diagnosticConsecutive+1U : UINT32_MAX) : 1U;
+        diagnosticLastReceivedMs=nowMs;
         const uint32_t previousDiagnosticSequence=diagnosticLastSequence;
         const int64_t previousDiagnosticLocalUs=diagnosticRx.lastRxCallbackUs;
         const int64_t previousDiagnosticRemoteUs=diagnosticRx.lastRemoteMonotonicUs;

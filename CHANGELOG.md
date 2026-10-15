@@ -1,3 +1,16 @@
+## v87-beta123 (2026-10-15) — passive Broadcaster-Verfügbarkeit (Build ungeprüft)
+- Nach drei fortlaufenden authentifizierten Diagnose-Beacons wird eine frische Broadcaster-Verbindung gemeldet. Nach 3,5 s ohne gültiges Paket verfällt dieser Zustand; Boot-/Epoch-/Senderwechsel oder Sequenzlücken beginnen neue Serie.
+- Kleiner JSON-Status ergänzt `candidate_fresh`, `candidate_age_ms`, `candidate_consecutive`, `handover_enabled:false`.
+- Keine Senderautorisierung, kein Abschalten der Coordinator-Beacons, kein Umschalten der Capture-Uhr; kein zusätzlicher Ereignispuffer.
+- Arduino-Gesamtbuild und Hardwareprüfung stehen aus. Vorerst nur für den Coordinator bauen und erst nach Rückmeldung flashen.
+
+## v87-beta123 (2026-10-15) — passive Broadcaster-Verfügbarkeit (Build ungeprüft)
+- Coordinator und normale Nodes erkennen nach drei aufeinanderfolgenden gültigen Diagnose-Beacons eine frische, beobachtete Broadcaster-Funkverbindung. Nach 3,5 Sekunden ohne gültiges Paket wird sie automatisch als inaktiv gemeldet.
+- Senderwechsel, Sequenzlücken, Boot-/Epoche-Wechsel und lange Empfangspausen setzen die Serie zurück; keine neue Heap-/Ringspeicherbelegung.
+- `/cluster_espnow_diagnostic_beacon_json` ergänzt `candidate_fresh`, `candidate_age_ms`, `candidate_consecutive` und `handover_enabled:false`.
+- **Keine Autorisierung**, keine Abschaltung produktiver Coordinator-Beacons, kein Wechsel der Capture-Uhr. Nächste Voraussetzung: authentifizierte Rollenbindung und bestätigte Senderfreigabe.
+- Arduino-Gesamtbuild und ESP32-Hardwaretest ausstehend. Erst nach erfolgreichem Build nur Coordinator aktualisieren.
+
 ## v87-beta122 (2026-10-15) — serverseitige Standby-Sperre (Arduino-Build ungeprüft)
 - Coordinator sperrt Node-Zeitsync, Capture, Drone, Restart, Shutdown, SD-Wipe und GPIO-Hardwaremessungen gegen authentifizierte Zeit-Broadcaster-Peers.
 - Berücksichtigt die derzeit auf 15 Zeichen gekürzte, signierte Heartbeat-Betriebsart `time_broadcaste` sowie die volle Schreibweise. Bestehendes Cluster-Wireformat unverändert.

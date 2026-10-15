@@ -1080,6 +1080,8 @@ static void handleEspNowDiagnosticBeaconCsv(){
     String csv="received,authenticated,rejected,replay,dropped,last_sequence,last_epoch,last_sender_tag,last_sender_boot,last_rx_callback_us,last_remote_monotonic_us,last_remote_utc_us\n";
     char line[280];
     snprintf(line,sizeof(line),"%lu,%lu,%lu,%lu,%lu,%lu,%lu,%llu,%llu,%lld,%lld,%lld\n",
+        s.candidateFresh ? "true" : "false",
+        (unsigned long)s.candidateAgeMs,(unsigned long)s.candidateConsecutive,
         (unsigned long)s.received,(unsigned long)s.authenticated,
         (unsigned long)s.rejected,(unsigned long)s.replay,(unsigned long)s.dropped,
         (unsigned long)s.lastSequence,(unsigned long)s.lastEpoch,
@@ -1091,8 +1093,10 @@ static void handleEspNowDiagnosticBeaconCsv(){
 }
 static void handleEspNowDiagnosticBeaconJson(){
     const auto s=ClusterEspNowRadio::diagnosticBeaconRxStats();
-    char data[460];
-    snprintf(data,sizeof(data),"{\"received\":%lu,\"authenticated\":%lu,\"rejected\":%lu,\"replay\":%lu,\"dropped\":%lu,\"last_sequence\":%lu,\"last_epoch\":%lu,\"last_sender_tag\":\"%llu\",\"last_sender_boot\":\"%llu\",\"last_rx_callback_us\":%lld,\"last_remote_monotonic_us\":%lld,\"last_remote_utc_us\":%lld}",
+    char data[560];
+    snprintf(data,sizeof(data),"{\"candidate_fresh\":%s,\"candidate_age_ms\":%lu,\"candidate_consecutive\":%lu,\"handover_enabled\":false,\"received\":%lu,\"authenticated\":%lu,\"rejected\":%lu,\"replay\":%lu,\"dropped\":%lu,\"last_sequence\":%lu,\"last_epoch\":%lu,\"last_sender_tag\":\"%llu\",\"last_sender_boot\":\"%llu\",\"last_rx_callback_us\":%lld,\"last_remote_monotonic_us\":%lld,\"last_remote_utc_us\":%lld}",
+        s.candidateFresh ? "true" : "false",
+        (unsigned long)s.candidateAgeMs,(unsigned long)s.candidateConsecutive,
         (unsigned long)s.received,(unsigned long)s.authenticated,
         (unsigned long)s.rejected,(unsigned long)s.replay,(unsigned long)s.dropped,
         (unsigned long)s.lastSequence,(unsigned long)s.lastEpoch,

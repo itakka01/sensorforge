@@ -100,6 +100,9 @@ struct DiagnosticBeaconRxStats {
     uint32_t lastSequence=0, lastEpoch=0;
     uint64_t lastSenderTag=0, lastSenderBoot=0;
     int64_t lastRxCallbackUs=0, lastRemoteMonotonicUs=0, lastRemoteUtcUs=0;
+    // Observation only: consecutive signed frames and local freshness. NOT authority.
+    uint32_t candidateConsecutive=0, candidateAgeMs=0;
+    bool candidateFresh=false;
     // Constant-memory interval residuals, callback timestamps only; NOT clock accuracy.
     uint32_t intervalSamples=0, intervalSkipped=0;
     int32_t intervalMinUs=0, intervalMaxUs=0;
