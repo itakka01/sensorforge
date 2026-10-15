@@ -6,7 +6,7 @@
 #include "cluster.h"
 #include "cluster_time_diagnostic_beacon.h"
 #include "cluster_time_shadow_handover.h"
-#include "cluster_time_grant_protocol.h" // wire format only; no handover enabled
+#include "cluster_time_grant_protocol.h" // diagnostic RF only; no handover enabled
 static_assert(ClusterTimeGrantProtocol::kWireBytes == 96, "grant frame size");
 #include "board_config.h"
 #include <Arduino.h>
@@ -26,6 +26,8 @@ static_assert(ClusterTimeGrantProtocol::kWireBytes == 96, "grant frame size");
 
 #if defined(BOARD_HAS_ESP_NOW) && BOARD_HAS_ESP_NOW
 // HMAC is derived in cluster.cpp with a diagnostic-only domain.
+extern bool clusterTimeGrantSign(const uint8_t*, size_t, uint8_t[32]);
+extern bool clusterTimeGrantVerify(const uint8_t*, size_t, const uint8_t[32]);
 extern bool clusterEspNowDiagnosticBeaconSign(const uint8_t*, size_t, uint8_t[32]);
 extern bool clusterEspNowDiagnosticBeaconVerify(const uint8_t*, size_t, const uint8_t[32]);
 namespace ClusterEspNowRadio {
@@ -135,6 +137,23 @@ uint64_t diagnosticLastTag=0,diagnosticLastBoot=0;
 uint32_t diagnosticLastEpoch=0,diagnosticLastSequence=0;
 uint32_t diagnosticLastReceivedMs=0,diagnosticConsecutive=0;
 ClusterTimeShadowHandover::Monitor shadowHandover;
+// Beta127: isolated diagnostic SF-TG transport. MAC+HMAC is NOT a trusted
+// role/identity enrollment. No variable below feeds productive permission.
+constexpr uint8_t kGrantQueueSize=4;
+struct GrantQueued { uint8_t bytes[ClusterTimeGrantProtocol::kWireBytes]; uint8_t mac[6]; };
+GrantQueued grantQueue[kGrantQueueSize]{};
+uint8_t grantHead=0,grantTail=0;
+GrantDiagnosticStats grantDiag{};
+uint8_t observedBroadcasterMac[6]={};
+uint64_t observedBroadcasterTag=0,observedBroadcasterBoot=0;
+uint32_t observedBroadcasterAt=0;
+uint32_t grantNextMs=0,grantTransaction=0,grantSequence=0;
+uint32_t grantPendingTransaction=0,grantPendingSequence=0,grantPendingAt=0;
+uint8_t grantPendingMac[6]={};
+uint64_t grantPendingTag=0,grantPendingBoot=0;
+uint64_t grantLastCoordinatorTag=0,grantLastCoordinatorBoot=0;
+uint32_t grantLastCoordinatorEpoch=0,grantLastCoordinatorSequence=0;
+
 
 // Callback-safe TX latency sampling. Entries are inserted before esp_now_send().
 // Match by destination MAC and FIFO; no per-packet sequence is supplied to TX callbacks.
@@ -549,6 +568,18 @@ void onReceive(const esp_now_recv_info_t* info,const uint8_t* data,int length) {
         portEXIT_CRITICAL(&queueMux);
         return;
     }
+    if(length==static_cast<int>(ClusterTimeGrantProtocol::kWireBytes)) {
+        portENTER_CRITICAL(&queueMux);
+        const uint8_t next=static_cast<uint8_t>((grantHead+1)%kGrantQueueSize);
+        if(next==grantTail) ++grantDiag.dropped;
+        else {
+            memcpy(grantQueue[grantHead].bytes,data,ClusterTimeGrantProtocol::kWireBytes);
+            memcpy(grantQueue[grantHead].mac,info->src_addr,6);
+            grantHead=next;
+        }
+        portEXIT_CRITICAL(&queueMux);
+        return;
+    }
     if(length!=static_cast<int>(EspNowTimePackets::kPacketSize))return;
     const int64_t rx=esp_timer_get_time();
     portENTER_CRITICAL(&queueMux);
@@ -579,7 +610,7 @@ bool pop(Queued &v) {
     portEXIT_CRITICAL(&queueMux);
     return ok;
 }
-void clearQueue(){portENTER_CRITICAL(&queueMux);head=tail=0;diagnosticHead=diagnosticTail=0;drops=0;portEXIT_CRITICAL(&queueMux);}
+void clearQueue(){portENTER_CRITICAL(&queueMux);head=tail=0;diagnosticHead=diagnosticTail=0;grantHead=grantTail=0;drops=0;portEXIT_CRITICAL(&queueMux);}
 bool start(uint8_t channel) {
     if(esp_now_init()!=ESP_OK)return false;
     if(esp_now_register_recv_cb(onReceive)!=ESP_OK){esp_now_deinit();return false;}
@@ -913,6 +944,62 @@ bool capturePaused() {
     return captureGuardUntilMs != 0 &&
            static_cast<int32_t>(millis() - captureGuardUntilMs) < 0;
 }
+// Eight prior signed samples; small static memory, no heap or additional RF.
+struct DiagnosticPredictionPoint { int64_t tx=0, rx=0; };
+constexpr size_t kDiagnosticPredictionHistory=8;
+DiagnosticPredictionPoint diagnosticPredictionHistory[kDiagnosticPredictionHistory];
+size_t diagnosticPredictionCount=0, diagnosticPredictionWrite=0;
+uint64_t diagnosticPredictionTag=0, diagnosticPredictionBoot=0;
+uint32_t diagnosticPredictionEpoch=0, diagnosticPredictionSequence=0;
+DiagnosticPredictionStats diagnosticPrediction{};
+void observeDiagnosticPrediction(const ClusterTimeDiagnosticBeacon::Message &msg,int64_t rx){
+    const bool same=msg.senderTag==diagnosticPredictionTag &&
+        msg.senderBoot==diagnosticPredictionBoot && msg.epoch==diagnosticPredictionEpoch;
+    if(!same || msg.sequence!=diagnosticPredictionSequence+1U){
+        diagnosticPredictionCount=diagnosticPredictionWrite=0;
+        diagnosticPredictionTag=msg.senderTag;diagnosticPredictionBoot=msg.senderBoot;
+        diagnosticPredictionEpoch=msg.epoch;
+    }
+    diagnosticPredictionSequence=msg.sequence;
+    bool valid=false;
+    double residual=0;
+    if(diagnosticPredictionCount>=4){
+        const size_t first=(diagnosticPredictionWrite+kDiagnosticPredictionHistory-diagnosticPredictionCount)%kDiagnosticPredictionHistory;
+        const int64_t x0=diagnosticPredictionHistory[first].tx;
+        const int64_t y0=diagnosticPredictionHistory[first].rx;
+        double sx=0,sy=0,sxx=0,sxy=0;
+        for(size_t i=0;i<diagnosticPredictionCount;++i){
+            const auto &p=diagnosticPredictionHistory[(first+i)%kDiagnosticPredictionHistory];
+            const double x=double(p.tx-x0),y=double(p.rx-y0);
+            sx+=x;sy+=y;sxx+=x*x;sxy+=x*y;
+        }
+        const double n=double(diagnosticPredictionCount),den=n*sxx-sx*sx;
+        if(den>1.0 && msg.monotonicUs>x0 && rx>y0){
+            const double slope=(n*sxy-sx*sy)/den;
+            if(std::isfinite(slope) && fabs(slope-1.0)<=0.0005){
+                const double pred=double(y0)+(sy-slope*sx)/n+slope*double(msg.monotonicUs-x0);
+                residual=double(rx)-pred;
+                valid=std::isfinite(residual) && fabs(residual)<=1000000.0;
+            }
+        }
+        if(!valid)++diagnosticPrediction.invalid;
+    }else ++diagnosticPrediction.warmup;
+    if(valid){
+        const int32_t e=static_cast<int32_t>(llround(residual));
+        const uint32_t n=++diagnosticPrediction.valid;
+        if(n==1){diagnosticPrediction.minErrorUs=e;diagnosticPrediction.maxErrorUs=e;}
+        else {if(e<diagnosticPrediction.minErrorUs)diagnosticPrediction.minErrorUs=e;
+              if(e>diagnosticPrediction.maxErrorUs)diagnosticPrediction.maxErrorUs=e;}
+        const double d=double(e)-diagnosticPrediction.meanErrorUs;
+        diagnosticPrediction.meanErrorUs+=d/double(n);
+        diagnosticPrediction.errorM2+=d*(double(e)-diagnosticPrediction.meanErrorUs);
+        diagnosticPrediction.meanAbsErrorUs+=(fabs(double(e))-diagnosticPrediction.meanAbsErrorUs)/double(n);
+    }
+    diagnosticPredictionHistory[diagnosticPredictionWrite]={msg.monotonicUs,rx};
+    diagnosticPredictionWrite=(diagnosticPredictionWrite+1)%kDiagnosticPredictionHistory;
+    if(diagnosticPredictionCount<kDiagnosticPredictionHistory)++diagnosticPredictionCount;
+}
+DiagnosticPredictionStats diagnosticPredictionStats(){return diagnosticPrediction;}
 void stop() {
     benchAbortInternal(true);
     benchRawCount=0;
@@ -928,9 +1015,20 @@ void stop() {
     stats.lastSeriesRttMinUs=stats.lastSeriesRttMaxUs=0;
     stats.lastSeriesOffsetP10Us=stats.lastSeriesOffsetP90Us=0;
     resetTiming();clearQueue();diagnosticRx={};
+    diagnosticPredictionCount=diagnosticPredictionWrite=0;
+    diagnosticPredictionTag=diagnosticPredictionBoot=0;
+    diagnosticPredictionEpoch=diagnosticPredictionSequence=0;
+    diagnosticPrediction={};
     diagnosticLastTag=diagnosticLastBoot=0;diagnosticLastEpoch=diagnosticLastSequence=0;
     diagnosticLastReceivedMs=diagnosticConsecutive=0;
     shadowHandover.reset();
+    grantDiag={};observedBroadcasterTag=observedBroadcasterBoot=0;
+    observedBroadcasterAt=grantNextMs=grantTransaction=grantSequence=0;
+    grantPendingTransaction=grantPendingSequence=grantPendingAt=0;
+    grantPendingTag=grantPendingBoot=0;
+    grantLastCoordinatorTag=grantLastCoordinatorBoot=0;
+    grantLastCoordinatorEpoch=grantLastCoordinatorSequence=0;
+    memset(observedBroadcasterMac,0,6);memset(grantPendingMac,0,6);
     for(auto &p:slotPeers)p={};slotNextIndex=0;slotOwner=-1;
     slotStartedMs=slotGuardUntilMs=0;slotGrantsSent=slotRotations=0;
     previousEstimate={};latestQualityEstimate={};lastPrecisionMs=0;failedSeries=0;lastSeriesFailure=0;lastRejectedReason=0;lastRejectedSeriesMs=0;lastRejectedHasMetrics=false;lastRejectedEstimate={};consecutiveFailures=0;
@@ -1050,6 +1148,101 @@ DiagnosticBeaconRxStats diagnosticBeaconRxStats(){
     out.shadowSourceChanges=shadow.sourceChanges;
     return out;
 }
+bool popGrant(GrantQueued &v) {
+    bool ok=false;
+    portENTER_CRITICAL(&queueMux);
+    if(grantTail!=grantHead) {
+        v=grantQueue[grantTail];
+        grantTail=static_cast<uint8_t>((grantTail+1)%kGrantQueueSize);
+        ok=true;
+    }
+    portEXIT_CRITICAL(&queueMux);
+    return ok;
+}
+// Both directions are observation-only. In particular, successful ACKs do not
+// change slotOwner, permissionUntilMs, broadcast scheduling, or capture time.
+void serviceGrantDiagnostic(uint32_t localBoot) {
+    if(!initialized || capturePaused() || !lastEpoch || !lastTag || !localBoot) return;
+    const uint32_t now=millis();
+    if(grantPendingTransaction && uint32_t(now-grantPendingAt)>2000U) {
+        ++grantDiag.timeouts;grantPendingTransaction=0;
+    }
+    GrantQueued item{};
+    unsigned budget=0;
+    while(budget++<3 && popGrant(item)) {
+        ++grantDiag.received;
+        ClusterTimeGrantProtocol::Message m{};
+        if(!ClusterTimeGrantProtocol::decode(item.bytes,sizeof(item.bytes),m,clusterTimeGrantVerify)) {
+            ++grantDiag.rejected;continue;
+        }
+        ++grantDiag.authenticated;
+        if(diagnosticMode) {
+            // No trusted coordinator identity -> never accept a lease.
+            // Only echo a fresh authenticated diagnostic Grant as an ACK.
+            if(m.action!=ClusterTimeGrantProtocol::Action::Grant ||
+               m.broadcasterTag!=lastTag || m.broadcasterBoot!=localBoot ||
+               m.coordinatorTag==lastTag || m.coordinatorEpoch!=lastEpoch ||
+               (grantLastCoordinatorTag &&
+                (m.coordinatorTag!=grantLastCoordinatorTag ||
+                 m.coordinatorBoot!=grantLastCoordinatorBoot ||
+                 m.coordinatorEpoch!=grantLastCoordinatorEpoch))) {
+                ++grantDiag.rejected;continue;
+            }
+            if(m.sequence<=grantLastCoordinatorSequence) {
+                ++grantDiag.replay;continue;
+            }
+            // Track even when ACK transmission fails; never repeat a grant.
+            grantLastCoordinatorTag=m.coordinatorTag;
+            grantLastCoordinatorBoot=m.coordinatorBoot;
+            grantLastCoordinatorEpoch=m.coordinatorEpoch;
+            grantLastCoordinatorSequence=m.sequence;
+            m.action=ClusterTimeGrantProtocol::Action::Ack;
+            uint8_t wire[ClusterTimeGrantProtocol::kWireBytes]={};
+            if(ClusterTimeGrantProtocol::encode(m,wire,sizeof(wire),clusterTimeGrantSign) &&
+               ensurePeer(item.mac) && esp_now_send(item.mac,wire,sizeof(wire))==ESP_OK)
+                ++grantDiag.acksSent;
+            else ++grantDiag.sendFailed;
+        } else {
+            if(!wasCoordinator || m.action!=ClusterTimeGrantProtocol::Action::Ack ||
+               !grantPendingTransaction || uint32_t(now-grantPendingAt)>2000U ||
+               m.transaction!=grantPendingTransaction || m.sequence!=grantPendingSequence ||
+               m.coordinatorTag!=lastTag || m.coordinatorBoot!=localBoot ||
+               m.coordinatorEpoch!=lastEpoch ||
+               m.broadcasterTag!=grantPendingTag ||
+               m.broadcasterBoot!=grantPendingBoot ||
+               memcmp(item.mac,grantPendingMac,6)!=0) {
+                ++grantDiag.rejected;continue;
+            }
+            ++grantDiag.acksVerified;
+            grantPendingTransaction=0;
+        }
+    }
+    if(diagnosticMode || !wasCoordinator || !observedBroadcasterAt ||
+       diagnosticConsecutive<3 || uint32_t(now-observedBroadcasterAt)>3500U ||
+       (grantNextMs && static_cast<int32_t>(now-grantNextMs)<0) ||
+       grantPendingTransaction) return;
+    grantNextMs=now+5000U;
+    ClusterTimeGrantProtocol::Message m{};
+    m.action=ClusterTimeGrantProtocol::Action::Grant;
+    m.coordinatorTag=lastTag;m.coordinatorBoot=localBoot;
+    m.broadcasterTag=observedBroadcasterTag;
+    m.broadcasterBoot=observedBroadcasterBoot;
+    m.coordinatorEpoch=lastEpoch;
+    m.transaction=++grantTransaction;if(!m.transaction)m.transaction=++grantTransaction;
+    m.sequence=++grantSequence;if(!m.sequence)m.sequence=++grantSequence;
+    m.leaseMs=1000; // purely descriptive; NEVER activated
+    uint8_t wire[ClusterTimeGrantProtocol::kWireBytes]={};
+    if(!ClusterTimeGrantProtocol::encode(m,wire,sizeof(wire),clusterTimeGrantSign) ||
+       !ensurePeer(observedBroadcasterMac) ||
+       esp_now_send(observedBroadcasterMac,wire,sizeof(wire))!=ESP_OK) {
+        ++grantDiag.sendFailed;return;
+    }
+    ++grantDiag.grantsSent;
+    grantPendingTransaction=m.transaction;grantPendingSequence=m.sequence;grantPendingAt=now;
+    grantPendingTag=m.broadcasterTag;grantPendingBoot=m.broadcasterBoot;
+    memcpy(grantPendingMac,observedBroadcasterMac,6);
+}
+GrantDiagnosticStats grantDiagnosticStats() {return grantDiag;}
 void serviceDiagnosticReceive() {
     if(!initialized || diagnosticMode || capturePaused())return;
     DiagnosticQueued item{};
@@ -1081,6 +1274,16 @@ void serviceDiagnosticReceive() {
         const uint32_t previousDiagnosticSequence=diagnosticLastSequence;
         const int64_t previousDiagnosticLocalUs=diagnosticRx.lastRxCallbackUs;
         const int64_t previousDiagnosticRemoteUs=diagnosticRx.lastRemoteMonotonicUs;
+        // A signed beacon is only a candidate MAC correlation, not proof of
+        // role or device ownership. Reset outstanding diagnostic transactions.
+        if (!sameDiagnosticSource ||
+            (observedBroadcasterAt && memcmp(observedBroadcasterMac,item.mac,6)!=0)) {
+            grantPendingTransaction=0;
+        }
+        memcpy(observedBroadcasterMac,item.mac,6);
+        observedBroadcasterTag=msg.senderTag;
+        observedBroadcasterBoot=msg.senderBoot;
+        observedBroadcasterAt=nowMs;
         diagnosticLastTag=msg.senderTag;diagnosticLastBoot=msg.senderBoot;
         diagnosticLastEpoch=msg.epoch;diagnosticLastSequence=msg.sequence;
         ++diagnosticRx.authenticated;
@@ -1106,6 +1309,7 @@ void serviceDiagnosticReceive() {
                 diagnosticRx.intervalM2+=delta*(static_cast<double>(r)-diagnosticRx.intervalMeanUs);
             } else ++diagnosticRx.intervalSkipped;
         } else if (diagnosticRx.authenticated>1) ++diagnosticRx.intervalSkipped;
+        observeDiagnosticPrediction(msg,item.rxUs);
         diagnosticRx.lastRxCallbackUs=item.rxUs;
         diagnosticRx.lastRemoteMonotonicUs=msg.monotonicUs;
         diagnosticRx.lastRemoteUtcUs=msg.utcUs;
@@ -1209,6 +1413,7 @@ void serviceDiagnosticBroadcaster(bool allowed, uint32_t epoch,
     diagnosticMode=true;
     wasCoordinator=false;lastEpoch=epoch;lastTag=tag;
     if (capturePaused()) return;
+    serviceGrantDiagnostic(localBootNonce);
     const uint32_t now=millis();
     if (!nextDiagnosticMs) nextDiagnosticMs=now+1000;
     if (static_cast<int32_t>(now-nextDiagnosticMs)<0) return;
@@ -1253,6 +1458,7 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
         nextSeriesMs = millis() + 1000UL;
     }
     serviceDiagnosticReceive();
+    serviceGrantDiagnostic(localBootNonce);
     Queued item;unsigned budget=0;
     while(budget++<5&&pop(item)) {
         // RX was timestamped at callback entry. Record service/queue latency.
@@ -1511,6 +1717,7 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
 namespace ClusterEspNowRadio {
 void service(bool,bool,uint32_t,const char*,uint32_t){}
 void serviceDiagnosticBroadcaster(bool,uint32_t,const char*,uint32_t){}
+GrantDiagnosticStats grantDiagnosticStats(){return {}; }
 void stop(){}
 void pauseForCapture(uint32_t){}
 bool capturePaused(){return false;}
@@ -1523,6 +1730,7 @@ BeaconPredictionStats beaconPredictionStats(){return {};}
 size_t beaconObservationCount(){return 0;}
 bool beaconObservationAt(size_t,BeaconObservation&){return false;}
 Diagnostics diagnostics(){return {};}
+DiagnosticPredictionStats diagnosticPredictionStats(){return {};}
 DiagnosticBeaconRxStats diagnosticBeaconRxStats(){return {};}
 bool beaconExperimentStart(uint32_t,bool){return false;}
 void beaconExperimentAbort(){}

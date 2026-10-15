@@ -4987,6 +4987,23 @@ String clusterStatusJson()
     json += '}';
     // ESP-NOW result frames are verified by the radio HMAC and replay gate.
     // Bind to the node boot nonce at presentation time; do not infer identity from MAC.
+    // Beta128: fixed-size, observation-only Grant/Ack counters. No new buffers,
+    // authority, capture-clock changes or productive beacon control.
+    const ClusterEspNowRadio::GrantDiagnosticStats grantStats =
+        ClusterEspNowRadio::grantDiagnosticStats();
+    json += ",\"espnow_grant_diagnostic\":{";
+    json += "\"handover_enabled\":false";
+    json += ",\"received\":" + String((unsigned long)grantStats.received);
+    json += ",\"authenticated\":" + String((unsigned long)grantStats.authenticated);
+    json += ",\"rejected\":" + String((unsigned long)grantStats.rejected);
+    json += ",\"replay\":" + String((unsigned long)grantStats.replay);
+    json += ",\"dropped\":" + String((unsigned long)grantStats.dropped);
+    json += ",\"grants_sent\":" + String((unsigned long)grantStats.grantsSent);
+    json += ",\"acks_sent\":" + String((unsigned long)grantStats.acksSent);
+    json += ",\"acks_verified\":" + String((unsigned long)grantStats.acksVerified);
+    json += ",\"timeouts\":" + String((unsigned long)grantStats.timeouts);
+    json += ",\"send_failed\":" + String((unsigned long)grantStats.sendFailed);
+    json += '}';
     json += ",\"espnow_node_reports\":[";
     ClusterEspNowRadio::NodeSyncReport reports[12];
     const size_t reportCount=ClusterEspNowRadio::nodeSyncReports(reports,12);

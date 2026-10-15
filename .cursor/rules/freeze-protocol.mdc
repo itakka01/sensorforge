@@ -1,0 +1,27 @@
+---
+description: SensorForge freeze until Gates 1–3; analysis then plan then implement then explain
+alwaysApply: true
+---
+
+# SensorForge freeze and work order
+
+Until the user reports Gates 1–3 passed on `v87-beta130`, do not add features.
+
+Work order for every task: (1) Analyse, (2) Plan, (3) Implement only if freeze allows, (4) Explain. Do not skip to implementation.
+
+If a request would add features, change productive time source/handover, add ESP-NOW packets/queues, enrollment, wipe/shutdown bulk tests, sequence/GPIO capture, or extra diagnostic buffers — **stop**, say it violates the freeze, and wait.
+
+## Freeze (current)
+
+- One tree: `v87-beta130`. Do not mix betas on a test fleet.
+- `SF_GRANT_PAIR_KEY_HEX` stays empty (Grant fail-closed) unless the user is executing a later, explicit gate.
+- `handover_enabled` stays false. No capture-clock or productive beacon switch.
+- Red at any gate: no second device, no delta, no SD wipe.
+
+## Gates (new features only after all three green)
+
+1. Arduino ESP32-S3 link for **both** XIAO and Freenove from this tree; flash only on success; boot shows `v87-beta130`, heap, role, SD, no immediate `loopTask` reset, web responds.
+2. 30–60 min soak: same firmware on coordinator + node (+ optional diagnostic broadcaster); productive + diagnostic beacons; Grant fail-closed; poll `/cluster_status` and one diagnostic JSON slowly. Abort on web hang, internal heap in red, reset, or productive beacons collapsing.
+3. One join → UTC photo in 10 s → UUID download with web auth; second job must drop old UUID. No wipe, bulk shutdown, or handover. HTTP accept ≠ JPEG; software dispatch ≠ exposure.
+
+Allowed before gates pass: analysis, plans, compile/boot help, soak/capture checklists, freeze-compatible bugfixes the user explicitly scopes as Gate-blocking (build/boot/hang/heap of the current tree). Not allowed: “just a small diagnostic” if it adds packets, queues, or JSON buffers.

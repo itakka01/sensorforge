@@ -1113,14 +1113,57 @@ static void handleEspNowDiagnosticBeaconJson(){
     server.send(200,"application/json; charset=utf-8",data);
 }
 // Small constant-memory summary; do not construct a large page or CSV history.
+// Passive A/B packet predictability only, never clock synchronization accuracy.
+static void handleEspNowAbPredictionJson(){
+    const auto a=ClusterEspNowRadio::beaconPredictionStats();
+    const auto b=ClusterEspNowRadio::diagnosticPredictionStats();
+    const double aSd=a.valid>1?sqrt(a.errorM2/double(a.valid-1)):0.0;
+    const double bSd=b.valid>1?sqrt(b.errorM2/double(b.valid-1)):0.0;
+    char hostname[65];size_t used=0;
+    for(size_t i=0;i<cfg_hostname.length() && used<sizeof(hostname)-1;++i){
+        const char c=cfg_hostname[i];
+        hostname[used++]=((c>='a'&&c<='z')||(c>='A'&&c<='Z')||
+            (c>='0'&&c<='9')||c=='-'||c=='_')?c:'_';
+    }
+    hostname[used]=0;
+    if(!used)snprintf(hostname,sizeof(hostname),"sensorforge");
+    char data[850];
+    snprintf(data,sizeof(data),
+        "{\"device\":\"%s\",\"measurement\":\"passive_one_step_rx_prediction\","
+        "\"unit\":\"us\",\"capture_clock_modified\":false,"
+        "\"sync_accuracy_measured\":false,"
+        "\"coordinator\":{\"samples\":%lu,\"stddev_us\":%.2f,\"mean_abs_us\":%.2f,\"min_us\":%ld,\"max_us\":%ld},"
+        "\"broadcaster\":{\"samples\":%lu,\"warmup\":%lu,\"invalid\":%lu,\"stddev_us\":%.2f,\"mean_abs_us\":%.2f,\"min_us\":%ld,\"max_us\":%ld},"
+        "\"free_heap\":%lu}",
+        hostname,(unsigned long)a.valid,aSd,a.meanAbsErrorUs,
+        (long)a.minErrorUs,(long)a.maxErrorUs,
+        (unsigned long)b.valid,(unsigned long)b.warmup,(unsigned long)b.invalid,
+        bSd,b.meanAbsErrorUs,(long)b.minErrorUs,(long)b.maxErrorUs,
+        (unsigned long)ESP.getFreeHeap());
+    server.sendHeader("Cache-Control","no-store");
+    server.send(200,"application/json; charset=utf-8",data);
+}
 static void handleEspNowDiagnosticIntervalsJson(){
     const auto s=ClusterEspNowRadio::diagnosticBeaconRxStats();
     const double stddev=s.intervalSamples>1 ?
         sqrt(s.intervalM2/static_cast<double>(s.intervalSamples-1)) : 0.0;
-    char data[300];
+    // Sanitize the configurable hostname before writing it into JSON.
+    // Fixed stack buffers: no String concatenation or heap allocation.
+    char hostname[65];
+    const size_t hostnameLen=cfg_hostname.length();
+    size_t used=0;
+    for(size_t i=0;i<hostnameLen && used<sizeof(hostname)-1;++i){
+        const char c=cfg_hostname[i];
+        if((c>='a' && c<='z') || (c>='A' && c<='Z') ||
+           (c>='0' && c<='9') || c=='-' || c=='_') hostname[used++]=c;
+        else hostname[used++]='_';
+    }
+    hostname[used]='\0';
+    if(!used){snprintf(hostname,sizeof(hostname),"sensorforge");}
+    char data[440];
     snprintf(data,sizeof(data),
-        "{\"samples\":%lu,\"skipped\":%lu,\"mean_us\":%.2f,\"stddev_us\":%.2f,\"min_us\":%ld,\"max_us\":%ld,\"free_heap\":%lu}",
-        (unsigned long)s.intervalSamples,(unsigned long)s.intervalSkipped,
+        "{\"device\":\"%s\",\"measurement\":\"diagnostic_broadcaster_rx_interval_error\",\"unit\":\"us\",\"samples\":%lu,\"skipped\":%lu,\"mean_us\":%.2f,\"stddev_us\":%.2f,\"min_us\":%ld,\"max_us\":%ld,\"free_heap\":%lu}",
+        hostname,(unsigned long)s.intervalSamples,(unsigned long)s.intervalSkipped,
         s.intervalMeanUs,stddev,(long)s.intervalMinUs,(long)s.intervalMaxUs,
         (unsigned long)ESP.getFreeHeap());
     server.sendHeader("Cache-Control","no-store");
@@ -1600,6 +1643,7 @@ void webconfigClusterRegisterRoutes(
     serverInstance.on("/cluster_espnow_diagnostic_beacon_csv", HTTP_GET, handleEspNowDiagnosticBeaconCsv);
     serverInstance.on("/cluster_espnow_diagnostic_beacon_json", HTTP_GET, handleEspNowDiagnosticBeaconJson);
     serverInstance.on("/cluster_espnow_diagnostic_intervals_json", HTTP_GET, handleEspNowDiagnosticIntervalsJson);
+    serverInstance.on("/cluster_espnow_ab_prediction_json", HTTP_GET, handleEspNowAbPredictionJson);
     serverInstance.on("/cluster_espnow_beacons_csv", HTTP_GET, handleEspNowBeaconCsv);
     serverInstance.on("/cluster_espnow_beacon_stats_csv", HTTP_GET, handleEspNowBeaconStatsCsv);
     serverInstance.on("/cluster_espnow_shared_events_csv", HTTP_GET, handleEspNowSharedEventsCsv);

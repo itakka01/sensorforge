@@ -1,3 +1,32 @@
+## v87-beta130 — 2026-10-15
+
+- Add a bounded eight-sample one-step-ahead regression for the separately authenticated 80-byte diagnostic broadcaster beacons, in the normal receive service loop (not ESP-NOW callback).
+- Add `/cluster_espnow_ab_prediction_json` comparing existing passive coordinator beacon prediction residuals and the diagnostic broadcaster prediction residuals on the SAME receiver. JSON clearly labels that these are RX software-timestamp predictability proxies, **not synchronization or capture-clock accuracy**.
+- No new radio packet, no capture-clock modification, no productive sender/permission change. Handover remains disabled. Approx. 128 bytes additional observation storage plus constant-size statistics.
+- Static source checks only; Arduino IDE build and hardware validation still required. The two sources transmit at different rates, so values cannot alone establish a 250-us sync target or the benefit of handover.
+
+## v87-beta129 — 2026-10-15
+
+- Add `device`, `measurement` and `unit` metadata to the existing `/cluster_espnow_diagnostic_intervals_json`; keep existing numeric field names unchanged.
+- Sanitize the configured hostname for JSON using a bounded stack buffer; no new measurement queue or dynamic allocation.
+- Measurement is diagnostic beacon RX interval error, **not** synchronization accuracy or capture-clock jitter. No changes to ESP-NOW processing, productive beacons, capture clock, or sender authorization.
+- Arduino IDE build and hardware tests not performed; do not flash until build succeeds.
+
+## v87-beta128 — 2026-10-15
+
+- Build correction: remove the duplicate `ClusterEspNowRadio::ensurePeer()` forward declaration; retain the existing anonymous-namespace implementation. No radio timing, Grant/Ack, capture-clock or beacon behavior changed. Arduino build still pending.
+- Expose the existing constant-memory SF-TG diagnostic Grant/Ack counters in cluster status JSON as `espnow_grant_diagnostic` (`received`, `authenticated`, `rejected`, `replay`, `dropped`, `grants_sent`, `acks_sent`, `acks_verified`, `timeouts`, `send_failed`, `handover_enabled:false`). No new queues or measurement arrays.
+- Verified code separation: malformed 96-byte Grant/Ack frames are decoded and rejected in the isolated diagnostic service loop; overflow drops frames within the separate 4-slot queue; at most three diagnostic packets are processed per service invocation. This is static code review, **not** a proven RF stress test. Shared radio airtime/CPU effects remain to be measured.
+- Trusted coordinator/broadcaster MAC-to-identity/role enrollment, durable boot replay guarantees, actual revoke/lease enforcement and safe productive fallback remain **hard blockers**. Productive beacon scheduler and capture clock are unchanged.
+- Arduino IDE compilation and hardware tests **not performed** in this delivery; do not flash before successful project build.
+
+## v87-beta127 — 2026-10-15
+
+- Added separate bounded 96-byte SF-TG ESP-NOW RX queue and service-loop HMAC verification (never crypto in RX callback).
+- Coordinator sends short-lived **diagnostic-only** signed Grant to a fresh observed diagnostic beacon MAC; broadcaster answers with signed Ack. Coordinator verifies transaction, sender MAC, boot, epoch and freshness; timeout fails closed. Counters exposed through `grantDiagnosticStats()` (not yet in WebConfig JSON).
+- A beacon MAC correlation is **not** secure device-role enrollment; the broadcaster does not accept permission/lease or switch time sources. Grant/Ack does not modify productive beacons, slot grants, capture clock or time-source selection. Revocation and trusted sender enrollment are still missing.
+- Full Arduino IDE build and hardware testing **not performed**; RF interaction requires validation before flashing.
+
 ## v87-beta126 — 2026-10-15
 
 - Attached dormant 64-byte SF-TG grant/ack/revoke body authentication to the runtime PSA cluster HMAC key, using an independently derived HMAC-SHA256 subkey (`SensorForge/ESP-NOW/time-grant/HMAC/v1`).

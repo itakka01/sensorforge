@@ -9,6 +9,11 @@ void service(bool allowed, bool coordinator, uint32_t epoch,
 // Independent diagnostic transmitter, never a coordinator or clock authority.
 void serviceDiagnosticBroadcaster(bool allowed, uint32_t epoch,
                                   const char *deviceId, uint32_t localBootNonce);
+struct GrantDiagnosticStats {
+    uint32_t received=0,authenticated=0,rejected=0,replay=0,dropped=0;
+    uint32_t grantsSent=0,acksSent=0,acksVerified=0,timeouts=0,sendFailed=0;
+};
+GrantDiagnosticStats grantDiagnosticStats();
 void stop();
 // Revoke short-lived permission, cancel samples, suppress TX during protected work.
 // Keeps the last accepted clock estimate for holdover.
@@ -111,6 +116,13 @@ struct DiagnosticBeaconRxStats {
     int32_t intervalMinUs=0, intervalMaxUs=0;
     double intervalMeanUs=0, intervalM2=0;
 };
+// Passive one-step-ahead prediction, separate from production clock/capture.
+struct DiagnosticPredictionStats {
+    uint32_t valid=0, warmup=0, invalid=0;
+    int32_t minErrorUs=0, maxErrorUs=0;
+    double meanErrorUs=0, errorM2=0, meanAbsErrorUs=0;
+};
+DiagnosticPredictionStats diagnosticPredictionStats();
 DiagnosticBeaconRxStats diagnosticBeaconRxStats();
 // Coordinator-only, manual beacon interval experiment; max 15 s, no Wi-Fi disconnect.
 struct BeaconExperimentState { bool active=false, quiet=false; uint32_t intervalMs=0, sent=0, remainingMs=0; };
