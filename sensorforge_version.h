@@ -21,13 +21,13 @@
 // WebConfig, so a running device can be mapped back to the exact Git tag.
 
 #define SENSORFORGE_RELEASE_NUMBER 87
-#define SENSORFORGE_RELEASE_TAG "v87-beta123"
+#define SENSORFORGE_RELEASE_TAG "v87-beta126"
 #define SENSORFORGE_RELEASE_DATE "2026-10-15"
 #define SENSORFORGE_RELEASE_SUMMARY \
-    "Beta 123: passive diagnostic broadcaster freshness watch; no handover."
+    "Beta 126: domain-separated PSA HMAC adapter for dormant grant protocol."
 
 // Current source-tree stage. v87 Beta 52 applies coordinator election updates promptly; retains Beta 51 join recovery.
-#define SENSORFORGE_WORKTREE_STAGE "v87-beta123"
+#define SENSORFORGE_WORKTREE_STAGE "v87-beta126"
 #define SENSORFORGE_WORKTREE_DATE "2026-10-15"
 #define SENSORFORGE_WORKTREE_SUMMARY \
-    "v87 Beta 122: reject standby node operations server-side; no clock switch."
+    "v87 Beta 126: grant HMAC adapter; real handover disabled."

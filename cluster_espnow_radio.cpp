@@ -5,6 +5,9 @@
 #include "cluster_espnow_regression.h"
 #include "cluster.h"
 #include "cluster_time_diagnostic_beacon.h"
+#include "cluster_time_shadow_handover.h"
+#include "cluster_time_grant_protocol.h" // wire format only; no handover enabled
+static_assert(ClusterTimeGrantProtocol::kWireBytes == 96, "grant frame size");
 #include "board_config.h"
 #include <Arduino.h>
 #include <WiFi.h>
@@ -131,6 +134,7 @@ DiagnosticBeaconRxStats diagnosticRx{};
 uint64_t diagnosticLastTag=0,diagnosticLastBoot=0;
 uint32_t diagnosticLastEpoch=0,diagnosticLastSequence=0;
 uint32_t diagnosticLastReceivedMs=0,diagnosticConsecutive=0;
+ClusterTimeShadowHandover::Monitor shadowHandover;
 
 // Callback-safe TX latency sampling. Entries are inserted before esp_now_send().
 // Match by destination MAC and FIFO; no per-packet sequence is supplied to TX callbacks.
@@ -926,6 +930,7 @@ void stop() {
     resetTiming();clearQueue();diagnosticRx={};
     diagnosticLastTag=diagnosticLastBoot=0;diagnosticLastEpoch=diagnosticLastSequence=0;
     diagnosticLastReceivedMs=diagnosticConsecutive=0;
+    shadowHandover.reset();
     for(auto &p:slotPeers)p={};slotNextIndex=0;slotOwner=-1;
     slotStartedMs=slotGuardUntilMs=0;slotGrantsSent=slotRotations=0;
     previousEstimate={};latestQualityEstimate={};lastPrecisionMs=0;failedSeries=0;lastSeriesFailure=0;lastRejectedReason=0;lastRejectedSeriesMs=0;lastRejectedHasMetrics=false;lastRejectedEstimate={};consecutiveFailures=0;
@@ -1035,6 +1040,14 @@ DiagnosticBeaconRxStats diagnosticBeaconRxStats(){
         out.candidateFresh=diagnosticConsecutive>=3 && out.candidateAgeMs<=3500U;
     }
     out.candidateConsecutive=diagnosticConsecutive;
+    // Observation-only state transitions. Snapshot does not touch ESP-NOW TX.
+    shadowHandover.observe(out.candidateFresh, diagnosticConsecutive,
+        diagnosticLastTag, diagnosticLastBoot, diagnosticLastEpoch);
+    const auto shadow=shadowHandover.state();
+    out.shadowActive=shadow.simulatedActive;
+    out.shadowActivations=shadow.simulatedActivations;
+    out.shadowFallbacks=shadow.simulatedFallbacks;
+    out.shadowSourceChanges=shadow.sourceChanges;
     return out;
 }
 void serviceDiagnosticReceive() {

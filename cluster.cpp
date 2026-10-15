@@ -1,4 +1,5 @@
 #include "cluster.h"
+#include "cluster_time_grant_protocol.h"
 #include "cluster_espnow_packets.h"
 #include "cluster_espnow_radio.h"
 #include "cluster_jobs.h"
@@ -729,6 +730,20 @@ static bool diagnosticBeaconMac(const uint8_t *data, size_t len, uint8_t mac[32]
 {
     if (!runtimeActive || !runtimeHmacKey || !data || !mac || len != 48) return false;
     static const uint8_t context[] = "SensorForge/ESP-NOW/diagnostic-beacon/HMAC/v1";
+    uint8_t subkey[32] = {};
+    if (!computePacketMac(context, sizeof(context) - 1, subkey)) return false;
+    const bool ok = computePacketMacWithRawKey(subkey, data, len, mac);
+    secureWipe(subkey, sizeof(subkey));
+    return ok;
+}
+
+// Separate HMAC key for SF-TG grant/ack/revoke protocol. No radio action is
+// enabled by this adapter. Never reuse the production time-beacon subkey.
+static bool grantProtocolMac(const uint8_t *data, size_t len, uint8_t mac[32])
+{
+    if (!runtimeActive || !runtimeHmacKey || !data || !mac ||
+        len != ClusterTimeGrantProtocol::kBodyBytes) return false;
+    static const uint8_t context[] = "SensorForge/ESP-NOW/time-grant/HMAC/v1";
     uint8_t subkey[32] = {};
     if (!computePacketMac(context, sizeof(context) - 1, subkey)) return false;
     const bool ok = computePacketMacWithRawKey(subkey, data, len, mac);
@@ -5408,6 +5423,23 @@ bool clusterCaptureProtectionActive() {
     if (clusterCaptureArmedFlag || pendingCapture.active) return true;
     return localIsCoordinator && coordinatorCaptureGuardUntilMs &&
            static_cast<int32_t>(millis()-coordinatorCaptureGuardUntilMs)<0;
+}
+
+// Beta126: codec callbacks only. These do NOT authorize a sender, accept a
+// grant, queue a packet, or alter the production ESP-NOW beacon schedule.
+bool clusterTimeGrantSign(const uint8_t *data, size_t len, uint8_t mac[32])
+{
+    return grantProtocolMac(data, len, mac);
+}
+
+bool clusterTimeGrantVerify(const uint8_t *data, size_t len, const uint8_t mac[32])
+{
+    if (!mac) return false;
+    uint8_t expected[32] = {};
+    if (!grantProtocolMac(data, len, expected)) return false;
+    const bool valid = constantTimeEqual(expected, mac, sizeof(expected));
+    secureWipe(expected, sizeof(expected));
+    return valid;
 }
 
 bool clusterEspNowDiagnosticBeaconSign(const uint8_t *data, size_t len, uint8_t mac[32])

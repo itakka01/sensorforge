@@ -129,3 +129,8 @@ bool clusterEspNowTimeVerify(const uint8_t *data, size_t length,
 // True from accepting/planning a shot through its protected deadline.
 // Storage/OTA admission must treat this as stronger than the 2s armed flag.
 bool clusterCaptureProtectionActive();
+
+// Grant/Ack/Revoke authentication adapters (no transport or TX permissions).
+// Only 64-byte authenticated bodies are accepted.
+bool clusterTimeGrantSign(const uint8_t *data, size_t len, uint8_t mac[32]);
+bool clusterTimeGrantVerify(const uint8_t *data, size_t len, const uint8_t mac[32]);

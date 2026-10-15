@@ -1,3 +1,22 @@
+## v87-beta126 — 2026-10-15
+
+- Attached dormant 64-byte SF-TG grant/ack/revoke body authentication to the runtime PSA cluster HMAC key, using an independently derived HMAC-SHA256 subkey (`SensorForge/ESP-NOW/time-grant/HMAC/v1`).
+- Strict length and runtime-key checks; constant-time MAC verification and secure wiping of ephemeral key/MAC buffers.
+- No ESP-NOW grant transport, no sender identity binding or acceptance, no productive time-source switch. Both capture clock and coordinator time beacons unchanged.
+- Native grant codec regression test passed; ESP32 Arduino full build and hardware test still pending.
+
+## v87-beta125 — 2026-10-15
+
+- Introduced independent, fixed-size 96-byte grant/ack/revoke message codec with explicit coordinator and broadcaster identities, bounded lease, transaction and sequence; verification callback for domain-separated HMAC.
+- Deliberately **no transport sending, no enrollment/identity binding, no time-beacon handover**. The new header is compile-included only, and production timing remains untouched.
+- Native codec/replay tests executed; Arduino build and hardware test not performed.
+
+## v87-beta124 (2026-10-15) — passive Übergabesimulation (Arduino-Build ungeprüft)
+- Konstantspeicher-Zustandsmaschine beobachtet Diagnose-Broadcaster und simuliert Aktivierung bei drei frischen signierten Beacons sowie Rückfall bei Timeout oder Identitätswechsel.
+- JSON ergänzt `shadow_active`, `shadow_activations`, `shadow_fallbacks`, `shadow_source_changes`. Ausschließlich Lese-/Diagnosewerte; keine produktiven TX-, HMAC-, Capture- oder Quellwahl-Änderungen.
+- **Nicht** als authentifizierte Senderfreigabe interpretieren: Zuordnung zur Clusterrolle, Freigabeprotokoll und ACK fehlen weiterhin.
+- Arduino-Build und Hardwaretest ausstehend. Zuerst nur auf Coordinator kompilieren.
+
 ## v87-beta123 (2026-10-15) — passive Broadcaster-Verfügbarkeit (Build ungeprüft)
 - Nach drei fortlaufenden authentifizierten Diagnose-Beacons wird eine frische Broadcaster-Verbindung gemeldet. Nach 3,5 s ohne gültiges Paket verfällt dieser Zustand; Boot-/Epoch-/Senderwechsel oder Sequenzlücken beginnen neue Serie.
 - Kleiner JSON-Status ergänzt `candidate_fresh`, `candidate_age_ms`, `candidate_consecutive`, `handover_enabled:false`.

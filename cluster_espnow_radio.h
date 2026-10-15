@@ -103,6 +103,9 @@ struct DiagnosticBeaconRxStats {
     // Observation only: consecutive signed frames and local freshness. NOT authority.
     uint32_t candidateConsecutive=0, candidateAgeMs=0;
     bool candidateFresh=false;
+    // Passive simulation only: never grants TX authority or changes clocks.
+    bool shadowActive=false;
+    uint32_t shadowActivations=0, shadowFallbacks=0, shadowSourceChanges=0;
     // Constant-memory interval residuals, callback timestamps only; NOT clock accuracy.
     uint32_t intervalSamples=0, intervalSkipped=0;
     int32_t intervalMinUs=0, intervalMaxUs=0;
