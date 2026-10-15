@@ -1,0 +1,391 @@
+#pragma once
+
+#include <Arduino.h>
+
+// =============================================================
+// GENERELLE SENSORFORGE-WIFI-SICHERHEIT
+// =============================================================
+
+// Global reachability safety floor for user-configurable WiFi TX power.
+// Stored in tenths of dBm: 85 = 8.5 dBm.
+//
+// This is deliberately NOT a board-specific radio capability value. A future
+// board profile may list hardware-valid TX levels below 8.5 dBm, but SensorForge
+// will not expose/apply them through config.txt because an accidentally tiny
+// transmit power can make a field device difficult or impossible to reach.
+//
+// The effective minimum is always the first value in the active board's
+// BOARD_WIFI_TX_POWER_LEVELS_X10[] that is >= this global floor. Therefore a
+// board without an 8.5-dBm step automatically uses its next higher valid step.
+static constexpr int16_t SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10 = 85;
+
+
+// =============================================================
+// BOARD AUSWÄHLEN
+// =============================================================
+
+//#define BOARD_FREENOVE
+#define BOARD_XIAO
+
+
+#if defined(BOARD_FREENOVE) && defined(BOARD_XIAO)
+#error "Nur ein Board darf aktiviert sein!"
+#endif
+
+#if !defined(BOARD_FREENOVE) && !defined(BOARD_XIAO)
+#error "Kein Board ausgewählt!"
+#endif
+
+
+// =============================================================
+// FREENOVE FNK0085
+// =============================================================
+
+#if defined(BOARD_FREENOVE)
+
+#define BOARD_DISPLAY_NAME "Freenove FNK0085 ESP32-S3 WROOM"
+#define BOARD_HAS_ESP_NOW 1
+
+// Video-codec hardware capability only. This does NOT by itself enable an
+// ONVIF/RTSP codec; the streamer must also implement and qualify that codec.
+#define BOARD_VIDEO_H264_CAPABLE 0
+
+// Optional encrypted management tunnel capability. Runtime default remains OFF.
+#define BOARD_WIREGUARD_CAPABLE 1
+// WireGuard is architecturally allowed on this board, but no production-qualified
+// backend is selected on the current Arduino-ESP32 3.3.12 / ESP-IDF 5.5.5
+// reference stack. The legacy WireGuard-ESP32 0.1.5 backend still depends on
+// removed tcpip_adapter APIs and is intentionally NOT linked.
+#define BOARD_WIREGUARD_BACKEND_ARDUINO 0
+
+#include <SD_MMC.h>
+
+#define STORAGE SD_MMC
+#define STORAGE_SDMMC
+
+// microSD storage policy for this board.
+//
+// The Freenove FNK0085 uses the ESP32-S3 SD_MMC peripheral rather than the
+// SPI-based SD backend used by the XIAO profile below. Therefore this board
+// deliberately has NO SD_SPI_NORMAL_FREQUENCY_HZ /
+// SD_SPI_MAX_FREQUENCY_HZ definitions. The Sync API high-speed remount logic
+// is compiled only for STORAGE_SPI boards and is not applicable here.
+//
+// If this board is changed to a different storage backend in the future, its
+// clock policy belongs here in the board profile, not in config.txt.
+
+// Presence input: LD2410S OT2 or AM312 PIR (HIGH = person present).
+// PIR_PIN is retained as a compatibility alias for existing code.
+#define PRESENCE_PIN        GPIO_NUM_21      // (gelb)
+#define PIR_PIN             PRESENCE_PIN
+#define MAGNET_SWITCH_PIN   GPIO_NUM_14     // (braun) andere Seite Magnetswitch auf GND
+
+// LD2410S UART:
+//   sensor OT1/TX -> RADAR_RX_PIN
+//   sensor RX     <- RADAR_TX_PIN
+#define RADAR_RX_PIN        GPIO_NUM_41
+#define RADAR_TX_PIN        GPIO_NUM_42
+
+// RTC / I2C bus.
+// GPIO1 and GPIO47 are exposed and unused by camera, SD, radar and magnet input.
+#define RTC_SDA_PIN          GPIO_NUM_1   // (grün)
+#define RTC_SCL_PIN          GPIO_NUM_47  // (blau)
+
+// Fixed board audio hardware.
+// External microphones are NOT described here. They are runtime-configurable
+// through config.txt / WebConfig Expert mode so one firmware image can support
+// different user wiring.
+#define BOARD_HAS_INTEGRATED_MIC 0
+#define BOARD_INTEGRATED_MIC_NAME "No integrated microphone"
+
+// Board-specific native sensor orientation correction.
+// User-facing rotation=0 is defined as the normal, non-mirrored product image.
+// Freenove currently needs no additional mirror/flip correction.
+#define CAMERA_BASE_HMIRROR 0
+#define CAMERA_BASE_VFLIP   0
+
+#define STATUS_LED_AVAILABLE 1
+#define LED_PIN             GPIO_NUM_2
+#define LED_ON_LEVEL        HIGH
+#define LED_OFF_LEVEL       LOW
+
+#define SD_MMC_CMD          GPIO_NUM_38
+#define SD_MMC_CLK          GPIO_NUM_39
+#define SD_MMC_D0           GPIO_NUM_40
+
+// Recording performance guard.
+//
+// This is a coarse configuration safety ceiling, not a claimed physical bus
+// throughput. The generic config layer computes a weighted pixel rate:
+//
+//   width * height * fps * JPEG-quality-weight
+//
+// A value of 0 means that no board-specific ceiling has been qualified yet.
+// The Freenove SD_MMC path has not been benchmarked with the same production
+// camera/AVI/SFENC1 methodology as the XIAO profile, so do not invent a limit
+// here. Once measured, place the validated conservative ceiling here.
+#define RECORDING_MAX_WEIGHTED_PIXEL_RATE 0UL
+#define RECORDING_PRODUCTION_FPS_CAP_1024X768 0
+
+// Board-specific CPU thermal emergency limit. This remains a firmware safety
+// constant (not config.txt) so field configuration cannot weaken protection.
+#define BOARD_THERMAL_EMERGENCY_C 80.0f
+
+// WiFi TX-power capabilities. Values are stored as tenths of dBm so supported
+// steps remain exact without floating-point comparisons. Keep this list in
+// ascending order. The actual user selection is persisted in config.txt; the
+// generic SensorForge safety floor decides which low levels are selectable.
+static constexpr int16_t BOARD_WIFI_TX_POWER_LEVELS_X10[] = {
+    20, 50, 70, 85, 110, 130, 140, 150, 165, 180, 200
+};
+static constexpr size_t BOARD_WIFI_TX_POWER_LEVEL_COUNT =
+    sizeof(BOARD_WIFI_TX_POWER_LEVELS_X10) / sizeof(BOARD_WIFI_TX_POWER_LEVELS_X10[0]);
+static constexpr int16_t BOARD_WIFI_TX_POWER_DEFAULT_X10 = 200;
+
+
+// Three provisional FNK0085 measurement input candidates for a dedicated test
+// setup: GPIO14 (magnet), GPIO21 (presence) and GPIO41 (radar UART RX).
+// ALL THREE conflict with existing SensorForge functions! They must remain
+// NONE until the measurement implementation can take exclusive ownership,
+// restore the pins afterwards, and verify physical wiring. No GPIO is touched.
+// GPIO35/36/37 are unavailable with OPI PSRAM; 38/39/40 are SD_MMC.
+#define CLUSTER_HW_TIME_CANDIDATE_IN_1 14
+#define CLUSTER_HW_TIME_CANDIDATE_IN_2 21
+#define CLUSTER_HW_TIME_CANDIDATE_IN_3 41
+#define CLUSTER_HW_TIME_IN_1 (-1)
+#define CLUSTER_HW_TIME_IN_2 (-1)
+#define CLUSTER_HW_TIME_IN_3 (-1)
+// Freenove diagnostic output candidate: GPIO48 (onboard RGB LED data).
+// This is NOT conflict-free; only use after explicit hardware verification
+// and exclusive control during a future, implemented measurement.
+// The current preparation code does not configure or drive this pin.
+#define CLUSTER_HW_TIME_OUT 48
+
+// =============================================================
+// XIAO ESP32S3 SENSE
+// =============================================================
+
+#elif defined(BOARD_XIAO)
+
+#define BOARD_DISPLAY_NAME "Seeed XIAO ESP32S3 Sense"
+#define BOARD_HAS_ESP_NOW 1
+
+// Reserved diagnostic output D1 / GPIO2. Only use during explicit test.
+// XIAO has no three-channel coordinator input assignment by default.
+#define CLUSTER_HW_TIME_OUT 2
+#define CLUSTER_HW_TIME_IN_1 (-1)
+#define CLUSTER_HW_TIME_IN_2 (-1)
+#define CLUSTER_HW_TIME_IN_3 (-1)
+
+
+// Video-codec hardware capability only. This does NOT by itself enable an
+// ONVIF/RTSP codec; the streamer must also implement and qualify that codec.
+#define BOARD_VIDEO_H264_CAPABLE 0
+
+// Optional encrypted management tunnel capability. Runtime default remains OFF.
+#define BOARD_WIREGUARD_CAPABLE 1
+// WireGuard is architecturally allowed on this board, but no production-qualified
+// backend is selected on the current Arduino-ESP32 3.3.12 / ESP-IDF 5.5.5
+// reference stack. The legacy WireGuard-ESP32 0.1.5 backend still depends on
+// removed tcpip_adapter APIs and is intentionally NOT linked.
+#define BOARD_WIREGUARD_BACKEND_ARDUINO 0
+
+#include <SPI.h>
+#include <SD.h>
+
+#define STORAGE SD
+#define STORAGE_SPI
+
+// Zuordnungstabelle XIAO ESP32S3 SENSE
+// D0 = GPIO1
+// D1 = GPIO2
+// D2 = GPIO3
+// D3 = GPIO4
+// D4 = GPIO5
+// D5 = GPIO6
+// D6 = GPIO43
+// D7 = GPIO44
+
+
+// Presence input: LD2410S OT2 or AM312 PIR (HIGH = person present).
+// PIR_PIN is retained as a compatibility alias for existing code.
+#define PRESENCE_PIN        GPIO_NUM_4      // D3 ← OT2 vom Radar (gelb)
+#define PIR_PIN             PRESENCE_PIN
+#define MAGNET_SWITCH_PIN   GPIO_NUM_1      // D0 ← Magnetswitch (zweite Leitung Magnetswitch auf GND) (braun)
+
+// XIAO hardware UART pins D7/RX and D6/TX.
+#define RADAR_RX_PIN GPIO_NUM_44  // D7 ← OT1 vom Radar (weiß)
+#define RADAR_TX_PIN GPIO_NUM_43  // D6 → RX am Radar (grau)
+
+// RTC / I2C bus.
+#define RTC_SDA_PIN          GPIO_NUM_5      // D4 ← RTC SDA (grün)
+#define RTC_SCL_PIN          GPIO_NUM_6      // D5 ← RTC SCL (blau)
+
+// Fixed board audio hardware: onboard XIAO ESP32-S3 Sense PDM microphone.
+// Seeed hardware routing: GPIO42=PDM CLK, GPIO41=PDM DATA.
+// Only physically integrated hardware belongs in the board profile. External
+// microphones are selected and wired at runtime through config.txt / WebConfig.
+#define BOARD_HAS_INTEGRATED_MIC 1
+#define BOARD_INTEGRATED_MIC_BACKEND_PDM 1
+#define BOARD_INTEGRATED_MIC_NAME "XIAO onboard PDM microphone"
+#define BOARD_INTEGRATED_MIC_PDM_CLK_PIN                  GPIO_NUM_42
+#define BOARD_INTEGRATED_MIC_PDM_DATA_PIN                 GPIO_NUM_41
+#define BOARD_INTEGRATED_MIC_MIN_SAMPLE_RATE_HZ            16000UL
+#define BOARD_INTEGRATED_MIC_MAX_SAMPLE_RATE_HZ            16000UL
+#define BOARD_INTEGRATED_MIC_RECOMMENDED_SAMPLE_RATE_HZ    16000UL
+
+// Board-specific native sensor orientation correction.
+// On the current SensorForge XIAO + OV3660 assembly the native sensor feed is
+// horizontally mirrored relative to the desired product image. Correct that
+// mirror here. User-facing rotation=180 is then composed on top by toggling
+// both axes, so it remains a true 180-degree rotation without introducing a
+// mirror.
+#define CAMERA_BASE_HMIRROR 1
+#define CAMERA_BASE_VFLIP   0
+
+// This XIAO Sense hardware revision routes microSD CS to GPIO21.
+// GPIO21 is also the onboard USER LED, so the firmware must not drive
+// that LED independently while the SD card is in use.
+#define STATUS_LED_AVAILABLE 0
+#define LED_PIN             GPIO_NUM_21
+#define LED_ON_LEVEL        LOW
+#define LED_OFF_LEVEL       HIGH
+
+#define SD_CS_PIN           GPIO_NUM_21
+#define SD_SCK_PIN          GPIO_NUM_7
+#define SD_MISO_PIN         GPIO_NUM_8
+#define SD_MOSI_PIN         GPIO_NUM_9
+
+// SD-SPI clock policy for this board.
+//
+// NORMAL is the production clock used for the normal SensorForge workload,
+// including recording. A real XIAO ESP32S3 Sense camera/AVI/SFENC1 benchmark
+// verified 20 MHz with full read-back integrity and substantially lower frame
+// write latency than the former 4 MHz setting. Power measurements showed no
+// material increase for the tested workload.
+//
+// v67 restores the previously qualified 20 MHz XIAO production/storage clock.
+// v66 temporarily reduced the clock to 10 MHz as an A/B stability experiment,
+// but that change did not improve the observed thermal margin and did not address
+// the separate foreground-WebConfig/system-load trigger under investigation.
+// Repeated 64 MiB raw, w+ and full SFENC1 write-behind endurance tests already
+// verified the storage stack at 20 MHz with complete read-back integrity.
+//
+// NORMAL and MAX remain equal so API-exclusive operation never changes the SD
+// clock behind the recorder's back. These values are firmware/board knowledge
+// and do NOT belong in config.txt.
+#define SD_SPI_NORMAL_FREQUENCY_HZ 20000000UL
+#define SD_SPI_MAX_FREQUENCY_HZ    20000000UL
+
+#if SD_SPI_NORMAL_FREQUENCY_HZ == 0 || SD_SPI_MAX_FREQUENCY_HZ == 0
+#error "SD SPI frequencies must be greater than zero"
+#endif
+
+#if SD_SPI_NORMAL_FREQUENCY_HZ > SD_SPI_MAX_FREQUENCY_HZ
+#error "SD_SPI_NORMAL_FREQUENCY_HZ must not exceed SD_SPI_MAX_FREQUENCY_HZ"
+#endif
+
+// Recording performance guard for configuration validation.
+//
+// This is deliberately a conservative UPPER CONFIGURATION CEILING, not an
+// exact throughput model and not a promise that every scene/card will sustain
+// the limit. The generic config layer computes:
+//
+//   weighted_pixel_rate = width * height * fps * quality_weight / 100
+//
+// quality_weight is 100% at JPEG quality=12 and for numerically larger
+// (lower-image-quality) values. Numerically smaller JPEG quality values create
+// larger JPEGs, so the generic guard adds 5% load per step below 12, capped at
+// 160%. Lower JPEG quality must never be used to raise this board ceiling.
+//
+// The weighted ceiling remains the generic guard for other resolutions. v67
+// retains the conservative 1024x768 production cap of 4 fps for the XIAO. The
+// previous 5 fps path has ample raw throughput, but combined camera/audio/SFENC1/
+// Image-Motion/WebConfig operation needs additional system margin. The 4 fps cap
+// remains in place while the production SD clock returns to the already qualified
+// 20 MHz setting.
+//
+// Re-qualify before raising either policy after a board/SD/core change.
+#define RECORDING_MAX_WEIGHTED_PIXEL_RATE 8000000UL
+
+// Board-specific CPU thermal emergency limit. Keep this in the board profile
+// so a future hardware qualification can raise/lower the limit centrally
+// without changing the generic thermal safety implementation.
+#define BOARD_THERMAL_EMERGENCY_C 80.0f
+
+// WiFi TX-power capabilities for XIAO ESP32S3 Sense. Keep the list in
+// ascending order. The generic SensorForge safety floor above decides which
+// low levels are user-selectable; the board profile itself describes the
+// hardware-valid levels and the backwards-compatible default.
+static constexpr int16_t BOARD_WIFI_TX_POWER_LEVELS_X10[] = {
+    85, 110, 130, 140, 150, 165, 180, 200
+};
+static constexpr size_t BOARD_WIFI_TX_POWER_LEVEL_COUNT =
+    sizeof(BOARD_WIFI_TX_POWER_LEVELS_X10) / sizeof(BOARD_WIFI_TX_POWER_LEVELS_X10[0]);
+static constexpr int16_t BOARD_WIFI_TX_POWER_DEFAULT_X10 = 200;
+
+#define RECORDING_PRODUCTION_FPS_CAP_1024X768 4
+
+#if CAMERA_BASE_HMIRROR != 0 && CAMERA_BASE_HMIRROR != 1
+#error "CAMERA_BASE_HMIRROR must be 0 or 1"
+#endif
+
+#if CAMERA_BASE_VFLIP != 0 && CAMERA_BASE_VFLIP != 1
+#error "CAMERA_BASE_VFLIP must be 0 or 1"
+#endif
+
+#endif
+
+
+// Generic helpers for board-scoped WiFi TX-power validation.
+static inline bool boardWifiTxPowerSupportedX10(int16_t valueX10)
+{
+    for (size_t i = 0; i < BOARD_WIFI_TX_POWER_LEVEL_COUNT; ++i) {
+        if (BOARD_WIFI_TX_POWER_LEVELS_X10[i] == valueX10)
+            return true;
+    }
+    return false;
+}
+
+static inline int16_t boardWifiTxPowerSafeMinimumX10()
+{
+    for (size_t i = 0; i < BOARD_WIFI_TX_POWER_LEVEL_COUNT; ++i) {
+        if (BOARD_WIFI_TX_POWER_LEVELS_X10[i] >= SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10)
+            return BOARD_WIFI_TX_POWER_LEVELS_X10[i];
+    }
+
+    // Board profiles must provide at least one level at or above the global
+    // SensorForge safety floor. Fall back to the board default defensively.
+    return BOARD_WIFI_TX_POWER_DEFAULT_X10;
+}
+
+static inline int16_t boardWifiTxPowerNormalizeUpX10(int16_t requestedX10)
+{
+    int16_t targetX10 = requestedX10;
+    if (targetX10 < SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10)
+        targetX10 = SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10;
+
+    for (size_t i = 0; i < BOARD_WIFI_TX_POWER_LEVEL_COUNT; ++i) {
+        int16_t levelX10 = BOARD_WIFI_TX_POWER_LEVELS_X10[i];
+        if (levelX10 >= targetX10 &&
+            levelX10 >= SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10)
+            return levelX10;
+    }
+
+    // No higher discrete step exists. Use the highest board-valid level that
+    // still satisfies the global safety floor. Lists are documented ascending.
+    for (size_t i = BOARD_WIFI_TX_POWER_LEVEL_COUNT; i > 0; --i) {
+        int16_t levelX10 = BOARD_WIFI_TX_POWER_LEVELS_X10[i - 1];
+        if (levelX10 >= SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10)
+            return levelX10;
+    }
+
+    return BOARD_WIFI_TX_POWER_DEFAULT_X10;
+}
+
+static inline int8_t boardWifiTxPowerQuarterDbm(int16_t valueX10)
+{
+    // esp_wifi_set_max_tx_power() uses quarter-dBm units. Every value in the
+    // board list maps exactly (for example 19.5 dBm -> 78).
+    return (int8_t)((valueX10 * 2) / 5);
+}

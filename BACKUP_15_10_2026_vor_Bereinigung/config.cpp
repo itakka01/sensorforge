@@ -1,0 +1,10134 @@
+#include "config.h"
+#include "board_config.h"
+#include "config_secrets.h"
+#include "image_motion.h"
+#include "branding.h"
+#include "camera_select.h"
+
+#include <FS.h>
+#include <LittleFS.h>
+#include <Preferences.h>
+#include <esp_partition.h>
+#include <time.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <new>
+
+
+// =============================================================
+// DEFAULT CONFIG
+// =============================================================
+
+// The factory hostname also becomes the Access-Point SSID. Derive it from the
+// central product branding so a future product rename automatically changes
+// the factory AP name without duplicating another product-name constant here.
+// Keep it ASCII/hostname friendly and within the 32-byte Wi-Fi SSID limit.
+static String makeDefaultHostnameFromBranding()
+{
+    String source = Branding::APP_NAME;
+    source.trim();
+
+    String result;
+    result.reserve(32);
+
+    bool lastWasSeparator = false;
+
+    for (size_t i = 0; i < source.length() && result.length() < 32; ++i) {
+        char c = source[i];
+
+        if (c >= 'A' && c <= 'Z')
+            c = (char)(c - 'A' + 'a');
+
+        bool alphaNumeric =
+            (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9');
+
+        if (alphaNumeric) {
+            result += c;
+            lastWasSeparator = false;
+        } else if (result.length() && !lastWasSeparator && result.length() < 32) {
+            result += '-';
+            lastWasSeparator = true;
+        }
+    }
+
+    while (result.endsWith("-"))
+        result.remove(result.length() - 1);
+
+    // Defensive fallback only for an unusable/empty branding literal.
+    if (!result.length())
+        result = "device";
+
+    return result;
+}
+
+#ifdef BOARD_FREENOVE
+String cfg_camera = "OV3660";
+#elif defined(BOARD_XIAO)
+String cfg_camera = "OV2640";
+#else
+String cfg_camera = "OV2640";
+#endif
+
+String cfg_resolution = "1024x768";
+
+#if RECORDING_PRODUCTION_FPS_CAP_1024X768 > 0
+int cfg_fps         = RECORDING_PRODUCTION_FPS_CAP_1024X768;
+#else
+int cfg_fps         = 5;
+#endif
+int cfg_quality     = 12;
+#ifdef BOARD_FREENOVE
+int cfg_camera_xclk_mhz = 10;
+#else
+int cfg_camera_xclk_mhz = 20;
+#endif
+int cfg_camera_auto_exposure = 1;
+int cfg_camera_ae_level = -1;
+String cfg_camera_crop_zoom = "1.0";
+int cfg_camera_crop_x = 1;
+int cfg_camera_crop_y = 1;
+int cfg_post_ms     = 3000;
+int cfg_led_enabled = 1;
+
+String cfg_recording_format = "avi";
+int cfg_timestamp_enabled   = 1;
+int cfg_recording_encryption = 0;
+int cfg_audio_enabled = 0;
+int cfg_audio_expert_mode = 0;
+String cfg_audio_source = "board_default";
+String cfg_audio_backend = "pdm";
+int cfg_audio_pdm_clk_pin = -1;
+int cfg_audio_pdm_data_pin = -1;
+int cfg_audio_i2s_bclk_pin = -1;
+int cfg_audio_i2s_ws_pin = -1;
+int cfg_audio_i2s_data_pin = -1;
+int cfg_audio_i2s_mclk_pin = -1;
+String cfg_audio_i2s_slot = "left";
+int cfg_audio_sample_rate = 16000;
+int cfg_audio_bits_per_sample = 16;
+int cfg_audio_channels = 1;
+int cfg_shooter_enabled = 0;
+String cfg_shooter_storage_format = "mkv";
+int cfg_shooter_interval_ms = 60000;
+int cfg_shooter_dark_mean_min = 20;
+float cfg_shooter_min_change_pct = 1.0f;
+float cfg_shooter_motion_hint_change_pct = 2.0f;
+int cfg_shooter_motion_hint_required_hits = 3;
+int cfg_shooter_motion_hint_window_frames = 4;
+int cfg_shooter_force_save_seconds = 60;
+int cfg_shooter_flush_seconds = 300;
+int cfg_recording_segment_seconds = 30;
+int cfg_recording_segment_max_mb  = 20;
+int cfg_recording_event_max_seconds = 60;
+int cfg_recording_event_cooldown_seconds = 120;
+String cfg_recording_not_before = "off";
+
+int cfg_motion_recording_enabled = 1;
+String cfg_motion_recording_decision = "direct";
+int cfg_image_motion_sensitivity = 5;
+float cfg_image_motion_min_area_pct = 6.0f;
+int cfg_image_motion_confirm_frames = 2;
+int cfg_image_motion_release_frames = 2;
+int cfg_image_motion_background_learning = 4;
+int cfg_image_motion_global_mean_delta = 24;
+int cfg_image_motion_global_change_pct = 70;
+String cfg_image_motion_roi_mask = imageMotionDefaultRoiMask();
+
+String cfg_operating_mode = "normal";
+int cfg_streamer_rtsp_enabled = 0;
+int cfg_streamer_http_mjpeg_enabled = 0;
+int cfg_onvif_enabled = 0;
+
+int cfg_wireguard_enabled = 0;
+String cfg_wireguard_address = "";
+String cfg_wireguard_private_key = "";
+String cfg_wireguard_peer_endpoint = "";
+String cfg_wireguard_peer_public_key = "";
+int cfg_wireguard_peer_port = 51820;
+
+String cfg_sleep_mode = "off";
+int cfg_sleep_delay_ms = 2000;
+int cfg_bootloop_protection = 1;
+
+int cfg_transport_mode = 0;
+int cfg_transport_check_seconds = 600;
+int cfg_transport_light_confirm_seconds = 10;
+int cfg_transport_install_delay_seconds = 300;
+int cfg_transport_max_duration_seconds = 86400;
+int cfg_transport_black_threshold = 25;
+
+int cfg_min_free_space_mb = 100;
+String cfg_disk_full_action = "rollover";
+
+String cfg_hostname  = makeDefaultHostnameFromBranding();
+String cfg_camera_display_name = "";
+String cfg_camera_location = "";
+String cfg_camera_gps_lat = "";
+String cfg_camera_gps_lon = "";
+String cfg_camera_responsible = "";
+String cfg_camera_email = "";
+String cfg_camera_overlay_text = "";
+String cfg_camera_description = "";
+String cfg_timezone = "CET-1CEST,M3.5.0,M10.5.0/3";
+String cfg_wifi_on_system_start = "on";
+int cfg_wifi_timeout_sec = 0;
+int cfg_wifi_alive_schedule_enabled = 0;
+String cfg_wifi_alive_schedule = "";
+String cfg_wifi_ssid = "";
+String cfg_wifi_pass = "";
+String cfg_wifi_ssids[SENSORFORGE_WIFI_PROFILE_COUNT];
+String cfg_wifi_passes[SENSORFORGE_WIFI_PROFILE_COUNT];
+float cfg_wifi_tx_power_dbm = BOARD_WIFI_TX_POWER_DEFAULT_X10 / 10.0f;
+
+int cfg_cluster_enabled = 0;
+String cfg_cluster_id = "";
+String cfg_cluster_name = "";
+uint32_t cfg_cluster_credential_epoch = 1;
+String cfg_cluster_password = "";
+String cfg_cluster_coordinator_policy = "auto";
+
+int cfg_hotspot_enabled = 1;
+int cfg_hotspot_fallback_enabled = 1;
+String cfg_hotspot_password = "";
+int cfg_hotspot_hidden = 0;
+
+int cfg_web_auth_enabled = 0;
+int cfg_web_recording_auto_pause = 1;
+String cfg_web_language = "de";
+String cfg_web_username = "admin";
+String cfg_web_password = "sensorforgeweb1234";
+String cfg_stream_usernames[SENSORFORGE_STREAM_USER_COUNT];
+String cfg_stream_passwords[SENSORFORGE_STREAM_USER_COUNT];
+int cfg_stream_allow_annotation_edit = 0;
+int cfg_stream_allow_delete = 0;
+
+String cfg_log_file = "/log.txt";
+
+int cfg_debug_enabled = 0;
+int cfg_rotation = 0;
+
+
+int configTransportBlackP95Limit()
+{
+    int limit =
+        cfg_transport_black_threshold + 10;
+
+    return
+        limit > 255
+        ? 255
+        : limit;
+}
+
+
+// =============================================================
+// INTERNAL CONFIG STATE
+// =============================================================
+
+static ConfigSource activeConfigSource =
+    CONFIG_SOURCE_DEFAULTS;
+
+static bool sdAvailableState =
+    false;
+
+static bool sdPresentState =
+    false;
+
+static bool sdValidState =
+    false;
+
+static bool internalAvailableState =
+    false;
+
+static bool internalValidState =
+    false;
+
+enum InternalConfigState {
+    INTERNAL_CONFIG_UNCHECKED = 0,
+    INTERNAL_CONFIG_UNAVAILABLE,
+    INTERNAL_CONFIG_MISSING,
+    INTERNAL_CONFIG_INVALID,
+    INTERNAL_CONFIG_VALID
+};
+
+static InternalConfigState internalConfigState =
+    INTERNAL_CONFIG_UNCHECKED;
+
+static String internalConfigDetail =
+    "not checked";
+
+
+// Maximum accepted config size.
+// This prevents a corrupted file from consuming excessive heap.
+static const size_t CONFIG_MAX_BYTES =
+    32U * 1024U;
+
+
+// =============================================================
+// TRANSPORT MODE SD/INTERNAL RECONCILIATION
+// =============================================================
+//
+// transport_mode is operational state, not just a preference. If the SD card
+// disappears while transport mode is released (or enabled), only the internal
+// config can be updated at that moment. A stale SD /config.txt must therefore
+// not later win by normal SD priority and resurrect the old transport state.
+//
+// Keep the last transport_mode change that could not be synchronized to SD in
+// NVS. As soon as a valid SD config is available again, loadConfig() reconciles
+// only transport_mode into that SD config while preserving every other setting,
+// then clears this marker.
+//
+// This is intentionally separate from /config.txt and LittleFS shadow data:
+// the shadow is normally replaced 1:1 when a valid SD config wins, which is
+// exactly the condition this marker must survive.
+static const char CONFIG_SYNC_PREFS_NAMESPACE[] =
+    "sfcfgsync";
+
+static const char CONFIG_SYNC_TRANSPORT_KEY[] =
+    "trpend";
+
+
+static bool transportModePendingRead(
+    int &mode
+)
+{
+    mode =
+        -1;
+
+    Preferences prefs;
+
+    if (!prefs.begin(
+            CONFIG_SYNC_PREFS_NAMESPACE,
+            true
+        )) {
+        return false;
+    }
+
+    uint8_t stored =
+        prefs.getUChar(
+            CONFIG_SYNC_TRANSPORT_KEY,
+            0xFF
+        );
+
+    prefs.end();
+
+    if (
+        stored != 0 &&
+        stored != 1
+    ) {
+        return false;
+    }
+
+    mode =
+        (int)stored;
+
+    return true;
+}
+
+
+static bool transportModePendingStore(
+    int mode
+)
+{
+    if (
+        mode != 0 &&
+        mode != 1
+    ) {
+        return false;
+    }
+
+    Preferences prefs;
+
+    if (!prefs.begin(
+            CONFIG_SYNC_PREFS_NAMESPACE,
+            false
+        )) {
+        return false;
+    }
+
+    size_t written =
+        prefs.putUChar(
+            CONFIG_SYNC_TRANSPORT_KEY,
+            (uint8_t)mode
+        );
+
+    prefs.end();
+
+    return
+        written == sizeof(uint8_t);
+}
+
+
+static void transportModePendingClear()
+{
+    Preferences prefs;
+
+    if (!prefs.begin(
+            CONFIG_SYNC_PREFS_NAMESPACE,
+            false
+        )) {
+        return;
+    }
+
+    prefs.remove(
+        CONFIG_SYNC_TRANSPORT_KEY
+    );
+
+    prefs.end();
+}
+
+
+// Apply a transport_mode change that was durably saved internally while the SD
+// copy was unavailable or could not be updated. The pending value always wins
+// for this single operational key. Other settings continue to follow the normal
+// SD > internal > defaults priority.
+static void reconcilePendingTransportMode()
+{
+    int pendingMode =
+        -1;
+
+    if (!transportModePendingRead(
+            pendingMode
+        )) {
+        return;
+    }
+
+    bool validSdIsAuthoritative =
+        activeConfigSource == CONFIG_SOURCE_SD &&
+        sdAvailableState &&
+        sdPresentState &&
+        sdValidState;
+
+    if (
+        validSdIsAuthoritative &&
+        cfg_transport_mode == pendingMode
+    ) {
+        transportModePendingClear();
+
+        Serial.printf(
+            "Config transport reconciliation: SD already matches pending mode=%d - marker cleared\n",
+            pendingMode
+        );
+
+        return;
+    }
+
+    if (
+        !validSdIsAuthoritative &&
+        cfg_transport_mode == pendingMode
+    ) {
+        Serial.printf(
+            "Config transport reconciliation: pending mode=%d retained until SD config is available\n",
+            pendingMode
+        );
+
+        return;
+    }
+
+    String error;
+
+    ConfigSaveResult result =
+        configSaveTransportMode(
+            pendingMode,
+            true,
+            error
+        );
+
+    if (result == CONFIG_SAVE_BOTH) {
+        Serial.printf(
+            "Config transport reconciliation: stale SD transport_mode corrected to %d | SD+internal synchronized\n",
+            pendingMode
+        );
+
+        return;
+    }
+
+    if (result == CONFIG_SAVE_INTERNAL_ONLY) {
+        Serial.printf(
+            "Config transport reconciliation: mode=%d applied internally | SD synchronization still pending\n",
+            pendingMode
+        );
+
+        return;
+    }
+
+    // CONFIG_SAVE_SD_FAILED means the internal shadow already contains the
+    // requested value but SD synchronization failed. For boot behavior the
+    // NVS marker is authoritative, so never let a stale SD value reactivate an
+    // old transport state. The marker remains and the next boot retries.
+    if (result == CONFIG_SAVE_SD_FAILED) {
+        cfg_transport_mode =
+            pendingMode;
+
+        Serial.printf(
+            "Config transport reconciliation: mode=%d forced for runtime | SD write failed, marker retained | %s\n",
+            pendingMode,
+            error.c_str()
+        );
+
+        return;
+    }
+
+    // Even if the persistent config could not be patched in this boot, the NVS
+    // marker is itself durable evidence of the newer operational state. Apply
+    // it to runtime and keep the marker for a later reconciliation attempt.
+    cfg_transport_mode =
+        pendingMode;
+
+    Serial.printf(
+        "Config transport reconciliation: mode=%d forced for runtime | persistent patch failed, marker retained | %s\n",
+        pendingMode,
+        error.c_str()
+    );
+}
+
+
+// =============================================================
+// TEMPORARY PARSED VALUES
+// =============================================================
+
+bool configParseWifiAliveSchedule(
+    const String &value,
+    WifiAliveScheduleEntry entries[SENSORFORGE_WIFI_ALIVE_SCHEDULE_MAX_ENTRIES],
+    size_t &count,
+    String *error
+)
+{
+    count = 0;
+    if (error)
+        *error = "";
+
+    String text = value;
+    text.trim();
+
+    if (!text.length())
+        return true;
+
+    size_t start = 0;
+
+    while (start <= text.length()) {
+        int separator = text.indexOf(';', start);
+        size_t end = separator >= 0 ? (size_t)separator : text.length();
+
+        String token = text.substring(start, end);
+        token.trim();
+
+        if (!token.length()) {
+            if (error)
+                *error = "wifi_alive_schedule contains an empty entry";
+            return false;
+        }
+
+        if (count >= SENSORFORGE_WIFI_ALIVE_SCHEDULE_MAX_ENTRIES) {
+            if (error)
+                *error = "wifi_alive_schedule has too many entries";
+            return false;
+        }
+
+        int slash = token.indexOf('/');
+        if (slash != 5 || token.length() <= 6) {
+            if (error)
+                *error = "wifi_alive_schedule entry must be HH:MM/minutes";
+            return false;
+        }
+
+        if (
+            token.charAt(2) != ':' ||
+            !isDigit(token.charAt(0)) ||
+            !isDigit(token.charAt(1)) ||
+            !isDigit(token.charAt(3)) ||
+            !isDigit(token.charAt(4))
+        ) {
+            if (error)
+                *error = "wifi_alive_schedule time must be HH:MM";
+            return false;
+        }
+
+        const int hour =
+            (token.charAt(0) - '0') * 10 +
+            (token.charAt(1) - '0');
+        const int minute =
+            (token.charAt(3) - '0') * 10 +
+            (token.charAt(4) - '0');
+
+        if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+            if (error)
+                *error = "wifi_alive_schedule time out of range";
+            return false;
+        }
+
+        String durationText = token.substring((size_t)slash + 1);
+        durationText.trim();
+
+        if (!durationText.length()) {
+            if (error)
+                *error = "wifi_alive_schedule duration missing";
+            return false;
+        }
+
+        for (size_t i = 0; i < durationText.length(); ++i) {
+            if (!isDigit(durationText.charAt(i))) {
+                if (error)
+                    *error = "wifi_alive_schedule duration must be numeric";
+                return false;
+            }
+        }
+
+        const long duration = strtol(durationText.c_str(), nullptr, 10);
+        if (duration < 1 || duration > 1440) {
+            if (error)
+                *error = "wifi_alive_schedule duration out of range (1..1440 minutes)";
+            return false;
+        }
+
+        for (size_t i = 0; i < count; ++i) {
+            if (entries[i].startMinuteOfDay == (uint16_t)(hour * 60 + minute)) {
+                if (error)
+                    *error = "wifi_alive_schedule contains duplicate start times";
+                return false;
+            }
+        }
+
+        entries[count].startMinuteOfDay =
+            (uint16_t)(hour * 60 + minute);
+        entries[count].durationMinutes =
+            (uint16_t)duration;
+        ++count;
+
+        if (separator < 0)
+            break;
+
+        start = (size_t)separator + 1;
+    }
+
+    return true;
+}
+
+static bool configClusterIdValid(const String &id)
+{
+    if (id.length() != 35 || !id.startsWith("cl-"))
+        return false;
+
+    for (size_t i = 3; i < id.length(); ++i) {
+        const char c = id[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            return false;
+    }
+    return true;
+}
+
+
+struct ConfigValues {
+    String camera;
+    String resolution;
+
+    int fps;
+    int quality;
+    int cameraXclkMhz;
+    int cameraAutoExposure;
+    int cameraAeLevel;
+    String cameraCropZoom;
+    int cameraCropX;
+    int cameraCropY;
+    int rotation;
+
+    String recordingFormat;
+    int timestampEnabled;
+    int recordingEncryption;
+    int audioEnabled;
+    int audioExpertMode;
+    String audioSource;
+    String audioBackend;
+    int audioPdmClkPin;
+    int audioPdmDataPin;
+    int audioI2sBclkPin;
+    int audioI2sWsPin;
+    int audioI2sDataPin;
+    int audioI2sMclkPin;
+    String audioI2sSlot;
+    int audioSampleRate;
+    int audioBitsPerSample;
+    int audioChannels;
+    int shooterEnabled;
+    String shooterStorageFormat;
+    int shooterIntervalMs;
+    int shooterDarkMeanMin;
+    float shooterMinChangePct;
+    float shooterMotionHintChangePct;
+    int shooterMotionHintRequiredHits;
+    int shooterMotionHintWindowFrames;
+    int shooterForceSaveSeconds;
+    int shooterFlushSeconds;
+    int recordingSegmentSeconds;
+    int recordingSegmentMaxMb;
+    int recordingEventMaxSeconds;
+    int recordingEventCooldownSeconds;
+    String recordingNotBefore;
+    int motionRecordingEnabled;
+    String motionRecordingDecision;
+    int imageMotionSensitivity;
+    float imageMotionMinAreaPct;
+    int imageMotionConfirmFrames;
+    int imageMotionReleaseFrames;
+    int imageMotionBackgroundLearning;
+    int imageMotionGlobalMeanDelta;
+    int imageMotionGlobalChangePct;
+    String imageMotionRoiMask;
+    int postMs;
+    int ledEnabled;
+
+    String operatingMode;
+    int streamerRtspEnabled;
+    int streamerHttpMjpegEnabled;
+    int onvifEnabled;
+
+    int wireguardEnabled;
+    String wireguardAddress;
+    String wireguardPrivateKey;
+    String wireguardPeerEndpoint;
+    String wireguardPeerPublicKey;
+    int wireguardPeerPort;
+
+    String sleepMode;
+    int sleepDelayMs;
+    int bootloopProtection;
+
+    int transportMode;
+    int transportCheckSeconds;
+    int transportLightConfirmSeconds;
+    int transportInstallDelaySeconds;
+    int transportMaxDurationSeconds;
+    int transportBlackThreshold;
+    int transportBlackLegacyMeanMax;
+    int transportBlackLegacyP95Max;
+
+    int minFreeSpaceMb;
+    String diskFullAction;
+
+    String wifiOnSystemStart;
+    int wifiTimeoutSec;
+    int wifiAliveScheduleEnabled;
+    String wifiAliveSchedule;
+    String hostname;
+    String cameraDisplayName;
+    String cameraLocation;
+    String cameraGpsLat;
+    String cameraGpsLon;
+    String cameraResponsible;
+    String cameraEmail;
+    String cameraOverlayText;
+    String cameraDescription;
+    String timezone;
+    String wifiSsids[SENSORFORGE_WIFI_PROFILE_COUNT];
+    String wifiPasses[SENSORFORGE_WIFI_PROFILE_COUNT];
+    float wifiTxPowerDbm;
+
+    int clusterEnabled;
+    String clusterId;
+    String clusterName;
+    uint32_t clusterCredentialEpoch;
+    String clusterPassword;
+    String clusterCoordinatorPolicy;
+
+    int hotspotEnabled;
+    int hotspotFallbackEnabled;
+    String hotspotPassword;
+    int hotspotHidden;
+
+    int webAuthEnabled;
+    int webRecordingAutoPause;
+    String webLanguage;
+    String webUsername;
+    String webPassword;
+    String streamUsernames[SENSORFORGE_STREAM_USER_COUNT];
+    String streamPasswords[SENSORFORGE_STREAM_USER_COUNT];
+    int streamAllowAnnotationEdit;
+    int streamAllowDelete;
+
+    int debugEnabled;
+    String logFile;
+};
+
+
+struct ConfigSeen {
+    bool camera;
+    bool resolution;
+    bool fps;
+    bool quality;
+    bool cameraXclkMhz;
+    bool cameraAutoExposure;
+    bool cameraAeLevel;
+    bool cameraCropZoom;
+    bool cameraCropX;
+    bool cameraCropY;
+    bool rotation;
+
+    bool recordingFormat;
+    bool timestampEnabled;
+    bool recordingEncryption;
+    bool audioEnabled;
+    bool audioExpertMode;
+    bool audioSource;
+    bool audioBackend;
+    bool audioPdmClkPin;
+    bool audioPdmDataPin;
+    bool audioI2sBclkPin;
+    bool audioI2sWsPin;
+    bool audioI2sDataPin;
+    bool audioI2sMclkPin;
+    bool audioI2sSlot;
+    bool audioSampleRate;
+    bool audioBitsPerSample;
+    bool audioChannels;
+    bool shooterEnabled;
+    bool shooterStorageFormat;
+    bool shooterIntervalMs;
+    bool shooterDarkMeanMin;
+    bool shooterMinChangePct;
+    bool shooterSimilarityThreshold; // legacy alias
+    bool shooterMotionHintChangePct;
+    bool shooterMotionHintRequiredHits;
+    bool shooterMotionHintWindowFrames;
+    bool shooterForceSaveSeconds;
+    bool shooterFlushSeconds;
+    bool recordingSegmentSeconds;
+    bool recordingSegmentMaxMb;
+    bool recordingEventMaxSeconds;
+    bool recordingEventCooldownSeconds;
+    bool recordingNotBefore;
+    bool motionRecordingEnabled;
+    bool motionRecordingDecision;
+    bool imageMotionEnabled;
+    bool imageMotionSensitivity;
+    bool imageMotionMinAreaPct;
+    bool imageMotionConfirmFrames;
+    bool imageMotionReleaseFrames;
+    bool imageMotionBackgroundLearning;
+    bool imageMotionGlobalMeanDelta;
+    bool imageMotionGlobalChangePct;
+    bool imageMotionRoiMask;
+    bool postMs;
+    bool ledEnabled;
+
+    bool operatingMode;
+    bool streamerRtspEnabled;
+    bool streamerHttpMjpegEnabled;
+    bool onvifEnabled;
+
+    bool wireguardEnabled;
+    bool wireguardAddress;
+    bool wireguardPrivateKey;
+    bool wireguardPeerEndpoint;
+    bool wireguardPeerPublicKey;
+    bool wireguardPeerPort;
+
+    bool sleepMode;
+    bool sleepDelayMs;
+    bool bootloopProtection;
+
+    bool transportMode;
+    bool transportCheckSeconds;
+    bool transportLightConfirmSeconds;
+    bool transportInstallDelaySeconds;
+    bool transportMaxDurationSeconds;
+    bool transportBlackThreshold;
+    bool transportBlackMeanMax; // legacy alias
+    bool transportBlackP95Max;  // legacy alias
+
+    bool minFreeSpaceMb;
+    bool diskFullAction;
+
+    bool wifiOnSystemStart;
+    bool wifiTimeoutSec;
+    bool wifiAliveScheduleEnabled;
+    bool wifiAliveSchedule;
+    bool hostname;
+    bool cameraDisplayName;
+    bool cameraLocation;
+    bool cameraGpsLat;
+    bool cameraGpsLon;
+    bool cameraResponsible;
+    bool cameraEmail;
+    bool cameraOverlayText;
+    bool cameraDescription;
+    bool timezone;
+    bool wifiSsids[SENSORFORGE_WIFI_PROFILE_COUNT];
+    bool wifiPasses[SENSORFORGE_WIFI_PROFILE_COUNT];
+    bool wifiTxPowerDbm;
+
+    bool clusterEnabled;
+    bool clusterId;
+    bool clusterName;
+    bool clusterCredentialEpoch;
+    bool clusterPassword;
+    bool clusterCoordinatorPolicy;
+
+    bool hotspotEnabled;
+    bool hotspotFallbackEnabled;
+    bool hotspotPassword;
+    bool hotspotHidden;
+
+    bool webAuthEnabled;
+    bool webRecordingAutoPause;
+    bool webLanguage;
+    bool webUsername;
+    bool webPassword;
+    bool streamUsernames[SENSORFORGE_STREAM_USER_COUNT];
+    bool streamPasswords[SENSORFORGE_STREAM_USER_COUNT];
+    bool streamAllowAnnotationEdit;
+    bool streamAllowDelete;
+
+    bool debugEnabled;
+    bool logFile;
+};
+
+
+static void setDefaultValues(
+    ConfigValues &values
+)
+{
+
+#ifdef BOARD_FREENOVE
+    values.camera =
+        "OV3660";
+#elif defined(BOARD_XIAO)
+    values.camera =
+        "OV2640";
+#else
+    values.camera =
+        "OV2640";
+#endif
+
+    values.resolution =
+        "1024x768";
+
+    values.fps =
+#if RECORDING_PRODUCTION_FPS_CAP_1024X768 > 0
+        RECORDING_PRODUCTION_FPS_CAP_1024X768;
+#else
+        5;
+#endif
+
+    values.quality =
+        12;
+
+#ifdef BOARD_FREENOVE
+    values.cameraXclkMhz =
+        10;
+#else
+    values.cameraXclkMhz =
+        20;
+#endif
+
+    values.cameraAutoExposure =
+        1;
+
+    values.cameraAeLevel =
+        -1;
+
+    values.cameraCropZoom =
+        "1.0";
+
+    values.cameraCropX =
+        1;
+
+    values.cameraCropY =
+        1;
+
+    values.rotation =
+        0;
+
+    values.recordingFormat =
+        "avi";
+
+    values.timestampEnabled =
+        1;
+
+    values.recordingEncryption =
+        0;
+
+    values.audioEnabled =
+        0;
+
+    values.audioExpertMode =
+        0;
+
+    values.audioSource =
+        "board_default";
+
+    values.audioBackend =
+        "pdm";
+
+    values.audioPdmClkPin =
+        -1;
+
+    values.audioPdmDataPin =
+        -1;
+
+    values.audioI2sBclkPin =
+        -1;
+
+    values.audioI2sWsPin =
+        -1;
+
+    values.audioI2sDataPin =
+        -1;
+
+    values.audioI2sMclkPin =
+        -1;
+
+    values.audioI2sSlot =
+        "left";
+
+    values.audioSampleRate =
+        16000;
+
+    values.audioBitsPerSample =
+        16;
+
+    values.audioChannels =
+        1;
+
+    values.shooterEnabled =
+        0;
+
+    values.shooterStorageFormat =
+        "mkv";
+
+    values.shooterIntervalMs =
+        60000;
+
+    values.shooterDarkMeanMin =
+        20;
+
+    values.shooterMinChangePct =
+        1.0f;
+
+    values.shooterMotionHintChangePct =
+        2.0f;
+
+    values.shooterMotionHintRequiredHits =
+        3;
+
+    values.shooterMotionHintWindowFrames =
+        4;
+
+    values.shooterForceSaveSeconds =
+        60;
+
+    values.shooterFlushSeconds =
+        300;
+
+    values.recordingSegmentSeconds =
+        30;
+
+    values.recordingSegmentMaxMb =
+        20;
+
+    values.recordingEventMaxSeconds =
+        60;
+
+    values.recordingEventCooldownSeconds =
+        120;
+
+    values.recordingNotBefore =
+        "off";
+
+    values.motionRecordingEnabled =
+        1;
+
+    values.motionRecordingDecision =
+        "direct";
+
+    values.imageMotionSensitivity =
+        5;
+
+    values.imageMotionMinAreaPct =
+        6.0f;
+
+    values.imageMotionConfirmFrames =
+        2;
+
+    values.imageMotionReleaseFrames =
+        2;
+
+    values.imageMotionBackgroundLearning =
+        4;
+
+    values.imageMotionGlobalMeanDelta =
+        24;
+
+    values.imageMotionGlobalChangePct =
+        70;
+
+    values.imageMotionRoiMask =
+        imageMotionDefaultRoiMask();
+
+    values.postMs =
+        3000;
+
+    values.ledEnabled =
+        1;
+
+    values.operatingMode =
+        "normal";
+
+    values.streamerRtspEnabled =
+        0;
+
+    values.streamerHttpMjpegEnabled =
+        0;
+
+    values.onvifEnabled =
+        0;
+
+    values.wireguardEnabled = 0;
+    values.wireguardAddress = "";
+    values.wireguardPrivateKey = "";
+    values.wireguardPeerEndpoint = "";
+    values.wireguardPeerPublicKey = "";
+    values.wireguardPeerPort = 51820;
+
+    values.sleepMode =
+        "off";
+
+    values.sleepDelayMs =
+        2000;
+
+    values.bootloopProtection =
+        1;
+
+    values.transportMode =
+        0;
+
+    values.transportCheckSeconds =
+        600;
+
+    values.transportLightConfirmSeconds =
+        10;
+
+    values.transportInstallDelaySeconds =
+        300;
+
+    values.transportMaxDurationSeconds =
+        86400;
+
+    values.transportBlackThreshold =
+        25;
+
+    values.transportBlackLegacyMeanMax =
+        25;
+
+    values.transportBlackLegacyP95Max =
+        35;
+
+    values.minFreeSpaceMb =
+        100;
+
+    values.diskFullAction =
+        "rollover";
+
+    values.wifiOnSystemStart =
+        "on";
+
+    values.wifiTimeoutSec =
+        0;
+
+    values.wifiAliveScheduleEnabled =
+        0;
+
+    values.wifiAliveSchedule =
+        "";
+
+    values.hostname =
+        makeDefaultHostnameFromBranding();
+
+    values.cameraDisplayName = "";
+    values.cameraLocation = "";
+    values.cameraGpsLat = "";
+    values.cameraGpsLon = "";
+    values.cameraResponsible = "";
+    values.cameraEmail = "";
+    values.cameraOverlayText = "";
+    values.cameraDescription = "";
+
+    values.timezone =
+        "CET-1CEST,M3.5.0,M10.5.0/3";
+
+    for (size_t i = 0; i < SENSORFORGE_WIFI_PROFILE_COUNT; ++i) {
+        values.wifiSsids[i] = "";
+        values.wifiPasses[i] = "";
+    }
+
+    values.wifiTxPowerDbm =
+        BOARD_WIFI_TX_POWER_DEFAULT_X10 / 10.0f;
+
+    values.clusterEnabled =
+        0;
+
+    values.clusterId =
+        "";
+
+    values.clusterName =
+        "";
+
+    values.clusterCredentialEpoch =
+        1;
+
+    values.clusterPassword =
+        "";
+
+    values.clusterCoordinatorPolicy =
+        "auto";
+
+    values.hotspotEnabled =
+        1;
+
+    values.hotspotFallbackEnabled =
+        1;
+
+    values.hotspotPassword =
+        "";
+
+    values.hotspotHidden =
+        0;
+
+    values.webAuthEnabled =
+        0;
+
+    values.webRecordingAutoPause =
+        1;
+
+    values.webLanguage =
+        "de";
+
+    values.webUsername =
+        "admin";
+
+    values.webPassword =
+        "sensorforgeweb1234";
+
+    for (size_t i = 0; i < SENSORFORGE_STREAM_USER_COUNT; ++i) {
+        values.streamUsernames[i] = "";
+        values.streamPasswords[i] = "";
+    }
+
+    values.streamAllowAnnotationEdit = 0;
+    values.streamAllowDelete = 0;
+
+    values.debugEnabled =
+        0;
+
+    values.logFile =
+        "/log.txt";
+}
+
+
+static bool serializeConfigValues(
+    const ConfigValues &values,
+    String &text,
+    String &error
+)
+{
+    error = "";
+    text = "";
+
+    // Keep one canonical complete representation for generated factory
+    // defaults. All current known keys are written explicitly so a reset does
+    // not depend on whatever happened to exist in an older config.txt.
+    if (!text.reserve(3200)) {
+        error = "not enough memory for factory config";
+        return false;
+    }
+
+#define APPEND_CONFIG_VALUE(keyName, valueExpr) \
+    do { \
+        text += keyName; \
+        text += '='; \
+        text += (valueExpr); \
+        text += '\n'; \
+    } while (0)
+
+    APPEND_CONFIG_VALUE("camera", values.camera);
+    APPEND_CONFIG_VALUE("resolution", values.resolution);
+    APPEND_CONFIG_VALUE("fps", String(values.fps));
+    APPEND_CONFIG_VALUE("quality", String(values.quality));
+    APPEND_CONFIG_VALUE("camera_xclk_mhz", String(values.cameraXclkMhz));
+    APPEND_CONFIG_VALUE("camera_auto_exposure", String(values.cameraAutoExposure));
+    APPEND_CONFIG_VALUE("camera_ae_level", String(values.cameraAeLevel));
+    APPEND_CONFIG_VALUE("camera_crop_zoom", values.cameraCropZoom);
+    APPEND_CONFIG_VALUE("camera_crop_x", String(values.cameraCropX));
+    APPEND_CONFIG_VALUE("camera_crop_y", String(values.cameraCropY));
+    APPEND_CONFIG_VALUE("rotation", String(values.rotation));
+
+    APPEND_CONFIG_VALUE("recording_format", values.recordingFormat);
+    APPEND_CONFIG_VALUE("timestamp_enabled", String(values.timestampEnabled));
+    APPEND_CONFIG_VALUE("recording_encryption", String(values.recordingEncryption));
+    APPEND_CONFIG_VALUE("audio_enabled", String(values.audioEnabled));
+    APPEND_CONFIG_VALUE("audio_expert_mode", String(values.audioExpertMode));
+    APPEND_CONFIG_VALUE("audio_source", values.audioSource);
+    APPEND_CONFIG_VALUE("audio_backend", values.audioBackend);
+    APPEND_CONFIG_VALUE("audio_pdm_clk_pin", String(values.audioPdmClkPin));
+    APPEND_CONFIG_VALUE("audio_pdm_data_pin", String(values.audioPdmDataPin));
+    APPEND_CONFIG_VALUE("audio_i2s_bclk_pin", String(values.audioI2sBclkPin));
+    APPEND_CONFIG_VALUE("audio_i2s_ws_pin", String(values.audioI2sWsPin));
+    APPEND_CONFIG_VALUE("audio_i2s_data_pin", String(values.audioI2sDataPin));
+    APPEND_CONFIG_VALUE("audio_i2s_mclk_pin", String(values.audioI2sMclkPin));
+    APPEND_CONFIG_VALUE("audio_i2s_slot", values.audioI2sSlot);
+    APPEND_CONFIG_VALUE("audio_sample_rate", String(values.audioSampleRate));
+    APPEND_CONFIG_VALUE("audio_bits_per_sample", String(values.audioBitsPerSample));
+    APPEND_CONFIG_VALUE("audio_channels", String(values.audioChannels));
+
+    APPEND_CONFIG_VALUE("shooter_enabled", String(values.shooterEnabled));
+    APPEND_CONFIG_VALUE("shooter_storage_format", values.shooterStorageFormat);
+    APPEND_CONFIG_VALUE("shooter_interval_ms", String(values.shooterIntervalMs));
+    APPEND_CONFIG_VALUE("shooter_dark_mean_min", String(values.shooterDarkMeanMin));
+    APPEND_CONFIG_VALUE("shooter_min_change_pct", String(values.shooterMinChangePct, 1));
+    APPEND_CONFIG_VALUE("shooter_motion_hint_change_pct", String(values.shooterMotionHintChangePct, 1));
+    APPEND_CONFIG_VALUE("shooter_motion_hint_required_hits", String(values.shooterMotionHintRequiredHits));
+    APPEND_CONFIG_VALUE("shooter_motion_hint_window_frames", String(values.shooterMotionHintWindowFrames));
+    APPEND_CONFIG_VALUE("shooter_force_save_seconds", String(values.shooterForceSaveSeconds));
+    APPEND_CONFIG_VALUE("shooter_flush_seconds", String(values.shooterFlushSeconds));
+
+    APPEND_CONFIG_VALUE("recording_segment_seconds", String(values.recordingSegmentSeconds));
+    APPEND_CONFIG_VALUE("recording_segment_max_mb", String(values.recordingSegmentMaxMb));
+    APPEND_CONFIG_VALUE("recording_event_max_seconds", String(values.recordingEventMaxSeconds));
+    APPEND_CONFIG_VALUE("recording_event_cooldown_seconds", String(values.recordingEventCooldownSeconds));
+    APPEND_CONFIG_VALUE("recording_not_before", values.recordingNotBefore);
+
+    APPEND_CONFIG_VALUE("motion_recording_enabled", String(values.motionRecordingEnabled));
+    APPEND_CONFIG_VALUE("motion_recording_decision", values.motionRecordingDecision);
+    APPEND_CONFIG_VALUE("image_motion_sensitivity", String(values.imageMotionSensitivity));
+    APPEND_CONFIG_VALUE("image_motion_min_area_pct", String(values.imageMotionMinAreaPct, 1));
+    APPEND_CONFIG_VALUE("image_motion_confirm_frames", String(values.imageMotionConfirmFrames));
+    APPEND_CONFIG_VALUE("image_motion_release_frames", String(values.imageMotionReleaseFrames));
+    APPEND_CONFIG_VALUE("image_motion_background_learning", String(values.imageMotionBackgroundLearning));
+    APPEND_CONFIG_VALUE("image_motion_global_mean_delta", String(values.imageMotionGlobalMeanDelta));
+    APPEND_CONFIG_VALUE("image_motion_global_change_pct", String(values.imageMotionGlobalChangePct));
+    APPEND_CONFIG_VALUE("image_motion_roi_mask", values.imageMotionRoiMask);
+
+    APPEND_CONFIG_VALUE("post_record_ms", String(values.postMs));
+    APPEND_CONFIG_VALUE("led_enabled", String(values.ledEnabled));
+
+    APPEND_CONFIG_VALUE("operating_mode", values.operatingMode);
+    APPEND_CONFIG_VALUE("streamer_rtsp_enabled", String(values.streamerRtspEnabled));
+    APPEND_CONFIG_VALUE("streamer_http_mjpeg_enabled", String(values.streamerHttpMjpegEnabled));
+    APPEND_CONFIG_VALUE("onvif_enabled", String(values.onvifEnabled));
+
+    APPEND_CONFIG_VALUE("wireguard_enabled", String(values.wireguardEnabled));
+    APPEND_CONFIG_VALUE("wireguard_address", values.wireguardAddress);
+    APPEND_CONFIG_VALUE("wireguard_private_key", values.wireguardPrivateKey);
+    APPEND_CONFIG_VALUE("wireguard_peer_endpoint", values.wireguardPeerEndpoint);
+    APPEND_CONFIG_VALUE("wireguard_peer_public_key", values.wireguardPeerPublicKey);
+    APPEND_CONFIG_VALUE("wireguard_peer_port", String(values.wireguardPeerPort));
+
+    APPEND_CONFIG_VALUE("sleep_mode", values.sleepMode);
+    APPEND_CONFIG_VALUE("sleep_delay_ms", String(values.sleepDelayMs));
+    APPEND_CONFIG_VALUE("bootloop_protection", String(values.bootloopProtection));
+
+    APPEND_CONFIG_VALUE("transport_mode", String(values.transportMode));
+    APPEND_CONFIG_VALUE("transport_check_seconds", String(values.transportCheckSeconds));
+    APPEND_CONFIG_VALUE("transport_light_confirm_seconds", String(values.transportLightConfirmSeconds));
+    APPEND_CONFIG_VALUE("transport_install_delay_seconds", String(values.transportInstallDelaySeconds));
+    APPEND_CONFIG_VALUE("transport_max_duration_seconds", String(values.transportMaxDurationSeconds));
+    APPEND_CONFIG_VALUE("transport_black_threshold", String(values.transportBlackThreshold));
+
+    APPEND_CONFIG_VALUE("min_free_space_mb", String(values.minFreeSpaceMb));
+    APPEND_CONFIG_VALUE("disk_full_action", values.diskFullAction);
+
+    APPEND_CONFIG_VALUE("wifi_on_system_start", values.wifiOnSystemStart);
+    APPEND_CONFIG_VALUE("wifi_timeout_sec", String(values.wifiTimeoutSec));
+    APPEND_CONFIG_VALUE("wifi_alive_schedule_enabled", String(values.wifiAliveScheduleEnabled));
+    APPEND_CONFIG_VALUE("wifi_alive_schedule", values.wifiAliveSchedule);
+    APPEND_CONFIG_VALUE("hostname", values.hostname);
+    APPEND_CONFIG_VALUE("camera_display_name", values.cameraDisplayName);
+    APPEND_CONFIG_VALUE("camera_location", values.cameraLocation);
+    APPEND_CONFIG_VALUE("camera_gps_lat", values.cameraGpsLat);
+    APPEND_CONFIG_VALUE("camera_gps_lon", values.cameraGpsLon);
+    APPEND_CONFIG_VALUE("camera_responsible", values.cameraResponsible);
+    APPEND_CONFIG_VALUE("camera_email", values.cameraEmail);
+    APPEND_CONFIG_VALUE("camera_overlay_text", values.cameraOverlayText);
+    APPEND_CONFIG_VALUE("camera_description", values.cameraDescription);
+    APPEND_CONFIG_VALUE("timezone", values.timezone);
+    APPEND_CONFIG_VALUE("wifi_ssid", values.wifiSsids[0]);
+    APPEND_CONFIG_VALUE("wifi_pass", values.wifiPasses[0]);
+    for (size_t i = 1; i < SENSORFORGE_WIFI_PROFILE_COUNT; ++i) {
+        APPEND_CONFIG_VALUE((String("wifi_ssid_") + String(i + 1)).c_str(), values.wifiSsids[i]);
+        APPEND_CONFIG_VALUE((String("wifi_pass_") + String(i + 1)).c_str(), values.wifiPasses[i]);
+    }
+    APPEND_CONFIG_VALUE("wifi_tx_power_dbm", String(values.wifiTxPowerDbm, 1));
+
+    APPEND_CONFIG_VALUE("cluster_enabled", String(values.clusterEnabled));
+    APPEND_CONFIG_VALUE("cluster_id", values.clusterId);
+    APPEND_CONFIG_VALUE("cluster_name", values.clusterName);
+    APPEND_CONFIG_VALUE("cluster_credential_epoch", String((unsigned long)values.clusterCredentialEpoch));
+    APPEND_CONFIG_VALUE("cluster_password", values.clusterPassword);
+    APPEND_CONFIG_VALUE("cluster_coordinator_policy", values.clusterCoordinatorPolicy);
+
+    APPEND_CONFIG_VALUE("hotspot_enabled", String(values.hotspotEnabled));
+    APPEND_CONFIG_VALUE("hotspot_fallback_enabled", String(values.hotspotFallbackEnabled));
+    APPEND_CONFIG_VALUE("hotspot_password", values.hotspotPassword);
+    APPEND_CONFIG_VALUE("hotspot_hidden", String(values.hotspotHidden));
+
+    APPEND_CONFIG_VALUE("web_auth_enabled", String(values.webAuthEnabled));
+    APPEND_CONFIG_VALUE("web_recording_auto_pause", String(values.webRecordingAutoPause));
+    APPEND_CONFIG_VALUE("web_language", values.webLanguage);
+    APPEND_CONFIG_VALUE("web_username", values.webUsername);
+    APPEND_CONFIG_VALUE("web_password", values.webPassword);
+    for (size_t i = 0; i < SENSORFORGE_STREAM_USER_COUNT; ++i) {
+        APPEND_CONFIG_VALUE((String("stream_username_") + String(i + 1)).c_str(), values.streamUsernames[i]);
+        APPEND_CONFIG_VALUE((String("stream_password_") + String(i + 1)).c_str(), values.streamPasswords[i]);
+    }
+    APPEND_CONFIG_VALUE("stream_allow_annotation_edit", String(values.streamAllowAnnotationEdit));
+    APPEND_CONFIG_VALUE("stream_allow_delete", String(values.streamAllowDelete));
+
+    APPEND_CONFIG_VALUE("debug_enabled", String(values.debugEnabled));
+    APPEND_CONFIG_VALUE("log_file", values.logFile);
+
+#undef APPEND_CONFIG_VALUE
+
+    return true;
+}
+
+
+static void clearSeen(
+    ConfigSeen &seen
+)
+{
+    memset(
+        &seen,
+        0,
+        sizeof(seen)
+    );
+}
+
+
+// =============================================================
+// VALIDATION HELPERS
+// =============================================================
+
+static bool parseIntegerStrict(
+    const String &text,
+    long &value
+)
+{
+    if (!text.length())
+        return false;
+
+    size_t start =
+        0;
+
+    if (
+        text[0] == '-' ||
+        text[0] == '+'
+    ) {
+        if (text.length() == 1)
+            return false;
+
+        start =
+            1;
+    }
+
+    for (
+        size_t i = start;
+        i < text.length();
+        ++i
+    ) {
+        if (!isDigit(text[i]))
+            return false;
+    }
+
+    value =
+        text.toInt();
+
+    return true;
+}
+
+
+static bool parseFloatStrict(
+    const String &text,
+    float &value
+)
+{
+    if (!text.length())
+        return false;
+
+    const char *start =
+        text.c_str();
+
+    char *end =
+        nullptr;
+
+    double parsed =
+        strtod(
+            start,
+            &end
+        );
+
+    if (
+        end == start ||
+        !end ||
+        *end != '\0' ||
+        !isfinite(parsed)
+    ) {
+        return false;
+    }
+
+    value =
+        (float)parsed;
+
+    return true;
+}
+
+
+static bool isSupportedResolution(
+    const String &value
+)
+{
+    return
+        value == "160x120" ||
+        value == "320x240" ||
+        value == "640x480" ||
+        value == "800x600" ||
+        value == "1024x768" ||
+        value == "1280x1024" ||
+        value == "1600x1200" ||
+        value == "2048x1536";
+}
+
+
+static uint32_t resolutionPixelCount(
+    const String &value
+)
+{
+    if (value == "160x120")
+        return 160UL * 120UL;
+
+    if (value == "320x240")
+        return 320UL * 240UL;
+
+    if (value == "640x480")
+        return 640UL * 480UL;
+
+    if (value == "800x600")
+        return 800UL * 600UL;
+
+    if (value == "1024x768")
+        return 1024UL * 768UL;
+
+    if (value == "1280x1024")
+        return 1280UL * 1024UL;
+
+    if (value == "1600x1200")
+        return 1600UL * 1200UL;
+
+    if (value == "2048x1536")
+        return 2048UL * 1536UL;
+
+    return 0;
+}
+
+
+uint32_t configRecordingPerformanceLimit()
+{
+    return
+        (uint32_t)RECORDING_MAX_WEIGHTED_PIXEL_RATE;
+}
+
+
+uint16_t configRecordingQualityWeightPercent(int quality)
+{
+    // esp32-camera JPEG quality uses a smaller numeric value for better image
+    // quality and normally larger JPEG frames. The performance guard therefore
+    // adds a conservative 5% load per step below the tested reference value 12.
+    // Numerically larger values never increase the allowed board ceiling: the
+    // minimum weight remains 100%. The maximum 160% also covers quality=0.
+    if (quality >= 12)
+        return 100;
+
+    if (quality < 0)
+        quality = 0;
+
+    int percent =
+        100 +
+        (12 - quality) * 5;
+
+    if (percent > 160)
+        percent = 160;
+
+    return
+        (uint16_t)percent;
+}
+
+
+uint32_t configRecordingPerformanceLoad(
+    const String &resolution,
+    int fps,
+    int quality
+)
+{
+    uint32_t pixels =
+        resolutionPixelCount(
+            resolution
+        );
+
+    if (pixels == 0 || fps <= 0)
+        return 0;
+
+    uint32_t qualityWeight =
+        configRecordingQualityWeightPercent(
+            quality
+        );
+
+    uint64_t weighted =
+        (uint64_t)pixels *
+        (uint64_t)fps *
+        (uint64_t)qualityWeight;
+
+    weighted =
+        (weighted + 99ULL) /
+        100ULL;
+
+    if (weighted > UINT32_MAX)
+        return UINT32_MAX;
+
+    return
+        (uint32_t)weighted;
+}
+
+
+int configRecordingPerformanceMaxFps(
+    const String &resolution,
+    int quality
+)
+{
+    uint32_t limit =
+        configRecordingPerformanceLimit();
+
+    // 0 explicitly means: this board has no qualified performance ceiling yet.
+    if (limit == 0)
+        return 30;
+
+    uint32_t pixels =
+        resolutionPixelCount(
+            resolution
+        );
+
+    if (pixels == 0)
+        return 0;
+
+    uint32_t qualityWeight =
+        configRecordingQualityWeightPercent(
+            quality
+        );
+
+    uint64_t denominator =
+        (uint64_t)pixels *
+        (uint64_t)qualityWeight;
+
+    if (denominator == 0)
+        return 0;
+
+    uint64_t maxFps =
+        ((uint64_t)limit * 100ULL) /
+        denominator;
+
+    if (maxFps > 30ULL)
+        maxFps = 30ULL;
+
+#if RECORDING_PRODUCTION_FPS_CAP_1024X768 > 0
+    if (
+        resolution == "1024x768" &&
+        maxFps > (uint64_t)RECORDING_PRODUCTION_FPS_CAP_1024X768
+    ) {
+        maxFps =
+            (uint64_t)RECORDING_PRODUCTION_FPS_CAP_1024X768;
+    }
+#endif
+
+    return
+        (int)maxFps;
+}
+
+
+bool configRecordingPerformanceAllowed(
+    const String &resolution,
+    int fps,
+    int quality,
+    uint32_t &load,
+    uint32_t &limit
+)
+{
+    load =
+        configRecordingPerformanceLoad(
+            resolution,
+            fps,
+            quality
+        );
+
+    limit =
+        configRecordingPerformanceLimit();
+
+    if (limit == 0)
+        return true;
+
+    if (load == 0)
+        return false;
+
+    return
+        load <= limit;
+}
+
+
+struct RecordingNotBeforeParts {
+    int year;
+    int month;
+    int day;
+    int hour;
+    int minute;
+    int second;
+};
+
+
+static bool recordingNotBeforeDigits(
+    const String &text,
+    size_t offset,
+    size_t count,
+    int &value
+)
+{
+    if (offset + count > text.length())
+        return false;
+
+    int result = 0;
+
+    for (size_t i = 0; i < count; ++i) {
+        char c = text[offset + i];
+
+        if (c < '0' || c > '9')
+            return false;
+
+        result =
+            result * 10 +
+            (c - '0');
+    }
+
+    value = result;
+    return true;
+}
+
+
+static bool recordingNotBeforeLeapYear(int year)
+{
+    return
+        (year % 4 == 0 && year % 100 != 0) ||
+        (year % 400 == 0);
+}
+
+
+static int recordingNotBeforeDaysInMonth(
+    int year,
+    int month
+)
+{
+    static const uint8_t days[] = {
+        31, 28, 31, 30, 31, 30,
+        31, 31, 30, 31, 30, 31
+    };
+
+    if (month < 1 || month > 12)
+        return 0;
+
+    if (month == 2 && recordingNotBeforeLeapYear(year))
+        return 29;
+
+    return days[month - 1];
+}
+
+
+static bool parseRecordingNotBeforeParts(
+    const String &text,
+    RecordingNotBeforeParts &parts
+)
+{
+    // Strict, unambiguous local ISO representation.
+    // Example: 2026-09-10T05:30:00
+    if (text.length() != 19)
+        return false;
+
+    if (
+        text[4] != '-' ||
+        text[7] != '-' ||
+        text[10] != 'T' ||
+        text[13] != ':' ||
+        text[16] != ':'
+    ) {
+        return false;
+    }
+
+    if (
+        !recordingNotBeforeDigits(text, 0, 4, parts.year) ||
+        !recordingNotBeforeDigits(text, 5, 2, parts.month) ||
+        !recordingNotBeforeDigits(text, 8, 2, parts.day) ||
+        !recordingNotBeforeDigits(text, 11, 2, parts.hour) ||
+        !recordingNotBeforeDigits(text, 14, 2, parts.minute) ||
+        !recordingNotBeforeDigits(text, 17, 2, parts.second)
+    ) {
+        return false;
+    }
+
+    if (parts.year < 2021 || parts.year > 2099)
+        return false;
+
+    if (parts.month < 1 || parts.month > 12)
+        return false;
+
+    int maxDay =
+        recordingNotBeforeDaysInMonth(
+            parts.year,
+            parts.month
+        );
+
+    if (parts.day < 1 || parts.day > maxDay)
+        return false;
+
+    if (parts.hour < 0 || parts.hour > 23)
+        return false;
+
+    if (parts.minute < 0 || parts.minute > 59)
+        return false;
+
+    if (parts.second < 0 || parts.second > 59)
+        return false;
+
+    return true;
+}
+
+
+static bool markOnce(
+    bool &flag,
+    const String &key,
+    String &error
+)
+{
+    if (flag) {
+        error =
+            "duplicate key: " +
+            key;
+
+        return false;
+    }
+
+    flag =
+        true;
+
+    return true;
+}
+
+
+static bool allRequiredKeysSeen(
+    const ConfigSeen &seen,
+    String &error
+)
+{
+    struct RequiredKey {
+        const char *name;
+        bool present;
+    };
+
+    const RequiredKey required[] = {
+        {"camera", seen.camera},
+        {"resolution", seen.resolution},
+        {"fps", seen.fps},
+        {"quality", seen.quality},
+        // Upgrade-added camera fields are optional. Missing values use
+        // setDefaultValues(), so older SD configs remain OTA-compatible.
+        {"rotation", seen.rotation},
+        {"recording_format", seen.recordingFormat},
+        {"timestamp_enabled", seen.timestampEnabled},
+        {"post_record_ms", seen.postMs},
+        {"led_enabled", seen.ledEnabled},
+        {"min_free_space_mb", seen.minFreeSpaceMb},
+        {"disk_full_action", seen.diskFullAction},
+        {"wifi_on_system_start", seen.wifiOnSystemStart},
+        {"hostname", seen.hostname},
+        // timezone was added after the original config schema; if absent,
+        // setDefaultValues() supplies the firmware default.
+        {"wifi_ssid", seen.wifiSsids[0]},
+        {"wifi_pass", seen.wifiPasses[0]},
+        {"debug_enabled", seen.debugEnabled},
+        {"log_file", seen.logFile},
+    };
+
+    for (
+        const RequiredKey &item :
+        required
+    ) {
+
+        if (!item.present) {
+
+            error =
+                "missing key: " +
+                String(item.name);
+
+            return false;
+        }
+    }
+
+    return true;
+}
+
+
+
+static bool audioPinMatchesCamera(
+    int pin,
+    const ConfigValues &values
+)
+{
+    if (pin < 0)
+        return false;
+
+    camera_pins_t cameraPins =
+        selectCamera(values.camera);
+
+    const int cameraPinList[] = {
+        cameraPins.pin_pwdn,
+        cameraPins.pin_reset,
+        cameraPins.pin_xclk,
+        cameraPins.pin_sscb_sda,
+        cameraPins.pin_sscb_scl,
+        cameraPins.pin_d7,
+        cameraPins.pin_d6,
+        cameraPins.pin_d5,
+        cameraPins.pin_d4,
+        cameraPins.pin_d3,
+        cameraPins.pin_d2,
+        cameraPins.pin_d1,
+        cameraPins.pin_d0,
+        cameraPins.pin_vsync,
+        cameraPins.pin_href,
+        cameraPins.pin_pclk
+    };
+
+    for (int reservedPin : cameraPinList) {
+        if (reservedPin >= 0 && pin == reservedPin)
+            return true;
+    }
+
+    return false;
+}
+
+
+static bool audioExternalPinConflict(
+    int pin,
+    const ConfigValues &values,
+    String &reason
+)
+{
+    reason = "";
+
+    if (pin < 0)
+        return false;
+
+    // ESP32-S3 SPI0/1 flash/PSRAM bus. Do not permit expert audio routing
+    // onto pins that may be physically tied to module memory.
+    if (pin >= 26 && pin <= 37) {
+        reason = "ESP32-S3 flash/PSRAM bus";
+        return true;
+    }
+
+    if (audioPinMatchesCamera(pin, values)) {
+        reason = "camera";
+        return true;
+    }
+
+    if (pin == (int)PRESENCE_PIN) {
+        reason = "presence/PIR";
+        return true;
+    }
+
+    if (pin == (int)MAGNET_SWITCH_PIN) {
+        reason = "magnet switch";
+        return true;
+    }
+
+    if (pin == (int)RADAR_RX_PIN || pin == (int)RADAR_TX_PIN) {
+        reason = "radar UART";
+        return true;
+    }
+
+    if (pin == (int)RTC_SDA_PIN || pin == (int)RTC_SCL_PIN) {
+        reason = "RTC/I2C";
+        return true;
+    }
+
+#if STATUS_LED_AVAILABLE
+    if (pin == (int)LED_PIN) {
+        reason = "status LED";
+        return true;
+    }
+#endif
+
+#if defined(STORAGE_SPI)
+    if (
+        pin == (int)SD_CS_PIN ||
+        pin == (int)SD_SCK_PIN ||
+        pin == (int)SD_MISO_PIN ||
+        pin == (int)SD_MOSI_PIN
+    ) {
+        reason = "microSD SPI";
+        return true;
+    }
+#elif defined(STORAGE_SDMMC)
+    if (
+        pin == (int)SD_MMC_CMD ||
+        pin == (int)SD_MMC_CLK ||
+        pin == (int)SD_MMC_D0
+    ) {
+        reason = "microSD SD_MMC";
+        return true;
+    }
+#endif
+
+#if BOARD_HAS_INTEGRATED_MIC
+#if defined(BOARD_INTEGRATED_MIC_BACKEND_PDM)
+    if (
+        pin == (int)BOARD_INTEGRATED_MIC_PDM_CLK_PIN ||
+        pin == (int)BOARD_INTEGRATED_MIC_PDM_DATA_PIN
+    ) {
+        reason = "integrated microphone";
+        return true;
+    }
+#endif
+#endif
+
+    return false;
+}
+
+
+static bool validateExternalAudioPin(
+    int pin,
+    bool optional,
+    const char *keyName,
+    const ConfigValues &values,
+    String &error
+)
+{
+    if (optional && pin == -1)
+        return true;
+
+    if (pin < 0 || pin > 48) {
+        error =
+            String(keyName) +
+            " must be GPIO 0..48" +
+            (optional ? " or -1" : "");
+        return false;
+    }
+
+    String reason;
+
+    if (audioExternalPinConflict(
+            pin,
+            values,
+            reason
+        )) {
+        error =
+            String(keyName) +
+            "=GPIO" +
+            String(pin) +
+            " conflicts with " +
+            reason;
+        return false;
+    }
+
+    return true;
+}
+
+
+static bool audioPinsAreUnique(
+    const int *pins,
+    size_t count,
+    String &error
+)
+{
+    for (size_t i = 0; i < count; ++i) {
+        if (pins[i] < 0)
+            continue;
+
+        for (size_t j = i + 1; j < count; ++j) {
+            if (pins[j] >= 0 && pins[i] == pins[j]) {
+                error =
+                    "external audio GPIO assignments must be unique";
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+
+static bool validateValues(
+    ConfigValues &values,
+    String &error
+)
+{
+    values.camera.trim();
+    values.resolution.trim();
+
+    values.cameraCropZoom.trim();
+
+    values.recordingFormat.trim();
+    values.recordingFormat.toLowerCase();
+
+    values.audioSource.trim();
+    values.audioSource.toLowerCase();
+
+    values.audioBackend.trim();
+    values.audioBackend.toLowerCase();
+
+    values.audioI2sSlot.trim();
+    values.audioI2sSlot.toLowerCase();
+
+    values.recordingNotBefore.trim();
+
+    values.shooterStorageFormat.trim();
+    values.shooterStorageFormat.toLowerCase();
+
+    String recordingNotBeforeLower =
+        values.recordingNotBefore;
+
+    recordingNotBeforeLower.toLowerCase();
+
+    if (recordingNotBeforeLower == "off") {
+        values.recordingNotBefore = "off";
+    }
+
+    values.diskFullAction.trim();
+    values.diskFullAction.toLowerCase();
+
+    values.operatingMode.trim();
+    values.operatingMode.toLowerCase();
+
+    values.sleepMode.trim();
+    values.sleepMode.toLowerCase();
+
+    values.wifiOnSystemStart.trim();
+    values.wifiOnSystemStart.toLowerCase();
+
+    // Backward compatibility for config files written by older firmware.
+    // The active runtime value is always normalized to the new vocabulary.
+    if (values.wifiOnSystemStart == "never") {
+        values.wifiOnSystemStart = "off";
+    } else if (values.wifiOnSystemStart == "always") {
+        values.wifiOnSystemStart = "on";
+    }
+
+    values.hostname.trim();
+    values.timezone.trim();
+    for (size_t i = 0; i < SENSORFORGE_WIFI_PROFILE_COUNT; ++i)
+        values.wifiSsids[i].trim();
+
+    values.clusterId.trim();
+    values.clusterId.toLowerCase();
+    values.clusterName.trim();
+    values.clusterCoordinatorPolicy.trim();
+    values.clusterCoordinatorPolicy.toLowerCase();
+
+    values.webLanguage.trim();
+    values.webLanguage.toLowerCase();
+
+    values.webUsername.trim();
+    for (size_t i = 0; i < SENSORFORGE_STREAM_USER_COUNT; ++i)
+        values.streamUsernames[i].trim();
+
+    values.logFile.trim();
+
+
+    if (!values.camera.length()) {
+        error =
+            "camera is empty";
+
+        return false;
+    }
+
+
+    if (!isSupportedResolution(
+            values.resolution
+        )) {
+
+        error =
+            "invalid resolution";
+
+        return false;
+    }
+
+
+    if (
+        values.fps < 1 ||
+        values.fps > 30
+    ) {
+
+        error =
+            "fps out of range";
+
+        return false;
+    }
+
+
+    if (
+        values.quality < 0 ||
+        values.quality > 63
+    ) {
+
+        error =
+            "quality out of range";
+
+        return false;
+    }
+
+
+    {
+        uint32_t performanceLoad = 0;
+        uint32_t performanceLimit = 0;
+
+        if (!configRecordingPerformanceAllowed(
+                values.resolution,
+                values.fps,
+                values.quality,
+                performanceLoad,
+                performanceLimit
+            )) {
+
+            int maxFps =
+                configRecordingPerformanceMaxFps(
+                    values.resolution,
+                    values.quality
+                );
+
+            error =
+                "recording performance limit exceeded: " +
+                values.resolution +
+                " @ " +
+                String(values.fps) +
+                " fps, quality=" +
+                String(values.quality) +
+                ", score=" +
+                String((unsigned long)performanceLoad) +
+                ", board_limit=" +
+                String((unsigned long)performanceLimit) +
+                ", max_fps=" +
+                String(maxFps);
+
+            return false;
+        }
+    }
+
+
+    if (
+        values.cameraXclkMhz != 10 &&
+        values.cameraXclkMhz != 16 &&
+        values.cameraXclkMhz != 20
+    ) {
+
+        error =
+            "camera_xclk_mhz must be 10, 16 or 20";
+
+        return false;
+    }
+
+
+    if (
+        values.cameraAutoExposure != 0 &&
+        values.cameraAutoExposure != 1
+    ) {
+
+        error =
+            "camera_auto_exposure must be 0 or 1";
+
+        return false;
+    }
+
+
+    if (
+        values.cameraAeLevel < -2 ||
+        values.cameraAeLevel > 2
+    ) {
+
+        error =
+            "camera_ae_level out of range (-2..2)";
+
+        return false;
+    }
+
+
+    if (
+        values.cameraCropZoom != "1.0" &&
+        values.cameraCropZoom != "1.5" &&
+        values.cameraCropZoom != "2.0"
+    ) {
+
+        error =
+            "camera_crop_zoom must be 1.0, 1.5 or 2.0";
+
+        return false;
+    }
+
+
+    if (
+        values.cameraCropX < 0 ||
+        values.cameraCropX > 2 ||
+        values.cameraCropY < 0 ||
+        values.cameraCropY > 2
+    ) {
+
+        error =
+            "camera_crop_x/camera_crop_y out of range (0..2)";
+
+        return false;
+    }
+
+
+    if (
+        values.rotation != 0 &&
+        values.rotation != 180
+    ) {
+
+        error =
+            "rotation must be 0 or 180";
+
+        return false;
+    }
+
+
+    if (
+        values.recordingFormat != "avi" &&
+        values.recordingFormat != "mkv"
+    ) {
+
+        error =
+            "recording_format must be avi or mkv";
+
+        return false;
+    }
+
+
+    if (
+        values.timestampEnabled != 0 &&
+        values.timestampEnabled != 1
+    ) {
+
+        error =
+            "timestamp_enabled must be 0 or 1";
+
+        return false;
+    }
+
+
+    if (
+        values.recordingEncryption != 0 &&
+        values.recordingEncryption != 1
+    ) {
+
+        error =
+            "recording_encryption must be 0 or 1";
+
+        return false;
+    }
+
+    if (
+        values.audioEnabled != 0 &&
+        values.audioEnabled != 1
+    ) {
+        error = "audio_enabled must be 0 or 1";
+        return false;
+    }
+
+    if (
+        values.audioExpertMode != 0 &&
+        values.audioExpertMode != 1
+    ) {
+        error = "audio_expert_mode must be 0 or 1";
+        return false;
+    }
+
+    if (
+        values.audioSource != "board_default" &&
+        values.audioSource != "external"
+    ) {
+        error = "audio_source must be board_default or external";
+        return false;
+    }
+
+    if (
+        values.audioBackend != "pdm" &&
+        values.audioBackend != "i2s"
+    ) {
+        error = "audio_backend must be pdm or i2s";
+        return false;
+    }
+
+    if (
+        values.audioI2sSlot != "left" &&
+        values.audioI2sSlot != "right" &&
+        values.audioI2sSlot != "stereo"
+    ) {
+        error = "audio_i2s_slot must be left, right or stereo";
+        return false;
+    }
+
+    const int audioConfiguredPins[] = {
+        values.audioPdmClkPin,
+        values.audioPdmDataPin,
+        values.audioI2sBclkPin,
+        values.audioI2sWsPin,
+        values.audioI2sDataPin,
+        values.audioI2sMclkPin
+    };
+
+    for (int pin : audioConfiguredPins) {
+        if (pin < -1 || pin > 48) {
+            error = "audio GPIO values must be -1 or GPIO 0..48";
+            return false;
+        }
+    }
+
+    if (
+        values.audioSampleRate < 8000 ||
+        values.audioSampleRate > 96000
+    ) {
+        error = "audio_sample_rate out of range (8000..96000)";
+        return false;
+    }
+
+    if (
+        values.audioBitsPerSample != 16 &&
+        values.audioBitsPerSample != 24 &&
+        values.audioBitsPerSample != 32
+    ) {
+        error = "audio_bits_per_sample must be 16, 24 or 32";
+        return false;
+    }
+
+    if (
+        values.audioChannels != 1 &&
+        values.audioChannels != 2
+    ) {
+        error = "audio_channels must be 1 or 2";
+        return false;
+    }
+
+    if (values.audioSource == "external") {
+        if (!values.audioExpertMode) {
+            error = "audio_source=external requires audio_expert_mode=1";
+            return false;
+        }
+
+        if (values.audioBackend == "pdm") {
+            if (
+                !validateExternalAudioPin(
+                    values.audioPdmClkPin,
+                    false,
+                    "audio_pdm_clk_pin",
+                    values,
+                    error
+                ) ||
+                !validateExternalAudioPin(
+                    values.audioPdmDataPin,
+                    false,
+                    "audio_pdm_data_pin",
+                    values,
+                    error
+                )
+            ) {
+                return false;
+            }
+
+            const int pdmPins[] = {
+                values.audioPdmClkPin,
+                values.audioPdmDataPin
+            };
+
+            if (!audioPinsAreUnique(
+                    pdmPins,
+                    sizeof(pdmPins) / sizeof(pdmPins[0]),
+                    error
+                )) {
+                return false;
+            }
+
+            // Keep the first external PDM implementation deliberately
+            // conservative. Higher quality can be qualified later without
+            // changing the config schema or container interface.
+            if (
+                values.audioSampleRate < 8000 ||
+                values.audioSampleRate > 48000
+            ) {
+                error = "external PDM supports 8000..48000 Hz";
+                return false;
+            }
+
+            if (
+                values.audioBitsPerSample != 16 ||
+                values.audioChannels != 1
+            ) {
+                error = "external PDM currently supports 16-bit mono";
+                return false;
+            }
+
+        } else {
+            if (
+                !validateExternalAudioPin(
+                    values.audioI2sBclkPin,
+                    false,
+                    "audio_i2s_bclk_pin",
+                    values,
+                    error
+                ) ||
+                !validateExternalAudioPin(
+                    values.audioI2sWsPin,
+                    false,
+                    "audio_i2s_ws_pin",
+                    values,
+                    error
+                ) ||
+                !validateExternalAudioPin(
+                    values.audioI2sDataPin,
+                    false,
+                    "audio_i2s_data_pin",
+                    values,
+                    error
+                ) ||
+                !validateExternalAudioPin(
+                    values.audioI2sMclkPin,
+                    true,
+                    "audio_i2s_mclk_pin",
+                    values,
+                    error
+                )
+            ) {
+                return false;
+            }
+
+            const int i2sPins[] = {
+                values.audioI2sBclkPin,
+                values.audioI2sWsPin,
+                values.audioI2sDataPin,
+                values.audioI2sMclkPin
+            };
+
+            if (!audioPinsAreUnique(
+                    i2sPins,
+                    sizeof(i2sPins) / sizeof(i2sPins[0]),
+                    error
+                )) {
+                return false;
+            }
+
+            // 24-bit DMA packing is intentionally not enabled yet. 16-bit PCM
+            // is the qualified common denominator for WAV and MKV muxing.
+            if (values.audioBitsPerSample != 16) {
+                error = "external I2S currently supports 16-bit PCM";
+                return false;
+            }
+
+            if (
+                values.audioChannels == 2 &&
+                values.audioI2sSlot != "stereo"
+            ) {
+                error = "stereo I2S requires audio_i2s_slot=stereo";
+                return false;
+            }
+
+            if (
+                values.audioChannels == 1 &&
+                values.audioI2sSlot == "stereo"
+            ) {
+                error = "mono I2S requires audio_i2s_slot=left or right";
+                return false;
+            }
+        }
+
+    } else if (values.audioEnabled) {
+#if BOARD_HAS_INTEGRATED_MIC
+#if defined(BOARD_INTEGRATED_MIC_BACKEND_PDM)
+        if (
+            values.audioSampleRate <
+                (int)BOARD_INTEGRATED_MIC_MIN_SAMPLE_RATE_HZ ||
+            values.audioSampleRate >
+                (int)BOARD_INTEGRATED_MIC_MAX_SAMPLE_RATE_HZ ||
+            values.audioBitsPerSample != 16 ||
+            values.audioChannels != 1
+        ) {
+            error =
+                "board-default microphone requires " +
+                String((unsigned long)BOARD_INTEGRATED_MIC_RECOMMENDED_SAMPLE_RATE_HZ) +
+                " Hz, 16-bit mono";
+            return false;
+        }
+#else
+#error "BOARD_HAS_INTEGRATED_MIC requires a supported integrated mic backend"
+#endif
+#else
+        error =
+            "audio_enabled=1 with audio_source=board_default but this board has no integrated microphone";
+        return false;
+#endif
+    }
+
+    if (
+        values.shooterEnabled != 0 &&
+        values.shooterEnabled != 1
+    ) {
+        error = "shooter_enabled must be 0 or 1";
+        return false;
+    }
+
+    if (
+        values.shooterStorageFormat != "mkv" &&
+        values.shooterStorageFormat != "jpg"
+    ) {
+        error = "shooter_storage_format must be mkv or jpg";
+        return false;
+    }
+
+    if (
+        values.shooterIntervalMs != 0 &&
+        (
+            values.shooterIntervalMs < 250 ||
+            values.shooterIntervalMs > 86400000
+        )
+    ) {
+        error =
+            "shooter_interval_ms must be 0 or 250..86400000";
+        return false;
+    }
+
+    if (
+        values.shooterEnabled &&
+        values.shooterIntervalMs == 0
+    ) {
+        error =
+            "shooter_enabled requires shooter_interval_ms >= 250";
+        return false;
+    }
+
+    if (
+        values.shooterDarkMeanMin < 0 ||
+        values.shooterDarkMeanMin > 255
+    ) {
+        error =
+            "shooter_dark_mean_min out of range (0..255)";
+        return false;
+    }
+
+    if (
+        values.shooterMinChangePct < 0.0f ||
+        values.shooterMinChangePct > 100.0f ||
+        (
+            values.shooterMinChangePct > 0.0f &&
+            values.shooterMinChangePct < 0.1f
+        )
+    ) {
+        error =
+            "shooter_min_change_pct must be 0 or 0.1..100.0";
+        return false;
+    }
+
+    if (
+        values.shooterMotionHintChangePct < 0.1f ||
+        values.shooterMotionHintChangePct > 100.0f
+    ) {
+        error =
+            "shooter_motion_hint_change_pct out of range (0.1..100.0)";
+        return false;
+    }
+
+    if (
+        values.shooterMinChangePct > 0.0f &&
+        values.shooterMotionHintChangePct <
+            values.shooterMinChangePct
+    ) {
+        error =
+            "shooter_motion_hint_change_pct must be >= shooter_min_change_pct";
+        return false;
+    }
+
+    if (
+        values.shooterMotionHintWindowFrames < 1 ||
+        values.shooterMotionHintWindowFrames > 8
+    ) {
+        error =
+            "shooter_motion_hint_window_frames out of range (1..8)";
+        return false;
+    }
+
+    if (
+        values.shooterMotionHintRequiredHits < 1 ||
+        values.shooterMotionHintRequiredHits >
+            values.shooterMotionHintWindowFrames
+    ) {
+        error =
+            "shooter_motion_hint_required_hits must be 1..window_frames";
+        return false;
+    }
+
+    if (
+        values.shooterForceSaveSeconds < 0 ||
+        values.shooterForceSaveSeconds > 86400
+    ) {
+        error =
+            "shooter_force_save_seconds out of range (0..86400)";
+        return false;
+    }
+
+    if (
+        values.shooterFlushSeconds < 0 ||
+        values.shooterFlushSeconds > 3600
+    ) {
+        error =
+            "shooter_flush_seconds out of range (0..3600)";
+        return false;
+    }
+
+    if (
+        values.motionRecordingEnabled != 0 &&
+        values.motionRecordingEnabled != 1
+    ) {
+        error = "motion_recording_enabled must be 0 or 1";
+        return false;
+    }
+
+    if (
+        values.motionRecordingDecision != "direct" &&
+        values.motionRecordingDecision != "image_verify" &&
+        values.motionRecordingDecision != "image_only"
+    ) {
+        error = "motion_recording_decision must be direct, image_verify or image_only";
+        return false;
+    }
+
+    if (values.imageMotionSensitivity < 1 || values.imageMotionSensitivity > 10) {
+        error = "image_motion_sensitivity out of range (1..10)";
+        return false;
+    }
+
+    if (values.imageMotionMinAreaPct < 0.1f || values.imageMotionMinAreaPct > 100.0f) {
+        error = "image_motion_min_area_pct out of range (0.1..100.0)";
+        return false;
+    }
+
+    if (values.imageMotionConfirmFrames < 1 || values.imageMotionConfirmFrames > 6) {
+        error = "image_motion_confirm_frames out of range (1..6)";
+        return false;
+    }
+
+    if (values.imageMotionReleaseFrames < 1 || values.imageMotionReleaseFrames > 10) {
+        error = "image_motion_release_frames out of range (1..10)";
+        return false;
+    }
+
+    if (values.imageMotionBackgroundLearning < 1 || values.imageMotionBackgroundLearning > 64) {
+        error = "image_motion_background_learning out of range (1..64)";
+        return false;
+    }
+
+    if (values.imageMotionGlobalMeanDelta < 5 || values.imageMotionGlobalMeanDelta > 100) {
+        error = "image_motion_global_mean_delta out of range (5..100)";
+        return false;
+    }
+
+    if (values.imageMotionGlobalChangePct < 20 || values.imageMotionGlobalChangePct > 100) {
+        error = "image_motion_global_change_pct out of range (20..100)";
+        return false;
+    }
+
+    if (!imageMotionValidateRoiMask(values.imageMotionRoiMask)) {
+        error = "image_motion_roi_mask must be a valid 20x15 compact hex mask";
+        return false;
+    }
+
+
+    if (values.recordingNotBefore != "off") {
+        RecordingNotBeforeParts armParts;
+
+        if (!parseRecordingNotBeforeParts(
+                values.recordingNotBefore,
+                armParts
+            )) {
+            error =
+                "recording_not_before must be off or YYYY-MM-DDTHH:MM:SS";
+
+            return false;
+        }
+    }
+
+
+    if (
+        values.recordingSegmentSeconds < 0 ||
+        values.recordingSegmentSeconds > 86400
+    ) {
+
+        error =
+            "recording_segment_seconds out of range (0..86400)";
+
+        return false;
+    }
+
+
+    if (
+        values.recordingSegmentMaxMb < 0 ||
+        values.recordingSegmentMaxMb > 4095
+    ) {
+
+        error =
+            "recording_segment_max_mb out of range (0..4095)";
+
+        return false;
+    }
+
+
+    if (
+        values.recordingEventMaxSeconds < 0 ||
+        values.recordingEventMaxSeconds > 86400
+    ) {
+
+        error =
+            "recording_event_max_seconds out of range (0..86400)";
+
+        return false;
+    }
+
+
+    if (
+        values.recordingEventCooldownSeconds < 0 ||
+        values.recordingEventCooldownSeconds > 86400
+    ) {
+
+        error =
+            "recording_event_cooldown_seconds out of range (0..86400)";
+
+        return false;
+    }
+
+
+    if (values.postMs < 0) {
+
+        error =
+            "post_record_ms must be >= 0";
+
+        return false;
+    }
+
+
+    if (
+        values.ledEnabled != 0 &&
+        values.ledEnabled != 1
+    ) {
+
+        error =
+            "led_enabled must be 0 or 1";
+
+        return false;
+    }
+
+
+    if (
+        values.operatingMode != "normal" &&
+        values.operatingMode != "streamer" &&
+        values.operatingMode != "time_broadcaster"
+    ) {
+
+        error =
+            "operating_mode must be normal, streamer or time_broadcaster";
+
+        return false;
+    }
+
+
+    if (
+        values.streamerRtspEnabled != 0 &&
+        values.streamerRtspEnabled != 1
+    ) {
+        error = "streamer_rtsp_enabled must be 0 or 1";
+        return false;
+    }
+
+
+    if (
+        values.streamerHttpMjpegEnabled != 0 &&
+        values.streamerHttpMjpegEnabled != 1
+    ) {
+        error = "streamer_http_mjpeg_enabled must be 0 or 1";
+        return false;
+    }
+
+    if (values.onvifEnabled != 0 && values.onvifEnabled != 1) {
+        error = "onvif_enabled must be 0 or 1";
+        return false;
+    }
+
+    if (values.onvifEnabled && !values.streamerRtspEnabled) {
+        error = "onvif_enabled requires streamer_rtsp_enabled=1";
+        return false;
+    }
+
+    if (values.wireguardEnabled != 0 && values.wireguardEnabled != 1) {
+        error = "wireguard_enabled must be 0 or 1";
+        return false;
+    }
+
+    auto wireguardKeyValid = [](const String &key) -> bool {
+        if (key.length() != 44 || key[43] != '=')
+            return false;
+        for (size_t i = 0; i < 43; ++i) {
+            const char c = key[i];
+            if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                  (c >= '0' && c <= '9') || c == '+' || c == '/'))
+                return false;
+        }
+        return true;
+    };
+
+    if (values.wireguardPeerPort < 1 || values.wireguardPeerPort > 65535) {
+        error = "wireguard_peer_port out of range (1..65535)";
+        return false;
+    }
+
+    if (values.wireguardAddress.length()) {
+        IPAddress vpnIp;
+        if (!vpnIp.fromString(values.wireguardAddress) ||
+            !(vpnIp[0] || vpnIp[1] || vpnIp[2] || vpnIp[3])) {
+            error = "wireguard_address must be a valid IPv4 address";
+            return false;
+        }
+    }
+
+    if (values.wireguardPrivateKey.length() && !wireguardKeyValid(values.wireguardPrivateKey)) {
+        error = "wireguard_private_key must be a 32-byte WireGuard Base64 key";
+        return false;
+    }
+
+    if (values.wireguardPeerPublicKey.length() && !wireguardKeyValid(values.wireguardPeerPublicKey)) {
+        error = "wireguard_peer_public_key must be a 32-byte WireGuard Base64 key";
+        return false;
+    }
+
+    if (values.wireguardPeerEndpoint.length() > 253 ||
+        values.wireguardPeerEndpoint.indexOf(' ') >= 0 ||
+        values.wireguardPeerEndpoint.indexOf('\t') >= 0) {
+        error = "wireguard_peer_endpoint is invalid";
+        return false;
+    }
+
+    if (values.wireguardEnabled) {
+        if (!values.wireguardAddress.length() ||
+            !values.wireguardPrivateKey.length() ||
+            !values.wireguardPeerEndpoint.length() ||
+            !values.wireguardPeerPublicKey.length()) {
+            error = "wireguard_enabled requires address, private key, peer endpoint and peer public key";
+            return false;
+        }
+        if (values.hotspotEnabled) {
+            error = "wireguard_enabled requires infrastructure WiFi (hotspot_enabled=0)";
+            return false;
+        }
+    }
+
+
+    if (
+        values.sleepMode != "off" &&
+        values.sleepMode != "light_sleep" &&
+        values.sleepMode != "deep_sleep"
+    ) {
+
+        error =
+            "sleep_mode must be off, light_sleep or deep_sleep";
+
+        return false;
+    }
+
+
+    if (
+        values.sleepDelayMs < 0 ||
+        values.sleepDelayMs > 60000
+    ) {
+
+        error =
+            "sleep_delay_ms out of range (0..60000)";
+
+        return false;
+    }
+
+
+    if (
+        values.bootloopProtection != 0 &&
+        values.bootloopProtection != 1
+    ) {
+
+        error =
+            "bootloop_protection must be 0 or 1";
+
+        return false;
+    }
+
+
+    if (
+        values.transportMode != 0 &&
+        values.transportMode != 1
+    ) {
+
+        error =
+            "transport_mode must be 0 or 1";
+
+        return false;
+    }
+
+
+    if (
+        values.transportCheckSeconds < 10 ||
+        values.transportCheckSeconds > 86400
+    ) {
+
+        error =
+            "transport_check_seconds out of range (10..86400)";
+
+        return false;
+    }
+
+
+    if (
+        values.transportLightConfirmSeconds < 0 ||
+        values.transportLightConfirmSeconds > 120
+    ) {
+
+        error =
+            "transport_light_confirm_seconds out of range (0..120)";
+
+        return false;
+    }
+
+
+    if (
+        values.transportInstallDelaySeconds < 0 ||
+        values.transportInstallDelaySeconds > 86400
+    ) {
+
+        error =
+            "transport_install_delay_seconds out of range (0..86400)";
+
+        return false;
+    }
+
+
+    if (
+        values.transportMaxDurationSeconds < 60 ||
+        values.transportMaxDurationSeconds > 604800
+    ) {
+
+        error =
+            "transport_max_duration_seconds out of range (60..604800)";
+
+        return false;
+    }
+
+
+    if (
+        values.transportBlackThreshold < 0 ||
+        values.transportBlackThreshold > 255
+    ) {
+
+        error =
+            "transport_black_threshold out of range (0..255)";
+
+        return false;
+    }
+
+
+    if (
+        values.minFreeSpaceMb < 0 ||
+        values.minFreeSpaceMb >
+            1024 * 1024
+    ) {
+
+        error =
+            "min_free_space_mb out of range";
+
+        return false;
+    }
+
+
+    if (
+        values.diskFullAction != "rollover" &&
+        values.diskFullAction != "stop"
+    ) {
+
+        error =
+            "disk_full_action must be rollover or stop";
+
+        return false;
+    }
+
+
+    if (
+        values.wifiOnSystemStart != "off" &&
+        values.wifiOnSystemStart != "on" &&
+        values.wifiOnSystemStart != "on_missing_time"
+    ) {
+
+        error =
+            "wifi_on_system_start must be off, on or on_missing_time";
+
+        return false;
+    }
+
+
+    if (
+        values.wifiTimeoutSec < 0 ||
+        values.wifiTimeoutSec > 86400
+    ) {
+
+        error =
+            "wifi_timeout_sec out of range (0..86400)";
+
+        return false;
+    }
+
+    if (
+        values.wifiAliveScheduleEnabled != 0 &&
+        values.wifiAliveScheduleEnabled != 1
+    ) {
+        error =
+            "wifi_alive_schedule_enabled must be 0 or 1";
+
+        return false;
+    }
+
+    {
+        WifiAliveScheduleEntry scheduleEntries[SENSORFORGE_WIFI_ALIVE_SCHEDULE_MAX_ENTRIES];
+        size_t scheduleCount = 0;
+        String scheduleError;
+
+        if (!configParseWifiAliveSchedule(
+                values.wifiAliveSchedule,
+                scheduleEntries,
+                scheduleCount,
+                &scheduleError
+            )) {
+            error = scheduleError;
+            return false;
+        }
+    }
+
+
+    {
+        int16_t txPowerX10 =
+            (int16_t)lroundf(values.wifiTxPowerDbm * 10.0f);
+
+        if (
+            fabsf(values.wifiTxPowerDbm * 10.0f - txPowerX10) > 0.01f ||
+            txPowerX10 < SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10 ||
+            !boardWifiTxPowerSupportedX10(txPowerX10)
+        ) {
+            error =
+                "wifi_tx_power_dbm is not a supported value for this board";
+            return false;
+        }
+    }
+
+
+    if (
+        values.clusterEnabled != 0 &&
+        values.clusterEnabled != 1
+    ) {
+        error =
+            "cluster_enabled must be 0 or 1";
+        return false;
+    }
+
+    if (values.clusterId.length() && !configClusterIdValid(values.clusterId)) {
+        error =
+            "cluster_id must be cl- followed by 32 lowercase hex characters";
+        return false;
+    }
+
+    if (values.clusterName.length() > 63) {
+        error =
+            "cluster_name exceeds 63 characters";
+        return false;
+    }
+
+    if (values.clusterCredentialEpoch == 0) {
+        error =
+            "cluster_credential_epoch must be >= 1";
+        return false;
+    }
+
+    if (
+        values.clusterPassword.length() != 0 &&
+        (
+            values.clusterPassword.length() < 8 ||
+            values.clusterPassword.length() > 63
+        )
+    ) {
+        error =
+            "cluster_password must be empty or 8..63 characters";
+        return false;
+    }
+
+    if (
+        values.clusterCoordinatorPolicy != "auto" &&
+        values.clusterCoordinatorPolicy != "preferred" &&
+        values.clusterCoordinatorPolicy != "node"
+    ) {
+        error =
+            "cluster_coordinator_policy must be auto, preferred or node";
+        return false;
+    }
+
+    if (values.clusterEnabled) {
+        if (!values.clusterName.length()) {
+            error =
+                "cluster_enabled requires cluster_name";
+            return false;
+        }
+
+        if (!values.clusterPassword.length()) {
+            error =
+                "cluster_enabled requires cluster_password";
+            return false;
+        }
+    }
+
+    if (
+        values.hotspotEnabled != 0 &&
+        values.hotspotEnabled != 1
+    ) {
+
+        error =
+            "hotspot_enabled must be 0 or 1";
+
+        return false;
+    }
+
+
+    if (
+        values.hotspotFallbackEnabled != 0 &&
+        values.hotspotFallbackEnabled != 1
+    ) {
+        error = "hotspot_fallback_enabled must be 0 or 1";
+        return false;
+    }
+
+
+    if (
+        values.hotspotHidden != 0 &&
+        values.hotspotHidden != 1
+    ) {
+
+        error =
+            "hotspot_hidden must be 0 or 1";
+
+        return false;
+    }
+
+
+    // Empty means an intentionally open local access point.
+    // Non-empty WPA2 passphrases must remain within the normal 8..63 range.
+    if (
+        values.hotspotPassword.length() != 0 &&
+        (
+            values.hotspotPassword.length() < 8 ||
+            values.hotspotPassword.length() > 63
+        )
+    ) {
+
+        error =
+            "hotspot_password must be empty (open AP) or 8..63 characters";
+
+        return false;
+    }
+
+
+    if (
+        values.webAuthEnabled != 0 &&
+        values.webAuthEnabled != 1
+    ) {
+
+        error =
+            "web_auth_enabled must be 0 or 1";
+
+        return false;
+    }
+
+
+    if (
+        values.webRecordingAutoPause != 0 &&
+        values.webRecordingAutoPause != 1
+    ) {
+
+        error =
+            "web_recording_auto_pause must be 0 or 1";
+
+        return false;
+    }
+
+
+    if (
+        values.webLanguage != "de" &&
+        values.webLanguage != "en"
+    ) {
+
+        error =
+            "web_language must be de or en";
+
+        return false;
+    }
+
+
+    if (
+        !values.webUsername.length() ||
+        values.webUsername.length() > 32 ||
+        values.webUsername.indexOf(':') >= 0
+    ) {
+
+        error =
+            "web_username must be 1..32 chars and must not contain ':'";
+
+        return false;
+    }
+
+
+    if (
+        values.webPassword.length() < 8 ||
+        values.webPassword.length() > 63
+    ) {
+
+        error =
+            "web_password length must be 8..63";
+
+        return false;
+    }
+
+    if ((values.streamAllowAnnotationEdit != 0 && values.streamAllowAnnotationEdit != 1) ||
+        (values.streamAllowDelete != 0 && values.streamAllowDelete != 1)) {
+        error = "streaming permissions must be 0 or 1";
+        return false;
+    }
+
+    for (size_t i = 0; i < SENSORFORGE_STREAM_USER_COUNT; ++i) {
+        String username = values.streamUsernames[i];
+        username.trim();
+
+        if (!username.length()) {
+            if (values.streamPasswords[i].length()) {
+                error = "stream_password_" + String(i + 1) + " set for empty streaming username";
+                return false;
+            }
+            continue;
+        }
+
+        if (username.length() > 32 || username.indexOf(':') >= 0) {
+            error = "stream_username_" + String(i + 1) + " must be 1..32 chars and must not contain ':'";
+            return false;
+        }
+
+        if (values.streamPasswords[i].length() < 8 || values.streamPasswords[i].length() > 63) {
+            error = "stream_password_" + String(i + 1) + " length must be 8..63";
+            return false;
+        }
+
+        if (username == values.webUsername) {
+            error = "streaming username must differ from administrator username";
+            return false;
+        }
+
+        for (size_t j = 0; j < i; ++j) {
+            String previous = values.streamUsernames[j];
+            previous.trim();
+            if (previous.length() && username == previous) {
+                error = "duplicate streaming username: " + username;
+                return false;
+            }
+        }
+    }
+
+
+    if (values.cameraDisplayName.length() > 80 ||
+        values.cameraLocation.length() > 120 ||
+        values.cameraGpsLat.length() > 24 ||
+        values.cameraGpsLon.length() > 24 ||
+        values.cameraResponsible.length() > 80 ||
+        values.cameraEmail.length() > 120 ||
+        values.cameraOverlayText.length() > 120 ||
+        values.cameraDescription.length() > 160) {
+        error = "camera metadata value too long";
+        return false;
+    }
+
+    if (values.cameraEmail.length() &&
+        (values.cameraEmail.indexOf('@') <= 0 || values.cameraEmail.indexOf(' ') >= 0)) {
+        error = "invalid camera_email";
+        return false;
+    }
+
+    auto validCoordinate = [](const String &v, double minV, double maxV) -> bool {
+        if (!v.length()) return true;
+        char *end = nullptr;
+        double n = strtod(v.c_str(), &end);
+        return end && end != v.c_str() && *end == '\0' && n >= minV && n <= maxV;
+    };
+    if (!validCoordinate(values.cameraGpsLat, -90.0, 90.0) ||
+        !validCoordinate(values.cameraGpsLon, -180.0, 180.0)) {
+        error = "invalid camera GPS coordinates";
+        return false;
+    }
+
+    if (
+        !values.hostname.length() ||
+        values.hostname.length() > 63
+    ) {
+
+        error =
+            "invalid hostname";
+
+        return false;
+    }
+
+
+    if (
+        !values.timezone.length() ||
+        values.timezone.length() > 127
+    ) {
+
+        error =
+            "timezone must be a non-empty POSIX TZ string (max 127 chars)";
+
+        return false;
+    }
+
+
+    for (
+        size_t i = 0;
+        i < values.timezone.length();
+        ++i
+    ) {
+
+        unsigned char c =
+            (unsigned char)values.timezone[i];
+
+        if (
+            c <= 0x20 ||
+            c == 0x7F
+        ) {
+
+            error =
+                "timezone contains whitespace/control characters";
+
+            return false;
+        }
+    }
+
+
+    if (
+        !values.logFile.length() ||
+        !values.logFile.startsWith("/") ||
+        values.logFile.indexOf("..") >= 0
+    ) {
+
+        error =
+            "invalid log_file";
+
+        return false;
+    }
+
+
+    if (
+        values.debugEnabled != 0 &&
+        values.debugEnabled != 1
+    ) {
+
+        error =
+            "debug_enabled must be 0 or 1";
+
+        return false;
+    }
+
+
+    return true;
+}
+
+
+// =============================================================
+// PARSE COMPLETE CONFIG TEXT
+// =============================================================
+
+static bool parseConfigText(
+    const String &text,
+    ConfigValues &values,
+    String &error
+)
+{
+    if (!text.length()) {
+        error =
+            "config is empty";
+
+        return false;
+    }
+
+
+    if (
+        text.length() >
+        CONFIG_MAX_BYTES
+    ) {
+
+        error =
+            "config is too large";
+
+        return false;
+    }
+
+
+    setDefaultValues(
+        values
+    );
+
+    ConfigSeen seen;
+
+    clearSeen(
+        seen
+    );
+
+
+    size_t lineStart =
+        0;
+
+
+    while (
+        lineStart <
+        text.length()
+    ) {
+
+        int newlinePos =
+            text.indexOf(
+                '\n',
+                lineStart
+            );
+
+
+        size_t lineEnd =
+            newlinePos >= 0
+            ? (size_t)newlinePos
+            : text.length();
+
+
+        String line =
+            text.substring(
+                lineStart,
+                lineEnd
+            );
+
+
+        line.replace(
+            "\r",
+            ""
+        );
+
+        line.trim();
+
+
+        if (
+            line.length() &&
+            !line.startsWith("#")
+        ) {
+
+            int separator =
+                line.indexOf('=');
+
+
+            if (separator <= 0) {
+
+                error =
+                    "invalid line: " +
+                    line;
+
+                return false;
+            }
+
+
+            String key =
+                line.substring(
+                    0,
+                    separator
+                );
+
+            String value =
+                line.substring(
+                    separator + 1
+                );
+
+
+            key.trim();
+            value.trim();
+
+
+            long numericValue =
+                0;
+
+
+            if (key == "camera") {
+
+                if (!markOnce(
+                        seen.camera,
+                        key,
+                        error
+                    )) {
+                    return false;
+                }
+
+                values.camera =
+                    value;
+
+            } else if (
+                key == "resolution"
+            ) {
+
+                if (!markOnce(
+                        seen.resolution,
+                        key,
+                        error
+                    )) {
+                    return false;
+                }
+
+                values.resolution =
+                    value;
+
+            } else if (
+                key == "fps"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.fps,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid fps";
+
+                    return false;
+                }
+
+                values.fps =
+                    (int)numericValue;
+
+            } else if (
+                key == "quality"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.quality,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid quality";
+
+                    return false;
+                }
+
+                values.quality =
+                    (int)numericValue;
+
+            } else if (
+                key == "camera_xclk_mhz"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.cameraXclkMhz,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid camera_xclk_mhz";
+
+                    return false;
+                }
+
+                values.cameraXclkMhz =
+                    (int)numericValue;
+
+            } else if (
+                key == "camera_auto_exposure"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.cameraAutoExposure,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid camera_auto_exposure";
+
+                    return false;
+                }
+
+                values.cameraAutoExposure =
+                    (int)numericValue;
+
+            } else if (
+                key == "camera_ae_level"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.cameraAeLevel,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid camera_ae_level";
+
+                    return false;
+                }
+
+                values.cameraAeLevel =
+                    (int)numericValue;
+
+            } else if (
+                key == "camera_crop_zoom"
+            ) {
+
+                if (!markOnce(
+                        seen.cameraCropZoom,
+                        key,
+                        error
+                    )) {
+                    return false;
+                }
+
+                values.cameraCropZoom =
+                    value;
+
+            } else if (
+                key == "camera_crop_x"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.cameraCropX,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid camera_crop_x";
+
+                    return false;
+                }
+
+                values.cameraCropX =
+                    (int)numericValue;
+
+            } else if (
+                key == "camera_crop_y"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.cameraCropY,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid camera_crop_y";
+
+                    return false;
+                }
+
+                values.cameraCropY =
+                    (int)numericValue;
+
+            } else if (
+                key == "rotation"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.rotation,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid rotation";
+
+                    return false;
+                }
+
+                values.rotation =
+                    (int)numericValue;
+
+            } else if (
+                key == "recording_format"
+            ) {
+
+                if (!markOnce(
+                        seen.recordingFormat,
+                        key,
+                        error
+                    )) {
+                    return false;
+                }
+
+                values.recordingFormat =
+                    value;
+
+            } else if (
+                key == "timestamp_enabled"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.timestampEnabled,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid timestamp_enabled";
+
+                    return false;
+                }
+
+                values.timestampEnabled =
+                    (int)numericValue;
+
+            } else if (
+                key == "recording_encryption"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.recordingEncryption,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid recording_encryption";
+
+                    return false;
+                }
+
+                values.recordingEncryption =
+                    (int)numericValue;
+
+            } else if (key == "audio_enabled") {
+                if (!markOnce(seen.audioEnabled, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid audio_enabled"; return false; }
+                values.audioEnabled = (int)numericValue;
+
+            } else if (key == "audio_expert_mode") {
+                if (!markOnce(seen.audioExpertMode, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid audio_expert_mode"; return false; }
+                values.audioExpertMode = (int)numericValue;
+
+            } else if (key == "audio_source") {
+                if (!markOnce(seen.audioSource, key, error)) return false;
+                values.audioSource = value;
+
+            } else if (key == "audio_backend") {
+                if (!markOnce(seen.audioBackend, key, error)) return false;
+                values.audioBackend = value;
+
+            } else if (key == "audio_pdm_clk_pin") {
+                if (!markOnce(seen.audioPdmClkPin, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid audio_pdm_clk_pin"; return false; }
+                values.audioPdmClkPin = (int)numericValue;
+
+            } else if (key == "audio_pdm_data_pin") {
+                if (!markOnce(seen.audioPdmDataPin, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid audio_pdm_data_pin"; return false; }
+                values.audioPdmDataPin = (int)numericValue;
+
+            } else if (key == "audio_i2s_bclk_pin") {
+                if (!markOnce(seen.audioI2sBclkPin, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid audio_i2s_bclk_pin"; return false; }
+                values.audioI2sBclkPin = (int)numericValue;
+
+            } else if (key == "audio_i2s_ws_pin") {
+                if (!markOnce(seen.audioI2sWsPin, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid audio_i2s_ws_pin"; return false; }
+                values.audioI2sWsPin = (int)numericValue;
+
+            } else if (key == "audio_i2s_data_pin") {
+                if (!markOnce(seen.audioI2sDataPin, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid audio_i2s_data_pin"; return false; }
+                values.audioI2sDataPin = (int)numericValue;
+
+            } else if (key == "audio_i2s_mclk_pin") {
+                if (!markOnce(seen.audioI2sMclkPin, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid audio_i2s_mclk_pin"; return false; }
+                values.audioI2sMclkPin = (int)numericValue;
+
+            } else if (key == "audio_i2s_slot") {
+                if (!markOnce(seen.audioI2sSlot, key, error)) return false;
+                values.audioI2sSlot = value;
+
+            } else if (key == "audio_sample_rate") {
+                if (!markOnce(seen.audioSampleRate, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid audio_sample_rate"; return false; }
+                values.audioSampleRate = (int)numericValue;
+
+            } else if (key == "audio_bits_per_sample") {
+                if (!markOnce(seen.audioBitsPerSample, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid audio_bits_per_sample"; return false; }
+                values.audioBitsPerSample = (int)numericValue;
+
+            } else if (key == "audio_channels") {
+                if (!markOnce(seen.audioChannels, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid audio_channels"; return false; }
+                values.audioChannels = (int)numericValue;
+
+            } else if (key == "shooter_enabled") {
+                if (!markOnce(seen.shooterEnabled, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid shooter_enabled"; return false; }
+                values.shooterEnabled = (int)numericValue;
+
+            } else if (key == "shooter_storage_format") {
+                if (!markOnce(seen.shooterStorageFormat, key, error)) return false;
+                values.shooterStorageFormat = value;
+
+            } else if (key == "shooter_interval_ms") {
+                if (!markOnce(seen.shooterIntervalMs, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid shooter_interval_ms"; return false; }
+                values.shooterIntervalMs = (int)numericValue;
+
+            } else if (key == "shooter_dark_mean_min") {
+                if (!markOnce(seen.shooterDarkMeanMin, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid shooter_dark_mean_min"; return false; }
+                values.shooterDarkMeanMin = (int)numericValue;
+
+            } else if (key == "shooter_min_change_pct") {
+                if (seen.shooterSimilarityThreshold) {
+                    error = "duplicate shooter filter key";
+                    return false;
+                }
+
+                float decimalValue = 0.0f;
+                if (!markOnce(seen.shooterMinChangePct, key, error) || !parseFloatStrict(value, decimalValue)) { if (!error.length()) error = "invalid shooter_min_change_pct"; return false; }
+                values.shooterMinChangePct = decimalValue;
+
+            } else if (key == "shooter_similarity_threshold") {
+                // Legacy compatibility with the first continuous-shooter build.
+                // Canonical configuration now stores the more intuitive minimum
+                // changed-area percentage instead of the inverse similarity.
+                if (seen.shooterMinChangePct) {
+                    error = "duplicate shooter filter key";
+                    return false;
+                }
+
+                float legacySimilarity = 0.0f;
+                if (!markOnce(seen.shooterSimilarityThreshold, key, error) || !parseFloatStrict(value, legacySimilarity)) { if (!error.length()) error = "invalid shooter_similarity_threshold"; return false; }
+
+                if (legacySimilarity < 0.0f || legacySimilarity > 100.0f) {
+                    error = "shooter_similarity_threshold out of range (0..100.0)";
+                    return false;
+                }
+
+                if (legacySimilarity <= 0.0f) {
+                    values.shooterMinChangePct = 0.0f;
+                } else {
+                    values.shooterMinChangePct =
+                        100.0f - legacySimilarity;
+
+                    // Legacy 100% meant "reject only a perfectly identical
+                    // frame". With the new direct change threshold, 0 means
+                    // filter disabled, so retain that old behavior as 0.1%.
+                    if (values.shooterMinChangePct < 0.1f)
+                        values.shooterMinChangePct = 0.1f;
+                }
+
+            } else if (key == "shooter_motion_hint_change_pct") {
+                float decimalValue = 0.0f;
+                if (!markOnce(seen.shooterMotionHintChangePct, key, error) || !parseFloatStrict(value, decimalValue)) { if (!error.length()) error = "invalid shooter_motion_hint_change_pct"; return false; }
+                values.shooterMotionHintChangePct = decimalValue;
+
+            } else if (key == "shooter_motion_hint_required_hits") {
+                if (!markOnce(seen.shooterMotionHintRequiredHits, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid shooter_motion_hint_required_hits"; return false; }
+                values.shooterMotionHintRequiredHits = (int)numericValue;
+
+            } else if (key == "shooter_motion_hint_window_frames") {
+                if (!markOnce(seen.shooterMotionHintWindowFrames, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid shooter_motion_hint_window_frames"; return false; }
+                values.shooterMotionHintWindowFrames = (int)numericValue;
+
+            } else if (key == "shooter_force_save_seconds") {
+                if (!markOnce(seen.shooterForceSaveSeconds, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid shooter_force_save_seconds"; return false; }
+                values.shooterForceSaveSeconds = (int)numericValue;
+
+            } else if (key == "shooter_flush_seconds") {
+                if (!markOnce(seen.shooterFlushSeconds, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid shooter_flush_seconds"; return false; }
+                values.shooterFlushSeconds = (int)numericValue;
+
+            } else if (
+                key == "recording_not_before"
+            ) {
+
+                if (!markOnce(
+                        seen.recordingNotBefore,
+                        key,
+                        error
+                    )) {
+                    return false;
+                }
+
+                values.recordingNotBefore =
+                    value;
+
+            } else if (key == "motion_recording_enabled") {
+                if (!markOnce(seen.motionRecordingEnabled, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid motion_recording_enabled"; return false; }
+                values.motionRecordingEnabled = (int)numericValue;
+
+            } else if (key == "motion_recording_decision") {
+                if (!markOnce(seen.motionRecordingDecision, key, error)) return false;
+                values.motionRecordingDecision = value;
+
+            } else if (key == "image_motion_enabled") {
+                // Legacy compatibility only. The old separate enable flag is no
+                // longer used; automatic image motion is selected exclusively by
+                // motion_recording_decision. Keep accepting 0/1 so existing SD
+                // cards remain valid until the next config save removes the key.
+                if (!markOnce(seen.imageMotionEnabled, key, error) ||
+                    !parseIntegerStrict(value, numericValue) ||
+                    (numericValue != 0 && numericValue != 1)) {
+                    if (!error.length()) error = "invalid legacy image_motion_enabled";
+                    return false;
+                }
+
+            } else if (key == "image_motion_sensitivity") {
+                if (!markOnce(seen.imageMotionSensitivity, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid image_motion_sensitivity"; return false; }
+                values.imageMotionSensitivity = (int)numericValue;
+
+            } else if (key == "image_motion_min_area_pct") {
+                float decimalValue = 0.0f;
+                if (!markOnce(seen.imageMotionMinAreaPct, key, error) || !parseFloatStrict(value, decimalValue)) { if (!error.length()) error = "invalid image_motion_min_area_pct"; return false; }
+                values.imageMotionMinAreaPct = decimalValue;
+
+            } else if (key == "image_motion_confirm_frames") {
+                if (!markOnce(seen.imageMotionConfirmFrames, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid image_motion_confirm_frames"; return false; }
+                values.imageMotionConfirmFrames = (int)numericValue;
+
+            } else if (key == "image_motion_release_frames") {
+                if (!markOnce(seen.imageMotionReleaseFrames, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid image_motion_release_frames"; return false; }
+                values.imageMotionReleaseFrames = (int)numericValue;
+
+            } else if (key == "image_motion_background_learning") {
+                if (!markOnce(seen.imageMotionBackgroundLearning, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid image_motion_background_learning"; return false; }
+                values.imageMotionBackgroundLearning = (int)numericValue;
+
+            } else if (key == "image_motion_global_mean_delta") {
+                if (!markOnce(seen.imageMotionGlobalMeanDelta, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid image_motion_global_mean_delta"; return false; }
+                values.imageMotionGlobalMeanDelta = (int)numericValue;
+
+            } else if (key == "image_motion_global_change_pct") {
+                if (!markOnce(seen.imageMotionGlobalChangePct, key, error) || !parseIntegerStrict(value, numericValue)) { if (!error.length()) error = "invalid image_motion_global_change_pct"; return false; }
+                values.imageMotionGlobalChangePct = (int)numericValue;
+
+            } else if (key == "image_motion_roi_mask") {
+                if (!markOnce(seen.imageMotionRoiMask, key, error)) return false;
+                values.imageMotionRoiMask = value;
+
+            } else if (
+                key == "recording_event_max_seconds"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.recordingEventMaxSeconds,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid recording_event_max_seconds";
+
+                    return false;
+                }
+
+                values.recordingEventMaxSeconds =
+                    (int)numericValue;
+
+            } else if (
+                key == "recording_event_cooldown_seconds"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.recordingEventCooldownSeconds,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid recording_event_cooldown_seconds";
+
+                    return false;
+                }
+
+                values.recordingEventCooldownSeconds =
+                    (int)numericValue;
+
+            } else if (
+                key == "recording_segment_seconds"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.recordingSegmentSeconds,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid recording_segment_seconds";
+
+                    return false;
+                }
+
+                values.recordingSegmentSeconds =
+                    (int)numericValue;
+
+            } else if (
+                key == "recording_segment_max_mb"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.recordingSegmentMaxMb,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid recording_segment_max_mb";
+
+                    return false;
+                }
+
+                values.recordingSegmentMaxMb =
+                    (int)numericValue;
+
+            } else if (
+                key == "post_record_ms"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.postMs,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid post_record_ms";
+
+                    return false;
+                }
+
+                values.postMs =
+                    (int)numericValue;
+
+            } else if (
+                key == "led_enabled"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.ledEnabled,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid led_enabled";
+
+                    return false;
+                }
+
+                values.ledEnabled =
+                    (int)numericValue;
+
+            } else if (
+                key == "operating_mode"
+            ) {
+
+                if (!markOnce(seen.operatingMode, key, error))
+                    return false;
+
+                values.operatingMode = value;
+
+            } else if (
+                key == "streamer_rtsp_enabled"
+            ) {
+
+                if (
+                    !markOnce(seen.streamerRtspEnabled, key, error) ||
+                    !parseIntegerStrict(value, numericValue)
+                ) {
+                    if (!error.length()) error = "invalid streamer_rtsp_enabled";
+                    return false;
+                }
+
+                values.streamerRtspEnabled = (int)numericValue;
+
+            } else if (
+                key == "streamer_http_mjpeg_enabled"
+            ) {
+
+                if (
+                    !markOnce(seen.streamerHttpMjpegEnabled, key, error) ||
+                    !parseIntegerStrict(value, numericValue)
+                ) {
+                    if (!error.length()) error = "invalid streamer_http_mjpeg_enabled";
+                    return false;
+                }
+
+                values.streamerHttpMjpegEnabled = (int)numericValue;
+
+            } else if (
+                key == "onvif_enabled"
+            ) {
+
+                if (
+                    !markOnce(seen.onvifEnabled, key, error) ||
+                    !parseIntegerStrict(value, numericValue)
+                ) {
+                    if (!error.length()) error = "invalid onvif_enabled";
+                    return false;
+                }
+
+                values.onvifEnabled = (int)numericValue;
+
+            } else if (key == "wireguard_enabled") {
+                if (!markOnce(seen.wireguardEnabled, key, error) ||
+                    !parseIntegerStrict(value, numericValue)) {
+                    if (!error.length()) error = "invalid wireguard_enabled";
+                    return false;
+                }
+                values.wireguardEnabled = (int)numericValue;
+
+            } else if (key == "wireguard_address") {
+                if (!markOnce(seen.wireguardAddress, key, error)) return false;
+                values.wireguardAddress = value;
+
+            } else if (key == "wireguard_private_key") {
+                if (!markOnce(seen.wireguardPrivateKey, key, error)) return false;
+                values.wireguardPrivateKey = value;
+
+            } else if (key == "wireguard_peer_endpoint") {
+                if (!markOnce(seen.wireguardPeerEndpoint, key, error)) return false;
+                values.wireguardPeerEndpoint = value;
+
+            } else if (key == "wireguard_peer_public_key") {
+                if (!markOnce(seen.wireguardPeerPublicKey, key, error)) return false;
+                values.wireguardPeerPublicKey = value;
+
+            } else if (key == "wireguard_peer_port") {
+                if (!markOnce(seen.wireguardPeerPort, key, error) ||
+                    !parseIntegerStrict(value, numericValue)) {
+                    if (!error.length()) error = "invalid wireguard_peer_port";
+                    return false;
+                }
+                values.wireguardPeerPort = (int)numericValue;
+
+            } else if (
+                key == "sleep_mode"
+            ) {
+
+                if (!markOnce(
+                        seen.sleepMode,
+                        key,
+                        error
+                    )) {
+                    return false;
+                }
+
+                values.sleepMode =
+                    value;
+
+            } else if (
+                key == "sleep_delay_ms"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.sleepDelayMs,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid sleep_delay_ms";
+
+                    return false;
+                }
+
+                values.sleepDelayMs =
+                    (int)numericValue;
+
+            } else if (
+                key == "bootloop_protection"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.bootloopProtection,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid bootloop_protection";
+
+                    return false;
+                }
+
+                values.bootloopProtection =
+                    (int)numericValue;
+
+            } else if (
+                key == "transport_mode"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.transportMode,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid transport_mode";
+
+                    return false;
+                }
+
+                values.transportMode =
+                    (int)numericValue;
+
+            } else if (
+                key == "transport_check_seconds"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.transportCheckSeconds,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid transport_check_seconds";
+
+                    return false;
+                }
+
+                values.transportCheckSeconds =
+                    (int)numericValue;
+
+            } else if (
+                key == "transport_light_confirm_seconds"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.transportLightConfirmSeconds,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid transport_light_confirm_seconds";
+
+                    return false;
+                }
+
+                values.transportLightConfirmSeconds =
+                    (int)numericValue;
+
+            } else if (
+                key == "transport_install_delay_seconds"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.transportInstallDelaySeconds,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid transport_install_delay_seconds";
+
+                    return false;
+                }
+
+                values.transportInstallDelaySeconds =
+                    (int)numericValue;
+
+            } else if (
+                key == "transport_max_duration_seconds"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.transportMaxDurationSeconds,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid transport_max_duration_seconds";
+
+                    return false;
+                }
+
+                values.transportMaxDurationSeconds =
+                    (int)numericValue;
+
+            } else if (
+                key == "transport_black_threshold"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.transportBlackThreshold,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid transport_black_threshold";
+
+                    return false;
+                }
+
+                values.transportBlackThreshold =
+                    (int)numericValue;
+
+            } else if (
+                key == "transport_black_mean_max"
+            ) {
+
+                // Legacy two-threshold transport config. The mean value maps
+                // directly to the new single user-facing threshold.
+                if (
+                    !markOnce(
+                        seen.transportBlackMeanMax,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid legacy transport_black_mean_max";
+
+                    return false;
+                }
+
+                values.transportBlackLegacyMeanMax =
+                    (int)numericValue;
+
+            } else if (
+                key == "transport_black_p95_max"
+            ) {
+
+                // Retained only so existing config.txt files remain loadable.
+                // New saves remove this key and derive the P95 guard internally.
+                if (
+                    !markOnce(
+                        seen.transportBlackP95Max,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid legacy transport_black_p95_max";
+
+                    return false;
+                }
+
+                values.transportBlackLegacyP95Max =
+                    (int)numericValue;
+
+            } else if (
+                key == "min_free_space_mb"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.minFreeSpaceMb,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid min_free_space_mb";
+
+                    return false;
+                }
+
+                values.minFreeSpaceMb =
+                    (int)numericValue;
+
+            } else if (
+                key == "disk_full_action"
+            ) {
+
+                if (!markOnce(
+                        seen.diskFullAction,
+                        key,
+                        error
+                    )) {
+                    return false;
+                }
+
+                values.diskFullAction =
+                    value;
+
+            } else if (
+                key == "wifi_on_system_start" ||
+                key == "wifi_mode"
+            ) {
+
+                // "wifi_mode" is accepted only as a legacy alias.
+                // If both old and new keys exist, markOnce() rejects
+                // the second occurrence as an ambiguous duplicate.
+                if (!markOnce(
+                        seen.wifiOnSystemStart,
+                        key,
+                        error
+                    )) {
+                    return false;
+                }
+
+                values.wifiOnSystemStart =
+                    value;
+
+            } else if (
+                key == "wifi_timeout_sec"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.wifiTimeoutSec,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid wifi_timeout_sec";
+
+                    return false;
+                }
+
+                values.wifiTimeoutSec =
+                    (int)numericValue;
+
+            } else if (
+                key == "wifi_alive_schedule_enabled"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.wifiAliveScheduleEnabled,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid wifi_alive_schedule_enabled";
+
+                    return false;
+                }
+
+                values.wifiAliveScheduleEnabled =
+                    (int)numericValue;
+
+            } else if (
+                key == "wifi_alive_schedule"
+            ) {
+
+                if (!markOnce(
+                        seen.wifiAliveSchedule,
+                        key,
+                        error
+                    )) {
+                    return false;
+                }
+
+                values.wifiAliveSchedule =
+                    value;
+
+            } else if (
+                key == "hostname"
+            ) {
+
+                if (!markOnce(
+                        seen.hostname,
+                        key,
+                        error
+                    )) {
+                    return false;
+                }
+
+                values.hostname =
+                    value;
+
+            } else if (key == "camera_display_name") {
+                if (!markOnce(seen.cameraDisplayName, key, error)) return false;
+                values.cameraDisplayName = value;
+            } else if (key == "camera_location") {
+                if (!markOnce(seen.cameraLocation, key, error)) return false;
+                values.cameraLocation = value;
+            } else if (key == "camera_gps_lat") {
+                if (!markOnce(seen.cameraGpsLat, key, error)) return false;
+                values.cameraGpsLat = value;
+            } else if (key == "camera_gps_lon") {
+                if (!markOnce(seen.cameraGpsLon, key, error)) return false;
+                values.cameraGpsLon = value;
+            } else if (key == "camera_responsible") {
+                if (!markOnce(seen.cameraResponsible, key, error)) return false;
+                values.cameraResponsible = value;
+            } else if (key == "camera_email") {
+                if (!markOnce(seen.cameraEmail, key, error)) return false;
+                values.cameraEmail = value;
+            } else if (key == "camera_overlay_text") {
+                if (!markOnce(seen.cameraOverlayText, key, error)) return false;
+                values.cameraOverlayText = value;
+            } else if (key == "camera_description") {
+                if (!markOnce(seen.cameraDescription, key, error)) return false;
+                values.cameraDescription = value;
+            } else if (
+                key == "timezone"
+            ) {
+
+                if (!markOnce(
+                        seen.timezone,
+                        key,
+                        error
+                    )) {
+                    return false;
+                }
+
+                values.timezone =
+                    value;
+
+            } else if (
+                key == "wifi_ssid"
+            ) {
+
+                if (!markOnce(
+                        seen.wifiSsids[0],
+                        key,
+                        error
+                    )) {
+                    return false;
+                }
+
+                values.wifiSsids[0] =
+                    value;
+
+            } else if (
+                key == "wifi_pass"
+            ) {
+
+                if (!markOnce(
+                        seen.wifiPasses[0],
+                        key,
+                        error
+                    )) {
+                    return false;
+                }
+
+                {
+                    bool wasEncrypted = false;
+                    String secretError;
+
+                    if (!configSecretDecode(
+                            "wifi_pass",
+                            value,
+                            values.wifiPasses[0],
+                            wasEncrypted,
+                            secretError
+                        )) {
+                        error =
+                            "wifi_pass: " +
+                            secretError;
+                        return false;
+                    }
+                }
+
+            } else if (key.startsWith("wifi_ssid_") || key.startsWith("wifi_pass_")) {
+                const bool isPass = key.startsWith("wifi_pass_");
+                const String suffix = key.substring(10);
+                const int profileNumber = suffix.toInt();
+                if (profileNumber < 2 || profileNumber > SENSORFORGE_WIFI_PROFILE_COUNT || suffix != String(profileNumber)) {
+                    error = "invalid WiFi profile key: " + key;
+                    return false;
+                }
+                const size_t profileIndex = (size_t)(profileNumber - 1);
+                if (isPass) {
+                    if (!markOnce(seen.wifiPasses[profileIndex], key, error)) return false;
+                    bool wasEncrypted = false;
+                    String secretError;
+                    if (!configSecretDecode(key.c_str(), value, values.wifiPasses[profileIndex], wasEncrypted, secretError)) {
+                        error = key + ": " + secretError;
+                        return false;
+                    }
+                } else {
+                    if (!markOnce(seen.wifiSsids[profileIndex], key, error)) return false;
+                    values.wifiSsids[profileIndex] = value;
+                }
+            } else if (
+                key == "wifi_tx_power_dbm"
+            ) {
+
+                float decimalValue = 0.0f;
+
+                if (
+                    !markOnce(
+                        seen.wifiTxPowerDbm,
+                        key,
+                        error
+                    ) ||
+                    !parseFloatStrict(
+                        value,
+                        decimalValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid wifi_tx_power_dbm";
+                    return false;
+                }
+
+                values.wifiTxPowerDbm =
+                    decimalValue;
+
+            } else if (
+                key == "cluster_enabled"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.clusterEnabled,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid cluster_enabled";
+                    return false;
+                }
+
+                values.clusterEnabled =
+                    (int)numericValue;
+
+            } else if (
+                key == "cluster_id"
+            ) {
+
+                if (!markOnce(
+                        seen.clusterId,
+                        key,
+                        error
+                    )) {
+                    return false;
+                }
+
+                values.clusterId =
+                    value;
+
+            } else if (
+                key == "cluster_name"
+            ) {
+
+                if (!markOnce(
+                        seen.clusterName,
+                        key,
+                        error
+                    )) {
+                    return false;
+                }
+
+                values.clusterName =
+                    value;
+
+            } else if (
+                key == "cluster_credential_epoch"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.clusterCredentialEpoch,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    ) ||
+                    numericValue < 1 ||
+                    numericValue > 0xFFFFFFFFLL
+                ) {
+                    if (!error.length())
+                        error = "invalid cluster_credential_epoch";
+                    return false;
+                }
+
+                values.clusterCredentialEpoch =
+                    (uint32_t)numericValue;
+
+            } else if (
+                key == "cluster_password"
+            ) {
+
+                if (!markOnce(
+                        seen.clusterPassword,
+                        key,
+                        error
+                    )) {
+                    return false;
+                }
+
+                {
+                    bool wasEncrypted = false;
+                    String secretError;
+
+                    if (!configSecretDecode(
+                            "cluster_password",
+                            value,
+                            values.clusterPassword,
+                            wasEncrypted,
+                            secretError
+                        )) {
+                        error =
+                            "cluster_password: " +
+                            secretError;
+                        return false;
+                    }
+                }
+
+            } else if (
+                key == "cluster_coordinator_policy"
+            ) {
+
+                if (!markOnce(
+                        seen.clusterCoordinatorPolicy,
+                        key,
+                        error
+                    )) {
+                    return false;
+                }
+
+                values.clusterCoordinatorPolicy =
+                    value;
+
+            } else if (
+                key == "hotspot_enabled"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.hotspotEnabled,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid hotspot_enabled";
+
+                    return false;
+                }
+
+                values.hotspotEnabled =
+                    (int)numericValue;
+
+            } else if (
+                key == "hotspot_fallback_enabled"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.hotspotFallbackEnabled,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid hotspot_fallback_enabled";
+                    return false;
+                }
+
+                values.hotspotFallbackEnabled =
+                    (int)numericValue;
+
+            } else if (
+                key == "hotspot_password"
+            ) {
+
+                if (!markOnce(
+                        seen.hotspotPassword,
+                        key,
+                        error
+                    )) {
+                    return false;
+                }
+
+                {
+                    bool wasEncrypted = false;
+                    String secretError;
+
+                    if (!configSecretDecode(
+                            "hotspot_password",
+                            value,
+                            values.hotspotPassword,
+                            wasEncrypted,
+                            secretError
+                        )) {
+                        error =
+                            "hotspot_password: " +
+                            secretError;
+                        return false;
+                    }
+                }
+
+            } else if (
+                key == "hotspot_hidden"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.hotspotHidden,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid hotspot_hidden";
+
+                    return false;
+                }
+
+                values.hotspotHidden =
+                    (int)numericValue;
+
+            } else if (
+                key == "web_auth_enabled"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.webAuthEnabled,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid web_auth_enabled";
+
+                    return false;
+                }
+
+                values.webAuthEnabled =
+                    (int)numericValue;
+
+            } else if (
+                key == "web_recording_auto_pause"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.webRecordingAutoPause,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid web_recording_auto_pause";
+
+                    return false;
+                }
+
+                values.webRecordingAutoPause =
+                    (int)numericValue;
+
+            } else if (
+                key == "web_language"
+            ) {
+
+                if (!markOnce(
+                        seen.webLanguage,
+                        key,
+                        error
+                    )) {
+                    return false;
+                }
+
+                values.webLanguage =
+                    value;
+
+            } else if (
+                key == "web_username"
+            ) {
+
+                if (!markOnce(
+                        seen.webUsername,
+                        key,
+                        error
+                    )) {
+                    return false;
+                }
+
+                values.webUsername =
+                    value;
+
+            } else if (
+                key == "web_password"
+            ) {
+
+                if (!markOnce(
+                        seen.webPassword,
+                        key,
+                        error
+                    )) {
+                    return false;
+                }
+
+                {
+                    bool wasEncrypted = false;
+                    String secretError;
+
+                    if (!configSecretDecode(
+                            "web_password",
+                            value,
+                            values.webPassword,
+                            wasEncrypted,
+                            secretError
+                        )) {
+                        error =
+                            "web_password: " +
+                            secretError;
+                        return false;
+                    }
+                }
+
+            } else if (key == "stream_allow_annotation_edit" || key == "stream_allow_delete") {
+                bool &seenFlag = key == "stream_allow_annotation_edit"
+                    ? seen.streamAllowAnnotationEdit
+                    : seen.streamAllowDelete;
+
+                if (!markOnce(seenFlag, key, error) || !parseIntegerStrict(value, numericValue)) {
+                    if (!error.length())
+                        error = "invalid " + key;
+                    return false;
+                }
+
+                if (key == "stream_allow_annotation_edit")
+                    values.streamAllowAnnotationEdit = (int)numericValue;
+                else
+                    values.streamAllowDelete = (int)numericValue;
+
+            } else if (key.startsWith("stream_username_") || key.startsWith("stream_password_")) {
+                const bool isPassword = key.startsWith("stream_password_");
+                const size_t prefixLength = 16U;
+                const String suffix = key.substring(prefixLength);
+                const int userNumber = suffix.toInt();
+                if (userNumber < 1 || userNumber > SENSORFORGE_STREAM_USER_COUNT || suffix != String(userNumber)) {
+                    error = "invalid streaming user key: " + key;
+                    return false;
+                }
+                const size_t userIndex = (size_t)(userNumber - 1);
+                if (isPassword) {
+                    if (!markOnce(seen.streamPasswords[userIndex], key, error)) return false;
+                    bool wasEncrypted = false;
+                    String secretError;
+                    if (!configSecretDecode(key.c_str(), value, values.streamPasswords[userIndex], wasEncrypted, secretError)) {
+                        error = key + ": " + secretError;
+                        return false;
+                    }
+                } else {
+                    if (!markOnce(seen.streamUsernames[userIndex], key, error)) return false;
+                    values.streamUsernames[userIndex] = value;
+                }
+
+            } else if (
+                key == "debug_enabled"
+            ) {
+
+                if (
+                    !markOnce(
+                        seen.debugEnabled,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid debug_enabled";
+
+                    return false;
+                }
+
+                values.debugEnabled =
+                    (int)numericValue;
+
+            } else if (
+                key == "log_file"
+            ) {
+
+                if (!markOnce(
+                        seen.logFile,
+                        key,
+                        error
+                    )) {
+                    return false;
+                }
+
+                values.logFile =
+                    value;
+
+            } else {
+
+                // Unknown keys are ignored intentionally.
+                // A future firmware may add fields while older
+                // firmware can still use the known subset.
+            }
+        }
+
+
+        if (newlinePos < 0)
+            break;
+
+
+        lineStart =
+            (size_t)newlinePos + 1U;
+    }
+
+
+    // Compatibility with the immediately preceding continuous-shooter test
+    // build, where interval_ms itself acted as the on/off switch. Once saved by
+    // this firmware, the explicit shooter_enabled key becomes canonical.
+    if (!seen.shooterEnabled && seen.shooterIntervalMs) {
+        values.shooterEnabled =
+            values.shooterIntervalMs > 0
+            ? 1
+            : 0;
+    }
+
+    // Normalize the legacy "interval 0 = off" representation to the explicit
+    // switch model so WebConfig always has a valid retained interval to show.
+    if (!values.shooterEnabled && values.shooterIntervalMs == 0)
+        values.shooterIntervalMs = 60000;
+
+    // WiFi TX-power normalization/migration. Board profiles define their own
+    // discrete valid levels, while SensorForge defines only a global reachability
+    // safety floor. Any finite stored value is normalized to the next higher
+    // valid level of the active board. If there is no higher level, the board's
+    // highest safe level is used. This also safely migrates older candidate
+    // configs that stored very-low or no-longer-listed values.
+    if (seen.wifiTxPowerDbm && isfinite(values.wifiTxPowerDbm)) {
+        int16_t txPowerX10 =
+            (int16_t)lroundf(values.wifiTxPowerDbm * 10.0f);
+        values.wifiTxPowerDbm =
+            boardWifiTxPowerNormalizeUpX10(txPowerX10) / 10.0f;
+    }
+
+    // Transport threshold migration:
+    // - new config: transport_black_threshold is canonical.
+    // - old config: transport_black_mean_max maps directly to the new value.
+    // - very old/partial config with only P95 maps to P95-10.
+    // The old P95 key is otherwise ignored; the runtime guard is always
+    // derived as threshold+10 (clamped to 255).
+    if (!seen.transportBlackThreshold) {
+        if (seen.transportBlackMeanMax) {
+            values.transportBlackThreshold =
+                values.transportBlackLegacyMeanMax;
+        } else if (seen.transportBlackP95Max) {
+            int migrated =
+                values.transportBlackLegacyP95Max - 10;
+
+            if (migrated < 0)
+                migrated = 0;
+
+            values.transportBlackThreshold =
+                migrated;
+        }
+    }
+
+
+    if (!allRequiredKeysSeen(
+            seen,
+            error
+        )) {
+        return false;
+    }
+
+
+    return
+        validateValues(
+            values,
+            error
+        );
+}
+
+
+static void applyValues(
+    const ConfigValues &values
+);
+
+
+bool configValidateText(
+    const String &text,
+    String &error
+)
+{
+    error = "";
+
+    // ConfigValues contains many Arduino String members and has grown with
+    // SensorForge's feature set. Do not place it on the loopTask stack from
+    // nested boot/recovery paths.
+    ConfigValues *values =
+        new (std::nothrow) ConfigValues;
+
+    if (!values) {
+        error =
+            "not enough memory for config validation";
+        return false;
+    }
+
+    bool valid =
+        parseConfigText(
+            text,
+            *values,
+            error
+        );
+
+    delete values;
+    return valid;
+}
+
+
+static bool parseAndApplyConfigText(
+    const String &text,
+    String &error
+)
+{
+    error = "";
+
+    ConfigValues *values =
+        new (std::nothrow) ConfigValues;
+
+    if (!values) {
+        error =
+            "not enough memory for config parse";
+        return false;
+    }
+
+    bool valid =
+        parseConfigText(
+            text,
+            *values,
+            error
+        );
+
+    if (valid)
+        applyValues(*values);
+
+    delete values;
+    return valid;
+}
+
+
+String configDefaultHostname()
+{
+    return makeDefaultHostnameFromBranding();
+}
+
+
+bool configBuildFactoryDefaultText(
+    String &text,
+    String &error
+)
+{
+    error = "";
+
+    ConfigValues *defaults =
+        new (std::nothrow) ConfigValues;
+
+    if (!defaults) {
+        error =
+            "not enough memory for factory config";
+        return false;
+    }
+
+    setDefaultValues(*defaults);
+
+    bool serialized =
+        serializeConfigValues(
+            *defaults,
+            text,
+            error
+        );
+
+    delete defaults;
+
+    if (!serialized)
+        return false;
+
+    String validationError;
+
+    if (!configValidateText(
+            text,
+            validationError
+        )) {
+        error =
+            "generated factory config invalid: " +
+            validationError;
+        return false;
+    }
+
+    return true;
+}
+
+
+// =============================================================
+// APPLY PARSED VALUES
+// =============================================================
+
+static void applyValues(
+    const ConfigValues &values
+)
+{
+    cfg_camera =
+        values.camera;
+
+    cfg_resolution =
+        values.resolution;
+
+    cfg_fps =
+        values.fps;
+
+#if RECORDING_PRODUCTION_FPS_CAP_1024X768 > 0
+    if (
+        cfg_resolution == "1024x768" &&
+        cfg_fps > RECORDING_PRODUCTION_FPS_CAP_1024X768
+    ) {
+        Serial.println(
+            "Config: XIAO stability profile clamps 1024x768 fps from " +
+            String(cfg_fps) +
+            " to " +
+            String(RECORDING_PRODUCTION_FPS_CAP_1024X768)
+        );
+        cfg_fps =
+            RECORDING_PRODUCTION_FPS_CAP_1024X768;
+    }
+#endif
+
+    cfg_quality =
+        values.quality;
+
+    cfg_camera_xclk_mhz =
+        values.cameraXclkMhz;
+
+    cfg_camera_auto_exposure =
+        values.cameraAutoExposure;
+
+    cfg_camera_ae_level =
+        values.cameraAeLevel;
+
+    cfg_camera_crop_zoom =
+        values.cameraCropZoom;
+
+    cfg_camera_crop_x =
+        values.cameraCropX;
+
+    cfg_camera_crop_y =
+        values.cameraCropY;
+
+    cfg_rotation =
+        values.rotation;
+
+    cfg_recording_format =
+        values.recordingFormat;
+
+    cfg_timestamp_enabled =
+        values.timestampEnabled;
+
+    cfg_recording_encryption =
+        values.recordingEncryption;
+
+    cfg_audio_enabled =
+        values.audioEnabled;
+
+    cfg_audio_expert_mode =
+        values.audioExpertMode;
+
+    cfg_audio_source =
+        values.audioSource;
+
+    cfg_audio_backend =
+        values.audioBackend;
+
+    cfg_audio_pdm_clk_pin =
+        values.audioPdmClkPin;
+
+    cfg_audio_pdm_data_pin =
+        values.audioPdmDataPin;
+
+    cfg_audio_i2s_bclk_pin =
+        values.audioI2sBclkPin;
+
+    cfg_audio_i2s_ws_pin =
+        values.audioI2sWsPin;
+
+    cfg_audio_i2s_data_pin =
+        values.audioI2sDataPin;
+
+    cfg_audio_i2s_mclk_pin =
+        values.audioI2sMclkPin;
+
+    cfg_audio_i2s_slot =
+        values.audioI2sSlot;
+
+    cfg_audio_sample_rate =
+        values.audioSampleRate;
+
+    cfg_audio_bits_per_sample =
+        values.audioBitsPerSample;
+
+    cfg_audio_channels =
+        values.audioChannels;
+
+    cfg_shooter_enabled = values.shooterEnabled;
+    cfg_shooter_storage_format = values.shooterStorageFormat;
+    cfg_shooter_interval_ms = values.shooterIntervalMs;
+    cfg_shooter_dark_mean_min = values.shooterDarkMeanMin;
+    cfg_shooter_min_change_pct = values.shooterMinChangePct;
+    cfg_shooter_motion_hint_change_pct = values.shooterMotionHintChangePct;
+    cfg_shooter_motion_hint_required_hits = values.shooterMotionHintRequiredHits;
+    cfg_shooter_motion_hint_window_frames = values.shooterMotionHintWindowFrames;
+    cfg_shooter_force_save_seconds = values.shooterForceSaveSeconds;
+    cfg_shooter_flush_seconds = values.shooterFlushSeconds;
+
+    cfg_recording_segment_seconds =
+        values.recordingSegmentSeconds;
+
+    cfg_recording_segment_max_mb =
+        values.recordingSegmentMaxMb;
+
+    cfg_recording_event_max_seconds =
+        values.recordingEventMaxSeconds;
+
+    cfg_recording_event_cooldown_seconds =
+        values.recordingEventCooldownSeconds;
+
+    cfg_recording_not_before =
+        values.recordingNotBefore;
+
+    cfg_motion_recording_enabled = values.motionRecordingEnabled;
+    cfg_motion_recording_decision = values.motionRecordingDecision;
+    cfg_image_motion_sensitivity = values.imageMotionSensitivity;
+    cfg_image_motion_min_area_pct = values.imageMotionMinAreaPct;
+    cfg_image_motion_confirm_frames = values.imageMotionConfirmFrames;
+    cfg_image_motion_release_frames = values.imageMotionReleaseFrames;
+    cfg_image_motion_background_learning = values.imageMotionBackgroundLearning;
+    cfg_image_motion_global_mean_delta = values.imageMotionGlobalMeanDelta;
+    cfg_image_motion_global_change_pct = values.imageMotionGlobalChangePct;
+    cfg_image_motion_roi_mask = values.imageMotionRoiMask;
+
+    cfg_post_ms =
+        values.postMs;
+
+    cfg_led_enabled =
+        values.ledEnabled;
+
+    cfg_operating_mode =
+        values.operatingMode;
+
+    cfg_streamer_rtsp_enabled =
+        values.streamerRtspEnabled;
+
+    cfg_streamer_http_mjpeg_enabled =
+        values.streamerHttpMjpegEnabled;
+
+    cfg_onvif_enabled =
+        values.onvifEnabled;
+
+    cfg_wireguard_enabled = values.wireguardEnabled;
+    cfg_wireguard_address = values.wireguardAddress;
+    cfg_wireguard_private_key = values.wireguardPrivateKey;
+    cfg_wireguard_peer_endpoint = values.wireguardPeerEndpoint;
+    cfg_wireguard_peer_public_key = values.wireguardPeerPublicKey;
+    cfg_wireguard_peer_port = values.wireguardPeerPort;
+
+    cfg_sleep_mode =
+        values.sleepMode;
+
+    cfg_sleep_delay_ms =
+        values.sleepDelayMs;
+
+    cfg_bootloop_protection =
+        values.bootloopProtection;
+
+    cfg_transport_mode =
+        values.transportMode;
+
+    cfg_transport_check_seconds =
+        values.transportCheckSeconds;
+
+    cfg_transport_light_confirm_seconds =
+        values.transportLightConfirmSeconds;
+
+    cfg_transport_install_delay_seconds =
+        values.transportInstallDelaySeconds;
+
+    cfg_transport_max_duration_seconds =
+        values.transportMaxDurationSeconds;
+
+    cfg_transport_black_threshold =
+        values.transportBlackThreshold;
+
+    cfg_min_free_space_mb =
+        values.minFreeSpaceMb;
+
+    cfg_disk_full_action =
+        values.diskFullAction;
+
+    cfg_wifi_on_system_start =
+        values.wifiOnSystemStart;
+
+    cfg_wifi_timeout_sec =
+        values.wifiTimeoutSec;
+
+    cfg_wifi_alive_schedule_enabled =
+        values.wifiAliveScheduleEnabled;
+
+    cfg_wifi_alive_schedule =
+        values.wifiAliveSchedule;
+
+    cfg_hostname =
+        values.hostname;
+
+    cfg_camera_display_name = values.cameraDisplayName;
+    cfg_camera_location = values.cameraLocation;
+    cfg_camera_gps_lat = values.cameraGpsLat;
+    cfg_camera_gps_lon = values.cameraGpsLon;
+    cfg_camera_responsible = values.cameraResponsible;
+    cfg_camera_email = values.cameraEmail;
+    cfg_camera_overlay_text = values.cameraOverlayText;
+    cfg_camera_description = values.cameraDescription;
+
+    cfg_timezone =
+        values.timezone;
+
+    for (size_t i = 0; i < SENSORFORGE_WIFI_PROFILE_COUNT; ++i) {
+        cfg_wifi_ssids[i] = values.wifiSsids[i];
+        cfg_wifi_passes[i] = values.wifiPasses[i];
+    }
+    cfg_wifi_ssid = cfg_wifi_ssids[0];
+    cfg_wifi_pass = cfg_wifi_passes[0];
+
+    cfg_wifi_tx_power_dbm =
+        values.wifiTxPowerDbm;
+
+    cfg_cluster_enabled =
+        values.clusterEnabled;
+
+    cfg_cluster_id =
+        values.clusterId;
+
+    cfg_cluster_name =
+        values.clusterName;
+
+    cfg_cluster_credential_epoch =
+        values.clusterCredentialEpoch;
+
+    cfg_cluster_password =
+        values.clusterPassword;
+
+    cfg_cluster_coordinator_policy =
+        values.clusterCoordinatorPolicy;
+
+    cfg_hotspot_enabled =
+        values.hotspotEnabled;
+
+    cfg_hotspot_fallback_enabled =
+        values.hotspotFallbackEnabled;
+
+    cfg_hotspot_password =
+        values.hotspotPassword;
+
+    cfg_hotspot_hidden =
+        values.hotspotHidden;
+
+    cfg_web_auth_enabled =
+        values.webAuthEnabled;
+
+    cfg_web_recording_auto_pause =
+        values.webRecordingAutoPause;
+
+    cfg_web_language =
+        values.webLanguage;
+
+    cfg_web_username =
+        values.webUsername;
+
+    cfg_web_password =
+        values.webPassword;
+
+    for (size_t i = 0; i < SENSORFORGE_STREAM_USER_COUNT; ++i) {
+        cfg_stream_usernames[i] = values.streamUsernames[i];
+        cfg_stream_passwords[i] = values.streamPasswords[i];
+    }
+    cfg_stream_allow_annotation_edit = values.streamAllowAnnotationEdit;
+    cfg_stream_allow_delete = values.streamAllowDelete;
+
+    cfg_debug_enabled =
+        values.debugEnabled;
+
+    cfg_log_file =
+        values.logFile;
+}
+
+
+// =============================================================
+// FILE HELPERS
+// =============================================================
+
+static bool readTextFile(
+    fs::FS &filesystem,
+    const char *path,
+    String &text
+)
+{
+    File file =
+        filesystem.open(
+            path,
+            FILE_READ
+        );
+
+
+    if (!file)
+        return false;
+
+
+    size_t size =
+        file.size();
+
+
+    if (
+        size == 0 ||
+        size >
+            CONFIG_MAX_BYTES
+    ) {
+
+        file.close();
+
+        return false;
+    }
+
+
+    text =
+        "";
+
+    text.reserve(
+        size + 1
+    );
+
+
+    while (file.available()) {
+
+        char buffer[256];
+
+        size_t got =
+            file.readBytes(
+                buffer,
+                sizeof(buffer)
+            );
+
+
+        if (got == 0)
+            break;
+
+
+        text.concat(
+            buffer,
+            got
+        );
+    }
+
+
+    file.close();
+
+
+    return
+        text.length() ==
+        size;
+}
+
+
+static bool writeConfigFileDirectVerified(
+    fs::FS &filesystem,
+    const char *path,
+    const String &text
+)
+{
+    filesystem.remove(path);
+
+    File file =
+        filesystem.open(
+            path,
+            FILE_WRITE
+        );
+
+    if (!file)
+        return false;
+
+    size_t written =
+        file.print(text);
+
+    file.flush();
+    file.close();
+
+    if (written != text.length()) {
+        filesystem.remove(path);
+        return false;
+    }
+
+    String verifyText;
+
+    if (
+        !readTextFile(
+            filesystem,
+            path,
+            verifyText
+        ) ||
+        verifyText != text
+    ) {
+        filesystem.remove(path);
+        return false;
+    }
+
+    String validationError;
+
+    if (!configValidateText(
+            verifyText,
+            validationError
+        )) {
+        filesystem.remove(path);
+        return false;
+    }
+
+    return true;
+}
+
+
+static void recoverAtomicFiles(
+    fs::FS &filesystem
+)
+{
+    if (
+        filesystem.exists(
+            "/config.txt"
+        )
+    ) {
+
+        if (
+            filesystem.exists(
+                "/config.tmp"
+            )
+        ) {
+            filesystem.remove(
+                "/config.tmp"
+            );
+        }
+
+        if (
+            filesystem.exists(
+                "/config.bak"
+            )
+        ) {
+            filesystem.remove(
+                "/config.bak"
+            );
+        }
+
+        return;
+    }
+
+
+    if (
+        filesystem.exists(
+            "/config.bak"
+        )
+    ) {
+
+        if (filesystem.rename(
+                "/config.bak",
+                "/config.txt"
+            )) {
+
+            if (
+                filesystem.exists(
+                    "/config.tmp"
+                )
+            ) {
+                filesystem.remove(
+                    "/config.tmp"
+                );
+            }
+
+            return;
+        }
+
+        // Do not destroy either recovery candidate when the restore itself
+        // fails. A later boot or explicit maintenance action may still be able
+        // to recover the filesystem.
+        return;
+    }
+
+
+    if (
+        filesystem.exists(
+            "/config.tmp"
+        )
+    ) {
+        // First-ever saves have no /config.txt and no /config.bak. If power or
+        // a reset interrupts the transaction after /config.tmp was fully
+        // written/verified but before the final rename, the temporary file is
+        // the only durable copy. The old code deleted it unconditionally,
+        // which turned an interrupted first save into "config missing".
+        String candidate;
+        String validationError;
+
+        bool candidateValid =
+            readTextFile(
+                filesystem,
+                "/config.tmp",
+                candidate
+            ) &&
+            configValidateText(
+                candidate,
+                validationError
+            );
+
+        if (candidateValid) {
+            // Keep the validated temp file intact until the authoritative path
+            // has been written and verified. This is deliberately a copy, not
+            // a rename: if recovery itself is interrupted, /config.tmp remains
+            // available for the next boot instead of losing the only good copy.
+            if (writeConfigFileDirectVerified(
+                    filesystem,
+                    "/config.txt",
+                    candidate
+                )) {
+                filesystem.remove(
+                    "/config.tmp"
+                );
+                return;
+            }
+
+            // Valid recovery data must never be thrown away merely because a
+            // filesystem metadata/write operation failed.
+            return;
+        }
+
+        // Only an actually invalid/incomplete temp file is safe to discard.
+        filesystem.remove(
+            "/config.tmp"
+        );
+    }
+}
+
+
+static bool atomicWriteText(
+    fs::FS &filesystem,
+    const String &text
+)
+{
+    filesystem.remove(
+        "/config.tmp"
+    );
+
+
+    File file =
+        filesystem.open(
+            "/config.tmp",
+            FILE_WRITE
+        );
+
+
+    if (!file)
+        return false;
+
+
+    size_t written =
+        file.print(
+            text
+        );
+
+
+    file.flush();
+    file.close();
+
+
+    if (
+        written !=
+        text.length()
+    ) {
+
+        filesystem.remove(
+            "/config.tmp"
+        );
+
+        return false;
+    }
+
+
+    String verifyText;
+
+
+    if (
+        !readTextFile(
+            filesystem,
+            "/config.tmp",
+            verifyText
+        ) ||
+        verifyText != text
+    ) {
+
+        filesystem.remove(
+            "/config.tmp"
+        );
+
+        return false;
+    }
+
+
+    String validationError;
+
+
+    if (!configValidateText(
+            verifyText,
+            validationError
+        )) {
+
+        filesystem.remove(
+            "/config.tmp"
+        );
+
+        return false;
+    }
+
+
+    filesystem.remove(
+        "/config.bak"
+    );
+
+
+    bool hadOld =
+        filesystem.exists(
+            "/config.txt"
+        );
+
+
+    if (hadOld) {
+
+        if (!filesystem.rename(
+                "/config.txt",
+                "/config.bak"
+            )) {
+
+            filesystem.remove(
+                "/config.tmp"
+            );
+
+            return false;
+        }
+    }
+
+
+    if (!filesystem.rename(
+            "/config.tmp",
+            "/config.txt"
+        )) {
+
+        if (hadOld) {
+            filesystem.rename(
+                "/config.bak",
+                "/config.txt"
+            );
+
+            filesystem.remove(
+                "/config.tmp"
+            );
+
+            return false;
+        }
+
+        // On the first-ever config there is no previous file to protect. A
+        // direct verified write is a safe fallback if the metadata rename
+        // itself fails.
+        if (writeConfigFileDirectVerified(
+                filesystem,
+                "/config.txt",
+                text
+            )) {
+            filesystem.remove(
+                "/config.tmp"
+            );
+            return true;
+        }
+
+        return false;
+    }
+
+
+    // Do not report a successful save merely because rename() returned true.
+    // The final authoritative path must itself be readable, byte-identical and
+    // valid before the transaction is committed and the backup is discarded.
+    String finalText;
+    String finalValidationError;
+
+    bool finalValid =
+        readTextFile(
+            filesystem,
+            "/config.txt",
+            finalText
+        ) &&
+        finalText == text &&
+        configValidateText(
+            finalText,
+            finalValidationError
+        );
+
+    if (!finalValid) {
+        if (hadOld) {
+            filesystem.remove(
+                "/config.txt"
+            );
+
+            filesystem.rename(
+                "/config.bak",
+                "/config.txt"
+            );
+
+            return false;
+        }
+
+        // No older config exists on a first-run device. Retry by writing the
+        // authoritative path directly and verify that exact path again.
+        if (!writeConfigFileDirectVerified(
+                filesystem,
+                "/config.txt",
+                text
+            )) {
+            return false;
+        }
+    }
+
+
+    filesystem.remove(
+        "/config.bak"
+    );
+
+
+    return true;
+}
+
+
+// =============================================================
+// LITTLEFS SHADOW
+// =============================================================
+
+static bool internalConfigPartitionLooksErased(
+    bool &known
+)
+{
+    known = false;
+
+    // Arduino-ESP32 LittleFS uses the "spiffs" data partition by default.
+    // We only permit automatic first-run formatting when that exact partition
+    // is demonstrably blank/erased. A mount failure on non-blank flash must
+    // never destroy a previously saved internal configuration.
+    const esp_partition_t *partition =
+        esp_partition_find_first(
+            ESP_PARTITION_TYPE_DATA,
+            ESP_PARTITION_SUBTYPE_DATA_SPIFFS,
+            "spiffs"
+        );
+
+    if (!partition)
+        return false;
+
+    known = true;
+
+    const size_t probeBytes =
+        partition->size < (16U * 1024U)
+        ? partition->size
+        : (16U * 1024U);
+
+    uint8_t buffer[256];
+
+    for (size_t offset = 0; offset < probeBytes; offset += sizeof(buffer)) {
+        size_t chunk =
+            probeBytes - offset < sizeof(buffer)
+            ? probeBytes - offset
+            : sizeof(buffer);
+
+        if (
+            esp_partition_read(
+                partition,
+                offset,
+                buffer,
+                chunk
+            ) != ESP_OK
+        ) {
+            known = false;
+            return false;
+        }
+
+        for (size_t i = 0; i < chunk; ++i) {
+            if (buffer[i] != 0xFFU)
+                return false;
+        }
+    }
+
+    return true;
+}
+
+
+static bool initInternalConfigStorage()
+{
+    // Mount retries are intentionally short and bounded. They cover a
+    // transient VFS/LittleFS startup failure without ever changing flash
+    // contents.
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        if (
+            LittleFS.begin(
+                false
+            )
+        ) {
+            internalAvailableState =
+                true;
+
+            recoverAtomicFiles(
+                LittleFS
+            );
+
+            internalValidState =
+                false;
+
+            if (LittleFS.exists("/config.txt")) {
+                internalConfigState =
+                    INTERNAL_CONFIG_UNCHECKED;
+                internalConfigDetail =
+                    "mounted; /config.txt present, validation pending";
+            } else {
+                internalConfigState =
+                    INTERNAL_CONFIG_MISSING;
+                internalConfigDetail =
+                    "mounted; /config.txt missing";
+            }
+
+            return true;
+        }
+
+        LittleFS.end();
+
+        if (attempt < 2)
+            delay(25);
+    }
+
+
+    bool partitionStateKnown = false;
+    bool partitionErased =
+        internalConfigPartitionLooksErased(
+            partitionStateKnown
+        );
+
+
+    // Fresh factory flash is the only automatic-format case. Once any data is
+    // present in the filesystem partition, a mount failure is treated as a
+    // preservation/recovery condition and never as permission to erase it.
+    if (
+        partitionStateKnown &&
+        partitionErased
+    ) {
+        Serial.println(
+            "Config: blank LittleFS partition detected - initializing first-run filesystem"
+        );
+
+        if (
+            LittleFS.begin(
+                true
+            )
+        ) {
+            internalAvailableState =
+                true;
+
+            internalValidState =
+                false;
+
+            recoverAtomicFiles(
+                LittleFS
+            );
+
+            internalConfigState =
+                INTERNAL_CONFIG_MISSING;
+            internalConfigDetail =
+                "fresh LittleFS initialized; /config.txt missing";
+
+            return true;
+        }
+    }
+
+
+    internalAvailableState =
+        false;
+
+    internalValidState =
+        false;
+
+    internalConfigState =
+        INTERNAL_CONFIG_UNAVAILABLE;
+
+    internalConfigDetail =
+        partitionStateKnown
+        ? "LittleFS mount failed; existing flash data preserved (not formatted)"
+        : "LittleFS mount failed; partition state unknown, data preserved (not formatted)";
+
+    Serial.println(
+        "Config: " +
+        internalConfigDetail
+    );
+
+    return false;
+}
+
+
+// =============================================================
+// CONFIG SECRET PERSISTENCE
+// =============================================================
+
+static bool configSecretFieldName(const String &key)
+{
+    return
+        key == "wifi_pass" ||
+        key.startsWith("wifi_pass_") ||
+        key == "hotspot_password" ||
+        key == "wireguard_private_key" ||
+        key == "cluster_password" ||
+        key == "web_password" ||
+        key.startsWith("stream_password_");
+}
+
+
+static bool protectConfigSecretsForStorage(
+    const String &input,
+    String &output,
+    int &newlyEncryptedCount,
+    int &encryptedFieldCount,
+    String &error
+)
+{
+    output = "";
+    error = "";
+    newlyEncryptedCount = 0;
+    encryptedFieldCount = 0;
+
+    output.reserve(
+        input.length() + 512
+    );
+
+    size_t start = 0;
+
+    while (start < input.length()) {
+        int newlinePos =
+            input.indexOf('\n', start);
+
+        size_t end =
+            newlinePos < 0
+            ? input.length()
+            : (size_t)newlinePos;
+
+        String originalLine =
+            input.substring(start, end);
+
+        String probe = originalLine;
+        probe.replace("\r", "");
+        probe.trim();
+
+        bool replaced = false;
+        char commentMarker = 0;
+
+        // Secret assignments are protected even when commented out. This is
+        // important for field configs that keep an old/alternate Wi-Fi
+        // password as e.g. "#wifi_pass=...". Such historical credentials must
+        // not remain recoverable from a removed SD card.
+        if (
+            probe.startsWith("#") ||
+            probe.startsWith(";")
+        ) {
+            commentMarker = probe[0];
+            probe = probe.substring(1);
+            probe.trim();
+        }
+
+        if (probe.length()) {
+            int separator = probe.indexOf('=');
+
+            if (separator > 0) {
+                String key = probe.substring(0, separator);
+                String value = probe.substring(separator + 1);
+                key.trim();
+                value.trim();
+
+                if (configSecretFieldName(key)) {
+                    String protectedValue = value;
+
+                    // Empty secret fields are valid (for example unused WiFi
+                    // profile slots). Keep them empty instead of passing a
+                    // zero-length plaintext through the ESP32-S3 PSA GCM
+                    // implementation, which rejects that call with
+                    // PSA_ERROR_INVALID_ARGUMENT (-135).
+                    if (value.length() > 0) {
+                        if (!configSecretIsEncrypted(value)) {
+                            String secretError;
+
+                            if (!configSecretEncrypt(
+                                    key.c_str(),
+                                    value,
+                                    protectedValue,
+                                    secretError
+                                )) {
+                                error =
+                                    key +
+                                    ": " +
+                                    secretError;
+                                return false;
+                            }
+
+                            newlyEncryptedCount++;
+                        }
+
+                        encryptedFieldCount++;
+                    }
+
+                    if (commentMarker)
+                        output += commentMarker;
+
+                    output += key;
+                    output += '=';
+                    output += protectedValue;
+                    replaced = true;
+                }
+            }
+        }
+
+        if (!replaced)
+            output += originalLine;
+
+        if (newlinePos >= 0) {
+            output += '\n';
+            start = end + 1U;
+        } else {
+            start = input.length();
+        }
+    }
+
+    return true;
+}
+
+
+static void migrateLoadedConfigSecrets()
+{
+    if (activeConfigSource == CONFIG_SOURCE_DEFAULTS)
+        return;
+
+    String sourceText;
+    bool sourceRead = false;
+
+    if (
+        activeConfigSource == CONFIG_SOURCE_SD &&
+        sdAvailableState &&
+        STORAGE.exists("/config.txt")
+    ) {
+        sourceRead =
+            readTextFile(
+                STORAGE,
+                "/config.txt",
+                sourceText
+            );
+    } else if (
+        activeConfigSource == CONFIG_SOURCE_INTERNAL &&
+        internalAvailableState &&
+        LittleFS.exists("/config.txt")
+    ) {
+        sourceRead =
+            readTextFile(
+                LittleFS,
+                "/config.txt",
+                sourceText
+            );
+    }
+
+    if (!sourceRead) {
+        Serial.println(
+            "Config secrets: WARNING - active config could not be read for SFSEC1 check"
+        );
+        return;
+    }
+
+    String protectedText;
+    String protectionError;
+    int newlyEncryptedCount = 0;
+    int encryptedFieldCount = 0;
+
+    if (!protectConfigSecretsForStorage(
+            sourceText,
+            protectedText,
+            newlyEncryptedCount,
+            encryptedFieldCount,
+            protectionError
+        )) {
+        Serial.println(
+            "Config secrets: WARNING - SFSEC1 protection unavailable | " +
+            protectionError
+        );
+        return;
+    }
+
+    if (newlyEncryptedCount == 0) {
+        Serial.println(
+            "Config secrets: SFSEC1 active | protected_entries=" +
+            String(encryptedFieldCount)
+        );
+        return;
+    }
+
+    String validationError;
+
+    if (!configValidateText(
+            protectedText,
+            validationError
+        )) {
+        Serial.println(
+            "Config secrets: WARNING - migrated SFSEC1 config validation failed | " +
+            validationError
+        );
+        return;
+    }
+
+    // Preserve config-source semantics during automatic migration. If SD was
+    // authoritative, update SD and its LittleFS shadow. If the internal copy
+    // was selected because SD was missing/invalid, do not overwrite that SD.
+    if (activeConfigSource == CONFIG_SOURCE_SD) {
+        if (!atomicWriteText(
+                STORAGE,
+                protectedText
+            )) {
+            Serial.println(
+                "Config secrets: WARNING - SFSEC1 migration SD write failed"
+            );
+            return;
+        }
+
+        sdPresentState = true;
+        sdValidState = true;
+
+        if (
+            internalAvailableState &&
+            atomicWriteText(
+                LittleFS,
+                protectedText
+            )
+        ) {
+            internalValidState = true;
+            internalConfigState = INTERNAL_CONFIG_VALID;
+            internalConfigDetail = "valid; SFSEC1 migration refreshed shadow";
+        } else if (internalAvailableState) {
+            internalValidState = false;
+            internalConfigState = INTERNAL_CONFIG_INVALID;
+            internalConfigDetail = "SFSEC1 migration internal shadow write failed";
+            Serial.println(
+                "Config secrets: WARNING - SFSEC1 migration internal shadow write failed"
+            );
+        }
+
+        Serial.println(
+            "Config secrets: plaintext migrated to SFSEC1 | entries=" +
+            String(newlyEncryptedCount) +
+            " | storage=SD+internal"
+        );
+        return;
+    }
+
+    if (!atomicWriteText(
+            LittleFS,
+            protectedText
+        )) {
+        internalValidState = false;
+        internalConfigState = INTERNAL_CONFIG_INVALID;
+        internalConfigDetail = "SFSEC1 migration internal write failed";
+        Serial.println(
+            "Config secrets: WARNING - SFSEC1 migration internal write failed"
+        );
+        return;
+    }
+
+    internalValidState = true;
+    internalConfigState = INTERNAL_CONFIG_VALID;
+    internalConfigDetail = "valid; SFSEC1 migration completed";
+
+    Serial.println(
+        "Config secrets: plaintext migrated to SFSEC1 | entries=" +
+        String(newlyEncryptedCount) +
+        " | storage=internal"
+    );
+}
+
+
+// =============================================================
+// LOAD CONFIG
+// =============================================================
+
+void loadConfig(
+    bool sdAvailable
+)
+{
+    activeConfigSource =
+        CONFIG_SOURCE_DEFAULTS;
+
+    sdAvailableState =
+        sdAvailable;
+
+    sdPresentState =
+        false;
+
+    sdValidState =
+        false;
+
+    internalAvailableState =
+        false;
+
+    internalValidState =
+        false;
+
+    internalConfigState =
+        INTERNAL_CONFIG_UNCHECKED;
+
+    internalConfigDetail =
+        "not checked";
+
+
+    initInternalConfigStorage();
+
+
+    // ---------------------------------------------------------
+    // 1. SD has absolute priority when present AND valid.
+    // ---------------------------------------------------------
+
+    if (sdAvailableState) {
+
+        recoverAtomicFiles(
+            STORAGE
+        );
+
+
+        sdPresentState =
+            STORAGE.exists(
+                "/config.txt"
+            );
+
+
+        if (sdPresentState) {
+
+            String sdText;
+
+
+            if (readTextFile(
+                    STORAGE,
+                    "/config.txt",
+                    sdText
+                )) {
+
+                String error;
+
+
+                if (parseAndApplyConfigText(
+                        sdText,
+                        error
+                    )) {
+
+                    sdValidState =
+                        true;
+
+                    activeConfigSource =
+                        CONFIG_SOURCE_SD;
+
+
+                    Serial.println(
+                        "Config: valid SD /config.txt loaded"
+                    );
+
+
+                    // Exact 1:1 shadow copy.
+                    if (internalAvailableState) {
+
+                        if (atomicWriteText(
+                                LittleFS,
+                                sdText
+                            )) {
+
+                            internalValidState =
+                                true;
+
+                            internalConfigState =
+                                INTERNAL_CONFIG_VALID;
+
+                            internalConfigDetail =
+                                "valid; refreshed from SD";
+
+                            Serial.println(
+                                "Config: internal shadow updated"
+                            );
+
+                        } else {
+
+                            internalValidState =
+                                false;
+
+                            internalConfigState =
+                                INTERNAL_CONFIG_INVALID;
+
+                            internalConfigDetail =
+                                "internal shadow update from SD failed";
+
+                            Serial.println(
+                                "Config: WARNING - internal shadow update failed"
+                            );
+                        }
+                    }
+
+
+                    // SD wins. No need to inspect internal config
+                    // for selection after successful SD load.
+                    goto config_loaded;
+                }
+
+
+                Serial.println(
+                    "Config: SD /config.txt INVALID: " +
+                    error
+                );
+
+            } else {
+
+                Serial.println(
+                    "Config: SD /config.txt cannot be read"
+                );
+            }
+        }
+    }
+
+
+    // ---------------------------------------------------------
+    // 2. SD missing/invalid -> internal LittleFS fallback.
+    // ---------------------------------------------------------
+
+    if (
+        internalAvailableState &&
+        LittleFS.exists(
+            "/config.txt"
+        )
+    ) {
+
+        String internalText;
+
+
+        if (readTextFile(
+                LittleFS,
+                "/config.txt",
+                internalText
+            )) {
+
+            String error;
+
+
+            if (parseAndApplyConfigText(
+                    internalText,
+                    error
+                )) {
+
+                internalValidState =
+                    true;
+
+                internalConfigState =
+                    INTERNAL_CONFIG_VALID;
+
+                internalConfigDetail =
+                    "valid";
+
+                activeConfigSource =
+                    CONFIG_SOURCE_INTERNAL;
+
+
+                Serial.println(
+                    "Config: using INTERNAL LittleFS fallback"
+                );
+
+
+                goto config_loaded;
+            }
+
+
+            internalValidState =
+                false;
+
+            internalConfigState =
+                INTERNAL_CONFIG_INVALID;
+
+            internalConfigDetail =
+                "validation failed: " +
+                error;
+
+            Serial.println(
+                "Config: internal shadow INVALID: " +
+                error
+            );
+        } else {
+            internalValidState =
+                false;
+
+            internalConfigState =
+                INTERNAL_CONFIG_INVALID;
+
+            internalConfigDetail =
+                "cannot read internal /config.txt";
+
+            Serial.println(
+                "Config: internal /config.txt cannot be read"
+            );
+        }
+    } else if (internalAvailableState) {
+        internalValidState =
+            false;
+
+        internalConfigState =
+            INTERNAL_CONFIG_MISSING;
+
+        internalConfigDetail =
+            "mounted; /config.txt missing";
+    }
+
+
+    // ---------------------------------------------------------
+    // 3. No usable external config -> firmware defaults.
+    // ---------------------------------------------------------
+
+    {
+        ConfigValues *defaults =
+            new (std::nothrow) ConfigValues;
+
+        if (defaults) {
+            setDefaultValues(*defaults);
+            applyValues(*defaults);
+            delete defaults;
+        } else {
+            // Global cfg_* variables are initialized to the same firmware
+            // defaults before setup(). Keep those values rather than risking
+            // a large stack allocation if the heap is exhausted.
+            Serial.println(
+                "Config: WARNING - no heap for default ConfigValues; keeping compiled cfg defaults"
+            );
+        }
+    }
+
+    activeConfigSource =
+        CONFIG_SOURCE_DEFAULTS;
+
+
+    Serial.println(
+        "Config: no valid SD/internal config - using firmware defaults"
+    );
+
+
+config_loaded:
+
+    migrateLoadedConfigSecrets();
+
+    // transport_mode may have been changed while the SD card was unavailable.
+    // Reconcile that newer operational state before any subsystem consumes
+    // cfg_transport_mode. This prevents a stale SD config from resurrecting a
+    // transport session that was already ended using the internal fallback.
+    reconcilePendingTransportMode();
+
+    // If SD was valid, internalValidState was set by the shadow
+    // write above. If internal was selected, it is already true.
+    // When SD wins but LittleFS existed beforehand and shadow
+    // write failed, we deliberately report internal invalid.
+
+
+    Serial.println(
+        "Config source: " +
+        String(
+            configSourceName()
+        )
+    );
+
+
+    Serial.println(
+        "Config SD: " +
+        String(
+            configSdStatusName()
+        )
+    );
+
+
+    Serial.println(
+        "Config internal shadow: " +
+        String(
+            configInternalStatusName()
+        )
+    );
+
+    Serial.println(
+        "Config internal detail: " +
+        internalConfigDetail
+    );
+
+
+    Serial.println(
+        "Config Camera: quality=" +
+        String(cfg_quality) +
+        " xclk_mhz=" +
+        String(cfg_camera_xclk_mhz) +
+        " auto_exposure=" +
+        String(cfg_camera_auto_exposure) +
+        " ae_level=" +
+        String(cfg_camera_ae_level)
+    );
+
+
+    Serial.println(
+        "Config Sleep: mode=" +
+        cfg_sleep_mode +
+        " delay_ms=" +
+        String(cfg_sleep_delay_ms) +
+        " bootloop_protection=" +
+        String(cfg_bootloop_protection)
+    );
+
+
+    Serial.println(
+        "Config Transport: mode=" +
+        String(cfg_transport_mode) +
+        " check_s=" +
+        String(cfg_transport_check_seconds) +
+        " confirm_s=" +
+        String(cfg_transport_light_confirm_seconds) +
+        " install_delay_s=" +
+        String(cfg_transport_install_delay_seconds) +
+        " max_duration_s=" +
+        String(cfg_transport_max_duration_seconds) +
+        " black_threshold=" +
+        String(cfg_transport_black_threshold) +
+        " p95_limit_auto=" +
+        String(configTransportBlackP95Limit())
+    );
+
+
+    Serial.println(
+        "Config Arming: recording_not_before=" +
+        cfg_recording_not_before
+    );
+
+    Serial.println(
+        "Config Recording safety: event_max_seconds=" +
+        String(cfg_recording_event_max_seconds) +
+        " cooldown_seconds=" +
+        String(cfg_recording_event_cooldown_seconds)
+    );
+
+    Serial.println(
+        "Config Recording encryption: enabled=" +
+        String(cfg_recording_encryption)
+    );
+
+    Serial.println(
+        "Config Audio: enabled=" +
+        String(cfg_audio_enabled) +
+        " expert=" +
+        String(cfg_audio_expert_mode) +
+        " source=" +
+        cfg_audio_source +
+        " backend=" +
+        cfg_audio_backend +
+        " rate=" +
+        String(cfg_audio_sample_rate) +
+        " bits=" +
+        String(cfg_audio_bits_per_sample) +
+        " channels=" +
+        String(cfg_audio_channels)
+    );
+
+    Serial.println(
+        "Config Shooter: enabled=" +
+        String(cfg_shooter_enabled) +
+        " storage_format=" +
+        cfg_shooter_storage_format +
+        " interval_ms=" +
+        String(cfg_shooter_interval_ms) +
+        " dark_mean_min=" +
+        String(cfg_shooter_dark_mean_min) +
+        " min_change_pct=" +
+        String(cfg_shooter_min_change_pct, 1) +
+        " motion_hint=" +
+        String(cfg_shooter_motion_hint_change_pct, 1) +
+        "%/" +
+        String(cfg_shooter_motion_hint_required_hits) +
+        "of" +
+        String(cfg_shooter_motion_hint_window_frames) +
+        " force_save_s=" +
+        String(cfg_shooter_force_save_seconds) +
+        " flush_s=" +
+        String(cfg_shooter_flush_seconds) +
+        " buffer=auto"
+    );
+
+    Serial.println(
+        "Config Motion recording: enabled=" +
+        String(cfg_motion_recording_enabled) +
+        " mode=" +
+        cfg_motion_recording_decision
+    );
+
+    {
+        uint32_t performanceLoad =
+            configRecordingPerformanceLoad(
+                cfg_resolution,
+                cfg_fps,
+                cfg_quality
+            );
+
+        uint32_t performanceLimit =
+            configRecordingPerformanceLimit();
+
+        int performanceMaxFps =
+            configRecordingPerformanceMaxFps(
+                cfg_resolution,
+                cfg_quality
+            );
+
+        Serial.println(
+            "Config Recording performance: resolution=" +
+            cfg_resolution +
+            " fps=" +
+            String(cfg_fps) +
+            " quality=" +
+            String(cfg_quality) +
+            " score=" +
+            String((unsigned long)performanceLoad) +
+            " board_limit=" +
+            String((unsigned long)performanceLimit) +
+            " max_fps=" +
+            String(performanceMaxFps)
+        );
+    }
+
+
+    // Diagnostic output deliberately never prints the password.
+    Serial.println(
+        "Config Timezone: " +
+        cfg_timezone
+    );
+
+
+    Serial.println(
+        "Config WiFi: on_system_start=" +
+        cfg_wifi_on_system_start
+    );
+
+    Serial.println(
+        "Config WiFi: timeout_sec=" +
+        String(cfg_wifi_timeout_sec)
+    );
+
+    Serial.println(
+        "Config WiFi: alive_schedule=" +
+        String(cfg_wifi_alive_schedule_enabled ? "on" : "off") +
+        " entries=" +
+        cfg_wifi_alive_schedule
+    );
+
+    Serial.println(
+        "Config WiFi: hostname=" +
+        cfg_hostname
+    );
+
+    Serial.println(
+        "Config WiFi: tx_power_dbm=" +
+        String(cfg_wifi_tx_power_dbm, 1)
+    );
+
+    Serial.println(
+        "Config Cluster: enabled=" +
+        String(cfg_cluster_enabled) +
+        " id=" +
+        (cfg_cluster_id.length() ? cfg_cluster_id : String("<legacy-derived>")) +
+        " name=" +
+        (cfg_cluster_name.length() ? cfg_cluster_name : String("<empty>")) +
+        " credential_epoch=" +
+        String((unsigned long)cfg_cluster_credential_epoch) +
+        " password=" +
+        String(cfg_cluster_password.length() ? "set" : "empty") +
+        " coordinator_policy=" +
+        cfg_cluster_coordinator_policy
+    );
+
+    for (size_t i = 0; i < SENSORFORGE_WIFI_PROFILE_COUNT; ++i) {
+        Serial.println(
+            "Config WiFi profile " + String(i + 1) + ": ssid=" +
+            (cfg_wifi_ssids[i].length() ? cfg_wifi_ssids[i] : String("<empty>")) +
+            " password=" + String(cfg_wifi_passes[i].length() ? "set" : "empty")
+        );
+    }
+
+    Serial.println(
+        "Config Hotspot: enabled=" +
+        String(cfg_hotspot_enabled) +
+        " fallback=" + String(cfg_hotspot_fallback_enabled) +
+        " hidden=" +
+        String(cfg_hotspot_hidden) +
+        " password=" +
+        String(
+            cfg_hotspot_password.length()
+            ? "set"
+            : "empty"
+        )
+    );
+
+    Serial.println(
+        "Config WireGuard: enabled=" + String(cfg_wireguard_enabled) +
+        " address=" + (cfg_wireguard_address.length() ? cfg_wireguard_address : String("<empty>")) +
+        " endpoint=" + (cfg_wireguard_peer_endpoint.length() ? cfg_wireguard_peer_endpoint : String("<empty>")) +
+        " port=" + String(cfg_wireguard_peer_port) +
+        " private_key=" + String(cfg_wireguard_private_key.length() ? "set" : "empty") +
+        " peer_public_key=" + String(cfg_wireguard_peer_public_key.length() ? "set" : "empty")
+    );
+
+    Serial.println(
+        "Config WebAuth: enabled=" +
+        String(cfg_web_auth_enabled) +
+        " recording_auto_pause=" +
+        String(cfg_web_recording_auto_pause) +
+        " language=" +
+        cfg_web_language +
+        " username=" +
+        cfg_web_username +
+        " password=" +
+        String(
+            cfg_web_password.length()
+            ? "set"
+            : "empty"
+        )
+    );
+}
+
+
+// =============================================================
+// STATUS API
+// =============================================================
+
+ConfigSource configGetSource()
+{
+    return
+        activeConfigSource;
+}
+
+
+const char *configSourceName()
+{
+    switch (activeConfigSource) {
+
+        case CONFIG_SOURCE_SD:
+            return "SD card";
+
+        case CONFIG_SOURCE_INTERNAL:
+            return "Internal LittleFS fallback";
+
+        case CONFIG_SOURCE_DEFAULTS:
+        default:
+            return "Firmware defaults";
+    }
+}
+
+
+bool configSdAvailable()
+{
+    return
+        sdAvailableState;
+}
+
+
+bool configSdPresent()
+{
+    return
+        sdPresentState;
+}
+
+
+bool configSdValid()
+{
+    return
+        sdValidState;
+}
+
+
+bool configInternalAvailable()
+{
+    return
+        internalAvailableState;
+}
+
+
+bool configInternalValid()
+{
+    return
+        internalValidState;
+}
+
+
+const char *configInternalStatusName()
+{
+    switch (internalConfigState) {
+        case INTERNAL_CONFIG_VALID:
+            return "valid";
+        case INTERNAL_CONFIG_MISSING:
+            return "missing";
+        case INTERNAL_CONFIG_INVALID:
+            return "invalid";
+        case INTERNAL_CONFIG_UNAVAILABLE:
+            return "unavailable";
+        case INTERNAL_CONFIG_UNCHECKED:
+        default:
+            return "unchecked";
+    }
+}
+
+
+String configInternalStatusDetail()
+{
+    return
+        internalConfigDetail;
+}
+
+
+void configRefreshSdStatus()
+{
+    sdPresentState =
+        false;
+
+    sdValidState =
+        false;
+
+
+    if (!sdAvailableState)
+        return;
+
+
+    sdPresentState =
+        STORAGE.exists(
+            "/config.txt"
+        );
+
+
+    if (!sdPresentState)
+        return;
+
+
+    String text;
+
+
+    if (!readTextFile(
+            STORAGE,
+            "/config.txt",
+            text
+        )) {
+        return;
+    }
+
+
+    String error;
+
+
+    sdValidState =
+        configValidateText(
+            text,
+            error
+        );
+}
+
+
+const char *configSdStatusName()
+{
+    if (!sdAvailableState)
+        return "unavailable";
+
+    if (!sdPresentState)
+        return "missing";
+
+    if (sdValidState)
+        return "valid";
+
+    return "invalid";
+}
+
+
+// =============================================================
+// CONFIG FILE MANAGEMENT
+// =============================================================
+
+bool configReadInternalText(
+    String &text,
+    String &error
+)
+{
+    text = "";
+    error = "";
+
+    if (
+        !internalAvailableState &&
+        !initInternalConfigStorage()
+    ) {
+        error =
+            "internal LittleFS unavailable: " +
+            internalConfigDetail;
+        return false;
+    }
+
+    if (!LittleFS.exists(
+            "/config.txt"
+        )) {
+        internalValidState =
+            false;
+
+        internalConfigState =
+            INTERNAL_CONFIG_MISSING;
+
+        internalConfigDetail =
+            "mounted; /config.txt missing";
+
+        error =
+            "internal /config.txt not found";
+        return false;
+    }
+
+    if (!readTextFile(
+            LittleFS,
+            "/config.txt",
+            text
+        )) {
+        internalValidState =
+            false;
+
+        internalConfigState =
+            INTERNAL_CONFIG_INVALID;
+
+        internalConfigDetail =
+            "cannot read internal /config.txt";
+
+        error =
+            "cannot read internal /config.txt";
+        return false;
+    }
+
+    String validationError;
+
+    if (!configValidateText(
+            text,
+            validationError
+        )) {
+        internalValidState =
+            false;
+
+        internalConfigState =
+            INTERNAL_CONFIG_INVALID;
+
+        internalConfigDetail =
+            "validation failed: " +
+            validationError;
+
+        error =
+            "internal /config.txt validation failed: " +
+            validationError;
+        return false;
+    }
+
+    internalValidState =
+        true;
+
+    internalConfigState =
+        INTERNAL_CONFIG_VALID;
+
+    internalConfigDetail =
+        "valid";
+
+    return true;
+}
+
+
+bool configCopyInternalToSd(
+    String &error
+)
+{
+    error = "";
+
+    if (!sdAvailableState) {
+        error =
+            "SD is unavailable";
+        return false;
+    }
+
+    String text;
+
+    if (!configReadInternalText(
+            text,
+            error
+        )) {
+        return false;
+    }
+
+    if (!atomicWriteText(
+            STORAGE,
+            text
+        )) {
+        error =
+            "could not write SD /config.txt";
+        return false;
+    }
+
+    sdPresentState =
+        true;
+
+    sdValidState =
+        true;
+
+    return true;
+}
+
+
+bool configDeleteSdCopy(
+    String &error
+)
+{
+    error = "";
+
+    if (!sdAvailableState) {
+        error =
+            "SD is unavailable";
+        return false;
+    }
+
+    // Never remove the SD copy unless a valid internal copy is already
+    // available. This guarantees that deleting /config.txt only changes
+    // the storage policy and cannot leave the device without configuration.
+    String internalText;
+
+    if (!configReadInternalText(
+            internalText,
+            error
+        )) {
+        return false;
+    }
+
+    const char *paths[] = {
+        "/config.tmp",
+        "/config.bak",
+        "/config.txt"
+    };
+
+    for (const char *path : paths) {
+        if (
+            STORAGE.exists(path) &&
+            !STORAGE.remove(path)
+        ) {
+            error =
+                "could not remove SD " +
+                String(path);
+            return false;
+        }
+    }
+
+    sdPresentState =
+        false;
+
+    sdValidState =
+        false;
+
+    // If this boot originally loaded the SD copy, the exact validated shadow
+    // is now the authoritative persistent copy for subsequent WebConfig status
+    // and saves. Runtime cfg_* values are unchanged.
+    if (
+        activeConfigSource ==
+        CONFIG_SOURCE_SD
+    ) {
+        activeConfigSource =
+            CONFIG_SOURCE_INTERNAL;
+    }
+
+    return true;
+}
+
+
+// =============================================================
+// SAVE CONFIG
+// =============================================================
+
+ConfigSaveResult configSaveText(
+    const String &text,
+    bool writeToSd,
+    String &error
+)
+{
+    error =
+        "";
+
+
+    if (!configValidateText(
+            text,
+            error
+        )) {
+
+        return
+            CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+
+    String protectedText;
+    String protectionError;
+    int newlyEncryptedCount = 0;
+    int encryptedFieldCount = 0;
+
+    if (!protectConfigSecretsForStorage(
+            text,
+            protectedText,
+            newlyEncryptedCount,
+            encryptedFieldCount,
+            protectionError
+        )) {
+
+        error =
+            "config secret protection failed: " +
+            protectionError;
+
+        return
+            CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+
+    // Validate exactly what will be persisted. This also authenticates every
+    // SFSEC1 field before touching either filesystem.
+    if (!configValidateText(
+            protectedText,
+            error
+        )) {
+
+        error =
+            "protected config validation failed: " +
+            error;
+
+        return
+            CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+
+    if (!internalAvailableState) {
+
+        if (!initInternalConfigStorage()) {
+
+            error =
+                "internal LittleFS unavailable";
+
+            return
+                CONFIG_SAVE_INTERNAL_FAILED;
+        }
+    }
+
+
+    // The shadow is the durable fallback and is always updated.
+    if (!atomicWriteText(
+            LittleFS,
+            protectedText
+        )) {
+
+        internalValidState =
+            false;
+
+        internalConfigState =
+            INTERNAL_CONFIG_INVALID;
+
+        internalConfigDetail =
+            "internal config write/verify failed";
+
+        error =
+            "internal config write failed";
+
+        return
+            CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+
+    internalValidState =
+        true;
+
+    internalConfigState =
+        INTERNAL_CONFIG_VALID;
+
+    internalConfigDetail =
+        "valid; saved and verified this boot";
+
+
+    // Storage policy is derived exclusively from the physical presence of
+    // SD /config.txt. The legacy writeToSd argument is retained for source
+    // compatibility with existing callers, but it can neither create a new
+    // SD config nor suppress synchronization while one already exists.
+    (void)writeToSd;
+
+    bool syncToSd =
+        sdAvailableState &&
+        STORAGE.exists(
+            "/config.txt"
+        );
+
+
+    if (!syncToSd) {
+
+        if (sdAvailableState) {
+            sdPresentState =
+                false;
+
+            sdValidState =
+                false;
+        }
+
+        return
+            CONFIG_SAVE_INTERNAL_ONLY;
+    }
+
+
+    if (!atomicWriteText(
+            STORAGE,
+            protectedText
+        )) {
+
+        error =
+            "internal config saved, but SD config write failed";
+
+        return
+            CONFIG_SAVE_SD_FAILED;
+    }
+
+
+    sdPresentState =
+        true;
+
+    sdValidState =
+        true;
+
+
+    return
+        CONFIG_SAVE_BOTH;
+}
+
+
+ConfigSaveResult configResetToFactoryDefaults(
+    String &error
+)
+{
+    error = "";
+
+    String text;
+
+    if (!configBuildFactoryDefaultText(
+            text,
+            error
+        )) {
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    // configSaveText always rewrites the internal LittleFS copy and, by the
+    // established SensorForge policy, also rewrites SD /config.txt when that
+    // file already exists. It deliberately does not create a new SD config on
+    // a card that previously had none.
+    ConfigSaveResult result =
+        configSaveText(
+            text,
+            sdAvailableState &&
+                STORAGE.exists("/config.txt"),
+            error
+        );
+
+    if (
+        result != CONFIG_SAVE_BOTH &&
+        result != CONFIG_SAVE_INTERNAL_ONLY
+    ) {
+        return result;
+    }
+
+    // A stale deferred transport-mode marker must never override the freshly
+    // persisted factory transport_mode=0 on the following boot.
+    transportModePendingClear();
+
+    // Keep the short interval before the scheduled reboot internally coherent.
+    String applyError;
+    if (!parseAndApplyConfigText(
+            text,
+            applyError
+        )) {
+        error =
+            "factory config saved, but runtime apply failed: " +
+            applyError;
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    activeConfigSource =
+        result == CONFIG_SAVE_BOTH
+        ? CONFIG_SOURCE_SD
+        : CONFIG_SOURCE_INTERNAL;
+
+    internalValidState = true;
+    internalConfigState = INTERNAL_CONFIG_VALID;
+    internalConfigDetail = "valid; factory reset saved";
+
+    if (result == CONFIG_SAVE_BOTH) {
+        sdPresentState = true;
+        sdValidState = true;
+    }
+
+    return result;
+}
+
+
+// -------------------------------------------------------------
+// Persist only the camera crop settings while preserving the exact active
+// config text. This avoids rebuilding unrelated fields from a Live Preview
+// request and keeps future/unknown keys intact.
+// -------------------------------------------------------------
+
+static bool replaceOrAppendConfigKey(
+    String &text,
+    const String &key,
+    const String &value
+)
+{
+    String output;
+    output.reserve(
+        text.length() +
+        key.length() +
+        value.length() +
+        8
+    );
+
+    bool replaced = false;
+    size_t start = 0;
+
+    while (start < text.length()) {
+
+        int newlinePos =
+            text.indexOf(
+                '\n',
+                start
+            );
+
+        size_t end =
+            newlinePos < 0
+            ? text.length()
+            : (size_t)newlinePos;
+
+        String line =
+            text.substring(
+                start,
+                end
+            );
+
+        String probe =
+            line;
+
+        probe.trim();
+
+        bool isComment =
+            probe.startsWith("#") ||
+            probe.startsWith(";");
+
+        bool isTarget =
+            false;
+
+        if (!isComment) {
+
+            int equalsPos =
+                probe.indexOf('=');
+
+            if (equalsPos >= 0) {
+
+                String foundKey =
+                    probe.substring(
+                        0,
+                        equalsPos
+                    );
+
+                foundKey.trim();
+
+                isTarget =
+                    foundKey == key;
+            }
+        }
+
+        if (isTarget) {
+
+            if (replaced) {
+                // The active config should already have passed duplicate-key
+                // validation. Refuse to manufacture an ambiguous file if that
+                // invariant was broken unexpectedly.
+                return false;
+            }
+
+            output +=
+                key +
+                "=" +
+                value;
+
+            replaced = true;
+
+        } else {
+
+            output +=
+                line;
+        }
+
+        if (newlinePos >= 0) {
+            output += '\n';
+            start = end + 1U;
+        } else {
+            start = text.length();
+        }
+    }
+
+    if (!replaced) {
+
+        if (
+            output.length() > 0 &&
+            !output.endsWith("\n")
+        ) {
+            output += '\n';
+        }
+
+        output +=
+            key +
+            "=" +
+            value +
+            "\n";
+    }
+
+    text =
+        output;
+
+    return true;
+}
+
+
+// Remove one active config key while preserving comments, unknown keys and the
+// surrounding text. Used to retire legacy keys without making old config.txt
+// files invalid on read.
+static bool removeConfigKey(
+    String &text,
+    const String &key
+)
+{
+    String output;
+    output.reserve(text.length());
+
+    size_t start = 0;
+    while (start < text.length()) {
+        int newlinePos = text.indexOf('\n', start);
+        size_t end = newlinePos < 0 ? text.length() : (size_t)newlinePos;
+        String line = text.substring(start, end);
+        String probe = line;
+        probe.trim();
+
+        bool remove = false;
+        if (!probe.startsWith("#") && !probe.startsWith(";")) {
+            int equalsPos = probe.indexOf('=');
+            if (equalsPos >= 0) {
+                String foundKey = probe.substring(0, equalsPos);
+                foundKey.trim();
+                remove = foundKey == key;
+            }
+        }
+
+        if (!remove) {
+            output += line;
+            if (newlinePos >= 0) output += '\n';
+        }
+
+        if (newlinePos >= 0) start = end + 1U;
+        else start = text.length();
+    }
+
+    text = output;
+    return true;
+}
+
+
+ConfigSaveResult configSaveCameraCrop(
+    const String &zoom,
+    int positionX,
+    int positionY,
+    bool writeToSd,
+    String &error
+)
+{
+    error =
+        "";
+
+    String normalizedZoom =
+        zoom;
+
+    normalizedZoom.trim();
+
+    if (
+        normalizedZoom != "1.0" &&
+        normalizedZoom != "1.5" &&
+        normalizedZoom != "2.0"
+    ) {
+
+        error =
+            "camera crop zoom must be 1.0, 1.5 or 2.0";
+
+        return
+            CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        positionX < 0 ||
+        positionX > 2 ||
+        positionY < 0 ||
+        positionY > 2
+    ) {
+
+        error =
+            "camera crop position must be in range 0..2";
+
+        return
+            CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+
+    String text;
+    bool sourceRead =
+        false;
+
+    // Prefer the active source. A valid SD config is normally mirrored 1:1
+    // into LittleFS, but reading the active source directly also covers the
+    // rare case where the shadow update failed.
+    if (
+        activeConfigSource == CONFIG_SOURCE_SD &&
+        sdAvailableState &&
+        STORAGE.exists(
+            "/config.txt"
+        )
+    ) {
+
+        sourceRead =
+            readTextFile(
+                STORAGE,
+                "/config.txt",
+                text
+            );
+    }
+
+    if (
+        !sourceRead &&
+        internalAvailableState &&
+        LittleFS.exists(
+            "/config.txt"
+        )
+    ) {
+
+        sourceRead =
+            readTextFile(
+                LittleFS,
+                "/config.txt",
+                text
+            );
+    }
+
+    if (
+        !sourceRead &&
+        sdAvailableState &&
+        STORAGE.exists(
+            "/config.txt"
+        )
+    ) {
+
+        sourceRead =
+            readTextFile(
+                STORAGE,
+                "/config.txt",
+                text
+            );
+    }
+
+    if (!sourceRead) {
+
+        error =
+            "no persistent config.txt available for crop save";
+
+        return
+            CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+
+    if (
+        !replaceOrAppendConfigKey(
+            text,
+            "camera_crop_zoom",
+            normalizedZoom
+        ) ||
+        !replaceOrAppendConfigKey(
+            text,
+            "camera_crop_x",
+            String(positionX)
+        ) ||
+        !replaceOrAppendConfigKey(
+            text,
+            "camera_crop_y",
+            String(positionY)
+        )
+    ) {
+
+        error =
+            "could not patch camera crop keys";
+
+        return
+            CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+
+    String validationError;
+
+    if (!configValidateText(
+            text,
+            validationError
+        )) {
+
+        error =
+            "patched config invalid: " +
+            validationError;
+
+        return
+            CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+
+    ConfigSaveResult result =
+        configSaveText(
+            text,
+            writeToSd,
+            error
+        );
+
+
+    if (
+        result == CONFIG_SAVE_BOTH ||
+        result == CONFIG_SAVE_INTERNAL_ONLY
+    ) {
+
+        cfg_camera_crop_zoom =
+            normalizedZoom;
+
+        cfg_camera_crop_x =
+            positionX;
+
+        cfg_camera_crop_y =
+            positionY;
+    }
+
+
+    return result;
+}
+
+
+
+
+ConfigSaveResult configSaveCameraSettings(
+    const String &camera,
+    const String &resolution,
+    int fps,
+    int quality,
+    int cameraXclkMhz,
+    int cameraAutoExposure,
+    int cameraAeLevel,
+    int rotation,
+    const String &cropZoom,
+    int cropPositionX,
+    int cropPositionY,
+    bool writeToSd,
+    String &error
+)
+{
+    error = "";
+
+    String normalizedCamera = camera;
+    String normalizedResolution = resolution;
+    String normalizedCropZoom = cropZoom;
+    normalizedCamera.trim();
+    normalizedResolution.trim();
+    normalizedCropZoom.trim();
+
+    if (!normalizedCamera.length()) {
+        error = "camera is empty";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (!isSupportedResolution(normalizedResolution)) {
+        error = "invalid resolution";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (fps < 1 || fps > 30) {
+        error = "fps out of range";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (quality < 0 || quality > 63) {
+        error = "quality out of range";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        cameraXclkMhz != 10 &&
+        cameraXclkMhz != 16 &&
+        cameraXclkMhz != 20
+    ) {
+        error = "camera_xclk_mhz must be 10, 16 or 20";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (cameraAutoExposure != 0 && cameraAutoExposure != 1) {
+        error = "camera_auto_exposure must be 0 or 1";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (cameraAeLevel < -2 || cameraAeLevel > 2) {
+        error = "camera_ae_level out of range (-2..2)";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (rotation != 0 && rotation != 180) {
+        error = "rotation must be 0 or 180";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        normalizedCropZoom != "1.0" &&
+        normalizedCropZoom != "1.5" &&
+        normalizedCropZoom != "2.0"
+    ) {
+        error = "camera crop zoom must be 1.0, 1.5 or 2.0";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        cropPositionX < 0 ||
+        cropPositionX > 2 ||
+        cropPositionY < 0 ||
+        cropPositionY > 2
+    ) {
+        error = "camera crop position must be in range 0..2";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    uint32_t performanceLoad = 0;
+    uint32_t performanceLimit = 0;
+    if (!configRecordingPerformanceAllowed(
+            normalizedResolution,
+            fps,
+            quality,
+            performanceLoad,
+            performanceLimit
+        )) {
+        int maxFps =
+            configRecordingPerformanceMaxFps(
+                normalizedResolution,
+                quality
+            );
+
+        error =
+            "recording performance limit exceeded: " +
+            normalizedResolution +
+            " @ " +
+            String(fps) +
+            " fps, quality=" +
+            String(quality) +
+            ", score=" +
+            String((unsigned long)performanceLoad) +
+            ", board_limit=" +
+            String((unsigned long)performanceLimit) +
+            ", max_fps=" +
+            String(maxFps);
+
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String text;
+    bool sourceRead = false;
+
+    // Preserve the complete active config including comments and future keys.
+    if (
+        activeConfigSource == CONFIG_SOURCE_SD &&
+        sdAvailableState &&
+        STORAGE.exists("/config.txt")
+    ) {
+        sourceRead =
+            readTextFile(
+                STORAGE,
+                "/config.txt",
+                text
+            );
+    }
+
+    if (
+        !sourceRead &&
+        internalAvailableState &&
+        LittleFS.exists("/config.txt")
+    ) {
+        sourceRead =
+            readTextFile(
+                LittleFS,
+                "/config.txt",
+                text
+            );
+    }
+
+    if (
+        !sourceRead &&
+        sdAvailableState &&
+        STORAGE.exists("/config.txt")
+    ) {
+        sourceRead =
+            readTextFile(
+                STORAGE,
+                "/config.txt",
+                text
+            );
+    }
+
+    if (!sourceRead) {
+        error = "no persistent config.txt available for camera save";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        !replaceOrAppendConfigKey(text, "camera", normalizedCamera) ||
+        !replaceOrAppendConfigKey(text, "resolution", normalizedResolution) ||
+        !replaceOrAppendConfigKey(text, "fps", String(fps)) ||
+        !replaceOrAppendConfigKey(text, "quality", String(quality)) ||
+        !replaceOrAppendConfigKey(text, "camera_xclk_mhz", String(cameraXclkMhz)) ||
+        !replaceOrAppendConfigKey(text, "camera_auto_exposure", String(cameraAutoExposure)) ||
+        !replaceOrAppendConfigKey(text, "camera_ae_level", String(cameraAeLevel)) ||
+        !replaceOrAppendConfigKey(text, "rotation", String(rotation)) ||
+        !replaceOrAppendConfigKey(text, "camera_crop_zoom", normalizedCropZoom) ||
+        !replaceOrAppendConfigKey(text, "camera_crop_x", String(cropPositionX)) ||
+        !replaceOrAppendConfigKey(text, "camera_crop_y", String(cropPositionY))
+    ) {
+        error = "could not patch camera setting keys";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String validationError;
+    if (!configValidateText(text, validationError)) {
+        error = "patched config invalid: " + validationError;
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    ConfigSaveResult result =
+        configSaveText(
+            text,
+            writeToSd,
+            error
+        );
+
+    if (
+        result == CONFIG_SAVE_BOTH ||
+        result == CONFIG_SAVE_INTERNAL_ONLY
+    ) {
+        // Keep the in-RAM config coherent so a later general config save before
+        // reboot cannot overwrite the newly persisted camera values. Sensor
+        // hardware that needs reinitialization still takes full effect on reboot.
+        cfg_camera = normalizedCamera;
+        cfg_resolution = normalizedResolution;
+        cfg_fps = fps;
+        cfg_quality = quality;
+        cfg_camera_xclk_mhz = cameraXclkMhz;
+        cfg_camera_auto_exposure = cameraAutoExposure;
+        cfg_camera_ae_level = cameraAeLevel;
+        cfg_rotation = rotation;
+        cfg_camera_crop_zoom = normalizedCropZoom;
+        cfg_camera_crop_x = cropPositionX;
+        cfg_camera_crop_y = cropPositionY;
+    }
+
+    return result;
+}
+
+
+
+ConfigSaveResult configSaveShooterSettings(
+    const String &storageFormat,
+    int intervalMs,
+    int darkMeanMin,
+    float minChangePct,
+    float motionHintChangePct,
+    int motionHintRequiredHits,
+    int motionHintWindowFrames,
+    int forceSaveSeconds,
+    int flushSeconds,
+    bool writeToSd,
+    String &error
+)
+{
+    error = "";
+
+    String normalizedStorageFormat = storageFormat;
+    normalizedStorageFormat.trim();
+    normalizedStorageFormat.toLowerCase();
+
+    if (
+        normalizedStorageFormat != "mkv" &&
+        normalizedStorageFormat != "jpg"
+    ) {
+        error = "shooter_storage_format must be mkv or jpg";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (intervalMs < 250 || intervalMs > 86400000) {
+        error = "shooter_interval_ms out of range (250..86400000)";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (darkMeanMin < 0 || darkMeanMin > 255) {
+        error = "shooter_dark_mean_min out of range (0..255)";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        minChangePct < 0.0f ||
+        minChangePct > 100.0f ||
+        (minChangePct > 0.0f && minChangePct < 0.1f)
+    ) {
+        error = "shooter_min_change_pct must be 0 or 0.1..100.0";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        motionHintChangePct < 0.1f ||
+        motionHintChangePct > 100.0f ||
+        (minChangePct > 0.0f && motionHintChangePct < minChangePct)
+    ) {
+        error = "shooter_motion_hint_change_pct must be 0.1..100.0 and >= shooter_min_change_pct";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        motionHintWindowFrames < 1 ||
+        motionHintWindowFrames > 8 ||
+        motionHintRequiredHits < 1 ||
+        motionHintRequiredHits > motionHintWindowFrames
+    ) {
+        error = "shooter motion hint hits/window invalid";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (forceSaveSeconds < 0 || forceSaveSeconds > 86400) {
+        error = "shooter_force_save_seconds out of range (0..86400)";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (flushSeconds < 0 || flushSeconds > 3600) {
+        error = "shooter_flush_seconds out of range (0..3600)";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String text;
+    bool sourceRead = false;
+
+    if (
+        activeConfigSource == CONFIG_SOURCE_SD &&
+        sdAvailableState &&
+        STORAGE.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    }
+
+    if (
+        !sourceRead &&
+        internalAvailableState &&
+        LittleFS.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(LittleFS, "/config.txt", text);
+    }
+
+    if (
+        !sourceRead &&
+        sdAvailableState &&
+        STORAGE.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    }
+
+    if (!sourceRead) {
+        error = "no persistent config.txt available for shooter save";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        !replaceOrAppendConfigKey(text, "shooter_storage_format", normalizedStorageFormat) ||
+        !replaceOrAppendConfigKey(text, "shooter_interval_ms", String(intervalMs)) ||
+        !replaceOrAppendConfigKey(text, "shooter_dark_mean_min", String(darkMeanMin)) ||
+        !replaceOrAppendConfigKey(text, "shooter_min_change_pct", String(minChangePct, 1)) ||
+        !replaceOrAppendConfigKey(text, "shooter_motion_hint_change_pct", String(motionHintChangePct, 1)) ||
+        !replaceOrAppendConfigKey(text, "shooter_motion_hint_required_hits", String(motionHintRequiredHits)) ||
+        !replaceOrAppendConfigKey(text, "shooter_motion_hint_window_frames", String(motionHintWindowFrames)) ||
+        !replaceOrAppendConfigKey(text, "shooter_force_save_seconds", String(forceSaveSeconds)) ||
+        !replaceOrAppendConfigKey(text, "shooter_flush_seconds", String(flushSeconds))
+    ) {
+        error = "could not patch shooter setting keys";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String validationError;
+    if (!configValidateText(text, validationError)) {
+        error = "patched config invalid: " + validationError;
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    ConfigSaveResult result = configSaveText(text, writeToSd, error);
+
+    if (
+        result == CONFIG_SAVE_BOTH ||
+        result == CONFIG_SAVE_INTERNAL_ONLY
+    ) {
+        cfg_shooter_storage_format = normalizedStorageFormat;
+        cfg_shooter_interval_ms = intervalMs;
+        cfg_shooter_dark_mean_min = darkMeanMin;
+        cfg_shooter_min_change_pct = minChangePct;
+        cfg_shooter_motion_hint_change_pct = motionHintChangePct;
+        cfg_shooter_motion_hint_required_hits = motionHintRequiredHits;
+        cfg_shooter_motion_hint_window_frames = motionHintWindowFrames;
+        cfg_shooter_force_save_seconds = forceSaveSeconds;
+        cfg_shooter_flush_seconds = flushSeconds;
+    }
+
+    return result;
+}
+
+
+ConfigSaveResult configSaveStorageSafety(
+    int minFreeSpaceMb,
+    const String &diskFullAction,
+    bool writeToSd,
+    String &error
+)
+{
+    error = "";
+
+    if (minFreeSpaceMb < 0 || minFreeSpaceMb > 1024 * 1024) {
+        error = "min_free_space_mb out of range";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String normalizedAction = diskFullAction;
+    normalizedAction.trim();
+    normalizedAction.toLowerCase();
+
+    if (
+        normalizedAction != "rollover" &&
+        normalizedAction != "stop"
+    ) {
+        error = "disk_full_action must be rollover or stop";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String text;
+    bool sourceRead = false;
+
+    if (
+        activeConfigSource == CONFIG_SOURCE_SD &&
+        sdAvailableState &&
+        STORAGE.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    }
+
+    if (
+        !sourceRead &&
+        internalAvailableState &&
+        LittleFS.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(LittleFS, "/config.txt", text);
+    }
+
+    if (
+        !sourceRead &&
+        sdAvailableState &&
+        STORAGE.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    }
+
+    if (!sourceRead) {
+        error = "no persistent config.txt available for storage safety save";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        !replaceOrAppendConfigKey(text, "min_free_space_mb", String(minFreeSpaceMb)) ||
+        !replaceOrAppendConfigKey(text, "disk_full_action", normalizedAction)
+    ) {
+        error = "could not patch storage safety keys";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String validationError;
+    if (!configValidateText(text, validationError)) {
+        error = "patched config invalid: " + validationError;
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    ConfigSaveResult result = configSaveText(text, writeToSd, error);
+
+    if (
+        result == CONFIG_SAVE_BOTH ||
+        result == CONFIG_SAVE_INTERNAL_ONLY
+    ) {
+        cfg_min_free_space_mb = minFreeSpaceMb;
+        cfg_disk_full_action = normalizedAction;
+    }
+
+    return result;
+}
+
+
+ConfigSaveResult configSaveRecordingEncryption(
+    int enabled,
+    bool writeToSd,
+    String &error
+)
+{
+    error = "";
+
+    if (enabled != 0 && enabled != 1) {
+        error = "recording_encryption must be 0 or 1";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String text;
+    bool sourceRead = false;
+
+    if (
+        activeConfigSource == CONFIG_SOURCE_SD &&
+        sdAvailableState &&
+        STORAGE.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    }
+
+    if (
+        !sourceRead &&
+        internalAvailableState &&
+        LittleFS.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(LittleFS, "/config.txt", text);
+    }
+
+    if (
+        !sourceRead &&
+        sdAvailableState &&
+        STORAGE.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    }
+
+    if (!sourceRead) {
+        error = "no persistent config.txt available for encryption save";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (!replaceOrAppendConfigKey(
+            text,
+            "recording_encryption",
+            String(enabled)
+        )) {
+        error = "could not patch recording_encryption";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String validationError;
+    if (!configValidateText(text, validationError)) {
+        error = "patched config invalid: " + validationError;
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    ConfigSaveResult result =
+        configSaveText(text, writeToSd, error);
+
+    if (
+        result == CONFIG_SAVE_BOTH ||
+        result == CONFIG_SAVE_INTERNAL_ONLY
+    ) {
+        cfg_recording_encryption = enabled;
+    }
+
+    return result;
+}
+
+
+ConfigSaveResult configSaveWebLanguage(
+    const String &languageCode,
+    bool writeToSd,
+    String &error
+)
+{
+    error = "";
+
+    String normalized = languageCode;
+    normalized.trim();
+    normalized.toLowerCase();
+
+    if (
+        normalized != "de" &&
+        normalized != "en"
+    ) {
+        error =
+            "web_language must be de or en";
+
+        return
+            CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+
+    String text;
+    bool sourceRead =
+        false;
+
+    // Preserve the exact active config text, including comments and future
+    // optional keys. Only web_language is patched.
+    if (
+        activeConfigSource == CONFIG_SOURCE_SD &&
+        sdAvailableState &&
+        STORAGE.exists(
+            "/config.txt"
+        )
+    ) {
+
+        sourceRead =
+            readTextFile(
+                STORAGE,
+                "/config.txt",
+                text
+            );
+    }
+
+    if (
+        !sourceRead &&
+        internalAvailableState &&
+        LittleFS.exists(
+            "/config.txt"
+        )
+    ) {
+
+        sourceRead =
+            readTextFile(
+                LittleFS,
+                "/config.txt",
+                text
+            );
+    }
+
+    if (
+        !sourceRead &&
+        sdAvailableState &&
+        STORAGE.exists(
+            "/config.txt"
+        )
+    ) {
+
+        sourceRead =
+            readTextFile(
+                STORAGE,
+                "/config.txt",
+                text
+            );
+    }
+
+    if (!sourceRead) {
+        error =
+            "no persistent config.txt available for web language save";
+
+        return
+            CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+
+    if (!replaceOrAppendConfigKey(
+            text,
+            "web_language",
+            normalized
+        )) {
+
+        error =
+            "could not patch web_language";
+
+        return
+            CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+
+    String validationError;
+
+    if (!configValidateText(
+            text,
+            validationError
+        )) {
+
+        error =
+            "patched config invalid: " +
+            validationError;
+
+        return
+            CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+
+    ConfigSaveResult result =
+        configSaveText(
+            text,
+            writeToSd,
+            error
+        );
+
+
+    if (
+        result == CONFIG_SAVE_BOTH ||
+        result == CONFIG_SAVE_INTERNAL_ONLY
+    ) {
+        cfg_web_language =
+            normalized;
+    }
+
+
+    return result;
+}
+
+
+ConfigSaveResult configSaveAccessSettings(
+    int authEnabled,
+    const String &adminUsernameInput,
+    const String &adminPassword,
+    const String streamUsernames[SENSORFORGE_STREAM_USER_COUNT],
+    const String streamPasswords[SENSORFORGE_STREAM_USER_COUNT],
+    int streamAllowAnnotationEdit,
+    int streamAllowDelete,
+    bool writeToSd,
+    String &error
+)
+{
+    error = "";
+
+    if (authEnabled != 0 && authEnabled != 1) {
+        error = "web_auth_enabled must be 0 or 1";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+    if ((streamAllowAnnotationEdit != 0 && streamAllowAnnotationEdit != 1) ||
+        (streamAllowDelete != 0 && streamAllowDelete != 1)) {
+        error = "streaming permissions must be 0 or 1";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String adminUsername = adminUsernameInput;
+    adminUsername.trim();
+    if (!adminUsername.length() || adminUsername.length() > 32 || adminUsername.indexOf(':') >= 0) {
+        error = "web_username must be 1..32 chars and must not contain ':'";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+    if (adminPassword.length() < 8 || adminPassword.length() > 63) {
+        error = "web_password length must be 8..63";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String normalizedUsers[SENSORFORGE_STREAM_USER_COUNT];
+    String finalPasswords[SENSORFORGE_STREAM_USER_COUNT];
+    for (size_t i = 0; i < SENSORFORGE_STREAM_USER_COUNT; ++i) {
+        normalizedUsers[i] = streamUsernames[i];
+        normalizedUsers[i].trim();
+        finalPasswords[i] = streamPasswords[i];
+
+        if (!normalizedUsers[i].length()) {
+            if (finalPasswords[i].length()) {
+                error = "stream_password_" + String(i + 1) + " set for empty streaming username";
+                return CONFIG_SAVE_INTERNAL_FAILED;
+            }
+            continue;
+        }
+
+        if (normalizedUsers[i].length() > 32 || normalizedUsers[i].indexOf(':') >= 0) {
+            error = "stream_username_" + String(i + 1) + " must be 1..32 chars and must not contain ':'";
+            return CONFIG_SAVE_INTERNAL_FAILED;
+        }
+        if (finalPasswords[i].length() < 8 || finalPasswords[i].length() > 63) {
+            error = "stream_password_" + String(i + 1) + " length must be 8..63";
+            return CONFIG_SAVE_INTERNAL_FAILED;
+        }
+        if (normalizedUsers[i] == adminUsername) {
+            error = "streaming username must differ from administrator username";
+            return CONFIG_SAVE_INTERNAL_FAILED;
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (normalizedUsers[j].length() && normalizedUsers[j] == normalizedUsers[i]) {
+                error = "duplicate streaming username: " + normalizedUsers[i];
+                return CONFIG_SAVE_INTERNAL_FAILED;
+            }
+        }
+    }
+
+    String text;
+    bool sourceRead = false;
+    if (activeConfigSource == CONFIG_SOURCE_SD && sdAvailableState && STORAGE.exists("/config.txt"))
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    if (!sourceRead && internalAvailableState && LittleFS.exists("/config.txt"))
+        sourceRead = readTextFile(LittleFS, "/config.txt", text);
+    if (!sourceRead && sdAvailableState && STORAGE.exists("/config.txt"))
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+
+    if (!sourceRead) {
+        error = "no persistent config.txt available for access settings save";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (!replaceOrAppendConfigKey(text, "web_auth_enabled", String(authEnabled)) ||
+        !replaceOrAppendConfigKey(text, "web_username", adminUsername) ||
+        !replaceOrAppendConfigKey(text, "web_password", adminPassword)) {
+        error = "could not patch administrator access keys";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    for (size_t i = 0; i < SENSORFORGE_STREAM_USER_COUNT; ++i) {
+        const String userKey = "stream_username_" + String(i + 1);
+        const String passKey = "stream_password_" + String(i + 1);
+        if (!replaceOrAppendConfigKey(text, userKey.c_str(), normalizedUsers[i]) ||
+            !replaceOrAppendConfigKey(text, passKey.c_str(), finalPasswords[i])) {
+            error = "could not patch streaming user " + String(i + 1);
+            return CONFIG_SAVE_INTERNAL_FAILED;
+        }
+    }
+
+    if (!replaceOrAppendConfigKey(text, "stream_allow_annotation_edit", String(streamAllowAnnotationEdit)) ||
+        !replaceOrAppendConfigKey(text, "stream_allow_delete", String(streamAllowDelete))) {
+        error = "could not patch streaming permissions";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String validationError;
+    if (!configValidateText(text, validationError)) {
+        error = "patched config invalid: " + validationError;
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    ConfigSaveResult result = configSaveText(text, writeToSd, error);
+    if (result == CONFIG_SAVE_BOTH || result == CONFIG_SAVE_INTERNAL_ONLY) {
+        cfg_web_auth_enabled = authEnabled;
+        cfg_web_username = adminUsername;
+        cfg_web_password = adminPassword;
+        for (size_t i = 0; i < SENSORFORGE_STREAM_USER_COUNT; ++i) {
+            cfg_stream_usernames[i] = normalizedUsers[i];
+            cfg_stream_passwords[i] = finalPasswords[i];
+        }
+        cfg_stream_allow_annotation_edit = streamAllowAnnotationEdit;
+        cfg_stream_allow_delete = streamAllowDelete;
+    }
+
+    return result;
+}
+
+
+ConfigSaveResult configSaveWireGuardSettings(
+    int enabled,
+    const String &address,
+    const String &privateKey,
+    const String &peerEndpoint,
+    const String &peerPublicKey,
+    int peerPort,
+    bool writeToSd,
+    String &error
+)
+{
+    error = "";
+
+    String normalizedAddress = address;
+    normalizedAddress.trim();
+    String normalizedPrivateKey = privateKey;
+    normalizedPrivateKey.trim();
+    String normalizedEndpoint = peerEndpoint;
+    normalizedEndpoint.trim();
+    String normalizedPublicKey = peerPublicKey;
+    normalizedPublicKey.trim();
+
+    if (enabled != 0 && enabled != 1) {
+        error = "wireguard_enabled must be 0 or 1";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (peerPort < 1 || peerPort > 65535) {
+        error = "wireguard_peer_port out of range (1..65535)";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String text;
+    bool sourceRead = false;
+    if (activeConfigSource == CONFIG_SOURCE_SD && sdAvailableState && STORAGE.exists("/config.txt"))
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    if (!sourceRead && internalAvailableState && LittleFS.exists("/config.txt"))
+        sourceRead = readTextFile(LittleFS, "/config.txt", text);
+    if (!sourceRead && sdAvailableState && STORAGE.exists("/config.txt"))
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+
+    if (!sourceRead) {
+        error = "no persistent config.txt available for WireGuard settings save";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        !replaceOrAppendConfigKey(text, "wireguard_enabled", String(enabled)) ||
+        !replaceOrAppendConfigKey(text, "wireguard_address", normalizedAddress) ||
+        !replaceOrAppendConfigKey(text, "wireguard_private_key", normalizedPrivateKey) ||
+        !replaceOrAppendConfigKey(text, "wireguard_peer_endpoint", normalizedEndpoint) ||
+        !replaceOrAppendConfigKey(text, "wireguard_peer_public_key", normalizedPublicKey) ||
+        !replaceOrAppendConfigKey(text, "wireguard_peer_port", String(peerPort))
+    ) {
+        error = "could not patch WireGuard setting keys";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String validationError;
+    if (!configValidateText(text, validationError)) {
+        error = "patched config invalid: " + validationError;
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    ConfigSaveResult result = configSaveText(text, writeToSd, error);
+    if (result == CONFIG_SAVE_BOTH || result == CONFIG_SAVE_INTERNAL_ONLY) {
+        cfg_wireguard_enabled = enabled;
+        cfg_wireguard_address = normalizedAddress;
+        cfg_wireguard_private_key = normalizedPrivateKey;
+        cfg_wireguard_peer_endpoint = normalizedEndpoint;
+        cfg_wireguard_peer_public_key = normalizedPublicKey;
+        cfg_wireguard_peer_port = peerPort;
+    }
+
+    return result;
+}
+
+
+
+ConfigSaveResult configSaveClusterSettings(
+    int enabled,
+    const String &clusterId,
+    const String &clusterName,
+    uint32_t credentialEpoch,
+    const String &clusterPassword,
+    const String &coordinatorPolicy,
+    bool writeToSd,
+    String &error
+)
+{
+    error = "";
+
+    String normalizedId = clusterId;
+    normalizedId.trim();
+    normalizedId.toLowerCase();
+
+    String normalizedName = clusterName;
+    normalizedName.trim();
+
+    String normalizedCoordinatorPolicy = coordinatorPolicy;
+    normalizedCoordinatorPolicy.trim();
+    normalizedCoordinatorPolicy.toLowerCase();
+
+    if (enabled != 0 && enabled != 1) {
+        error = "cluster_enabled must be 0 or 1";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (!normalizedId.length() || !configClusterIdValid(normalizedId)) {
+        error = "cluster_id must be cl- followed by 32 lowercase hex characters";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (normalizedName.length() > 63) {
+        error = "cluster_name exceeds 63 characters";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (credentialEpoch == 0) {
+        error = "cluster_credential_epoch must be >= 1";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        clusterPassword.length() != 0 &&
+        (clusterPassword.length() < 8 || clusterPassword.length() > 63)
+    ) {
+        error = "cluster_password must be empty or 8..63 characters";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        normalizedCoordinatorPolicy != "auto" &&
+        normalizedCoordinatorPolicy != "preferred" &&
+        normalizedCoordinatorPolicy != "node"
+    ) {
+        error = "cluster_coordinator_policy must be auto, preferred or node";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (enabled && !normalizedName.length()) {
+        error = "cluster_enabled requires cluster_name";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (enabled && !clusterPassword.length()) {
+        error = "cluster_enabled requires cluster_password";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String text;
+    bool sourceRead = false;
+    if (activeConfigSource == CONFIG_SOURCE_SD && sdAvailableState && STORAGE.exists("/config.txt"))
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    if (!sourceRead && internalAvailableState && LittleFS.exists("/config.txt"))
+        sourceRead = readTextFile(LittleFS, "/config.txt", text);
+    if (!sourceRead && sdAvailableState && STORAGE.exists("/config.txt"))
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+
+    if (!sourceRead) {
+        error = "no persistent config.txt available for cluster settings save";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        !replaceOrAppendConfigKey(text, "cluster_enabled", String(enabled)) ||
+        !replaceOrAppendConfigKey(text, "cluster_id", normalizedId) ||
+        !replaceOrAppendConfigKey(text, "cluster_name", normalizedName) ||
+        !replaceOrAppendConfigKey(text, "cluster_credential_epoch", String((unsigned long)credentialEpoch)) ||
+        !replaceOrAppendConfigKey(text, "cluster_password", clusterPassword) ||
+        !replaceOrAppendConfigKey(text, "cluster_coordinator_policy", normalizedCoordinatorPolicy)
+    ) {
+        error = "could not patch cluster setting keys";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String validationError;
+    if (!configValidateText(text, validationError)) {
+        error = "patched config invalid: " + validationError;
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    ConfigSaveResult result = configSaveText(text, writeToSd, error);
+    if (result == CONFIG_SAVE_BOTH || result == CONFIG_SAVE_INTERNAL_ONLY) {
+        cfg_cluster_enabled = enabled;
+        cfg_cluster_id = normalizedId;
+        cfg_cluster_name = normalizedName;
+        cfg_cluster_credential_epoch = credentialEpoch;
+        cfg_cluster_password = clusterPassword;
+        cfg_cluster_coordinator_policy = normalizedCoordinatorPolicy;
+    }
+
+    return result;
+}
+
+ConfigSaveResult configSaveWifiSettings(
+    const String &hostname,
+    const String &wifiOnSystemStart,
+    int wifiTimeoutSec,
+    int wifiAliveScheduleEnabled,
+    const String &wifiAliveSchedule,
+    const String wifiSsids[SENSORFORGE_WIFI_PROFILE_COUNT],
+    const String wifiPasses[SENSORFORGE_WIFI_PROFILE_COUNT],
+    float wifiTxPowerDbm,
+    int hotspotEnabled,
+    int hotspotFallbackEnabled,
+    const String &hotspotPassword,
+    int hotspotHidden,
+    bool writeToSd,
+    String &error
+)
+{
+    error = "";
+
+    String normalizedHostname = hostname;
+    normalizedHostname.trim();
+
+    String normalizedStartup = wifiOnSystemStart;
+    normalizedStartup.trim();
+    normalizedStartup.toLowerCase();
+
+    String normalizedAliveSchedule = wifiAliveSchedule;
+    normalizedAliveSchedule.trim();
+
+    String normalizedSsids[SENSORFORGE_WIFI_PROFILE_COUNT];
+    for (size_t i = 0; i < SENSORFORGE_WIFI_PROFILE_COUNT; ++i) {
+        normalizedSsids[i] = wifiSsids[i];
+        normalizedSsids[i].trim();
+        if (normalizedSsids[i].length() > 32) {
+            error = "wifi_ssid profile " + String(i + 1) + " exceeds 32 characters";
+            return CONFIG_SAVE_INTERNAL_FAILED;
+        }
+        if (!normalizedSsids[i].length() && wifiPasses[i].length()) {
+            error = "wifi_pass set for empty WiFi profile " + String(i + 1);
+            return CONFIG_SAVE_INTERNAL_FAILED;
+        }
+    }
+
+    if (
+        normalizedStartup != "off" &&
+        normalizedStartup != "on" &&
+        normalizedStartup != "on_missing_time"
+    ) {
+        error = "wifi_on_system_start must be off, on or on_missing_time";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (wifiTimeoutSec < 0 || wifiTimeoutSec > 86400) {
+        error = "wifi_timeout_sec out of range (0..86400)";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (wifiAliveScheduleEnabled != 0 && wifiAliveScheduleEnabled != 1) {
+        error = "wifi_alive_schedule_enabled must be 0 or 1";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    {
+        WifiAliveScheduleEntry scheduleEntries[SENSORFORGE_WIFI_ALIVE_SCHEDULE_MAX_ENTRIES];
+        size_t scheduleCount = 0;
+        String scheduleError;
+        if (!configParseWifiAliveSchedule(
+                normalizedAliveSchedule,
+                scheduleEntries,
+                scheduleCount,
+                &scheduleError
+            )) {
+            error = scheduleError;
+            return CONFIG_SAVE_INTERNAL_FAILED;
+        }
+    }
+
+    int16_t txPowerX10 = (int16_t)lroundf(wifiTxPowerDbm * 10.0f);
+    if (
+        fabsf(wifiTxPowerDbm * 10.0f - txPowerX10) > 0.01f ||
+        txPowerX10 < SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10 ||
+        !boardWifiTxPowerSupportedX10(txPowerX10)
+    ) {
+        error = "wifi_tx_power_dbm is not a supported value for this board";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (hotspotEnabled != 0 && hotspotEnabled != 1) {
+        error = "hotspot_enabled must be 0 or 1";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (hotspotFallbackEnabled != 0 && hotspotFallbackEnabled != 1) {
+        error = "hotspot_fallback_enabled must be 0 or 1";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (hotspotHidden != 0 && hotspotHidden != 1) {
+        error = "hotspot_hidden must be 0 or 1";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        hotspotPassword.length() != 0 &&
+        (hotspotPassword.length() < 8 || hotspotPassword.length() > 63)
+    ) {
+        error = "hotspot_password must be empty (open AP) or 8..63 characters";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String text;
+    bool sourceRead = false;
+
+    if (
+        activeConfigSource == CONFIG_SOURCE_SD &&
+        sdAvailableState &&
+        STORAGE.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    }
+
+    if (
+        !sourceRead &&
+        internalAvailableState &&
+        LittleFS.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(LittleFS, "/config.txt", text);
+    }
+
+    if (
+        !sourceRead &&
+        sdAvailableState &&
+        STORAGE.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    }
+
+    bool initializedFromFactoryDefaults = false;
+
+    // First-run case: on a freshly flashed board without an SD card there is
+    // intentionally no persistent /config.txt yet. The dedicated WiFi page
+    // still has to be able to create the first durable configuration. Use the
+    // existing canonical factory-default serializer as the complete baseline,
+    // then patch only the WiFi keys below and pass the result through the same
+    // validation / SFSEC1 / configSaveText() path as every normal save.
+    //
+    // Do not create an SD config here. configSaveText() preserves the existing
+    // SensorForge storage policy: LittleFS is always written, while SD is only
+    // synchronized when /config.txt already exists there.
+    if (!sourceRead) {
+        String factoryError;
+
+        if (!configBuildFactoryDefaultText(text, factoryError)) {
+            error = "could not build initial config for WiFi settings save: " + factoryError;
+            return CONFIG_SAVE_INTERNAL_FAILED;
+        }
+
+        initializedFromFactoryDefaults = true;
+    }
+
+    if (
+        !replaceOrAppendConfigKey(text, "hostname", normalizedHostname) ||
+        !replaceOrAppendConfigKey(text, "wifi_on_system_start", normalizedStartup) ||
+        !replaceOrAppendConfigKey(text, "wifi_timeout_sec", String(wifiTimeoutSec)) ||
+        !replaceOrAppendConfigKey(text, "wifi_alive_schedule_enabled", String(wifiAliveScheduleEnabled)) ||
+        !replaceOrAppendConfigKey(text, "wifi_alive_schedule", normalizedAliveSchedule) ||
+        !replaceOrAppendConfigKey(text, "wifi_ssid", normalizedSsids[0]) ||
+        !replaceOrAppendConfigKey(text, "wifi_pass", wifiPasses[0]) ||
+        !replaceOrAppendConfigKey(text, "wifi_tx_power_dbm", String(wifiTxPowerDbm, 1)) ||
+        !replaceOrAppendConfigKey(text, "hotspot_enabled", String(hotspotEnabled)) ||
+        !replaceOrAppendConfigKey(text, "hotspot_fallback_enabled", String(hotspotFallbackEnabled)) ||
+        !replaceOrAppendConfigKey(text, "hotspot_password", hotspotPassword) ||
+        !replaceOrAppendConfigKey(text, "hotspot_hidden", String(hotspotHidden))
+    ) {
+        error = "could not patch WiFi setting keys";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    for (size_t i = 1; i < SENSORFORGE_WIFI_PROFILE_COUNT; ++i) {
+        const String ssidKey = "wifi_ssid_" + String(i + 1);
+        const String passKey = "wifi_pass_" + String(i + 1);
+        if (
+            !replaceOrAppendConfigKey(text, ssidKey.c_str(), normalizedSsids[i]) ||
+            !replaceOrAppendConfigKey(text, passKey.c_str(), wifiPasses[i])
+        ) {
+            error = "could not patch WiFi profile " + String(i + 1);
+            return CONFIG_SAVE_INTERNAL_FAILED;
+        }
+    }
+
+    String validationError;
+    if (!configValidateText(text, validationError)) {
+        error = "patched config invalid: " + validationError;
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    ConfigSaveResult result = configSaveText(text, writeToSd, error);
+
+    if (
+        result == CONFIG_SAVE_BOTH ||
+        result == CONFIG_SAVE_INTERNAL_ONLY
+    ) {
+        // A first-run save turns the factory-default runtime state into a real
+        // persistent internal configuration immediately. Reflect that source
+        // now instead of reporting DEFAULTS until the next reboot.
+        if (initializedFromFactoryDefaults) {
+            activeConfigSource =
+                result == CONFIG_SAVE_BOTH
+                ? CONFIG_SOURCE_SD
+                : CONFIG_SOURCE_INTERNAL;
+            internalValidState = true;
+            internalConfigState = INTERNAL_CONFIG_VALID;
+            internalConfigDetail = "valid; initial WiFi config saved";
+        }
+
+        cfg_hostname = normalizedHostname;
+        cfg_wifi_on_system_start = normalizedStartup;
+        cfg_wifi_timeout_sec = wifiTimeoutSec;
+        cfg_wifi_alive_schedule_enabled = wifiAliveScheduleEnabled;
+        cfg_wifi_alive_schedule = normalizedAliveSchedule;
+        for (size_t i = 0; i < SENSORFORGE_WIFI_PROFILE_COUNT; ++i) {
+            cfg_wifi_ssids[i] = normalizedSsids[i];
+            cfg_wifi_passes[i] = wifiPasses[i];
+        }
+        cfg_wifi_ssid = cfg_wifi_ssids[0];
+        cfg_wifi_pass = cfg_wifi_passes[0];
+        cfg_wifi_tx_power_dbm = wifiTxPowerDbm;
+        cfg_hotspot_enabled = hotspotEnabled;
+        cfg_hotspot_fallback_enabled = hotspotFallbackEnabled;
+        cfg_hotspot_password = hotspotPassword;
+        cfg_hotspot_hidden = hotspotHidden;
+    }
+
+    return result;
+}
+
+
+ConfigSaveResult configSaveImageMotion(
+    int sensitivity,
+    float minAreaPct,
+    int confirmFrames,
+    int releaseFrames,
+    int backgroundLearning,
+    int globalMeanDelta,
+    int globalChangePct,
+    const String &roiMask,
+    bool writeToSd,
+    String &error
+)
+{
+    error = "";
+
+    if (sensitivity < 1 || sensitivity > 10 ||
+        minAreaPct < 0.1f || minAreaPct > 100.0f ||
+        confirmFrames < 1 || confirmFrames > 6 ||
+        releaseFrames < 1 || releaseFrames > 10 ||
+        backgroundLearning < 1 || backgroundLearning > 64 ||
+        globalMeanDelta < 5 || globalMeanDelta > 100 ||
+        globalChangePct < 20 || globalChangePct > 100 ||
+        !imageMotionValidateRoiMask(roiMask)) {
+        error = "invalid image motion settings";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String text;
+    bool sourceRead = false;
+
+    if (activeConfigSource == CONFIG_SOURCE_SD && sdAvailableState && STORAGE.exists("/config.txt"))
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    if (!sourceRead && internalAvailableState && LittleFS.exists("/config.txt"))
+        sourceRead = readTextFile(LittleFS, "/config.txt", text);
+    if (!sourceRead && sdAvailableState && STORAGE.exists("/config.txt"))
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+
+    if (!sourceRead) {
+        error = "no persistent config.txt available for image motion save";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    // Retire the old separate enable flag on the next image-motion save.
+    // motion_recording_decision is the sole source of truth.
+    removeConfigKey(text, "image_motion_enabled");
+
+    if (!replaceOrAppendConfigKey(text, "image_motion_sensitivity", String(sensitivity)) ||
+        !replaceOrAppendConfigKey(text, "image_motion_min_area_pct", String(minAreaPct, 1)) ||
+        !replaceOrAppendConfigKey(text, "image_motion_confirm_frames", String(confirmFrames)) ||
+        !replaceOrAppendConfigKey(text, "image_motion_release_frames", String(releaseFrames)) ||
+        !replaceOrAppendConfigKey(text, "image_motion_background_learning", String(backgroundLearning)) ||
+        !replaceOrAppendConfigKey(text, "image_motion_global_mean_delta", String(globalMeanDelta)) ||
+        !replaceOrAppendConfigKey(text, "image_motion_global_change_pct", String(globalChangePct)) ||
+        !replaceOrAppendConfigKey(text, "image_motion_roi_mask", roiMask)) {
+        error = "could not patch image motion keys";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String validationError;
+    if (!configValidateText(text, validationError)) {
+        error = "patched config invalid: " + validationError;
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    ConfigSaveResult result = configSaveText(text, writeToSd, error);
+
+    if (result == CONFIG_SAVE_BOTH || result == CONFIG_SAVE_INTERNAL_ONLY) {
+        cfg_image_motion_sensitivity = sensitivity;
+        cfg_image_motion_min_area_pct = minAreaPct;
+        cfg_image_motion_confirm_frames = confirmFrames;
+        cfg_image_motion_release_frames = releaseFrames;
+        cfg_image_motion_background_learning = backgroundLearning;
+        cfg_image_motion_global_mean_delta = globalMeanDelta;
+        cfg_image_motion_global_change_pct = globalChangePct;
+        cfg_image_motion_roi_mask = roiMask;
+    }
+
+    return result;
+}
+
+
+ConfigSaveResult configSaveStreamerSettings(
+    const String &operatingModeInput,
+    int rtspEnabled,
+    int httpMjpegEnabled,
+    int onvifEnabled,
+    bool writeToSd,
+    String &error
+)
+{
+    String operatingMode = operatingModeInput;
+    operatingMode.trim();
+    operatingMode.toLowerCase();
+
+    if (operatingMode != "normal" && operatingMode != "streamer" &&
+        operatingMode != "time_broadcaster") {
+        error = "operating_mode must be normal, streamer or time_broadcaster";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if ((rtspEnabled != 0 && rtspEnabled != 1) ||
+        (httpMjpegEnabled != 0 && httpMjpegEnabled != 1) ||
+        (onvifEnabled != 0 && onvifEnabled != 1)) {
+        error = "streamer/ONVIF enable flags must be 0 or 1";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (onvifEnabled && !rtspEnabled) {
+        error = "onvif_enabled requires streamer_rtsp_enabled=1";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String text;
+    if (!configReadInternalText(text, error))
+        return CONFIG_SAVE_INTERNAL_FAILED;
+
+    auto setKey = [&](const char *key, const String &value) {
+        String prefix = String(key) + "=";
+        int start = 0;
+        while (start < (int)text.length()) {
+            int end = text.indexOf('\n', start);
+            if (end < 0) end = text.length();
+            String line = text.substring(start, end);
+            String trimmed = line;
+            trimmed.trim();
+            if (trimmed.startsWith(prefix)) {
+                String replacement = prefix + value;
+                text = text.substring(0, start) + replacement + text.substring(end);
+                return;
+            }
+            start = end + 1;
+        }
+        if (text.length() && !text.endsWith("\n")) text += '\n';
+        text += prefix + value + "\n";
+    };
+
+    setKey("operating_mode", operatingMode);
+    setKey("streamer_rtsp_enabled", String(rtspEnabled));
+    setKey("streamer_http_mjpeg_enabled", String(httpMjpegEnabled));
+    setKey("onvif_enabled", String(onvifEnabled));
+
+    // Operating-mode and streamer transport changes are reboot-only by design.
+    // Do NOT alter runtime globals here: hot-switching camera/audio ownership
+    // would bypass the boot-time initialization/teardown boundaries.
+    return configSaveText(text, writeToSd, error);
+}
+
+
+ConfigSaveResult configSaveTransportMode(
+    int mode,
+    bool writeToSd,
+    String &error
+)
+{
+    error =
+        "";
+
+    if (
+        mode != 0 &&
+        mode != 1
+    ) {
+        error =
+            "transport mode must be 0 or 1";
+
+        return
+            CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+
+    String text;
+    bool sourceRead =
+        false;
+
+    // Preserve the exact active config text, including comments and any
+    // future optional keys, and patch only transport_mode.
+    if (
+        activeConfigSource == CONFIG_SOURCE_SD &&
+        sdAvailableState &&
+        STORAGE.exists(
+            "/config.txt"
+        )
+    ) {
+
+        sourceRead =
+            readTextFile(
+                STORAGE,
+                "/config.txt",
+                text
+            );
+    }
+
+    if (
+        !sourceRead &&
+        internalAvailableState &&
+        LittleFS.exists(
+            "/config.txt"
+        )
+    ) {
+
+        sourceRead =
+            readTextFile(
+                LittleFS,
+                "/config.txt",
+                text
+            );
+    }
+
+    if (
+        !sourceRead &&
+        sdAvailableState &&
+        STORAGE.exists(
+            "/config.txt"
+        )
+    ) {
+
+        sourceRead =
+            readTextFile(
+                STORAGE,
+                "/config.txt",
+                text
+            );
+    }
+
+    if (!sourceRead) {
+        error =
+            "no persistent config.txt available for transport mode save";
+
+        return
+            CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+
+    if (!replaceOrAppendConfigKey(
+            text,
+            "transport_mode",
+            String(mode)
+        )) {
+
+        error =
+            "could not patch transport_mode";
+
+        return
+            CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+
+    String validationError;
+
+    if (!configValidateText(
+            text,
+            validationError
+        )) {
+
+        error =
+            "patched config invalid: " +
+            validationError;
+
+        return
+            CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+
+    ConfigSaveResult result =
+        configSaveText(
+            text,
+            writeToSd,
+            error
+        );
+
+
+    if (result == CONFIG_SAVE_BOTH) {
+        // Both persistent copies now carry the requested state. Any older
+        // deferred reconciliation request is obsolete.
+        transportModePendingClear();
+
+        cfg_transport_mode =
+            mode;
+
+    } else if (
+        result == CONFIG_SAVE_INTERNAL_ONLY ||
+        result == CONFIG_SAVE_SD_FAILED
+    ) {
+        // The internal copy already contains the newer transport state but the
+        // SD copy is absent or was not writable. Persist the intended value
+        // independently so a stale SD config cannot later win by normal source
+        // priority and resurrect the old mode.
+        if (!transportModePendingStore(
+                mode
+            )) {
+            error =
+                error.length()
+                ? error + "; transport SD reconciliation marker write failed"
+                : String("transport SD reconciliation marker write failed");
+
+            return
+                CONFIG_SAVE_INTERNAL_FAILED;
+        }
+
+        if (result == CONFIG_SAVE_INTERNAL_ONLY) {
+            cfg_transport_mode =
+                mode;
+        }
+    }
+
+
+    return result;
+}
+
+
+ConfigSaveResult configSaveTransportSettings(
+    int checkSeconds,
+    int lightConfirmSeconds,
+    int installDelaySeconds,
+    int maxDurationSeconds,
+    int blackThreshold,
+    bool writeToSd,
+    String &error
+)
+{
+    error = "";
+
+    if (checkSeconds < 10 || checkSeconds > 86400) {
+        error = "transport_check_seconds out of range (10..86400)";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (lightConfirmSeconds < 0 || lightConfirmSeconds > 120) {
+        error = "transport_light_confirm_seconds out of range (0..120)";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (installDelaySeconds < 0 || installDelaySeconds > 86400) {
+        error = "transport_install_delay_seconds out of range (0..86400)";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (maxDurationSeconds < 60 || maxDurationSeconds > 604800) {
+        error = "transport_max_duration_seconds out of range (60..604800)";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (blackThreshold < 0 || blackThreshold > 255) {
+        error = "transport_black_threshold out of range (0..255)";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String text;
+    bool sourceRead = false;
+
+    // Use the exact active config text so comments and future optional keys
+    // survive a transport calibration/settings save unchanged.
+    if (
+        activeConfigSource == CONFIG_SOURCE_SD &&
+        sdAvailableState &&
+        STORAGE.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    }
+
+    if (
+        !sourceRead &&
+        internalAvailableState &&
+        LittleFS.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(LittleFS, "/config.txt", text);
+    }
+
+    if (
+        !sourceRead &&
+        sdAvailableState &&
+        STORAGE.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    }
+
+    if (!sourceRead) {
+        error = "no persistent config.txt available for transport settings save";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    // New transport config has one user-facing darkness parameter. Remove
+    // legacy two-threshold keys when this dedicated page is saved.
+    removeConfigKey(text, "transport_black_mean_max");
+    removeConfigKey(text, "transport_black_p95_max");
+
+    if (
+        !replaceOrAppendConfigKey(text, "transport_check_seconds", String(checkSeconds)) ||
+        !replaceOrAppendConfigKey(text, "transport_light_confirm_seconds", String(lightConfirmSeconds)) ||
+        !replaceOrAppendConfigKey(text, "transport_install_delay_seconds", String(installDelaySeconds)) ||
+        !replaceOrAppendConfigKey(text, "transport_max_duration_seconds", String(maxDurationSeconds)) ||
+        !replaceOrAppendConfigKey(text, "transport_black_threshold", String(blackThreshold))
+    ) {
+        error = "could not patch transport settings";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String validationError;
+
+    if (!configValidateText(text, validationError)) {
+        error = "patched config invalid: " + validationError;
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    ConfigSaveResult result =
+        configSaveText(
+            text,
+            writeToSd,
+            error
+        );
+
+    if (
+        result == CONFIG_SAVE_BOTH ||
+        result == CONFIG_SAVE_INTERNAL_ONLY
+    ) {
+        cfg_transport_check_seconds = checkSeconds;
+        cfg_transport_light_confirm_seconds = lightConfirmSeconds;
+        cfg_transport_install_delay_seconds = installDelaySeconds;
+        cfg_transport_max_duration_seconds = maxDurationSeconds;
+        cfg_transport_black_threshold = blackThreshold;
+    }
+
+    return result;
+}
+
+
+// =============================================================
+// CREATE RECORDING FOLDER
+// =============================================================
+
+String makeFolder()
+{
+    struct tm t;
+    char buf[32];
+
+    if (getLocalTime(&t, 100)) {
+
+        strftime(
+            buf,
+            sizeof(buf),
+            "/%Y%m%d",
+            &t
+        );
+
+        if (!STORAGE.exists(buf)) {
+
+            if (!STORAGE.mkdir(buf)) {
+                Serial.println(
+                    "Config: could not create folder " +
+                    String(buf)
+                );
+            }
+        }
+
+        return String(buf);
+    }
+
+
+    const char *fallback =
+        "/fallback";
+
+
+    if (!STORAGE.exists(fallback)) {
+
+        if (!STORAGE.mkdir(fallback)) {
+            Serial.println(
+                "Config: could not create fallback folder"
+            );
+        }
+    }
+
+
+    return
+        String(fallback);
+}
+
+
+// =============================================================
+// CREATE RECORDING FILENAME
+// =============================================================
+
+String makeFilename()
+{
+    struct tm t;
+    char buf[32];
+
+    if (getLocalTime(&t, 100)) {
+
+        const char *extension =
+            (cfg_recording_format == "mkv")
+            ? ".mkv"
+            : ".avi";
+
+        strftime(
+            buf,
+            sizeof(buf),
+            "%H%M%S",
+            &t
+        );
+
+        return
+            String(buf) +
+            extension;
+    }
+
+
+    const char *extension =
+        (cfg_recording_format == "mkv")
+        ? ".mkv"
+        : ".avi";
+
+
+    snprintf(
+        buf,
+        sizeof(buf),
+        "fallback_%lu",
+        millis()
+    );
+
+
+    return
+        String(buf) +
+        extension;
+}
+
+
+// =============================================================
+// RECORDING NOT-BEFORE / ARMING SCHEDULE
+// =============================================================
+
+static String recordingScheduleCacheValue;
+static String recordingScheduleCacheTimezone;
+static bool recordingScheduleCacheInitialized = false;
+static bool recordingScheduleCacheEnabled = false;
+static bool recordingScheduleCacheValid = false;
+static time_t recordingScheduleCacheEpoch = 0;
+
+
+static void refreshRecordingScheduleCache()
+{
+    if (
+        recordingScheduleCacheInitialized &&
+        recordingScheduleCacheValue == cfg_recording_not_before &&
+        recordingScheduleCacheTimezone == cfg_timezone
+    ) {
+        return;
+    }
+
+    recordingScheduleCacheInitialized = true;
+    recordingScheduleCacheValue = cfg_recording_not_before;
+    recordingScheduleCacheTimezone = cfg_timezone;
+    recordingScheduleCacheEnabled = false;
+    recordingScheduleCacheValid = false;
+    recordingScheduleCacheEpoch = 0;
+
+    String value = cfg_recording_not_before;
+    value.trim();
+
+    String lower = value;
+    lower.toLowerCase();
+
+    if (lower == "off") {
+        recordingScheduleCacheEnabled = false;
+        recordingScheduleCacheValid = true;
+        return;
+    }
+
+    recordingScheduleCacheEnabled = true;
+
+    RecordingNotBeforeParts parts;
+
+    if (!parseRecordingNotBeforeParts(
+            value,
+            parts
+        )) {
+        return;
+    }
+
+    if (!cfg_timezone.length())
+        return;
+
+    // mktime()/localtime_r() interpret the civil date in the configured local
+    // timezone. Re-applying TZ here also keeps runtime behavior correct after a
+    // WebConfig save that changes the timezone without an immediate reboot.
+    setenv(
+        "TZ",
+        cfg_timezone.c_str(),
+        1
+    );
+
+    tzset();
+
+    struct tm localTime;
+    memset(
+        &localTime,
+        0,
+        sizeof(localTime)
+    );
+
+    localTime.tm_year = parts.year - 1900;
+    localTime.tm_mon = parts.month - 1;
+    localTime.tm_mday = parts.day;
+    localTime.tm_hour = parts.hour;
+    localTime.tm_min = parts.minute;
+    localTime.tm_sec = parts.second;
+    localTime.tm_isdst = -1;
+
+    time_t epoch =
+        mktime(
+            &localTime
+        );
+
+    if (epoch == (time_t)-1)
+        return;
+
+    // Round-trip validation rejects impossible civil times, including a local
+    // time skipped by a daylight-saving transition.
+    struct tm roundTrip;
+
+    if (!localtime_r(
+            &epoch,
+            &roundTrip
+        )) {
+        return;
+    }
+
+    if (
+        roundTrip.tm_year != parts.year - 1900 ||
+        roundTrip.tm_mon != parts.month - 1 ||
+        roundTrip.tm_mday != parts.day ||
+        roundTrip.tm_hour != parts.hour ||
+        roundTrip.tm_min != parts.minute ||
+        roundTrip.tm_sec != parts.second
+    ) {
+        return;
+    }
+
+    recordingScheduleCacheEpoch = epoch;
+    recordingScheduleCacheValid = true;
+}
+
+
+RecordingNotBeforeState configRecordingNotBeforeState(
+    time_t *deadlineEpoch,
+    int64_t *remainingSeconds
+)
+{
+    if (deadlineEpoch)
+        *deadlineEpoch = 0;
+
+    if (remainingSeconds)
+        *remainingSeconds = 0;
+
+    refreshRecordingScheduleCache();
+
+    if (!recordingScheduleCacheEnabled) {
+        return
+            recordingScheduleCacheValid
+            ? RECORDING_NOT_BEFORE_OFF
+            : RECORDING_NOT_BEFORE_INVALID;
+    }
+
+    if (!recordingScheduleCacheValid)
+        return RECORDING_NOT_BEFORE_INVALID;
+
+    if (deadlineEpoch)
+        *deadlineEpoch = recordingScheduleCacheEpoch;
+
+    time_t now =
+        time(nullptr);
+
+    // 2021-01-01 UTC, matching the existing time validity policy without the
+    // 100 ms getLocalTime() wait. This path is called frequently by motion
+    // detection and therefore must remain non-blocking.
+    if (now < (time_t)1609459200)
+        return RECORDING_NOT_BEFORE_CLOCK_INVALID;
+
+    int64_t remaining =
+        (int64_t)recordingScheduleCacheEpoch -
+        (int64_t)now;
+
+    if (remaining > 0) {
+        if (remainingSeconds)
+            *remainingSeconds = remaining;
+
+        return RECORDING_NOT_BEFORE_WAITING;
+    }
+
+    return RECORDING_NOT_BEFORE_REACHED;
+}
+
+
+bool configRecordingAllowedNow()
+{
+    RecordingNotBeforeState state =
+        configRecordingNotBeforeState(
+            nullptr,
+            nullptr
+        );
+
+    return
+        state == RECORDING_NOT_BEFORE_OFF ||
+        state == RECORDING_NOT_BEFORE_REACHED;
+}
+
+
+const char *configRecordingNotBeforeStateName(
+    RecordingNotBeforeState state
+)
+{
+    switch (state) {
+        case RECORDING_NOT_BEFORE_OFF:
+            return "off";
+
+        case RECORDING_NOT_BEFORE_WAITING:
+            return "waiting";
+
+        case RECORDING_NOT_BEFORE_REACHED:
+            return "reached";
+
+        case RECORDING_NOT_BEFORE_CLOCK_INVALID:
+            return "clock_invalid";
+
+        case RECORDING_NOT_BEFORE_INVALID:
+        default:
+            return "invalid";
+    }
+}
+
+
+String configRecordingNotBeforeDisplay()
+{
+    String value = cfg_recording_not_before;
+    value.trim();
+
+    String lower = value;
+    lower.toLowerCase();
+
+    if (lower == "off")
+        return "keine Zeitsperre";
+
+    RecordingNotBeforeParts parts;
+
+    if (!parseRecordingNotBeforeParts(
+            value,
+            parts
+        )) {
+        return "ungueltig";
+    }
+
+    char buffer[32];
+
+    snprintf(
+        buffer,
+        sizeof(buffer),
+        "%02d.%02d.%04d %02d:%02d:%02d",
+        parts.day,
+        parts.month,
+        parts.year,
+        parts.hour,
+        parts.minute,
+        parts.second
+    );
+
+    return String(buffer);
+}
+
+
+// =============================================================
+// CHECK IF SYSTEM TIME IS VALID
+// =============================================================
+
+bool timeIsValid()
+{
+    struct tm t;
+
+    if (!getLocalTime(
+            &t,
+            100
+        )) {
+        return false;
+    }
+
+    return
+        (t.tm_year + 1900) >
+        2020;
+}

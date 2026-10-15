@@ -1,0 +1,45 @@
+======================================================================
+WIEDEREINSTIEG - HIER STARTEN
+======================================================================
+
+PROJEKTSTATUS:
+
+Bauteile fuer mindestens:
+- 2 x IR-SYNC-Sender
+- 5 x IR-SYNC-Empfaenger
+
+sind bestellt.
+
+FINALER SENDER:
+XIAO ESP32-S3
+D3 / GPIO4
+IRLZ34NPBF
+8 x Kingbright L-934F3C
+10-us-Puls
+10 Hz
+
+FINALER EMPFAENGER:
+BPW34
+MCP6022
+LM393P
+D3 / GPIO4 am XIAO ESP32-S3 Sense
+
+NAECHSTER SCHRITT:
+
+NICHT sofort alle Geraete bauen.
+
+1. Einen Sender aufbauen und elektrisch testen.
+2. Sender zuerst mit nur einer IR-LED testen.
+3. Danach alle 8 LEDs bestuecken.
+4. Einen Empfaenger aufbauen.
+5. VREF, TIA_OUT und SYNC_OUT messen.
+6. Sender + Empfaenger zusammen testen.
+7. Erst danach weitere 4 Empfaenger identisch aufbauen.
+8. Anschliessend Controller-Synchronitaet messen.
+9. Erst danach Kamera-VSYNC und Frame-Timing untersuchen.
+
+WICHTIG:
+
+Die Schaltung nicht grundlos neu entwerfen.
+Aenderungen erst nach konkreten Messergebnissen.
+======================================================================

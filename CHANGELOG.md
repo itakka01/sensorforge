@@ -1,9 +1,15 @@
-## v87-beta120 (2026-10-15) — passive SFDB event trace, build not verified
-- A ring of up to 128 HMAC-authenticated diagnostic beacon receptions on the receiver, with local ESP-NOW callback timestamp, sender identity, sequence, epoch, and remote software timestamps.
-- Read-only `/cluster_espnow_diagnostic_beacon_events_csv` streamed CSV, to compare against existing `/cluster_espnow_shared_events_csv` on the SAME receiver.
-- Event ring resets on sender/boot/epoch changes and radio restart; no additional RF traffic, no clock-source changes, no capture-path changes.
-- CSV timestamps are software callback timestamps; do not interpret them as RF arrival, absolute accuracy or camera exposure timing.
-- Firmware sketch not compiled with Arduino ESP32 here; update only the diagnostic receiver after successful compilation.
+## v87-beta122 (2026-10-15) — serverseitige Standby-Sperre (Arduino-Build ungeprüft)
+- Coordinator sperrt Node-Zeitsync, Capture, Drone, Restart, Shutdown, SD-Wipe und GPIO-Hardwaremessungen gegen authentifizierte Zeit-Broadcaster-Peers.
+- Berücksichtigt die derzeit auf 15 Zeichen gekürzte, signierte Heartbeat-Betriebsart `time_broadcaste` sowie die volle Schreibweise. Bestehendes Cluster-Wireformat unverändert.
+- Harmloser Einzel-Verbindungstest bleibt absichtlich möglich. Keine Änderung an ESP-NOW-Beacons, Capture-Uhr, Diagnoseintervallen oder automatischer Übergabe.
+- Quelltextprüfung erfolgt; vollständiger Arduino-Build und Hardwaretest stehen aus. Ausschließlich Coordinator aktualisieren, erst nach erfolgreichem Build.
+
+## v87-beta121 (2026-10-15) — low-RAM diagnostic interval aggregates (BUILD UNVERIFIED)
+- Based directly on tested beta119, **not** unstable beta120; no extra 128-entry diagnostic event ring.
+- Constant-memory consecutive-diagnostic-beacon RX-minus-TX interval residual statistics: samples, skipped, mean, sample standard deviation, min, max.
+- New read-only `/cluster_espnow_diagnostic_intervals_json` returns statistics plus currently free heap; existing diagnostics unchanged.
+- Estimates reflect software callback scheduling and sender clock rate, **not** radio PHY timing or camera synchronization. Gaps and source changes are omitted.
+- No capture-clock, production coordinator packet, HMAC, time-source or broadcaster TX changes. Arduino compile and hardware validation pending. Update only devxiao2 after successful build; do not install on coordinator.
 
 ## v87-beta119 (2026-10-15) — experimental diagnostic broadcaster; BUILD UNVERIFIED
 - Added passive `/cluster_espnow_diagnostic_beacon_json` and `/cluster_espnow_diagnostic_beacon_csv` read-only receiver snapshots to `webconfig_cluster.cpp`. Last callback timestamps are software timestamps, not precise physical arrival timestamps. No effect on clock selection.

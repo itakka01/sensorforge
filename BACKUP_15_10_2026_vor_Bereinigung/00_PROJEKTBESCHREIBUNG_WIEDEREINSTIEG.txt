@@ -1,0 +1,819 @@
+======================================================================
+V87 BETA 50 2026-10-08 - CLUSTER JOIN PASSWORT-VALIDIERUNG
+======================================================================
+
+- Bei einem aktuell per passiver Discovery sichtbaren bestehenden Cluster wird
+  das Kandidatenpasswort jetzt VOR jedem Config-Save lokal gegen ein kurzeitig
+  im RAM gehaltenes, HMAC-signiertes SFC1-Presence-Paket geprueft.
+- Falsches Passwort: klare Fehlermeldung, keine Aenderung an config.txt, kein
+  geplanter Reboot.
+- Ist SFD1 bereits sichtbar, aber noch kein signiertes SFC1-Paket eingetroffen,
+  wird ebenfalls nicht gespeichert; die Seite soll einige Sekunden offen bleiben
+  und Save erneut versucht werden.
+- Kein neues Wire-Protokoll und keine Challenge notwendig: bestehende Beta-38+
+  Presence-Signaturen werden wiederverwendet; Passwort/Key verlassen das Geraet
+  nicht.
+- Recovery-Fall fuer bereits falsch gespeichertes Passwort bei gleicher
+  Cluster-ID: nach erfolgreicher Pruefung gegen den sichtbaren Cluster bleibt
+  dessen angekuendigte Credential-Epoch erhalten, statt lokal hochgezaehlt zu
+  werden.
+- Manuelle Erstellung eines wirklich neuen/offline Clusters bleibt moeglich, da
+  dort definitionsgemaess keine Gegenstelle fuer eine Vorabpruefung existiert.
+
+======================================================================
+V87 BETA 49 2026-10-08 - CLUSTER RESTART PAGE COMPILE FIX
+======================================================================
+
+- Reiner Compile-Fix auf Basis von Beta 48.
+- webconfig.cpp bindet cluster.h ein, damit clusterEffectiveId() auf der
+  Cluster-Neustartseite deklariert ist.
+- Keine Aenderung an Cluster-Protokoll, WiFi, Config, Storage, Recording oder
+  sonstigem Laufzeitverhalten.
+
+SENSORFORGE / ESP32-S3 CAMERA (XIAO + FREENOVE)
+PROJEKTBESCHREIBUNG, AKTUELLER RELEASESTAND UND WIEDEREINSTIEG
+Stand: 2026-10-08
+Autoritativer Arbeitsstand: v87 Beta 50
+Letzter stabiler offizieller Release: v86 (2026-10-01)
+Core-Version / Branding: 7.1.0
+Host API: 1.22
+Integration-/App-Profil: 1.1
+
+======================================================================
+1. VERBINDLICHER WIEDEREINSTIEGSPUNKT
+======================================================================
+
+Der vollstaendige Quellstand v87-beta50 ist die aktuelle autoritative Basis.
+Aeltere Arbeitsordner, Zwischen-ZIPs und historische Beta-Staende duerfen nicht
+als Ausgangspunkt fuer neue Aenderungen verwendet werden.
+
+Bei jeder Aenderung gelten verbindlich diese Arbeitsregeln:
+
+- ausschliesslich vom kompletten aktuellen Source-Tree ausgehen; niemals Code aus
+  Erinnerung, alten Delta-ZIPs oder Beschreibungen erraten/re-konstruieren
+- vor einer Aenderung die real betroffenen Dateien, Aufrufer und Lifecycle-/
+  Ownership-Pfade lesen
+- SAFETY FIRST: bestehende produktive Funktionalitaet bleibt erhalten, sofern
+  die angeforderte Aenderung sie nicht ausdruecklich betrifft
+- niemals bestehende Funktionalitaet als beiläufiges Cleanup entfernen
+- Aenderungen moeglichst additiv, klein und technisch klar abgegrenzt umsetzen
+- Sicherheits-/Recovery-/Recording-/Storage-Pfade nicht durch UI-, Lizenz- oder
+  Integrationsfunktionen schwaechen
+- neue Config-Keys additiv mit sicheren Defaults einfuehren; alte config.txt-
+  Dateien muessen ohne Migration weiter funktionieren
+- webconfig.cpp moeglichst schlank/orchestrierend halten; neue eigenstaendige
+  WebConfig-Funktionalitaet technisch sinnvoll in eigene .cpp/.h-Module auslagern
+- Secrets niemals in Web/API/Logs/Diagnose oder Release-Artefakten exponieren
+- Codeaenderungen immer als EIN Delta-ZIP liefern, das ausschliesslich
+  geaenderte/neue Projektdateien unter Originalnamen und Originalpfad enthaelt
+- keine umbenannten Kopien, Patch-/Diff-Dateien, Testplaene oder sonstige
+  Zusatzartefakte in Code-ZIPs aufnehmen
+- nach freigegebenen Releases den vollstaendigen Stand in Git committen/taggen
+
+Aktueller Entwicklungsstand:
+
+- v87-beta50: Join-Validierung fuer sichtbare Cluster. Der passive Scanner haelt waehrend geoeffneter `/cluster`-Seite wenige aktuelle signierte SFC1-Presence-Pakete nur im RAM. Beim Save eines sichtbaren bestehenden Clusters wird das Kandidatenpasswort lokal mit der bestehenden Cluster-Key-Ableitung gegen diesen HMAC-Verkehr geprueft. Falsches Passwort oder noch fehlender signierter Proof blockiert den Save vor config.txt und vor dem Reboot. Ein erfolgreich gepruefter Recovery-Join zur gleichen Cluster-ID behaelt die vom sichtbaren Cluster gemeldete Credential-Epoch. Kein neues Wire-Paket, keine Passwortuebertragung; manuelle neue/offline Cluster bleiben moeglich.
+- v87-beta48: Cluster-Erstbenutzung/Apply-Lifecycle korrigiert. Ein fabrikneues Board besitzt noch keinen NVS-Namespace `sfclprof`; ein read-only Preferences-Open wurde bisher faelschlich als `cluster profile storage unavailable` behandelt. Beim expliziten Join/Save wird der leere Namespace nun sicher initialisiert; echte NVS-Fehler bleiben Fehler. Zusaetzlich werden Cluster-Einstellungen nach verifiziertem Save nicht mehr nur persistent geschrieben und mit `restart_required` stehen gelassen, sondern ueber eine sichtbare Neustartseite und kontrollierten Reboot in einen frischen Cluster-Runtime-Start ueberfuehrt. Passive Discovery bleibt unveraendert: nur aktive Cluster-Mitglieder ab Beta 38 senden SFD1; ein deaktiviertes Geraet hoert nur solange `/cluster` offen ist und sendet dabei nichts.
+- v87-beta47: realen No-SD-Bootcrash aus Beta 46 behoben. Nach den erwarteten fuenf SD-Mount-Fehlversuchen lief das System in `Stack canary watchpoint triggered (loopTask)` und rebootete, bevor Config/WiFi starten konnten. Die fehlende SD selbst bleibt ein erlaubter Zustand; Ursache war die inzwischen grosse `ConfigValues`-Struktur, die in verschachtelten Config-Validierungs-/Default-/Recovery-Pfaden mehrfach als lokale Stack-Arbeitsvariable/Temporary angelegt wurde. Beta 47 fuellt Defaults nun in bestehende Objekte und legt die grossen temporaeren ConfigValues fuer Validation/Parse/Apply/Factory-Pfade kurzlebig auf dem Heap statt auf dem Arduino-loopTask-Stack an. Besonders der Beta-45-Recoverypfad fuer `/config.tmp` kann dadurch beim Boot validieren, ohne den Task-Stack zu ueberlaufen. Config-Schema und Prioritaet SD > LittleFS > Defaults bleiben unveraendert.
+- v87-beta46: WiFi-Save/Apply-Lifecycle korrigiert. Ein erfolgreicher WiFi-Save aktualisierte zuvor bereits die Runtime-Config, liess aber das aktuell laufende Funkinterface im alten Modus weiterlaufen und plante keinen Neustart. Dadurch konnte der normale WiFi-Inaktivitaets-Timeout spaeter das alte Interface abschalten, ohne dass der neu konfigurierte STA-/Fallback-Pfad je gestartet wurde. Ab Beta 46 wird nach verifiziert erfolgreichem Save ein kontrollierter Reboot geplant und vorher eine eigene Reconnect-Seite mit neuem Geraetenamen, Netzwerkmodus und Fallback-Status angezeigt. STA-Verbindungsversuche und Hotspot-Fallback selbst bleiben unveraendert und werden nach dem Boot deterministisch ueber startWebConfig() angewendet.
+- v87-beta45: atomaren Config-Persistenzpfad nach erneutem No-SD-Hardwarebefund gehaertet. Konkreter Fehler: bei einem unterbrochenen allerersten internen Save konnte bereits eine vollstaendig geschriebene/valide `/config.tmp` existieren, waehrend `/config.txt` und `/config.bak` noch fehlten; die bisherige Boot-Recovery loeschte diese einzige gute Kopie blind und fiel danach auf Firmware-Defaults zurueck. Ab Beta 45 wird eine solche Temp-Datei gelesen/validiert und erst nach erfolgreich verifiziertem Wiederaufbau von `/config.txt` entfernt. Zusaetzlich gilt ein atomarer Save erst als erfolgreich, wenn die finale `/config.txt` nach dem Rename erneut gelesen, bytegleich verglichen und validiert wurde; beim ersten Save existiert ein direkter verifizierter Final-Write-Fallback. Bestehende Config-Updates behalten Backup/Rollback; WiFi-/SD-/Cluster-/Recording-Semantik bleibt unveraendert.
+- v87-beta44: reine WiFi-WebConfig-Anzeigeaenderung. Der unter `Eigener Hotspot` gezeigte Hotspot-Name folgt nun live dem noch ungespeicherten Feld `Geraetename`/`hostname`. Die Anzeige aendert keine Persistenz und startet/konfiguriert WiFi nicht; wirksam gespeichert wird weiterhin ausschliesslich ueber den bestehenden WiFi-Save-/Lifecycle-Pfad.
+- v87-beta43: internen LittleFS-Config-Speicher nach realem First-Run-Test ohne SD gehaertet. Ein LittleFS-Mountfehler fuehrt nicht mehr automatisch zu einem Formatieren bereits beschriebener Flash-Daten. Normaler Mount wird begrenzt wiederholt; automatisch formatiert wird nur, wenn die konkrete interne `spiffs`-Partition nachweislich blank/erased ist. Bei nicht-leerer Partition werden Daten bei Mountfehler erhalten. `/config` zeigt den internen Zustand nun getrennt als valid/missing/invalid/unavailable plus genaue Detailursache (z.B. Validierungs-/SFSEC1-Fehler oder Mountfehler). Speicherprioritaet SD > intern > Defaults bleibt unveraendert. Hardware-Re-Test des konkreten Fehlerbilds ist erforderlich, bevor der Low-Level-Fall als abgeschlossen gilt.
+- v87-beta42: WiFi-Provisioning gehaertet. Die dedizierte WiFi-Seite lehnt STA/externes WLAN ohne mindestens ein SSID-Profil ab. Historische/teilkonfigurierte Configs mit `hotspot_enabled=0` und gleichzeitig null SSIDs starten beim Boot den normalen lokalen Hotspot als Recovery-Pfad, auch wenn ein altes `hotspot_fallback_enabled=0` gespeichert ist. Sobald mindestens ein echtes STA-Profil existiert, bleibt die explizite Auswahl `Offline bleiben` unveraendert autoritativ. Keine Aenderung an erfolgreichem STA-Betrieb, Timeout, Schedule, Cluster, Recording oder Storage.
+- v87-beta41: Factory-/Firmware-Default `hotspot_fallback_enabled` von 0 auf 1 geaendert. Wenn Infrastruktur-WLAN gewaehlt ist und kein gespeichertes WLAN erreichbar ist, ist der Default nun Fallback auf den eigenen Hotspot statt offline bleiben. Bereits persistierte Configs werden nicht migriert oder ueberschrieben; ein dort explizit gespeichertes 0 bleibt 0.
+- v87-beta40: First-Run-Fix fuer fabrikneue Boards ohne SD und ohne internen Config-Shadow; der erste WiFi-Save baut die bestehende kanonische Factory-Default-Konfiguration als Basis, patcht nur die WiFi-Werte und persistiert sie ueber den normalen validierten/SFSEC1-geschuetzten LittleFS-Pfad. Es wird dabei keine SD-config.txt neu erzeugt; SD > intern > Defaults bleibt unveraendert.
+- v87-beta39: reiner Arduino-ESP32-3.3.12-Build-Fix in cluster.cpp; lokale HEX-Lookup-Tabelle wegen Kollision mit dem Arduino-Makro HEX in HEX_DIGITS umbenannt; keine Cluster-Laufzeitlogik geaendert
+- v87-beta38: passive Cluster-Suche nur waehrend geoeffneter /cluster-Seite, stabile cluster_id, Credential-Epoch und hardwareverschluesselter Known-Cluster-Cache
+- v87-beta37: automatische Coordinator-Wahl mit Auto/Preferred/Node-only-Policy, Coordinator-Epoch und signierten Node->Coordinator-Unicast-Heartbeats mit ACK
+- v87-beta36: Cluster-Liveness auf 10-s-Heartbeat / 60-s-Lease erweitert
+- geordnetes WiFi-AUS sendet best-effort ein signiertes LEAVE; bei Strom-/Funk-
+  verlust greift die Lease
+- Nodes melden optional die ungefaehre verbleibende WiFi-Laufzeit als Statuswert;
+  Cluster darf daraus niemals WiFi starten, verlaengern oder offen halten
+- /cluster zeigt den gesamten aktuell sichtbaren Verbund inkl. Lease/WiFi-Restzeit
+- generische HMAC-authentisierte Resource-Announcements als Metadatenbasis
+  implementiert; Nutzdaten selbst werden niemals per Multicast uebertragen
+- automatischer Peer-Dateidownload ist noch NICHT angebunden und muss spaeter
+  bewusst auf dem existierenden Storage/API-Pfad aufsetzen
+- v87-beta35: WiFi-Zeitplan-UI verhindert doppelte Startzeiten bereits im Browser
+- v87-beta34: optionale lokale Cluster-Basis ueber bestehendes WiFi
+- Cluster standardmaessig AUS; alte Konfigurationen verhalten sich unveraendert
+
+======================================================================
+2. PRODUKTZIEL
+======================================================================
+
+SensorForge ist eine lokale ESP32-S3 Kamera-/Sensor-Firmware mit zwei klar
+getrennten Betriebswelten:
+
+A) Normalbetrieb / autonome SensorForge-Kamera
+   - bewegungs-/sensorgetriggerte Aufnahme
+   - PIR / Radar / Image Motion / Power Shooter
+   - SD-Aufzeichnung, Diagnose, Recovery und Sleep/Wake
+   - optional verschluesselte Aufzeichnungen
+
+B) Netzwerk-Streamer
+   - RTSP/RTP-JPEG
+   - HTTP-MJPEG
+   - Snapshot
+   - optional Audio
+   - ONVIF-Basisintegration
+   - keine parallele zweite Kamera-/Encoderpipeline
+
+Grundsatz: Streaming, ONVIF, API, Home-Assistant-/Netzwerkfunktionen und spaetere
+Clusterfunktionen duerfen den bewaehrten autonomen Recording-/Sleep-Pfad nicht
+unbemerkt ersetzen oder umgehen.
+
+======================================================================
+3. UNTERSTUETZTE HARDWARE
+======================================================================
+
+Aktuelle Boardprofile:
+
+- Seeed XIAO ESP32S3 Sense
+- Freenove FNK0085 ESP32-S3 WROOM
+
+Die aktive Boardauswahl erfolgt aktuell compile-time ueber board_config.h.
+Der aktuelle eingecheckte Stand aktiviert BOARD_XIAO; Freenove bleibt als
+vollstaendiges alternatives Profil vorhanden.
+
+Wichtige aktuelle Capability-Gates:
+
+- H.264 auf XIAO/Freenove: AUS / nicht implementiert
+- WireGuard Architektur-Capability: vorbereitet
+- WireGuard Runtime-Backend auf aktuellen Profilen: AUS / nicht qualifiziert
+- XIAO: integriertes PDM-Mikrofon vorhanden
+- Freenove: kein integriertes Mikrofonprofil
+
+Keine Capability darf allein durch ein Board-Flag nach aussen advertised werden,
+wenn der reale SensorForge-Pfad nicht implementiert und qualifiziert ist.
+
+======================================================================
+4. WICHTIGE SOURCE-MODULE
+======================================================================
+
+Zentrale Laufzeit / Hardware:
+
+- sensorforge.ino
+- board_config.h
+- branding.h
+- sensorforge_version.h
+- camera_init.cpp
+- config.cpp / config.h
+- rtc.cpp / rtc.h
+- thermal.h
+- storage_guard.cpp / storage_guard.h
+
+Recording / Medien:
+
+- recorder.cpp / recorder.h
+- avi_writer.cpp / avi_writer.h
+- mkv_writer.cpp / mkv_writer.h
+- recording_storage.cpp / .h
+- recording_crypto.cpp / .h
+- recording_write_buffer.cpp / .h
+- audio_capture.cpp / .h
+- audio_wav.cpp / .h
+
+Motion / Sensorik:
+
+- image_motion.cpp / .h
+- motion_diagnostics.cpp / .h
+- radar.cpp / .h
+
+Netzwerk / Integration:
+
+- streamer.cpp / .h
+- onvif.cpp / .h
+- sync_api.cpp / .h
+- device_identity.cpp / .h
+- cluster.cpp / .h
+- cluster_profiles.cpp / .h
+- webconfig.cpp / .h
+- webconfig_wifi.cpp / .h
+- webconfig_streamer.cpp / .h
+- webconfig_audio.cpp / .h
+- webconfig_transport.cpp / .h
+- webconfig_cluster.cpp / .h
+- webconfig_wireguard.cpp / .h
+- webplayer.cpp / .h
+
+Security / Lizenz / Update:
+
+- access_control.cpp / .h
+- web_csrf.cpp / .h
+- config_secrets.cpp / .h
+- log_storage.cpp / .h
+- firmware_security.cpp / .h
+- firmware_public_key.h
+- license.cpp / .h
+- license_policy.cpp / .h
+- license_trial.cpp / .h
+- license_usage.cpp / .h
+- license_keyring.h
+
+Tools:
+
+- sensorforge_sync.py
+- sensorforge_license.py
+- sensorforge_license_keygen.py
+- sensorforge_firmware_sign.py
+- sensorforge_onvif_test.py
+
+======================================================================
+5. CONFIGURATION / KOMPATIBILITAET
+======================================================================
+
+Die persistente Hauptkonfiguration bleibt textbasiert. Neue Keys muessen additiv
+und mit sicheren Defaults eingefuehrt werden. Alte Konfigurationen ohne neue Keys
+muessen das bisherige Verhalten behalten.
+
+Secrets werden nicht im Klartext ueber GET-APIs oder Diagnose ausgegeben.
+SensorForge besitzt fuer sensible Config-/Log-/Storage-Daten getrennte
+Kryptographiepfade und Domains.
+
+Wichtige UI-/Config-Konventionen des aktuellen Standes:
+
+- WiFi-Timeout wird in der WebUI in Minuten eingegeben
+- intern bleibt wifi_timeout_sec in Sekunden gespeichert
+- Transportsicherungszeiten werden benutzerfreundlich in Minuten/Stunden/Tagen
+  dargestellt, intern weiterhin in Sekunden gespeichert
+- Default Transport-Pruefintervall: 600 s / 10 Minuten
+- Maximale Transportdauer: 60..604800 s / bis 7 Tage
+
+======================================================================
+6. RECORDING / STORAGE / ENCRYPTION
+======================================================================
+
+SensorForge besitzt einen zentralen Recording-Owner. Andere Funktionen duerfen
+keine parallele Kamera-/Recorderownership aufbauen.
+
+Aufzeichnungen werden ueber die vorhandenen Storage-/Finalisierungs-/Recovery-
+Pfade geschrieben. Sicherheitskritische Funktionen wie Thermal Guard, sichere
+Containerfinalisierung und Storage-Recovery bleiben immer aktiv, unabhaengig vom
+Lizenzmodus.
+
+Recording Encryption:
+
+- internes Format: SFENC1
+- AES-256-CTR + HMAC-SHA256, Encrypt-then-MAC
+- 32-KiB logische Chunks, authentisierter Header und Chunks
+- Hardware-Vertrauensanker ueber ESP32-S3 eFuse-HMAC-Key
+- Root-Key wird nicht aus MAC/Hardware-ID abgeleitet
+- getrennte Domain-Ableitungen fuer Recording, Config-Secrets und Logs
+
+Der permanente eFuse-Root ist von Lizenzidentitaet und Firmware-Signing getrennt.
+
+======================================================================
+7. STREAMING / ONVIF / AUDIO
+======================================================================
+
+Netzwerk-Streamer:
+
+- RTSP/RTP-JPEG
+- HTTP-MJPEG
+- Snapshot
+- optional Audio, wenn Board/Config dies real unterstuetzen
+
+ONVIF:
+
+- WS-Discovery
+- read-only Device Service
+- read-only Media Service
+- read-only Imaging Service
+- UsernameToken/PasswordDigest und HTTP Basic/Digest im implementierten Umfang
+- GetStreamUri nutzt bestehenden RTSP/JPEG-Pfad
+- GetSnapshotUri nutzt bestehenden Snapshot-Pfad
+
+Feldstatus:
+
+- automatische Discovery wurde auf XIAO mit Android Onvier real bestaetigt
+- Device-/Media-Abfragen, Authentifizierung, Snapshot und RTSP/JPEG funktionieren
+- keine Behauptung offizieller ONVIF-Zertifizierung / voller Profile-T-Konformitaet
+- H.264 ist auf den aktuellen Boards nicht implementiert
+
+ONVIF bleibt eingefroren, solange kein konkretes reproduzierbares
+Interoperabilitaetsproblem vorliegt.
+
+======================================================================
+8. LOKALE API / INTEGRATION
+======================================================================
+
+Namespace: /api/v1
+Host-Protokoll: 1.22
+Integration-/App-Profil: 1.1
+
+Die API ist administrator-only und verwendet die bestehende SensorForge-
+Authentifizierung. Transport ist derzeit lokales HTTP und deshalb fuer
+vertrauenswuerdige/isolierte Netze vorgesehen.
+
+Wichtige Identitaeten:
+
+- device_id = vom Benutzer veraenderbarer Hostname / Netzwerkidentitaet
+- integration_id = zufaellige stabile 128-Bit-ID in NVS fuer Integrationen
+- license hardware_id = separate boardgebundene Lizenzidentitaet aus Factory-MAC
+
+Diese Identitaeten duerfen nicht vermischt werden.
+
+Die integration_id ist seit v87-beta34 zugleich die Cluster-Node-ID. API und
+Cluster verwenden dafuer dieselbe zentrale Implementierung in
+device_identity.cpp/.h; es wird keine zweite Geraeteidentitaet erzeugt.
+
+======================================================================
+9. WIFI / HOME ASSISTANT / WIREGUARD
+======================================================================
+
+WiFi:
+
+- Infrastruktur-WLAN, eigener Hotspot und Fallback-Hotspot sind vorhanden
+- Multi-WiFi-/Recovery-Verhalten bleibt bestehende Netzwerkautoritaet
+- automatische WiFi-Zeitfenster sind additiv vorbereitet/implementiert
+- UI-Timeout in Minuten, interne Speicherung in Sekunden
+
+Home Assistant:
+
+- optionale Integrationsschicht, nicht eigenes Produktprofil
+- bestehende SensorForge-Funktionalitaet bleibt Hauptprodukt
+- API-Polling darf WebConfig-/Recording-Pause-Semantik nicht ausloesen
+
+WireGuard/VPN:
+
+- Architektur, Config-/Secret-/API-Struktur vorbereitet
+- kein qualifiziertes Backend im aktuellen XIAO/Freenove-Build
+- legacy WireGuard-ESP32 0.1.5 wird nicht gelinkt
+- UI zeigt nur den klaren Status "Derzeit nicht verfuegbar"
+- keine lokale Drittanbieter-Patchabhaengigkeit
+- spaetere Fortsetzung nur mit gepflegtem ESP-NETIF-kompatiblen Backend oder
+  nach separat qualifizierter Plattformmigration
+
+======================================================================
+10. TRANSPORTSICHERUNG
+======================================================================
+
+Die Transportsicherung ist ein expliziter, manueller Modus zum sicheren
+Transport/Abdecken des Geraets.
+
+Aktueller WebConfig-Code liegt seit v87-beta33 in:
+
+- webconfig_transport.cpp
+- webconfig_transport.h
+
+Die Auslagerung war rein strukturell. Transport-/Recording-/Reboot-Semantik
+wurde nicht geaendert.
+
+Wichtige aktuelle UI-Regeln:
+
+- einheitlicher Floating-Save-Button wie in anderen Config-Seiten
+- "Wartezeit nach Entfernen der Abdeckung"
+- maximale Transportdauer als Minuten / Stunden / Tage
+- Bestaetigungszeit nach erkannter Helligkeit in Sekunden
+- Pruefintervall als Minuten / Stunden
+- Standard-Pruefintervall 10 Minuten
+- ungewoehnlich helle Schwarzmessung wird NICHT als automatischer Grenzwert-
+  Vorschlag uebernommen
+
+======================================================================
+11. LIZENZSYSTEM / PRODUKTMODI
+======================================================================
+
+Das Lizenzsystem ist boardgebunden und offline verifizierbar.
+
+Hardware-ID:
+
+- aus der werkseitigen ESP32-S3 Factory/eFuse-MAC abgeleitet
+- sichtbares Format SF-...
+- unabhaengig von device_id und integration_id
+
+Activation Code:
+
+- SF1 = Legacy/Beta-Kompatibilitaet
+- SF2 = aktuelles Keyring-Format mit signierter Issuer-Key-ID
+- ECDSA P-256 / SHA-256
+- Firmware enthaelt nur Public Keys
+- Private Keys duerfen niemals in Firmware, Repo, Release-ZIP oder Chat landen
+- installierter Code liegt intern unter LittleFS /license.dat
+- ein gueltiger Code wird atomar gespeichert und ist sofort aktiv
+
+Produktmodi:
+
+1. TRIAL
+   - Auslieferzustand ohne Aktivierung
+   - volle Funktionalitaet
+   - endet beim ersten erreichten Limit:
+     * 14 Tage aktive Nutzung
+     * oder 14 Tage vertrauenswuerdige Kalenderzeit, sobald vorhanden
+     * oder 20 h Recording
+     * oder 100 h aktives Streaming
+
+2. DEMO
+   - automatischer Rueckfall nach verbrauchtem Trial
+   - 10 neue Aufnahmen pro Tag
+   - max. 1 h Recording pro Tag
+   - max. 1 h Streaming pro Tag
+   - Radar-Konfiguration/Kalibrierung bleibt verfuegbar
+   - lokale Management-/Diagnosefunktionen bleiben verfuegbar
+
+3. FULL
+   - permanente Vollfreischaltung
+
+4. SERVICE
+   - separate Service-Edition
+
+Usage Accounting:
+
+- kumulierte Recording-Zeit
+- Recording-Anzahl
+- aktive Streaming-Wandzeit (mindestens ein RTSP/HTTP-MJPEG-Client)
+- ungefaehre kumulierte System-Uptime
+- letzter vertrauenswuerdiger Zeitanker
+- interne NVS-Persistenz mit redundanten Slots / CRC fuer Robustheit
+- bewusst grobe Checkpoints, keine per-Frame-Flashwrites
+
+Die UI zeigt dezent SYS / FILM / STRM sowie den effektiven Produktmodus.
+
+SF2 Keyring / Security Model:
+
+- Online-TRIAL-Key soll nur EVALUATION ausstellen duerfen
+- FULL/SERVICE Authority-Key bleibt offline oder spaeter nicht exportierbar in HSM/KMS
+- separater RECOVERY-Key bleibt offline
+- Firmware prueft Signatur UND Capabilities der Issuer-Key-ID
+- kompromittierter Trial-Webserver kann dadurch keine FULL-/SERVICE-Lizenz erzeugen
+- Firmware-Signing verwendet ein komplett separates Schluesselpaar
+
+Aktueller Beta-Keyring ist NICHT production-ready. Vor kommerziellem Release
+muessen auf einem eigenen vertrauenswuerdigen/offline Rechner Production-Keys
+mit sensorforge_license_keygen.py erzeugt und der Public-Keyring eingebaut werden.
+
+======================================================================
+12. FIRMWAREUPDATE / SIGNING
+======================================================================
+
+SD- und WiFi-Firmwareupdates verwenden signierte .sfw-Pakete.
+
+- ECDSA P-256 / SHA-256
+- eigener Firmware-Public-Key in der Firmware
+- eigener Firmware-Private-Key nur auf Release-System
+- Firmware-Key ist strikt vom Lizenz-Key getrennt
+- SD prueft Signatur vor dem Schreiben
+- WiFi schreibt in inaktive OTA-Partition und prueft vor Aktivierung
+- normales OTA ersetzt die App-Partition und laesst LittleFS / license.dat bestehen
+
+Secure Boot / Flash Encryption / Anti-Rollback sind weiterhin separate spaetere
+Hardening-Themen. Sie duerfen nicht beilaufig zusammen mit Lizenz- oder
+Featurearbeit aktiviert werden, da eFuse-Schritte teilweise irreversibel sind.
+
+======================================================================
+13. WEB-SICHERHEIT / ZUGRIFF
+======================================================================
+
+- Administratorrolle
+- zusaetzliche Streaming-Benutzer
+- Rollen fuer Medienzugriff / Annotation / Delete
+- zentraler CSRF-Schutz fuer mutierende Browseraktionen
+- RTSP/HTTP-MJPEG Auth bei aktiviertem Webschutz
+- Machine-to-Machine API/ONVIF besitzen getrennte passende Auth-/CSRF-Regeln
+
+Aktuelle Management-Transportannahme:
+
+- lokales vertrauenswuerdiges bzw. isoliertes Netz
+- keine direkte Internet-Portweiterleitung fuer WebConfig/API/ONVIF/RTSP
+- HTTPS/TLS bleibt ein spaeterer Hardening-Punkt
+
+======================================================================
+14. RELEASES / AKTUELLE BETA-KETTE
+======================================================================
+
+v87-beta38  2026-10-08
+- temporaerer passiver Cluster-Discovery-Listener nur solange /cluster aktiv gepollt wird; niemals WiFi-Start/-Verlaengerung und keine eigenen Cluster-TX-Pakete im deaktivierten Zustand
+- stabile oeffentliche cluster_id und cluster_credential_epoch eingefuehrt
+- aktive Cluster senden kleines oeffentliches SFD1-Discovery-Metadatenpaket ohne Passwort/Join-Recht
+- Drop-down aus sichtbaren und lokal bekannten Clustern; Cluster-ID bleibt auch manuell eingebbar
+- bis zu sechs bekannte Cluster-Credentials boardlokal in NVS; Passwort nur SFSEC1-verschluesselt und nie im Browser/JSON
+- gespeichertes Passwort wird bei Credential-Epoch-Mismatch bewusst nicht automatisch benutzt
+- lokaler Same-ID-Passwortwechsel wird bei aktuell authentisierten Remote-Peers blockiert; zentrale Rotation bleibt Coordinator-Aufgabe
+- gleiche Cluster-ID mit inkompatiblen Credentials bleibt in getrennten Auth-Partitionen und wird nicht automatisch zusammengefuehrt
+
+v87-beta37  2026-10-08
+- automatische Coordinator-Wahl: auto / preferred / node-only
+- deterministische Kandidatenwahl ueber Policy + stabile integration_id
+- Coordinator-Epoch/Generation als Basis fuer spaetere autorisierte Commands
+- signierte Node->Coordinator-Unicast-Heartbeats alle 10 s auf UDP 39428 mit signiertem ACK
+- Direct-Heartbeat erneuert die Node-Liveness beim Coordinator unabhaengig von einzelnen verlorenen Multicast-Paketen
+- noch keine Time-Master-/Laser-Synchronisation und keine Remote-Commands
+
+v87-beta36  2026-10-08
+- Cluster-Presence weiterhin 10 s, Liveness jetzt 60-s-Lease
+- signiertes LEAVE bei geordnetem WiFi-Shutdown
+- ungefaehre WiFi-Restzeit als reine Statusmetadaten
+- komplette Cluster-Uebersicht je Node
+- generische Resource-Announcements fuer spaetere automatisierte Peer-Transfers
+- keine Multicast-Uebertragung grosser Resource-Nutzdaten
+
+v87-beta35  2026-10-08
+- WiFi-Zeitplan-UI: freie Default-Startzeiten und lokale Duplicate-Pruefung
+
+v87-beta34  2026-10-08
+- optionale lokale Cluster-Mitgliedschaft ueber bestehendes WiFi
+- stabiler integration_id-Pfad zentral in device_identity.cpp/.h
+- mDNS/DNS-SD Announcement _sfcluster._udp ueber bestehenden mDNS-Responder
+- authentisierte HMAC-SHA256 Multicast-Presence / volatile Peer-Liste
+- eigene Cluster-WebConfig-/Statusseite in webconfig_cluster.cpp/.h
+- keine Zeitkorrektur, Fernsteuerung oder Multi-Kamera-Steuerung
+
+v87-beta33  2026-10-08
+- Transportsicherungs-WebConfig in eigenes Modul ausgelagert
+- keine funktionale Aenderung
+
+v87-beta32  2026-10-08
+- Transportzeit-UI vereinheitlicht
+- Minuten/Stunden/Tage fuer maximale Dauer
+- Minuten/Stunden fuer Pruefintervall
+- Default Pruefintervall 10 Minuten
+
+v87-beta31  2026-10-08
+- einheitlicher Save-Button der Transportsicherung
+- WiFi-Timeout in der UI auf Minuten umgestellt
+- helle Schwarzmessungen werden nicht als Grenzwert vorgeschlagen
+
+v87-beta30  2026-10-07
+- SF2-Lizenzformat / Keyring / Issuer-Capabilities
+- Vorbereitung fuer getrennte Trial-, Full- und Recovery-Schluessel
+
+v87-beta29  2026-10-06
+- Trial-Limits getrennt: 20 h Recording / 100 h Streaming
+
+v87-beta28  2026-10-06
+- TRIAL als Auslieferzustand, danach DEMO
+- zentrale Lizenzpolicy fuer Recording-/Streaming-Tageslimits
+
+v87-beta27  2026-10-06
+- aktive Streaming-Zeit in Usage Accounting aufgenommen
+
+v87-beta26  2026-10-06
+- kumulierte SYS-/FILM-Anzeige und Produktmodus in WebConfig
+
+v87-beta25  2026-10-06
+- ressourcenschonende persistente Usage-Counter-Grundlage
+
+v87-beta24  2026-10-03
+- WireGuard-Benutzeransicht bereinigt; Backend bewusst geparkt
+
+v86          2026-10-01  OFFIZIELL
+- letzter stabiler offizieller Release
+
+Weitere historische Detailstaende sind im Git-Verlauf bzw. CHANGELOG erhalten.
+Der Wiedereinstieg soll NICHT mehr aus alten Einzel-Betas rekonstruiert werden.
+
+======================================================================
+15. OFFENE / KOMMERZIELLE PUNKTE VOR PRODUKTIONSRELEASE
+======================================================================
+
+Lizenz:
+
+- Production-Keyring offline erzeugen
+- Legacy-SF1 fuer Production deaktivieren
+- FULL/SERVICE-Key sicher offline oder HSM/KMS verwalten
+- Trial-Webservice spaeter nur mit EVALUATION-Key ausstatten
+- Reboot-/Wrong-Device-/Manipulations-Negativtests fuer SF2 abschliessen
+
+Firmware-Signing:
+
+- Production-Firmware-Key sicher erzeugen/verwahren
+- signierte SD-/WiFi-Updatepfade final auf beiden Boards qualifizieren
+
+Security/Compliance:
+
+- HTTPS/TLS fuer Management spaeter neu bewerten
+- Secure Boot/Flash Encryption nur als eigenes qualifiziertes Projekt
+
+Hardware-/Regression:
+
+- aktuelle Beta-Linie auf XIAO und Freenove regressionspruefen
+- Recording, Sleep/Wake, SD, WebConfig, RTSP/ONVIF, Audio, OTA, Lizenz und
+  Transportsicherung unter realer Last testen
+
+======================================================================
+16. LOKALE CLUSTER-/MULTI-CAMERA-BASIS
+======================================================================
+
+Seit v87-beta34 ist eine optionale lokale Cluster-Basis implementiert. v87-beta36
+erweitert sie um Lease/LEAVE-Liveness und generische Resource-Announcements,
+v87-beta37 um automatische Coordinator-Wahl und direkte Node-Heartbeats.
+v87-beta38 fuegt stabile Cluster-IDs, passives Discovery und einen verschluesselten
+Known-Cluster-Cache hinzu. Die Clusterfunktion bleibt strikt dem bestehenden
+SensorForge-WiFi-Lifecycle untergeordnet.
+
+Detaillierte autoritative Cluster-Wiedereinstiegsdokumentation:
+
+- CLUSTER_ARCHITECTURE.md
+
+Beta 38 ist der derzeitige Cluster-Freeze-Punkt. Die allgemeine Cluster-
+Infrastruktur soll bis zum konkreten Anwendungsfall Zeitsynchronisation +
+zeitgesteuerte Multi-Camera-Ausloesung nicht auf Verdacht weiter ausgebaut werden.
+Ein vollstaendiger Multi-Device-Hardware-/Performance-Test dieser Clusterbasis ist
+noch durchzufuehren; die Implementierung ist daher architektonisch vorbereitet,
+aber nicht allein durch Dokumentation als feldqualifiziert zu betrachten.
+
+Verbindliche Ownership-/Safety-Regeln:
+
+- cluster_enabled=0 ist Default und bleibt fuer alte Configs der Fallback
+- bei deaktiviertem Cluster gibt es KEINE dauerhafte Cluster-Runtime, keinen
+  Cluster-mDNS-Service, keine Heartbeats und keine Resource-Pakete
+- einzige Beta-38-Ausnahme: solange die WebConfig-Seite /cluster aktiv gepollt
+  wird, darf ein temporaerer receive-only Multicast-Listener laufen; er sendet
+  selbst keine SensorForge-Clusterpakete, tritt keinem Cluster bei und laeuft
+  nach Ende des Browser-Pollings automatisch aus
+- Cluster darf WiFi NIEMALS selbst starten, verlaengern oder offen halten
+- Cluster-Runtime startet nur nachdem der bestehende WiFi-Lifecycle erfolgreich
+  ein Service-Netz bereitgestellt hat
+- vor jedem geordneten WiFi-Shutdown wird Cluster gestoppt
+- Recording, Streamer, Sleep/Wake, WebConfig, OTA und Netzwerk-Recovery bleiben
+  die autoritativen Owner ihrer bestehenden Pfade
+
+Konfiguration:
+
+- cluster_enabled=0|1, Default 0
+- cluster_id=cl-<32 lowercase hex>, stabile oeffentliche 128-Bit Cluster-ID
+- cluster_name=<logischer Anzeigename>
+- cluster_credential_epoch=<Generation >=1>, Default 1
+- cluster_password=<gemeinsames Secret, 8..63 Zeichen>
+- cluster_coordinator_policy=auto|preferred|node, Default auto
+- alte Beta-37-Configs ohne cluster_id erhalten kompatibel eine deterministische
+  Legacy-ID aus dem vorhandenen Cluster-Namen; beim naechsten Cluster-Save wird
+  diese ID explizit persistiert
+- cluster_password wird ueber den bestehenden SFSEC1-Config-Secret-Pfad
+  geschuetzt gespeichert und niemals per mDNS/Status/API ausgegeben
+- ab Beta 38 wird der HMAC-/Tag-Trust-Domain bewusst aus stabiler cluster_id +
+  Passwort abgeleitet (SensorForgeClusterKeyV2); der Anzeigename ist kein
+  kryptographischer Identitaetsbestandteil
+- deshalb muessen alle Mitglieder eines bestehenden Beta-37-Clusters gemeinsam
+  auf Beta 38 aktualisiert werden; gemischte Beta-37/Beta-38-Mitgliedschaft ist
+  bewusst nicht unterstuetzt. Gemeinsam aktualisierte Altconfigs leiten aus dem
+  bisherigen Cluster-Namen dieselbe deterministische Legacy-cluster_id ab
+- Aenderungen werden gespeichert und beim naechsten normalen WiFi-/Geraetestart
+  wirksam; kein erzwungener Reboot aus der Cluster-Seite
+
+Identitaet:
+
+- Node-ID ist die bestehende stabile zufaellige 128-Bit integration_id aus NVS
+- device_identity.cpp/.h ist die gemeinsame Implementierung fuer API und Cluster
+- MAC-Adresse und Lizenz-Hardware-ID werden dafuer nicht verwendet
+
+Discovery / Presence / Liveness:
+
+- der bestehende zentrale mDNS-Responder bleibt allein in sensorforge.ino owned
+- Cluster fuegt bei aktivierter Mitgliedschaft nur den Service _sfcluster._udp
+  hinzu; kein zweiter MDNS.begin()/MDNS.end()-Lifecycle
+- selbstlernende Peer-Erkennung erfolgt ueber kleine lokale UDP-Multicast-Pakete
+- Basispresence bleibt aus Kompatibilitaetsgruenden im SFC1-Format
+- Heartbeat: 10 Sekunden
+- Lease: 60 Sekunden
+- max. 16 volatile Peers
+- Coordinator-Policy pro Geraet: auto (Default), preferred oder node
+- node kandidiert niemals als Coordinator; preferred steht vor auto; bei Gleichstand entscheidet deterministisch die stabile integration_id
+- die tatsaechliche Coordinator-Rolle ist Runtime-State und keine harte Benutzer-Masterzuweisung
+- jeder Coordinator-Start besitzt eine neue Runtime-Epoch/Generation; Coordinator-ID plus Epoch sind die kuenftige Basis fuer autorisierte Produktionsbefehle
+- jeder Nicht-Coordinator sendet alle 10 s einen HMAC-signierten Unicast-Heartbeat direkt an den aktuellen Coordinator auf UDP 39428
+- der Coordinator bestaetigt mit einem HMAC-signierten ACK; diese Direkt-Heartbeats erneuern beim Coordinator die Node-Liveness auch dann, wenn einzelne Multicast-Presence-Pakete verloren gehen
+- die automatische Wahl verwendet weiterhin die 60-s-Peer-Lease; ein einzelner verlorener Broadcast loest keinen Coordinator-Wechsel aus
+- Presence/Metadaten sind HMAC-SHA256-authentisiert; Nodes mit anderem
+  Cluster-Passwort werden nicht aufgenommen
+- ein zusaetzliches SFM1-Metadatenpaket transportiert lease_sec und
+  wifi_remaining_sec
+- wifi_remaining_sec ist nur eine ungefaehre Statusinformation aus dem bereits
+  bestehenden WiFi-Abschalt-/Zeitplan-Lifecycle; -1 bedeutet offen/unbekannt
+- dieser Wert darf niemals als Anlass dienen, WiFi durch Cluster offen zu halten
+- aktive Nodes senden zusaetzlich alle 10 s ein kleines OEFFENTLICHES SFD1-
+  Discovery-Paket mit Cluster-ID, Anzeigename, Credential-Epoch, Node-ID, Policy
+  und Release; es enthaelt KEIN Passwort und berechtigt NICHT zum Clusterbeitritt
+- SFD1 wird nur fuer die Auswahlliste/Diagnose verwendet; Peer-Mitgliedschaft,
+  Election und Commands duerfen ausschliesslich authentisierte Daten verwenden
+- bei geordnetem WiFi-AUS sendet der Node best-effort ein signiertes SFL1 LEAVE
+- bei Stromausfall, Crash, Funkloch oder verlorenem LEAVE greift die 60-s-Lease
+
+Statusdaten pro Node:
+
+- integration_id
+- Hostname / IP
+- operating mode
+- Firmware-Release
+- Uptime
+- Recording-/Streaming-/Transportstatus
+- Zeit gueltig / Epoch
+- Lease und Lease-Restzeit
+- ungefaehre WiFi-Restzeit
+- konfigurierte Coordinator-Policy und tatsaechliche Runtime-Rolle
+- aktuell gewaehlter Coordinator inkl. Epoch/Generation
+- Alter des direkten Coordinator-Heartbeats bzw. ACK, soweit fuer den lokalen Node relevant
+
+WebConfig:
+
+- eigene Seite /cluster
+- eigene Implementierung webconfig_cluster.cpp/.h
+- webconfig.cpp enthaelt nur Navigation und Route-Hook
+- jeder Node zeigt den gesamten aktuell sichtbaren Cluster inkl. lokalem Node
+- Peerstatus wird nur angezeigt; die Seite steuert keine fremden Nodes
+- solange /cluster offen ist, wird passiv nach SFD1-Announcements gehorcht und
+  eine Drop-down-Liste sichtbarer Cluster aufgebaut; Cluster-ID/Name koennen
+  weiterhin manuell eingegeben werden
+- bis zu sechs erfolgreich verwendete Cluster werden boardlokal in NVS gemerkt;
+  die Passwoerter liegen dort ausschliesslich als SFSEC1 mit hardwaregebundenem
+  Key und werden niemals an Browser/Status-JSON zurueckgegeben
+- meldet ein sichtbarer Cluster eine andere Credential-Epoch als der gespeicherte
+  Known-Cluster-Eintrag, wird das alte Passwort NICHT automatisch benutzt
+
+Passwort-/Credential-Regel ab v87-beta38:
+
+- Cluster-ID und Passwort sind getrennt; Passwortwechsel erzeugt keinen neuen
+  Cluster, sondern eine neue cluster_credential_epoch
+- eine lokale Passwortaenderung fuer dieselbe Cluster-ID wird abgelehnt, solange
+  aktuell authentisierte Remote-Peers am laufenden Cluster haengen; dadurch darf
+  die WebConfig keinen gesunden Mehrgeraete-Cluster versehentlich teilen
+- isolierte Recovery/Rejoin-Situationen ohne authentisierte Peers duerfen lokal
+  neu credentialed werden; die Credential-Epoch wird dabei bei Bedarf erhoeht
+- die spaetere echte Cluster-weite Passwortrotation ist ausschliesslich eine
+  Coordinator-Transaktion: PREPARE mit neuem Secret ueber den alten trust domain,
+  ACK der aktiven Nodes, danach COMMIT einer neuen Credential-Epoch
+- diese verteilte Rotation ist in Beta 38 bewusst NOCH NICHT implementiert
+- Offline-Nodes, die eine spaetere Rotation verpassen, sehen nach Rueckkehr die
+  neue oeffentliche Credential-Epoch und muessen das neue Passwort einmal neu
+  bekommen/eingeben; danach wird es wieder lokal verschluesselt gemerkt
+- zwei Teilgruppen mit gleicher Cluster-ID aber verschiedenen Passwoertern
+  authentisieren sich NICHT gegenseitig und nehmen NICHT an derselben Election
+  teil; Discovery darf den ID-Konflikt sichtbar machen, aber niemals automatisch
+  ein Passwort als Gewinner bestimmen
+- Security-Grenze: das aktuelle Shared-Password/HMAC-Modell ist fuer ein
+  vertrauenswuerdiges lokales Netz gedacht und ist kein PAKE/PKI-Protokoll;
+  mitgeschnittener authentisierter Verkehr erlaubt grundsaetzlich Offline-
+  Passwortversuche. Deshalb starke/zufaellige Cluster-Secrets verwenden und
+  dieses Modell vor einem kommerziellen Security-Claim nochmals bewerten
+- ein erster Auto-/Preferred-Node kann einen neuen Cluster selbst bootstrappen
+  und wird mangels besserem Kandidaten Coordinator; wenn alle Nodes auf `node`
+  stehen, existiert bewusst kein Coordinator
+
+Resource-Announcement-Grundlage ab v87-beta36:
+
+- kleine Resource-Metadaten koennen mit SFR1 HMAC-authentisiert broadcastet werden
+- Felder: owner integration_id, resource_id, resource type, UTC-Zeitstempel in
+  Mikrosekunden, Groesse, TTL und kompakter Locator
+- Resource-Nutzdaten (JPEG, Video, Datei) werden NIEMALS per Multicast gesendet
+- pro Node wird nur eine kleine volatile Resource-Tabelle gehalten
+- aktuelle Obergrenze: 24 volatile Resource-Announcements, TTL max. 3600 s
+- die C++-Schnittstelle clusterAnnounceResource() ist als generische Basis
+  vorhanden
+- derzeit ruft noch KEIN Kamera-/Recordingpfad diese Schnittstelle automatisch auf
+- ein automatischer Peer-Download ist bewusst noch NICHT implementiert
+- spaeter muss der Pull eines konkreten Bildes/Videos ueber einen bestehenden,
+  sicher geprueften Storage-/API-Pfad erfolgen; kein paralleler Dateizugriff darf
+  erfunden werden
+
+Bewusste Nicht-Funktionen in v87-beta38:
+
+- KEINE automatische Uhrkorrektur / Zeitsynchronisation
+- Coordinator ist implementiert; noch KEIN separater Time Master / Laser-Sync-Master
+- KEINE Remote-Commands
+- KEIN gemeinsames START/STOP Recording
+- KEINE Frame-/Take-Synchronisierung
+- KEIN automatischer Download angekuendigter Ressourcen
+
+Naechste sichere Cluster-Schritte:
+
+1. Beta-37-Election und Direkt-Heartbeats mit mindestens zwei, besser drei realen Geraeten im selben WLAN testen
+2. Auto/Preferred/Node-only-Failover sowie LEAVE/Lease-Ablauf pruefen
+3. Streamer-/Recording-Regression mit Cluster AUS vs. EIN messen
+4. danach Zeitbasis/Time-Master separat planen; Laser/TSF/FTM duerfen spaeter als Capability hinzukommen, ohne die Benutzer-Policy in einen Force-Master-Schalter umzubauen
+5. fuer Resource-Pull zuerst den konkreten bestehenden Datei-/Storage-Pfad lesen und daraus einen cluster-authentisierten, ownership-sicheren Abruf definieren
+6. Produktionssession erst danach: feste Coordinator-ID + Epoch + Session-ID, bestaetigte Commands und kein stilles Failover mitten in einem Take
+
+======================================================================
+17. DOKUMENTATION / HISTORISCHE ZUSATZDATEIEN
+======================================================================
+
+Separate Spezialdokumente bleiben bewusst ausserhalb dieser Hauptbeschreibung,
+z. B.:
+
+- 00_STROMVERBRAUCH.txt
+- 00_SYNC_CAMS_BESCHREIBUNG.txt
+- 00_SYNC_SENDER_BESCHREIBUNG.txt
+- CLUSTER_ARCHITECTURE.md
+- FIRMWARE_SIGNING.txt
+- README_Radar_Kalibrierung.txt
+- SENSORFORGE_API_V1.md
+
+Diese Dateien koennen Spezialtests/-konzepte enthalten, sind aber kein Ersatz
+fuer den autoritativen Release- und Wiedereinstiegsstand in diesem Dokument.
+
+======================================================================
+18. KURZER WIEDEREINSTIEGSPROMPT
+======================================================================
+
+Arbeite auf SensorForge v87-beta38 vom 2026-10-08.
+Lies vor Aenderungen die betroffenen Dateien aus dem kompletten aktuellen
+Source-Tree. Alte Beta-ZIPs oder historische Beschreibungsabschnitte sind keine
+Source-Basis und Code darf niemals geraten werden. Bestehende Funktionalitaet,
+insbesondere Recording-, Storage-, Sleep-, Security-, Update- und Recoverypfade,
+hat Vorrang und darf nicht beiläufig entfernt werden. Neue Funktionen additiv,
+ressourcenschonend und board-/capability-gated umsetzen. webconfig.cpp schlank
+halten und eigenstaendige UI-Funktionalitaet wenn technisch sinnvoll in Module
+auslagern. Delta-ZIP nur mit geaenderten/neuen Dateien unter Originalnamen und
+Originalpfad liefern.

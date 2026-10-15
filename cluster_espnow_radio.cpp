@@ -130,11 +130,6 @@ uint8_t diagnosticHead=0,diagnosticTail=0;
 DiagnosticBeaconRxStats diagnosticRx{};
 uint64_t diagnosticLastTag=0,diagnosticLastBoot=0;
 uint32_t diagnosticLastEpoch=0,diagnosticLastSequence=0;
-// Receiver-side ring; written only from serviceDiagnosticReceive(), never from the callback.
-constexpr size_t kDiagnosticEventCapacity=128;
-DiagnosticBeaconEvent diagnosticEvents[kDiagnosticEventCapacity]{};
-size_t diagnosticEventCount=0, diagnosticEventWrite=0;
-
 
 // Callback-safe TX latency sampling. Entries are inserted before esp_now_send().
 // Match by destination MAC and FIFO; no per-packet sequence is supplied to TX callbacks.
@@ -928,7 +923,7 @@ void stop() {
     stats.lastSeriesRttMinUs=stats.lastSeriesRttMaxUs=0;
     stats.lastSeriesOffsetP10Us=stats.lastSeriesOffsetP90Us=0;
     resetTiming();clearQueue();diagnosticRx={};
-    diagnosticLastTag=diagnosticLastBoot=0;diagnosticLastEpoch=diagnosticLastSequence=0;diagnosticEventCount=diagnosticEventWrite=0;
+    diagnosticLastTag=diagnosticLastBoot=0;diagnosticLastEpoch=diagnosticLastSequence=0;
     for(auto &p:slotPeers)p={};slotNextIndex=0;slotOwner=-1;
     slotStartedMs=slotGuardUntilMs=0;slotGrantsSent=slotRotations=0;
     previousEstimate={};latestQualityEstimate={};lastPrecisionMs=0;failedSeries=0;lastSeriesFailure=0;lastRejectedReason=0;lastRejectedSeriesMs=0;lastRejectedHasMetrics=false;lastRejectedEstimate={};consecutiveFailures=0;
@@ -1031,13 +1026,6 @@ size_t nodeSyncReports(NodeSyncReport* out,size_t capacity){
     }
     return count;
 }
-size_t diagnosticBeaconEventCount(){return diagnosticEventCount;}
-bool diagnosticBeaconEventAt(size_t index, DiagnosticBeaconEvent &out){
-    if(index>=diagnosticEventCount)return false;
-    const size_t first=(diagnosticEventWrite+kDiagnosticEventCapacity-diagnosticEventCount)%kDiagnosticEventCapacity;
-    out=diagnosticEvents[(first+index)%kDiagnosticEventCapacity];
-    return true;
-}
 DiagnosticBeaconRxStats diagnosticBeaconRxStats(){return diagnosticRx;}
 void serviceDiagnosticReceive() {
     if(!initialized || diagnosticMode || capturePaused())return;
@@ -1058,22 +1046,36 @@ void serviceDiagnosticReceive() {
            msg.epoch==diagnosticLastEpoch && msg.sequence<=diagnosticLastSequence) {
             ++diagnosticRx.replay;continue;
         }
+        const bool sameDiagnosticSource=(msg.senderTag==diagnosticLastTag &&
+            msg.senderBoot==diagnosticLastBoot && msg.epoch==diagnosticLastEpoch);
+        const uint32_t previousDiagnosticSequence=diagnosticLastSequence;
+        const int64_t previousDiagnosticLocalUs=diagnosticRx.lastRxCallbackUs;
+        const int64_t previousDiagnosticRemoteUs=diagnosticRx.lastRemoteMonotonicUs;
         diagnosticLastTag=msg.senderTag;diagnosticLastBoot=msg.senderBoot;
         diagnosticLastEpoch=msg.epoch;diagnosticLastSequence=msg.sequence;
-        if (diagnosticEventCount &&
-            (diagnosticEvents[(diagnosticEventWrite+kDiagnosticEventCapacity-1)%kDiagnosticEventCapacity].senderTag!=msg.senderTag ||
-             diagnosticEvents[(diagnosticEventWrite+kDiagnosticEventCapacity-1)%kDiagnosticEventCapacity].senderBoot!=msg.senderBoot ||
-             diagnosticEvents[(diagnosticEventWrite+kDiagnosticEventCapacity-1)%kDiagnosticEventCapacity].epoch!=msg.epoch))
-            diagnosticEventCount=diagnosticEventWrite=0;
-        DiagnosticBeaconEvent &event=diagnosticEvents[diagnosticEventWrite];
-        event={msg.sequence,msg.epoch,msg.senderTag,msg.senderBoot,item.rxUs,msg.monotonicUs,msg.utcUs};
-        diagnosticEventWrite=(diagnosticEventWrite+1)%kDiagnosticEventCapacity;
-        if(diagnosticEventCount<kDiagnosticEventCapacity)++diagnosticEventCount;
         ++diagnosticRx.authenticated;
         diagnosticRx.lastSequence=msg.sequence;
         diagnosticRx.lastEpoch=msg.epoch;
         diagnosticRx.lastSenderTag=msg.senderTag;
         diagnosticRx.lastSenderBoot=msg.senderBoot;
+        // Compare consecutive local RX intervals with consecutive sender intervals.
+        // Never subtract absolute clocks (unknown inter-device offset).
+        // Reset across source/boot/epoch changes or sequence gaps.
+        if (sameDiagnosticSource && msg.sequence == previousDiagnosticSequence + 1U &&
+            item.rxUs > previousDiagnosticLocalUs && msg.monotonicUs > previousDiagnosticRemoteUs) {
+            const int64_t localDelta=item.rxUs-previousDiagnosticLocalUs;
+            const int64_t remoteDelta=msg.monotonicUs-previousDiagnosticRemoteUs;
+            const int64_t residual=localDelta-remoteDelta;
+            if (residual>=-1000000LL && residual<=1000000LL) {
+                const int32_t r=static_cast<int32_t>(residual);
+                const uint32_t n=++diagnosticRx.intervalSamples;
+                if(n==1 || r<diagnosticRx.intervalMinUs)diagnosticRx.intervalMinUs=r;
+                if(n==1 || r>diagnosticRx.intervalMaxUs)diagnosticRx.intervalMaxUs=r;
+                const double delta=static_cast<double>(r)-diagnosticRx.intervalMeanUs;
+                diagnosticRx.intervalMeanUs+=delta/static_cast<double>(n);
+                diagnosticRx.intervalM2+=delta*(static_cast<double>(r)-diagnosticRx.intervalMeanUs);
+            } else ++diagnosticRx.intervalSkipped;
+        } else if (diagnosticRx.authenticated>1) ++diagnosticRx.intervalSkipped;
         diagnosticRx.lastRxCallbackUs=item.rxUs;
         diagnosticRx.lastRemoteMonotonicUs=msg.monotonicUs;
         diagnosticRx.lastRemoteUtcUs=msg.utcUs;
@@ -1491,8 +1493,6 @@ BeaconPredictionStats beaconPredictionStats(){return {};}
 size_t beaconObservationCount(){return 0;}
 bool beaconObservationAt(size_t,BeaconObservation&){return false;}
 Diagnostics diagnostics(){return {};}
-size_t diagnosticBeaconEventCount(){return 0;}
-bool diagnosticBeaconEventAt(size_t,DiagnosticBeaconEvent&){return false;}
 DiagnosticBeaconRxStats diagnosticBeaconRxStats(){return {};}
 bool beaconExperimentStart(uint32_t,bool){return false;}
 void beaconExperimentAbort(){}

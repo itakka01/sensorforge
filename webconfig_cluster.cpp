@@ -1,3 +1,4 @@
+#include <math.h>
 #include <cmath>
 #include "webconfig_cluster.h"
 
@@ -1101,26 +1102,19 @@ static void handleEspNowDiagnosticBeaconJson(){
     server.sendHeader("Cache-Control","no-store");
     server.send(200,"application/json; charset=utf-8",data);
 }
-// Passive, bounded event trace. The two CSVs share the same receiving device clock.
-static void handleEspNowDiagnosticBeaconEventsCsv(){
+// Small constant-memory summary; do not construct a large page or CSV history.
+static void handleEspNowDiagnosticIntervalsJson(){
+    const auto s=ClusterEspNowRadio::diagnosticBeaconRxStats();
+    const double stddev=s.intervalSamples>1 ?
+        sqrt(s.intervalM2/static_cast<double>(s.intervalSamples-1)) : 0.0;
+    char data[300];
+    snprintf(data,sizeof(data),
+        "{\"samples\":%lu,\"skipped\":%lu,\"mean_us\":%.2f,\"stddev_us\":%.2f,\"min_us\":%ld,\"max_us\":%ld,\"free_heap\":%lu}",
+        (unsigned long)s.intervalSamples,(unsigned long)s.intervalSkipped,
+        s.intervalMeanUs,stddev,(long)s.intervalMinUs,(long)s.intervalMaxUs,
+        (unsigned long)ESP.getFreeHeap());
     server.sendHeader("Cache-Control","no-store");
-    server.sendHeader("Content-Disposition","attachment; filename=espnow_diagnostic_beacon_events.csv");
-    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-    server.send(200,"text/csv; charset=utf-8","");
-    server.sendContent("sequence,epoch,sender_tag,sender_boot,node_rx_callback_us,remote_monotonic_us,remote_utc_us\n");
-    const size_t count=ClusterEspNowRadio::diagnosticBeaconEventCount();
-    for(size_t i=0;i<count;++i){
-        ClusterEspNowRadio::DiagnosticBeaconEvent e;
-        if(!ClusterEspNowRadio::diagnosticBeaconEventAt(i,e))continue;
-        char line[192];
-        snprintf(line,sizeof(line),"%lu,%lu,%llu,%llu,%lld,%lld,%lld\n",
-            (unsigned long)e.sequence,(unsigned long)e.epoch,
-            (unsigned long long)e.senderTag,(unsigned long long)e.senderBoot,
-            (long long)e.rxCallbackUs,(long long)e.remoteMonotonicUs,
-            (long long)e.remoteUtcUs);
-        server.sendContent(line);
-    }
-    server.sendContent("");
+    server.send(200,"application/json; charset=utf-8",data);
 }
 // Deliberately no UI element; diagnostics use existing authentication gates.
 static void handleEspNowBeaconCsv(){
@@ -1594,8 +1588,8 @@ void webconfigClusterRegisterRoutes(
     serverInstance.on("/cluster_espnow_benchmark_status", HTTP_GET, handleEspNowBenchmarkStatus);
     serverInstance.on("/cluster_espnow_benchmark_csv", HTTP_GET, handleEspNowBenchmarkCsv);
     serverInstance.on("/cluster_espnow_diagnostic_beacon_csv", HTTP_GET, handleEspNowDiagnosticBeaconCsv);
-    serverInstance.on("/cluster_espnow_diagnostic_beacon_events_csv", HTTP_GET, handleEspNowDiagnosticBeaconEventsCsv);
     serverInstance.on("/cluster_espnow_diagnostic_beacon_json", HTTP_GET, handleEspNowDiagnosticBeaconJson);
+    serverInstance.on("/cluster_espnow_diagnostic_intervals_json", HTTP_GET, handleEspNowDiagnosticIntervalsJson);
     serverInstance.on("/cluster_espnow_beacons_csv", HTTP_GET, handleEspNowBeaconCsv);
     serverInstance.on("/cluster_espnow_beacon_stats_csv", HTTP_GET, handleEspNowBeaconStatsCsv);
     serverInstance.on("/cluster_espnow_shared_events_csv", HTTP_GET, handleEspNowSharedEventsCsv);

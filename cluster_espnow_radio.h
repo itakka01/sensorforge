@@ -100,16 +100,11 @@ struct DiagnosticBeaconRxStats {
     uint32_t lastSequence=0, lastEpoch=0;
     uint64_t lastSenderTag=0, lastSenderBoot=0;
     int64_t lastRxCallbackUs=0, lastRemoteMonotonicUs=0, lastRemoteUtcUs=0;
+    // Constant-memory interval residuals, callback timestamps only; NOT clock accuracy.
+    uint32_t intervalSamples=0, intervalSkipped=0;
+    int32_t intervalMinUs=0, intervalMaxUs=0;
+    double intervalMeanUs=0, intervalM2=0;
 };
-// Last 128 authenticated SFDB frames, timestamped on the receiver's own monotonic clock.
-// For offline comparison with /cluster_espnow_shared_events_csv; diagnostic only.
-struct DiagnosticBeaconEvent {
-    uint32_t sequence=0, epoch=0;
-    uint64_t senderTag=0, senderBoot=0;
-    int64_t rxCallbackUs=0, remoteMonotonicUs=0, remoteUtcUs=0;
-};
-size_t diagnosticBeaconEventCount();
-bool diagnosticBeaconEventAt(size_t index, DiagnosticBeaconEvent &out);
 DiagnosticBeaconRxStats diagnosticBeaconRxStats();
 // Coordinator-only, manual beacon interval experiment; max 15 s, no Wi-Fi disconnect.
 struct BeaconExperimentState { bool active=false, quiet=false; uint32_t intervalMs=0, sent=0, remainingMs=0; };

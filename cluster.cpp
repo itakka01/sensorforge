@@ -1166,6 +1166,23 @@ static ClusterPeer *findPeer(const char *integrationId)
     return nullptr;
 }
 
+// Standby broadcaster is a management peer, not a recording/sync/SD node.
+// The authenticated legacy heartbeat carries at most 15 characters of mode.
+// Do not change that signed packet format in this compatibility release.
+static bool peerIsStandbyTimeBroadcaster(const ClusterPeer *peer)
+{
+    if (!peer || !peer->used) return false;
+    return strcmp(peer->mode, "time_broadcaste") == 0 ||
+           strcmp(peer->mode, "time_broadcaster") == 0;
+}
+
+static bool rejectStandbyNodeAction(const ClusterPeer *peer, String &error)
+{
+    if (!peerIsStandbyTimeBroadcaster(peer)) return false;
+    error = "Zeit-Broadcaster (Standby): diese Node-Aktion ist gesperrt.";
+    return true;
+}
+
 static ClusterPeer *ensurePeerForAuthenticatedPacket(
     const char *integrationId,
     uint32_t remoteBoot,
@@ -4245,6 +4262,7 @@ bool clusterRequestNodeTimeSync(const String &nodeId, String &error)
         (uint32_t)(millis() - peer->lastSeenMs) > 60000UL) {
         error = "Node ist nicht authentifiziert erreichbar."; return false;
     }
+    if (rejectStandbyNodeAction(peer, error)) return false;
     char bootText[9];
     snprintf(bootText, sizeof(bootText), "%08lx", (unsigned long)bootNonce);
     if (++timeSyncCommandSeq == 0) ++timeSyncCommandSeq;
@@ -4328,6 +4346,7 @@ bool clusterRequestNodeRestart(const String &nodeId, String &error)
         (uint32_t)(millis() - peer->lastSeenMs) > 60000UL) {
         error = "Node ist nicht authentifiziert erreichbar."; return false;
     }
+    if (rejectStandbyNodeAction(peer, error)) return false;
     if (++probeSeq == 0) ++probeSeq;
     const uint64_t id = ((uint64_t)bootNonce << 32) | probeSeq;
     if (!ClusterJobs::enqueue(id, currentCoordinatorEpoch, peer->integrationId,
@@ -4370,6 +4389,7 @@ bool clusterRequestNodeShutdown(const String &nodeId, String &error)
         (uint32_t)(millis()-peer->lastSeenMs)>60000UL) {
         error="Node ist nicht authentifiziert erreichbar."; return false;
     }
+    if (rejectStandbyNodeAction(peer, error)) return false;
     if (++probeSeq == 0) ++probeSeq;
     const uint64_t id=((uint64_t)bootNonce<<32)|probeSeq;
     if (!ClusterJobs::enqueue(id, currentCoordinatorEpoch, peer->integrationId,
@@ -4420,6 +4440,7 @@ bool clusterRequestNodeHwTime(const String &nodeId, uint8_t channel,
         error = "Mess-Node nicht erreichbar.";
         return false;
     }
+    if (rejectStandbyNodeAction(peer, error)) return false;
     if (++probeSeq==0) ++probeSeq;
     char cb[9],nb[9],when[30];
     snprintf(cb,sizeof(cb),"%08lx",(unsigned long)bootNonce);
@@ -4456,6 +4477,7 @@ bool clusterHwTimeStart(const String nodeIds[3], String &error) {
             (uint32_t)(millis() - peer->lastSeenMs) > 60000UL) {
             error = "Mess-Node nicht erreichbar: " + nodeIds[i]; return false;
         }
+        if (rejectStandbyNodeAction(peer, error)) return false;
     }
     int64_t nowUtc = 0;
     if (!clusterTimeNowUs(nowUtc)) { error = "Cluster-Uhr nicht bereit."; return false; }
@@ -4565,6 +4587,7 @@ bool clusterRequestNodeCapture(const String &nodeId,int64_t utcUs,String &error)
     const ClusterPeer *peer=findPeer(nodeId.c_str());
     if(!peer||!peer->used||!usableIp(peer->ip)||!peer->bootNonce||
        (uint32_t)(millis()-peer->lastSeenMs)>60000UL){error="Node nicht erreichbar.";return false;}
+    if (rejectStandbyNodeAction(peer, error)) return false;
     if(++probeSeq==0)++probeSeq;
     uint64_t id=((uint64_t)bootNonce<<32)|probeSeq;
     if(!ClusterJobs::enqueue(id,currentCoordinatorEpoch,peer->integrationId,
@@ -4590,8 +4613,7 @@ bool clusterRequestNodeCapture(const String &nodeId,int64_t utcUs,String &error)
     if(!sendSignedPayloadTo(cmd,peer->ip,CLUSTER_COORDINATOR_PORT,"scheduled photo")){
         ClusterJobs::transition(id,currentCoordinatorEpoch,ClusterJobs::State::Failed,millis(),1);
         error="Capture-Auftrag nicht gesendet.";return false;
-    }
-    ++captureSent;return true;
+    }    ++captureSent;return true;
 }
 
 bool clusterRequestNodeDrone(const String &nodeId,bool enabled,String &error){
@@ -4599,6 +4621,7 @@ bool clusterRequestNodeDrone(const String &nodeId,bool enabled,String &error){
     const ClusterPeer *peer=findPeer(nodeId.c_str());
     if(!peer||!peer->used||!usableIp(peer->ip)||!peer->bootNonce||
        (uint32_t)(millis()-peer->lastSeenMs)>60000UL){error="Node nicht erreichbar/authentifiziert.";return false;}
+    if (rejectStandbyNodeAction(peer, error)) return false;
     if(++probeSeq==0)++probeSeq;
     const uint64_t id=((uint64_t)bootNonce<<32)|probeSeq;
     if(!ClusterJobs::enqueue(id,currentCoordinatorEpoch,peer->integrationId,
@@ -4612,8 +4635,7 @@ bool clusterRequestNodeDrone(const String &nodeId,bool enabled,String &error){
     if(!sendSignedPayloadTo(msg,peer->ip,CLUSTER_COORDINATOR_PORT,"drone mode")){
         ClusterJobs::transition(id,currentCoordinatorEpoch,ClusterJobs::State::Failed,millis(),1);
         error="Drone-Auftrag nicht gesendet.";return false;
-    }
-    return true;
+    }    return true;
 }
 
 bool clusterRequestNodeWipe(const String &nodeId,String &error)
@@ -4626,6 +4648,7 @@ bool clusterRequestNodeWipe(const String &nodeId,String &error)
         (uint32_t)(millis()-peer->lastSeenMs)>60000UL) {
         error="Node nicht authentifiziert erreichbar.";return false;
     }
+    if (rejectStandbyNodeAction(peer, error)) return false;
     if (++probeSeq==0) ++probeSeq;
     const uint64_t id=((uint64_t)bootNonce<<32)|probeSeq;
     if (!ClusterJobs::enqueue(id,currentCoordinatorEpoch,peer->integrationId,
