@@ -6,6 +6,9 @@ namespace ClusterEspNowRadio {
 // Called from ordinary cluster loop, not from Wi-Fi callbacks.
 void service(bool allowed, bool coordinator, uint32_t epoch,
              const char *coordinatorId, uint32_t localBootNonce);
+// Independent diagnostic transmitter, never a coordinator or clock authority.
+void serviceDiagnosticBroadcaster(bool allowed, uint32_t epoch,
+                                  const char *deviceId, uint32_t localBootNonce);
 void stop();
 // Revoke short-lived permission, cancel samples, suppress TX during protected work.
 // Keeps the last accepted clock estimate for holdover.
@@ -91,6 +94,23 @@ struct Diagnostics {
     uint32_t syncPermissionRemainingMs=0;
 };
 Diagnostics diagnostics();
+// Diagnostic SFDB receiver only; never used by precisionUtcNow() or capture.
+struct DiagnosticBeaconRxStats {
+    uint32_t received=0, authenticated=0, rejected=0, replay=0, dropped=0;
+    uint32_t lastSequence=0, lastEpoch=0;
+    uint64_t lastSenderTag=0, lastSenderBoot=0;
+    int64_t lastRxCallbackUs=0, lastRemoteMonotonicUs=0, lastRemoteUtcUs=0;
+};
+// Last 128 authenticated SFDB frames, timestamped on the receiver's own monotonic clock.
+// For offline comparison with /cluster_espnow_shared_events_csv; diagnostic only.
+struct DiagnosticBeaconEvent {
+    uint32_t sequence=0, epoch=0;
+    uint64_t senderTag=0, senderBoot=0;
+    int64_t rxCallbackUs=0, remoteMonotonicUs=0, remoteUtcUs=0;
+};
+size_t diagnosticBeaconEventCount();
+bool diagnosticBeaconEventAt(size_t index, DiagnosticBeaconEvent &out);
+DiagnosticBeaconRxStats diagnosticBeaconRxStats();
 // Coordinator-only, manual beacon interval experiment; max 15 s, no Wi-Fi disconnect.
 struct BeaconExperimentState { bool active=false, quiet=false; uint32_t intervalMs=0, sent=0, remainingMs=0; };
 bool beaconExperimentStart(uint32_t intervalMs, bool quiet=false);

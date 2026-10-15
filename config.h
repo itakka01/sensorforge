@@ -89,7 +89,7 @@ extern int cfg_image_motion_global_change_pct;
 extern String cfg_image_motion_roi_mask; // 20x15 compact bit mask, 76 hex chars
 
 // Operating mode / network streamer
-extern String cfg_operating_mode;              // "normal" or "streamer"
+extern String cfg_operating_mode;              // "normal", "streamer", "time_broadcaster"
 extern int cfg_streamer_rtsp_enabled;           // 0/1
 extern int cfg_streamer_http_mjpeg_enabled;     // 0/1
 extern int cfg_onvif_enabled;                    // 0/1, basic ONVIF discovery/media integration

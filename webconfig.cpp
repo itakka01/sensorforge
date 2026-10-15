@@ -2462,6 +2462,25 @@ static void handleRoot()
     // Keep SD/config state fresh for the dashboard as well.
     configRefreshSdStatus();
 
+    // Beta115 standby page: no status polling, camera preview or dashboard
+    // initialization. Broadcasting is intentionally NOT enabled by this page.
+    if (cfg_operating_mode == "time_broadcaster") {
+        String html;
+        html.reserve(900);
+        html = F("<!doctype html><html lang='de'><head><meta charset='utf-8'>"
+                 "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                 "<title>SensorForge Zeit-Broadcaster</title></head>"
+                 "<body style='font-family:sans-serif;max-width:700px;margin:3em auto;padding:1em'>"
+                 "<h1>SensorForge Zeit-Broadcaster</h1>"
+                 "<p>Diagnostischer Standby-Modus: Kamera und Aufzeichnung sind deaktiviert.</p>"
+                 "<p><strong>Die Zeituebertragung ist noch nicht freigegeben.</strong> "
+                 "Der sichere HMAC-geschuetzte Senderwechsel ist noch nicht integriert.</p>"
+                 "<p><a href='/config'>Konfiguration</a></p></body></html>");
+        server.sendHeader("Cache-Control", "no-store");
+        server.send(200, "text/html; charset=utf-8", html);
+        return;
+    }
+
     if (streamerModeEnabled()) {
         String html = htmlHeader();
         html += "<div class='page-title'><div><h2>" + htmlText(UI_DASH_OVERVIEW) +
@@ -5153,6 +5172,9 @@ static void handleSave()
         // Drone is an exclusive UI choice, but the saved normal Recording/Shooter
         // preferences remain intact for the next regular-mode selection.
         operatingMode = "normal";
+    } else if (operatingModeSelection == "time_broadcaster") {
+        // Diagnostic standby only: TX remains forbidden pending full handover integration.
+        operatingMode = "time_broadcaster";
     } else if (operatingModeSelection == "streamer") {
         // Streamer ownership is reboot-only. Preserve the user's normal-mode
         // recording/shooter choices so they return unchanged when switching

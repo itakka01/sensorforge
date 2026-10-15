@@ -241,6 +241,7 @@ String webconfigStreamerOperatingModeHtml(
         "<option value='shooter'" + String(!droneModeEnabled() && !configuredStreamerMode && !cfg_motion_recording_enabled && cfg_shooter_enabled ? " selected" : "") + ">Power Shooter standalone</option>"
         "<option value='motion_shooter'" + String(!droneModeEnabled() && !configuredStreamerMode && cfg_motion_recording_enabled && cfg_shooter_enabled ? " selected" : "") + ">Normal Recording + Power Shooter</option>"
         "<option value='streamer'" + String(!droneModeEnabled() && configuredStreamerMode ? " selected" : "") + ">Netzwerk-Streamer</option>"
+        "<option value='time_broadcaster'" + String(cfg_operating_mode == "time_broadcaster" ? " selected" : "") + ">Zeit-Broadcaster (Diagnose-Standby, kein Sendebetrieb)</option>"
         "</select>"
         "<div id='cfgStreamerOptions' style='margin-top:14px;padding:14px;border:1px solid #8fb5c9;border-radius:8px;background:#f7fbfd'>"
         "<div style='display:flex;align-items:center;gap:6px;flex-wrap:wrap'><b>Netzwerk-Streamer</b>" +

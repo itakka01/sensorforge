@@ -14468,6 +14468,8 @@ static bool tryEnterConfiguredSleep()
 // WEB CONFIG WIFI
 // =============================================================
 
+static bool timeBroadcasterModeEnabled();
+
 void startWebConfig()
 {
 #if defined(BOARD_FREENOVE)
@@ -14632,7 +14634,7 @@ void startWebConfig()
 
     // Kamera bereits für Live-Preview initialisieren.
     // startRecording() verwendet später dieselbe laufende Kamera.
-    if (!cameraInitialized) {
+    if (!timeBroadcasterModeEnabled() && !cameraInitialized) {
         Serial.println(
             "Initializing camera for WebConfig preview..."
         );
@@ -15152,6 +15154,12 @@ static bool startRadarMotionTrackingRobust()
     return false;
 }
 
+
+// Beta115: early runtime isolation. This mode cannot transmit until an
+// authenticated coordinator grant is integrated. It retains WebConfig.
+static bool timeBroadcasterModeEnabled() {
+    return cfg_operating_mode == "time_broadcaster";
+}
 
 void setup() {
 
@@ -15835,7 +15843,7 @@ void setup() {
     // only AFTER SD mount/config/logger/recovery have completed.
     // ---------------------------------------------------------
 
-    if (!streamerModeEnabled())
+    if (!streamerModeEnabled() && !timeBroadcasterModeEnabled())
         radarBegin();
 
 
@@ -15945,6 +15953,18 @@ void setup() {
         );
     }
 
+
+    // ---------------------------------------------------------
+    // Beta115 time-broadcaster standby (fail closed, no time TX yet).
+    // Keep WLAN/Cluster/WebConfig alive. No recording/camera/radar startup.
+    // ---------------------------------------------------------
+    if (timeBroadcasterModeEnabled()) {
+        Serial.println("TIME BROADCASTER: standby; TX not authorized");
+        if (!webConfigStarted) {
+            Serial.println("TIME BROADCASTER: WebConfig unavailable");
+        }
+        return;
+    }
 
     // ---------------------------------------------------------
     // Dedicated network-streamer mode
@@ -16296,6 +16316,18 @@ void loop() {
     // A prepared UTC Capture has precedence over noncritical loop services.
     // UDP processing remains ahead of this guard; camera owner is not shared.
     if (clusterCaptureArmed()) { delay(1); return; }
+
+    // A dedicated time broadcaster must take priority over Drone Mode.
+    // Otherwise a default-enabled Drone Mode would run recorder and OTA
+    // maintenance tasks in what must be a minimal diagnostic-only mode.
+    // Transmitting time beacons remains disabled until authenticated handover.
+    if (timeBroadcasterModeEnabled()) {
+        // Dedicated standby: service only the cluster and management UI.
+        // No camera, motion processing or recorder work is performed.
+        if (webConfigStarted) webConfigLoop();
+        delay(1);
+        return;
+    }
 
     // Passive Drone Mode: keep the authenticated cluster/UTC scheduler alive,
     // but do not enter the autonomous motion, shooter, SD-recovery or recording

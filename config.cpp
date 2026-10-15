@@ -2836,11 +2836,12 @@ static bool validateValues(
 
     if (
         values.operatingMode != "normal" &&
-        values.operatingMode != "streamer"
+        values.operatingMode != "streamer" &&
+        values.operatingMode != "time_broadcaster"
     ) {
 
         error =
-            "operating_mode must be normal or streamer";
+            "operating_mode must be normal, streamer or time_broadcaster";
 
         return false;
     }
@@ -9439,8 +9440,9 @@ ConfigSaveResult configSaveStreamerSettings(
     operatingMode.trim();
     operatingMode.toLowerCase();
 
-    if (operatingMode != "normal" && operatingMode != "streamer") {
-        error = "operating_mode must be normal or streamer";
+    if (operatingMode != "normal" && operatingMode != "streamer" &&
+        operatingMode != "time_broadcaster") {
+        error = "operating_mode must be normal, streamer or time_broadcaster";
         return CONFIG_SAVE_INTERNAL_FAILED;
     }
 

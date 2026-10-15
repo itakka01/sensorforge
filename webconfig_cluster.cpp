@@ -198,6 +198,9 @@ function sizeText(v){v=Number(v)||0;if(!v)return '-';if(v<1024)return v+' B';if(
 function statusText(n){var x=[];if(n.recording)x.push('Recording');if(n.streaming)x.push('Streaming');if(n.transport)x.push('Transport');return x.length?x.join(' · '):'Bereit';}
 function policyText(v){if(v==='preferred')return 'Bevorzugt';if(v==='node')return 'Nur Node';return 'Auto';}
 function roleText(v){return v==='coordinator'?'Coordinator':'Node';}
+function isStandbyBroadcaster(n){var m=String(n&&n.mode||'');return m==='time_broadcaster'||m==='time_broadcaste';}
+function displayRole(n){return isStandbyBroadcaster(n)?'Zeit-Broadcaster (Standby)':roleText(n.cluster_role);}
+function isActionableNode(n){return n&&!n.local&&!isStandbyBroadcaster(n)&&!!n.online;}
 function nodeNavigationLink(n,d){
  if(n.local||!d.runtime_active||!n.online)return '';
  var ip=String(n.ip||'');var parts=ip.split('.');
@@ -233,7 +236,7 @@ function renderChoices(d){
  if(sig===choiceSignature)return;choiceSignature=sig;var selected=choice.value||current;choice.innerHTML='<option value="">Manuell / neuer Cluster</option>'+entries.map(function(e){var label=e.name+' · '+e.id+(e.online?' · '+e.nodes+' online':' · bekannt/offline')+(e.coord?' · Coordinator':'')+(e.saved&&!e.stale?' · Passwort gespeichert':'')+(e.stale?' · Passwort geändert?':'')+(e.conflict?' · CREDENTIAL-EPOCH-KONFLIKT':'')+(e.authMismatch?' · NICHT AUTHENTIFIZIERT':'');return '<option value="'+esc(e.id)+'"'+(e.conflict?' disabled':'')+'>'+esc(label)+'</option>';}).join('');if(selected&&choiceData[selected]&&!choiceData[selected].conflict)choice.value=selected;}
  if(choice){choice.addEventListener('change',function(){var e=choiceData[choice.value];if(!e)return;if(idField)idField.value=e.id;if(nameField)nameField.value=e.name;if(epochField)epochField.value=String(e.epoch||1);if(passwordField){passwordField.value='';passwordField.placeholder=(e.saved&&!e.stale)?'Gespeichertes Passwort wird verwendet':(e.stale?'Passwort erneut eingeben':'Mindestens 8 Zeichen');}if(credentialHint)credentialHint.textContent=e.stale?'Der sichtbare Cluster meldet eine andere Credential-Epoch. Das gespeicherte Passwort wird nicht automatisch verwendet.':((e.saved&&!e.stale)?'Passwort für diesen Cluster ist auf diesem Gerät hardwaregebunden gespeichert. Leeres Feld verwendet es intern.':'Für diesen Cluster ist kein passendes Passwort gespeichert.');dirty();});}
  if(idField)idField.addEventListener('input',function(){if(choice)choice.value='';});if(nameField)nameField.addEventListener('input',function(){if(choice)choice.value='';});
-function render(d){if(!rows||!line)return;renderChoices(d);var pills=[];pills.push('<span class="status-pill '+(d.runtime_active?'ok':'warn')+'">Runtime '+(d.runtime_active?'AKTIV':'AUS')+'</span>');var coord=String(d.coordinator_id||'');pills.push('<span class="status-pill '+(coord?'ok':'warn')+'">Coordinator '+(coord?esc(coord):'keiner')+(d.coordinator_epoch?(' · Epoch '+esc(d.coordinator_epoch)):'')+'</span>');var ct=d.cluster_time||{};pills.push('<span class="status-pill '+(ct.valid?'ok':'warn')+'">Clusterzeit '+(ct.valid?'aktiv':'wartet auf Zeitquelle')+'</span>');if(d.restart_required)pills.push('<span class="status-pill warn">NEUSTART ERFORDERLICH</span>');if(d.error)pills.push('<span class="status-pill danger">'+esc(d.error)+'</span>');line.innerHTML=pills.join(' ');var diag=document.getElementById('clusterAckDiagnostics'),q=d.ack_diagnostics||{};if(diag){diag.textContent='ACK-Diagnose (seit Runtime-Start, lokal): HB gesendet '+(q.hb_sent||0)+' / Sendefehler '+(q.hb_send_failed||0)+' · ACK-Sendeversuche '+(q.ack_send_attempted||0)+' / Sendefehler '+(q.ack_send_failed||0)+' · signierte ACK empfangen '+(q.ack_authenticated||0)+' / akzeptiert '+(q.ack_accepted||0)+' / abgelehnt '+(q.ack_rejected||0)+' · Coordinator-Wechsel '+(q.coordinator_changes||0)+' / Epoch-Wechsel '+(q.coordinator_epoch_changes||0)+' / ACK-Kontext-Resets '+(q.ack_context_resets||0)+' / unvollständige Coordinator-Meldungen '+(q.incomplete_coord_announcements||0)+' · letzter Ablehnungsgrund '+(q.last_reject||'none');}var jd=document.getElementById('clusterJobDiagnostics'),j=d.job_probe_diagnostics||{};if(jd)jd.textContent='Job-Probe (lokal): empfangen '+(j.received||0)+' / ACK gesendet '+(j.ack_sent||0)+' / abgelehnt '+(j.rejected||0)+' ('+(j.last_reject||'none')+') · ACK empfangen '+(j.ack_received||0)+' / abgelehnt '+(j.ack_rejected||0)+' ('+(j.last_ack_reject||'none')+')';var rd=document.getElementById('clusterRestartDiagnostics'),r=d.job_restart_diagnostics||{};if(rd)rd.textContent='Neustart-Diagnose (lokal): Aufträge empfangen '+(r.received||0)+' / geplant und ACK gesendet '+(r.accepted||0)+' / abgelehnt '+(r.rejected||0)+' ('+(r.last_reject||'none')+') · ACK empfangen '+(r.ack_received||0)+' / akzeptiert '+(r.ack_accepted||0)+' / abgelehnt '+(r.ack_rejected||0)+' ('+(r.last_ack_reject||'none')+')';var td=document.getElementById('clusterTimeDiagnostics');if(td){var t=d.cluster_time||{};td.textContent='Clusterzeit: '+(t.valid?'gültig':'noch nicht verfügbar')+' · Quelle '+(t.source||'-')+' · Messungen '+(t.accepted||0)+' / verworfen '+(t.rejected||0)+' · RTT '+(t.last_rtt_us||0)+' µs · Alter '+(t.sample_age_ms||0)+' ms · Abweichung zur Geräteuhr '+(t.local_offset_available?((Number(t.local_offset_us||0)/1000).toFixed(2)+' ms'):'nicht messbar')+' · grobe Unsicherheit ±'+(Number(t.uncertainty_estimate_us||0)/1000).toFixed(2)+' ms (Schätzung, keine Garantie; keine Frame-Synchronität)';}var tr=document.getElementById('clusterElectionTrace');if(tr){var entries=Array.isArray(d.election_trace)?d.election_trace:[];tr.textContent='Letzte Election-Übergänge (RAM):\\n'+(entries.length?entries.join('\\n'):'keine');}var a=orderedNodes(Array.isArray(d.nodes)?d.nodes:[],d);var simple=document.getElementById('clusterSimpleRows');if(simple){simple.innerHTML=a.length?a.map(function(n){return '<tr><td><strong>'+esc(n.hostname||'-')+'</strong>'+(n.local?' <span class="status-pill ok">LOKAL</span>':'')+'</td><td>'+esc(roleText(n.cluster_role))+nodeNavigationLink(n,d)+'</td><td>'+esc(statusText(n))+'</td><td>'+esc(n.ip||'-')+'</td><td>'+esc(age(n.age_ms,n.local))+'</td></tr>';}).join(''):'<tr><td colspan="5" class="muted">Keine Geräte sichtbar.</td></tr>';}if(!a.length){rows.innerHTML='<tr><td colspan="13" class="muted">Keine Geräte sichtbar.</td></tr>';}else{rows.innerHTML=a.map(function(n){return '<tr><td><strong>'+esc(n.hostname||'-')+'</strong>'+(n.local?' <span class="status-pill ok">LOKAL</span>':'')+'</td><td><strong>'+esc(roleText(n.cluster_role))+'</strong></td><td>'+esc(policyText(n.coordinator_policy))+'</td><td class="cluster-id">'+esc(n.integration_id||'-')+'</td><td>'+esc(n.ip||'-')+'</td><td>'+esc(n.mode||'-')+'</td><td>'+esc(statusText(n))+'</td><td>'+esc(n.release||'-')+'</td><td>'+esc(timeText(n))+'</td><td>'+esc(leaseText(n))+'</td><td>'+esc(linkText(n,d))+'</td><td>'+esc(wifiText(n))+'</td><td>'+esc(age(n.age_ms,n.local))+'</td></tr>';}).join('');}
+function render(d){if(!rows||!line)return;renderChoices(d);var pills=[];pills.push('<span class="status-pill '+(d.runtime_active?'ok':'warn')+'">Runtime '+(d.runtime_active?'AKTIV':'AUS')+'</span>');var coord=String(d.coordinator_id||'');pills.push('<span class="status-pill '+(coord?'ok':'warn')+'">Coordinator '+(coord?esc(coord):'keiner')+(d.coordinator_epoch?(' · Epoch '+esc(d.coordinator_epoch)):'')+'</span>');var ct=d.cluster_time||{};pills.push('<span class="status-pill '+(ct.valid?'ok':'warn')+'">Clusterzeit '+(ct.valid?'aktiv':'wartet auf Zeitquelle')+'</span>');if(d.restart_required)pills.push('<span class="status-pill warn">NEUSTART ERFORDERLICH</span>');if(d.error)pills.push('<span class="status-pill danger">'+esc(d.error)+'</span>');line.innerHTML=pills.join(' ');var diag=document.getElementById('clusterAckDiagnostics'),q=d.ack_diagnostics||{};if(diag){diag.textContent='ACK-Diagnose (seit Runtime-Start, lokal): HB gesendet '+(q.hb_sent||0)+' / Sendefehler '+(q.hb_send_failed||0)+' · ACK-Sendeversuche '+(q.ack_send_attempted||0)+' / Sendefehler '+(q.ack_send_failed||0)+' · signierte ACK empfangen '+(q.ack_authenticated||0)+' / akzeptiert '+(q.ack_accepted||0)+' / abgelehnt '+(q.ack_rejected||0)+' · Coordinator-Wechsel '+(q.coordinator_changes||0)+' / Epoch-Wechsel '+(q.coordinator_epoch_changes||0)+' / ACK-Kontext-Resets '+(q.ack_context_resets||0)+' / unvollständige Coordinator-Meldungen '+(q.incomplete_coord_announcements||0)+' · letzter Ablehnungsgrund '+(q.last_reject||'none');}var jd=document.getElementById('clusterJobDiagnostics'),j=d.job_probe_diagnostics||{};if(jd)jd.textContent='Job-Probe (lokal): empfangen '+(j.received||0)+' / ACK gesendet '+(j.ack_sent||0)+' / abgelehnt '+(j.rejected||0)+' ('+(j.last_reject||'none')+') · ACK empfangen '+(j.ack_received||0)+' / abgelehnt '+(j.ack_rejected||0)+' ('+(j.last_ack_reject||'none')+')';var rd=document.getElementById('clusterRestartDiagnostics'),r=d.job_restart_diagnostics||{};if(rd)rd.textContent='Neustart-Diagnose (lokal): Aufträge empfangen '+(r.received||0)+' / geplant und ACK gesendet '+(r.accepted||0)+' / abgelehnt '+(r.rejected||0)+' ('+(r.last_reject||'none')+') · ACK empfangen '+(r.ack_received||0)+' / akzeptiert '+(r.ack_accepted||0)+' / abgelehnt '+(r.ack_rejected||0)+' ('+(r.last_ack_reject||'none')+')';var td=document.getElementById('clusterTimeDiagnostics');if(td){var t=d.cluster_time||{};td.textContent='Clusterzeit: '+(t.valid?'gültig':'noch nicht verfügbar')+' · Quelle '+(t.source||'-')+' · Messungen '+(t.accepted||0)+' / verworfen '+(t.rejected||0)+' · RTT '+(t.last_rtt_us||0)+' µs · Alter '+(t.sample_age_ms||0)+' ms · Abweichung zur Geräteuhr '+(t.local_offset_available?((Number(t.local_offset_us||0)/1000).toFixed(2)+' ms'):'nicht messbar')+' · grobe Unsicherheit ±'+(Number(t.uncertainty_estimate_us||0)/1000).toFixed(2)+' ms (Schätzung, keine Garantie; keine Frame-Synchronität)';}var tr=document.getElementById('clusterElectionTrace');if(tr){var entries=Array.isArray(d.election_trace)?d.election_trace:[];tr.textContent='Letzte Election-Übergänge (RAM):\\n'+(entries.length?entries.join('\\n'):'keine');}var a=orderedNodes(Array.isArray(d.nodes)?d.nodes:[],d);var simple=document.getElementById('clusterSimpleRows');if(simple){simple.innerHTML=a.length?a.map(function(n){return '<tr><td><strong>'+esc(n.hostname||'-')+'</strong>'+(n.local?' <span class="status-pill ok">LOKAL</span>':'')+'</td><td>'+esc(displayRole(n))+nodeNavigationLink(n,d)+'</td><td>'+esc(statusText(n))+'</td><td>'+esc(n.ip||'-')+'</td><td>'+esc(age(n.age_ms,n.local))+'</td></tr>';}).join(''):'<tr><td colspan="5" class="muted">Keine Geräte sichtbar.</td></tr>';}if(!a.length){rows.innerHTML='<tr><td colspan="13" class="muted">Keine Geräte sichtbar.</td></tr>';}else{rows.innerHTML=a.map(function(n){return '<tr><td><strong>'+esc(n.hostname||'-')+'</strong>'+(n.local?' <span class="status-pill ok">LOKAL</span>':'')+'</td><td><strong>'+esc(displayRole(n))+'</strong></td><td>'+esc(policyText(n.coordinator_policy))+'</td><td class="cluster-id">'+esc(n.integration_id||'-')+'</td><td>'+esc(n.ip||'-')+'</td><td>'+esc(n.mode||'-')+'</td><td>'+esc(statusText(n))+'</td><td>'+esc(n.release||'-')+'</td><td>'+esc(timeText(n))+'</td><td>'+esc(leaseText(n))+'</td><td>'+esc(linkText(n,d))+'</td><td>'+esc(wifiText(n))+'</td><td>'+esc(age(n.age_ms,n.local))+'</td></tr>';}).join('');}
 if(resRows){var byId={};a.forEach(function(n){byId[String(n.integration_id||'')]=n.hostname||n.integration_id||'-';});var rr=Array.isArray(d.resources)?d.resources:[];if(!rr.length){resRows.innerHTML='<tr><td colspan="7" class="muted">Noch keine Ressourcen angekündigt.</td></tr>';}else{resRows.innerHTML=rr.map(function(r){var owner=byId[String(r.owner_integration_id||'')]||r.owner_integration_id||'-';return '<tr><td><strong>'+esc(owner)+'</strong><div class="cluster-subtle">'+esc(r.source_ip||'-')+'</div></td><td class="cluster-id">'+esc(r.resource_id||'-')+'</td><td>'+esc(r.type||'-')+'</td><td>'+esc(resourceTime(r.timestamp_us))+'</td><td>'+esc(sizeText(r.size_bytes))+'</td><td>'+esc(duration(r.ttl_remaining_sec,'-'))+'</td><td class="cluster-id">'+esc(r.locator||'-')+'</td></tr>';}).join('');}}}
 function poll(){fetch('/cluster_status?t='+Date.now(),{cache:'no-store',credentials:'same-origin'}).then(function(r){if(!r.ok)throw new Error();return r.json();}).then(render).catch(function(e){console.error('Cluster-Status: Abruf oder Anzeige fehlgeschlagen',e);if(line)line.innerHTML='<span class="status-pill danger">Cluster-Status konnte nicht angezeigt werden</span>';});}poll();setInterval(poll,3000);document.addEventListener('visibilitychange',function(){if(!document.hidden)poll();});
 })();</script>
@@ -412,6 +415,8 @@ window.sfCoordinateStatus=function(force){
 function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 function fmt(n){return (Number(n)/1024).toFixed(1)+' GiB';}
 function up(s){s=Math.max(0,Number(s)||0);return Math.floor(s/86400)+'d '+Math.floor((s%86400)/3600)+'h '+Math.floor((s%3600)/60)+'m';}
+function isStandbyBroadcaster(n){var m=String(n&&n.mode||'');return m==='time_broadcaster'||m==='time_broadcaste';}
+function isActionableNode(n){return !!n&&!n.local&&!isStandbyBroadcaster(n)&&!!n.online;}
 function nodeUrl(n){var ip=String(n.ip||''),p=ip.split('.');if(p.length!==4||!p.every(function(x){return /^\d{1,3}$/.test(x)&&Number(x)<=255;})||ip==='0.0.0.0'||ip==='255.255.255.255')return '';return 'http://'+ip+'/';}
 function latestJob(n,jobs){var id=String(n.integration_id||'');var a=jobs.filter(function(j){return String(j.node)===id&&Number(j.kind)!==4;});if(!a.length)return '–';var j=a[a.length-1], kind=Number(j.kind),state=Number(j.state);var action=kind===1?'Neustart':kind===2?'Shutdown':kind===3?'SD Wipe':kind===6?'Foto':kind===7?'Drone Mode':'Verbindungstest';var stateText={1:'Wartet',2:'Gesendet',3:'ACK bestätigt',5:'Erfolgreich',6:'Abgelehnt',7:'Keine ACK'}[state]||'Status '+state;
 if(kind===7&&state===5)stateText=Number(j.result)===1?'Eingeschaltet':'Ausgeschaltet';
@@ -423,7 +428,7 @@ return action+': '+stateText;}
 function renderHealth(d){var rows=document.getElementById('clusterHealthRows');if(!rows)return;
 var ns=Array.isArray(d.nodes)?d.nodes:[],jobs=Array.isArray(d.job_probes)?d.job_probes:[];ns.sort(function(a,b){return (a.cluster_role==='coordinator'?0:1)-(b.cluster_role==='coordinator'?0:1);});
 rows.innerHTML=ns.map(function(n){var ok=!!n.health_valid,total=Number(n.sd_total_mib||0),used=Number(n.sd_used_mib||0);
-return '<tr><td>'+(n.local?'–':'<input type="checkbox" class="cluster-node-choice" value="'+esc(n.integration_id)+'" '+(window.sfSelectedNodes&&window.sfSelectedNodes.has(String(n.integration_id))?'checked':'')+'>')+'</td><td>'+(nodeUrl(n)?'<a href="'+nodeUrl(n)+'" target="_blank" rel="noopener noreferrer">'+esc(n.hostname||n.integration_id)+'</a>':esc(n.hostname||n.integration_id))+'</td><td>'+esc(n.release||'–')+'</td><td>'+esc(n.cluster_role||'–')+'</td><td>'+esc(latestJob(n,jobs))+'</td><td>'+(ok&&total?fmt(used):'–')+'</td><td>'+(ok&&total?fmt(Math.max(0,total-used)):'–')+'</td><td>'+(ok&&Number(n.cpu_temp_deci_c)>-1000?(Number(n.cpu_temp_deci_c)/10).toFixed(1)+' °C':'–')+'</td><td>'+esc(up(n.uptime_seconds))+'</td><td><code>'+esc(n.boot_id||'–')+'</code></td><td>'+esc(n.recording?'Recording':'Bereit')+'</td></tr>';}).join('');
+return '<tr><td>'+(isActionableNode(n)?'<input type="checkbox" class="cluster-node-choice" value="'+esc(n.integration_id)+'" '+(window.sfSelectedNodes&&window.sfSelectedNodes.has(String(n.integration_id))?'checked':'')+'>':'–')+'</td><td>'+(nodeUrl(n)?'<a href="'+nodeUrl(n)+'" target="_blank" rel="noopener noreferrer">'+esc(n.hostname||n.integration_id)+'</a>':esc(n.hostname||n.integration_id))+'</td><td>'+esc(n.release||'–')+'</td><td>'+esc(isStandbyBroadcaster(n)?'Zeit-Broadcaster (Standby)':(n.cluster_role||'–'))+'</td><td>'+esc(latestJob(n,jobs))+'</td><td>'+(ok&&total?fmt(used):'–')+'</td><td>'+(ok&&total?fmt(Math.max(0,total-used)):'–')+'</td><td>'+(ok&&Number(n.cpu_temp_deci_c)>-1000?(Number(n.cpu_temp_deci_c)/10).toFixed(1)+' °C':'–')+'</td><td>'+esc(up(n.uptime_seconds))+'</td><td><code>'+esc(n.boot_id||'–')+'</code></td><td>'+esc(n.recording?'Recording':'Bereit')+'</td></tr>';}).join('');
 var extra=document.getElementById('clusterHealthExtra');if(extra)extra.textContent=ns.map(function(n){return (n.hostname||n.integration_id)+': freier Heap '+(n.health_valid?Math.round(Number(n.free_heap_bytes||0)/1024)+' KiB':'unbekannt');}).join(' · ');
 sfRenderEspNowDiag(d);
 if(window.sfCaptureReportUpdate)window.sfCaptureReportUpdate(d);
@@ -432,12 +437,13 @@ if(window.sfSelectionUpdate)window.sfSelectionUpdate();
 }
 function pollHealth(){window.sfCoordinateStatus().then(function(d){renderHealth(d);}).catch(function(){});}
 window.sfSelectedNodes=new Set();
+function sfActionableSelectedIds(){var nodes=Array.isArray((sfLatestStatus||{}).nodes)?sfLatestStatus.nodes:[];return nodes.filter(function(n){return isActionableNode(n)&&window.sfSelectedNodes.has(String(n.integration_id||''));}).map(function(n){return String(n.integration_id);});}
 window.sfSelectionUpdate=function(){var els=Array.from(document.querySelectorAll('.cluster-node-choice'));var ids=new Set(els.map(function(x){return x.value;}));Array.from(window.sfSelectedNodes).forEach(function(id){if(!ids.has(id))window.sfSelectedNodes.delete(id);});var label=document.getElementById('clusterSelectionCount');if(label)label.textContent=window.sfSelectedNodes.size+' ausgewählt';sfRenderHwTimeInfo();};
 window.sfHwTimeNodeBoards=window.sfHwTimeNodeBoards||{};
 function sfHwBoardLabel(kind){return kind==='freenove'?'Freenove':'XIAO';}
 function sfHwSourcePin(kind){return kind==='xiao'?'GPIO2 (D1)':(kind==='freenove'?'GPIO48 (RGB-LED, Diagnose-Reserve)':'unbekannt');}
 function sfHwPinText(pin){return Number(pin)>=0?('GPIO'+pin):'NONE';}
-function sfHwSelectedNodes(){var d=sfLatestStatus||{},nodes=Array.isArray(d.nodes)?d.nodes:[];return orderedNodes(nodes,d).filter(function(n){return !n.local&&window.sfSelectedNodes.has(String(n.integration_id||''));});}
+function sfHwSelectedNodes(){var d=sfLatestStatus||{},nodes=Array.isArray(d.nodes)?d.nodes:[];return orderedNodes(nodes,d).filter(function(n){return isActionableNode(n)&&window.sfSelectedNodes.has(String(n.integration_id||''));});}
 function sfRenderHwTimeInfo(){
   var box=document.getElementById('clusterHardwareTimeInfo'),choice=document.getElementById('clusterActionChoice');
   if(!box||!choice)return;
@@ -559,7 +565,7 @@ function sfShowSyncNotice(message,autohide){
  el.textContent=message;el.style.display='block';
  if(autohide)sfSyncNoticeTimer=setTimeout(function(){el.style.display='none';sfSyncNoticeTimer=null;},6500);
 }
-async function runBulk(path,label,danger){if(actionBusy)return;var ids=Array.from(window.sfSelectedNodes);var out=document.getElementById('clusterBulkFeedback');if(!ids.length){out.textContent='Bitte zuerst mindestens einen entfernten Node auswählen.';if(path==='/cluster_node_sync_time')sfShowSyncNotice('Keine Nodes ausgewählt – Zeitsynchronisierung nicht gestartet.',true);if(sfIsPowerAction(path))sfShowPowerNotice('Bitte zuerst mindestens einen Node auswählen.',true);return;}
+async function runBulk(path,label,danger){if(actionBusy)return;var ids=sfActionableSelectedIds();var out=document.getElementById('clusterBulkFeedback');if(!ids.length){out.textContent='Bitte zuerst mindestens einen entfernten Node auswählen.';if(path==='/cluster_node_sync_time')sfShowSyncNotice('Keine Nodes ausgewählt – Zeitsynchronisierung nicht gestartet.',true);if(sfIsPowerAction(path))sfShowPowerNotice('Bitte zuerst mindestens einen Node auswählen.',true);return;}
 var text=label+' für '+ids.length+' ausgewählte Nodes auslösen?';if(danger)text+=' ACHTUNG: Shutdown ohne Wake-Quellen; RESET oder Stromversorgung zum Wiederaufwachen erforderlich.';
 if((path==='/cluster_node_restart'||path==='/cluster_node_shutdown'||path==='/cluster_node_wipe')&&!confirm(path==='/cluster_node_wipe'?'ACHTUNG: Alle SD-Daten der ausgewählten Nodes unwiderruflich löschen? Laufende Aufnahmen werden SOFORT beendet und ebenfalls gelöscht. Konfiguration wird aus internem Backup wiederhergestellt.':text))return;actionBusy=true;window.sfCoordinatorBulkActive=true;var buttons=['clusterBulkProbe','clusterBulkRestart','clusterBulkShutdown','clusterBulkSync','clusterBulkWipe','clusterBulkDroneOn','clusterBulkDroneOff'];buttons.forEach(function(x){document.getElementById(x).disabled=true;});var done=0,errors=0,details=[],actionRows=[];var actionTable=document.getElementById('clusterBulkActionRows'),actionBody=document.getElementById('clusterBulkActionBody');if(actionTable)actionTable.style.display='none';
 if(path==='/cluster_node_sync_time')sfShowSyncNotice('Zeitsynchronisierung: Aufträge an '+ids.length+' Node(s) werden gesendet …',false);
@@ -725,7 +731,7 @@ function sfShowCaptureCountdown(target){
  sfCountdownTick=setInterval(function(){sfSyncPaint(performance.now());},50);
 }
 document.getElementById('clusterBulkCapture').addEventListener('click',async function(){
- var ids=Array.from(window.sfSelectedNodes),out=document.getElementById('clusterCaptureFeedback');
+ var ids=sfActionableSelectedIds(),out=document.getElementById('clusterCaptureFeedback');
  if(!ids.length){out.textContent='Bitte Nodes auswählen.';return;}
  var seconds=Number(document.getElementById('clusterCaptureSeconds').value),minutes=Number(document.getElementById('clusterCaptureMinutes').value),hours=Number(document.getElementById('clusterCaptureHours').value);
  if(['clusterCaptureHours','clusterCaptureMinutes','clusterCaptureSeconds'].some(function(id){return document.getElementById(id).value==='';})){out.textContent='Stunden, Minuten und Sekunden müssen ausgefüllt sein.';return;}
@@ -815,7 +821,7 @@ document.getElementById('clusterBulkShutdown').addEventListener('click',function
 document.getElementById('clusterBulkSync').addEventListener('click',function(){runBulk('/cluster_node_sync_time','Zeitsynchronisation',false);});
 document.getElementById('clusterBulkWipe').addEventListener('click',function(){runBulk('/cluster_node_wipe','SD-Wipe',true);});
 document.getElementById('clusterSdPreflight').addEventListener('click',function(){
- var out=document.getElementById('clusterSdPreflightResult'),ids=Array.from(window.sfSelectedNodes);
+ var out=document.getElementById('clusterSdPreflightResult'),ids=sfActionableSelectedIds();
  if(!ids.length){out.textContent='Bitte mindestens einen entfernten Node auswählen.';return;}
  out.textContent='SD-Status wird geprüft …';
  window.sfCoordinateStatus().then(function(d){
@@ -1064,6 +1070,57 @@ static void handleEspNowBenchmarkStatus(){
     out+="]}";
     server.sendHeader("Cache-Control","no-store");
     server.send(200,"application/json; charset=utf-8",out);
+}
+// Read-only, passive SFDB diagnostic data. Not a clock-source selector.
+static void handleEspNowDiagnosticBeaconCsv(){
+    const auto s=ClusterEspNowRadio::diagnosticBeaconRxStats();
+    server.sendHeader("Cache-Control","no-store");
+    server.sendHeader("Content-Disposition","attachment; filename=espnow_diagnostic_beacon.csv");
+    String csv="received,authenticated,rejected,replay,dropped,last_sequence,last_epoch,last_sender_tag,last_sender_boot,last_rx_callback_us,last_remote_monotonic_us,last_remote_utc_us\n";
+    char line[280];
+    snprintf(line,sizeof(line),"%lu,%lu,%lu,%lu,%lu,%lu,%lu,%llu,%llu,%lld,%lld,%lld\n",
+        (unsigned long)s.received,(unsigned long)s.authenticated,
+        (unsigned long)s.rejected,(unsigned long)s.replay,(unsigned long)s.dropped,
+        (unsigned long)s.lastSequence,(unsigned long)s.lastEpoch,
+        (unsigned long long)s.lastSenderTag,(unsigned long long)s.lastSenderBoot,
+        (long long)s.lastRxCallbackUs,(long long)s.lastRemoteMonotonicUs,
+        (long long)s.lastRemoteUtcUs);
+    csv+=line;
+    server.send(200,"text/csv; charset=utf-8",csv);
+}
+static void handleEspNowDiagnosticBeaconJson(){
+    const auto s=ClusterEspNowRadio::diagnosticBeaconRxStats();
+    char data[460];
+    snprintf(data,sizeof(data),"{\"received\":%lu,\"authenticated\":%lu,\"rejected\":%lu,\"replay\":%lu,\"dropped\":%lu,\"last_sequence\":%lu,\"last_epoch\":%lu,\"last_sender_tag\":\"%llu\",\"last_sender_boot\":\"%llu\",\"last_rx_callback_us\":%lld,\"last_remote_monotonic_us\":%lld,\"last_remote_utc_us\":%lld}",
+        (unsigned long)s.received,(unsigned long)s.authenticated,
+        (unsigned long)s.rejected,(unsigned long)s.replay,(unsigned long)s.dropped,
+        (unsigned long)s.lastSequence,(unsigned long)s.lastEpoch,
+        (unsigned long long)s.lastSenderTag,(unsigned long long)s.lastSenderBoot,
+        (long long)s.lastRxCallbackUs,(long long)s.lastRemoteMonotonicUs,
+        (long long)s.lastRemoteUtcUs);
+    server.sendHeader("Cache-Control","no-store");
+    server.send(200,"application/json; charset=utf-8",data);
+}
+// Passive, bounded event trace. The two CSVs share the same receiving device clock.
+static void handleEspNowDiagnosticBeaconEventsCsv(){
+    server.sendHeader("Cache-Control","no-store");
+    server.sendHeader("Content-Disposition","attachment; filename=espnow_diagnostic_beacon_events.csv");
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200,"text/csv; charset=utf-8","");
+    server.sendContent("sequence,epoch,sender_tag,sender_boot,node_rx_callback_us,remote_monotonic_us,remote_utc_us\n");
+    const size_t count=ClusterEspNowRadio::diagnosticBeaconEventCount();
+    for(size_t i=0;i<count;++i){
+        ClusterEspNowRadio::DiagnosticBeaconEvent e;
+        if(!ClusterEspNowRadio::diagnosticBeaconEventAt(i,e))continue;
+        char line[192];
+        snprintf(line,sizeof(line),"%lu,%lu,%llu,%llu,%lld,%lld,%lld\n",
+            (unsigned long)e.sequence,(unsigned long)e.epoch,
+            (unsigned long long)e.senderTag,(unsigned long long)e.senderBoot,
+            (long long)e.rxCallbackUs,(long long)e.remoteMonotonicUs,
+            (long long)e.remoteUtcUs);
+        server.sendContent(line);
+    }
+    server.sendContent("");
 }
 // Deliberately no UI element; diagnostics use existing authentication gates.
 static void handleEspNowBeaconCsv(){
@@ -1536,6 +1593,9 @@ void webconfigClusterRegisterRoutes(
     serverInstance.on("/cluster_espnow_benchmark_abort", HTTP_POST, handleEspNowBenchmarkAbort);
     serverInstance.on("/cluster_espnow_benchmark_status", HTTP_GET, handleEspNowBenchmarkStatus);
     serverInstance.on("/cluster_espnow_benchmark_csv", HTTP_GET, handleEspNowBenchmarkCsv);
+    serverInstance.on("/cluster_espnow_diagnostic_beacon_csv", HTTP_GET, handleEspNowDiagnosticBeaconCsv);
+    serverInstance.on("/cluster_espnow_diagnostic_beacon_events_csv", HTTP_GET, handleEspNowDiagnosticBeaconEventsCsv);
+    serverInstance.on("/cluster_espnow_diagnostic_beacon_json", HTTP_GET, handleEspNowDiagnosticBeaconJson);
     serverInstance.on("/cluster_espnow_beacons_csv", HTTP_GET, handleEspNowBeaconCsv);
     serverInstance.on("/cluster_espnow_beacon_stats_csv", HTTP_GET, handleEspNowBeaconStatsCsv);
     serverInstance.on("/cluster_espnow_shared_events_csv", HTTP_GET, handleEspNowSharedEventsCsv);

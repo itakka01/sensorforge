@@ -1,3 +1,50 @@
+## v87-beta120 (2026-10-15) — passive SFDB event trace, build not verified
+- A ring of up to 128 HMAC-authenticated diagnostic beacon receptions on the receiver, with local ESP-NOW callback timestamp, sender identity, sequence, epoch, and remote software timestamps.
+- Read-only `/cluster_espnow_diagnostic_beacon_events_csv` streamed CSV, to compare against existing `/cluster_espnow_shared_events_csv` on the SAME receiver.
+- Event ring resets on sender/boot/epoch changes and radio restart; no additional RF traffic, no clock-source changes, no capture-path changes.
+- CSV timestamps are software callback timestamps; do not interpret them as RF arrival, absolute accuracy or camera exposure timing.
+- Firmware sketch not compiled with Arduino ESP32 here; update only the diagnostic receiver after successful compilation.
+
+## v87-beta119 (2026-10-15) — experimental diagnostic broadcaster; BUILD UNVERIFIED
+- Added passive `/cluster_espnow_diagnostic_beacon_json` and `/cluster_espnow_diagnostic_beacon_csv` read-only receiver snapshots to `webconfig_cluster.cpp`. Last callback timestamps are software timestamps, not precise physical arrival timestamps. No effect on clock selection.
+
+
+- Standby `time_broadcaster` sends separately HMAC-authenticated `SFDB` diagnostic frames (80 bytes, 1 Hz) when joined to an active cluster.
+- Dedicated HMAC domain, distinct from ordinary 76-byte time frames. Legacy nodes ignore the unknown wire length. No coordinator handover, clock-source update or capture-clock changes.
+- Separate 80-byte SFDB RX queue added on regular coordinator/nodes; bounded callback copy, HMAC verified in main service, replay counter and last authenticated RX timestamp. No changes to production 76-byte decoder, time estimate or capture path.
+- Read-only diagnostic JSON/CSV receiver snapshots available. Arduino build and on-device receiver checks missing; **not flash-ready**.
+
+## v87-beta118 – 2026-10-15 – Zeit-Broadcaster in Clusterstatus korrekt erkennen
+
+- Ursache: `time_broadcaster` hat 16 Zeichen, aber Heartbeat-Begrenzung und Peer-Puffer erlauben nur 15 Zeichen; empfangen wird `time_broadcaste`.
+- Beide voneinander getrennten Coordinator-JavaScript-Bloecke erkennen nun den exakten Modus sowie die bisherige abgeschnittene Schreibweise.
+- Dadurch ist `devxiao3` als Diagnose-Standby sichtbar und wird in der Browseroberflaeche nicht für normale Node-Sammelaktionen ausgewaehlt.
+- Keine Protokoll-, Funk-, Capture- oder Zeitquellen-Aenderung. Server-seitige Aktionssperre noch offen.
+- JavaScript-Test ausgefuehrt; Arduino-Gesamtbuild nicht geprueft. Nur Coordinator aktualisieren.
+
+## v87-beta117 – 2026-10-15 – Cluster-Dashboard Ladefehler behoben
+
+- Fehler in beta116: `isStandbyBroadcaster` und `isActionableNode` waren nur in einem anderen JavaScript-IIFE definiert. Der Health-/Status-Renderer brach daher ab und zeigte dauerhaft „Lädt …“.
+- Beide Hilfsfunktionen sind nun direkt im Dashboard-JavaScript definiert; Clusterprotokoll, ESP-NOW und Capture-Zeit unverändert.
+- JavaScript-Syntax geprüft; Arduino-Gesamtbuild nicht geprüft. Nur Coordinator aktualisieren.
+
+## v87-beta116 – 2026-10-15 – Coordinator-Anzeige fuer Zeit-Broadcaster
+
+- Coordinator-Weboberflaeche zeigt `time_broadcaster` explizit als „Zeit-Broadcaster (Standby)“.
+- Standby-Broadcaster bleiben in der Geraeteuebersicht sichtbar, sind aber nicht als reguläre Nodes auswaehlbar.
+- Sammelaktionen und Capture-Ausloesung filtern die Auswahl zusaetzlich anhand des aktuellen Cluster-Status.
+- Nur Browser-/UI-Schutz: Die Cluster-HTTP-Endpunkte werden nicht serverseitig um eine Moduspruefung erweitert. Keine Aenderung an ESP-NOW, Capture-Zeitquelle oder Handover.
+- Arduino-Gesamtbuild und Hardwaretest ausstehend; nur Coordinator aktualisieren.
+
+## v87-beta115 – 2026-10-15 – Time-Broadcaster Diagnose-Standby (keine Zeitübernahme)
+
+- Optionaler Betriebsmodus `time_broadcaster` in Konfiguration und Weboberfläche. Dashboard zeigt eine einfache statische Statusseite mit Konfigurationslink.
+- Im Modus werden Kamera-Vorschau, Kamera-Aufnahme und Radarstart ausgelassen; die Hauptschleife verlässt den Aufzeichnungspfad frühzeitig. WLAN, WebConfig und Cluster bleiben nutzbar.
+- Eine Broadcaster-Instanz darf bei der Cluster-Coordinator-Wahl nicht selbst kandidieren.
+- **Kein Zeit-Beacon-Sendebetrieb**: Der Cluster ruft den unveränderten beta114-ESP-NOW-Transport für den Diagnose-Broadcaster nicht auf. Der bereits existierende Coordinator sendet weiter wie bisher; die Capture-Uhr bleibt unverändert.
+- Die unfertigen Handover-/Enrollment-Experimente sind bewusst nicht Teil dieser Version. Automatischer Senderwechsel ist für eine spätere Version reserviert.
+- Verifikation: isolierte Sicherheits-/Versionsprüfungen, keine vollständige Arduino-ESP32-Kompilierung und kein Geräteversuch. Vor dem Flashen vollständigen Build und gezielten Standby-Test durchführen.
+
 ## v87-beta114 — 2026-10-14
 - Optionaler 15-s-Diagnosemodus: Beim bestehenden 100-ms-Beacontest keine neuen individuellen ESP-NOW-Sync-Slot-Leases ausgeben. Aktive Lease wird widerrufen; Nodes laufen nach Lease-Ablauf in Holdover.
 - Checkbox im Coordinator-Testbereich und Statusfeld. Automatisches Ende/Abbruch/Capture-Pause stellen die normale Slotvergabe wieder her.

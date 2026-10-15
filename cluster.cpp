@@ -46,10 +46,6 @@ static const uint16_t CLUSTER_COORDINATOR_PORT = 39428;
 static const uint32_t CLUSTER_HEARTBEAT_MS = 10000UL;
 static const uint32_t CLUSTER_DEFAULT_LEASE_SEC = 60UL;
 static const uint32_t CLUSTER_COORDINATOR_HEARTBEAT_MS = 10000UL;
-// Wait for three authenticated cluster announcement periods before self-election.
-static const uint32_t CLUSTER_SELF_ELECTION_MIN_WAIT_MS = 15000UL;
-static const uint32_t CLUSTER_SELF_ELECTION_CYCLES = 3UL;
-
 static const uint32_t CLUSTER_COORDINATOR_LEASE_SEC = 60UL;
 static const uint32_t CLUSTER_DISCOVERY_SCAN_LEASE_MS = 12000UL;
 static const uint32_t CLUSTER_DISCOVERY_NODE_TTL_MS = 35000UL;
@@ -374,8 +370,6 @@ static const char *diagAckLastReject = "none";
 static int32_t localWifiRemainingSeconds = -1;
 static CoordinatorPolicy runtimeCoordinatorPolicy = COORDINATOR_POLICY_AUTO;
 static bool localIsCoordinator = false;
-// 0 means a remote candidate was seen; otherwise first moment self-election became possible.
-static uint32_t selfElectionCandidateSinceMs = 0;
 static uint32_t localCoordinatorEpoch = 0;
 static char currentCoordinatorId[36] = {};
 static IPAddress currentCoordinatorIp;
@@ -721,6 +715,20 @@ static bool espNowTimeMac(const uint8_t *data, size_t len, uint8_t mac[32])
     if (!runtimeActive || !runtimeHmacKey || !data || !mac ||
         len != EspNowTimePackets::kPayloadSize) return false;
     static const uint8_t context[] = "SensorForge/ESP-NOW/time/HMAC/v1";
+    uint8_t subkey[32] = {};
+    if (!computePacketMac(context, sizeof(context) - 1, subkey)) return false;
+    const bool ok = computePacketMacWithRawKey(subkey, data, len, mac);
+    secureWipe(subkey, sizeof(subkey));
+    return ok;
+}
+
+// Diagnostics-only 80-byte broadcaster frames. A separate derived key and
+// non-production frame size prevent the existing 76-byte clock RX path from
+// accepting these as time authority messages.
+static bool diagnosticBeaconMac(const uint8_t *data, size_t len, uint8_t mac[32])
+{
+    if (!runtimeActive || !runtimeHmacKey || !data || !mac || len != 48) return false;
+    static const uint8_t context[] = "SensorForge/ESP-NOW/diagnostic-beacon/HMAC/v1";
     uint8_t subkey[32] = {};
     if (!computePacketMac(context, sizeof(context) - 1, subkey)) return false;
     const bool ok = computePacketMacWithRawKey(subkey, data, len, mac);
@@ -1201,7 +1209,8 @@ static void recomputeCoordinator(uint32_t now)
     CoordinatorPolicy bestPolicy = COORDINATOR_POLICY_NODE_ONLY;
     ClusterPeer *bestPeer = nullptr;
 
-    if (runtimeCoordinatorPolicy != COORDINATOR_POLICY_NODE_ONLY) {
+    if (cfg_operating_mode != "time_broadcaster" &&
+        runtimeCoordinatorPolicy != COORDINATOR_POLICY_NODE_ONLY) {
         bestId = deviceIntegrationId().c_str();
         bestPolicy = runtimeCoordinatorPolicy;
     }
@@ -1229,27 +1238,6 @@ static void recomputeCoordinator(uint32_t now)
             bestId = peer.integrationId;
             bestPolicy = peer.coordinatorPolicy;
             bestPeer = &peer;
-        }
-    }
-
-    // Suppress transient self-coordinator announcements during discovery and
-    // after a coordinator lease expires. Delay only a NEW local election:
-    // established coordinators and authenticated remote winners are unchanged.
-    const bool selfIsBest = bestId &&
-        strcmp(bestId, deviceIntegrationId().c_str()) == 0;
-    if (!selfIsBest) {
-        selfElectionCandidateSinceMs = 0;
-    } else if (!localIsCoordinator) {
-        if (selfElectionCandidateSinceMs == 0)
-            selfElectionCandidateSinceMs = now ? now : 1U;
-        const uint32_t threeCyclesMs = CLUSTER_HEARTBEAT_MS *
-                                        CLUSTER_SELF_ELECTION_CYCLES;
-        const uint32_t waitMs = threeCyclesMs > CLUSTER_SELF_ELECTION_MIN_WAIT_MS
-                                    ? threeCyclesMs
-                                    : CLUSTER_SELF_ELECTION_MIN_WAIT_MS;
-        if ((uint32_t)(now - selfElectionCandidateSinceMs) < waitMs) {
-            bestId = nullptr;
-            bestPeer = nullptr;
         }
     }
 
@@ -3849,7 +3837,6 @@ void clusterNetworkStart()
     lastAckCoordinatorBoot = 0;
     lastCoordinatorAckSequence = 0;
     localIsCoordinator = false;
-    selfElectionCandidateSinceMs = 0;
     localCoordinatorEpoch = 0;
     currentCoordinatorId[0] = '\0';
     currentCoordinatorIp = IPAddress();
@@ -3926,7 +3913,6 @@ void clusterNetworkStop()
     localWifiRemainingSeconds = -1;
     sequenceNumber = 0;
     localIsCoordinator = false;
-    selfElectionCandidateSinceMs = 0;
     localCoordinatorEpoch = 0;
     currentCoordinatorId[0] = '\0';
     currentCoordinatorIp = IPAddress();
@@ -4043,10 +4029,16 @@ void clusterLoop()
     // Diagnostic ESP-NOW time transport only; never changes cluster clock.
     // Capture deadline takes precedence over any radio work.
     if (!clusterCaptureProtectionActive()) {
-        ClusterEspNowRadio::service(runtimeActive && (localIsCoordinator || droneModeEnabled()),
-                                   localIsCoordinator, currentCoordinatorEpoch,
-                                   localIsCoordinator ? deviceIntegrationId().c_str() : currentCoordinatorId,
-                                   bootNonce);
+        if (cfg_operating_mode == "time_broadcaster") {
+            ClusterEspNowRadio::serviceDiagnosticBroadcaster(runtimeActive && !localIsCoordinator,
+                                                              currentCoordinatorEpoch,
+                                                              deviceIntegrationId().c_str(), bootNonce);
+        } else {
+            ClusterEspNowRadio::service(runtimeActive && (localIsCoordinator || droneModeEnabled()),
+                                       localIsCoordinator, currentCoordinatorEpoch,
+                                       localIsCoordinator ? deviceIntegrationId().c_str() : currentCoordinatorId,
+                                       bootNonce);
+        }
     }
     hwTimeSessionService();
     // Never keep a measurement output scheduled after Drone Mode has ended.
@@ -5393,6 +5385,21 @@ bool clusterCaptureProtectionActive() {
     if (clusterCaptureArmedFlag || pendingCapture.active) return true;
     return localIsCoordinator && coordinatorCaptureGuardUntilMs &&
            static_cast<int32_t>(millis()-coordinatorCaptureGuardUntilMs)<0;
+}
+
+bool clusterEspNowDiagnosticBeaconSign(const uint8_t *data, size_t len, uint8_t mac[32])
+{
+    return diagnosticBeaconMac(data, len, mac);
+}
+
+bool clusterEspNowDiagnosticBeaconVerify(const uint8_t *data, size_t len, const uint8_t mac[32])
+{
+    uint8_t expected[32] = {};
+    if (!mac || !diagnosticBeaconMac(data, len, expected)) return false;
+    uint8_t difference = 0;
+    for (size_t i=0;i<sizeof(expected);++i) difference |= expected[i]^mac[i];
+    secureWipe(expected,sizeof(expected));
+    return difference==0;
 }
 
 // Callbacks for EspNowTimePackets::encode/decode. Never call from the

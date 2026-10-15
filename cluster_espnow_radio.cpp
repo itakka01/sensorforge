@@ -4,6 +4,7 @@
 #include "cluster_espnow_drift.h"
 #include "cluster_espnow_regression.h"
 #include "cluster.h"
+#include "cluster_time_diagnostic_beacon.h"
 #include "board_config.h"
 #include <Arduino.h>
 #include <WiFi.h>
@@ -21,6 +22,9 @@
 #include <sys/time.h>
 
 #if defined(BOARD_HAS_ESP_NOW) && BOARD_HAS_ESP_NOW
+// HMAC is derived in cluster.cpp with a diagnostic-only domain.
+extern bool clusterEspNowDiagnosticBeaconSign(const uint8_t*, size_t, uint8_t[32]);
+extern bool clusterEspNowDiagnosticBeaconVerify(const uint8_t*, size_t, const uint8_t[32]);
 namespace ClusterEspNowRadio {
 namespace {
 constexpr uint32_t kBroadcastEveryMs=10000;
@@ -114,6 +118,24 @@ portMUX_TYPE queueMux=portMUX_INITIALIZER_UNLOCKED;
 volatile uint8_t head=0,tail=0;
 volatile uint32_t drops=0;
 Diagnostics stats;
+// Separate bounded SFDB diagnostic RX path; never enters the production clock queue.
+constexpr uint8_t kDiagnosticQueueSize=4;
+struct DiagnosticQueued {
+    uint8_t bytes[ClusterTimeDiagnosticBeacon::kWireBytes];
+    uint8_t mac[6];
+    int64_t rxUs;
+};
+DiagnosticQueued diagnosticQueue[kDiagnosticQueueSize]={};
+uint8_t diagnosticHead=0,diagnosticTail=0;
+DiagnosticBeaconRxStats diagnosticRx{};
+uint64_t diagnosticLastTag=0,diagnosticLastBoot=0;
+uint32_t diagnosticLastEpoch=0,diagnosticLastSequence=0;
+// Receiver-side ring; written only from serviceDiagnosticReceive(), never from the callback.
+constexpr size_t kDiagnosticEventCapacity=128;
+DiagnosticBeaconEvent diagnosticEvents[kDiagnosticEventCapacity]{};
+size_t diagnosticEventCount=0, diagnosticEventWrite=0;
+
+
 // Callback-safe TX latency sampling. Entries are inserted before esp_now_send().
 // Match by destination MAC and FIFO; no per-packet sequence is supplied to TX callbacks.
 constexpr size_t kTxPendingCapacity=24;
@@ -162,6 +184,8 @@ void onSent(const uint8_t* mac,esp_now_send_status_t status) {
 bool initialized=false, wasCoordinator=false;
 uint8_t boundChannel=0;
 uint32_t nextBroadcastMs=0,nextSeriesMs=0,nextProbeMs=0,txSequence=0,lastEpoch=0;
+uint32_t nextDiagnosticMs=0, diagnosticSequence=0;
+bool diagnosticMode=false;
 // Manual short-rate experiment. No heap and no automatic startup.
 uint32_t beaconExperimentUntilMs=0;
 uint32_t beaconExperimentIntervalMs=0;
@@ -510,7 +534,22 @@ uint64_t idTag(const char* id) {
     return x ? x : 1;
 }
 void onReceive(const esp_now_recv_info_t* info,const uint8_t* data,int length) {
-    if(!info||!info->src_addr||!data||length!=static_cast<int>(EspNowTimePackets::kPacketSize))return;
+    if(!info||!info->src_addr||!data)return;
+    if(length==static_cast<int>(ClusterTimeDiagnosticBeacon::kWireBytes)) {
+        const int64_t rx=esp_timer_get_time();
+        portENTER_CRITICAL(&queueMux);
+        const uint8_t next=static_cast<uint8_t>((diagnosticHead+1)%kDiagnosticQueueSize);
+        if(next==diagnosticTail) ++diagnosticRx.dropped;
+        else {
+            memcpy(diagnosticQueue[diagnosticHead].bytes,data,ClusterTimeDiagnosticBeacon::kWireBytes);
+            memcpy(diagnosticQueue[diagnosticHead].mac,info->src_addr,6);
+            diagnosticQueue[diagnosticHead].rxUs=rx;
+            diagnosticHead=next;
+        }
+        portEXIT_CRITICAL(&queueMux);
+        return;
+    }
+    if(length!=static_cast<int>(EspNowTimePackets::kPacketSize))return;
     const int64_t rx=esp_timer_get_time();
     portENTER_CRITICAL(&queueMux);
     uint8_t next=static_cast<uint8_t>((head+1)%kQueueSize);
@@ -522,6 +561,17 @@ void onReceive(const esp_now_recv_info_t* info,const uint8_t* data,int length) {
     }
     portEXIT_CRITICAL(&queueMux);
 }
+bool popDiagnostic(DiagnosticQueued &v) {
+    bool ok=false;
+    portENTER_CRITICAL(&queueMux);
+    if(diagnosticTail!=diagnosticHead){
+        v=diagnosticQueue[diagnosticTail];
+        diagnosticTail=static_cast<uint8_t>((diagnosticTail+1)%kDiagnosticQueueSize);
+        ok=true;
+    }
+    portEXIT_CRITICAL(&queueMux);
+    return ok;
+}
 bool pop(Queued &v) {
     bool ok=false;
     portENTER_CRITICAL(&queueMux);
@@ -529,7 +579,7 @@ bool pop(Queued &v) {
     portEXIT_CRITICAL(&queueMux);
     return ok;
 }
-void clearQueue(){portENTER_CRITICAL(&queueMux);head=tail=0;drops=0;portEXIT_CRITICAL(&queueMux);}
+void clearQueue(){portENTER_CRITICAL(&queueMux);head=tail=0;diagnosticHead=diagnosticTail=0;drops=0;portEXIT_CRITICAL(&queueMux);}
 bool start(uint8_t channel) {
     if(esp_now_init()!=ESP_OK)return false;
     if(esp_now_register_recv_cb(onReceive)!=ESP_OK){esp_now_deinit();return false;}
@@ -871,13 +921,14 @@ void stop() {
     permissionUntilMs=0;coordinatorPermissionIssued=false;localBootNonceForControl=0;
     if(initialized){esp_now_deinit();initialized=false;}
     txTimingReset();
-    boundChannel=0;lastEpoch=0;lastTag=0;stats.active=false;
+    boundChannel=0;lastEpoch=0;lastTag=0;diagnosticMode=false;nextDiagnosticMs=0;stats.active=false;
     stats.lastExchangeValid=false;stats.lastOffsetUs=0;stats.lastRttUs=0;
     stats.lastSeriesEstimateAvailable=false;stats.lastSeriesEstimateAgeMs=0;
     stats.lastSeriesSelected=0;stats.lastSeriesSpreadUs=0;
     stats.lastSeriesRttMinUs=stats.lastSeriesRttMaxUs=0;
     stats.lastSeriesOffsetP10Us=stats.lastSeriesOffsetP90Us=0;
-    resetTiming();clearQueue();
+    resetTiming();clearQueue();diagnosticRx={};
+    diagnosticLastTag=diagnosticLastBoot=0;diagnosticLastEpoch=diagnosticLastSequence=0;diagnosticEventCount=diagnosticEventWrite=0;
     for(auto &p:slotPeers)p={};slotNextIndex=0;slotOwner=-1;
     slotStartedMs=slotGuardUntilMs=0;slotGrantsSent=slotRotations=0;
     previousEstimate={};latestQualityEstimate={};lastPrecisionMs=0;failedSeries=0;lastSeriesFailure=0;lastRejectedReason=0;lastRejectedSeriesMs=0;lastRejectedHasMetrics=false;lastRejectedEstimate={};consecutiveFailures=0;
@@ -980,6 +1031,54 @@ size_t nodeSyncReports(NodeSyncReport* out,size_t capacity){
     }
     return count;
 }
+size_t diagnosticBeaconEventCount(){return diagnosticEventCount;}
+bool diagnosticBeaconEventAt(size_t index, DiagnosticBeaconEvent &out){
+    if(index>=diagnosticEventCount)return false;
+    const size_t first=(diagnosticEventWrite+kDiagnosticEventCapacity-diagnosticEventCount)%kDiagnosticEventCapacity;
+    out=diagnosticEvents[(first+index)%kDiagnosticEventCapacity];
+    return true;
+}
+DiagnosticBeaconRxStats diagnosticBeaconRxStats(){return diagnosticRx;}
+void serviceDiagnosticReceive() {
+    if(!initialized || diagnosticMode || capturePaused())return;
+    DiagnosticQueued item{};
+    unsigned budget=0;
+    while(budget++<3 && popDiagnostic(item)) {
+        ++diagnosticRx.received;
+        ClusterTimeDiagnosticBeacon::Message msg{};
+        if(!ClusterTimeDiagnosticBeacon::decode(item.bytes,sizeof(item.bytes),msg,
+                                                clusterEspNowDiagnosticBeaconVerify)) {
+            ++diagnosticRx.rejected;
+            continue;
+        }
+        if(msg.senderTag==lastTag || msg.epoch!=lastEpoch) {
+            ++diagnosticRx.rejected;continue;
+        }
+        if(msg.senderTag==diagnosticLastTag && msg.senderBoot==diagnosticLastBoot &&
+           msg.epoch==diagnosticLastEpoch && msg.sequence<=diagnosticLastSequence) {
+            ++diagnosticRx.replay;continue;
+        }
+        diagnosticLastTag=msg.senderTag;diagnosticLastBoot=msg.senderBoot;
+        diagnosticLastEpoch=msg.epoch;diagnosticLastSequence=msg.sequence;
+        if (diagnosticEventCount &&
+            (diagnosticEvents[(diagnosticEventWrite+kDiagnosticEventCapacity-1)%kDiagnosticEventCapacity].senderTag!=msg.senderTag ||
+             diagnosticEvents[(diagnosticEventWrite+kDiagnosticEventCapacity-1)%kDiagnosticEventCapacity].senderBoot!=msg.senderBoot ||
+             diagnosticEvents[(diagnosticEventWrite+kDiagnosticEventCapacity-1)%kDiagnosticEventCapacity].epoch!=msg.epoch))
+            diagnosticEventCount=diagnosticEventWrite=0;
+        DiagnosticBeaconEvent &event=diagnosticEvents[diagnosticEventWrite];
+        event={msg.sequence,msg.epoch,msg.senderTag,msg.senderBoot,item.rxUs,msg.monotonicUs,msg.utcUs};
+        diagnosticEventWrite=(diagnosticEventWrite+1)%kDiagnosticEventCapacity;
+        if(diagnosticEventCount<kDiagnosticEventCapacity)++diagnosticEventCount;
+        ++diagnosticRx.authenticated;
+        diagnosticRx.lastSequence=msg.sequence;
+        diagnosticRx.lastEpoch=msg.epoch;
+        diagnosticRx.lastSenderTag=msg.senderTag;
+        diagnosticRx.lastSenderBoot=msg.senderBoot;
+        diagnosticRx.lastRxCallbackUs=item.rxUs;
+        diagnosticRx.lastRemoteMonotonicUs=msg.monotonicUs;
+        diagnosticRx.lastRemoteUtcUs=msg.utcUs;
+    }
+}
 Diagnostics diagnostics(){Diagnostics out=stats;
     portENTER_CRITICAL(&txMux);
     out.txCallbackLatencyLastUs=txLatencyLastUs;
@@ -1059,13 +1158,53 @@ bool benchmarkLocalPacket(size_t seq,bool &downReceived,bool &upAcked,uint32_t &
 }
 
 
+void serviceDiagnosticBroadcaster(bool allowed, uint32_t epoch,
+                                  const char *deviceId, uint32_t localBootNonce) {
+    if (!allowed || !epoch || !localBootNonce || !deviceId || !*deviceId ||
+        WiFi.status()!=WL_CONNECTED || WiFi.getMode()!=WIFI_MODE_STA) {
+        if (initialized) stop();
+        return;
+    }
+    uint8_t channel=0; wifi_second_chan_t secondary=WIFI_SECOND_CHAN_NONE;
+    if (esp_wifi_get_channel(&channel,&secondary)!=ESP_OK || !channel) {
+        if (initialized) stop();
+        return;
+    }
+    const uint64_t tag=idTag(deviceId);
+    if (initialized && (!diagnosticMode || boundChannel!=channel ||
+                        lastEpoch!=epoch || lastTag!=tag)) stop();
+    if (!initialized && !start(channel)) return;
+    diagnosticMode=true;
+    wasCoordinator=false;lastEpoch=epoch;lastTag=tag;
+    if (capturePaused()) return;
+    const uint32_t now=millis();
+    if (!nextDiagnosticMs) nextDiagnosticMs=now+1000;
+    if (static_cast<int32_t>(now-nextDiagnosticMs)<0) return;
+    nextDiagnosticMs=now+1000;
+    ClusterTimeDiagnosticBeacon::Message beacon{};
+    beacon.epoch=epoch;
+    beacon.sequence=++diagnosticSequence;
+    if (!beacon.sequence) beacon.sequence=++diagnosticSequence;
+    beacon.senderTag=tag;
+    beacon.senderBoot=localBootNonce;
+    beacon.monotonicUs=esp_timer_get_time();
+    struct timeval tv={};
+    if (gettimeofday(&tv,nullptr)==0 && tv.tv_sec>=1577836800LL)
+        beacon.utcUs=static_cast<int64_t>(tv.tv_sec)*1000000LL+tv.tv_usec;
+    uint8_t packet[ClusterTimeDiagnosticBeacon::kWireBytes]={};
+    if (!ClusterTimeDiagnosticBeacon::encode(beacon,packet,
+            clusterEspNowDiagnosticBeaconSign)) return;
+    // Existing production receivers discard length 80 before packet decoding.
+    if (esp_now_send(kBroadcastMac,packet,sizeof(packet))==ESP_OK) ++stats.sent;
+}
+
 void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_t localBootNonce) {
     if(!allowed||!epoch||!localBootNonce||!id||!*id||WiFi.status()!=WL_CONNECTED||
        WiFi.getMode()!=WIFI_MODE_STA){if(initialized)stop();return;}
     uint8_t channel=0;wifi_second_chan_t secondary=WIFI_SECOND_CHAN_NONE;
     if(esp_wifi_get_channel(&channel,&secondary)!=ESP_OK||!channel){if(initialized)stop();return;}
     uint64_t tag=idTag(id);
-    if(initialized&&(boundChannel!=channel||lastEpoch!=epoch||lastTag!=tag||wasCoordinator!=coordinator))stop();
+    if(initialized&&(diagnosticMode||boundChannel!=channel||lastEpoch!=epoch||lastTag!=tag||wasCoordinator!=coordinator))stop();
     if(!initialized){
         if(!start(channel))return;
         if(!coordinator)loadDriftPrior(id);
@@ -1081,6 +1220,7 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
         nextBroadcastMs = millis() + kBroadcastEveryMs;
         nextSeriesMs = millis() + 1000UL;
     }
+    serviceDiagnosticReceive();
     Queued item;unsigned budget=0;
     while(budget++<5&&pop(item)) {
         // RX was timestamped at callback entry. Record service/queue latency.
@@ -1338,6 +1478,7 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
 #else
 namespace ClusterEspNowRadio {
 void service(bool,bool,uint32_t,const char*,uint32_t){}
+void serviceDiagnosticBroadcaster(bool,uint32_t,const char*,uint32_t){}
 void stop(){}
 void pauseForCapture(uint32_t){}
 bool capturePaused(){return false;}
@@ -1350,6 +1491,9 @@ BeaconPredictionStats beaconPredictionStats(){return {};}
 size_t beaconObservationCount(){return 0;}
 bool beaconObservationAt(size_t,BeaconObservation&){return false;}
 Diagnostics diagnostics(){return {};}
+size_t diagnosticBeaconEventCount(){return 0;}
+bool diagnosticBeaconEventAt(size_t,DiagnosticBeaconEvent&){return false;}
+DiagnosticBeaconRxStats diagnosticBeaconRxStats(){return {};}
 bool beaconExperimentStart(uint32_t,bool){return false;}
 void beaconExperimentAbort(){}
 BeaconExperimentState beaconExperimentSnapshot(){return {};}
