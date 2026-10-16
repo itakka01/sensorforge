@@ -75,6 +75,14 @@ uint16_t clusterCapturePhoto(uint64_t jobId,int64_t targetUtcUs,int64_t &dispatc
     memcpy(copy,fb->buf,fb->len);
     size_t size=fb->len;
     esp_camera_fb_return(fb);
+
+    // SAFETY: Double-check array bounds before access (defense-in-depth).
+    // Should be prevented by check at line 50, but adding sanity check here.
+    if(count >= kMaxFrames) {
+        heap_caps_free(copy);
+        return 6;  // Should never happen, but fail-safe
+    }
+
     Frame &f=slots[count++];
     f.bytes=(uint8_t*)copy;f.length=size;f.job=jobId;
     f.target=targetUtcUs;f.dispatch=dispatchUtcUs;

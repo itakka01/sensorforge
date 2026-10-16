@@ -24,8 +24,8 @@ static constexpr int16_t SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10 = 85;
 // BOARD AUSWÄHLEN
 // =============================================================
 
-//#define BOARD_FREENOVE
-#define BOARD_XIAO
+#define BOARD_FREENOVE
+//#define BOARD_XIAO
 
 
 #if defined(BOARD_FREENOVE) && defined(BOARD_XIAO)

@@ -1905,7 +1905,17 @@ static void finishStreamerStress(const char *reason)
         return;
 
     const uint32_t now = millis();
-    const uint32_t elapsedMs = std::max<uint32_t>(1U, now - stressState.startedMs);
+
+    // SAFETY: Protect against millis() rollover (happens after ~49 days).
+    // If now < startedMs, the subtraction wraps to a huge value. Detect and clamp.
+    uint32_t elapsedMs;
+    if (now >= stressState.startedMs) {
+        elapsedMs = now - stressState.startedMs;
+    } else {
+        // Timer rolled over - clamp to reasonable maximum (e.g., 7 days)
+        elapsedMs = 7U * 24U * 60U * 60U * 1000U;
+    }
+    elapsedMs = std::max<uint32_t>(1U, elapsedMs);  // Ensure never 0
     const uint32_t frameDelta = framesCaptured - stressState.framesStart;
     const uint64_t jpegDelta = jpegBytesCaptured - stressState.jpegBytesStart;
     const uint64_t rtspPacketsDelta = rtspVideoPackets - stressState.rtspPacketsStart;

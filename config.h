@@ -232,6 +232,13 @@ bool configInternalValid();
 const char *configInternalStatusName();
 String configInternalStatusDetail();
 
+// Ensure internal configuration storage (LittleFS) is available.
+// If not mounted, attempts to initialize/mount it.
+// Returns true if LittleFS is available after the call, false otherwise.
+// Note: This will NOT format corrupt partitions (preserves data). Only blank
+// partitions (fresh factory flash) are auto-formatted.
+bool configEnsureInternalAvailable();
+
 
 // Re-check the current SD /config.txt without changing the
 // active runtime configuration. Useful after SD wipe/card change.
@@ -335,7 +342,8 @@ enum ConfigSaveResult {
 ConfigSaveResult configSaveText(
     const String &text,
     bool writeToSd,
-    String &error
+    String &error,
+    bool allowFormatOnFirstRun = false
 );
 
 // Replace every known config value with the current firmware defaults. Internal

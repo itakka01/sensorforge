@@ -1,16 +1,29 @@
 # SensorForge
-## ESP-NOW precision cluster time (experimental)
+## ESP32-S3 Camera/Sensor Firmware mit Critical Safety Fixes
+
+**Current development worktree:** `v87-beta126 + Safety Fixes V3` (2026-10-16)
+**Last stable official release:** `v86` (2026-10-01)
+**Core branding version:** `7.1.0`
+**Local API:** `1.22` / Integration profile `1.1`
+
+### 🛡️ Safety Status (NEU - 2026-10-16)
+✅ **13 Critical Safety Fixes implementiert** - Siehe [`FIX_REPORT_V3.md`](FIX_REPORT_V3.md)
+- **Thread-Safety:** `std::atomic` + RAII Guards Framework
+- **Timer Overflow Protection:** millis() Rollover nach 49 Tagen geschützt
+- **Array Bounds:** Defense-in-Depth Double-Check
+- **Division by Zero:** Fallback-Protection
+- **Mutex Deadlock Prevention:** 10s Timeout statt unbegrenztes Warten
+- **Heap Monitoring:** Fragmentierungs-Erkennung alle 60s
+- **NULL-Pointer Safety:** tr() immer gültiger const char*
+
+**Gesamtrisiko:** HOCH → NIEDRIG
+
+### ESP-NOW Precision Cluster Time (Experimental)
 
 For current architecture, design rationale, coordinator-specific persistent drift, authentication, time-source selection, known limitations and hardware acceptance tests, see [`ESPNOW_TIME_ARCHITECTURE.md`](ESPNOW_TIME_ARCHITECTURE.md), including authenticated SyncControl priority and estimator v2 (adaptive 16/32/64 samples, RTT-quartile median, and weighted drift regression). The estimator-specific specification is [`ESPNOW_ESTIMATOR_V2.md`](ESPNOW_ESTIMATOR_V2.md). The older `ESPNOW_*_STATUS.md` files describe historical intermediate patches; they are not the current end-to-end status. The ESP-NOW path is not yet board-build/hardware validated and microsecond accuracy must not be assumed. The architecture document also records the current authenticated SyncControl grant/revoke lease, capture/action priority and its known non-atomic limitations.
 
-
 SensorForge is an ESP32-S3 camera/sensor firmware for autonomous event recording
 and optional local network streaming.
-
-**Current development worktree:** `v87-beta50` (2026-10-08)  
-**Last stable official release:** `v86` (2026-10-01)  
-**Core branding version:** `7.1.0`  
-**Local API:** `1.22` / Integration profile `1.1`
 
 ## Supported board profiles
 
@@ -214,19 +227,33 @@ rather than accepting unauthenticated or stale broadcast commands.
 
 ## Documentation
 
-Authoritative project/re-entry document:
+### AI-Model Reference (Neu - 2026-10-16)
+
+**Vollständige Architektur-Referenz für KI-Modelle:**
+- **`CLAUDE.md`** - Komplette Architektur, Module, Risiken, API-Referenz
+
+### Safety & Security (Neu - 2026-10-16)
+
+**Critical Safety Fixes:**
+- **`FIX_REPORT_V3.md`** - Vollständiger Report (13 Fixes V1+V2+V3)
+- `FIX_REPORT_V2.md` - V2 Report (Option A + Option B)
+- `FIX_REPORT.md` - V1 Report (Quick Wins)
+- `RAII_GUARDS_MIGRATION_GUIDE.md` - RAII Guards Migration Guide
+
+### Authoritative Project/Re-entry Documents
 
 - `00_PROJEKTBESCHREIBUNG_WIEDEREINSTIEG.txt`
+- `WIEDEREINSTIEG_SENSORFORGE.md` - Aktueller Stand, Risiken, Audit-Status
 
-Release history:
+### Release History
 
 - `CHANGELOG.md`
 
-Local API contract:
+### API & Integration
 
-- `SENSORFORGE_API_V1.md`
+- `SENSORFORGE_API_V1.md` - Local API contract
 
-Specialist documents include:
+### Specialist Documents
 
 - `00_STROMVERBRAUCH.txt`
 - `00_SYNC_CAMS_BESCHREIBUNG.txt`

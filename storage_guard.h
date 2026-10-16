@@ -1,13 +1,56 @@
 #pragma once
 
 #include <Arduino.h>
+#include <atomic>
+
+// =============================================================
+// REFERENCE-COUNTED STORAGE LOCK (Thread-Safe)
+// =============================================================
+
+// Internal reference counter for storage lock depth.
+// Do NOT access directly - use StorageLockGuard instead.
+extern std::atomic<int> g_storageLockDepth;
 
 // Cooperative system-wide SD/storage gate.
-// Set to true before operations that temporarily make the filesystem unsafe
-// for normal users (format, remount, wipe, future maintenance operations).
-// Modules should refuse NEW storage work while this flag is set.
-// This is a state gate, not a mutex, and does not forcibly close open handles.
-extern volatile bool g_storageLocked;
+// This is now managed by the reference counter and should be read-only
+// for most code. Use StorageLockGuard for thread-safe lock/unlock.
+//
+// SAFETY: Changed from volatile bool to std::atomic<bool>. The lock state
+// is now automatically managed by g_storageLockDepth reference counter.
+extern std::atomic<bool> g_storageLocked;
+
+// =============================================================
+// RAII STORAGE LOCK GUARD (Preferred API)
+// =============================================================
+
+// Thread-safe RAII guard for storage locking.
+// Automatically increments reference counter on construction,
+// decrements on destruction. Storage is unlocked only when
+// depth reaches zero (all guards released).
+//
+// Usage:
+//   {
+//       StorageLockGuard lock;
+//       // ... storage is locked here ...
+//   }  // automatic unlock
+//
+class StorageLockGuard {
+public:
+    StorageLockGuard();
+    ~StorageLockGuard();
+
+    // Non-copyable, non-movable (RAII pattern)
+    StorageLockGuard(const StorageLockGuard&) = delete;
+    StorageLockGuard& operator=(const StorageLockGuard&) = delete;
+    StorageLockGuard(StorageLockGuard&&) = delete;
+    StorageLockGuard& operator=(StorageLockGuard&&) = delete;
+};
+
+// Initialize RAII guard mutex - call from setup() before any Guard usage
+void initStorageLockGuard();
+
+// Legacy direct access (deprecated - use StorageLockGuard instead)
+// Only kept for gradual migration. Will be removed in future version.
 
 // Latched when the filesystem/VFS reports a hard physical I/O fault (EIO).
 // This is deliberately separate from g_storageLocked: the current recorder is

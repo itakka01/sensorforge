@@ -16922,7 +16922,8 @@ static void handleAudioTestRecord()
     // audioMicTestService() yielded to other firmware services.
     // The initial lock was false (checked above). Keep it asserted if a
     // concurrent cluster wipe has since blocked new recording starts.
-    g_storageLocked = g_recordingStartBlocked;
+    // SAFETY: Atomic load/store instead of direct assignment (not copyable).
+    g_storageLocked.store(g_recordingStartBlocked.load());
 
     if (!ok) {
         server.send(500, "text/plain; charset=utf-8", error.length() ? error : "Mikrofontest fehlgeschlagen.");

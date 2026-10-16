@@ -2430,14 +2430,14 @@ bool mkvEnd()
 
     // Compute the video duration before stopping audio so final buffered PCM
     // can be drained to the same timeline endpoint.
+    // SAFETY: Protect against division by zero if mkvFps is 0.
     double videoDurationMs =
         mkvSparseMode
         ? (double)(mkvLastFrameTimeMs + (uint64_t)mkvSparseTailMs)
-        : (
-            (double)frameCount *
-            1000.0
-          ) /
-          (double)mkvFps;
+        : (mkvFps > 0
+            ? ((double)frameCount * 1000.0) / (double)mkvFps
+            : 0.0  // Fallback if FPS is 0
+          );
 
 
     if (

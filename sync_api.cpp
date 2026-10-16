@@ -230,6 +230,12 @@ static SpiClockSwitchResult switchSpiStorageClock(
     if (!admission) return result; // Concurrent SD maintenance owns the card.
 
 
+    // SAFETY WARNING: Save/restore pattern for g_storageLocked has a theoretical
+    // race condition if another task modifies g_storageLocked between save and
+    // restore. The ScopedSyncSdRemount admission guard above prevents concurrent
+    // remounts, but g_storageLocked is also modified by web_sd_maintenance.cpp,
+    // webconfig.cpp, and sensorforge.ino. A reference-counted lock solution
+    // should be implemented to fully eliminate this risk.
     bool previousStorageLock = g_storageLocked;
     bool previousRecordingBlock = g_recordingStartBlocked;
 
@@ -1807,14 +1813,23 @@ static void handleFile()
     if (pipelineBufferB)
         free(pipelineBufferB);
 
-    uint32_t elapsedMs = millis() - startedMs;
+    // SAFETY: Protect against millis() rollover (happens after ~49 days).
+    uint32_t now = millis();
+    uint32_t elapsedMs;
+    if (now >= startedMs) {
+        elapsedMs = now - startedMs;
+    } else {
+        // Timer rolled over - clamp to reasonable maximum
+        elapsedMs = 24U * 60U * 60U * 1000U;  // 24 hours max
+    }
 
     if (ok && remaining == 0) {
         float mbPerSecond = 0.0f;
         if (elapsedMs > 0) {
+            // Cast to double first for better precision with large values
             mbPerSecond =
-                ((float)sentBytes / (1024.0f * 1024.0f)) /
-                ((float)elapsedMs / 1000.0f);
+                ((double)sentBytes / (1024.0 * 1024.0)) /
+                ((double)elapsedMs / 1000.0);
         }
 
         Serial.printf(
@@ -2136,6 +2151,8 @@ static void handleTestSdSpi()
     const uint32_t restoreHz = SD_SPI_MAX_FREQUENCY_HZ;
     const uint32_t restoreMhz = restoreHz / 1000000UL;
 
+    // SAFETY WARNING: Save/restore pattern for g_storageLocked - same race
+    // condition risk as switchSpiStorageClock() above. See comment there.
     bool previousStorageLock = g_storageLocked;
     bool previousRecordingBlock = g_recordingStartBlocked;
 

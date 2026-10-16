@@ -1,6 +1,7 @@
 #include "license.h"
 #include "license_public_key.h"
 #include "license_keyring.h"
+#include "config.h"
 
 #include <FS.h>
 #include <LittleFS.h>
@@ -881,6 +882,18 @@ static bool writeInstalledLicenseAtomic(
 {
     error = "";
 
+    // Ensure LittleFS is available before attempting to write.
+    // This handles the case where the board was freshly flashed with a corrupt
+    // but non-blank LittleFS partition. If the partition is completely blank,
+    // it will be auto-formatted. If corrupt but not blank, we preserve the data
+    // and fail gracefully (user should configure WiFi first, which will format
+    // the LittleFS as part of the Beta 40/43 first-run policy).
+    if (!configEnsureInternalAvailable()) {
+        error =
+            "internal storage (LittleFS) unavailable - please configure WiFi settings first";
+        return false;
+    }
+
     LittleFS.remove(
         LICENSE_TMP_PATH
     );
@@ -1055,6 +1068,15 @@ void licenseBegin()
 
 bool licenseReload()
 {
+    // If LittleFS is not available, treat license as missing.
+    // This handles freshly flashed boards with corrupt LittleFS gracefully.
+    if (!configInternalAvailable()) {
+        clearLicenseData();
+        currentStatus =
+            LICENSE_STATUS_MISSING;
+        return true;
+    }
+
     recoverLicenseFiles();
 
     if (!LittleFS.exists(LICENSE_PATH)) {
@@ -1305,6 +1327,16 @@ bool licenseInstallCode(
 bool licenseRemove(String &error)
 {
     error = "";
+
+    // Ensure LittleFS is available before attempting to remove files.
+    // If LittleFS is not available, there are no license files to remove anyway,
+    // so we can safely clear the in-memory state and return success.
+    if (!configEnsureInternalAvailable()) {
+        clearLicenseData();
+        currentStatus =
+            LICENSE_STATUS_MISSING;
+        return true;
+    }
 
     const char *paths[] = {
         LICENSE_PATH,

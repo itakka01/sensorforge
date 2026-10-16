@@ -6,10 +6,102 @@
 
 #include <FS.h>
 #include <esp_task_wdt.h>
+#include <atomic>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
+
+// =============================================================
+// REFERENCE-COUNTED STORAGE LOCK
+// =============================================================
+
+// Reference counter for storage lock depth (thread-safe).
+std::atomic<int> g_storageLockDepth(0);
 
 // Cooperative global storage gate declared in storage_guard.h.
-volatile bool g_storageLocked = false;
+// Now managed by reference counter - DO NOT modify directly!
+// Use StorageLockGuard instead.
+std::atomic<bool> g_storageLocked(false);
+
+
+// =============================================================
+// RAII STORAGE LOCK GUARD IMPLEMENTATION
+// =============================================================
+
+// THREAD SAFETY: Mutex protects the critical section between fetch_sub and
+// store(false) to prevent race conditions where a destructor and constructor
+// could interleave and corrupt the lock state. See LOCK_SEMANTICS_ANALYSIS.md
+// Problem 1 for detailed proof-of-concept.
+//
+// IMPORTANT: Mutex is initialized explicitly in sensorforge.ino setup() to
+// avoid lazy-init race condition (two threads could create two mutexes).
+static SemaphoreHandle_t g_storageLockMutex = nullptr;
+
+void initStorageLockGuard() {
+    if (g_storageLockMutex == nullptr) {
+        g_storageLockMutex = xSemaphoreCreateMutex();
+    }
+}
+
+StorageLockGuard::StorageLockGuard()
+{
+    // Mutex must be initialized by sensorforge.ino setup()
+    if (g_storageLockMutex == nullptr) {
+        Serial.println("[STORAGE LOCK] FATAL: Mutex not initialized! Call initStorageLockGuard() in setup()");
+        // Create it anyway as emergency fallback (better than crash)
+        g_storageLockMutex = xSemaphoreCreateMutex();
+    }
+
+    // THREAD SAFETY: Mutex protects counter + flag updates atomically
+    xSemaphoreTake(g_storageLockMutex, portMAX_DELAY);
+
+    int depth = g_storageLockDepth.fetch_add(1, std::memory_order_relaxed);
+    g_storageLocked.store(true, std::memory_order_relaxed);
+
+    // Debug: Log deep nesting (potential logic error)
+    if (depth > 5) {
+        Serial.printf(
+            "[STORAGE LOCK] WARNING: Deep lock nesting depth=%d\n",
+            depth + 1
+        );
+    }
+
+    xSemaphoreGive(g_storageLockMutex);
+}
+
+StorageLockGuard::~StorageLockGuard()
+{
+    if (g_storageLockMutex == nullptr) {
+        // Should never happen, but fail-safe
+        Serial.println("[STORAGE LOCK] FATAL: Mutex not initialized!");
+        return;
+    }
+
+    // THREAD SAFETY: Mutex protects counter + flag updates atomically
+    xSemaphoreTake(g_storageLockMutex, portMAX_DELAY);
+
+    int depth = g_storageLockDepth.fetch_sub(1, std::memory_order_relaxed);
+
+    // Sanity check: depth should never go negative
+    if (depth <= 0) {
+        Serial.println(
+            "[STORAGE LOCK] ERROR: Lock depth underflow! "
+            "Mismatched lock/unlock calls detected."
+        );
+        // Clamp to zero to prevent further damage
+        g_storageLockDepth.store(0, std::memory_order_relaxed);
+        g_storageLocked.store(false, std::memory_order_relaxed);
+        xSemaphoreGive(g_storageLockMutex);
+        return;
+    }
+
+    // Unlock only when depth reaches zero (all guards released)
+    if (depth == 1) {  // depth before decrement was 1, now 0
+        g_storageLocked.store(false, std::memory_order_relaxed);
+    }
+
+    xSemaphoreGive(g_storageLockMutex);
+}
 
 // Hard I/O fault latch. A recorder/storage worker may set this from another
 // FreeRTOS task; bool reads/writes are atomic on ESP32-S3 and the state changes

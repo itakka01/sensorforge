@@ -57,6 +57,7 @@
 #include "streamer.h"
 #include "firmware_security.h"
 #include "firmware_ota_activation.h"
+#include "firmware_update_admission.h"
 #include "firmware_auto_scheduler.h"
 #include "wireguard_manager.h"
 #include "drone_mode.h"
@@ -64,6 +65,7 @@
 #include "cluster.h"
 #include "cluster_capture.h"
 #include "sd_presence_policy.h"
+#include "heap_monitor.h"
 
 
 // =============================================================
@@ -15172,6 +15174,11 @@ void setup() {
     resetDiagnosticsBegin();
     droneModeBegin();
 
+    // Thread-Safety: Initialize mutexes before any Guard usage
+    initRecordingBlockGuard();
+    initStorageLockGuard();
+    FirmwareUpdateAdmission::init();
+
     delay(300);
 
     Serial.println();
@@ -16229,6 +16236,9 @@ void setup() {
         }
 #endif
     }
+
+    // Initialize heap health monitoring (logs every 60s, warns on fragmentation)
+    heapMonitorInit();
 }
 
 
@@ -16302,6 +16312,9 @@ void loop() {
 
     // Non-blocking recording/fault LED state.
     updateStatusLed();
+
+    // Periodic heap health monitoring (logs every 60s, warns on fragmentation)
+    heapMonitorService();
 
     // Optional cluster service is deliberately independent of recorder/streamer
     // policy and is a no-op unless cluster runtime started with WiFi. The

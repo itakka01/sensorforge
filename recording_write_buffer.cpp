@@ -15,6 +15,11 @@ static const size_t DRAIN_CHUNK_BYTES =
 static const uint32_t SLOW_DRAIN_WRITE_US =
     20000UL;
 
+// SAFETY: Mutex timeout to prevent deadlock (10 seconds).
+// portMAX_DELAY would wait forever if mutex is never released.
+static const TickType_t MUTEX_TIMEOUT_TICKS =
+    pdMS_TO_TICKS(10000);
+
 static uint32_t elapsedUs(uint64_t startUs)
 {
     uint64_t nowUs =
@@ -340,7 +345,7 @@ size_t RecordingWriteBufferedFile::write(
         if (
             xSemaphoreTake(
                 mutex_,
-                portMAX_DELAY
+                MUTEX_TIMEOUT_TICKS
             ) == pdTRUE
         ) {
             size_t freeBytes =
@@ -467,7 +472,7 @@ void RecordingWriteBufferedFile::drainTask()
             if (
                 xSemaphoreTake(
                     mutex_,
-                    portMAX_DELAY
+                    MUTEX_TIMEOUT_TICKS
                 ) == pdTRUE
             ) {
                 if (queued_ > 0) {
@@ -510,7 +515,7 @@ void RecordingWriteBufferedFile::drainTask()
             if (
                 xSemaphoreTake(
                     mutex_,
-                    portMAX_DELAY
+                    MUTEX_TIMEOUT_TICKS
                 ) == pdTRUE
             ) {
                 drainWriteCalls_++;
@@ -564,7 +569,7 @@ void RecordingWriteBufferedFile::drainTask()
         if (
             xSemaphoreTake(
                 mutex_,
-                portMAX_DELAY
+                MUTEX_TIMEOUT_TICKS
             ) == pdTRUE
         ) {
             drained = queued_ == 0;
@@ -606,7 +611,7 @@ bool RecordingWriteBufferedFile::waitUntilDrained(
         if (
             xSemaphoreTake(
                 mutex_,
-                portMAX_DELAY
+                MUTEX_TIMEOUT_TICKS
             ) == pdTRUE
         ) {
             queuedNow = queued_;

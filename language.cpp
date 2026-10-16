@@ -478,8 +478,13 @@ const char *tr(UiTextId id)
 
     const UiTextEntry &entry = UI_TEXTS[(uint16_t)id];
 
-    return
+    // SAFETY: Always return a valid const char*, never NULL.
+    // If the UI_TEXTS table has NULL entries (should never happen in
+    // production), return empty string as fallback.
+    const char *result =
         cfg_web_language == "en"
         ? entry.en
         : entry.de;
+
+    return result ? result : "";
 }

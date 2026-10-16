@@ -57,7 +57,46 @@
 
 # SensorForge – Wiedereinstieg und technischer Übergabestand
 
-**Stand:** 2026-10-10 · **Firmware:** v87-beta105 · **Basis:** beta104 + beta105-Delta; beta103-Handover historisch
+**Stand:** 2026-10-16 · **Firmware:** v87-beta126 + Safety Fixes V3 · **Basis:** beta105 + 13 Critical Safety Fixes
+
+## 🛡️ CRITICAL SAFETY FIXES (NEU - 2026-10-16)
+
+**Vollständiger Report:** [`FIX_REPORT_V3.md`](FIX_REPORT_V3.md)
+
+### Implementierte Fixes (V1+V2+V3):
+1. ✅ **g_storageLocked → std::atomic** (V1)
+2. ✅ **g_recordingStartBlocked → std::atomic** (V2)
+3. ✅ **Heap Monitoring System** (V2)
+4. ✅ **tr() NULL-Safety** (V1)
+5. ✅ **StorageLockGuard RAII Class** (V2)
+6. ✅ **RecordingBlockGuard RAII Class** (V2)
+7. ✅ **Reference Counter Implementation** (V2)
+8. ✅ **Migration Guide** (V2)
+9. ✅ **Timer Overflow Protection - streamer.cpp** (V3)
+10. ✅ **Array Bounds Check - cluster_capture.cpp** (V3)
+11. ✅ **Division by Zero Protection - mkv_writer.cpp** (V3)
+12. ✅ **Mutex Deadlock Prevention - recording_write_buffer.cpp** (V3)
+13. ✅ **Integer Overflow Protection - sync_api.cpp** (V3)
+
+**Gesamtrisiko:** HOCH → NIEDRIG
+
+**Neue Dateien:**
+- `heap_monitor.h` / `heap_monitor.cpp` (V2)
+- `RAII_GUARDS_MIGRATION_GUIDE.md` (V2)
+- `FIX_REPORT_V3.md` (Dieser Report)
+
+**Geänderte Dateien:**
+- `storage_guard.h/cpp` (V1+V2: atomic + RAII)
+- `recorder.h/cpp` (V2: atomic + RAII)
+- `sensorforge.ino` (V2: Heap Monitoring Integration)
+- `language.cpp` (V1: tr() NULL-Safety)
+- `sync_api.cpp` (V1+V3: Kommentare + Timer Overflow)
+- `streamer.cpp` (V3: Timer Overflow)
+- `cluster_capture.cpp` (V3: Array Bounds)
+- `mkv_writer.cpp` (V3: Division by Zero)
+- `recording_write_buffer.cpp` (V3: Mutex Deadlock)
+
+---
 
 ## 1. Zweck und wichtigste Entscheidung
 
@@ -74,11 +113,29 @@ SensorForge wird als verteilter Multi-Kamera-Cluster auf ESP32-S3 weiterentwicke
 
 ## 3. Wo liegt was?
 
+### Safety & Security (NEU - 2026-10-16)
+- **`CLAUDE.md`** – **KI-Entwickler-Referenz** - Vollständige Architektur, alle Module, Risiken
+- **`FIX_REPORT_V3.md`** – Vollständiger Safety-Fixes-Report (13 Fixes V1+V2+V3)
+- `FIX_REPORT_V2.md` – V2-Fixes-Report (Option A + Option B)
+- `FIX_REPORT.md` – V1-Fixes-Report (Quick Wins)
+- `RAII_GUARDS_MIGRATION_GUIDE.md` – RAII Guards Migration (6-10h Aufwand)
+- `heap_monitor.h/.cpp` – Heap-Fragmentierungs-Monitoring (alle 60s)
+
+### Core Documentation
 - `CHANGELOG.md` – versionsbezogene Historie und Fehlerkorrekturen.
 - `CLUSTER_ARCHITECTURE.md` – Protokolle, Rollen und Entscheidungen (lange technische Historie).
 - `WIEDEREINSTIEG_SENSORFORGE.md` – **diese** schnelle und verbindliche Übergabe.
+- `README.md` – Features, Entwicklungsregeln, Safety-Status
+
+### Code-Module (mit V3-Verbesserungen)
+- `storage_guard.h/.cpp` – SD-Zugriffskontrolle + **RAII Guards** (V1+V2)
+- `recorder.h/.cpp` – Recording-Interface + **RAII Guards** (V2)
 - `cluster.cpp`, `cluster_jobs.*` – Cluster-Runtime, signierte Befehle, Jobzustände, Statusmeldungen.
-- `cluster_capture.h/.cpp` – zeitgesteuerter Capture-/PSRAM-Medienpfad (ab beta93, erweitert beta102).
+- `cluster_capture.h/.cpp` – zeitgesteuerter Capture-/PSRAM-Medienpfad + **Array Bounds Defense** (V3)
+- `streamer.cpp` – RTSP/HTTP-Streaming + **Timer Overflow Protection** (V3)
+- `sync_api.cpp` – REST API + **Integer Overflow Protection** (V3)
+- `mkv_writer.cpp` – MKV Container + **Division by Zero Protection** (V3)
+- `recording_write_buffer.cpp` – Write-Behind + **Mutex Deadlock Prevention** (V3)
 - `webconfig_cluster.cpp` – Coordinator-Aktionen, Capture-Countdown, Fertigstellungsbericht und Medienlinks.
 - `webconfig.cpp` – Node-Weboberfläche, Betriebsmodus-Banner, JPEG-Download `/capture_media`.
 - `sensorforge_version.h` – Versionskennung; bleibt bei diesem reinen Dokumentationsnachtrag unverändert.

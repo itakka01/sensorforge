@@ -6249,7 +6249,7 @@ static bool internalConfigPartitionLooksErased(
 }
 
 
-static bool initInternalConfigStorage()
+static bool initInternalConfigStorage(bool allowFormatOnFirstRun = false)
 {
     // Mount retries are intentionally short and bounded. They cover a
     // transient VFS/LittleFS startup failure without ever changing flash
@@ -6302,19 +6302,39 @@ static bool initInternalConfigStorage()
     // Fresh factory flash is the only automatic-format case. Once any data is
     // present in the filesystem partition, a mount failure is treated as a
     // preservation/recovery condition and never as permission to erase it.
+    //
+    // EXCEPTION: When saving WiFi settings for the first time (first-run from
+    // factory defaults with no SD card), Beta 40 policy allows creating the
+    // initial internal config even if the partition is corrupt. This resolves
+    // the Beta 40/43 conflict where Beta 43 corruption-protection prevented
+    // the first-run WiFi save from succeeding.
     if (
         partitionStateKnown &&
-        partitionErased
+        (partitionErased || allowFormatOnFirstRun)
     ) {
-        Serial.println(
-            "Config: blank LittleFS partition detected - initializing first-run filesystem"
-        );
+        if (allowFormatOnFirstRun && !partitionErased) {
+            Serial.println(
+                "Config: first-run WiFi save - formatting corrupt LittleFS to create initial config"
+            );
+        } else {
+            Serial.println(
+                "Config: blank LittleFS partition detected - initializing first-run filesystem"
+            );
+        }
 
         if (
             LittleFS.begin(
                 true
             )
         ) {
+            // ESP32 LittleFS stability fix: After a fresh format, the filesystem
+            // needs a short stabilization period before write operations become
+            // reliable. Without this delay, the first atomicWriteText() can fail
+            // with "internal config write failed" even though the mount succeeded.
+            // This is a known ESP32 LittleFS issue that was previously fixed and
+            // reappeared after adding the Beta 40/43 first-run format capability.
+            delay(150);
+
             internalAvailableState =
                 true;
 
@@ -6328,7 +6348,9 @@ static bool initInternalConfigStorage()
             internalConfigState =
                 INTERNAL_CONFIG_MISSING;
             internalConfigDetail =
-                "fresh LittleFS initialized; /config.txt missing";
+                allowFormatOnFirstRun && !partitionErased
+                ? "corrupt LittleFS formatted for first-run WiFi save; /config.txt missing"
+                : "fresh LittleFS initialized; /config.txt missing";
 
             return true;
         }
@@ -7244,6 +7266,22 @@ bool configInternalAvailable()
 }
 
 
+bool configEnsureInternalAvailable()
+{
+    if (internalAvailableState)
+        return true;
+
+    // Try to initialize LittleFS. This will format only if the partition is
+    // completely blank (fresh factory flash). Corrupt but non-blank partitions
+    // are preserved (Beta 43 policy).
+    //
+    // For first-run WiFi save, configSaveText() uses allowFormatOnFirstRun=true
+    // to resolve the Beta 40/43 conflict. For all other operations (license,
+    // secrets, etc.), we preserve corrupt data and fail gracefully.
+    return initInternalConfigStorage(false);
+}
+
+
 bool configInternalValid()
 {
     return
@@ -7540,7 +7578,8 @@ bool configDeleteSdCopy(
 ConfigSaveResult configSaveText(
     const String &text,
     bool writeToSd,
-    String &error
+    String &error,
+    bool allowFormatOnFirstRun
 )
 {
     error =
@@ -7597,7 +7636,7 @@ ConfigSaveResult configSaveText(
 
     if (!internalAvailableState) {
 
-        if (!initInternalConfigStorage()) {
+        if (!initInternalConfigStorage(allowFormatOnFirstRun)) {
 
             error =
                 "internal LittleFS unavailable";
@@ -9305,7 +9344,7 @@ ConfigSaveResult configSaveWifiSettings(
         return CONFIG_SAVE_INTERNAL_FAILED;
     }
 
-    ConfigSaveResult result = configSaveText(text, writeToSd, error);
+    ConfigSaveResult result = configSaveText(text, writeToSd, error, initializedFromFactoryDefaults);
 
     if (
         result == CONFIG_SAVE_BOTH ||
