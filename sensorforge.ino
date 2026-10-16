@@ -51,6 +51,7 @@
 #include "audio_capture.h"
 #include "recording_load_test.h"
 #include "mkv_writer.h"
+#include "webplayer.h"
 #include "log_storage.h"
 #include "image_motion.h"
 #include "motion_diagnostics.h"
@@ -15179,6 +15180,10 @@ void setup() {
     initStorageLockGuard();
     FirmwareUpdateAdmission::init();
 
+    // Heap Optimization: Allocate buffers in PSRAM
+    webplayerInit();
+    mkvWriterInit();
+
     delay(300);
 
     Serial.println();
@@ -16658,11 +16663,13 @@ void loop() {
                 webConfigCameraPreviewActive();
 
             // Storage failure gets its own finite unattended service window,
-            // even if the normal WiFi timeout is configured as unlimited or
-            // much longer. An actively used browser keeps the session alive via
-            // the existing heartbeat, so operator service is never cut off.
+            // but ONLY if the user has enabled WiFi timeout (cfg_wifi_timeout_sec > 0).
+            // If timeout is disabled (0), the user expects WiFi to stay on indefinitely,
+            // even with storage faults. An actively used browser keeps the session alive
+            // via the existing heartbeat, so operator service is never cut off.
             if (
                 !sdPresenceExpectNoCard() &&
+                cfg_wifi_timeout_sec > 0 &&
                 webConfigStarted &&
                 webConfigInactiveFor(
                     STORAGE_FAULT_WEB_IDLE_TIMEOUT_SECONDS

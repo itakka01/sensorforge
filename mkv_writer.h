@@ -5,6 +5,10 @@
 
 #include "recording_write_buffer.h"
 
+// Initialize MKV writer resources (audio mux buffer in PSRAM).
+// Call from setup() before recording functionality.
+void mkvWriterInit();
+
 struct MkvFrameTiming {
     bool valid;
     uint32_t cameraUs;

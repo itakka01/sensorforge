@@ -2,6 +2,10 @@
 
 #include <WebServer.h>
 
+// Initialize webplayer resources (transfer buffer in PSRAM).
+// Call from setup() before using webplayer functionality.
+void webplayerInit();
+
 // Register the recording-player HTTP routes on the existing WebServer.
 void webPlayerRegisterRoutes(WebServer &server);
 

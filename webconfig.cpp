@@ -3993,6 +3993,7 @@ static void handleConfigFactoryReset()
     );
 
     String html = htmlHeader();
+    html.reserve(6000);  // Prevent heap fragmentation
 
     html +=
         "<div class='page-title'><div><h2>Werkseinstellungen gespeichert</h2>"
@@ -4033,6 +4034,8 @@ static void handleShooterPage()
 {
     String notice = server.arg("notice");
     String html = htmlHeader();
+    html.reserve(6000);  // Prevent heap fragmentation
+    html.reserve(8000);  // Shooter page - prevent heap fragmentation
 
     html +=
         "<div class='page-title'><div>"
@@ -4204,6 +4207,8 @@ static void handleConfig()
     configRefreshSdStatus();
 
     String html = htmlHeader();
+    html.reserve(6000);  // Prevent heap fragmentation
+    html.reserve(25000);  // System status page - prevent heap fragmentation
 
     String configNotice =
         server.arg("notice");
@@ -6522,6 +6527,8 @@ static bool accessConfigWriteToSd()
 static void handleAccessSettingsPage()
 {
     String html = htmlHeader();
+    html.reserve(6000);  // Prevent heap fragmentation
+    html.reserve(8000);  // Access settings page - prevent heap fragmentation
 
     html += "<div class='page-title'><div><h2>Benutzer &amp; Zugriff</h2>"
             "<p>Administrator und Streaming-Zugänge verwalten</p></div></div>";
@@ -6698,6 +6705,7 @@ static void handleViewerHome()
     }
 
     String html = htmlHeader();
+    html.reserve(6000);  // Prevent heap fragmentation
     html += "<div class='page-title'><div><h2>Livebild</h2>"
             "<p>Direkter Zugriff auf den HTTP-MJPEG-Viewer</p></div></div>";
 
@@ -7746,6 +7754,7 @@ static String imageMotionInfoButton(
 static void handleImageMotionPage()
 {
     String html = htmlHeader();
+    html.reserve(6000);  // Prevent heap fragmentation
     if (droneModeEnabled()) {
         stopCameraPreview();
         html += "<h2>Image Motion</h2><p>Drone Mode aktiv – Live-Vorschau deaktiviert. "
@@ -7967,6 +7976,7 @@ function release(){fetch('/preview_stop?im=1',{method:'POST',keepalive:true}).ca
 static void handlePreview()
 {
     String html = htmlHeader();
+    html.reserve(6000);  // Prevent heap fragmentation
     if (droneModeEnabled()) {
         stopCameraPreview();
         html += "<h2>Kamera</h2><p>Drone Mode aktiv – Live-Vorschau deaktiviert. "
@@ -8795,6 +8805,8 @@ static void handleCameraAdvanced()
     stopCameraPreview();
 
     String html = htmlHeader();
+    html.reserve(6000);  // Prevent heap fragmentation
+    html.reserve(12000);  // Camera settings page - prevent heap fragmentation
     html +=
         "<div class='page-title'><div><h2>Erweiterte Kameraeinstellungen</h2>"
         "<p>Technische Parameter für Bildrate, JPEG und Sensorbetrieb</p></div></div>";
@@ -11994,6 +12006,7 @@ static String systemInfoButton(
 static void handleWifiSettingsPage()
 {
     String html = htmlHeader();
+    html.reserve(6000);  // Prevent heap fragmentation
     html += webconfigWifiSettingsHtml(server.arg("notice"));
     html += htmlFooter();
     server.send(200, "text/html; charset=utf-8", html);
@@ -17394,6 +17407,7 @@ static void handleRecordingLoadTestStatusPage()
     }
 
     String html = htmlHeader();
+    html.reserve(6000);  // Prevent heap fragmentation
     html +=
         "<h2>" + htmlText(UI_RECORDING_LOAD_STATUS_TITLE) + "</h2>"
         "<section class='settings-section'>"
@@ -17470,6 +17484,8 @@ static void handleRecordingLoadTestResult()
         result.completed;
 
     String html = htmlHeader();
+    html.reserve(6000);  // Prevent heap fragmentation
+    html.reserve(20000);  // Recording load test page - prevent heap fragmentation
     html +=
         "<h2>" +
         htmlText(UI_RECORDING_LOAD_TITLE) +
@@ -18210,6 +18226,7 @@ static void handleLicensePage()
         licenseHardwareId();
 
     String html = htmlHeader();
+    html.reserve(6000);  // Prevent heap fragmentation
 
     html +=
         "<div class='page-title'><div><h2>" +
@@ -18634,6 +18651,7 @@ static void handleLicenseRemove()
 static void handleSysInfo()
 {
     String html = htmlHeader();
+    html.reserve(6000);  // Prevent heap fragmentation
 
     html +=
         "<div class='page-title'><div>"
@@ -18758,6 +18776,7 @@ static void handleSysInfo()
 static void handleBoardInfo()
 {
     String html = htmlHeader();
+    html.reserve(6000);  // Prevent heap fragmentation
 
     html += "<h2>Board Info</h2>";
 
@@ -18790,6 +18809,8 @@ static void handlePSRAM()
         return;
 
     String html = htmlHeader();
+    html.reserve(6000);  // Prevent heap fragmentation
+    html.reserve(4000);  // PSRAM test page - prevent heap fragmentation
 
     html += "<h2>PSRAM Test</h2>";
 

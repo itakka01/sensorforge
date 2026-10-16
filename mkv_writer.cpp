@@ -10,6 +10,7 @@
 
 #include <FS.h>
 #include <esp_camera.h>
+#include <esp_heap_caps.h>
 #include <esp_timer.h>
 #include <time.h>
 #include <string.h>
@@ -41,6 +42,34 @@
 //
 // No JPEG decoding/re-encoding.
 // =============================================================
+
+// HEAP OPTIMIZATION: Allocated in PSRAM to save 4 KB of internal RAM.
+static uint8_t *audioMuxBuffer = nullptr;
+
+// HEAP OPTIMIZATION: Initialize audio mux buffer in PSRAM
+void mkvWriterInit()
+{
+    if (audioMuxBuffer != nullptr)
+        return;  // Already initialized
+
+    audioMuxBuffer = static_cast<uint8_t *>(
+        heap_caps_malloc(
+            4080,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+        )
+    );
+
+    if (!audioMuxBuffer) {
+        Serial.println("[MKV] FATAL: Failed to allocate 4 KB audio mux buffer in PSRAM!");
+        // Fallback to internal RAM
+        audioMuxBuffer = static_cast<uint8_t *>(malloc(4080));
+        if (audioMuxBuffer) {
+            Serial.println("[MKV] WARNING: Using internal RAM for audio buffer (heap pressure!)");
+        }
+    } else {
+        Serial.println("[MKV] Audio mux buffer allocated in PSRAM (4 KB saved from internal heap)");
+    }
+}
 
 static RecordingWriteBufferedFile mkvFile;
 static RecordingWriteBufferStats lastWriteBufferStats = {};
@@ -76,7 +105,6 @@ static AudioFormat mkvAudioFormat = {0, 0, 0};
 static uint64_t audioBytesWritten = 0;
 static uint64_t audioLastEndTimeMs = 0;
 static AudioCaptureStats finalAudioStats = {};
-static uint8_t audioMuxBuffer[4080];
 
 // Detailed per-stage timing is enabled only by the explicit Recording Load
 // Test. Normal recordings keep the established low-overhead path.

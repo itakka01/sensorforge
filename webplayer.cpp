@@ -11,6 +11,7 @@
 
 #include <FS.h>
 #include <WiFi.h>
+#include <esp_heap_caps.h>
 #include <algorithm>
 #include <string.h>
 #include <vector>
@@ -31,6 +32,37 @@
 //
 // Timestamp/subtitle overlay is intentionally the next step.
 // =============================================================
+
+
+// Shared transfer buffer.
+// JPEGs are sent to the browser in small chunks.
+// HEAP OPTIMIZATION: Allocated in PSRAM to save 8 KB of internal RAM.
+static uint8_t *transferBuffer = nullptr;
+
+// HEAP OPTIMIZATION: Initialize transfer buffer in PSRAM
+void webplayerInit()
+{
+    if (transferBuffer != nullptr)
+        return;  // Already initialized
+
+    transferBuffer = static_cast<uint8_t *>(
+        heap_caps_malloc(
+            8192,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+        )
+    );
+
+    if (!transferBuffer) {
+        Serial.println("[WEBPLAYER] FATAL: Failed to allocate 8 KB transfer buffer in PSRAM!");
+        // Fallback to internal RAM (will fragment heap, but better than crash)
+        transferBuffer = static_cast<uint8_t *>(malloc(8192));
+        if (transferBuffer) {
+            Serial.println("[WEBPLAYER] WARNING: Using internal RAM for transfer buffer (heap pressure!)");
+        }
+    } else {
+        Serial.println("[WEBPLAYER] Transfer buffer allocated in PSRAM (8 KB saved from internal heap)");
+    }
+}
 
 
 static WebServer *playerServer =
@@ -91,10 +123,6 @@ static String pendingDeletePaths[PLAYER_DELETE_QUEUE_MAX];
 static uint8_t pendingDeleteCount = 0;
 static uint32_t pendingDeleteSafeSinceMs = 0;
 
-
-// Shared transfer buffer.
-// JPEGs are sent to the browser in small chunks.
-static uint8_t transferBuffer[8192];
 
 
 // Finite batches only. At the project's normal 5 fps this is
