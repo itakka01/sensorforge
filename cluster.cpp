@@ -4062,9 +4062,14 @@ void clusterLoop()
     // Capture deadline takes precedence over any radio work.
     if (!clusterCaptureProtectionActive()) {
         if (cfg_operating_mode == "time_broadcaster") {
+            // Beta131-CORRECTED (Third cycle): Broadcaster receives BOTH IDs (Problem 1 & 2 FIX)
+            // 1. Own device ID - for diagnostic beacons and Grant identity verification
+            // 2. Coordinator ID - for time reference validation in precisionUtcNow()
             ClusterEspNowRadio::serviceDiagnosticBroadcaster(runtimeActive && !localIsCoordinator,
                                                               currentCoordinatorEpoch,
-                                                              deviceIntegrationId().c_str(), bootNonce);
+                                                              deviceIntegrationId().c_str(),  // Broadcaster's OWN ID
+                                                              currentCoordinatorId,  // Coordinator's ID
+                                                              bootNonce);
         } else {
             ClusterEspNowRadio::service(runtimeActive && (localIsCoordinator || droneModeEnabled()),
                                        localIsCoordinator, currentCoordinatorEpoch,

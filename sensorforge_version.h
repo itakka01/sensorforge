@@ -21,13 +21,13 @@
 // WebConfig, so a running device can be mapped back to the exact Git tag.
 
 #define SENSORFORGE_RELEASE_NUMBER 87
-#define SENSORFORGE_RELEASE_TAG "v87-beta130"
-#define SENSORFORGE_RELEASE_DATE "2026-10-15"
+#define SENSORFORGE_RELEASE_TAG "v87-beta131"
+#define SENSORFORGE_RELEASE_DATE "2026-10-16"
 #define SENSORFORGE_RELEASE_SUMMARY \
-    "Beta 130: passive coordinator/broadcaster prediction comparison; no clock change."
+    "Beta 131: production broadcaster handover with lease-based exclusive transmission."
 
-// Current source-tree stage. v87 Beta 52 applies coordinator election updates promptly; retains Beta 51 join recovery.
-#define SENSORFORGE_WORKTREE_STAGE "v87-beta130"
-#define SENSORFORGE_WORKTREE_DATE "2026-10-15"
+// Current source-tree stage. Beta 131: Production ESP-NOW time broadcaster integration.
+#define SENSORFORGE_WORKTREE_STAGE "v87-beta131"
+#define SENSORFORGE_WORKTREE_DATE "2026-10-16"
 #define SENSORFORGE_WORKTREE_SUMMARY \
-    "v87 Beta 130: passive A/B RX predictor; handover disabled."
+    "v87 Beta 131: production broadcaster handover enabled; enrolled coordinator/broadcaster pair."

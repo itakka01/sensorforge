@@ -6,9 +6,14 @@ namespace ClusterEspNowRadio {
 // Called from ordinary cluster loop, not from Wi-Fi callbacks.
 void service(bool allowed, bool coordinator, uint32_t epoch,
              const char *coordinatorId, uint32_t localBootNonce);
-// Independent diagnostic transmitter, never a coordinator or clock authority.
+// Beta131-CORRECTED (Third cycle): Broadcaster does THREE things:
+// 1. Sends diagnostic beacons (own identity) so coordinator can observe
+// 2. Syncs WITH coordinator (coordinatorId) as node via Probe/Reply/Final
+// 3. Sends production beacons when lease active
+// CRITICAL: Must receive BOTH broadcaster's own ID AND coordinator ID
 void serviceDiagnosticBroadcaster(bool allowed, uint32_t epoch,
-                                  const char *deviceId, uint32_t localBootNonce);
+                                  const char *broadcasterDeviceId, const char *coordinatorId,
+                                  uint32_t localBootNonce);
 struct GrantDiagnosticStats {
     uint32_t received=0,authenticated=0,rejected=0,replay=0,dropped=0;
     uint32_t grantsSent=0,acksSent=0,acksVerified=0,timeouts=0,sendFailed=0;
@@ -97,6 +102,15 @@ struct Diagnostics {
     uint32_t capturePauseRemainingMs=0;
     bool syncPermission=false;
     uint32_t syncPermissionRemainingMs=0;
+    // Beta131: Production broadcaster handover state
+    bool handoverEnabled=true;
+    bool broadcasterLeaseActive=false;
+    uint32_t broadcasterLeaseRemainingMs=0;
+    bool coordinatorSuppressingBeacons=false;
+    uint32_t coordinatorBeaconsSuppressed=0;
+    uint64_t activeTimeSource=0;  // 0=none, or tag of active coordinator/broadcaster
+    uint32_t sourceChanges=0;
+    uint32_t broadcasterProductionBeaconsSent=0;
 };
 Diagnostics diagnostics();
 // Diagnostic SFDB receiver only; never used by precisionUtcNow() or capture.
