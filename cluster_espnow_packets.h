@@ -6,10 +6,10 @@
 // MAC must be HMAC-SHA256 under an ESP-NOW-specific key derived from the
 // authenticated cluster credentials; raw shared secrets must never be logged.
 namespace EspNowTimePackets {
-constexpr size_t kPayloadSize = 44;
+constexpr size_t kPayloadSize = 48;  // V2: expanded from 44 to 48 bytes
 constexpr size_t kMacSize = 32;
 constexpr size_t kPacketSize = kPayloadSize + kMacSize;
-constexpr uint8_t kVersion = 1;
+constexpr uint8_t kVersion = 2;  // V2: Software timestamp correction
 enum class Type : uint8_t { Beacon=1, Probe=2, Reply=3, Final=4, SyncControl=5, NodeSyncReport=6, NodeDriftReport=7, BenchControl=8, BenchDown=9, BenchUp=10, BenchAck=11 };
 struct Frame {
   Type type = Type::Beacon;
@@ -19,6 +19,7 @@ struct Frame {
   uint64_t senderBoot = 0;
   int64_t timeUs = 0; // monotonic timestamp; NOT a radio airtime timestamp
   uint32_t nonce = 0;
+  uint32_t preSendDelayUs = 0; // V2: measured TX preparation delay (timestamp to esp_now_send completion)
 };
 // Sign callback returns true only after writing exactly 32 MAC bytes.
 using SignMac = bool (*)(const uint8_t*, size_t, uint8_t[32], void*);

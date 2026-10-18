@@ -1,0 +1,12 @@
+{
+  "seed_hosts": [
+    "http://devxiao3.local"
+  ],
+  "interval_seconds": 10,
+  "timeout_seconds": 5,
+  "rediscover_every_cycles": 6,
+  "auth": {
+    "username": "ja1",
+    "password": "sensor4337"
+  }
+}

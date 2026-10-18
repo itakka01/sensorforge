@@ -1,0 +1,396 @@
+#include "cluster_espnow_packets.h"
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+
+// Test HMAC callbacks (simplified for testing)
+static uint8_t testKey[32] = {0};
+bool testSign(const uint8_t* data, size_t len, uint8_t mac[32], void* user) {
+    // Simple XOR-based MAC for testing
+    memset(mac, 0, 32);
+    for(size_t i = 0; i < len; i++) {
+        mac[i % 32] ^= data[i];
+    }
+    for(int i = 0; i < 32; i++) {
+        mac[i] ^= testKey[i];
+    }
+    return true;
+}
+
+bool testVerify(const uint8_t* data, size_t len, const uint8_t mac[32], void* user) {
+    uint8_t computed[32];
+    testSign(data, len, computed, user);
+    return memcmp(computed, mac, 32) == 0;
+}
+
+void test_basic_encode_decode() {
+    printf("Test 1: Basic V2 encode/decode with preSendDelayUs... ");
+
+    using namespace EspNowTimePackets;
+    Frame f;
+    f.type = Type::Probe;
+    f.epoch = 12345;
+    f.sequence = 100;
+    f.coordinatorTag = 0xABCDEF0123456789ULL;
+    f.senderBoot = 0x9876543210FEDCBAULL;
+    f.timeUs = 1000000000LL;
+    f.nonce = 42;
+    f.preSendDelayUs = 725;  // V2: Measured delay
+
+    uint8_t packet[kPacketSize];
+    assert(encode(f, packet, testSign, nullptr));
+
+    // Verify version
+    assert(packet[4] == 2);  // kVersion = 2
+
+    Frame decoded;
+    assert(decode(packet, kPacketSize, decoded, testVerify, nullptr));
+
+    assert(decoded.type == Type::Probe);
+    assert(decoded.epoch == 12345);
+    assert(decoded.sequence == 100);
+    assert(decoded.coordinatorTag == 0xABCDEF0123456789ULL);
+    assert(decoded.senderBoot == 0x9876543210FEDCBAULL);
+    assert(decoded.timeUs == 1000000000LL);
+    assert(decoded.nonce == 42);
+    assert(decoded.preSendDelayUs == 725);  // V2: Preserved
+
+    printf("PASSED\n");
+}
+
+void test_hmac_authentication() {
+    printf("Test 2: HMAC authenticates preSendDelayUs field... ");
+
+    using namespace EspNowTimePackets;
+    Frame f;
+    f.type = Type::Final;
+    f.epoch = 1;
+    f.sequence = 50;
+    f.coordinatorTag = 1;
+    f.senderBoot = 1;
+    f.timeUs = 5000000LL;
+    f.nonce = 99;
+    f.preSendDelayUs = 800;
+
+    uint8_t packet[kPacketSize];
+    assert(encode(f, packet, testSign, nullptr));
+
+    // Tamper with preSendDelayUs in payload (position 44-47)
+    packet[44] ^= 0xFF;
+
+    Frame decoded;
+    // Should fail verification due to HMAC mismatch
+    assert(!decode(packet, kPacketSize, decoded, testVerify, nullptr));
+
+    printf("PASSED\n");
+}
+
+void test_all_packet_types() {
+    printf("Test 3: All packet types support preSendDelayUs... ");
+
+    using namespace EspNowTimePackets;
+    Type types[] = {Type::Beacon, Type::Probe, Type::Reply, Type::Final,
+                    Type::SyncControl, Type::NodeSyncReport, Type::NodeDriftReport,
+                    Type::BenchControl, Type::BenchDown, Type::BenchUp, Type::BenchAck};
+
+    for(auto type : types) {
+        Frame f;
+        f.type = type;
+        f.epoch = 1;
+        f.sequence = 1;
+        f.coordinatorTag = 1;
+        f.senderBoot = 1;
+        f.timeUs = 1000000LL;
+        f.nonce = 1;
+        f.preSendDelayUs = 650;
+
+        uint8_t packet[kPacketSize];
+        assert(encode(f, packet, testSign, nullptr));
+
+        Frame decoded;
+        assert(decode(packet, kPacketSize, decoded, testVerify, nullptr));
+        assert(decoded.preSendDelayUs == 650);
+    }
+
+    printf("PASSED\n");
+}
+
+void test_zero_delay() {
+    printf("Test 4: Zero delay (first Probe in series)... ");
+
+    using namespace EspNowTimePackets;
+    Frame f;
+    f.type = Type::Probe;
+    f.epoch = 1;
+    f.sequence = 1;
+    f.coordinatorTag = 1;
+    f.senderBoot = 1;
+    f.timeUs = 2000000LL;
+    f.nonce = 1;
+    f.preSendDelayUs = 0;  // First Probe, no previous delay
+
+    uint8_t packet[kPacketSize];
+    assert(encode(f, packet, testSign, nullptr));
+
+    Frame decoded;
+    assert(decode(packet, kPacketSize, decoded, testVerify, nullptr));
+    assert(decoded.preSendDelayUs == 0);
+
+    printf("PASSED\n");
+}
+
+void test_max_delay() {
+    printf("Test 5: Maximum delay value (uint32_t max)... ");
+
+    using namespace EspNowTimePackets;
+    Frame f;
+    f.type = Type::Probe;
+    f.epoch = 1;
+    f.sequence = 1;
+    f.coordinatorTag = 1;
+    f.senderBoot = 1;
+    f.timeUs = 3000000LL;
+    f.nonce = 1;
+    f.preSendDelayUs = 0xFFFFFFFF;  // Max uint32_t
+
+    uint8_t packet[kPacketSize];
+    assert(encode(f, packet, testSign, nullptr));
+
+    Frame decoded;
+    assert(decode(packet, kPacketSize, decoded, testVerify, nullptr));
+    assert(decoded.preSendDelayUs == 0xFFFFFFFF);
+
+    printf("PASSED\n");
+}
+
+void test_realistic_delays() {
+    printf("Test 6: Realistic delay values (600-850 µs)... ");
+
+    using namespace EspNowTimePackets;
+    uint32_t realistic_delays[] = {600, 650, 700, 725, 750, 800, 825, 850};
+
+    for(auto delay : realistic_delays) {
+        Frame f;
+        f.type = Type::Probe;
+        f.epoch = 1;
+        f.sequence = 1;
+        f.coordinatorTag = 1;
+        f.senderBoot = 1;
+        f.timeUs = 4000000LL;
+        f.nonce = 1;
+        f.preSendDelayUs = delay;
+
+        uint8_t packet[kPacketSize];
+        assert(encode(f, packet, testSign, nullptr));
+
+        Frame decoded;
+        assert(decode(packet, kPacketSize, decoded, testVerify, nullptr));
+        assert(decoded.preSendDelayUs == delay);
+    }
+
+    printf("PASSED\n");
+}
+
+void test_packet_size() {
+    printf("Test 7: V2 packet size is 80 bytes (48+32)... ");
+
+    using namespace EspNowTimePackets;
+    assert(kPayloadSize == 48);
+    assert(kMacSize == 32);
+    assert(kPacketSize == 80);
+    assert(kVersion == 2);
+
+    printf("PASSED\n");
+}
+
+void test_negative_timestamp_with_correction() {
+    printf("Test 8: Negative timestamp with positive correction... ");
+
+    using namespace EspNowTimePackets;
+    Frame f;
+    f.type = Type::Final;
+    f.epoch = 1;
+    f.sequence = 1;
+    f.coordinatorTag = 1;
+    f.senderBoot = 1;
+    f.timeUs = -500000LL;  // Negative (before reference)
+    f.nonce = 1;
+    f.preSendDelayUs = 750;  // Positive correction
+
+    uint8_t packet[kPacketSize];
+    assert(encode(f, packet, testSign, nullptr));
+
+    Frame decoded;
+    assert(decode(packet, kPacketSize, decoded, testVerify, nullptr));
+    assert(decoded.timeUs == -500000LL);
+    assert(decoded.preSendDelayUs == 750);
+
+    // Corrected timestamp
+    int64_t corrected = decoded.timeUs + static_cast<int64_t>(decoded.preSendDelayUs);
+    assert(corrected == -499250LL);
+
+    printf("PASSED\n");
+}
+
+void test_validation_fails_without_required_fields() {
+    printf("Test 9: Validation fails without required fields... ");
+
+    using namespace EspNowTimePackets;
+    Frame f;
+    f.type = Type::Probe;
+    f.epoch = 0;  // Invalid
+    f.sequence = 1;
+    f.coordinatorTag = 1;
+    f.senderBoot = 1;
+    f.timeUs = 1000000LL;
+    f.nonce = 1;
+    f.preSendDelayUs = 700;
+
+    uint8_t packet[kPacketSize];
+    assert(!encode(f, packet, testSign, nullptr));  // Should fail
+
+    printf("PASSED\n");
+}
+
+void test_replay_window_with_v2() {
+    printf("Test 10: Replay protection works with V2 packets... ");
+
+    using namespace EspNowTimePackets;
+    ReplayWindow window;
+
+    Frame f1;
+    f1.type = Type::Probe;
+    f1.epoch = 1;
+    f1.sequence = 100;
+    f1.coordinatorTag = 1;
+    f1.senderBoot = 1;
+    f1.timeUs = 1000000LL;
+    f1.nonce = 1;
+    f1.preSendDelayUs = 700;
+
+    assert(acceptSequence(window, f1));  // First packet, accepted
+
+    Frame f2 = f1;
+    f2.sequence = 101;
+    f2.preSendDelayUs = 720;
+    assert(acceptSequence(window, f2));  // Higher sequence, accepted
+
+    Frame f3 = f1;
+    f3.sequence = 101;  // Same as f2
+    f3.preSendDelayUs = 730;
+    assert(!acceptSequence(window, f3));  // Replay, rejected
+
+    printf("PASSED\n");
+}
+
+void test_simulated_exchange_with_correction() {
+    printf("Test 11: Simulated exchange with software correction... ");
+
+    using namespace EspNowTimePackets;
+
+    // Simulate Node sending Probe
+    Frame probe;
+    probe.type = Type::Probe;
+    probe.epoch = 1;
+    probe.sequence = 10;
+    probe.coordinatorTag = 0x1234567890ABCDEFULL;
+    probe.senderBoot = 0xABCDEF0123456789ULL;
+    probe.timeUs = 1000000LL;  // t1_early
+    probe.nonce = 5;
+    probe.preSendDelayUs = 0;  // First Probe, no previous delay
+
+    uint8_t probePacket[kPacketSize];
+    assert(encode(probe, probePacket, testSign, nullptr));
+
+    // Coordinator receives and decodes
+    Frame probeDecoded;
+    assert(decode(probePacket, kPacketSize, probeDecoded, testVerify, nullptr));
+    int64_t t1_corrected = probeDecoded.timeUs + probeDecoded.preSendDelayUs;
+    assert(t1_corrected == 1000000LL);  // 0 correction for first Probe
+
+    int64_t t2 = 1002000LL;  // Coordinator RX time
+
+    // Coordinator sends Final with t3
+    Frame final;
+    final.type = Type::Final;
+    final.epoch = 1;
+    final.sequence = 11;
+    final.coordinatorTag = 0x1234567890ABCDEFULL;
+    final.senderBoot = 0xFEDCBA9876543210ULL;  // Coordinator boot
+    final.timeUs = 1003000LL;  // t3_early
+    final.nonce = 5;
+    final.preSendDelayUs = 750;  // Measured delay from Reply
+
+    uint8_t finalPacket[kPacketSize];
+    assert(encode(final, finalPacket, testSign, nullptr));
+
+    // Node receives and decodes
+    Frame finalDecoded;
+    assert(decode(finalPacket, kPacketSize, finalDecoded, testVerify, nullptr));
+    int64_t t3_corrected = finalDecoded.timeUs + finalDecoded.preSendDelayUs;
+    assert(t3_corrected == 1003750LL);  // 1003000 + 750
+
+    // Note: This test doesn't calculate offset, just verifies encoding/decoding
+
+    printf("PASSED\n");
+}
+
+void test_v2_second_probe_with_previous_delay() {
+    printf("Test 12: Second Probe carries delay from first Probe... ");
+
+    using namespace EspNowTimePackets;
+
+    // First Probe: no delay
+    Frame probe1;
+    probe1.type = Type::Probe;
+    probe1.epoch = 1;
+    probe1.sequence = 20;
+    probe1.coordinatorTag = 1;
+    probe1.senderBoot = 1;
+    probe1.timeUs = 2000000LL;
+    probe1.nonce = 10;
+    probe1.preSendDelayUs = 0;  // No previous Probe
+
+    // Second Probe: carries delay from first
+    Frame probe2;
+    probe2.type = Type::Probe;
+    probe2.epoch = 1;
+    probe2.sequence = 21;
+    probe2.coordinatorTag = 1;
+    probe2.senderBoot = 1;
+    probe2.timeUs = 2100000LL;
+    probe2.nonce = 11;
+    probe2.preSendDelayUs = 720;  // Measured from probe1
+
+    uint8_t packet[kPacketSize];
+    assert(encode(probe2, packet, testSign, nullptr));
+
+    Frame decoded;
+    assert(decode(packet, kPacketSize, decoded, testVerify, nullptr));
+
+    // Corrected t1 for probe2
+    int64_t t1_corrected = decoded.timeUs + decoded.preSendDelayUs;
+    assert(t1_corrected == 2100720LL);
+
+    printf("PASSED\n");
+}
+
+int main() {
+    printf("=== V2 Protocol Production Code Tests ===\n\n");
+
+    test_basic_encode_decode();
+    test_hmac_authentication();
+    test_all_packet_types();
+    test_zero_delay();
+    test_max_delay();
+    test_realistic_delays();
+    test_packet_size();
+    test_negative_timestamp_with_correction();
+    test_validation_fails_without_required_fields();
+    test_replay_window_with_v2();
+    test_simulated_exchange_with_correction();
+    test_v2_second_probe_with_previous_delay();
+
+    printf("\n=== All 12 tests PASSED ===\n");
+    return 0;
+}

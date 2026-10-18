@@ -1,0 +1,416 @@
+// SensorForge v87-beta131 – Software Timestamp Correction Feasibility Test
+// Vergleicht OLD (symmetrisch vor HMAC), Cycle 22 (asymmetrisch), und CORRECTED (gemessen)
+//
+// Compile: g++ -o test_software_correction test_software_correction.cpp -std=c++17 -I.
+// Run: ./test_software_correction
+// Clean: rm test_software_correction && mv test_software_correction.cpp test_software_correction.cpp.test
+
+#include <cstdio>
+#include <cstdint>
+#include <cmath>
+#include <cstring>
+#include <tuple>
+
+// ============================================================================
+// Test Framework
+// ============================================================================
+
+static int tests_passed = 0;
+static int tests_failed = 0;
+
+#define ASSERT_TRUE(cond, msg) \
+    if (!(cond)) { \
+        printf("  FAILED: %s\n", msg); \
+        tests_failed++; \
+        return; \
+    } else { \
+        tests_passed++; \
+    }
+
+#define ASSERT_NEAR(val, expected, tolerance, msg) \
+    if (fabs((val) - (expected)) > (tolerance)) { \
+        printf("  FAILED: %s (expected %.2f, got %.2f)\n", msg, (double)(expected), (double)(val)); \
+        tests_failed++; \
+        return; \
+    } else { \
+        tests_passed++; \
+    }
+
+// ============================================================================
+// Four-Timestamp Exchange Simulation
+// ============================================================================
+
+struct ExchangeResult {
+    double true_offset_us;
+    double calculated_offset_us;
+    double bias_us;          // calculated - true
+    double t1, t2, t3, t4;   // captured timestamps
+    double d1_measured, d3_measured;  // for corrected approach
+};
+
+// Simulate exchange with OLD behavior (both before HMAC, no correction)
+ExchangeResult simulate_old(double true_offset, double d1_presend, double d3_presend) {
+    ExchangeResult r = {};
+    r.true_offset_us = true_offset;
+
+    // RF times (node's clock reference)
+    double rf_probe_tx = 1000000.0;
+    double rf_probe_rx = rf_probe_tx + 5000.0;  // 5ms flight
+    double rf_reply_tx = rf_probe_rx + 200.0;   // 200µs processing
+    double rf_reply_rx = rf_reply_tx + 5000.0;  // 5ms return
+
+    // Captured timestamps (OLD: both before HMAC)
+    r.t1 = rf_probe_tx - d1_presend;           // before HMAC
+    r.t2 = rf_probe_rx + true_offset;          // callback (accurate)
+    r.t3 = rf_reply_tx + true_offset - d3_presend;  // before HMAC
+    r.t4 = rf_reply_rx;                        // callback (accurate)
+
+    // NTP formula
+    r.calculated_offset_us = ((r.t2 - r.t1) + (r.t3 - r.t4)) / 2.0;
+    r.bias_us = r.calculated_offset_us - r.true_offset_us;
+
+    return r;
+}
+
+// Simulate exchange with Cycle 22 (asymmetric: t1 before, t3 after HMAC)
+ExchangeResult simulate_cycle22(double true_offset, double d1_presend) {
+    ExchangeResult r = {};
+    r.true_offset_us = true_offset;
+
+    double rf_probe_tx = 1000000.0;
+    double rf_probe_rx = rf_probe_tx + 5000.0;
+    double rf_reply_tx = rf_probe_rx + 200.0;
+    double rf_reply_rx = rf_reply_tx + 5000.0;
+
+    // Cycle 22: t1 before HMAC, t3 after HMAC (near esp_now_send)
+    r.t1 = rf_probe_tx - d1_presend;           // before HMAC
+    r.t2 = rf_probe_rx + true_offset;          // callback
+    r.t3 = rf_reply_tx + true_offset;          // after HMAC (no delay!)
+    r.t4 = rf_reply_rx;                        // callback
+
+    r.calculated_offset_us = ((r.t2 - r.t1) + (r.t3 - r.t4)) / 2.0;
+    r.bias_us = r.calculated_offset_us - r.true_offset_us;
+
+    return r;
+}
+
+// Simulate exchange with SOFTWARE CORRECTION
+ExchangeResult simulate_corrected(double true_offset, double d1_presend, double d3_presend,
+                                   double d1_driver, double d3_driver) {
+    ExchangeResult r = {};
+    r.true_offset_us = true_offset;
+
+    double rf_probe_tx = 1000000.0;
+    double rf_probe_rx = rf_probe_tx + 5000.0;
+    double rf_reply_tx = rf_probe_rx + 200.0;
+    double rf_reply_rx = rf_reply_tx + 5000.0;
+
+    // Capture early (before HMAC, for authentication)
+    double t1_early = rf_probe_tx - d1_presend;
+    double t3_early = rf_reply_tx + true_offset - d3_presend;
+
+    // Measure delay from early capture to after esp_now_send()
+    // (includes HMAC + esp_now_send execution, but NOT driver delay)
+    r.d1_measured = d1_presend;  // measured time from t1 to after send call
+    r.d3_measured = d3_presend;  // measured time from t3 to after send call
+
+    // Apply correction
+    double t1_corrected = t1_early + r.d1_measured;  // now at "after esp_now_send" time
+    double t3_corrected = t3_early + r.d3_measured;  // now at "after esp_now_send" time
+
+    // Store for debugging
+    r.t1 = t1_corrected;
+    r.t2 = rf_probe_rx + true_offset;
+    r.t3 = t3_corrected;
+    r.t4 = rf_reply_rx;
+
+    // Remaining bias comes from driver delay difference
+    // t1_corrected is still d1_driver before RF
+    // t3_corrected is still d3_driver before RF
+    double rf_t1 = rf_probe_tx;
+    double rf_t3 = rf_reply_tx + true_offset;
+
+    // Corrected timestamps are at "after esp_now_send", which is d_driver before RF
+    double actual_t1 = rf_t1 - d1_driver;
+    double actual_t3 = rf_t3 - d3_driver;
+
+    // Use actual times in formula
+    r.calculated_offset_us = ((r.t2 - actual_t1) + (actual_t3 - r.t4)) / 2.0;
+    r.bias_us = r.calculated_offset_us - r.true_offset_us;
+
+    return r;
+}
+
+// ============================================================================
+// Test Cases
+// ============================================================================
+
+void test_old_symmetric_no_bias() {
+    printf("\nTest A: OLD – Symmetrische Pre-Send Delays (kein Bias)\n");
+
+    auto r = simulate_old(1000.0, 732.0, 732.0);
+
+    ASSERT_NEAR(r.bias_us, 0.0, 0.1,
+                "Symmetrische Delays → Bias = 0");
+}
+
+void test_old_asymmetric_small_bias() {
+    printf("\nTest B: OLD – Asymmetrische Pre-Send Delays (kleiner Bias)\n");
+
+    auto r = simulate_old(1000.0, 732.0, 600.0);
+
+    double expected_bias = (732.0 - 600.0) / 2.0;
+    ASSERT_NEAR(r.bias_us, expected_bias, 0.1,
+                "Asymmetrische Delays → Bias = (d1-d3)/2");
+}
+
+void test_old_varying_spread() {
+    printf("\nTest C: OLD – Variierende Delays (Spread-Analyse)\n");
+
+    const int n = 16;
+    double biases[n];
+
+    for (int i = 0; i < n; i++) {
+        double d1 = 600.0 + i * 15.0;          // 600-825 µs
+        double d3 = 600.0 + (15 - i) * 15.0;   // 825-600 µs
+        auto r = simulate_old(1000.0, d1, d3);
+        biases[i] = r.bias_us;
+    }
+
+    double min_bias = biases[0], max_bias = biases[0], sum = 0;
+    for (int i = 0; i < n; i++) {
+        if (biases[i] < min_bias) min_bias = biases[i];
+        if (biases[i] > max_bias) max_bias = biases[i];
+        sum += biases[i];
+    }
+    double spread = max_bias - min_bias;
+    double mean_bias = sum / n;
+
+    printf("  Bias-Bereich: %.2f bis %.2f µs\n", min_bias, max_bias);
+    printf("  Spread: %.2f µs\n", spread);
+    printf("  Mittelwert: %.2f µs\n", mean_bias);
+
+    ASSERT_NEAR(mean_bias, 0.0, 0.1,
+                "OLD: Mittelwert ≈ 0 (unabhängige Variation)");
+    ASSERT_NEAR(spread, 225.0, 5.0,
+                "OLD: Spread ≈ 225 µs");
+}
+
+void test_cycle22_systematic_bias() {
+    printf("\nTest D: Cycle 22 – Systematischer Bias\n");
+
+    auto r = simulate_cycle22(1000.0, 732.0);
+
+    double expected_bias = 732.0 / 2.0;
+    ASSERT_NEAR(r.bias_us, expected_bias, 0.1,
+                "Cycle 22: Bias = +366 µs (systematisch)");
+}
+
+void test_cycle22_reduced_spread() {
+    printf("\nTest E: Cycle 22 – Reduzierter Spread\n");
+
+    const int n = 16;
+    double biases[n];
+
+    for (int i = 0; i < n; i++) {
+        double d1 = 600.0 + i * 15.0;  // nur Probe variiert
+        auto r = simulate_cycle22(1000.0, d1);
+        biases[i] = r.bias_us;
+    }
+
+    double min_bias = biases[0], max_bias = biases[0];
+    for (int i = 1; i < n; i++) {
+        if (biases[i] < min_bias) min_bias = biases[i];
+        if (biases[i] > max_bias) max_bias = biases[i];
+    }
+    double spread = max_bias - min_bias;
+
+    printf("  Spread: %.2f µs (vs OLD: 225 µs)\n", spread);
+
+    ASSERT_NEAR(spread, 112.5, 5.0,
+                "Cycle 22: Spread ≈ 112.5 µs (50% Reduktion)");
+}
+
+void test_corrected_zero_driver_delay() {
+    printf("\nTest F: CORRECTED – Ohne Treiber-Verzögerung (idealer Fall)\n");
+
+    // Keine Treiber-Verzögerung → perfekte Korrektur möglich
+    auto r = simulate_corrected(1000.0, 732.0, 732.0, 0.0, 0.0);
+
+    ASSERT_NEAR(r.bias_us, 0.0, 0.1,
+                "CORRECTED (kein Treiber-Delay): Bias = 0");
+}
+
+void test_corrected_symmetric_driver_delay() {
+    printf("\nTest G: CORRECTED – Symmetrische Treiber-Verzögerung\n");
+
+    // Beide Seiten haben gleiche Treiber-Verzögerung
+    auto r = simulate_corrected(1000.0, 732.0, 732.0, 100.0, 100.0);
+
+    ASSERT_NEAR(r.bias_us, 0.0, 0.1,
+                "CORRECTED (symmetrischer Treiber): Bias = 0");
+}
+
+void test_corrected_asymmetric_driver_delay() {
+    printf("\nTest H: CORRECTED – Asymmetrische Treiber-Verzögerung\n");
+
+    // Node: 50µs, Coordinator: 150µs Treiber-Verzögerung
+    auto r = simulate_corrected(1000.0, 732.0, 732.0, 50.0, 150.0);
+
+    double expected_bias = (50.0 - 150.0) / 2.0;
+    printf("  Verbleibender Bias: %.2f µs (Treiber-Asymmetrie)\n", r.bias_us);
+
+    ASSERT_NEAR(r.bias_us, expected_bias, 0.1,
+                "CORRECTED: Verbleibender Bias = (d_driver_diff)/2");
+    ASSERT_TRUE(fabs(r.bias_us) < 100.0,
+                "CORRECTED: |Bias| < 100 µs (besser als Cycle 22: 366 µs)");
+}
+
+void test_corrected_varying_presend_low_spread() {
+    printf("\nTest I: CORRECTED – Variierende Pre-Send, niedriger Spread\n");
+
+    const int n = 16;
+    double biases[n];
+
+    // Pre-Send variiert stark, aber wird gemessen und korrigiert
+    for (int i = 0; i < n; i++) {
+        double d1 = 600.0 + i * 15.0;          // 600-825 µs
+        double d3 = 600.0 + (15 - i) * 15.0;   // 825-600 µs (anti-korreliert)
+        // Treiber-Verzögerung konstant und symmetrisch
+        auto r = simulate_corrected(1000.0, d1, d3, 100.0, 100.0);
+        biases[i] = r.bias_us;
+    }
+
+    double min_bias = biases[0], max_bias = biases[0];
+    for (int i = 1; i < n; i++) {
+        if (biases[i] < min_bias) min_bias = biases[i];
+        if (biases[i] > max_bias) max_bias = biases[i];
+    }
+    double spread = max_bias - min_bias;
+
+    printf("  Spread: %.2f µs (Pre-Send variiert stark!)\n", spread);
+
+    ASSERT_NEAR(spread, 0.0, 0.1,
+                "CORRECTED: Spread ≈ 0 (Pre-Send-Variation eliminiert)");
+}
+
+void test_comparison_absolute_bias() {
+    printf("\nTest J: Vergleich – Absoluter Bias (d1=732, d3=732, driver=100µs sym.)\n");
+
+    auto old = simulate_old(1000.0, 732.0, 732.0);
+    auto cycle22 = simulate_cycle22(1000.0, 732.0);
+    auto corrected = simulate_corrected(1000.0, 732.0, 732.0, 100.0, 100.0);
+
+    printf("  OLD:       Bias = %+.2f µs\n", old.bias_us);
+    printf("  Cycle 22:  Bias = %+.2f µs\n", cycle22.bias_us);
+    printf("  CORRECTED: Bias = %+.2f µs\n", corrected.bias_us);
+
+    ASSERT_TRUE(fabs(old.bias_us) < fabs(cycle22.bias_us),
+                "OLD besser als Cycle 22 (absoluter Bias)");
+    ASSERT_TRUE(fabs(corrected.bias_us) < fabs(cycle22.bias_us),
+                "CORRECTED besser als Cycle 22 (absoluter Bias)");
+    ASSERT_TRUE(fabs(corrected.bias_us) <= fabs(old.bias_us),
+                "CORRECTED mindestens so gut wie OLD (absoluter Bias)");
+}
+
+void test_comparison_worst_case_driver() {
+    printf("\nTest K: Worst-Case – Maximale Treiber-Asymmetrie (±50µs)\n");
+
+    // Annahme: Treiber-Verzögerung 50-150 µs, worst case ±50 µs Differenz
+    auto corrected_worst = simulate_corrected(1000.0, 732.0, 732.0, 50.0, 150.0);
+
+    printf("  CORRECTED (worst case): Bias = %+.2f µs\n", corrected_worst.bias_us);
+
+    ASSERT_TRUE(fabs(corrected_worst.bias_us) <= 50.0,
+                "CORRECTED worst case: |Bias| ≤ 50 µs");
+    ASSERT_TRUE(fabs(corrected_worst.bias_us) < 250.0,
+                "CORRECTED: Erfüllt ≤250 µs Anforderung selbst im worst case");
+}
+
+void test_realistic_scenario() {
+    printf("\nTest L: Realistisches Szenario (gemischte Delays, Treiber-Variation)\n");
+
+    const int n = 16;
+    double old_biases[n], cycle22_biases[n], corrected_biases[n];
+
+    for (int i = 0; i < n; i++) {
+        // Realistische Variation
+        double d1 = 700.0 + (i % 5) * 20.0;      // 700-780 µs
+        double d3 = 720.0 + ((i+2) % 4) * 15.0;  // 720-765 µs
+        double d_driver_node = 80.0 + (i % 3) * 10.0;  // 80-100 µs
+        double d_driver_coord = 90.0 + (i % 2) * 10.0; // 90-100 µs
+
+        auto old = simulate_old(1000.0, d1, d3);
+        auto c22 = simulate_cycle22(1000.0, d1);
+        auto corr = simulate_corrected(1000.0, d1, d3, d_driver_node, d_driver_coord);
+
+        old_biases[i] = old.bias_us;
+        cycle22_biases[i] = c22.bias_us;
+        corrected_biases[i] = corr.bias_us;
+    }
+
+    // Statistiken berechnen
+    auto calc_stats = [](double* arr, int n) {
+        double min = arr[0], max = arr[0], sum = 0, sum_sq = 0;
+        for (int i = 0; i < n; i++) {
+            if (arr[i] < min) min = arr[i];
+            if (arr[i] > max) max = arr[i];
+            sum += arr[i];
+            sum_sq += arr[i] * arr[i];
+        }
+        double mean = sum / n;
+        double variance = (sum_sq / n) - (mean * mean);
+        double stddev = sqrt(variance);
+        return std::make_tuple(min, max, mean, max - min, stddev);
+    };
+
+    auto [old_min, old_max, old_mean, old_spread, old_std] = calc_stats(old_biases, n);
+    auto [c22_min, c22_max, c22_mean, c22_spread, c22_std] = calc_stats(cycle22_biases, n);
+    auto [cor_min, cor_max, cor_mean, cor_spread, cor_std] = calc_stats(corrected_biases, n);
+
+    printf("\n  OLD:\n");
+    printf("    Mittelwert: %+.2f µs, Spread: %.2f µs, Stddev: %.2f µs\n",
+           old_mean, old_spread, old_std);
+    printf("  Cycle 22:\n");
+    printf("    Mittelwert: %+.2f µs, Spread: %.2f µs, Stddev: %.2f µs\n",
+           c22_mean, c22_spread, c22_std);
+    printf("  CORRECTED:\n");
+    printf("    Mittelwert: %+.2f µs, Spread: %.2f µs, Stddev: %.2f µs\n",
+           cor_mean, cor_spread, cor_std);
+
+    ASSERT_TRUE(fabs(cor_mean) < fabs(c22_mean),
+                "CORRECTED: Besserer Mittelwert als Cycle 22");
+    ASSERT_TRUE(cor_spread < c22_spread,
+                "CORRECTED: Besserer Spread als Cycle 22");
+    ASSERT_TRUE(fabs(cor_mean) < 50.0,
+                "CORRECTED: |Mittelwert| < 50 µs");
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+int main() {
+    printf("=================================================================\n");
+    printf("SensorForge – Software Timestamp Correction Feasibility Test\n");
+    printf("=================================================================\n");
+
+    test_old_symmetric_no_bias();
+    test_old_asymmetric_small_bias();
+    test_old_varying_spread();
+    test_cycle22_systematic_bias();
+    test_cycle22_reduced_spread();
+    test_corrected_zero_driver_delay();
+    test_corrected_symmetric_driver_delay();
+    test_corrected_asymmetric_driver_delay();
+    test_corrected_varying_presend_low_spread();
+    test_comparison_absolute_bias();
+    test_comparison_worst_case_driver();
+    test_realistic_scenario();
+
+    printf("\n=================================================================\n");
+    printf("Test Results: %d PASSED, %d FAILED\n", tests_passed, tests_failed);
+    printf("=================================================================\n");
+
+    return tests_failed > 0 ? 1 : 0;
+}

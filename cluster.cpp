@@ -109,6 +109,8 @@ struct PendingCapture {
     uint32_t cb=0,epoch=0,seq=0;
     int64_t utc=0;
     int64_t anchorUtcUs=0,anchorMonoUs=0,deadlineMonoUs=0;
+    // Beta131-FIX (Eighth cycle, Problem 2): Track time source generation
+    uint32_t sourceGeneration=0;  // Detects source changes even within same epoch
 };
 static PendingCapture pendingCapture;
 bool clusterCaptureArmedFlag=false;
@@ -3033,8 +3035,11 @@ static void processJobCapture(char **f,size_t n,const IPAddress &ip) {
     const int64_t remainingUs=utc-nowUtc;
     captureResultRetry=CaptureResultRetry{};
     clusterCaptureBeginJob(((uint64_t)cb<<32)|seq);
+    // Beta131-FIX (Eighth cycle, Problem 2): Store time source generation
+    // CRITICAL: Capture must detect source changes even within same epoch
     pendingCapture={true,cb,epoch,seq,utc,nowUtc,acceptedMonoUs,
-                    acceptedMonoUs+remainingUs};
+                    acceptedMonoUs+remainingUs,
+                    ClusterEspNowRadio::timeSourceGeneration()};
     sendCaptureResult(cb,epoch,seq,1,0,0);
 }
 static void processJobCaptureResult(char **f,size_t n,const IPAddress &ip) {
@@ -3086,6 +3091,32 @@ static void processJobCaptureResult(char **f,size_t n,const IPAddress &ip) {
 // backends must replace the dispatch mechanism, not the shared UTC contract.
 static void serviceScheduledCapture(){
     if(!pendingCapture.active)return;
+
+    // Beta131-FIX (Eighth cycle, Problem 2): Abort capture on time source change
+    // CRITICAL: Planned captures must NOT execute if coordinator/epoch changed
+    // Epoch check detects cross-epoch switches, generation check detects same-epoch switches
+    const uint32_t currentGeneration = ClusterEspNowRadio::timeSourceGeneration();
+    if(pendingCapture.epoch != currentCoordinatorEpoch) {
+        Serial.printf("[CLUSTER CAPTURE] ABORTED - epoch changed (%u -> %u)\n",
+            pendingCapture.epoch, currentCoordinatorEpoch);
+        PendingCapture p=pendingCapture;
+        pendingCapture.active=false;
+        clusterCaptureArmedFlag=false;
+        queueCaptureTerminalResult(p.cb,p.epoch,p.seq,3,2,0);  // Aborted due to source change
+        return;
+    }
+    // Beta131-FIX (Eighth cycle, Problem 2): Detect source changes within same epoch
+    // CRITICAL: Coordinator ↔ Broadcaster switch invalidates time model even if epoch unchanged
+    if(pendingCapture.sourceGeneration != currentGeneration) {
+        Serial.printf("[CLUSTER CAPTURE] ABORTED - source generation changed (%u -> %u) within epoch %u\n",
+            pendingCapture.sourceGeneration, currentGeneration, currentCoordinatorEpoch);
+        PendingCapture p=pendingCapture;
+        pendingCapture.active=false;
+        clusterCaptureArmedFlag=false;
+        queueCaptureTerminalResult(p.cb,p.epoch,p.seq,3,2,0);  // Aborted due to source change
+        return;
+    }
+
     // Deliberately do not call clusterTimeNowUs() here. A capture accepted
     // at UTC T owns a fixed monotonic deadline even if the coordinator's
     // NTP clock jumps, the node receives a new sync sample, or WiFi drops.
@@ -4989,6 +5020,29 @@ String clusterStatusJson()
     json += ",\"precision_clock_active\":";json += espSource ? "true" : "false";
     json += ",\"precision_sample_age_ms\":" + String(espSource ? (unsigned long)sourceAge : 0UL);
     json += ",\"precision_rtt_us\":" + String(espSource ? sourceRtt : 0.0, 3);
+    // Beta131: Broadcaster handover diagnostics (minimal addition for verification)
+    json += ",\"broadcaster_lease_active\":"; json += esn.broadcasterLeaseActive ? "true" : "false";
+    json += ",\"broadcaster_lease_remaining_ms\":" + String((unsigned long)esn.broadcasterLeaseRemainingMs);
+    json += ",\"broadcaster_production_beacons_sent\":" + String((unsigned long)esn.broadcasterProductionBeaconsSent);
+    json += ",\"coordinator_suppressing_beacons\":"; json += esn.coordinatorSuppressingBeacons ? "true" : "false";
+    json += ",\"coordinator_beacons_suppressed\":" + String((unsigned long)esn.coordinatorBeaconsSuppressed);
+    char activeSourceText[17]; snprintf(activeSourceText,sizeof(activeSourceText),"%016llx",(unsigned long long)esn.activeTimeSource);
+    json += ",\"active_time_source\":\"" + String(activeSourceText) + "\"";
+    json += ",\"source_changes\":" + String((unsigned long)esn.sourceChanges);
+    // Beta131-DIAGNOSIS (Seventeenth cycle): Production beacon blocking diagnostics
+    json += ",\"broadcaster_time_base_invalid\":" + String((unsigned long)esn.broadcasterTimeBaseInvalid);
+    json += ",\"broadcaster_precision_failed\":" + String((unsigned long)esn.broadcasterPrecisionFailed);
+    json += ",\"precision_guard_was_coordinator\":" + String((unsigned long)esn.precisionGuardWasCoordinator);
+    json += ",\"precision_guard_epoch_mismatch\":" + String((unsigned long)esn.precisionGuardEpochMismatch);
+    json += ",\"precision_guard_tag_mismatch\":" + String((unsigned long)esn.precisionGuardTagMismatch);
+    json += ",\"precision_guard_not_valid\":" + String((unsigned long)esn.precisionGuardNotValid);
+    json += ",\"precision_guard_other\":" + String((unsigned long)esn.precisionGuardOther);
+    // Beta131-DIAGNOSIS (Nineteenth cycle): Separate "other" guards for precise diagnosis
+    json += ",\"precision_guard_ref_lifetime\":" + String((unsigned long)esn.precisionGuardRefLifetime);
+    json += ",\"precision_guard_estimate_age\":" + String((unsigned long)esn.precisionGuardEstimateAge);
+    json += ",\"precision_guard_drift\":" + String((unsigned long)esn.precisionGuardDrift);
+    json += ",\"precision_guard_mono_reconstruct\":" + String((unsigned long)esn.precisionGuardMonoReconstruct);
+    json += ",\"precision_guard_utc_range\":" + String((unsigned long)esn.precisionGuardUtcRange);
     json += '}';
     // ESP-NOW result frames are verified by the radio HMAC and replay gate.
     // Bind to the node boot nonce at presentation time; do not infer identity from MAC.
@@ -4997,7 +5051,10 @@ String clusterStatusJson()
     const ClusterEspNowRadio::GrantDiagnosticStats grantStats =
         ClusterEspNowRadio::grantDiagnosticStats();
     json += ",\"espnow_grant_diagnostic\":{";
-    json += "\"handover_enabled\":false";
+    // Beta131-FIX: Show actual handover capability status
+    const bool handoverCapable = (cfg_operating_mode == "time_broadcaster") || localIsCoordinator;
+    json += "\"handover_enabled\":";
+    json += handoverCapable ? "true" : "false";
     json += ",\"received\":" + String((unsigned long)grantStats.received);
     json += ",\"authenticated\":" + String((unsigned long)grantStats.authenticated);
     json += ",\"rejected\":" + String((unsigned long)grantStats.rejected);

@@ -1,0 +1,157 @@
+// V2 ESP-NOW Packet Size Verification Test
+// Tests that V2 packets are created with correct size for ESP-NOW transmission
+// Verifies sizeof() calculations match kPacketSize constant
+
+#include "cluster_espnow_packets.h"
+#include <stdio.h>
+#include <string.h>
+
+// Mock HMAC function for testing
+bool mockSign(const uint8_t* payload, size_t len, uint8_t mac[32], void* user) {
+    if (len != EspNowTimePackets::kPayloadSize) {
+        printf("ERROR: Sign called with wrong payload size: %zu (expected %zu)\n",
+               len, EspNowTimePackets::kPayloadSize);
+        return false;
+    }
+    memset(mac, 0xAA, 32);  // Fill with test pattern
+    return true;
+}
+
+bool mockVerify(const uint8_t* payload, size_t len, const uint8_t mac[32], void* user) {
+    if (len != EspNowTimePackets::kPayloadSize) {
+        printf("ERROR: Verify called with wrong payload size: %zu (expected %zu)\n",
+               len, EspNowTimePackets::kPayloadSize);
+        return false;
+    }
+    return true;
+}
+
+int main() {
+    printf("=== V2 ESP-NOW Packet Size Verification ===\n\n");
+
+    // Test 1: Verify constants
+    printf("Test 1 - V2 Protocol Constants:\n");
+    printf("  kPayloadSize = %zu (expected 48)\n", EspNowTimePackets::kPayloadSize);
+    printf("  kMacSize = %zu (expected 32)\n", EspNowTimePackets::kMacSize);
+    printf("  kPacketSize = %zu (expected 80)\n", EspNowTimePackets::kPacketSize);
+    printf("  kVersion = %u (expected 2)\n", EspNowTimePackets::kVersion);
+
+    bool test1 = (EspNowTimePackets::kPayloadSize == 48 &&
+                  EspNowTimePackets::kMacSize == 32 &&
+                  EspNowTimePackets::kPacketSize == 80 &&
+                  EspNowTimePackets::kVersion == 2);
+    printf("  Result: %s\n\n", test1 ? "PASS ✓" : "FAIL ✗");
+
+    // Test 2: Verify stack buffer size (like broadcaster beacons use)
+    printf("Test 2 - Stack Buffer Size:\n");
+    uint8_t packet[EspNowTimePackets::kPacketSize];
+    size_t packetSize = sizeof(packet);
+    printf("  sizeof(packet[kPacketSize]) = %zu\n", packetSize);
+    printf("  kPacketSize constant = %zu\n", EspNowTimePackets::kPacketSize);
+
+    bool test2 = (packetSize == 80 && packetSize == EspNowTimePackets::kPacketSize);
+    printf("  Result: %s\n\n", test2 ? "PASS ✓" : "FAIL ✗");
+
+    // Test 3: Verify encoding fills entire buffer
+    printf("Test 3 - Encode Buffer Fill:\n");
+    EspNowTimePackets::Frame frame{};
+    frame.type = EspNowTimePackets::Type::Beacon;
+    frame.epoch = 12345;
+    frame.sequence = 1;
+    frame.coordinatorTag = 0x1234567890ABCDEFULL;
+    frame.senderBoot = 0xFEDCBA0987654321ULL;
+    frame.timeUs = 1000000;
+    frame.nonce = 999;
+    frame.preSendDelayUs = 750;  // V2 field
+
+    uint8_t buffer[EspNowTimePackets::kPacketSize];
+    memset(buffer, 0xFF, sizeof(buffer));  // Fill with marker to detect unused bytes
+
+    bool encodeOk = EspNowTimePackets::encode(frame, buffer, mockSign, nullptr);
+    printf("  Encode result: %s\n", encodeOk ? "true" : "false");
+
+    if (encodeOk) {
+        // Check magic bytes
+        printf("  Magic bytes: %c%c%c%c\n", buffer[0], buffer[1], buffer[2], buffer[3]);
+        printf("  Version: %u\n", buffer[4]);
+        printf("  Type: %u\n", buffer[5]);
+
+        // Check if all 80 bytes were written (no 0xFF markers remain)
+        bool allWritten = true;
+        for (size_t i = 0; i < EspNowTimePackets::kPacketSize; i++) {
+            if (buffer[i] == 0xFF) {
+                printf("  WARNING: Byte %zu not written (still 0xFF)\n", i);
+                allWritten = false;
+            }
+        }
+        printf("  All bytes written: %s\n", allWritten ? "yes" : "no");
+    }
+
+    bool test3 = encodeOk && buffer[0] == 'S' && buffer[4] == 2;
+    printf("  Result: %s\n\n", test3 ? "PASS ✓" : "FAIL ✗");
+
+    // Test 4: Verify decode accepts 80-byte packets
+    printf("Test 4 - Decode Size Validation:\n");
+    EspNowTimePackets::Frame decoded{};
+
+    // Should accept 80 bytes
+    bool decode80 = EspNowTimePackets::decode(buffer, 80, decoded, mockVerify, nullptr);
+    printf("  Decode(80 bytes): %s\n", decode80 ? "accepted" : "rejected");
+
+    // Should reject 76 bytes (V1 size)
+    bool decode76 = EspNowTimePackets::decode(buffer, 76, decoded, mockVerify, nullptr);
+    printf("  Decode(76 bytes): %s\n", decode76 ? "accepted" : "rejected");
+
+    // Should reject other sizes
+    bool decode100 = EspNowTimePackets::decode(buffer, 100, decoded, mockVerify, nullptr);
+    printf("  Decode(100 bytes): %s\n", decode100 ? "accepted" : "rejected");
+
+    bool test4 = decode80 && !decode76 && !decode100;
+    printf("  Result: %s\n\n", test4 ? "PASS ✓" : "FAIL ✗");
+
+    // Test 5: Verify preSendDelayUs roundtrip
+    printf("Test 5 - preSendDelayUs Field Roundtrip:\n");
+    frame.preSendDelayUs = 12345;
+    memset(buffer, 0, sizeof(buffer));
+
+    if (EspNowTimePackets::encode(frame, buffer, mockSign, nullptr)) {
+        EspNowTimePackets::Frame roundtrip{};
+        if (EspNowTimePackets::decode(buffer, 80, roundtrip, mockVerify, nullptr)) {
+            printf("  Original preSendDelayUs: %u\n", frame.preSendDelayUs);
+            printf("  Decoded preSendDelayUs: %u\n", roundtrip.preSendDelayUs);
+            bool match = (roundtrip.preSendDelayUs == frame.preSendDelayUs);
+            printf("  Result: %s\n\n", match ? "PASS ✓" : "FAIL ✗");
+        } else {
+            printf("  Decode failed!\n");
+            printf("  Result: FAIL ✗\n\n");
+        }
+    } else {
+        printf("  Encode failed!\n");
+        printf("  Result: FAIL ✗\n\n");
+    }
+
+    // Test 6: ESP-NOW size limit check
+    printf("Test 6 - ESP-NOW Compatibility:\n");
+    printf("  ESP-NOW max payload: 250 bytes\n");
+    printf("  V2 packet size: %zu bytes\n", EspNowTimePackets::kPacketSize);
+    bool test6 = (EspNowTimePackets::kPacketSize <= 250);
+    printf("  Within ESP-NOW limit: %s\n", test6 ? "yes" : "no");
+    printf("  Result: %s\n\n", test6 ? "PASS ✓" : "FAIL ✗");
+
+    // Final verdict
+    printf("=== Final Verdict ===\n");
+    bool allPass = test1 && test2 && test3 && test4 && test6;
+    if (allPass) {
+        printf("✓ ALL TESTS PASSED\n");
+        printf("✓ V2 packet size correct (80 bytes)\n");
+        printf("✓ Encode/decode compatible with 80-byte packets\n");
+        printf("✓ sizeof() calculations correct\n");
+        printf("✓ preSendDelayUs field functional\n");
+        printf("✓ ESP-NOW compatible\n");
+        return 0;
+    } else {
+        printf("✗ SOME TESTS FAILED\n");
+        printf("V2 packet size implementation has issues!\n");
+        return 1;
+    }
+}

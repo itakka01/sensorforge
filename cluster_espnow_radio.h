@@ -111,6 +111,20 @@ struct Diagnostics {
     uint64_t activeTimeSource=0;  // 0=none, or tag of active coordinator/broadcaster
     uint32_t sourceChanges=0;
     uint32_t broadcasterProductionBeaconsSent=0;
+    // Beta131-DIAGNOSIS (Seventeenth cycle): Production beacon blocking diagnostics
+    uint32_t broadcasterTimeBaseInvalid=0;  // Line 2342 blocked: !broadcasterTimeBaseValid
+    uint32_t broadcasterPrecisionFailed=0;  // Line 2350 blocked: precisionUtcNow() returned false
+    uint32_t precisionGuardWasCoordinator=0;  // precisionUtcNow guard: wasCoordinator
+    uint32_t precisionGuardEpochMismatch=0;  // precisionUtcNow guard: epoch != lastEpoch
+    uint32_t precisionGuardTagMismatch=0;  // precisionUtcNow guard: idTag(coordinatorId) != lastTag
+    uint32_t precisionGuardNotValid=0;  // precisionUtcNow guard: !latestQualityEstimate.valid
+    uint32_t precisionGuardOther=0;  // precisionUtcNow guard: basic initialization
+    // Beta131-DIAGNOSIS (Nineteenth cycle): Separate "other" guards
+    uint32_t precisionGuardRefLifetime=0;  // referenceReceivedNodeMono > 30s
+    uint32_t precisionGuardEstimateAge=0;  // estimate age > 120s
+    uint32_t precisionGuardDrift=0;  // drift invalid or > 500ppm
+    uint32_t precisionGuardMonoReconstruct=0;  // reference mono reconstruction failed
+    uint32_t precisionGuardUtcRange=0;  // UTC target out of valid range
 };
 Diagnostics diagnostics();
 // Diagnostic SFDB receiver only; never used by precisionUtcNow() or capture.
@@ -198,5 +212,10 @@ struct NodeSyncReport {
 // Copy up to capacity reports, one per last authenticated node boot ID.
 // Never infer a sync from Probes or from Wi-Fi status.
 size_t nodeSyncReports(NodeSyncReport* out, size_t capacity);
+
+// Beta131-FIX (Eighth cycle, Problem 2): Time source generation for capture validation
+// Returns monotonic counter that increments on every time source switch
+// Used to detect source changes even within same epoch
+uint32_t timeSourceGeneration();
 
 }

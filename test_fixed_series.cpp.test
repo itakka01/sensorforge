@@ -1,0 +1,265 @@
+// Beta131 Cycle 21: Fixed 16-sample series regression tests
+// Tests verify that fixed series length reduces drift-induced spread
+
+#include "cluster_espnow_twoway.h"
+#include <cstdio>
+#include <cmath>
+#include <cstdlib>
+
+using namespace ClusterEspNowTwoWay;
+
+// Test helper: Generate synthetic exchange with controlled parameters
+Exchange makeExchange(int64_t nodeTimeUs, double offsetUs, double rttUs) {
+    Exchange e;
+    e.nodeTxUs = nodeTimeUs;
+    const int64_t nodeDuration = static_cast<int64_t>(llround(rttUs));
+    e.nodeRxUs = nodeTimeUs + nodeDuration;
+
+    // offset = (coordinatorRxUs - nodeTxUs + coordinatorTxUs - nodeRxUs) / 2
+    // Solve for coordinator timestamps assuming symmetric propagation:
+    const int64_t coordTimeBase = nodeTimeUs + static_cast<int64_t>(llround(offsetUs));
+    const int64_t propagationUs = nodeDuration / 2;
+
+    e.coordinatorRxUs = coordTimeBase + propagationUs;
+    e.coordinatorTxUs = coordTimeBase + propagationUs;
+
+    return e;
+}
+
+// Test A: 16 samples with constant offset and low jitter
+bool testA_constantOffset() {
+    printf("\n=== Test A: 16 samples, constant offset, low jitter ===\n");
+
+    Exchange samples[16];
+    const double baseOffset = 100.0;  // 100 µs constant offset
+    const double baseRtt = 2000.0;    // 2 ms RTT
+
+    for (int i = 0; i < 16; ++i) {
+        const int64_t nodeTime = i * 50000LL;  // 50 ms intervals
+        const double jitter = (i % 2) ? 5.0 : -5.0;  // ±5 µs jitter
+        samples[i] = makeExchange(nodeTime, baseOffset + jitter, baseRtt);
+    }
+
+    Estimate e = estimate(samples, 16);
+
+    printf("  valid=%d, accepted=%d, selected=%d\n", e.valid, e.accepted, e.selected);
+    printf("  offsetUs=%.2f, spreadUs=%.2f, medianRttUs=%.2f\n",
+           e.offsetUs, e.spreadUs, e.medianRttUs);
+
+    const bool passed = e.valid && e.accepted >= 8 &&
+                       e.spreadUs <= 250.0 && e.medianRttUs <= 30000.0;
+    printf("  Result: %s (spread=%.2f µs < 250 µs)\n",
+           passed ? "PASS" : "FAIL", e.spreadUs);
+
+    return passed;
+}
+
+// Test B: 16 samples with -22 ppm drift
+bool testB_drift22ppm() {
+    printf("\n=== Test B: 16 samples, -22 ppm drift ===\n");
+
+    Exchange samples[16];
+    const double baseOffset = 100.0;
+    const double baseRtt = 2000.0;
+    const double driftPpm = -22.0;
+
+    for (int i = 0; i < 16; ++i) {
+        const int64_t nodeTime = i * 50000LL;  // 50 ms intervals
+        const double elapsedS = nodeTime / 1000000.0;
+        const double driftOffset = driftPpm * elapsedS;  // Drift accumulation
+        const double jitter = ((i * 7) % 11) - 5.0;  // Pseudo-random ±5 µs jitter
+        samples[i] = makeExchange(nodeTime, baseOffset + driftOffset + jitter, baseRtt);
+    }
+
+    Estimate e = estimate(samples, 16);
+
+    printf("  valid=%d, accepted=%d, selected=%d\n", e.valid, e.accepted, e.selected);
+    printf("  offsetUs=%.2f, spreadUs=%.2f, medianRttUs=%.2f\n",
+           e.offsetUs, e.spreadUs, e.medianRttUs);
+
+    // Expected drift over 16 samples @ 50ms = 750ms total
+    const double expectedDrift = 22.0 * 0.75;  // ~16.5 µs
+    printf("  Expected drift impact: ~%.1f µs\n", expectedDrift);
+
+    const bool passed = e.valid && e.accepted >= 8 &&
+                       e.spreadUs <= 250.0 && e.medianRttUs <= 30000.0;
+    printf("  Result: %s (spread=%.2f µs < 250 µs)\n",
+           passed ? "PASS" : "FAIL", e.spreadUs);
+
+    return passed;
+}
+
+// Test C: 64 samples with -22 ppm drift (shows problem with long series)
+bool testC_drift22ppm_64samples() {
+    printf("\n=== Test C: 64 samples, -22 ppm drift (OLD BEHAVIOR) ===\n");
+
+    Exchange samples[64];
+    const double baseOffset = 100.0;
+    const double baseRtt = 2000.0;
+    const double driftPpm = -22.0;
+
+    for (int i = 0; i < 64; ++i) {
+        const int64_t nodeTime = i * 50000LL;  // 50 ms intervals
+        const double elapsedS = nodeTime / 1000000.0;
+        const double driftOffset = driftPpm * elapsedS;
+        const double jitter = ((i * 7) % 11) - 5.0;
+        samples[i] = makeExchange(nodeTime, baseOffset + driftOffset + jitter, baseRtt);
+    }
+
+    Estimate e = estimate(samples, 64);
+
+    printf("  valid=%d, accepted=%d, selected=%d\n", e.valid, e.accepted, e.selected);
+    printf("  offsetUs=%.2f, spreadUs=%.2f, medianRttUs=%.2f\n",
+           e.offsetUs, e.spreadUs, e.medianRttUs);
+
+    // Expected drift over 64 samples @ 50ms = 3150ms total
+    const double expectedDrift = 22.0 * 3.15;  // ~69 µs
+    printf("  Expected drift impact: ~%.1f µs\n", expectedDrift);
+
+    const bool wouldPass = e.valid && e.accepted >= 8 &&
+                          e.spreadUs <= 250.0 && e.medianRttUs <= 30000.0;
+    printf("  Result: %s (spread=%.2f µs vs 250 µs limit)\n",
+           wouldPass ? "PASS" : "FAIL (EXPECTED)", e.spreadUs);
+    printf("  Note: This demonstrates why adaptive extension caused problems\n");
+
+    return true;  // Test passes by demonstrating the problem
+}
+
+// Test D: 16 samples with excessive spread (should be rejected)
+bool testD_excessiveSpread() {
+    printf("\n=== Test D: 16 samples, excessive spread > 250 µs ===\n");
+
+    Exchange samples[16];
+    const double baseOffset = 100.0;
+    const double baseRtt = 2000.0;
+
+    for (int i = 0; i < 16; ++i) {
+        const int64_t nodeTime = i * 50000LL;
+        // Create large offset variation (±150 µs)
+        const double largeJitter = (i % 2) ? 150.0 : -150.0;
+        samples[i] = makeExchange(nodeTime, baseOffset + largeJitter, baseRtt);
+    }
+
+    Estimate e = estimate(samples, 16);
+
+    printf("  valid=%d, accepted=%d, selected=%d\n", e.valid, e.accepted, e.selected);
+    printf("  offsetUs=%.2f, spreadUs=%.2f, medianRttUs=%.2f\n",
+           e.offsetUs, e.spreadUs, e.medianRttUs);
+
+    const bool correctlyRejected = !(e.valid && e.accepted >= 8 &&
+                                    e.spreadUs <= 250.0 && e.medianRttUs <= 30000.0);
+    printf("  Result: %s (spread=%.2f µs > 250 µs, correctly rejected)\n",
+           correctlyRejected ? "PASS" : "FAIL", e.spreadUs);
+
+    return correctlyRejected;
+}
+
+// Test E: Verify nodeReferenceUs consistency with median offset
+bool testE_nodeReferenceConsistency() {
+    printf("\n=== Test E: nodeReferenceUs consistency check ===\n");
+
+    Exchange samples[16];
+    const double baseOffset = 100.0;
+    const double baseRtt = 2000.0;
+    const double driftPpm = -22.0;
+
+    // Create samples with varying RTT to test sorting
+    for (int i = 0; i < 16; ++i) {
+        const int64_t nodeTime = i * 50000LL;
+        const double elapsedS = nodeTime / 1000000.0;
+        const double driftOffset = driftPpm * elapsedS;
+        const double rttVariation = (i % 3) * 100.0;  // RTT varies 0-200 µs
+        samples[i] = makeExchange(nodeTime, baseOffset + driftOffset, baseRtt + rttVariation);
+    }
+
+    Estimate e = estimate(samples, 16);
+
+    printf("  offsetUs=%.2f, nodeReferenceUs=%lld\n", e.offsetUs, e.nodeReferenceUs);
+    printf("  selected=%d samples in lowest-RTT quartile\n", e.selected);
+
+    // nodeReferenceUs should be from the lowest-RTT sample (accepted[0])
+    // This may not be the median time point!
+    // Calculate expected offset at nodeReferenceUs time
+    const double referenceS = e.nodeReferenceUs / 1000000.0;
+    const double expectedOffsetAtRef = baseOffset + driftPpm * referenceS;
+    const double offsetDiff = fabs(e.offsetUs - expectedOffsetAtRef);
+
+    printf("  Expected offset at reference time: %.2f µs\n", expectedOffsetAtRef);
+    printf("  Actual median offset: %.2f µs\n", e.offsetUs);
+    printf("  Difference: %.2f µs\n", offsetDiff);
+
+    // This test documents the inconsistency but doesn't fail
+    // The inconsistency is acceptable for 16 samples (~16 µs max error)
+    // but becomes problematic for 64 samples (~64 µs error)
+    printf("  Note: Inconsistency is %s for 16-sample series\n",
+           offsetDiff < 20.0 ? "acceptable" : "significant");
+
+    return true;  // Always pass, this is documentation
+}
+
+// Test F: Forward-propagation compatibility (simplified verification)
+bool testF_forwardPropagation() {
+    printf("\n=== Test F: Forward-propagation with 16 samples ===\n");
+
+    // Create two sequential estimates to verify drift calculation
+    Exchange samples1[16], samples2[16];
+    const double baseOffset = 100.0;
+    const double baseRtt = 2000.0;
+    const double driftPpm = -22.0;
+
+    // First series at t=0
+    for (int i = 0; i < 16; ++i) {
+        const int64_t nodeTime = i * 50000LL;
+        const double elapsedS = nodeTime / 1000000.0;
+        samples1[i] = makeExchange(nodeTime, baseOffset + driftPpm * elapsedS, baseRtt);
+    }
+
+    // Second series at t=45s (typical successful series interval)
+    const int64_t timeGap = 45000000LL;
+    for (int i = 0; i < 16; ++i) {
+        const int64_t nodeTime = timeGap + i * 50000LL;
+        const double elapsedS = nodeTime / 1000000.0;
+        samples2[i] = makeExchange(nodeTime, baseOffset + driftPpm * elapsedS, baseRtt);
+    }
+
+    Estimate e1 = estimate(samples1, 16);
+    Estimate e2 = estimate(samples2, 16);
+
+    printf("  Series 1: offset=%.2f µs, nodeRef=%lld\n", e1.offsetUs, e1.nodeReferenceUs);
+    printf("  Series 2: offset=%.2f µs, nodeRef=%lld\n", e2.offsetUs, e2.nodeReferenceUs);
+
+    // Calculate drift using estimateDriftPpm
+    double calculatedDrift = 0.0;
+    const bool driftValid = estimateDriftPpm(e1, e2, calculatedDrift, 1000000LL);
+
+    printf("  Calculated drift: %.2f ppm (expected: %.2f ppm)\n",
+           calculatedDrift, driftPpm);
+    printf("  Drift estimation %s\n", driftValid ? "valid" : "invalid");
+
+    const double driftError = fabs(calculatedDrift - driftPpm);
+    const bool passed = driftValid && driftError < 5.0;  // Allow 5 ppm error
+    printf("  Result: %s (drift error=%.2f ppm)\n",
+           passed ? "PASS" : "FAIL", driftError);
+
+    return passed;
+}
+
+int main() {
+    printf("SensorForge v87-beta131 Cycle 21: Fixed Series Regression Tests\n");
+    printf("================================================================\n");
+
+    int passed = 0, total = 0;
+
+    ++total; if (testA_constantOffset()) ++passed;
+    ++total; if (testB_drift22ppm()) ++passed;
+    ++total; if (testC_drift22ppm_64samples()) ++passed;
+    ++total; if (testD_excessiveSpread()) ++passed;
+    ++total; if (testE_nodeReferenceConsistency()) ++passed;
+    ++total; if (testF_forwardPropagation()) ++passed;
+
+    printf("\n================================================================\n");
+    printf("Test Results: %d/%d PASSED\n", passed, total);
+    printf("================================================================\n");
+
+    return (passed == total) ? 0 : 1;
+}

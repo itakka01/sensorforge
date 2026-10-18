@@ -32,6 +32,9 @@ extern bool clusterEspNowDiagnosticBeaconSign(const uint8_t*, size_t, uint8_t[32
 extern bool clusterEspNowDiagnosticBeaconVerify(const uint8_t*, size_t, const uint8_t[32]);
 namespace ClusterEspNowRadio {
 namespace {
+// V2 Software Timestamp Correction: Track measured delays for next transmission
+static uint32_t lastProbePreSendUs=0;   // Delay from last Probe (for next Probe)
+static uint32_t lastReplyPreSendUs=0;   // Delay from current Reply (for Final)
 constexpr uint32_t kBroadcastEveryMs=10000;
 // No active broadcast traffic: retain only the last 12 authenticated beacons.
 // About 480 bytes static; no heap allocation, no callback-side changes.
@@ -153,6 +156,11 @@ uint8_t grantPendingMac[6]={};
 uint64_t grantPendingTag=0,grantPendingBoot=0;
 uint64_t grantLastCoordinatorTag=0,grantLastCoordinatorBoot=0;
 uint32_t grantLastCoordinatorEpoch=0,grantLastCoordinatorSequence=0;
+// Beta131-FIX (Sixth cycle, Problem 3): Boot history for Grant/Ack replay protection
+// CRITICAL: Track coordinator boot history to allow legitimate reboots while rejecting replay attacks
+struct GrantBootHistory { uint64_t boot=0; uint32_t lastSeenMs=0; };
+GrantBootHistory grantCoordinatorBootHistory[3];  // Last 3 coordinator boot sessions
+uint8_t grantActiveBootIndex=0;  // Currently active boot session index
 
 // Beta131-CORRECTED: Broadcaster production lease state with secure transaction protocol.
 // Broadcaster runs as NODE (synchronizes with coordinator) AND sends production beacons.
@@ -161,6 +169,13 @@ bool broadcasterLeaseActive=false;
 uint32_t broadcasterLeaseActivationMs=0;  // Transaction-confirmed activation time
 uint32_t broadcasterLeaseExpiresMs=0,broadcasterLeaseGrantedAt=0;
 uint32_t broadcasterProductionSequence=0,broadcasterProductionBeaconsSent=0;
+// Beta131-DIAGNOSIS (Seventeenth cycle): Production beacon blocking diagnostics
+uint32_t broadcasterTimeBaseInvalid=0,broadcasterPrecisionFailed=0;
+uint32_t precisionGuardWasCoordinator=0,precisionGuardEpochMismatch=0;
+uint32_t precisionGuardTagMismatch=0,precisionGuardNotValid=0,precisionGuardOther=0;
+// Beta131-DIAGNOSIS (Nineteenth cycle): Separate "other" guards
+uint32_t precisionGuardRefLifetime=0,precisionGuardEstimateAge=0;
+uint32_t precisionGuardDrift=0,precisionGuardMonoReconstruct=0,precisionGuardUtcRange=0;
 uint32_t broadcasterActivationTransaction=0;  // SECURE: confirmed transaction for activation
 bool broadcasterTimeBaseValid=false;  // SECURE: only send production when time is synchronized
 
@@ -177,15 +192,25 @@ uint32_t diagnosticSequence=0;  // Diagnostic beacon sequence
 // Beta131-CORRECTED: Coordinator tracking of granted broadcaster lease with transaction confirmation
 bool coordinatorGrantedLeaseActive=false;
 uint32_t coordinatorGrantedLeaseExpiresMs=0;
+uint32_t coordinatorSuppressionStartMs=0;  // Beta131-FIX (Tenth cycle): Delayed suppression for bootstrap
 uint32_t coordinatorBeaconsSuppressed=0;
 uint32_t coordinatorLeaseTransaction=0;  // SECURE: current lease transaction
 uint64_t coordinatorLeaseBroadcasterTag=0;  // SECURE: authorized broadcaster identity
 uint64_t coordinatorLeaseBroadcasterBoot=0;  // SECURE: authorized broadcaster boot
+// Beta131-FIX (Eighth cycle, Problem 1): Startup guard prevents double-sender after coordinator reboot
+// CRITICAL: After reboot, coordinator has no knowledge of previously granted leases
+// Guard suppresses production beacons until any old leases have safely expired
+uint32_t coordinatorStartupGuardUntilMs=0;  // millis() timestamp when startup guard expires
+// Beta132-V2-FIX: Track broadcaster production beacon reception for condition-based suppression
+// CRITICAL: Coordinator only suppresses when broadcaster CONFIRMED active (received production beacon)
+uint32_t lastProductionBeaconFromLeasedBroadcasterMs=0;  // Last time coordinator received broadcaster production beacon
 
 // Beta131-CORRECTED: Node tracking of active time source with role validation
 uint64_t activeTimeSourceTag=0;  // 0=none, or tag of coordinator/broadcaster
 uint64_t activeTimeSourceBoot=0;  // Boot ID of active source
 uint32_t activeTimeSourceEpoch=0;  // Epoch of active source
+// Beta131-FIX (Seventh cycle, Problem 2): Track active time source MAC for Reply/Final validation
+uint8_t activeTimeSourceMac[6]={};  // MAC address of active time source from validated beacon
 uint32_t sourceChanges=0;
 
 // Callback-safe TX latency sampling. Entries are inserted before esp_now_send().
@@ -236,7 +261,7 @@ void onSent(const uint8_t* mac,esp_now_send_status_t status) {
 bool initialized=false, wasCoordinator=false;
 uint8_t boundChannel=0;
 uint32_t nextBroadcastMs=0,nextSeriesMs=0,nextProbeMs=0,txSequence=0,lastEpoch=0;
-uint32_t nextDiagnosticMs=0, diagnosticSequence=0;
+// Beta131-FIX: nextDiagnosticMs and diagnosticSequence already defined at lines 179-180
 bool diagnosticMode=false;
 // Manual short-rate experiment. No heap and no automatic startup.
 uint32_t beaconExperimentUntilMs=0;
@@ -313,7 +338,18 @@ void serviceSlots(uint32_t now,uint32_t epoch,uint64_t tag,uint32_t boot) {
 uint32_t localBootNonceForControl=0;
 uint64_t lastTag=0;
 // Shared exchange state is declared before benchmark service helpers.
-struct Pending { bool active=false; uint32_t nonce=0; int64_t t1=0,t2=0,t4ReplyRx=0; uint32_t startedMs=0; } pending;
+// Beta131-FIX (Sixth cycle, Problem 1): Bind Probe/Reply/Final to sender identity
+struct Pending {
+    bool active=false;
+    uint32_t nonce=0;
+    int64_t t1=0,t2=0,t4ReplyRx=0;
+    uint32_t startedMs=0;
+    // CRITICAL: Expected sender identity for Reply/Final validation
+    uint64_t expectedTag=0;     // Sender's coordinatorTag (broadcaster OR coordinator)
+    uint64_t expectedBoot=0;    // Sender's boot nonce
+    uint32_t expectedEpoch=0;   // Sender's epoch
+    uint8_t expectedMac[6]={};  // Sender's MAC address
+} pending;
 uint32_t nonceSeed=0;
 // Transport benchmark: 100 downlink packets and 100 uplink packets per peer.
 // The result is *transport* delivery/ACK latency, not an absolute one-way time.
@@ -429,7 +465,9 @@ void benchNodeTick(uint32_t now){
             probe.coordinatorTag=lastTag;probe.senderBoot=localBootNonceForControl;
             probe.nonce=nonceSeed?nonceSeed:1;
             if(sendFrame(probe,kBroadcastMac,&probe.timeUs,false)){
-                pending.active=true;pending.nonce=probe.nonce;pending.t1=probe.timeUs;
+                pending.active=true;pending.nonce=probe.nonce;
+                // V2: Apply software timestamp correction with CURRENT Probe's measured delay
+                pending.t1=probe.timeUs + static_cast<int64_t>(lastProbePreSendUs);
                 pending.startedMs=now;++stats.probesSent;
                 ++benchTimeProbes;
             }
@@ -447,7 +485,15 @@ void benchNodeTick(uint32_t now){
 }
 
 EspNowTimePackets::ReplayWindow coordinatorReplay;
-struct PeerReplay { bool used=false; uint8_t mac[6]={}; EspNowTimePackets::ReplayWindow replay; };
+// Beta131-FIX (Fifth cycle, Problem 1): Track boot history for random nonce replay protection
+struct BootHistory { uint64_t boot=0; uint32_t lastSeenMs=0; };
+struct PeerReplay {
+    bool used=false;
+    uint8_t mac[6]={};
+    EspNowTimePackets::ReplayWindow replay;
+    BootHistory bootHistory[3]; // Track last 3 boot sessions (random nonces, not sequential)
+    uint8_t activeBootIndex=0; // Index of currently active boot in history
+};
 PeerReplay peerReplay[12];
 ClusterEspNowTwoWay::Exchange exchanges[kMaxSamplesPerSeries];
 uint8_t seriesCount=0;
@@ -548,6 +594,43 @@ void acceptEstimate(const ClusterEspNowTwoWay::Estimate &e) {
     latestQualityEstimate=e;
     seriesPrecisionAccepted=true;
     lastPrecisionMs=millis();
+
+    // Beta131-FIX (Twentieth cycle): Forward-propagate beacon reference from Probe/Reply/Final
+    // CRITICAL: Broadcaster cannot receive beacons during lease (coordinator suppresses them).
+    // Solution: Update beacon reference based on successful precision series to keep it fresh.
+    // MATHEMATICS: Use actual offset difference (offsetNew - offsetOld), NOT drift approximation.
+    // This ensures exact UTC tracking even with offset jumps (RF jitter, clock steps).
+    // Condition: broadcaster context (lease exists) AND valid beacon reference AND moving forward
+    if (broadcasterLeaseExpiresMs && referenceUtcUs && referenceReceivedNodeMono) {
+        const int64_t elapsedNode = e.nodeReferenceUs - referenceReceivedNodeMono;
+        // Only update if moving forward and within reasonable bounds (prevent wraparound issues)
+        if (elapsedNode > 0 && elapsedNode < static_cast<int64_t>(kPrecisionLifetimeMs) * 1000LL) {
+            // Calculate new coordinator monotonic from current precision estimate
+            // offsetUs = coordinatorMono - nodeMono (from cluster_espnow_twoway.h:22)
+            const int64_t newCoordMono = e.nodeReferenceUs + static_cast<int64_t>(llround(e.offsetUs));
+
+            // Reconstruct old coordinator monotonic from 32-bit referenceMonoLow
+            // Use same wraparound logic as precisionUtcNow() for consistency
+            const int32_t delta = static_cast<int32_t>(referenceMonoLow - static_cast<uint32_t>(newCoordMono));
+            const int64_t oldCoordMono = newCoordMono + delta;
+
+            // Calculate elapsed coordinator time using ACTUAL offset difference
+            // elapsedCoord = (nodeNew + offsetNew) - (nodeOld + offsetOld)
+            //              = elapsedNode + (offsetNew - offsetOld)
+            // This correctly handles offset jumps without drift approximation error
+            const int64_t elapsedCoord = newCoordMono - oldCoordMono;
+
+            // Update UTC reference by adding exact elapsed coordinator time
+            referenceUtcUs += elapsedCoord;
+
+            // Update coordinator monotonic reference (32-bit low)
+            referenceMonoLow = static_cast<uint32_t>(newCoordMono);
+
+            // Update node reception timestamp
+            referenceReceivedNodeMono = e.nodeReferenceUs;
+        }
+    }
+
     // Regression across multiple *series*, not two potentially noisy cycles.
     if (driftHistoryCount && e.nodeReferenceUs<=driftHistory[driftHistoryCount-1].nodeTimeUs)
         driftHistoryCount=0;
@@ -587,20 +670,7 @@ uint64_t idTag(const char* id) {
 }
 void onReceive(const esp_now_recv_info_t* info,const uint8_t* data,int length) {
     if(!info||!info->src_addr||!data)return;
-    if(length==static_cast<int>(ClusterTimeDiagnosticBeacon::kWireBytes)) {
-        const int64_t rx=esp_timer_get_time();
-        portENTER_CRITICAL(&queueMux);
-        const uint8_t next=static_cast<uint8_t>((diagnosticHead+1)%kDiagnosticQueueSize);
-        if(next==diagnosticTail) ++diagnosticRx.dropped;
-        else {
-            memcpy(diagnosticQueue[diagnosticHead].bytes,data,ClusterTimeDiagnosticBeacon::kWireBytes);
-            memcpy(diagnosticQueue[diagnosticHead].mac,info->src_addr,6);
-            diagnosticQueue[diagnosticHead].rxUs=rx;
-            diagnosticHead=next;
-        }
-        portEXIT_CRITICAL(&queueMux);
-        return;
-    }
+    // Beta133-FIX: Grant frames (96 bytes) - unique size, no conflict
     if(length==static_cast<int>(ClusterTimeGrantProtocol::kWireBytes)) {
         portENTER_CRITICAL(&queueMux);
         const uint8_t next=static_cast<uint8_t>((grantHead+1)%kGrantQueueSize);
@@ -613,7 +683,44 @@ void onReceive(const esp_now_recv_info_t* info,const uint8_t* data,int length) {
         portEXIT_CRITICAL(&queueMux);
         return;
     }
-    if(length!=static_cast<int>(EspNowTimePackets::kPacketSize))return;
+    // Beta133-FIX: 80-byte frames - distinguish Diagnostic ('SFDB') vs Time ('SFEN') by magic
+    // CRITICAL: Both ClusterTimeDiagnosticBeacon and EspNowTimePackets are 80 bytes
+    // Wire format byte 2: Diagnostic='D' (0x44), Time='E' (0x45)
+    // Magic is HMAC-protected, preventing type spoofing attacks
+    if(length==static_cast<int>(ClusterTimeDiagnosticBeacon::kWireBytes)) {
+        // Diagnostic Beacon: magic 'SFDB' (S=0x53, F=0x46, D=0x44, B=0x42)
+        if(length>=3 && data[0]=='S' && data[1]=='F' && data[2]=='D') {
+            const int64_t rx=esp_timer_get_time();
+            portENTER_CRITICAL(&queueMux);
+            const uint8_t next=static_cast<uint8_t>((diagnosticHead+1)%kDiagnosticQueueSize);
+            if(next==diagnosticTail) ++diagnosticRx.dropped;
+            else {
+                memcpy(diagnosticQueue[diagnosticHead].bytes,data,ClusterTimeDiagnosticBeacon::kWireBytes);
+                memcpy(diagnosticQueue[diagnosticHead].mac,info->src_addr,6);
+                diagnosticQueue[diagnosticHead].rxUs=rx;
+                diagnosticHead=next;
+            }
+            portEXIT_CRITICAL(&queueMux);
+            return;
+        }
+        // Time Packet: magic 'SFEN' (S=0x53, F=0x46, E=0x45, N=0x4E)
+        // Fall through to time packet queue below if magic matches
+        if(length<3 || data[0]!='S' || data[1]!='F' || data[2]!='E') {
+            // Invalid magic for 80-byte packet
+            return;
+        }
+        // Valid time packet magic - continue to time queue
+    } else {
+        // Wrong size (not 80, not 96)
+        static uint32_t wrongSizePackets = 0;
+        ++wrongSizePackets;
+        if(wrongSizePackets % 10 == 1) {
+            Serial.printf("[RX-REJECT] Wrong size: got %d bytes, expected %zu or %zu. Count: %u\n",
+                length, ClusterTimeDiagnosticBeacon::kWireBytes, ClusterTimeGrantProtocol::kWireBytes, wrongSizePackets);
+        }
+        return;
+    }
+    // Time packet queue (80-byte 'SFEN' packets only reach here)
     const int64_t rx=esp_timer_get_time();
     portENTER_CRITICAL(&queueMux);
     uint8_t next=static_cast<uint8_t>((head+1)%kQueueSize);
@@ -684,15 +791,27 @@ bool sendFrame(EspNowTimePackets::Frame& f,const uint8_t mac[6],
         txPending[slot].enqueueUs=queuedAtUs;
     } else ++txPendingOverflow;
     portEXIT_CRITICAL(&txMux);
-    // Reply transmits t2; t3 is delivered later by Final. Probe transmits t1.
-    // The timestamp must precede HMAC signing because Probe.timeUs is authenticated.
-    // This remains a software (pre-driver), not RF airtime, timestamp.
+    // V2 Software Timestamp Correction:
+    // - Probe: carries t1 (early) + delay from PREVIOUS Probe
+    // - Reply: carries t2 (RX timestamp, no correction needed)
+    // - Final: carries t3 (early) + delay from CURRENT Reply
+    // Timestamps captured before HMAC for authentication, delays measured after send.
+
     int64_t stampUs=0;
     if(txStampOut) {
         stampUs=esp_timer_get_time();
         *txStampOut=stampUs;
         if(!replyStamp)f.timeUs=stampUs;
     }
+
+    // V2: Set preSendDelayUs ONLY for Final (carries Reply's measured delay)
+    // Probe cannot carry its own delay (not yet measured), so preSendDelayUs=0
+    if(f.type==EspNowTimePackets::Type::Final) {
+        f.preSendDelayUs=lastReplyPreSendUs;  // Measured delay from Reply (already sent)
+    } else {
+        f.preSendDelayUs=0;  // Probe/Reply/others: no delay in packet
+    }
+
     uint8_t b[EspNowTimePackets::kPacketSize];
     if(!EspNowTimePackets::encode(f,b,clusterEspNowTimeSign,nullptr)) {
         if(slot!=kTxPendingCapacity) {
@@ -702,10 +821,27 @@ bool sendFrame(EspNowTimePackets::Frame& f,const uint8_t mac[6],
         }
         return false;
     }
+    // V2: Send packet FIRST, then measure delay (timestamp to esp_now_send completion)
+    if(esp_now_send(mac,b,sizeof(b))!=ESP_OK) {
+        if(slot!=kTxPendingCapacity){
+            portENTER_CRITICAL(&txMux);
+            if(txPending[slot].used && txPending[slot].enqueueUs==queuedAtUs)txPending[slot].used=false;
+            portEXIT_CRITICAL(&txMux);
+        }
+        return false;
+    }
+    // V2: Measure delay AFTER esp_now_send() completes
     if(txStampOut) {
         const int64_t preSendUs=esp_timer_get_time()-stampUs;
         if(preSendUs>=0 && preSendUs<=UINT32_MAX) {
             const uint32_t delta=static_cast<uint32_t>(preSendUs);
+            // V2: Store measured delay for local correction (Probe) or next packet (Reply→Final)
+            if(f.type==EspNowTimePackets::Type::Probe) {
+                lastProbePreSendUs=delta;  // Current Probe's delay (for local correction)
+            } else if(f.type==EspNowTimePackets::Type::Reply) {
+                lastReplyPreSendUs=delta;  // Current Reply's delay (for Final packet)
+            }
+            // Update statistics
             uint32_t &last=replyStamp ? stats.replyTxPreSendLastUs : stats.probeTxPreSendLastUs;
             uint32_t &max=replyStamp ? stats.replyTxPreSendMaxUs : stats.probeTxPreSendMaxUs;
             uint32_t &count=replyStamp ? stats.replyTxPreSendSamples : stats.probeTxPreSendSamples;
@@ -715,14 +851,6 @@ bool sendFrame(EspNowTimePackets::Frame& f,const uint8_t mac[6],
             ++count;
             total+=delta;
         }
-    }
-    if(esp_now_send(mac,b,sizeof(b))!=ESP_OK) {
-        if(slot!=kTxPendingCapacity){
-            portENTER_CRITICAL(&txMux);
-            if(txPending[slot].used && txPending[slot].enqueueUs==queuedAtUs)txPending[slot].used=false;
-            portEXIT_CRITICAL(&txMux);
-        }
-        return false;
     }
     ++stats.sent;return true;
 }
@@ -898,9 +1026,68 @@ bool acceptPeer(const uint8_t mac[6],const EspNowTimePackets::Frame &f) {
     for(auto &p:peerReplay)if(p.used&&memcmp(p.mac,mac,6)==0){slot=&p;break;}
     if(!slot)for(auto &p:peerReplay)if(!p.used){slot=&p;p.used=true;memcpy(p.mac,mac,6);break;}
     if(!slot)return false;
-    if(slot->replay.initialized &&
-       (slot->replay.boot!=f.senderBoot||slot->replay.epoch!=f.epoch))
-        slot->replay={}; // authenticated new boot; no time state transferred
+
+    const uint32_t now=millis();
+
+    // Beta131-FIX (Fifth cycle, Problem 1): Replay protection for RANDOM boot nonces
+    // CRITICAL: Boot IDs are esp_random(), NOT sequential! Cannot use numeric comparison.
+    // STRATEGY: Track last 3 boot sessions with timestamps. Accept active boot + new boots.
+    //           Reject old boot IDs (replay attacks) and backwards epoch changes.
+
+    // Epoch must never decrease (epochs ARE sequential)
+    if(slot->replay.initialized && f.epoch < slot->replay.epoch) {
+        return false;  // REJECT: Backwards epoch (replay attack)
+    }
+
+    // Check if this is a known boot session
+    int8_t knownBootIndex = -1;
+    for(uint8_t i=0; i<3; ++i) {
+        if(slot->bootHistory[i].boot == f.senderBoot && slot->bootHistory[i].boot != 0) {
+            knownBootIndex = i;
+            break;
+        }
+    }
+
+    if(slot->replay.initialized) {
+        const bool bootChanged = (slot->replay.boot != f.senderBoot);
+        const bool epochChanged = (slot->replay.epoch != f.epoch);
+
+        if(bootChanged) {
+            if(knownBootIndex >= 0 && knownBootIndex != slot->activeBootIndex) {
+                // REJECT: Old boot session (was seen before, but not currently active)
+                // This is a replay attack - sender is trying to use an old boot context
+                return false;
+            }
+            // Accept: New boot session (never seen before) - legitimate restart
+            // Add to history, evict oldest if needed
+            uint8_t oldestIndex = 0;
+            uint32_t oldestTime = slot->bootHistory[0].lastSeenMs;
+            for(uint8_t i=1; i<3; ++i) {
+                if(slot->bootHistory[i].lastSeenMs < oldestTime) {
+                    oldestTime = slot->bootHistory[i].lastSeenMs;
+                    oldestIndex = i;
+                }
+            }
+            slot->activeBootIndex = oldestIndex;
+            slot->bootHistory[oldestIndex].boot = f.senderBoot;
+            slot->bootHistory[oldestIndex].lastSeenMs = now;
+            slot->replay = {};  // Reset replay window for new boot
+        } else if(epochChanged) {
+            // Same boot, new epoch - reset replay window
+            slot->replay = {};
+        }
+    } else {
+        // First packet from this peer - initialize
+        slot->activeBootIndex = 0;
+        slot->bootHistory[0].boot = f.senderBoot;
+        slot->bootHistory[0].lastSeenMs = now;
+    }
+
+    // Update last seen time for active boot
+    if(knownBootIndex == slot->activeBootIndex) {
+        slot->bootHistory[slot->activeBootIndex].lastSeenMs = now;
+    }
+
     return EspNowTimePackets::acceptSequence(slot->replay,f);
 }
 void resetTiming(){
@@ -926,17 +1113,15 @@ void finishSample(int64_t t3) {
        exchanges[seriesCount++]={pending.t1,pending.t2,t3,t4};
     pending={};++stats.exchangesComplete;
     if(seriesCount>=seriesTarget) {
+        // Beta131-FIX (Twenty-first cycle): Fixed 16-sample series
+        // REMOVED: Adaptive extension from 16→32→64 samples
+        // REASON: Drift accumulation over long series (up to 12s) causes spread increase
+        // Example: -22 ppm drift × 12s = 264 µs additional spread (exceeds 250 µs limit)
+        // Fixed 16 samples: ~0.72s × 22 µs/s = 15.8 µs drift impact (well within limit)
         auto e=ClusterEspNowTwoWay::estimate(exchanges,seriesCount);
-        const bool quality=e.valid && e.accepted>=8 &&
-            e.spreadUs<=250.0 && e.medianRttUs<=30000.0;
-        if(!quality && seriesTarget<kMaxSamplesPerSeries &&
-           uint32_t(millis()-seriesStartedMs)<kMaxSeriesDurationMs) {
-            seriesTarget=seriesTarget==kInitialSamples ? kExpandedSamples : kMaxSamplesPerSeries;
-        } else {
-            acceptEstimate(e);
-            seriesCount=0;seriesTarget=kInitialSamples;seriesStartedMs=0;
-            nextSeriesMs=millis()+(seriesPrecisionAccepted ? 45000UL : qualityRetryDelayMs());
-        }
+        acceptEstimate(e);
+        seriesCount=0;seriesTarget=kInitialSamples;seriesStartedMs=0;
+        nextSeriesMs=millis()+(seriesPrecisionAccepted ? 45000UL : qualityRetryDelayMs());
     }
 }
 }
@@ -1067,6 +1252,9 @@ void stop() {
     grantPendingTag=grantPendingBoot=0;
     grantLastCoordinatorTag=grantLastCoordinatorBoot=0;
     grantLastCoordinatorEpoch=grantLastCoordinatorSequence=0;
+    // Beta131-FIX (Sixth cycle, Problem 3): Clear boot history on broadcaster reset
+    for(auto &h : grantCoordinatorBootHistory) h = {};
+    grantActiveBootIndex = 0;
     memset(observedBroadcasterMac,0,6);memset(grantPendingMac,0,6);
     // Beta131-CORRECTED: Reset broadcaster and source tracking state
     broadcasterLeaseActive=false;broadcasterLeaseActivationMs=0;
@@ -1074,9 +1262,16 @@ void stop() {
     broadcasterProductionSequence=0;broadcasterProductionBeaconsSent=0;
     broadcasterActivationTransaction=0;broadcasterTimeBaseValid=false;
     coordinatorGrantedLeaseActive=false;coordinatorGrantedLeaseExpiresMs=0;
+    coordinatorSuppressionStartMs=0;  // Beta131-FIX (Tenth cycle): Clear suppression timing
     coordinatorBeaconsSuppressed=0;coordinatorLeaseTransaction=0;
     coordinatorLeaseBroadcasterTag=0;coordinatorLeaseBroadcasterBoot=0;
-    activeTimeSourceTag=0;activeTimeSourceBoot=0;activeTimeSourceEpoch=0;sourceChanges=0;
+    lastProductionBeaconFromLeasedBroadcasterMs=0;  // Beta132-V2-FIX: Clear broadcaster tracking
+    activeTimeSourceTag=0;activeTimeSourceBoot=0;activeTimeSourceEpoch=0;
+    // Beta131-FIX (Ninth cycle, Problem 2): Increment sourceChanges on stop, NOT reset
+    // CRITICAL: Ensures pending captures become invalid after radio restart
+    // Monotonic generation prevents old captures from matching new generation values
+    ++sourceChanges;
+    memset(activeTimeSourceMac,0,6);  // Beta131-FIX (Seventh cycle, Problem 2)
     for(auto &p:slotPeers)p={};slotNextIndex=0;slotOwner=-1;
     slotStartedMs=slotGuardUntilMs=0;slotGrantsSent=slotRotations=0;
     previousEstimate={};latestQualityEstimate={};lastPrecisionMs=0;failedSeries=0;lastSeriesFailure=0;lastRejectedReason=0;lastRejectedSeriesMs=0;lastRejectedHasMetrics=false;lastRejectedEstimate={};consecutiveFailures=0;
@@ -1142,17 +1337,55 @@ bool beaconObservationAt(size_t index, BeaconObservation &out){
 }
 bool precisionUtcNow(uint32_t epoch, const char *coordinatorId,
                     int64_t &utcUs, uint32_t &sampleAgeMs, double &rttUs) {
-    if (!initialized || wasCoordinator || epoch != lastEpoch ||
-        !coordinatorId || idTag(coordinatorId) != lastTag ||
-        !latestQualityEstimate.valid || !referenceUtcUs ||
-        !lastPrecisionMs || !referenceReceivedNodeMono ||
-        (uint32_t)(millis()-lastPrecisionMs)>kPrecisionLifetimeMs) return false;
+    // Beta131-DIAGNOSIS (Seventeenth cycle): Detailed guard tracking
+    if (!initialized || !coordinatorId || !referenceUtcUs || !referenceReceivedNodeMono) {
+        ++precisionGuardOther;  // Basic initialization/validity
+        return false;
+    }
+    if (wasCoordinator) {
+        ++precisionGuardWasCoordinator;
+        return false;
+    }
+    if (epoch != lastEpoch) {
+        ++precisionGuardEpochMismatch;
+        return false;
+    }
+    if (idTag(coordinatorId) != lastTag) {
+        ++precisionGuardTagMismatch;
+        return false;
+    }
+    if (!latestQualityEstimate.valid) {
+        ++precisionGuardNotValid;
+        return false;
+    }
+    if (!lastPrecisionMs || (uint32_t)(millis()-lastPrecisionMs)>kPrecisionLifetimeMs) {
+        ++precisionGuardOther;  // Precision lifetime expired
+        return false;
+    }
     const int64_t now=esp_timer_get_time();
-    if (now<referenceReceivedNodeMono || now-referenceReceivedNodeMono>kReferenceLifetimeUs) return false;
+    // Beta131-FIX (Nineteenth/Twentieth cycle): Broadcaster-specific extended reference lifetime
+    // CRITICAL: Broadcaster receives beacons BEFORE activation but coordinator suppresses
+    // beacons DURING broadcaster lease. Forward-propagation (line 590-613) keeps reference fresh.
+    // Fallback: Extended lifetime if forward-propagation fails or no new precision series accepted.
+    // Use broadcasterLeaseExpiresMs (not broadcasterLeaseActive) to detect broadcaster context
+    // even after lease expires or gets revoked, preventing Catch-22 where revocation disables fix.
+    // Normal nodes: 30s (fresh beacons), Broadcaster: 120s (forward-propagated or holdover)
+    const int64_t maxReferenceAge = broadcasterLeaseExpiresMs ?
+        static_cast<int64_t>(kPrecisionLifetimeMs) * 1000LL : kReferenceLifetimeUs;
+    if (now<referenceReceivedNodeMono || now-referenceReceivedNodeMono>maxReferenceAge) {
+        ++precisionGuardRefLifetime;  // Reference lifetime expired (30s node, 120s broadcaster)
+        return false;
+    }
     const double age=static_cast<double>(now-latestQualityEstimate.nodeReferenceUs);
-    if (age<0 || age>static_cast<double>(kPrecisionLifetimeMs)*1000.0) return false;
+    if (age<0 || age>static_cast<double>(kPrecisionLifetimeMs)*1000.0) {
+        ++precisionGuardEstimateAge;  // Estimate age exceeds lifetime (120s)
+        return false;
+    }
     const double drift=stats.driftValid ? stats.driftPpm : 0.0;
-    if (!std::isfinite(drift) || fabs(drift)>500.0) return false;
+    if (!std::isfinite(drift) || fabs(drift)>500.0) {
+        ++precisionGuardDrift;  // Drift invalid or excessive
+        return false;
+    }
     const double coordinatorNow=static_cast<double>(now)+latestQualityEstimate.offsetUs+
         age*drift/1000000.0;
     // Reconstruct 64-bit coordinator monotonic time from the beacon's low
@@ -1160,9 +1393,17 @@ bool precisionUtcNow(uint32_t epoch, const char *coordinatorId,
     const int64_t approx=static_cast<int64_t>(llround(coordinatorNow));
     const int32_t delta=static_cast<int32_t>(referenceMonoLow-static_cast<uint32_t>(approx));
     const int64_t referenceMono=approx+delta;
-    if (referenceMono<=0 || llabs(referenceMono-approx)>kReferenceLifetimeUs) return false;
+    // Beta131-FIX (Twentieth cycle): Use broadcaster-aware limit for reconstruction check
+    // Must match maxReferenceAge logic to prevent inconsistent failures
+    if (referenceMono<=0 || llabs(referenceMono-approx)>maxReferenceAge) {
+        ++precisionGuardMonoReconstruct;  // Reference mono reconstruction failed
+        return false;
+    }
     const long double target=(long double)referenceUtcUs+(long double)coordinatorNow-referenceMono;
-    if(target<1577836800000000.0L || target>4102444800000000.0L) return false;
+    if(target<1577836800000000.0L || target>4102444800000000.0L) {
+        ++precisionGuardUtcRange;  // UTC target out of valid range
+        return false;
+    }
     utcUs=static_cast<int64_t>(llround(target));
     sampleAgeMs=(uint32_t)(millis()-lastPrecisionMs);
     rttUs=latestQualityEstimate.medianRttUs;
@@ -1260,34 +1501,123 @@ void serviceGrantDiagnostic(uint32_t localBoot) {
                 continue;
             }
 
-            // SECURE: Verify coordinator hasn't changed (prevents coordinator impersonation)
-            if(grantLastCoordinatorTag &&
-                (m.coordinatorTag!=grantLastCoordinatorTag ||
-                 m.coordinatorBoot!=grantLastCoordinatorBoot ||
-                 m.coordinatorEpoch!=grantLastCoordinatorEpoch)) {
+            // Beta131-FIX (Sixth cycle, Problem 3): Boot history replay protection for Grant/Ack
+            // CRITICAL: Allow legitimate coordinator reboots while rejecting replay attacks
+            // Similar logic to acceptPeer() but for Grant/Ack protocol path
+
+            // Check if coordinator boot is in boot history
+            int8_t knownBootIndex = -1;
+            for(uint8_t i=0; i<3; ++i) {
+                if(grantCoordinatorBootHistory[i].boot == m.coordinatorBoot &&
+                   grantCoordinatorBootHistory[i].boot != 0) {
+                    knownBootIndex = i;
+                    break;
+                }
+            }
+
+            const bool bootChanged = (grantLastCoordinatorTag != 0) &&
+                                     (m.coordinatorBoot != grantLastCoordinatorBoot);
+            const bool tagOrEpochChanged = (grantLastCoordinatorTag != 0) &&
+                                           (m.coordinatorTag != grantLastCoordinatorTag ||
+                                            m.coordinatorEpoch != grantLastCoordinatorEpoch);
+
+            // REJECT: Tag/Epoch changed (different coordinator)
+            if(tagOrEpochChanged) {
                 ++grantDiag.rejected;
-                Serial.println("[BROADCASTER] Grant REJECTED - coordinator changed");
+                Serial.printf("[BROADCASTER] Grant REJECTED - coordinator tag/epoch changed (old %llx:%u, new %llx:%u)\n",
+                    grantLastCoordinatorTag, grantLastCoordinatorEpoch, m.coordinatorTag, m.coordinatorEpoch);
                 continue;
             }
 
-            // SECURE: Replay protection (Problem 4)
-            if(m.sequence<=grantLastCoordinatorSequence) {
+            // REJECT: Old boot session (replay attack)
+            // Boot was seen before but is not the currently active boot
+            if(bootChanged && knownBootIndex >= 0 && knownBootIndex != grantActiveBootIndex) {
                 ++grantDiag.replay;
-                Serial.printf("[BROADCASTER] Grant REJECTED - replay (seq %u <= %u)\n",
-                    m.sequence, grantLastCoordinatorSequence);
+                Serial.printf("[BROADCASTER] Grant REJECTED - old boot session replay (boot %llu, active index %u, known index %d)\n",
+                    m.coordinatorBoot, grantActiveBootIndex, knownBootIndex);
                 continue;
             }
 
-            // Track even when ACK transmission fails; never repeat a grant.
+            // ACCEPT: New boot session (legitimate coordinator reboot)
+            if(bootChanged && knownBootIndex < 0) {
+                // Find oldest boot entry to evict
+                uint8_t oldestIndex = 0;
+                uint32_t oldestTime = grantCoordinatorBootHistory[0].lastSeenMs;
+                for(uint8_t i=1; i<3; ++i) {
+                    if(grantCoordinatorBootHistory[i].lastSeenMs < oldestTime) {
+                        oldestTime = grantCoordinatorBootHistory[i].lastSeenMs;
+                        oldestIndex = i;
+                    }
+                }
+                grantActiveBootIndex = oldestIndex;
+                grantCoordinatorBootHistory[oldestIndex].boot = m.coordinatorBoot;
+                grantCoordinatorBootHistory[oldestIndex].lastSeenMs = now;
+                grantLastCoordinatorSequence = 0;  // Reset sequence tracking for new boot
+                Serial.printf("[BROADCASTER] Grant ACCEPTED - new boot session (boot %llu, index %u)\n",
+                    m.coordinatorBoot, grantActiveBootIndex);
+            }
+            // ACCEPT: Same boot session (continuation)
+            else if(!bootChanged || (knownBootIndex == grantActiveBootIndex)) {
+                // Update last seen time for active boot
+                if(knownBootIndex == grantActiveBootIndex) {
+                    grantCoordinatorBootHistory[grantActiveBootIndex].lastSeenMs = now;
+                } else if(grantLastCoordinatorTag == 0) {
+                    // First Grant ever - initialize boot history
+                    grantActiveBootIndex = 0;
+                    grantCoordinatorBootHistory[0].boot = m.coordinatorBoot;
+                    grantCoordinatorBootHistory[0].lastSeenMs = now;
+                }
+
+                // SECURE: Replay protection via sequence numbers (within same boot)
+                if(grantLastCoordinatorTag && m.sequence <= grantLastCoordinatorSequence) {
+                    ++grantDiag.replay;
+                    Serial.printf("[BROADCASTER] Grant REJECTED - sequence replay (seq %u <= %u)\n",
+                        m.sequence, grantLastCoordinatorSequence);
+                    continue;
+                }
+            }
+
+            // Track coordinator identity and sequence
             grantLastCoordinatorTag=m.coordinatorTag;
             grantLastCoordinatorBoot=m.coordinatorBoot;
             grantLastCoordinatorEpoch=m.coordinatorEpoch;
             grantLastCoordinatorSequence=m.sequence;
 
+            // Beta131-FIX (Thirteenth cycle): Bootstrap coordinator identity from Grant
+            // CRITICAL: After broadcaster restart, coordinator suppresses beacons (active lease)
+            // Grant contains authenticated coordinator identity - use for bootstrap
+            // This enables Probe/Reply/Final exchanges without prior beacon reception
+            // Beta131-DIAGNOSIS (Fourteenth cycle): Detect beacon-grant race condition
+            if(!activeTimeSourceTag) {
+                activeTimeSourceTag = m.coordinatorTag;
+                activeTimeSourceBoot = m.coordinatorBoot;
+                activeTimeSourceEpoch = m.coordinatorEpoch;
+                memcpy(activeTimeSourceMac, item.mac, 6);  // Coordinator's MAC from Grant sender
+                Serial.printf("[BOOTSTRAP] Coordinator identity from Grant: tag=%llx boot=%llx epoch=%u\n",
+                    activeTimeSourceTag, activeTimeSourceBoot, activeTimeSourceEpoch);
+            } else {
+                // DIAGNOSIS: Grant-Bootstrap skipped because activeTimeSourceTag already set
+                Serial.printf("[GRANT-RX] Bootstrap SKIPPED - activeTimeSource already set:\n");
+                Serial.printf("  Existing: tag=%llx boot=%llx epoch=%u\n",
+                    activeTimeSourceTag, activeTimeSourceBoot, activeTimeSourceEpoch);
+                Serial.printf("  Grant:    tag=%llx boot=%llx epoch=%u\n",
+                    m.coordinatorTag, m.coordinatorBoot, m.coordinatorEpoch);
+                if(activeTimeSourceEpoch != m.coordinatorEpoch) {
+                    Serial.printf("  ⚠️  EPOCH MISMATCH: existing=%u grant=%u (delta=%d)\n",
+                        activeTimeSourceEpoch, m.coordinatorEpoch,
+                        static_cast<int32_t>(m.coordinatorEpoch - activeTimeSourceEpoch));
+                }
+            }
+
             // Beta131-CORRECTED (Third cycle): Problem 3 FIX - Lease renewal support
+            // Beta131-FIX (Tenth cycle, CORRECTED): Activation delay MUST exceed coordinator suppression
             // CRITICAL: Distinguish initial activation from renewal
-            // Initial: Schedule activation after 500ms guard time
+            // Initial: Schedule activation after 1500ms (coordinator suppresses at 1000ms)
             // Renewal: Already active, just extend expiry time
+            // TIMING: Coordinator suppression = Grant_send + 1000ms
+            //         Broadcaster activation = Grant_receive + 1500ms
+            //         With RF_delay ≤ 50ms: Activation at ~1550ms > Suppression at 1000ms
+            //         Safety margin: 550ms (prevents overlap)
             if(m.leaseMs>=500U && m.leaseMs<=10000U && m.transaction) {
                 const bool isRenewal = broadcasterLeaseActive;
 
@@ -1297,13 +1627,14 @@ void serviceGrantDiagnostic(uint32_t localBoot) {
                     Serial.printf("[BROADCASTER] Lease RENEWED (txn %u): expiry extended to +%u ms\n",
                         m.transaction, m.leaseMs);
                 } else {
-                    // Initial activation - schedule with guard time
+                    // Initial activation - schedule with guard time to prevent coordinator overlap
+                    constexpr uint32_t kActivationDelayMs = 1500U;  // MUST be > coordinator suppression delay
                     broadcasterActivationTransaction=m.transaction;
-                    broadcasterLeaseActivationMs=now+500U;
+                    broadcasterLeaseActivationMs=now+kActivationDelayMs;
                     broadcasterLeaseExpiresMs=now+m.leaseMs;
                     broadcasterLeaseGrantedAt=now;
-                    Serial.printf("[BROADCASTER] Grant ACCEPTED (txn %u): activation at +500ms, expiry at +%u ms\n",
-                        m.transaction, m.leaseMs);
+                    Serial.printf("[BROADCASTER] Grant ACCEPTED (txn %u): activation at +%u ms, expiry at +%u ms\n",
+                        m.transaction, kActivationDelayMs, m.leaseMs);
                 }
             } else {
                 ++grantDiag.rejected;
@@ -1351,11 +1682,10 @@ void serviceGrantDiagnostic(uint32_t localBoot) {
             ++grantDiag.acksVerified;
             grantPendingTransaction=0;
 
-            // Beta131-CORRECTED: Ack confirms pre-emptive suppression (Problem 2 FIX)
-            // Coordinator already suppressed beacons when Grant was sent (line 1374)
-            // Ack just confirms broadcaster received Grant and will activate
-            // Lease continues until expiry (no change to coordinatorGrantedLeaseExpiresMs)
-            Serial.printf("[COORDINATOR] Ack VERIFIED (txn %u) - broadcaster confirmed, lease continues\n",
+            // Beta131-FIX (Tenth cycle, CORRECTED): Ack only confirms broadcaster receipt
+            // TIMING: Suppression already scheduled on Grant send (1000ms delay)
+            // No timing changes needed here - just log confirmation
+            Serial.printf("[COORDINATOR] Ack VERIFIED (txn %u) - broadcaster confirmed (suppression already scheduled)\n",
                 m.transaction);
         } else {
             ++grantDiag.rejected;  // Unknown action or role mismatch
@@ -1364,13 +1694,35 @@ void serviceGrantDiagnostic(uint32_t localBoot) {
     // Beta131-CORRECTED: Coordinator sends Grant (Problem 3 & 4)
     // REMOVED diagnosticMode check - broadcaster detection now uses diagnostic beacon observation
     // SECURE: Only grant to observed broadcaster with fresh beacons
+    // Beta131-FIX (Eighth cycle, Problem 1): No grants during startup guard
     if(!wasCoordinator || !observedBroadcasterAt ||
        diagnosticConsecutive<3 || uint32_t(now-observedBroadcasterAt)>3500U ||
        (grantNextMs && static_cast<int32_t>(now-grantNextMs)<0) ||
-       grantPendingTransaction) return;
+       grantPendingTransaction ||
+       (coordinatorStartupGuardUntilMs && now < coordinatorStartupGuardUntilMs)) return;
 
     // SECURE: Verify broadcaster is not the coordinator itself (Problem 4)
     if(observedBroadcasterTag==lastTag) return;
+
+    // Beta131-FIX (Fourth cycle, Problem 4): SECURITY LIMITATION DOCUMENTED
+    // LIMITATION: Cluster HMAC proves cluster membership, NOT individual device identity
+    // LIMITATION: Tag/Boot/MAC are self-reported, not cryptographically bound to device
+    // LIMITATION: Any cluster member can CLAIM to be broadcaster (no PKI, no device-specific keys)
+    // MITIGATION: Broadcaster role requires explicit mode configuration (cfg_operating_mode="time_broadcaster")
+    // MITIGATION: Production deployments should use firewall/network isolation for broadcaster device
+    // MITIGATION: Diagnostic beacons require consecutive authenticity (diagnosticConsecutive>=3)
+    // RISK: Malicious cluster member could impersonate broadcaster, inject false time
+    // ACCEPTED: Current design trades PKI complexity for operational simplicity in trusted environments
+
+    // Beta131-FIX (Sixth cycle, Problem 3): BOOT HISTORY REPLAY PROTECTION LIMITATION
+    // LIMITATION: 3-entry boot history prevents replay after ≤3 reboots
+    // LIMITATION: Attacker with >3 old boot contexts could replay after sufficient coordinator reboots
+    // SCENARIO: Coordinator reboots 4 times → oldest boot evicted → attacker can replay boot #1
+    // MITIGATION: Boot history timestamps track "last seen" to detect stale replays
+    // MITIGATION: Legitimate reboots happen infrequently (minutes/hours apart, not seconds)
+    // MITIGATION: Replay window resets per boot (sequence numbers prevent in-session replay)
+    // RISK: Sophisticated attacker with multiple captured boots + frequent forced reboots
+    // ACCEPTED: 3-entry limit balances memory (24 bytes) vs. attack complexity in trusted environment
 
     // Beta131-CORRECTED (Third cycle): Problem 3 FIX - Lease renewal timing
     // CRITICAL: Grant interval MUST be < lease duration for seamless renewal
@@ -1397,17 +1749,52 @@ void serviceGrantDiagnostic(uint32_t localBoot) {
     grantPendingTag=m.broadcasterTag;grantPendingBoot=m.broadcasterBoot;
     memcpy(grantPendingMac,observedBroadcasterMac,6);
 
-    // Beta131-CORRECTED: Pre-emptive beacon suppression (Problem 2 FIX)
-    // CRITICAL: Suppress beacons IMMEDIATELY after sending Grant, BEFORE waiting for Ack
-    // This prevents overlap if Ack is lost or delayed
-    // If Ack doesn't arrive within timeout, coordinator will resume beacons (line 1207)
-    coordinatorGrantedLeaseActive=true;
-    coordinatorGrantedLeaseExpiresMs=now+m.leaseMs;
-    coordinatorLeaseTransaction=m.transaction;
-    coordinatorLeaseBroadcasterTag=m.broadcasterTag;
-    coordinatorLeaseBroadcasterBoot=m.broadcasterBoot;
-    Serial.printf("[COORDINATOR] Grant SENT (txn %u) - beacons suppressed pre-emptively, awaiting Ack\n",
-        m.transaction);
+    // Beta131-FIX (Fourth cycle, Problem 2+3): Conservative lease boundaries with renewal logic
+    // CRITICAL: Add 1000ms safety margin to prevent coordinator resuming before broadcaster stops
+    // CRITICAL: Only extend lease if renewal (active) AND expiry soon, prevents unbounded extension
+    // Coordinator lease = Grant send time + leaseMs + 1000ms margin
+    // Broadcaster lease = Grant receive time + leaseMs (no margin)
+    // Guarantees gap (no overlap) even with RF delays, queue delays, clock drift
+    const uint32_t kCoordinatorSafetyMarginMs = 1000U;
+    const uint32_t newExpiryMs = now+m.leaseMs+kCoordinatorSafetyMarginMs;
+    const bool isRenewal = coordinatorGrantedLeaseActive;
+    const uint32_t remainingMs = isRenewal && now<coordinatorGrantedLeaseExpiresMs ?
+                                  coordinatorGrantedLeaseExpiresMs-now : 0;
+
+    // Beta131-FIX (Tenth cycle, Problem 1): Bootstrap-safe beacon suppression
+    // CRITICAL: Don't suppress on INITIAL grant - broadcaster needs beacons to build time base
+    // Only suppress on RENEWAL (broadcaster already active and sending production beacons)
+    // Initial Grant: Send grant but DON'T suppress coordinator beacons yet
+    // Renewal: Broadcaster already active, extend suppression
+    if(isRenewal) {
+        // Renewal with ≤2s remaining: extend lease
+        if(remainingMs<=2000U) {
+            coordinatorGrantedLeaseExpiresMs=newExpiryMs;
+            Serial.printf("[COORDINATOR] Grant RENEWAL (txn %u) - suppression extended to +%u ms\n",
+                m.transaction, m.leaseMs+kCoordinatorSafetyMarginMs);
+        } else {
+            // Renewal with sufficient time remaining: don't extend (prevents unbounded extension)
+            Serial.printf("[COORDINATOR] Grant SENT (txn %u) - suppression continues (%u ms remaining)\n",
+                m.transaction, remainingMs);
+        }
+    } else {
+        // Beta132-V2-FIX: Grace period + condition-based suppression for V2 bootstrap
+        // CRITICAL: V2 requires successful 16-sample series before broadcaster can activate
+        // TIMING: Grace period = 10000ms from Grant send (allows multiple series attempts)
+        //         After grace: Coordinator only suppresses when broadcaster CONFIRMED active
+        //         No timer-based trust: Coordinator verifies production beacons before suppressing
+        // SAFETY: Zero double production (suppress only when broadcaster confirmed)
+        //         Zero deadlock (coordinator continues if broadcaster fails)
+        constexpr uint32_t kSuppressionDelayMs = 10000U;  // V2: Grace period for bootstrap
+        coordinatorLeaseTransaction=m.transaction;
+        coordinatorLeaseBroadcasterTag=m.broadcasterTag;
+        coordinatorLeaseBroadcasterBoot=m.broadcasterBoot;
+        coordinatorGrantedLeaseExpiresMs=newExpiryMs;
+        coordinatorGrantedLeaseActive=true;  // Activate lease tracking
+        coordinatorSuppressionStartMs=now+kSuppressionDelayMs;  // Schedule condition check
+        Serial.printf("[COORDINATOR] Grant INITIAL (txn %u) - grace period %u ms, then condition-based suppression\n",
+            m.transaction, kSuppressionDelayMs);
+    }
 }
 GrantDiagnosticStats grantDiagnosticStats() {return grantDiag;}
 void serviceDiagnosticReceive() {
@@ -1502,6 +1889,20 @@ Diagnostics diagnostics(){Diagnostics out=stats;
     out.activeTimeSource=activeTimeSourceTag;
     out.sourceChanges=sourceChanges;
     out.broadcasterProductionBeaconsSent=broadcasterProductionBeaconsSent;
+    // Beta131-DIAGNOSIS (Seventeenth cycle): Production beacon blocking diagnostics
+    out.broadcasterTimeBaseInvalid=broadcasterTimeBaseInvalid;
+    out.broadcasterPrecisionFailed=broadcasterPrecisionFailed;
+    out.precisionGuardWasCoordinator=precisionGuardWasCoordinator;
+    out.precisionGuardEpochMismatch=precisionGuardEpochMismatch;
+    out.precisionGuardTagMismatch=precisionGuardTagMismatch;
+    out.precisionGuardNotValid=precisionGuardNotValid;
+    out.precisionGuardOther=precisionGuardOther;
+    // Beta131-DIAGNOSIS (Nineteenth cycle): Separate "other" guards
+    out.precisionGuardRefLifetime=precisionGuardRefLifetime;
+    out.precisionGuardEstimateAge=precisionGuardEstimateAge;
+    out.precisionGuardDrift=precisionGuardDrift;
+    out.precisionGuardMonoReconstruct=precisionGuardMonoReconstruct;
+    out.precisionGuardUtcRange=precisionGuardUtcRange;
     return out;}
 bool beaconExperimentStart(uint32_t intervalMs, bool quiet){
     if(intervalMs!=50 && intervalMs!=100 && intervalMs!=200 && intervalMs!=500)return false;
@@ -1653,11 +2054,23 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
     if(esp_wifi_get_channel(&channel,&secondary)!=ESP_OK||!channel){if(initialized)stop();return;}
     uint64_t tag=idTag(id);
     if(initialized&&(diagnosticMode||boundChannel!=channel||lastEpoch!=epoch||lastTag!=tag||wasCoordinator!=coordinator))stop();
-    if(!initialized){
+    const bool freshStart = !initialized;
+    if(freshStart){
         if(!start(channel))return;
         if(!coordinator)loadDriftPrior(id);
     }
     wasCoordinator=coordinator;lastEpoch=epoch;lastTag=tag;localBootNonceForControl=localBootNonce;
+
+    // Beta131-FIX (Eighth cycle, Problem 1): Coordinator startup guard
+    // CRITICAL: After reboot, suppress production beacons until old leases expire
+    // Guard duration: LEASE_DURATION (3000) + SAFETY_MARGIN (1000) + RF_DELAY (50) + MARGIN (1000) = 5050ms
+    // Conservative: 6000ms to handle clock drift and delayed packets
+    if(freshStart && wasCoordinator) {
+        constexpr uint32_t kStartupGuardMs = 6000U;
+        coordinatorStartupGuardUntilMs = millis() + kStartupGuardMs;
+        Serial.printf("[COORDINATOR] Startup guard active for %u ms (until T=%u)\n",
+            kStartupGuardMs, coordinatorStartupGuardUntilMs);
+    }
     if (capturePaused()) {
         if(beaconExperimentUntilMs)beaconExperimentAbort();
         return; // Capture always wins.
@@ -1682,8 +2095,17 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
         }
         ++stats.received;
         EspNowTimePackets::Frame f;
-        if(!EspNowTimePackets::decode(item.bytes,sizeof(item.bytes),f,clusterEspNowTimeVerify,nullptr)||
-           f.epoch!=epoch){++stats.rejected;continue;}
+        // Beta131-FIX (Fifteenth cycle): REMOVE premature epoch validation
+        // CRITICAL: This rejected ALL packets (including Replies/Finals from coordinator)
+        // that didn't match the local device epoch - breaking exchanges completely!
+        // Epoch validation is packet-type-specific and happens later:
+        // - Replies: Line ~2234 (bootstrap-safe, validates against activeTimeSourceEpoch)
+        // - Finals: Line ~2262 (bootstrap-safe, validates against activeTimeSourceEpoch)
+        // - Beacons: No local epoch validation needed (sets activeTimeSourceEpoch)
+        if(!EspNowTimePackets::decode(item.bytes,sizeof(item.bytes),f,clusterEspNowTimeVerify,nullptr)){
+            ++stats.rejected;
+            continue;
+        }
 
         // Beta131-CORRECTED: Source switching moved AFTER full validation (Problem 5)
         // DO NOT switch source here - must validate packet type and role first
@@ -1723,22 +2145,42 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
                 ++stats.rejected;continue;
             }
             ++stats.authenticated;
-            // Beta131-CORRECTED: Coordinator skips Probe handling when broadcaster lease active (Problem 4)
-            // Broadcaster handles node Probes when lease active to offload coordinator RF traffic
-            if(coordinatorGrantedLeaseActive && f.type==EspNowTimePackets::Type::Probe) {
-                continue;  // Let broadcaster handle this Probe
+            // Beta131-FIX (Sixteenth cycle): Coordinator must answer broadcaster's own Probes
+            // CRITICAL: Broadcaster needs time base from coordinator BEFORE it can handle node Probes
+            // Only skip Probes NOT addressed to coordinator (i.e., addressed to broadcaster)
+            // PREVIOUS BUG: Skipped ALL Probes when lease active, including broadcaster's own
+            // This created DEADLOCK: Broadcaster couldn't get time base, couldn't activate, lease expired
+            if(coordinatorGrantedLeaseActive && f.type==EspNowTimePackets::Type::Probe && f.coordinatorTag != tag) {
+                continue;  // Let broadcaster handle Probes addressed to broadcaster (from nodes)
             }
+            // Fall through: Handle Probes addressed to coordinator (from broadcaster itself during bootstrap)
             if(f.type==EspNowTimePackets::Type::NodeSyncReport ||
                f.type==EspNowTimePackets::Type::NodeDriftReport){
                 noteSlotPeer(item.mac,static_cast<uint32_t>(f.senderBoot));
                 acceptNodeReport(f);continue;
             }
-            // Only the slot owner may receive timestamp replies. Authentication
-            // and replay validation above still apply for every received packet.
+            // Beta131-FIX (Seventh cycle, Problem 1): Verify Probe is addressed to THIS coordinator
+            // CRITICAL: Only respond to Probes explicitly addressed to coordinator's sender identity
+            // Prevents responding to Probes meant for broadcaster or other time sources
+            if(f.coordinatorTag != tag) {
+                ++stats.rejected;
+                continue;  // Probe addressed to different sender (e.g., broadcaster)
+            }
+
+            // Beta131-FIX (Sixteenth cycle): Check if Probe is from observed broadcaster
+            // CRITICAL: Broadcaster needs time base from coordinator (not a slot owner!)
+            // Broadcaster is special role, not regular node in slot system
+            const bool isObservedBroadcaster = (observedBroadcasterAt != 0 &&
+                                                memcmp(item.mac, observedBroadcasterMac, 6) == 0 &&
+                                                f.senderBoot == observedBroadcasterBoot);
+
+            // Only slot owner, benchmark target, or observed broadcaster may receive timestamp replies
+            // Authentication and replay validation above still apply for every received packet
             if(!slotIsOwner(item.mac,static_cast<uint32_t>(f.senderBoot)) &&
                !(bench.running && bench.phase==3 && bench.peerIndex<bench.peerCount &&
                  f.senderBoot==bench.peers[bench.peerIndex].boot &&
-                 memcmp(item.mac,benchMac[bench.peerIndex],6)==0)) continue;
+                 memcmp(item.mac,benchMac[bench.peerIndex],6)==0) &&
+               !isObservedBroadcaster) continue;
             // Four-timestamp exchange: t1=Node Probe TX, t2=Coordinator Probe RX,
             // t3=Coordinator REPLY TX call, t4=Node REPLY RX callback.
             // Final delivers t3 metadata only; Final RX is NEVER t4.
@@ -1768,13 +2210,26 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
         if(broadcasterLeaseActive && broadcasterTimeBaseValid && f.type==EspNowTimePackets::Type::Probe &&
            acceptPeer(item.mac,f)) {
             ++stats.authenticated;
+
+            // Beta131-FIX (Seventh cycle, Problem 1): Verify Probe is addressed to THIS broadcaster
+            // CRITICAL: Only respond if Probe explicitly addresses broadcaster's sender identity
+            // During lease, nodes should probe broadcasterOwnTag, not coordinator tag
+            if(f.coordinatorTag != broadcasterOwnTag) {
+                ++stats.rejected;
+                continue;  // Probe addressed to different sender (e.g., coordinator or other broadcaster)
+            }
+
             // Broadcaster handles Probes when authorized and time base is valid
             // This enables nodes to perform full Probe/Reply/Final exchanges with broadcaster
             // Four-timestamp exchange: t1=Node Probe TX, t2=Broadcaster Probe RX,
             // t3=Broadcaster REPLY TX, t4=Node REPLY RX
             if(!ensurePeer(item.mac)){++stats.rejected;continue;}
             EspNowTimePackets::Frame r;
-            r.type=EspNowTimePackets::Type::Reply;r.epoch=epoch;r.coordinatorTag=tag;
+            r.type=EspNowTimePackets::Type::Reply;r.epoch=epoch;
+            // Beta131-FIX (Fifth cycle, Problem 2): Broadcaster uses OWN tag, not coordinator tag
+            // CRITICAL: Reply/Final must match production beacon sender identity (broadcasterOwnTag)
+            // Nodes calculate offset to BROADCASTER's clock, not coordinator's clock
+            r.coordinatorTag=broadcasterOwnTag;  // Broadcaster's identity, not coordinator's
             r.senderBoot=localBootNonce;r.nonce=f.nonce;r.timeUs=item.rxUs;
             int64_t replyDispatchBeforeUs=0;
             // t3 denotes the Reply send path, broadcaster uses own monotonic clock
@@ -1873,6 +2328,24 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
         stats.lastLocalRxUs=item.rxUs;stats.lastRemoteStampUs=f.timeUs;
         if(f.type==EspNowTimePackets::Type::Beacon && f.timeUs>=1577836800000000LL &&
            f.timeUs<4102444800000000LL) {
+            // Beta131-FIX (Twelfth cycle): Ignore own beacons (broadcaster receiving its own production beacons)
+            // CRITICAL: Broadcaster must NOT update activeTimeSourceTag to its own tag
+            // Otherwise: broadcaster sends Probes to itself instead of coordinator → exchanges fail
+            if(f.senderBoot == localBootNonce) {
+                ++stats.rejected;
+                continue;  // Ignore own beacon (self-reception)
+            }
+            // Beta132-V2-FIX: Track broadcaster production beacon reception for condition-based suppression
+            // CRITICAL: Coordinator tracks AUTHENTICATED production beacons from leased broadcaster
+            // This enables condition-based suppression (only suppress when broadcaster confirmed active)
+            // SECURE: Verified via HMAC (acceptPeer above), coordinatorTag + senderBoot match
+            if(wasCoordinator && coordinatorGrantedLeaseActive &&
+               f.coordinatorTag == coordinatorLeaseBroadcasterTag &&
+               f.senderBoot == coordinatorLeaseBroadcasterBoot) {
+                lastProductionBeaconFromLeasedBroadcasterMs = millis();
+                // Serial.printf("[COORDINATOR] Production beacon from broadcaster (tag %llx boot %llx)\n",
+                //     f.coordinatorTag, f.senderBoot);
+            }
             // For beacons only: timeUs=UTC, nonce=lower 32 bits of the
             // coordinator's monotonic timestamp sampled alongside UTC.
             referenceUtcUs=f.timeUs;
@@ -1914,16 +2387,95 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
                 // Any scheduled captures should check activeTimeSourceTag and abort on mismatch
             }
             // Update active source ONLY after successful beacon validation
+            // Beta131-FIX (Seventh cycle, Problem 2): Track sender MAC from validated beacon
+            // Beta131-DIAGNOSIS (Fourteenth cycle): Track beacon updates to detect race with Grant
+            const uint64_t previousTag = activeTimeSourceTag;
+            const uint32_t previousEpoch = activeTimeSourceEpoch;
             activeTimeSourceTag = f.coordinatorTag;
             activeTimeSourceBoot = f.senderBoot;
             activeTimeSourceEpoch = f.epoch;
+            memcpy(activeTimeSourceMac, item.mac, 6);  // Store MAC for Reply/Final validation
+            if(!previousTag) {
+                Serial.printf("[BEACON-RX] FIRST activeTimeSource set: tag=%llx epoch=%u\n",
+                    f.coordinatorTag, f.epoch);
+            } else if(previousEpoch != f.epoch) {
+                Serial.printf("[BEACON-RX] Epoch UPDATE: %u -> %u (delta=%d)\n",
+                    previousEpoch, f.epoch, static_cast<int32_t>(f.epoch - previousEpoch));
+            }
         }
+        // Beta131-FIX (Sixth cycle, Problem 1): Validate Reply/Final sender identity
+        // CRITICAL: Only accept Reply/Final from expected time source (prevents mixed timestamps)
         if(f.type==EspNowTimePackets::Type::Reply&&pending.active&&f.nonce==pending.nonce) {
-            pending.t2=f.timeUs;
-            pending.t4ReplyRx=item.rxUs; // t4: the Reply receive callback, not Final
+            // SECURE: Verify sender identity matches expected time source
+            // Beta131-FIX (Seventh cycle, Problem 2): Also validate sender MAC
+            // Beta131-FIX (Tenth cycle, Problem 2): Bootstrap-safe boot validation
+            // Beta131-FIX (Eleventh cycle): Bootstrap-safe epoch validation
+            bool macMatches = true;
+            bool macIsExpected = false;
+            for(int i=0; i<6; ++i) {
+                if(pending.expectedMac[i] != 0) macIsExpected = true;
+                if(pending.expectedMac[i] != item.mac[i]) macMatches = false;
+            }
+            // BOOTSTRAP: If expectedBoot==0 (no beacon received yet), accept any boot from expected tag
+            // NORMAL: If expectedBoot!=0, require exact boot match to prevent time source confusion
+            const bool bootMatches = (pending.expectedBoot == 0) ? true : (f.senderBoot == pending.expectedBoot);
+            // BOOTSTRAP: If expectedEpoch==0 (no beacon received yet), accept any epoch from expected tag
+            // NORMAL: If expectedEpoch!=0, require exact epoch match to prevent time source confusion
+            const bool epochMatches = (pending.expectedEpoch == 0) ? true : (f.epoch == pending.expectedEpoch);
+            if(f.coordinatorTag==pending.expectedTag &&
+               bootMatches &&
+               epochMatches &&
+               (!macIsExpected || macMatches)) {  // MAC must match if expected
+                pending.t2=f.timeUs;
+                pending.t4ReplyRx=item.rxUs; // t4: the Reply receive callback, not Final
+            } else {
+                // REJECT: Reply from wrong sender (different time source, boot/epoch, or MAC)
+                // This prevents mixing timestamps from coordinator and broadcaster
+                // Beta131-DIAGNOSIS (Fourteenth cycle): Log rejection reason
+                Serial.printf("[REPLY-RX] REJECTED - Identity mismatch:\n");
+                Serial.printf("  coordinatorTag: %llx (expected %llx) %s\n",
+                    f.coordinatorTag, pending.expectedTag,
+                    (f.coordinatorTag==pending.expectedTag) ? "✓" : "✗");
+                Serial.printf("  senderBoot:     %llx (expected %llx) %s\n",
+                    f.senderBoot, pending.expectedBoot,
+                    bootMatches ? "✓" : "✗");
+                Serial.printf("  epoch:          %u (expected %u) %s\n",
+                    f.epoch, pending.expectedEpoch,
+                    epochMatches ? "✓" : "✗");
+                pending={};  // Abort transaction
+                ++stats.rejected;
+            }
         }
-        if(f.type==EspNowTimePackets::Type::Final&&pending.active&&f.nonce==pending.nonce)
-            finishSample(f.timeUs);
+        if(f.type==EspNowTimePackets::Type::Final&&pending.active&&f.nonce==pending.nonce) {
+            // SECURE: Verify sender identity matches expected time source
+            // Beta131-FIX (Seventh cycle, Problem 2): Also validate sender MAC
+            // Beta131-FIX (Tenth cycle, Problem 2): Bootstrap-safe boot validation
+            // Beta131-FIX (Eleventh cycle): Bootstrap-safe epoch validation
+            bool macMatches = true;
+            bool macIsExpected = false;
+            for(int i=0; i<6; ++i) {
+                if(pending.expectedMac[i] != 0) macIsExpected = true;
+                if(pending.expectedMac[i] != item.mac[i]) macMatches = false;
+            }
+            // BOOTSTRAP: If expectedBoot==0 (no beacon received yet), accept any boot from expected tag
+            // NORMAL: If expectedBoot!=0, require exact boot match to prevent time source confusion
+            const bool bootMatches = (pending.expectedBoot == 0) ? true : (f.senderBoot == pending.expectedBoot);
+            // BOOTSTRAP: If expectedEpoch==0 (no beacon received yet), accept any epoch from expected tag
+            // NORMAL: If expectedEpoch!=0, require exact epoch match to prevent time source confusion
+            const bool epochMatches = (pending.expectedEpoch == 0) ? true : (f.epoch == pending.expectedEpoch);
+            if(f.coordinatorTag==pending.expectedTag &&
+               bootMatches &&
+               epochMatches &&
+               (!macIsExpected || macMatches)) {  // MAC must match if expected
+                // V2: Apply software timestamp correction to t3 using delay from Coordinator's Reply
+                int64_t t3_corrected = f.timeUs + static_cast<int64_t>(f.preSendDelayUs);
+                finishSample(t3_corrected);
+            } else {
+                // REJECT: Final from wrong sender (different MAC, tag, boot, or epoch)
+                pending={};  // Abort transaction
+                ++stats.rejected;
+            }
+        }
     }
     uint32_t now=millis();
 
@@ -1997,11 +2549,22 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
                     }
                 }
             } else {
+                // Beta131-DIAGNOSIS (Seventeenth cycle): Track precisionUtcNow() failure
+                ++broadcasterPrecisionFailed;
+                // Beta131-FIX (Eighteenth cycle): Clear activation state on revocation
+                // CRITICAL: Prevents re-activation loop with stale transaction
+                // Without this, broadcasterLeaseActivationMs/Transaction remain set
+                // and re-activate on next tick when broadcasterTimeBaseValid flips to true
                 broadcasterLeaseActive=false;
+                broadcasterLeaseActivationMs=0;
+                broadcasterActivationTransaction=0;
                 broadcasterTimeBaseValid=false;
                 Serial.println("[BROADCASTER] Time base LOST - lease revoked");
             }
         }
+    } else if(broadcasterLeaseActive && !broadcasterTimeBaseValid) {
+        // Beta131-DIAGNOSIS (Seventeenth cycle): Track time base invalid (but lease active)
+        ++broadcasterTimeBaseInvalid;
     }
 
     // Now continue with normal service flow
@@ -2009,9 +2572,10 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
     if(coordinator && bench.running){benchTick(now);return;}
     if(!coordinator && benchNodePhase){benchNodeTick(now);return;}
     if(coordinator){
-        // Beta131: Check if granted broadcaster lease has expired
+        // Beta131-FIX (Tenth cycle): Check if granted broadcaster lease has expired
         if(coordinatorGrantedLeaseActive && now>=coordinatorGrantedLeaseExpiresMs) {
             coordinatorGrantedLeaseActive=false;
+            coordinatorSuppressionStartMs=0;  // Clear suppression timing
             Serial.println("[COORDINATOR] Broadcaster lease EXPIRED - resuming own beacons");
         }
 
@@ -2019,10 +2583,44 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
         if(static_cast<int32_t>(now-nextBroadcastMs)>=0){
             nextBroadcastMs=now+(beaconExperimentUntilMs?beaconExperimentIntervalMs:kBroadcastEveryMs);
 
-            // Beta131: Suppress coordinator beacons while broadcaster lease is active
-            if(coordinatorGrantedLeaseActive) {
+            // Beta131-FIX (Eighth cycle, Problem 1): Startup guard prevents overlap after reboot
+            // CRITICAL: Suppress beacons until any old leases from previous run have expired
+            if(coordinatorStartupGuardUntilMs && now < coordinatorStartupGuardUntilMs) {
                 ++coordinatorBeaconsSuppressed;
-                return;  // Broadcaster is sending production beacons
+                return;  // Startup guard active
+            }
+            // Clear guard once expired
+            if(coordinatorStartupGuardUntilMs && now >= coordinatorStartupGuardUntilMs) {
+                coordinatorStartupGuardUntilMs = 0;
+                Serial.println("[COORDINATOR] Startup guard EXPIRED - resuming production beacons");
+            }
+
+            // Beta132-V2-FIX: Condition-based suppression ONLY when broadcaster confirmed active
+            // CRITICAL: Prevents bootstrap deadlock AND prevents double production
+            // TIMING: Grace period (10s) allows broadcaster to complete 16-sample series
+            // CONDITION: Only suppress when broadcaster sends AUTHENTICATED production beacons
+            // SAFETY: Coordinator automatically resumes if broadcaster stops (no timer-based trust)
+            if(coordinatorGrantedLeaseActive && coordinatorSuppressionStartMs && now >= coordinatorSuppressionStartMs) {
+                // Check if broadcaster is CONFIRMED active (recent production beacon within 2s)
+                const bool broadcasterConfirmedActive = (lastProductionBeaconFromLeasedBroadcasterMs != 0 &&
+                                                         (now - lastProductionBeaconFromLeasedBroadcasterMs) < 2000);
+
+                if(broadcasterConfirmedActive) {
+                    // SAFE: Broadcaster confirmed sending production beacons, suppress coordinator
+                    ++coordinatorBeaconsSuppressed;
+                    return;  // Broadcaster active, suppressing coordinator beacons
+                } else {
+                    // SAFE: Broadcaster not confirmed - keep sending coordinator beacons
+                    // This prevents deadlock: coordinator continues until broadcaster ready
+                    // Log throttled (every 5s) to avoid spam
+                    static uint32_t lastLogMs = 0;
+                    if((now - lastLogMs) >= 5000) {
+                        Serial.printf("[COORDINATOR] Broadcaster not confirmed active - continuing beacons (grace elapsed: %u ms)\n",
+                            now - coordinatorSuppressionStartMs);
+                        lastLogMs = now;
+                    }
+                    // Fall through to send beacon
+                }
             }
 
             EspNowTimePackets::Frame b;
@@ -2036,7 +2634,16 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
             if(clockOk && monoAfter-monoBefore<2000) {
                 b.timeUs=static_cast<int64_t>(tv.tv_sec)*1000000LL+tv.tv_usec;
                 b.nonce=static_cast<uint32_t>(monoBefore+(monoAfter-monoBefore)/2);
-                if(sendFrame(b,kBroadcastMac) && beaconExperimentUntilMs)++beaconExperimentSent;
+                // Beta132-DIAGNOSIS: Track coordinator production beacons sent
+                static uint32_t coordinatorProductionBeaconsSent = 0;
+                if(sendFrame(b,kBroadcastMac)) {
+                    ++coordinatorProductionBeaconsSent;
+                    if(beaconExperimentUntilMs) ++beaconExperimentSent;
+                    // Log every 10th beacon to verify sending
+                    if(coordinatorProductionBeaconsSent % 10 == 0) {
+                        Serial.printf("[COORDINATOR] Production beacon #%u sent\n", coordinatorProductionBeaconsSent);
+                    }
+                }
             }
         }
         return;
@@ -2074,15 +2681,50 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
     nonceSeed=nonceSeed*1664525u+1013904223u;
     if(!nonceSeed)++nonceSeed;
     EspNowTimePackets::Frame p;
-    p.type=EspNowTimePackets::Type::Probe;p.epoch=epoch;p.coordinatorTag=tag;
+    p.type=EspNowTimePackets::Type::Probe;p.epoch=epoch;
+    // Beta131-FIX (Fifth cycle, Problem 2): Probe uses ACTIVE time source, not coordinator
+    // CRITICAL: When broadcaster is active, probe must reference broadcaster (activeTimeSourceTag)
+    // Nodes sync with whoever is currently sending beacons (coordinator OR broadcaster)
+    p.coordinatorTag=activeTimeSourceTag?activeTimeSourceTag:tag;  // Active source or fallback to coordinator
     p.senderBoot=localBootNonce;p.nonce=nonceSeed;
     int64_t probeStampUs=0;
     if(sendFrame(p,kBroadcastMac,&probeStampUs,false)) {
-        pending.active=true;pending.nonce=p.nonce;pending.t1=p.timeUs;
-        pending.startedMs=now;++stats.probesSent;
+        pending.active=true;pending.nonce=p.nonce;
+        // V2: Apply software timestamp correction using THIS Probe's measured delay
+        // sendFrame() measured delay AFTER esp_now_send() and stored in lastProbePreSendUs
+        // This is the CURRENT Probe's actual delay, not from a previous Probe
+        pending.t1=p.timeUs + static_cast<int64_t>(lastProbePreSendUs);
+        pending.startedMs=now;
+        // Beta131-FIX (Sixth cycle, Problem 1): Store expected sender identity
+        // CRITICAL: Reply/Final must come from same time source as Probe was sent to
+        // Beta131-FIX (Eleventh cycle): Use active time source epoch, not local epoch
+        pending.expectedTag=p.coordinatorTag;    // Active time source (broadcaster OR coordinator)
+        pending.expectedBoot=activeTimeSourceBoot;   // Boot ID from last beacon
+        pending.expectedEpoch=activeTimeSourceTag ? activeTimeSourceEpoch : 0;  // Active source epoch (0 if bootstrap)
+        // Beta131-DIAGNOSIS (Fourteenth cycle): Log probe details for troubleshooting
+        if(stats.probesSent % 10 == 0) {  // Every 10th probe to reduce log spam
+            Serial.printf("[PROBE-TX] coordinatorTag=%llx expectedBoot=%llx expectedEpoch=%u\n",
+                p.coordinatorTag, pending.expectedBoot, pending.expectedEpoch);
+        }
+        // Beta131-FIX (Seventh cycle, Problem 2): Store expected MAC from validated beacon
+        // CRITICAL: Reply/Final MAC must match beacon sender to prevent MAC spoofing
+        if(activeTimeSourceTag) {
+            memcpy(pending.expectedMac, activeTimeSourceMac, 6);  // MAC from validated beacon
+        } else {
+            memset(pending.expectedMac, 0, 6);  // No active source yet (fallback)
+        }
+        ++stats.probesSent;
     }
     // Clock selection is performed by clusterTimeNowUs(), never by callback.
 }
+
+// Beta131-FIX (Eighth cycle, Problem 2): Time source generation for capture validation
+// CRITICAL: Captures must detect source changes even within same epoch
+// Returns generation counter that increments on every source switch
+uint32_t timeSourceGeneration() {
+    return sourceChanges;
+}
+
 }
 #else
 namespace ClusterEspNowRadio {
@@ -2116,5 +2758,6 @@ void benchmarkLocalTransport(uint32_t &runId,uint32_t &downReceived,uint32_t &up
 bool benchmarkLocalPacket(size_t,bool&,bool&,uint32_t&){return false;}
 
 size_t nodeSyncReports(NodeSyncReport*,size_t){return 0;}
+uint32_t timeSourceGeneration(){return 0;}
 }
 #endif

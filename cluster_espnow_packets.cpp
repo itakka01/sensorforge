@@ -16,6 +16,7 @@ bool encode(const Frame &f, uint8_t out[kPacketSize], SignMac sign, void* user) 
   out[0]='S';out[1]='F';out[2]='E';out[3]='N';out[4]=kVersion;out[5]=static_cast<uint8_t>(f.type);
   put(out,8,f.epoch,4);put(out,12,f.sequence,4);put(out,16,f.coordinatorTag,8);
   put(out,24,f.senderBoot,8);put(out,32,static_cast<uint64_t>(f.timeUs),8);put(out,40,f.nonce,4);
+  put(out,44,f.preSendDelayUs,4);  // V2: Software timestamp correction
   return sign(out,kPayloadSize,out+kPayloadSize,user);
 }
 bool decode(const uint8_t* b, size_t len, Frame &out, VerifyMac verify, void* user) {
@@ -25,6 +26,7 @@ bool decode(const uint8_t* b, size_t len, Frame &out, VerifyMac verify, void* us
   if(!verify(b,kPayloadSize,b+kPayloadSize,user)) return false;
   Frame f;f.type=type;f.epoch=static_cast<uint32_t>(get(b,8,4));f.sequence=static_cast<uint32_t>(get(b,12,4));
   f.coordinatorTag=get(b,16,8);f.senderBoot=get(b,24,8);f.timeUs=static_cast<int64_t>(get(b,32,8));f.nonce=static_cast<uint32_t>(get(b,40,4));
+  f.preSendDelayUs=static_cast<uint32_t>(get(b,44,4));  // V2: Software timestamp correction
   if(!f.epoch||!f.sequence||!f.coordinatorTag||!f.senderBoot) return false;
   out=f;return true;
 }
