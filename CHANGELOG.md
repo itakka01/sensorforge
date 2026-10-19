@@ -1,3 +1,43 @@
+## v87-beta134 — 2026-10-19 (ESP-NOW REPLAY-DEADLOCK FIX)
+
+**KRITISCHER BUG-FIX: Normale Nodes blieben dauerhaft im Replay-Zustand stehen**
+
+**HARDWAREBEFUND (beta133):**
+- devxiao1/devxiao2: `probes_sent`/`authenticated` eingefroren, `replay` ≈ `received` steigend, `active_time_source=0`
+- Neustart nur von devxiao1 (ohne Flash): sofort 16/16 Exchanges, `replay=0`; devxiao2 als Kontrolle blieb blockiert
+
+**ROOT CAUSE (statisch nachgewiesen):**
+- `makeCoordinatorEpoch()` (`cluster.cpp`) erzeugt Epochs per `esp_random()` – nicht monoton
+- `acceptPeer()` verwarf jedoch jede numerisch kleinere Epoch ("epochs ARE sequential") – dauerhaft und vor der Boot-Behandlung
+- Folge: Nach einem Coordinator-Epoch-Wechsel (~50 %) wurden alle Frames von Coordinator (SyncControl) und Broadcaster (Beacons) als Replay verworfen → keine Sync-Permission → keine Probes → keine Zeitquelle; nur ein Empfänger-Neustart löschte `peerReplay`
+- Zusätzlich: Production-Beacons nutzten einen eigenen Sequenzzähler, den `stop()` bei unveränderter Boot-ID/Epoch auf 0 setzte (nicht-monotone Sequenz im selben Replay-Fenster)
+
+**FIX (`cluster_espnow_radio.cpp`):**
+- `acceptPeer()`: Frames werden nur bei `f.epoch == lastEpoch` (lokal bestätigte Coordinator-Epoch) angenommen – reine Gleichheit, kein numerischer Vergleich
+- `acceptPeer()`/`BootHistory`: Replay-Session = (Boot, Epoch); bekannte, nicht aktive Sessions bleiben abgewiesen; numerische Epoch-Prüfung entfernt
+- Production-Beacons: `sequence = nextSequence()` (gemeinsamer, nie zurückgesetzter Sequenzraum pro Sender); `broadcasterProductionSequence` entfernt
+- BROADCASTER-PROBE-DIAG (beta133) wieder rein passiv: ursprünglicher Kontrollfluss und `stats.rejected`-Zählung wiederhergestellt
+
+**UNVERÄNDERT:**
+- HMAC, `decode()`, `acceptSequence()` (strikt `seq > last`), Frame-Layouts, Schlüssel
+- Qualitätsgrenzen, Zeitschätzung, Timestamp-Mathematik, Grant-Pfad
+
+**RESTRISIKO:**
+- Innerhalb derselben Epoch hält die Historie 3 Sender-Boots; nach >3 Reboots eines Nicht-Coordinator-Senders (Broadcaster/Node) wäre die Replay-Abwehr für dessen älteste Boots wirkungslos
+- Epoch-Wechsel: Frames mit abweichender Epoch werden bis zur lokalen Übernahme der neuen Epoch verworfen (zählen als `replay`)
+- Vertrauen in `lastEpoch` hängt am Replay-Schutz der Cluster-Koordination (SFC1)
+
+**BUILDS:**
+- XIAO: 3.200.655 B (95 %), Freenove: 3.211.851 B (96 %), 0 Warnungen (arduino-cli, IDE 2.3.10, Core 3.3.12)
+- Nicht hardwaregetestet
+
+**IMPACT:**
+- **ALLE 4 Geräte müssen geflasht werden** (Empfängerlogik auf allen Rollen, Beacon-Sequenz auf dem Broadcaster)
+
+**ÄNDERUNGEN:**
+- `cluster_espnow_radio.cpp`: `acceptPeer()`, `BootHistory`, `service()` (Beacon-Sequenz, Probe-Diagnose), `stop()`
+- `sensorforge_version.h`: v87-beta134
+
 ## v87-beta133 — 2026-10-19 (80-BYTE DISPATCH CONFLICT FIX)
 
 **KRITISCHER BUG-FIX: 80-Byte-Paketverteilung korrigiert**

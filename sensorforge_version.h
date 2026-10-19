@@ -21,13 +21,13 @@
 // WebConfig, so a running device can be mapped back to the exact Git tag.
 
 #define SENSORFORGE_RELEASE_NUMBER 87
-#define SENSORFORGE_RELEASE_TAG "v87-beta133"
+#define SENSORFORGE_RELEASE_TAG "v87-beta134"
 #define SENSORFORGE_RELEASE_DATE "2026-10-19"
 #define SENSORFORGE_RELEASE_SUMMARY \
-    "Beta 133: Fix 80-byte dispatch conflict (Diagnostic vs Time packets) - magic-based routing."
+    "Beta 134: ESP-NOW replay fix - random epochs as (boot, epoch) sessions bound to confirmed epoch."
 
-// Current source-tree stage. Beta 133: V2 protocol with fixed 80-byte packet dispatch.
-#define SENSORFORGE_WORKTREE_STAGE "v87-beta133"
+// Current source-tree stage. Beta 134: ESP-NOW replay windows no longer deadlock on random epochs.
+#define SENSORFORGE_WORKTREE_STAGE "v87-beta134"
 #define SENSORFORGE_WORKTREE_DATE "2026-10-19"
 #define SENSORFORGE_WORKTREE_SUMMARY \
-    "v87 Beta 133: 80-byte dispatch conflict fixed - Diagnostic ('SFDB') vs Time ('SFEN') by magic."
+    "v87 Beta 134: replay sessions (boot, epoch) bound to confirmed epoch; beacon sequence unified."

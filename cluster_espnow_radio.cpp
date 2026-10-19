@@ -168,7 +168,7 @@ uint8_t grantActiveBootIndex=0;  // Currently active boot session index
 bool broadcasterLeaseActive=false;
 uint32_t broadcasterLeaseActivationMs=0;  // Transaction-confirmed activation time
 uint32_t broadcasterLeaseExpiresMs=0,broadcasterLeaseGrantedAt=0;
-uint32_t broadcasterProductionSequence=0,broadcasterProductionBeaconsSent=0;
+uint32_t broadcasterProductionBeaconsSent=0;
 // Beta131-DIAGNOSIS (Seventeenth cycle): Production beacon blocking diagnostics
 uint32_t broadcasterTimeBaseInvalid=0,broadcasterPrecisionFailed=0;
 uint32_t precisionGuardWasCoordinator=0,precisionGuardEpochMismatch=0;
@@ -486,12 +486,12 @@ void benchNodeTick(uint32_t now){
 
 EspNowTimePackets::ReplayWindow coordinatorReplay;
 // Beta131-FIX (Fifth cycle, Problem 1): Track boot history for random nonce replay protection
-struct BootHistory { uint64_t boot=0; uint32_t lastSeenMs=0; };
+struct BootHistory { uint64_t boot=0; uint32_t epoch=0; uint32_t lastSeenMs=0; };
 struct PeerReplay {
     bool used=false;
     uint8_t mac[6]={};
     EspNowTimePackets::ReplayWindow replay;
-    BootHistory bootHistory[3]; // Track last 3 boot sessions (random nonces, not sequential)
+    BootHistory bootHistory[3]; // Track last 3 (boot, epoch) sessions (both random, not sequential)
     uint8_t activeBootIndex=0; // Index of currently active boot in history
 };
 PeerReplay peerReplay[12];
@@ -1029,36 +1029,44 @@ bool acceptPeer(const uint8_t mac[6],const EspNowTimePackets::Frame &f) {
 
     const uint32_t now=millis();
 
+    // Beta134-FIX: Bind every time frame to the locally confirmed Coordinator epoch.
+    // All roles call service() with currentCoordinatorEpoch (Coordinator: its own),
+    // and an epoch change stops/restarts the radio, so legitimate frames always carry
+    // lastEpoch. Frames of older or foreign epochs can never open or touch a session,
+    // even after their session was evicted from the bounded history below.
+    // Equality only - epochs are random, never compare them numerically.
+    if(!lastEpoch || f.epoch!=lastEpoch) return false;
+
     // Beta131-FIX (Fifth cycle, Problem 1): Replay protection for RANDOM boot nonces
     // CRITICAL: Boot IDs are esp_random(), NOT sequential! Cannot use numeric comparison.
-    // STRATEGY: Track last 3 boot sessions with timestamps. Accept active boot + new boots.
-    //           Reject old boot IDs (replay attacks) and backwards epoch changes.
+    // Beta133-FIX: Coordinator epochs are ALSO esp_random() (makeCoordinatorEpoch() in
+    // cluster.cpp), so the former "epoch must never decrease" check rejected a new epoch
+    // with ~50% probability - permanently, for every frame of that sender MAC.
+    // STRATEGY: A session is (boot, epoch). Track the last 3 sessions with timestamps.
+    //           Accept the active session + never-seen sessions; reject recently seen,
+    //           no longer active sessions (replay of an older boot or epoch context).
 
-    // Epoch must never decrease (epochs ARE sequential)
-    if(slot->replay.initialized && f.epoch < slot->replay.epoch) {
-        return false;  // REJECT: Backwards epoch (replay attack)
-    }
-
-    // Check if this is a known boot session
+    // Check if this is a known session
     int8_t knownBootIndex = -1;
     for(uint8_t i=0; i<3; ++i) {
-        if(slot->bootHistory[i].boot == f.senderBoot && slot->bootHistory[i].boot != 0) {
+        if(slot->bootHistory[i].boot == f.senderBoot && slot->bootHistory[i].boot != 0 &&
+           slot->bootHistory[i].epoch == f.epoch) {
             knownBootIndex = i;
             break;
         }
     }
 
     if(slot->replay.initialized) {
-        const bool bootChanged = (slot->replay.boot != f.senderBoot);
-        const bool epochChanged = (slot->replay.epoch != f.epoch);
+        const bool sessionChanged = (slot->replay.boot != f.senderBoot) ||
+                                    (slot->replay.epoch != f.epoch);
 
-        if(bootChanged) {
+        if(sessionChanged) {
             if(knownBootIndex >= 0 && knownBootIndex != slot->activeBootIndex) {
-                // REJECT: Old boot session (was seen before, but not currently active)
-                // This is a replay attack - sender is trying to use an old boot context
+                // REJECT: Old session (was seen before, but not currently active)
+                // This is a replay attack - sender is trying to use an old boot/epoch context
                 return false;
             }
-            // Accept: New boot session (never seen before) - legitimate restart
+            // Accept: New session (never seen before) - legitimate restart or new epoch
             // Add to history, evict oldest if needed
             uint8_t oldestIndex = 0;
             uint32_t oldestTime = slot->bootHistory[0].lastSeenMs;
@@ -1070,20 +1078,19 @@ bool acceptPeer(const uint8_t mac[6],const EspNowTimePackets::Frame &f) {
             }
             slot->activeBootIndex = oldestIndex;
             slot->bootHistory[oldestIndex].boot = f.senderBoot;
+            slot->bootHistory[oldestIndex].epoch = f.epoch;
             slot->bootHistory[oldestIndex].lastSeenMs = now;
-            slot->replay = {};  // Reset replay window for new boot
-        } else if(epochChanged) {
-            // Same boot, new epoch - reset replay window
-            slot->replay = {};
+            slot->replay = {};  // Reset replay window for new session
         }
     } else {
         // First packet from this peer - initialize
         slot->activeBootIndex = 0;
         slot->bootHistory[0].boot = f.senderBoot;
+        slot->bootHistory[0].epoch = f.epoch;
         slot->bootHistory[0].lastSeenMs = now;
     }
 
-    // Update last seen time for active boot
+    // Update last seen time for active session
     if(knownBootIndex == slot->activeBootIndex) {
         slot->bootHistory[slot->activeBootIndex].lastSeenMs = now;
     }
@@ -1259,7 +1266,7 @@ void stop() {
     // Beta131-CORRECTED: Reset broadcaster and source tracking state
     broadcasterLeaseActive=false;broadcasterLeaseActivationMs=0;
     broadcasterLeaseExpiresMs=0;broadcasterLeaseGrantedAt=0;
-    broadcasterProductionSequence=0;broadcasterProductionBeaconsSent=0;
+    broadcasterProductionBeaconsSent=0;
     broadcasterActivationTransaction=0;broadcasterTimeBaseValid=false;
     coordinatorGrantedLeaseActive=false;coordinatorGrantedLeaseExpiresMs=0;
     coordinatorSuppressionStartMs=0;  // Beta131-FIX (Tenth cycle): Clear suppression timing
@@ -2218,22 +2225,21 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
         static uint32_t diagReplyFailed = 0;
         static uint32_t diagLastLogMs = 0;
 
-        if(f.type==EspNowTimePackets::Type::Probe && broadcasterOwnTag) {
+        // Diagnosis is passive: it only counts. Probes failing the gate below fall
+        // through to the type filter exactly as before (++stats.rejected there).
+        const bool diagProbe = f.type==EspNowTimePackets::Type::Probe && broadcasterOwnTag;
+        if(diagProbe) {
             ++diagProbesTotal;
+            if(!broadcasterLeaseActive) ++diagLeaseInactive;
+            else if(!broadcasterTimeBaseValid) ++diagTimeInvalid;
+        }
 
-            if(!broadcasterLeaseActive) {
-                ++diagLeaseInactive;
-                continue;
-            }
-            if(!broadcasterTimeBaseValid) {
-                ++diagTimeInvalid;
-                continue;
-            }
-            if(!acceptPeer(item.mac,f)) {
-                ++diagAuthFailed;
-                continue;
-            }
-
+        bool broadcasterProbeAccepted=false;
+        if(broadcasterLeaseActive && broadcasterTimeBaseValid && f.type==EspNowTimePackets::Type::Probe) {
+            broadcasterProbeAccepted=acceptPeer(item.mac,f);
+            if(!broadcasterProbeAccepted && diagProbe) ++diagAuthFailed;
+        }
+        if(broadcasterProbeAccepted) {
             ++stats.authenticated;
 
             // Beta131-FIX (Seventh cycle, Problem 1): Verify Probe is addressed to THIS broadcaster
@@ -2576,8 +2582,10 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
                 EspNowTimePackets::Frame prodBeacon{};
                 prodBeacon.type=EspNowTimePackets::Type::Beacon;
                 prodBeacon.epoch=epoch;
-                prodBeacon.sequence=++broadcasterProductionSequence;
-                if(!prodBeacon.sequence) prodBeacon.sequence=++broadcasterProductionSequence;
+                // Same sequence space as every other frame from this MAC/boot/epoch:
+                // receivers keep ONE replay window per sender MAC, and txSequence is
+                // never reset by stop(), so a radio restart cannot replay low sequences.
+                prodBeacon.sequence=nextSequence();
                 // Beta131-FIX (Fourth cycle, Problem 1): Use broadcaster's OWN tag as sender identity
                 // Distinguishes: coordinator=time authority, broadcaster=physical sender+authorized source
                 // Nodes track broadcaster as activeTimeSourceTag (not coordinator) when lease active
