@@ -1,0 +1,82 @@
+// Beta137 host test: role-based WiFi power save decisions (wifi_power_policy.h).
+//   g++ -std=c++17 -Wall -Wextra -I. -x c++ test_wifi_power_policy.cpp.test -o /tmp/test_wifi_power_policy
+// The service loop below mirrors WifiPowerPolicy::service() with a simulated
+// esp_wifi_get_ps()/esp_wifi_set_ps(); the decisions are the real header functions.
+
+#include <stdio.h>
+#include "wifi_power_policy.h"
+
+using namespace WifiPowerPolicy;
+static int g_failures = 0;
+#define CHECK(cond, msg) do { if (cond) printf("  PASS %s\n", msg); \
+    else { printf("  FAIL %s (line %d)\n", msg, __LINE__); ++g_failures; } } while (0)
+
+struct FakeWifi {
+    bool staUp = true;
+    Mode radio = Mode::MinModem;      // what esp_wifi_get_ps() returns
+    Mode arduinoSleep = Mode::MinModem; // WiFi.getSleep(): restored on STA start
+    bool failSet = false;
+    unsigned setCalls = 0;
+    void staRestart() { radio = arduinoSleep; }  // Arduino STA_START handler
+};
+
+struct Service {
+    Status st; uint32_t lastFailureMs = 0;
+    void run(FakeWifi &w, bool coord, bool bcast, uint32_t now) {
+        st.timeCriticalRole = roleRequiresNoSleep(coord, bcast);
+        st.expected = expectedMode(st.timeCriticalRole, w.arduinoSleep);
+        if (!w.staUp) { st.actual = Mode::Unknown; return; }
+        st.actual = w.radio;
+        if (!shouldApply(true, st.actual, st.expected, lastFailureMs, now)) return;
+        ++w.setCalls;
+        if (!w.failSet) { w.radio = st.expected; ++st.applies; st.actual = st.expected; lastFailureMs = 0; }
+        else { ++st.applyFailures; lastFailureMs = now ? now : 1; }
+    }
+};
+
+int main() {
+    printf("=== WiFi power policy (beta137) ===\n");
+    printf("T1 coordinator gets WIFI_PS_NONE\n");
+    { FakeWifi w; Service s; s.run(w, true, false, 1000);
+      CHECK(w.radio == Mode::None && s.st.applies == 1, "coordinator -> none"); }
+
+    printf("T2 time broadcaster gets WIFI_PS_NONE independent of lease\n");
+    { FakeWifi w; Service s; s.run(w, false, true, 1000);
+      CHECK(w.radio == Mode::None, "broadcaster -> none");
+      for (uint32_t t = 2000; t < 60000; t += 250) s.run(w, false, true, t);  // lease state is no input
+      CHECK(w.setCalls == 1, "no repeated set calls while stable"); }
+
+    printf("T3 normal node keeps previous behaviour\n");
+    { FakeWifi w; Service s; for (uint32_t t = 0; t < 10000; t += 250) s.run(w, false, false, t);
+      CHECK(w.radio == Mode::MinModem && w.setCalls == 0, "node untouched (min_modem, no set call)");
+      FakeWifi w2; w2.arduinoSleep = Mode::None; w2.radio = Mode::None; Service s2; s2.run(w2, false, false, 0);
+      CHECK(w2.setCalls == 0, "node with Arduino sleep disabled stays disabled"); }
+
+    printf("T4 role changes update the setting\n");
+    { FakeWifi w; Service s; s.run(w, false, false, 0);
+      s.run(w, true, false, 250);  CHECK(w.radio == Mode::None, "node -> coordinator: none");
+      s.run(w, false, false, 500); CHECK(w.radio == Mode::MinModem, "coordinator -> node: restored min_modem");
+      s.run(w, false, true, 750);  CHECK(w.radio == Mode::None, "node -> broadcaster: none");
+      CHECK(w.setCalls == 3 && s.st.applies == 3, "exactly one set call per role change"); }
+
+    printf("T5 reconnect / re-init restores the required setting\n");
+    { FakeWifi w; Service s; s.run(w, true, false, 0);
+      w.staUp = false; s.run(w, true, false, 250);
+      CHECK(s.st.actual == Mode::Unknown && w.setCalls == 1, "STA down: no call, actual unknown");
+      w.staUp = true; w.staRestart(); s.run(w, true, false, 500);
+      CHECK(w.radio == Mode::None && w.setCalls == 2, "after STA restart none re-applied"); }
+
+    printf("T6 API failures are visible and backed off\n");
+    { FakeWifi w; w.failSet = true; Service s;
+      for (uint32_t t = 1000; t < 6000; t += 250) s.run(w, true, false, t);
+      CHECK(s.st.applyFailures == 1, "one failure within 5 s back-off");
+      s.run(w, true, false, 6000);
+      CHECK(s.st.applyFailures == 2, "retry after back-off, failure counted");
+      w.failSet = false; s.run(w, true, false, 11000);
+      CHECK(w.radio == Mode::None && s.st.applies == 1, "recovers when the API succeeds");
+      CHECK(!shouldApply(true, Mode::Unknown, Mode::None, 0, 0), "unknown actual mode never triggers a set");
+      CHECK(!shouldApply(true, Mode::None, Mode::Unknown, 0, 0), "unknown expected mode never triggers a set"); }
+
+    printf("=== %s (%d failures) ===\n", g_failures ? "FAILED" : "ALL PASSED", g_failures);
+    return g_failures ? 1 : 0;
+}

@@ -21,13 +21,13 @@
 // WebConfig, so a running device can be mapped back to the exact Git tag.
 
 #define SENSORFORGE_RELEASE_NUMBER 87
-#define SENSORFORGE_RELEASE_TAG "v87-beta136"
-#define SENSORFORGE_RELEASE_DATE "2026-10-19"
+#define SENSORFORGE_RELEASE_TAG "v87-beta137"
+#define SENSORFORGE_RELEASE_DATE "2026-10-20"
 #define SENSORFORGE_RELEASE_SUMMARY \
-    "Beta 136: Day ZIP includes verified EXAPAN converter from SD:/tools (version + SHA-256)."
+    "Beta 137: Coordinator and Time Broadcaster run with WiFi modem sleep disabled (WIFI_PS_NONE)."
 
-// Current source-tree stage. Beta 136: optional EXAPAN converter in day ZIP downloads.
-#define SENSORFORGE_WORKTREE_STAGE "v87-beta136"
-#define SENSORFORGE_WORKTREE_DATE "2026-10-19"
+// Current source-tree stage. Beta 137: role-based WiFi power save for time-critical roles.
+#define SENSORFORGE_WORKTREE_STAGE "v87-beta137"
+#define SENSORFORGE_WORKTREE_DATE "2026-10-20"
 #define SENSORFORGE_WORKTREE_SUMMARY \
-    "v87 Beta 136: day ZIP adds SD:/tools EXAPAN converter (released SHA-256 list) + notices."
+    "v87 Beta 137: WIFI_PS_NONE for coordinator/time broadcaster; /cluster_status wifi_ps_* fields."

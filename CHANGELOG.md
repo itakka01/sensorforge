@@ -1,3 +1,22 @@
+## v87-beta137 — 2026-10-20 (WLAN-MODEM-SLEEP FÜR ZEITKRITISCHE ROLLEN AUS)
+
+**Architekturregel:** Coordinator und Time Broadcaster arbeiten mit `WIFI_PS_NONE`. Normale Nodes behalten das bisherige Verhalten.
+
+**Bisher:** Die Firmware setzte den Power-Save-Modus nirgends; Arduino-ESP32 3.3.12 verwendet auf dem ESP32-S3 standardmäßig `WIFI_PS_MIN_MODEM` (`WiFiGeneric.cpp`) und setzt ihn bei jedem STA-Start erneut (`STA.cpp`). Alle vier Geräte liefen daher mit Modem-Sleep.
+
+**ÄNDERUNG:**
+- `wifi_power_policy.cpp/.h` (neu): rollenabhängige Steuerung über `esp_wifi_get_ps()`/`esp_wifi_set_ps()`; Rolle = gewählter Coordinator (`runtimeActive && localIsCoordinator`) oder konfigurierter `operating_mode=time_broadcaster` – unabhängig vom Lease-Zustand
+- Prüfung alle 250 ms per `esp_wifi_get_ps()`; Setzen nur bei Abweichung (Rollenwechsel, STA-Neustart/Reconnect), Rücklese-Verifikation, 5 s Pause nach Fehlschlag
+- Nodes: Sollwert = `WiFi.getSleep()` (bisheriges Verhalten); kein `WiFi.setSleep()`, Arduino-Konfiguration bleibt unverändert
+- Während Capture-Schutz keine Änderung
+- `cluster.cpp`: Aufruf in `clusterLoop()`; `/cluster_status` → `espnow_time_local.wifi_ps_mode` (gelesen), `wifi_ps_expected`, `wifi_ps_time_critical_role`, `wifi_ps_applies`, `wifi_ps_apply_failures`, `wifi_ps_read_failures`, `wifi_ps_last_error`
+
+**UNVERÄNDERT:** Estimator, 250-µs-Grenze, Zeitstempel/Offset, HMAC, Replay, Epoch/Sequenz, Lease, Suppression, Early-Resume, Capture, Frame-Layouts.
+
+**TESTS:** `test_wifi_power_policy.cpp.test` (neu, 17/17); alle 13 Host-Tests grün.
+
+**HINWEIS:** Modem-Sleep ist eine plausible, nicht nachgewiesene Ursache der Coordinator-Streuung; Vergleich mit beta136 im 60-min-Test erforderlich. Höherer Stromverbrauch für Coordinator/Broadcaster.
+
 ## v87-beta136 — 2026-10-19 (EXAPAN-KONVERTER IM TAGESARCHIV)
 
 **NEU: Optionaler Archiv-Konverter im Tages-ZIP**

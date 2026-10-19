@@ -33,6 +33,7 @@
 #include <time.h>
 #include <sys/time.h>
 #include <esp_timer.h>
+#include "wifi_power_policy.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -4089,6 +4090,15 @@ void clusterMdnsAdvertise()
 
 void clusterLoop()
 {
+    // Beta137: Coordinator and configured Time Broadcaster run without WiFi modem
+    // sleep (WIFI_PS_NONE); other roles keep the Arduino default. Follows the ROLE,
+    // not the broadcaster lease. Never touched while a capture deadline is protected.
+    if (!clusterCaptureProtectionActive()) {
+        WifiPowerPolicy::service(
+            runtimeActive && localIsCoordinator,
+            cfg_operating_mode == "time_broadcaster"
+        );
+    }
     // Diagnostic ESP-NOW time transport only; never changes cluster clock.
     // Capture deadline takes precedence over any radio work.
     if (!clusterCaptureProtectionActive()) {
@@ -5064,6 +5074,17 @@ String clusterStatusJson()
     char activeSourceText[17]; snprintf(activeSourceText,sizeof(activeSourceText),"%016llx",(unsigned long long)esn.activeTimeSource);
     json += ",\"active_time_source\":\"" + String(activeSourceText) + "\"";
     json += ",\"source_changes\":" + String((unsigned long)esn.sourceChanges);
+    // Beta137: role-based WiFi power save (actual value read via esp_wifi_get_ps()).
+    {
+        const WifiPowerPolicy::Status wps = WifiPowerPolicy::status();
+        json += ",\"wifi_ps_mode\":\""; json += WifiPowerPolicy::modeName(wps.actual); json += "\"";
+        json += ",\"wifi_ps_expected\":\""; json += WifiPowerPolicy::modeName(wps.expected); json += "\"";
+        json += ",\"wifi_ps_time_critical_role\":"; json += wps.timeCriticalRole ? "true" : "false";
+        json += ",\"wifi_ps_applies\":" + String((unsigned long)wps.applies);
+        json += ",\"wifi_ps_apply_failures\":" + String((unsigned long)wps.applyFailures);
+        json += ",\"wifi_ps_read_failures\":" + String((unsigned long)wps.readFailures);
+        json += ",\"wifi_ps_last_error\":" + String((long)wps.lastError);
+    }
     // Beta131-DIAGNOSIS (Seventeenth cycle): Production beacon blocking diagnostics
     json += ",\"broadcaster_time_base_invalid\":" + String((unsigned long)esn.broadcasterTimeBaseInvalid);
     json += ",\"broadcaster_precision_failed\":" + String((unsigned long)esn.broadcasterPrecisionFailed);
