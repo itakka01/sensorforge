@@ -5026,6 +5026,41 @@ String clusterStatusJson()
     json += ",\"broadcaster_production_beacons_sent\":" + String((unsigned long)esn.broadcasterProductionBeaconsSent);
     json += ",\"coordinator_suppressing_beacons\":"; json += esn.coordinatorSuppressingBeacons ? "true" : "false";
     json += ",\"coordinator_beacons_suppressed\":" + String((unsigned long)esn.coordinatorBeaconsSuppressed);
+    // Beta136: coordinator_suppressing_beacons = actual suppression; lease state separately.
+    json += ",\"coordinator_broadcaster_lease_active\":"; json += esn.coordinatorBroadcasterLeaseActive ? "true" : "false";
+    json += ",\"coordinator_broadcaster_beacon_age_ms\":" + String((unsigned long)esn.coordinatorBroadcasterBeaconAgeMs);
+    json += ",\"coordinator_beacons_sent\":" + String((unsigned long)esn.coordinatorBeaconsSent);
+    json += ",\"coordinator_early_resumes\":" + String((unsigned long)esn.coordinatorEarlyResumes);
+    // Beta136: series quality since radio start (reason: 0 none, 1 invalid, 2 spread, 3 rtt, 4 deadline)
+    json += ",\"series_accepted\":" + String((unsigned long)esn.seriesAccepted);
+    json += ",\"series_rejected\":" + String((unsigned long)esn.seriesRejected);
+    json += ",\"series_reject_invalid\":" + String((unsigned long)esn.seriesRejectInvalid);
+    json += ",\"series_reject_spread\":" + String((unsigned long)esn.seriesRejectSpread);
+    json += ",\"series_reject_rtt\":" + String((unsigned long)esn.seriesRejectRtt);
+    json += ",\"series_reject_deadline\":" + String((unsigned long)esn.seriesRejectDeadline);
+    json += ",\"series_consecutive_failures\":" + String((unsigned int)esn.seriesConsecutiveFailures);
+    json += ",\"series_last_failure_reason\":" + String((unsigned int)esn.seriesLastFailureReason);
+    json += ",\"series_last_rejected_age_ms\":" + String((unsigned long)esn.seriesLastRejectedAgeMs);
+    json += ",\"series_last_rejected_spread_us\":" + String((unsigned long)esn.seriesLastRejectedSpreadUs);
+    json += ",\"series_last_completed_age_ms\":" + String((unsigned long)esn.seriesLastCompletedAgeMs);
+    json += ",\"series_next_in_ms\":" + String((unsigned long)esn.seriesNextInMs);
+    // Beta136: probe RX (t2) -> reply pre-send (t3) on this device, answered probes only.
+    json += ",\"probe_reply_delay_samples\":" + String((unsigned long)esn.probeReplyDelaySamples);
+    json += ",\"probe_reply_delay_last_us\":" + String((unsigned long)esn.probeReplyDelayLastUs);
+    json += ",\"probe_reply_delay_max_us\":" + String((unsigned long)esn.probeReplyDelayMaxUs);
+    json += ",\"probe_reply_delay_mean_us\":" + String(esn.probeReplyDelaySamples ?
+        (double)esn.probeReplyDelayTotalUs / (double)esn.probeReplyDelaySamples : 0.0, 1);
+    json += ",\"probe_reply_delay_hist\":[";
+    for (uint8_t i = 0; i < ClusterEspNowRadio::Diagnostics::kProbeReplyDelayBuckets; ++i) {
+        if (i) json += ",";
+        json += String((unsigned long)esn.probeReplyDelayHist[i]);
+    }
+    json += "],\"probe_reply_delay_hist_upper_us\":[";
+    for (uint8_t i = 0; i + 1 < ClusterEspNowRadio::Diagnostics::kProbeReplyDelayBuckets; ++i) {
+        if (i) json += ",";
+        json += String((unsigned long)ClusterEspNowRadio::kProbeReplyDelayBucketUpperUs[i]);
+    }
+    json += "]";
     char activeSourceText[17]; snprintf(activeSourceText,sizeof(activeSourceText),"%016llx",(unsigned long long)esn.activeTimeSource);
     json += ",\"active_time_source\":\"" + String(activeSourceText) + "\"";
     json += ",\"source_changes\":" + String((unsigned long)esn.sourceChanges);

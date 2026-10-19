@@ -106,8 +106,29 @@ struct Diagnostics {
     bool handoverEnabled=true;
     bool broadcasterLeaseActive=false;
     uint32_t broadcasterLeaseRemainingMs=0;
+    // Beta136: TRUE only while the coordinator actually suppresses its own beacons
+    // (lease active, grace elapsed, leased broadcaster heard < 2 s ago).
     bool coordinatorSuppressingBeacons=false;
     uint32_t coordinatorBeaconsSuppressed=0;
+    bool coordinatorBroadcasterLeaseActive=false;    // former meaning of coordinatorSuppressingBeacons
+    uint32_t coordinatorBroadcasterBeaconAgeMs=0;    // 0 = never heard since lease start
+    uint32_t coordinatorBeaconsSent=0;               // coordinator production beacons since boot
+    uint32_t coordinatorEarlyResumes=0;              // beacons sent early after confirmation loss
+    // Beta136: series quality (since radio start). Reasons: 1=invalid/insufficient,
+    // 2=spread, 3=RTT, 4=series deadline. Quality thresholds are NOT exposed/changed here.
+    uint32_t seriesAccepted=0, seriesRejected=0;
+    uint32_t seriesRejectInvalid=0, seriesRejectSpread=0, seriesRejectRtt=0, seriesRejectDeadline=0;
+    uint8_t seriesConsecutiveFailures=0, seriesLastFailureReason=0;
+    uint32_t seriesLastRejectedAgeMs=0;     // 0 = none
+    uint32_t seriesLastRejectedSpreadUs=0;  // 0 = no metrics (reason 1/4)
+    uint32_t seriesLastCompletedAgeMs=0;    // 0 = none
+    uint32_t seriesNextInMs=0;              // 0 = due / not scheduled
+    // Beta136: local probe RX callback (t2) -> reply pre-send stamp (t3), answered probes only.
+    // Firmware service latency (cancels in the offset math); buckets: upper bounds in us.
+    static constexpr uint8_t kProbeReplyDelayBuckets=9;
+    uint32_t probeReplyDelaySamples=0, probeReplyDelayLastUs=0, probeReplyDelayMaxUs=0;
+    uint64_t probeReplyDelayTotalUs=0;
+    uint32_t probeReplyDelayHist[kProbeReplyDelayBuckets]={};
     uint64_t activeTimeSource=0;  // 0=none, or tag of active coordinator/broadcaster
     uint32_t sourceChanges=0;
     uint32_t broadcasterProductionBeaconsSent=0;
@@ -126,6 +147,9 @@ struct Diagnostics {
     uint32_t precisionGuardMonoReconstruct=0;  // reference mono reconstruction failed
     uint32_t precisionGuardUtcRange=0;  // UTC target out of valid range
 };
+// Upper bounds (us) of probeReplyDelayHist buckets 0..7; bucket 8 = above the last bound.
+constexpr uint32_t kProbeReplyDelayBucketUpperUs[Diagnostics::kProbeReplyDelayBuckets-1]=
+    {500,1000,2000,5000,10000,20000,50000,100000};
 Diagnostics diagnostics();
 // Diagnostic SFDB receiver only; never used by precisionUtcNow() or capture.
 struct DiagnosticBeaconRxStats {

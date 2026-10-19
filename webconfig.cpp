@@ -62,6 +62,7 @@
 #include "firmware_ota_verify.h"
 #include "web_csrf.h"
 #include "onvif.h"
+#include "day_archive_tools.h"
 
 static const char *AUDIO_MIC_TEST_PATH = "/sensorforge_audio_test.wav";
 static const uint32_t AUDIO_MIC_TEST_DURATION_MS = 10000UL;
@@ -15210,6 +15211,60 @@ static void handleDownloadDay()
             "No readable recordings found for this day."
         );
         return;
+    }
+
+    // Optional EXAPAN converter from SD:/tools (verified against the released
+    // SHA-256 list) plus a short notice when it is missing/outdated/rejected.
+    // Only added when the day has recordings; never fails the download.
+    {
+        std::vector<DayArchiveToolFile> toolFiles;
+        String toolNotice;
+        dayArchiveCollectTools(
+            toolFiles,
+            toolNotice
+        );
+        if (!toolNotice.isEmpty()) {
+            DayArchiveToolFile noticeFile;
+            noticeFile.name =
+                DAY_ARCHIVE_TOOLS_NOTICE_NAME;
+            noticeFile.data =
+                toolNotice;
+            toolFiles.push_back(
+                noticeFile
+            );
+        }
+        for (DayArchiveToolFile &tool : toolFiles) {
+            bool nameTaken = false;
+            for (const DayZipEntry &existing : entries) {
+                if (existing.name.equalsIgnoreCase(tool.name)) {
+                    nameTaken = true;
+                    break;
+                }
+            }
+            if (nameTaken)
+                continue;  // never shadow a recording file of the same name
+            DayZipEntry toolEntry;
+            toolEntry.name =
+                tool.name;
+            toolEntry.size =
+                (uint32_t)tool.data.length();
+            toolEntry.crc32 = 0;
+            toolEntry.localHeaderOffset = 0;
+            toolEntry.synthetic = true;
+            toolEntry.syntheticData =
+                std::move(tool.data);
+            localAreaBytes +=
+                30ULL +
+                (uint64_t)toolEntry.name.length() +
+                (uint64_t)toolEntry.size +
+                16ULL;
+            centralAreaBytes +=
+                46ULL +
+                (uint64_t)toolEntry.name.length();
+            entries.push_back(
+                std::move(toolEntry)
+            );
+        }
     }
 
 

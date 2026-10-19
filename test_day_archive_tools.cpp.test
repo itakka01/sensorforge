@@ -1,0 +1,53 @@
+// Host test for day_archive_tools_policy.h (EXAPAN converter in day ZIP downloads).
+//   g++ -std=c++17 -Wall -Wextra -I. -x c++ test_day_archive_tools.cpp.test -o /tmp/test_day_archive_tools
+//   /tmp/test_day_archive_tools        (run from the sketch folder)
+// The SHA-256 of the real .cmd is verified by tools/update_archive_tools_manifest.sh --check.
+
+#include <stdio.h>
+#include <string>
+#include <fstream>
+#include <sstream>
+#include "day_archive_tools_policy.h"
+
+using namespace DayArchiveToolsPolicy;
+static int g_failures = 0;
+#define CHECK(cond, msg) do { if (cond) printf("  PASS %s\n", msg); \
+    else { printf("  FAIL %s (line %d)\n", msg, __LINE__); ++g_failures; } } while (0)
+
+static uint16_t marker(const std::string &s) { return parseVersionMarker(s.data(), s.size()); }
+
+int main() {
+    printf("=== Day archive tools policy ===\n");
+    printf("T1 version marker parsing\n");
+    CHECK(marker("#!/bin/bash\n# EXAPAN_CONVERTER_VERSION=3\nset -e\n") == 3, "marker found");
+    CHECK(marker("# EXAPAN_CONVERTER_VERSION=12\r\n") == 12, "CRLF tolerated");
+    CHECK(marker("echo hi\n") == 0, "missing marker -> 0");
+    CHECK(marker("# EXAPAN_CONVERTER_VERSION=\n") == 0, "empty value -> 0");
+    CHECK(marker("# EXAPAN_CONVERTER_VERSION=2x\n") == 0, "garbage -> 0");
+    CHECK(marker("# EXAPAN_CONVERTER_VERSION=0\n") == 0, "zero -> 0");
+    CHECK(marker("# EXAPAN_CONVERTER_VERSION=99999999\n") == 0, "overflow -> 0");
+    CHECK(marker("x # EXAPAN_CONVERTER_VERSION=4\n") == 0, "must start the line");
+
+    printf("T2 classification (SHA-256 decides)\n");
+    static const char kA[] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    static const char kB[] = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    static const char kX[] = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const ArchiveToolRelease rel[] = { {1, kA}, {2, kB} };
+    CHECK(classify(2, kB, rel, 2, 2) == ConverterStatus::Current, "newest release -> Current");
+    CHECK(classify(1, kA, rel, 2, 2) == ConverterStatus::Outdated, "older release -> Outdated");
+    CHECK(classify(2, kX, rel, 2, 2) == ConverterStatus::Modified, "known version, wrong hash -> Modified");
+    CHECK(classify(1, kB, rel, 2, 2) == ConverterStatus::Modified, "hash of other version -> Modified");
+    CHECK(classify(3, kX, rel, 2, 2) == ConverterStatus::Unknown, "newer than firmware -> Unknown");
+    CHECK(classify(3, kB, rel, 2, 2) == ConverterStatus::Unknown, "faked newer marker never accepted");
+    CHECK(classify(0, kB, rel, 2, 2) == ConverterStatus::NoMarker, "no marker -> NoMarker");
+
+    printf("T3 repository converter matches generated manifest version\n");
+    std::ifstream in("exapan_archive_convert.cmd", std::ios::binary);
+    std::stringstream ss; ss << in.rdbuf(); const std::string cmd = ss.str();
+    CHECK(!cmd.empty(), "exapan_archive_convert.cmd readable");
+    CHECK(cmd.find('\r') == std::string::npos, "LF line endings (bash part)");
+    CHECK(marker(cmd) == kExapanConverterCurrentVersion, "marker == kExapanConverterCurrentVersion");
+
+    printf("=== %s (%d failures) ===\n", g_failures ? "FAILED" : "ALL PASSED", g_failures);
+    return g_failures ? 1 : 0;
+}

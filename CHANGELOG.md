@@ -1,3 +1,31 @@
+## v87-beta136 — 2026-10-19 (EXAPAN-KONVERTER IM TAGESARCHIV)
+
+**NEU: Optionaler Archiv-Konverter im Tages-ZIP**
+- Liegen `SD:/tools/exapan_archive_convert.cmd` (+ `README_Exapan_Archive_Converter.md`) auf der SD-Karte, werden sie beim Tages-Download mit ins ZIP gelegt
+- Freigabe nur über SHA-256-Liste in der Firmware (`archive_tools_manifest.h`); Versionseintrag `# EXAPAN_CONVERTER_VERSION=<n>` in der `.cmd` liefert die Begründung
+- Hinweisdatei `_EXAPAN_KONVERTER_HINWEIS.txt` im ZIP bei: Datei fehlt, veraltet (wird beigelegt), verändert/ohne Version/unbekannt neuer (wird NICHT beigelegt), README fehlt
+- Download scheitert nie an den Konverter-Dateien; ohne Aufnahmen werden sie nicht angehängt; Aufnahmen gleichen Namens werden nie überdeckt
+- Geprüfte Bytes werden gestreamt (PSRAM, max. 64 KB pro Datei); Flash +~8 KB
+
+**NEU: Diagnose und schnellerer Coordinator-Fallback (Zeitsync)**
+- `/cluster_status`: Serienqualität (`series_accepted/rejected`, Gründe invalid/spread/rtt/deadline, `series_consecutive_failures`, `series_last_failure_reason`, Alter/Spread der letzten Ablehnung, `series_next_in_ms`)
+- `/cluster_status`: Probe→Reply-Verzögerung (t2→t3) mit Histogramm (`probe_reply_delay_hist`, Grenzen in `probe_reply_delay_hist_upper_us`), Mittel/Max/Last
+- `coordinator_suppressing_beacons` = tatsächliche Unterdrückung (vorher: nur Lease aktiv); neu `coordinator_broadcaster_lease_active`, `coordinator_broadcaster_beacon_age_ms`, `coordinator_beacons_sent`, `coordinator_early_resumes`
+- Coordinator sendet nach Verlust der Broadcaster-Bestätigung (> 2 s) sofort einen Beacon über den normalen Sendepfad statt bis zu 10 s zu warten (Lücke im Modell 11 s → 2 s)
+- Unverändert: Qualitätsgrenzen, HMAC, Replay-Schutz, Timestamp-Mathematik, Estimator, Capture, Frame-Layouts
+- `test_time_source_flapping.cpp.test`: T9 Ausfall/Wiederaufnahme (40/40 PASS)
+
+**ÄNDERUNGEN:**
+- `webconfig.cpp`: `handleDownloadDay()` hängt Tool-Einträge an (Muster der vorhandenen synthetischen Einträge)
+- `day_archive_tools.cpp/.h`, `day_archive_tools_policy.h`, `archive_tools_manifest.h` (generiert): neu
+- `tools/update_archive_tools_manifest.sh`: pflegt die Versionsliste (`--check` prüft nur)
+- `exapan_archive_convert.cmd`: Versionszeile v1 + Pflegehinweis
+- `test_day_archive_tools.cpp.test`: Host-Test, 18/18 PASS
+- `cluster_espnow_radio.cpp/.h`, `cluster.cpp`, `cluster_time_source_policy.h`: Zeitsync-Diagnose + Early-Resume
+- `sensorforge_version.h`: v87-beta136
+
+**BUILDS:** XIAO 3.213.227 B, Freenove 3.224.763 B (je 96 %), 0 Warnungen. Nicht hardwaregetestet.
+
 ## v87-beta135 — 2026-10-19 (ZEITQUELLEN-FLATTERN BEHOBEN) – Testkandidat, nicht als stabil markiert
 
 **HARDWAREBEFUND (beta134, 5-Minuten-Test):**

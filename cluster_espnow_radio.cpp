@@ -204,7 +204,9 @@ uint64_t coordinatorLeaseBroadcasterBoot=0;  // SECURE: authorized broadcaster b
 uint32_t coordinatorStartupGuardUntilMs=0;  // millis() timestamp when startup guard expires
 // Beta132-V2-FIX: Track broadcaster production beacon reception for condition-based suppression
 // CRITICAL: Coordinator only suppresses when broadcaster CONFIRMED active (received production beacon)
-uint32_t lastProductionBeaconFromLeasedBroadcasterMs=0;  // Last time coordinator received broadcaster production beacon
+uint32_t lastProductionBeaconFromLeasedBroadcasterMs=0;
+bool coordinatorLastSlotSuppressed=false;  // Beta136: last beacon slot was suppressed (early resume)
+uint32_t coordinatorProductionBeaconsSent=0, coordinatorEarlyResumes=0;  // Beta136: diagnostics  // Last time coordinator received broadcaster production beacon
 
 // Beta131-CORRECTED: Node tracking of active time source with role validation
 uint64_t activeTimeSourceTag=0;  // 0=none, or tag of coordinator/broadcaster
@@ -517,6 +519,19 @@ uint32_t qualityRetryDelayMs() {
     return kRetryBaseMs + ((mixed ^ (mixed>>15)) % kRetryJitterMs);
 }
 uint32_t failedSeries=0;
+// Beta136 diagnostics: probe RX callback (t2) -> reply pre-send stamp (t3). Observation only.
+void recordProbeReplyDelay(int64_t rxUs, int64_t replyStampUs) {
+    if(replyStampUs<rxUs) return;
+    const uint64_t delta=static_cast<uint64_t>(replyStampUs-rxUs);
+    const uint32_t us=delta>UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(delta);
+    uint8_t bucket=0;
+    while(bucket<Diagnostics::kProbeReplyDelayBuckets-1 && us>kProbeReplyDelayBucketUpperUs[bucket]) ++bucket;
+    ++stats.probeReplyDelayHist[bucket];
+    ++stats.probeReplyDelaySamples;
+    stats.probeReplyDelayLastUs=us;
+    if(us>stats.probeReplyDelayMaxUs) stats.probeReplyDelayMaxUs=us;
+    stats.probeReplyDelayTotalUs+=us;
+}
 uint32_t successfulSeries=0, lastCompletedSeriesMs=0, nextSeriesStatsReportMs=0;
 uint32_t lastEstimateMs=0;
 uint8_t lastCompletedSeriesResult=0;
@@ -526,6 +541,7 @@ uint32_t lastRejectedSeriesMs=0;
 bool lastRejectedHasMetrics=false;
 ClusterEspNowTwoWay::Estimate lastRejectedEstimate;
 uint8_t consecutiveFailures=0;
+uint32_t seriesRejectByReason[5]={};  // Beta136 diagnostics: index = lastSeriesFailure (1..4)
 uint32_t nextReportDebugMs=0;
 
 ClusterEspNowTwoWay::Estimate previousEstimate;
@@ -575,7 +591,7 @@ void acceptEstimate(const ClusterEspNowTwoWay::Estimate &e) {
     seriesPrecisionAccepted=false;
     lastCompletedSeriesMs=millis();
     lastCompletedSeriesResult=2;
-    if (!e.valid) { ++failedSeries; lastSeriesFailure=1; lastRejectedReason=1; lastRejectedSeriesMs=millis(); lastRejectedHasMetrics=false; lastRejectedEstimate=e; consecutiveFailures=static_cast<uint8_t>(std::min(8U,unsigned(consecutiveFailures)+1U)); return; }
+    if (!e.valid) { ++failedSeries; lastSeriesFailure=1; ++seriesRejectByReason[1]; lastRejectedReason=1; lastRejectedSeriesMs=millis(); lastRejectedHasMetrics=false; lastRejectedEstimate=e; consecutiveFailures=static_cast<uint8_t>(std::min(8U,unsigned(consecutiveFailures)+1U)); return; }
     stats.lastOffsetUs = e.offsetUs;
     stats.lastRttUs = e.medianRttUs;
     // A wide offset range indicates RF/software timing jitter, not calibrated drift.
@@ -583,6 +599,7 @@ void acceptEstimate(const ClusterEspNowTwoWay::Estimate &e) {
         !std::isfinite(e.medianRttUs) || e.medianRttUs > 30000.0) {
         ++failedSeries;
         lastSeriesFailure=(e.accepted<8?1:(e.spreadUs>250.0?2:3));
+        ++seriesRejectByReason[lastSeriesFailure];
         lastRejectedEstimate=e;
         lastRejectedReason=lastSeriesFailure; lastRejectedSeriesMs=millis(); lastRejectedHasMetrics=true;
         consecutiveFailures=static_cast<uint8_t>(std::min(8U,unsigned(consecutiveFailures)+1U));
@@ -1274,6 +1291,7 @@ void stop() {
     coordinatorBeaconsSuppressed=0;coordinatorLeaseTransaction=0;
     coordinatorLeaseBroadcasterTag=0;coordinatorLeaseBroadcasterBoot=0;
     lastProductionBeaconFromLeasedBroadcasterMs=0;  // Beta132-V2-FIX: Clear broadcaster tracking
+    coordinatorLastSlotSuppressed=false;
     activeTimeSourceTag=0;activeTimeSourceBoot=0;activeTimeSourceEpoch=0;
     // Beta131-FIX (Ninth cycle, Problem 2): Increment sourceChanges on stop, NOT reset
     // CRITICAL: Ensures pending captures become invalid after radio restart
@@ -1282,7 +1300,7 @@ void stop() {
     memset(activeTimeSourceMac,0,6);  // Beta131-FIX (Seventh cycle, Problem 2)
     for(auto &p:slotPeers)p={};slotNextIndex=0;slotOwner=-1;
     slotStartedMs=slotGuardUntilMs=0;slotGrantsSent=slotRotations=0;
-    previousEstimate={};latestQualityEstimate={};lastPrecisionMs=0;failedSeries=0;lastSeriesFailure=0;lastRejectedReason=0;lastRejectedSeriesMs=0;lastRejectedHasMetrics=false;lastRejectedEstimate={};consecutiveFailures=0;
+    previousEstimate={};latestQualityEstimate={};lastPrecisionMs=0;failedSeries=0;for(auto &r:seriesRejectByReason)r=0;lastSeriesFailure=0;lastRejectedReason=0;lastRejectedSeriesMs=0;lastRejectedHasMetrics=false;lastRejectedEstimate={};consecutiveFailures=0;
     successfulSeries=0;lastCompletedSeriesMs=0;lastCompletedSeriesResult=0;nextSeriesStatsReportMs=0;lastEstimateMs=0;
     referenceUtcUs=0;referenceMonoLow=0;referenceReceivedNodeMono=0;
     beaconObsCount=beaconObsWrite=0;beaconStats={};sharedEventCount=sharedEventWrite=0;sharedEventBoot=0;sharedEventEpoch=0;
@@ -1892,7 +1910,28 @@ Diagnostics diagnostics(){Diagnostics out=stats;
     out.handoverEnabled=true;
     out.broadcasterLeaseActive=broadcasterLeaseActive;
     out.broadcasterLeaseRemainingMs=broadcasterLeaseActive && now<broadcasterLeaseExpiresMs ? broadcasterLeaseExpiresMs-now : 0;
-    out.coordinatorSuppressingBeacons=coordinatorGrantedLeaseActive;
+    // Beta136: actual suppression state (same predicate as the beacon slot), lease separately.
+    out.coordinatorSuppressingBeacons=wasCoordinator &&
+        ClusterTimeSourcePolicy::coordinatorShouldSuppressBeacon(coordinatorGrantedLeaseActive,
+            coordinatorSuppressionStartMs,lastProductionBeaconFromLeasedBroadcasterMs,now);
+    out.coordinatorBroadcasterLeaseActive=coordinatorGrantedLeaseActive;
+    out.coordinatorBroadcasterBeaconAgeMs=lastProductionBeaconFromLeasedBroadcasterMs ?
+        uint32_t(now-lastProductionBeaconFromLeasedBroadcasterMs) : 0;
+    out.coordinatorBeaconsSent=coordinatorProductionBeaconsSent;
+    out.coordinatorEarlyResumes=coordinatorEarlyResumes;
+    out.seriesAccepted=successfulSeries;
+    out.seriesRejected=failedSeries;
+    out.seriesRejectInvalid=seriesRejectByReason[1];
+    out.seriesRejectSpread=seriesRejectByReason[2];
+    out.seriesRejectRtt=seriesRejectByReason[3];
+    out.seriesRejectDeadline=seriesRejectByReason[4];
+    out.seriesConsecutiveFailures=consecutiveFailures;
+    out.seriesLastFailureReason=lastSeriesFailure;
+    out.seriesLastRejectedAgeMs=lastRejectedSeriesMs ? uint32_t(now-lastRejectedSeriesMs) : 0;
+    out.seriesLastRejectedSpreadUs=lastRejectedHasMetrics && std::isfinite(lastRejectedEstimate.spreadUs) ?
+        static_cast<uint32_t>(llround(std::max(0.0,std::min(4294967295.0,lastRejectedEstimate.spreadUs)))) : 0;
+    out.seriesLastCompletedAgeMs=lastCompletedSeriesMs ? uint32_t(now-lastCompletedSeriesMs) : 0;
+    out.seriesNextInMs=nextSeriesMs && static_cast<int32_t>(nextSeriesMs-now)>0 ? nextSeriesMs-now : 0;
     out.coordinatorBeaconsSuppressed=coordinatorBeaconsSuppressed;
     out.activeTimeSource=activeTimeSourceTag;
     out.sourceChanges=sourceChanges;
@@ -2217,6 +2256,7 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
             // t3 denotes the Reply send path, NOT the later Final send call.
             // Reply.timeUs continues to carry t2 unchanged.
             if(!sendFrame(r,item.mac,&replyDispatchBeforeUs,true))continue;
+            recordProbeReplyDelay(item.rxUs,replyDispatchBeforeUs);
             const int64_t finalDispatchUs=esp_timer_get_time();
             if(finalDispatchUs>=replyDispatchBeforeUs){
                 const uint64_t delta=static_cast<uint64_t>(finalDispatchUs-replyDispatchBeforeUs);
@@ -2291,6 +2331,7 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
                 continue;
             }
             ++diagReplySent;
+            recordProbeReplyDelay(item.rxUs,replyDispatchBeforeUs);
             const int64_t finalDispatchUs=esp_timer_get_time();
             if(finalDispatchUs>=replyDispatchBeforeUs){
                 const uint64_t delta=static_cast<uint64_t>(finalDispatchUs-replyDispatchBeforeUs);
@@ -2639,6 +2680,15 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
         }
 
         if(!(beaconExperimentUntilMs && beaconExperimentQuiet))serviceSlots(now,epoch,tag,localBootNonce);
+        // Beta136: resume immediately (normal send path below) once suppression stops holding,
+        // instead of leaving nodes without any beacon source for up to kBroadcastEveryMs.
+        if(ClusterTimeSourcePolicy::coordinatorShouldResumeEarly(coordinatorLastSlotSuppressed,
+               ClusterTimeSourcePolicy::coordinatorShouldSuppressBeacon(coordinatorGrantedLeaseActive,
+                   coordinatorSuppressionStartMs,lastProductionBeaconFromLeasedBroadcasterMs,now))) {
+            coordinatorLastSlotSuppressed=false;
+            ++coordinatorEarlyResumes;
+            nextBroadcastMs=now;
+        }
         if(static_cast<int32_t>(now-nextBroadcastMs)>=0){
             nextBroadcastMs=now+(beaconExperimentUntilMs?beaconExperimentIntervalMs:kBroadcastEveryMs);
 
@@ -2668,6 +2718,7 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
                 if(broadcasterConfirmedActive) {
                     // SAFE: Broadcaster confirmed sending production beacons, suppress coordinator
                     ++coordinatorBeaconsSuppressed;
+                    coordinatorLastSlotSuppressed=true;
                     return;  // Broadcaster active, suppressing coordinator beacons
                 } else {
                     // SAFE: Broadcaster not confirmed - keep sending coordinator beacons
@@ -2683,6 +2734,7 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
                 }
             }
 
+            coordinatorLastSlotSuppressed=false;
             EspNowTimePackets::Frame b;
             b.type=EspNowTimePackets::Type::Beacon;b.epoch=epoch;
             b.coordinatorTag=tag;b.senderBoot=localBootNonce;
@@ -2694,8 +2746,7 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
             if(clockOk && monoAfter-monoBefore<2000) {
                 b.timeUs=static_cast<int64_t>(tv.tv_sec)*1000000LL+tv.tv_usec;
                 b.nonce=static_cast<uint32_t>(monoBefore+(monoAfter-monoBefore)/2);
-                // Beta132-DIAGNOSIS: Track coordinator production beacons sent
-                static uint32_t coordinatorProductionBeaconsSent = 0;
+                // Beta132-DIAGNOSIS: Track coordinator production beacons sent (Beta136: exported)
                 if(sendFrame(b,kBroadcastMac)) {
                     ++coordinatorProductionBeaconsSent;
                     if(beaconExperimentUntilMs) ++beaconExperimentSent;
@@ -2728,7 +2779,7 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
     if(seriesCount>0 && uint32_t(now-seriesStartedMs)>kMaxSeriesDurationMs) {
         // Never extend a busy/failed measurement series indefinitely.
         seriesCount=0;seriesTarget=kInitialSamples;seriesStartedMs=0;
-        pending={};++failedSeries;lastSeriesFailure=4;lastRejectedReason=4;lastRejectedSeriesMs=now;lastRejectedHasMetrics=false;
+        pending={};++failedSeries;lastSeriesFailure=4;++seriesRejectByReason[4];lastRejectedReason=4;lastRejectedSeriesMs=now;lastRejectedHasMetrics=false;
         lastCompletedSeriesMs=now;lastCompletedSeriesResult=3;
         consecutiveFailures=static_cast<uint8_t>(std::min(8U,unsigned(consecutiveFailures)+1U));
         nextSeriesMs=now+qualityRetryDelayMs();return;

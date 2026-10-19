@@ -1,4 +1,4 @@
-// Beta135 regression test: time-source flapping (coordinator vs. broadcaster beacons)
+// Beta135/136 regression test: time-source flapping (coordinator vs. broadcaster beacons)
 //
 // Uses the REAL decision functions from cluster_time_source_policy.h (also called by
 // cluster_espnow_radio.cpp) and the REAL wire codec / replay window from
@@ -36,6 +36,8 @@ struct Sim {
     bool leaseActive = false; uint32_t leaseExpires = 0, suppressionStart = 0, lastLeasedBeacon = 0;
     uint64_t leaseTag = 0, leaseBoot = 0; uint32_t nextGrant = 0, nextCoordBeacon = 1000;
     uint32_t coordBeaconsSent = 0;
+    bool earlyResume = true;             // false = beta135 (wait for next 10 s slot)
+    bool lastSlotSuppressed = false; uint32_t earlyResumes = 0;
     // broadcaster
     bool bcastAlive = true, bcastTimeValid = true; uint32_t bcastLeaseExpires = 0, nextProd = 0;
     // node
@@ -70,12 +72,15 @@ struct Sim {
                 isLeasedBroadcasterBeacon(leaseActive, leaseTag, leaseBoot, kBcastTag, bcastBoot))
                 lastLeasedBeacon = now;
         }
-        // Coordinator beacon slot.
+        // Coordinator beacon slot (beta136: early resume after confirmation loss).
+        const bool suppressNow = coordinatorShouldSuppressBeacon(leaseActive, suppressionStart, lastLeasedBeacon, now);
+        if (earlyResume && coordinatorShouldResumeEarly(lastSlotSuppressed, suppressNow)) {
+            lastSlotSuppressed = false; ++earlyResumes; nextCoordBeacon = now;
+        }
         if (now >= nextCoordBeacon) {
             nextCoordBeacon = now + kBroadcastEveryMs;
-            if (!coordinatorShouldSuppressBeacon(leaseActive, suppressionStart, lastLeasedBeacon, now)) {
-                ++coordBeaconsSent; nodeRx(kCoordTag, coordBoot, now);
-            }
+            if (suppressNow) lastSlotSuppressed = true;
+            else { lastSlotSuppressed = false; ++coordBeaconsSent; nodeRx(kCoordTag, coordBoot, now); }
         }
     }
     void run(uint32_t from, uint32_t to) { for (uint32_t t = from; t < to; t += 10) tick(t); }
@@ -184,11 +189,39 @@ static void test8_probesAfterSwitch() {
     CHECK(s.probeTarget() == kCoordTag && s.activeBoot == 0xC1, "after failover probes the (rebooted) coordinator");
 }
 
+static void test9_earlyResume() {
+    printf("T9 coordinator resumes early after broadcaster loss (beta136)\n");
+    // Gap = last broadcaster beacon -> first coordinator beacon (nodes without a source).
+    auto outageGap = [](Sim &s, uint32_t from) {
+        s.bcastAlive = false; const uint32_t lastBcast = s.lastBeaconRx; uint32_t t = from;
+        while (s.activeTag != kCoordTag && t < from + 30000) { s.tick(t); t += 10; }
+        return s.lastBeaconRx - lastBcast;
+    };
+    Sim old; old.earlyResume = false; old.run(0, 120130);
+    const uint32_t oldGap = outageGap(old, 120130);
+    Sim neu; neu.run(0, 120130);
+    const uint32_t steadyEarly = neu.earlyResumes;
+    const uint32_t newGap = outageGap(neu, 120130);
+    neu.run(neu.lastBeaconRx + 10, 160000);
+    printf("  gap without beacon source: beta135 %u ms, beta136 %u ms\n", oldGap, newGap);
+    CHECK(steadyEarly == 0, "no early resume in steady state");
+    CHECK(neu.earlyResumes == 1, "exactly one early beacon per loss");
+    CHECK(newGap <= kBroadcasterConfirmWindowMs + 100, "gap <= confirm window (+1 tick)");
+    CHECK(newGap < oldGap, "shorter than waiting for the next 10 s slot");
+    CHECK(neu.activeTag == kCoordTag, "node on coordinator during outage");
+    neu.bcastAlive = true; neu.bcastBoot = 0xB2; neu.run(160000, 260000);
+    CHECK(neu.activeTag == kBcastTag, "broadcaster resumes after return");
+    Sim blip; blip.run(0, 60000);
+    const uint32_t base = blip.sourceChanges;
+    blip.bcastAlive = false; blip.run(60000, 61500); blip.bcastAlive = true; blip.run(61500, 120000);
+    CHECK(blip.earlyResumes == 0 && blip.sourceChanges == base, "1.5 s beacon gap: no resume, no switch");
+}
+
 int main() {
-    printf("=== Time source flapping regression (beta135) ===\n");
+    printf("=== Time source flapping regression (beta135/136) ===\n");
     test1_bothSendersValid(); test2_leaseActivationDeactivation(); test3_bootEpochChange();
     test4_broadcasterFailAndReturn(); test5_precisionInvalidThenValid(); test6_staleWrongRepeated();
-    test7_steadyStateNoChanges(); test8_probesAfterSwitch();
+    test7_steadyStateNoChanges(); test8_probesAfterSwitch(); test9_earlyResume();
     printf("=== %s (%d failures) ===\n", g_failures ? "FAILED" : "ALL PASSED", g_failures);
     return g_failures ? 1 : 0;
 }

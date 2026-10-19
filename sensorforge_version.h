@@ -21,13 +21,13 @@
 // WebConfig, so a running device can be mapped back to the exact Git tag.
 
 #define SENSORFORGE_RELEASE_NUMBER 87
-#define SENSORFORGE_RELEASE_TAG "v87-beta135"
+#define SENSORFORGE_RELEASE_TAG "v87-beta136"
 #define SENSORFORGE_RELEASE_DATE "2026-10-19"
 #define SENSORFORGE_RELEASE_SUMMARY \
-    "Beta 135: Coordinator sees leased broadcaster beacons - suppression works, no source flapping."
+    "Beta 136: Day ZIP includes verified EXAPAN converter from SD:/tools (version + SHA-256)."
 
-// Current source-tree stage. Beta 135: time-source flapping (coordinator vs broadcaster) fixed.
-#define SENSORFORGE_WORKTREE_STAGE "v87-beta135"
+// Current source-tree stage. Beta 136: optional EXAPAN converter in day ZIP downloads.
+#define SENSORFORGE_WORKTREE_STAGE "v87-beta136"
 #define SENSORFORGE_WORKTREE_DATE "2026-10-19"
 #define SENSORFORGE_WORKTREE_SUMMARY \
-    "v87 Beta 135: coordinator beacon suppression confirmed by leased broadcaster beacons."
+    "v87 Beta 136: day ZIP adds SD:/tools EXAPAN converter (released SHA-256 list) + notices."

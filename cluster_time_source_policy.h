@@ -27,6 +27,14 @@ inline bool coordinatorShouldSuppressBeacon(bool leaseActive, uint32_t suppressi
            static_cast<uint32_t>(nowMs - lastLeasedBeaconMs) < kBroadcasterConfirmWindowMs;
 }
 
+// Beta136: after the last beacon slot was suppressed, the coordinator sends its
+// next beacon as soon as suppression no longer holds (confirmation lost or lease
+// ended) instead of waiting up to kBroadcastEveryMs for the next regular slot.
+// One early beacon per loss; it uses the normal beacon send path.
+inline bool coordinatorShouldResumeEarly(bool lastSlotSuppressed, bool suppressNow) {
+    return lastSlotSuppressed && !suppressNow;
+}
+
 // Node side: a validated beacon whose sender identity differs from the active
 // source is a real source change (timing state must be reset).
 inline bool isSourceChange(uint64_t activeTag, uint64_t activeBoot, uint32_t activeEpoch,
