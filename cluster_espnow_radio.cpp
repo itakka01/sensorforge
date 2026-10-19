@@ -2207,8 +2207,33 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
 
         // Beta131-CORRECTED: Broadcaster Probe handling when lease active (Problem 4 FIX)
         // Broadcaster must respond to Probes from nodes for full 4-timestamp synchronization
-        if(broadcasterLeaseActive && broadcasterTimeBaseValid && f.type==EspNowTimePackets::Type::Probe &&
-           acceptPeer(item.mac,f)) {
+        // Beta133-DIAGNOSIS: Detailed broadcaster probe handling tracking
+        static uint32_t diagProbesTotal = 0;
+        static uint32_t diagLeaseInactive = 0;
+        static uint32_t diagTimeInvalid = 0;
+        static uint32_t diagAuthFailed = 0;
+        static uint32_t diagTagMismatch = 0;
+        static uint32_t diagPeerFailed = 0;
+        static uint32_t diagReplySent = 0;
+        static uint32_t diagReplyFailed = 0;
+        static uint32_t diagLastLogMs = 0;
+
+        if(f.type==EspNowTimePackets::Type::Probe && broadcasterOwnTag) {
+            ++diagProbesTotal;
+
+            if(!broadcasterLeaseActive) {
+                ++diagLeaseInactive;
+                continue;
+            }
+            if(!broadcasterTimeBaseValid) {
+                ++diagTimeInvalid;
+                continue;
+            }
+            if(!acceptPeer(item.mac,f)) {
+                ++diagAuthFailed;
+                continue;
+            }
+
             ++stats.authenticated;
 
             // Beta131-FIX (Seventh cycle, Problem 1): Verify Probe is addressed to THIS broadcaster
@@ -2216,6 +2241,7 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
             // During lease, nodes should probe broadcasterOwnTag, not coordinator tag
             if(f.coordinatorTag != broadcasterOwnTag) {
                 ++stats.rejected;
+                ++diagTagMismatch;
                 continue;  // Probe addressed to different sender (e.g., coordinator or other broadcaster)
             }
 
@@ -2223,7 +2249,11 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
             // This enables nodes to perform full Probe/Reply/Final exchanges with broadcaster
             // Four-timestamp exchange: t1=Node Probe TX, t2=Broadcaster Probe RX,
             // t3=Broadcaster REPLY TX, t4=Node REPLY RX
-            if(!ensurePeer(item.mac)){++stats.rejected;continue;}
+            if(!ensurePeer(item.mac)){
+                ++stats.rejected;
+                ++diagPeerFailed;
+                continue;
+            }
             EspNowTimePackets::Frame r;
             r.type=EspNowTimePackets::Type::Reply;r.epoch=epoch;
             // Beta131-FIX (Fifth cycle, Problem 2): Broadcaster uses OWN tag, not coordinator tag
@@ -2233,7 +2263,11 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
             r.senderBoot=localBootNonce;r.nonce=f.nonce;r.timeUs=item.rxUs;
             int64_t replyDispatchBeforeUs=0;
             // t3 denotes the Reply send path, broadcaster uses own monotonic clock
-            if(!sendFrame(r,item.mac,&replyDispatchBeforeUs,true))continue;
+            if(!sendFrame(r,item.mac,&replyDispatchBeforeUs,true)){
+                ++diagReplyFailed;
+                continue;
+            }
+            ++diagReplySent;
             const int64_t finalDispatchUs=esp_timer_get_time();
             if(finalDispatchUs>=replyDispatchBeforeUs){
                 const uint64_t delta=static_cast<uint64_t>(finalDispatchUs-replyDispatchBeforeUs);
@@ -2244,6 +2278,17 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
             r.type=EspNowTimePackets::Type::Final;r.timeUs=replyDispatchBeforeUs;
             if(sendFrame(r,item.mac))++stats.probesAnswered;
             continue;
+        }
+
+        // Beta133-DIAGNOSIS: Output broadcaster probe handling stats every 5s
+        if(broadcasterOwnTag && (millis() - diagLastLogMs) >= 5000) {
+            Serial.printf("[BROADCASTER-PROBE-DIAG] total=%u lease_off=%u time_invalid=%u auth_fail=%u tag_mismatch=%u peer_fail=%u reply_sent=%u reply_fail=%u\n",
+                diagProbesTotal, diagLeaseInactive, diagTimeInvalid, diagAuthFailed,
+                diagTagMismatch, diagPeerFailed, diagReplySent, diagReplyFailed);
+            diagLastLogMs = millis();
+            // Reset counters for next interval
+            diagProbesTotal = diagLeaseInactive = diagTimeInvalid = diagAuthFailed =
+                diagTagMismatch = diagPeerFailed = diagReplySent = diagReplyFailed = 0;
         }
 
         // Beta131-CORRECTED: Per-sender replay protection (Problem 5 FIX)
