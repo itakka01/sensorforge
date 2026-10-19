@@ -21,13 +21,13 @@
 // WebConfig, so a running device can be mapped back to the exact Git tag.
 
 #define SENSORFORGE_RELEASE_NUMBER 87
-#define SENSORFORGE_RELEASE_TAG "v87-beta134"
+#define SENSORFORGE_RELEASE_TAG "v87-beta135"
 #define SENSORFORGE_RELEASE_DATE "2026-10-19"
 #define SENSORFORGE_RELEASE_SUMMARY \
-    "Beta 134: ESP-NOW replay fix - random epochs as (boot, epoch) sessions bound to confirmed epoch."
+    "Beta 135: Coordinator sees leased broadcaster beacons - suppression works, no source flapping."
 
-// Current source-tree stage. Beta 134: ESP-NOW replay windows no longer deadlock on random epochs.
-#define SENSORFORGE_WORKTREE_STAGE "v87-beta134"
+// Current source-tree stage. Beta 135: time-source flapping (coordinator vs broadcaster) fixed.
+#define SENSORFORGE_WORKTREE_STAGE "v87-beta135"
 #define SENSORFORGE_WORKTREE_DATE "2026-10-19"
 #define SENSORFORGE_WORKTREE_SUMMARY \
-    "v87 Beta 134: replay sessions (boot, epoch) bound to confirmed epoch; beacon sequence unified."
+    "v87 Beta 135: coordinator beacon suppression confirmed by leased broadcaster beacons."

@@ -7,6 +7,7 @@
 #include "cluster_time_diagnostic_beacon.h"
 #include "cluster_time_shadow_handover.h"
 #include "cluster_time_grant_protocol.h" // Beta131: production handover enabled
+#include "cluster_time_source_policy.h"
 static_assert(ClusterTimeGrantProtocol::kWireBytes == 96, "grant frame size");
 #include "board_config.h"
 #include <Arduino.h>
@@ -2146,6 +2147,22 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
                 }
                 continue;
             }
+            // Beta135-FIX: The coordinator must SEE the leased broadcaster's production beacons,
+            // otherwise lastProductionBeaconFromLeasedBroadcasterMs never updates, suppression never
+            // engages and the coordinator keeps beaconing every kBroadcastEveryMs. Nodes then switch
+            // broadcaster->coordinator->broadcaster on every coordinator beacon (2 source_changes/10 s).
+            // Previously all beacons were rejected by the type filter below, leaving the node-path
+            // tracking unreachable. Liveness only: the beacon is never used as a time reference here.
+            if(f.type==EspNowTimePackets::Type::Beacon) {
+                if(ClusterTimeSourcePolicy::isLeasedBroadcasterBeacon(coordinatorGrantedLeaseActive,
+                       coordinatorLeaseBroadcasterTag,coordinatorLeaseBroadcasterBoot,
+                       f.coordinatorTag,f.senderBoot) &&
+                   acceptPeer(item.mac,f)) {
+                    ++stats.authenticated;
+                    lastProductionBeaconFromLeasedBroadcasterMs=millis();
+                } else ++stats.rejected;
+                continue;
+            }
             if((f.type!=EspNowTimePackets::Type::Probe &&
                 f.type!=EspNowTimePackets::Type::NodeSyncReport &&
                 f.type!=EspNowTimePackets::Type::NodeDriftReport)||!acceptPeer(item.mac,f)){
@@ -2386,17 +2403,8 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
                 ++stats.rejected;
                 continue;  // Ignore own beacon (self-reception)
             }
-            // Beta132-V2-FIX: Track broadcaster production beacon reception for condition-based suppression
-            // CRITICAL: Coordinator tracks AUTHENTICATED production beacons from leased broadcaster
-            // This enables condition-based suppression (only suppress when broadcaster confirmed active)
-            // SECURE: Verified via HMAC (acceptPeer above), coordinatorTag + senderBoot match
-            if(wasCoordinator && coordinatorGrantedLeaseActive &&
-               f.coordinatorTag == coordinatorLeaseBroadcasterTag &&
-               f.senderBoot == coordinatorLeaseBroadcasterBoot) {
-                lastProductionBeaconFromLeasedBroadcasterMs = millis();
-                // Serial.printf("[COORDINATOR] Production beacon from broadcaster (tag %llx boot %llx)\n",
-                //     f.coordinatorTag, f.senderBoot);
-            }
+            // Beta135: Leased-broadcaster beacon tracking for condition-based suppression lives in the
+            // coordinator RX block (this node path is never reached with coordinator=true).
             // For beacons only: timeUs=UTC, nonce=lower 32 bits of the
             // coordinator's monotonic timestamp sampled alongside UTC.
             referenceUtcUs=f.timeUs;
@@ -2421,10 +2429,8 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
             // SECURE: Only switch source after complete validation of permissible production time packet
             // SECURE: Track boot ID and epoch to prevent mixing timestamps from different sources
             // SECURE: Protect replay protection and capture clock from uncontrolled time jumps
-            if(activeTimeSourceTag &&
-               (activeTimeSourceTag != f.coordinatorTag ||
-                activeTimeSourceBoot != f.senderBoot ||
-                activeTimeSourceEpoch != f.epoch)) {
+            if(ClusterTimeSourcePolicy::isSourceChange(activeTimeSourceTag,activeTimeSourceBoot,
+                   activeTimeSourceEpoch,f.coordinatorTag,f.senderBoot,f.epoch)) {
                 // SECURE: Source change detected - reset timing state (but preserve replay protection)
                 resetTiming();  // Clears pending samples, NOT replay windows (per-sender protection persists)
                 latestQualityEstimate = {};  // Clears precision estimates
@@ -2655,8 +2661,9 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
             // SAFETY: Coordinator automatically resumes if broadcaster stops (no timer-based trust)
             if(coordinatorGrantedLeaseActive && coordinatorSuppressionStartMs && now >= coordinatorSuppressionStartMs) {
                 // Check if broadcaster is CONFIRMED active (recent production beacon within 2s)
-                const bool broadcasterConfirmedActive = (lastProductionBeaconFromLeasedBroadcasterMs != 0 &&
-                                                         (now - lastProductionBeaconFromLeasedBroadcasterMs) < 2000);
+                const bool broadcasterConfirmedActive = ClusterTimeSourcePolicy::coordinatorShouldSuppressBeacon(
+                    coordinatorGrantedLeaseActive, coordinatorSuppressionStartMs,
+                    lastProductionBeaconFromLeasedBroadcasterMs, now);
 
                 if(broadcasterConfirmedActive) {
                     // SAFE: Broadcaster confirmed sending production beacons, suppress coordinator

@@ -1,3 +1,41 @@
+## v87-beta135 — 2026-10-19 (ZEITQUELLEN-FLATTERN BEHOBEN) – Testkandidat, nicht als stabil markiert
+
+**HARDWAREBEFUND (beta134, 5-Minuten-Test):**
+- devxiao1/devxiao2: `source_changes` je +58 (~2 pro 10 s), `replay` 0, Exchanges ohne Timeouts
+- `cluster_time.source` wechselte zwischen `espnow_precision` und `wifi_coordinator`
+
+**ROOT CAUSE (statisch nachgewiesen):**
+- Coordinator-RX (`service()`, `if(coordinator)`-Block) verwarf jeden Beacon im Typfilter (`++stats.rejected`)
+- Die Erfassung `lastProductionBeaconFromLeasedBroadcasterMs` lag im Node-Pfad und war für den Coordinator unerreichbar
+- Folge: Suppression griff nie, der Coordinator sendete trotz aktiver Lease alle `kBroadcastEveryMs` (10 s) einen Beacon
+- Nodes behandeln jeden gültigen Beacon eines anderen Senders als Quellenwechsel: Broadcaster→Coordinator→Broadcaster = 2 `source_changes` pro 10 s, jeweils `resetTiming()` + Präzisionsverwerfung → zeitweise WiFi-Fallback
+- Nebenwirkung: `rejected` auf dem Coordinator stieg mit jedem Broadcaster-Beacon (~5/s)
+
+**FIX:**
+- `cluster_espnow_radio.cpp` (`service()`, Coordinator-Block): Beacons des geleasten Broadcasters (Tag + Boot aus dem Grant, `acceptPeer()`-geprüft) aktualisieren `lastProductionBeaconFromLeasedBroadcasterMs`; nur Lebendnachweis, keine Zeitreferenz; andere Beacons weiterhin `rejected`
+- Unerreichbarer Erfassungscode im Node-Pfad entfernt (verschoben)
+- `cluster_time_source_policy.h` (neu): reine Entscheidungsfunktionen (Lease-Beacon-Bindung, Suppression, Quellenwechsel), von Firmware und Host-Test gemeinsam genutzt; Suppressions- und Wechsellogik semantisch unverändert
+
+**UNVERÄNDERT:**
+- HMAC, Replay-Schutz (`acceptPeer`, `acceptSequence`), Frame-Layouts, Schlüssel, Qualitätsgrenzen, Timestamp-Mathematik, GPIO-Capture-Logik
+- Failover: Ohne Broadcaster-Beacon > 2 s sendet der Coordinator wieder (nächster 10-s-Slot)
+
+**TESTS:**
+- `test_time_source_flapping.cpp.test` (neu, Host, nutzt echte Policy-Funktionen und echten Codec/Replay-Window): 8 Szenarien, 33/33 PASS; reproduziert beta134-Verhalten (60 Wechsel/300 s) und zeigt ≤ 2 Wechsel im Fix-Modell
+- Bestehende `test_80byte_dispatch`, `test_v2_condition_based_suppression`: PASS
+- Dispatch-Integration im Firmware-RX-Pfad nur per Build geprüft, nicht hardwaregetestet
+
+**RESTRISIKO:**
+- In den 10 s Karenzzeit nach einer neuen Lease kann ein Coordinator-Beacon noch ein Wechselpaar auslösen
+- Nodes priorisieren weiterhin nicht zwischen Sendern; stabil nur, solange die Suppression greift
+
+**BUILDS:** XIAO 3.200.751 B (95 %), Freenove 3.212.003 B (96 %), 0 Warnungen
+
+**IMPACT:** Coordinator (devfreenove1) zwingend; alle 4 Geräte empfohlen (Versionsgleichstand)
+
+**ÄNDERUNGEN:**
+- `cluster_espnow_radio.cpp`, `cluster_time_source_policy.h` (neu), `test_time_source_flapping.cpp.test` (neu), `sensorforge_version.h`: v87-beta135
+
 ## v87-beta134 — 2026-10-19 (ESP-NOW REPLAY-DEADLOCK FIX)
 
 **KRITISCHER BUG-FIX: Normale Nodes blieben dauerhaft im Replay-Zustand stehen**
