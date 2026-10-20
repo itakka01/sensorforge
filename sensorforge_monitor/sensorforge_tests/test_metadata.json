@@ -1,0 +1,13 @@
+{
+  "run_id": "2026-10-19T22:47:50.972+00:00",
+  "hosts": [
+    "devfreenove1.local",
+    "devxiao1.local",
+    "devxiao2.local",
+    "devxiao3.local"
+  ],
+  "interval": 10.0,
+  "start_utc": "2026-10-19T22:47:50.972+00:00",
+  "duration_minutes": 60.0,
+  "firmware_expected": "v87-beta134"
+}

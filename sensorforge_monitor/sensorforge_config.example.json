@@ -1,0 +1,21 @@
+{
+  "expected_hosts": [
+    "devfreenove1.local",
+    "devxiao1.local",
+    "devxiao2.local",
+    "devxiao3.local"
+  ],
+  "interval_seconds": 10,
+  "timeout_seconds": 5,
+  "stalled_probe_seconds": 120,
+  "auth": {
+    "username": "",
+    "password": ""
+  },
+  "fallback_ips": {
+    "devfreenove1.local": "",
+    "devxiao1.local": "",
+    "devxiao2.local": "",
+    "devxiao3.local": ""
+  }
+}

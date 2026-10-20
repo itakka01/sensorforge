@@ -1,12 +1,7 @@
 {
-  "seed_hosts": [
-    "http://devxiao3.local"
-  ],
+  "expected_hosts": ["devfreenove1.local", "devxiao1.local", "devxiao2.local", "devxiao3.local"],
   "interval_seconds": 10,
   "timeout_seconds": 5,
-  "rediscover_every_cycles": 6,
-  "auth": {
-    "username": "ja1",
-    "password": "sensor4337"
-  }
+  "stalled_probe_seconds": 120,
+  "auth": {"username": "ja1", "password": "sensor4337"}
 }

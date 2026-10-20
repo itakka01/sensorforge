@@ -1,42 +1,45 @@
-# SensorForge Cluster Monitor
+# SensorForge Test Manager v1 (beta134)
 
-Read-only, auto-discovering cluster monitor using `/cluster_status`. Python 3.10+; no mandatory third-party libraries.
+Read-only stability diagnostics, Python 3.10+, no additional packages. Existing `sensorforge_monitor.py` included as the HTTP parser for compatibility.
 
-## Setup and run
+## Start
 
-```bash
-python sensorforge_monitor.py init
-python sensorforge_monitor.py run --minutes 15 --interval 10
-```
+1. Copy `sensorforge_config.example.json` to `sensorforge_config.json` and enter local HTTP credentials **only in your private copy**. Never publish that file.
+2. Start `python sensorforge_test_manager.py` and choose a menu entry.
+3. Or use `python sensorforge_test_manager.py --minutes 360`.
+4. Reports are generated at the end (Ctrl+C also works). Rebuild with `python sensorforge_test_manager.py --report`.
 
-Specify an existing config or output directory via `--config` / `--output`. Use `--minutes 0` to run until Ctrl+C. Regenerate reports with `python sensorforge_monitor.py report --output sensorforge_results`.
+Outputs: `sensorforge_tests/stability.sqlite3`, `stability_report.json`, `stability_report.md`, `test_metadata.json`. The SQLite DB contains full raw API payloads and connection metadata; review before sharing. It contains no configured HTTP password. Hostnames and IPs may still be present.
 
-Optional graph support:
+## Stability checks
 
-```bash
-python -m pip install matplotlib
-```
+- Each named device polled independently, so a failed seed or broken cluster discovery does not silently omit a node.
+- DNS hostname is retried via freshly resolved IP when available; every attempt and error is saved.
+- HTTP outages tracked per device, including unresolved outages at the end.
+- Boot and coordinator-epoch transitions recorded; counter increases for replay, rejected frames, timeouts, and source changes recorded.
+- Probe inactivity of at least 120 s (configurable) flagged if probe counter is present on non-coordinator nodes.
+- Drift estimates and broadcaster lease snapshots retained from beta134 firmware diagnostics.
 
-## Files
+**Important:** `PASS_MONITORING_ONLY` never means absolute uptime, valid firmware behavior, time drift correction, or proven GPIO alignment. Shorter outages may occur between polls. An epoch change observed after all nodes rebooted is not proof of seamless epoch acceptance. Any failures are reported as FAIL, and missing evidence as INCOMPLETE. Controlled recovery tests and wired accuracy tests are separate future phases.
 
-- `measurements.csv`: one row per host and sample, including failure rows
-- `monitor.sqlite3`: all polls in SQLite; no password stored
-- `report.json`: machine-readable summary/alerts, safe to share after inspecting local identifiers
-- `report.md`: readable report, safe to paste into ChatGPT after reviewing identifiers
-- `spread.png`, `accepted_age.png`, `exchanges.png`, `beacons.png`, `rx.png`: time-series charts if matplotlib is installed
+No automatic reboot, configuration update, flashing, or network changes. No outbound network requests except to hosts configured in the test configuration.
 
-## Discovery and scalability
+## Version 1.1 – Bedienung und Netzwerkdiagnose
 
-The script queries one or more `seed_hosts`, reads the `nodes` array, and polls discovered IPs directly. Discovery runs periodically to find new nodes. Adjust `rediscover_every_cycles`, `timeout_seconds`, and `interval_seconds` in the JSON config. For a large cluster, use a longer interval to limit query traffic. Results distinguish coordinator, time broadcaster and normal nodes. It works with V1 or V2 JSON fields where present.
+Start: `python sensorforge_test_manager.py` (im Ordner mit `sensorforge_config.json`).
 
-## Authentication and security
+Menüoption 4: Stunden und zusätzliche Minuten getrennt eingeben. Für offene Laufzeit beide 0 wählen. Während des Tests mit `q` + Enter oder einmal `Ctrl+C` beenden; Berichte werden anschließend erzeugt. Im Terminal erscheinen Laufzeitbalken, DNS-Status, HTTP-Status, verwendeter Zugriffsweg, Probes, Exchanges und Replay-Zähler.
 
-`init` optionally collects **HTTP Basic Authentication** username/password and writes them only to `sensorforge_config.json` (best-effort owner-only permissions). Credentials never appear in CSV, SQLite, or reports. **This tool does not configure cluster pairing credentials or Wi-Fi passwords**; those do not belong in the monitor. Do not share the config file. Use on a trusted LAN. If your firmware uses a web login form/session cookie instead of HTTP Basic, direct API authentication may need a firmware-specific adapter; don't send credentials through unsupported auth mechanisms.
+Optional `fallback_ips` in `sensorforge_config.json` mit den *tatsächlich aktuellen* IPv4-Adressen pro `.local`-Host befüllen. Falls mDNS/DNS nicht auflöst, wird die eingetragene IP direkt abgefragt. Auch IPs aus den `nodes`-Listen anderer erreichbarer Boards werden zur Laufzeit gelernt. Ein per IP erreichbares Gerät wird nur bei passender lokaler Host-Identität anerkannt. **Ohne konfigurierte oder gelernte IP ist kein unabhängiger IP-Fallback möglich.** DNS-Fehler und HTTP-Zustand werden je Abfrage in der Tabelle `network_checks` gespeichert; eine Wiederherstellung nur per IP gilt nicht als DNS-Erfolg.
 
-Read-only HTTP GET; no settings changes or flash commands. Nodes remain responsible for their own time computation.
+Beim Testende werden Dateipfade und eine lokale `file://`-Adresse zu `stability_report.html` angezeigt. Den Bericht auf demselben Test-PC im Browser öffnen.
 
-## Interpretation limits
+Hinweis: Terminal-Ausgabe ist kein GUI; der Abbruch wird über `q` + Enter oder `Ctrl+C` ausgelöst. Ein laufender HTTP-Aufruf kann bis zum eingestellten Timeout dauern. Für echte 24/72-Stunden-Tests das Terminal und den PC wach halten. Tests verursachen keine Änderungen an den Boards.
 
-The monitor measures **estimator quality, continuity, exchanges, error counters, lease state, and Beacon TX counts**, not physical GPIO skew. `last_series_spread_us <= 250` does **not** imply GPIO offsets <=250 microseconds. To measure the real requirement, connect a common pulse to multiple GPIO capture inputs (or use an appropriate shared-trigger capture method), then compare node timestamps for the same event and publish capture results. HTTP-delivered `utc_us` are **not simultaneous** and cannot be subtracted to obtain microsecond-level precision.
+## Version 1.2 – HTML-Dashboard
 
-`release` may be stale because firmware metadata is independent of the wire protocol version; confirm firmware versions from build artifacts/logs separately.
+`stability_report.html` enthält wieder eine eigenständige, offline nutzbare HTML-Auswertung mit Geräteübersicht, Netzwerkdiagnose, Vorfällen und SVG-Zeitreihendiagrammen (Probes, Exchanges, Replay, Drift, Spread, Beacons, Authentifizierung). Keine zusätzlichen Python-Pakete erforderlich. Die Diagramme zeigen Firmware-Schätzwerte und Zähler, keine GPIO-Genauigkeitsmessung.
+
+Aufruf wie bisher: `python sensorforge_test_manager.py`. Vorhandene Messung neu auswerten mit Menüpunkt 5 oder `python sensorforge_test_manager.py --report`.
+
+**Achtung:** Die alte `sensorforge_results/monitor.sqlite3` ist ein anderes Datenbankformat und wird von der neuen Berichts-Funktion nicht direkt verarbeitet. Für neue Testläufe die Dateien aus `sensorforge_tests` bereitstellen.
