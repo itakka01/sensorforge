@@ -21,13 +21,13 @@
 // WebConfig, so a running device can be mapped back to the exact Git tag.
 
 #define SENSORFORGE_RELEASE_NUMBER 87
-#define SENSORFORGE_RELEASE_TAG "v87-beta137"
+#define SENSORFORGE_RELEASE_TAG "v87-beta138"
 #define SENSORFORGE_RELEASE_DATE "2026-10-20"
 #define SENSORFORGE_RELEASE_SUMMARY \
-    "Beta 137: Coordinator and Time Broadcaster run with WiFi modem sleep disabled (WIFI_PS_NONE)."
+    "Beta 138: WIFI_PS_NONE on every active cluster member; all ESP-NOW sends tracked for TX latency."
 
-// Current source-tree stage. Beta 137: role-based WiFi power save for time-critical roles.
-#define SENSORFORGE_WORKTREE_STAGE "v87-beta137"
+// Current source-tree stage. Beta 138: cluster-wide WiFi power save rule, TX diagnostics fix.
+#define SENSORFORGE_WORKTREE_STAGE "v87-beta138"
 #define SENSORFORGE_WORKTREE_DATE "2026-10-20"
 #define SENSORFORGE_WORKTREE_SUMMARY \
-    "v87 Beta 137: WIFI_PS_NONE for coordinator/time broadcaster; /cluster_status wifi_ps_* fields."
+    "v87 Beta 138: active cluster -> WIFI_PS_NONE; tx_callback_unmatched fix; Reply TX latency histogram."

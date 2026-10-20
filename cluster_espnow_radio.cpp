@@ -219,17 +219,59 @@ uint32_t sourceChanges=0;
 // Callback-safe TX latency sampling. Entries are inserted before esp_now_send().
 // Match by destination MAC and FIFO; no per-packet sequence is supplied to TX callbacks.
 constexpr size_t kTxPendingCapacity=24;
-struct TxPending { bool used=false; uint8_t mac[6]={}; int64_t enqueueUs=0; };
+// Beta138: EVERY esp_now_send() registers an entry (also grants/acks and diagnostic/production
+// beacons). Before, only sendFrame() did, so those frames counted as "unmatched" and their
+// callbacks could consume another frame's entry with the same MAC (e.g. a broadcaster production
+// beacon taking a pending broadcast Probe), which mis-attributed TX latency samples.
+constexpr uint8_t kTxClassOther=0, kTxClassReply=1;
+struct TxPending { bool used=false; uint8_t mac[6]={}; int64_t enqueueUs=0; uint8_t frameClass=kTxClassOther; };
 TxPending txPending[kTxPendingCapacity];
 portMUX_TYPE txMux=portMUX_INITIALIZER_UNLOCKED;
 uint32_t txLatencyLastUs=0,txLatencyMaxUs=0,txLatencySamples=0;
 uint32_t txCallbackFailed=0,txPendingOverflow=0,txCallbackUnmatched=0;
+// Beta138 diagnostics: enqueue -> TX-done callback of Reply frames only (NOT the RF airtime).
+uint32_t txReplyLatencyLastUs=0,txReplyLatencyMaxUs=0,txReplyLatencySamples=0;
+uint32_t txReplyLatencyHist[Diagnostics::kProbeReplyDelayBuckets]={};
 void txTimingReset() {
     portENTER_CRITICAL(&txMux);
     for(auto &entry:txPending)entry={};
     txLatencyLastUs=txLatencyMaxUs=txLatencySamples=0;
     txCallbackFailed=txPendingOverflow=txCallbackUnmatched=0;
+    txReplyLatencyLastUs=txReplyLatencyMaxUs=txReplyLatencySamples=0;
+    for(auto &bucket:txReplyLatencyHist)bucket=0;
     portEXIT_CRITICAL(&txMux);
+}
+// Registers a TX-latency entry before esp_now_send(). Returns the slot (or capacity on overflow).
+size_t txPendingRegister(const uint8_t mac[6],uint8_t frameClass,int64_t enqueueUs) {
+    size_t slot=kTxPendingCapacity;
+    portENTER_CRITICAL(&txMux);
+    for(size_t i=0;i<kTxPendingCapacity;++i) {
+        if(txPending[i].used && enqueueUs-txPending[i].enqueueUs>2000000LL)txPending[i].used=false;
+        if(!txPending[i].used && slot==kTxPendingCapacity)slot=i;
+    }
+    if(slot!=kTxPendingCapacity) {
+        txPending[slot].used=true;
+        memcpy(txPending[slot].mac,mac,6);
+        txPending[slot].enqueueUs=enqueueUs;
+        txPending[slot].frameClass=frameClass;
+    } else ++txPendingOverflow;
+    portEXIT_CRITICAL(&txMux);
+    return slot;
+}
+// Releases an entry whose esp_now_send() was not issued or failed.
+void txPendingCancel(size_t slot,int64_t enqueueUs) {
+    if(slot==kTxPendingCapacity)return;
+    portENTER_CRITICAL(&txMux);
+    if(txPending[slot].used && txPending[slot].enqueueUs==enqueueUs)txPending[slot].used=false;
+    portEXIT_CRITICAL(&txMux);
+}
+// Direct esp_now_send() with TX-latency registration (grants, acks, beacons).
+esp_err_t espNowSendTracked(const uint8_t mac[6],const uint8_t *data,size_t length) {
+    const int64_t enqueueUs=esp_timer_get_time();
+    const size_t slot=txPendingRegister(mac,kTxClassOther,enqueueUs);
+    const esp_err_t err=esp_now_send(mac,data,length);
+    if(err!=ESP_OK)txPendingCancel(slot,enqueueUs);
+    return err;
 }
 void onSentMac(const uint8_t* mac,esp_now_send_status_t status) {
     const int64_t now=esp_timer_get_time();
@@ -247,6 +289,15 @@ void onSentMac(const uint8_t* mac,esp_now_send_status_t status) {
             txLatencyLastUs=static_cast<uint32_t>(elapsed);
             if(txLatencyLastUs>txLatencyMaxUs)txLatencyMaxUs=txLatencyLastUs;
             ++txLatencySamples;
+            if(txPending[match].frameClass==kTxClassReply) {
+                const uint32_t us=txLatencyLastUs;
+                uint8_t bucket=0;
+                while(bucket<Diagnostics::kProbeReplyDelayBuckets-1 && us>kProbeReplyDelayBucketUpperUs[bucket])++bucket;
+                ++txReplyLatencyHist[bucket];
+                ++txReplyLatencySamples;
+                txReplyLatencyLastUs=us;
+                if(us>txReplyLatencyMaxUs)txReplyLatencyMaxUs=us;
+            }
         }
     }
     if(status!=ESP_NOW_SEND_SUCCESS)++txCallbackFailed;
@@ -797,18 +848,8 @@ bool sendFrame(EspNowTimePackets::Frame& f,const uint8_t mac[6],
     // Prepare callback bookkeeping BEFORE sampling the transmission timestamp.
     // Otherwise queue bookkeeping unnecessarily biases t1/t3.
     const int64_t queuedAtUs=esp_timer_get_time();
-    size_t slot=kTxPendingCapacity;
-    portENTER_CRITICAL(&txMux);
-    for(size_t i=0;i<kTxPendingCapacity;++i) {
-        if(txPending[i].used && queuedAtUs-txPending[i].enqueueUs>2000000LL)txPending[i].used=false;
-        if(!txPending[i].used && slot==kTxPendingCapacity)slot=i;
-    }
-    if(slot!=kTxPendingCapacity) {
-        txPending[slot].used=true;
-        memcpy(txPending[slot].mac,mac,6);
-        txPending[slot].enqueueUs=queuedAtUs;
-    } else ++txPendingOverflow;
-    portEXIT_CRITICAL(&txMux);
+    const size_t slot=txPendingRegister(mac,
+        f.type==EspNowTimePackets::Type::Reply ? kTxClassReply : kTxClassOther,queuedAtUs);
     // V2 Software Timestamp Correction:
     // - Probe: carries t1 (early) + delay from PREVIOUS Probe
     // - Reply: carries t2 (RX timestamp, no correction needed)
@@ -832,20 +873,12 @@ bool sendFrame(EspNowTimePackets::Frame& f,const uint8_t mac[6],
 
     uint8_t b[EspNowTimePackets::kPacketSize];
     if(!EspNowTimePackets::encode(f,b,clusterEspNowTimeSign,nullptr)) {
-        if(slot!=kTxPendingCapacity) {
-            portENTER_CRITICAL(&txMux);
-            if(txPending[slot].used && txPending[slot].enqueueUs==queuedAtUs)txPending[slot].used=false;
-            portEXIT_CRITICAL(&txMux);
-        }
+        txPendingCancel(slot,queuedAtUs);
         return false;
     }
     // V2: Send packet FIRST, then measure delay (timestamp to esp_now_send completion)
     if(esp_now_send(mac,b,sizeof(b))!=ESP_OK) {
-        if(slot!=kTxPendingCapacity){
-            portENTER_CRITICAL(&txMux);
-            if(txPending[slot].used && txPending[slot].enqueueUs==queuedAtUs)txPending[slot].used=false;
-            portEXIT_CRITICAL(&txMux);
-        }
+        txPendingCancel(slot,queuedAtUs);
         return false;
     }
     // V2: Measure delay AFTER esp_now_send() completes
@@ -1672,7 +1705,7 @@ void serviceGrantDiagnostic(uint32_t localBoot) {
             m.action=ClusterTimeGrantProtocol::Action::Ack;
             uint8_t wire[ClusterTimeGrantProtocol::kWireBytes]={};
             if(ClusterTimeGrantProtocol::encode(m,wire,sizeof(wire),clusterTimeGrantSign) &&
-               ensurePeer(item.mac) && esp_now_send(item.mac,wire,sizeof(wire))==ESP_OK)
+               ensurePeer(item.mac) && espNowSendTracked(item.mac,wire,sizeof(wire))==ESP_OK)
                 ++grantDiag.acksSent;
             else {
                 ++grantDiag.sendFailed;
@@ -1766,7 +1799,7 @@ void serviceGrantDiagnostic(uint32_t localBoot) {
     uint8_t wire[ClusterTimeGrantProtocol::kWireBytes]={};
     if(!ClusterTimeGrantProtocol::encode(m,wire,sizeof(wire),clusterTimeGrantSign) ||
        !ensurePeer(observedBroadcasterMac) ||
-       esp_now_send(observedBroadcasterMac,wire,sizeof(wire))!=ESP_OK) {
+       espNowSendTracked(observedBroadcasterMac,wire,sizeof(wire))!=ESP_OK) {
         ++grantDiag.sendFailed;return;
     }
     ++grantDiag.grantsSent;
@@ -1903,6 +1936,10 @@ Diagnostics diagnostics(){Diagnostics out=stats;
     out.txCallbackFailed=txCallbackFailed;
     out.txPendingOverflow=txPendingOverflow;
     out.txCallbackUnmatched=txCallbackUnmatched;
+    out.txReplyLatencySamples=txReplyLatencySamples;
+    out.txReplyLatencyLastUs=txReplyLatencyLastUs;
+    out.txReplyLatencyMaxUs=txReplyLatencyMaxUs;
+    for(uint8_t i=0;i<Diagnostics::kProbeReplyDelayBuckets;++i)out.txReplyLatencyHist[i]=txReplyLatencyHist[i];
     portEXIT_CRITICAL(&txMux);
     out.lastSeriesEstimateAgeMs=lastEstimateMs ? uint32_t(millis()-lastEstimateMs) : 0;    out.lastAcceptedAgeMs=lastPrecisionMs ? uint32_t(millis()-lastPrecisionMs) : 0;out.precisionRecentlyAccepted=lastPrecisionMs && out.lastAcceptedAgeMs<=kPrecisionLifetimeMs;out.capturePauseRemainingMs=capturePaused() ? uint32_t(captureGuardUntilMs-millis()) : 0;out.syncPermission=syncPermissionValid();out.syncPermissionRemainingMs=out.syncPermission?uint32_t(permissionUntilMs-millis()):0;portENTER_CRITICAL(&queueMux);out.dropped=drops;portEXIT_CRITICAL(&queueMux);
     // Beta131: Production broadcaster handover state
@@ -2081,7 +2118,7 @@ void serviceDiagnosticBroadcaster(bool allowed, uint32_t epoch,
 
         uint8_t packet[ClusterTimeDiagnosticBeacon::kWireBytes]={};
         if(ClusterTimeDiagnosticBeacon::encode(beacon,packet,clusterEspNowDiagnosticBeaconSign)) {
-            if(esp_now_send(kBroadcastMac,packet,sizeof(packet))==ESP_OK) {
+            if(espNowSendTracked(kBroadcastMac,packet,sizeof(packet))==ESP_OK) {
                 ++stats.sent;
                 Serial.printf("[BROADCASTER] Diagnostic beacon sent (seq %u, tag %llx)\n",
                     beacon.sequence, beacon.senderTag);
@@ -2623,6 +2660,10 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
                 // - Probe/Reply/Final: timeUs = broadcaster's monotonic time
                 // Nodes calculate offset to BROADCASTER's clock (not coordinator's)
                 // This ensures mathematical consistency across all broadcaster messages
+                // Beta138: TX-latency registration happens before the stamp, so the
+                // stamp -> esp_now_send() path of the beacon is unchanged.
+                const int64_t prodEnqueueUs = esp_timer_get_time();
+                const size_t prodSlot = txPendingRegister(kBroadcastMac, kTxClassOther, prodEnqueueUs);
                 const int64_t broadcasterMonoUs = esp_timer_get_time();
                 const uint32_t broadcasterMonoLow = static_cast<uint32_t>(broadcasterMonoUs);
 
@@ -2642,11 +2683,12 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
                 prodBeacon.nonce=broadcasterMonoLow;  // Broadcaster's own monotonic time
 
                 uint8_t packet[EspNowTimePackets::kPacketSize];
-                if(EspNowTimePackets::encode(prodBeacon,packet,clusterEspNowTimeSign,nullptr)) {
-                    if(esp_now_send(kBroadcastMac,packet,sizeof(packet))==ESP_OK) {
-                        ++stats.sent;
-                        ++broadcasterProductionBeaconsSent;
-                    }
+                if(EspNowTimePackets::encode(prodBeacon,packet,clusterEspNowTimeSign,nullptr) &&
+                   esp_now_send(kBroadcastMac,packet,sizeof(packet))==ESP_OK) {
+                    ++stats.sent;
+                    ++broadcasterProductionBeaconsSent;
+                } else {
+                    txPendingCancel(prodSlot, prodEnqueueUs);
                 }
             } else {
                 // Beta131-DIAGNOSIS (Seventeenth cycle): Track precisionUtcNow() failure

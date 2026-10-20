@@ -34,15 +34,15 @@ wifi_ps_type_t toIdf(Mode mode) {
 
 }  // namespace
 
-void service(bool isCoordinator, bool isTimeBroadcaster) {
+void service(bool clusterActive) {
     const uint32_t now = millis();
     if (serviced && static_cast<uint32_t>(now - lastServiceMs) < kServiceIntervalMs) return;
     serviced = true;
     lastServiceMs = now;
 
-    state.timeCriticalRole = roleRequiresNoSleep(isCoordinator, isTimeBroadcaster);
+    state.clusterActive = clusterActive;
     // Baseline = previous behaviour: the sleep type Arduino applies on STA start.
-    state.expected = expectedMode(state.timeCriticalRole, fromIdf(WiFi.getSleep()));
+    state.expected = expectedMode(clusterActive, fromIdf(WiFi.getSleep()));
 
     const bool staUp = (WiFi.getMode() & WIFI_MODE_STA) != 0;
     if (!staUp) {
@@ -69,7 +69,7 @@ void service(bool isCoordinator, bool isTimeBroadcaster) {
         state.lastError = 0;
         lastFailureMs = 0;
         logWrite(String("[WIFI-PS] ") + modeName(previous) + " -> " + modeName(state.expected) +
-                 (state.timeCriticalRole ? " (coordinator/time broadcaster)" : " (node default)"));
+                 (state.clusterActive ? " (cluster active)" : " (cluster inactive, default)"));
     } else {
         ++state.applyFailures;
         state.lastError = err != ESP_OK ? static_cast<int32_t>(err) : -1;

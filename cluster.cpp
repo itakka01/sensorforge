@@ -4090,14 +4090,12 @@ void clusterMdnsAdvertise()
 
 void clusterLoop()
 {
-    // Beta137: Coordinator and configured Time Broadcaster run without WiFi modem
-    // sleep (WIFI_PS_NONE); other roles keep the Arduino default. Follows the ROLE,
-    // not the broadcaster lease. Never touched while a capture deadline is protected.
+    // Beta138: every device with an ACTIVE cluster runtime (coordinator, time
+    // broadcaster - also without lease - and normal nodes) runs without WiFi modem
+    // sleep (WIFI_PS_NONE); outside active cluster operation the Arduino default is
+    // restored. Never touched while a capture deadline is protected.
     if (!clusterCaptureProtectionActive()) {
-        WifiPowerPolicy::service(
-            runtimeActive && localIsCoordinator,
-            cfg_operating_mode == "time_broadcaster"
-        );
+        WifiPowerPolicy::service(runtimeActive);
     }
     // Diagnostic ESP-NOW time transport only; never changes cluster clock.
     // Capture deadline takes precedence over any radio work.
@@ -5065,6 +5063,14 @@ String clusterStatusJson()
         if (i) json += ",";
         json += String((unsigned long)esn.probeReplyDelayHist[i]);
     }
+    json += "],\"tx_reply_latency_samples\":" + String((unsigned long)esn.txReplyLatencySamples);
+    json += ",\"tx_reply_latency_last_us\":" + String((unsigned long)esn.txReplyLatencyLastUs);
+    json += ",\"tx_reply_latency_max_us\":" + String((unsigned long)esn.txReplyLatencyMaxUs);
+    json += ",\"tx_reply_latency_hist\":[";
+    for (uint8_t i = 0; i < ClusterEspNowRadio::Diagnostics::kProbeReplyDelayBuckets; ++i) {
+        if (i) json += ",";
+        json += String((unsigned long)esn.txReplyLatencyHist[i]);
+    }
     json += "],\"probe_reply_delay_hist_upper_us\":[";
     for (uint8_t i = 0; i + 1 < ClusterEspNowRadio::Diagnostics::kProbeReplyDelayBuckets; ++i) {
         if (i) json += ",";
@@ -5079,7 +5085,7 @@ String clusterStatusJson()
         const WifiPowerPolicy::Status wps = WifiPowerPolicy::status();
         json += ",\"wifi_ps_mode\":\""; json += WifiPowerPolicy::modeName(wps.actual); json += "\"";
         json += ",\"wifi_ps_expected\":\""; json += WifiPowerPolicy::modeName(wps.expected); json += "\"";
-        json += ",\"wifi_ps_time_critical_role\":"; json += wps.timeCriticalRole ? "true" : "false";
+        json += ",\"wifi_ps_cluster_active\":"; json += wps.clusterActive ? "true" : "false";
         json += ",\"wifi_ps_applies\":" + String((unsigned long)wps.applies);
         json += ",\"wifi_ps_apply_failures\":" + String((unsigned long)wps.applyFailures);
         json += ",\"wifi_ps_read_failures\":" + String((unsigned long)wps.readFailures);

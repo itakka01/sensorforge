@@ -1,3 +1,20 @@
+## v87-beta138 — 2026-10-20 (CLUSTER-WEITER WLAN-POWER-SAVE + TX-DIAGNOSE-FIX)
+
+**Regel:** Jedes Gerät mit aktivem Cluster-Runtime (Coordinator, Time Broadcaster auch ohne Lease, normale Nodes; boardunabhängig) läuft mit `WIFI_PS_NONE`. Ohne aktiven Cluster gilt das bisherige Verhalten (`WiFi.getSleep()`, Arduino-Default `WIFI_PS_MIN_MODEM`). Rollenwechsel innerhalb des aktiven Clusters ändern nichts; Cluster-Deaktivierung stellt die Baseline wieder her; STA-Neustart/Reconnect wird erkannt und korrigiert.
+- `wifi_power_policy.cpp/.h`: `service(clusterActive)`; Readback, Fehlerzähler, 5 s Back-off unverändert
+- `/cluster_status`: `wifi_ps_cluster_active` ersetzt `wifi_ps_time_critical_role`
+
+**FIX Diagnose `tx_callback_unmatched`:**
+- Ursache: Nur `sendFrame()` registrierte TX-Einträge. Grant (Coordinator), Grant-Ack, Diagnose- und Production-Beacons (Broadcaster) wurden direkt mit `esp_now_send()` gesendet → jeder Callback „unmatched“ (beta137: devxiao3 31.850 = 26.477 Production + 3.585 Diagnose + 1.788 Acks; Coordinator 1.788 = Grants). Da nur über die Ziel-MAC zugeordnet wird, konnten diese Callbacks fremde Einträge gleicher MAC übernehmen (z. B. Production-Beacon ↔ Broadcast-Probe) → TX-Latenzwerte verfälscht.
+- Fix: Alle Sendestellen registrieren (`txPendingRegister`/`espNowSendTracked`); beim Production-Beacon vor dem Zeitstempel, Sendepfad Zeitstempel→`esp_now_send` unverändert.
+- Neu: `tx_reply_latency_*` (nur Reply-Frames, Enqueue→TX-Callback, Histogramm mit den Grenzen von `probe_reply_delay_hist_upper_us`).
+
+**UNVERÄNDERT:** 250-µs-Grenze, Estimator, Zeitstempel/Offset, HMAC, Replay, Epoch, Frame-Layouts, Lease, Suppression, Early-Resume, Capture.
+
+**BEFUND beta137:** Nodes (noch mit Modem-Sleep) gegen Broadcaster: 97/97 Serien ≤ 250 µs (Streuung ~22 µs). Gegen Coordinator (bereits `WIFI_PS_NONE`): 15/40 (Streuung ~280–310 µs). Modem-Sleep ist damit nicht die Hauptursache der Coordinator-Streuung.
+
+**TESTS:** `test_wifi_power_policy` 18/18 (Cluster an/aus, Rollenwechsel, Reconnect, API-Fehler); alle 13 Host-Tests grün.
+
 ## v87-beta137 — 2026-10-20 (WLAN-MODEM-SLEEP FÜR ZEITKRITISCHE ROLLEN AUS)
 
 **Architekturregel:** Coordinator und Time Broadcaster arbeiten mit `WIFI_PS_NONE`. Normale Nodes behalten das bisherige Verhalten.

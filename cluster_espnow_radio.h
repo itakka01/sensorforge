@@ -129,6 +129,11 @@ struct Diagnostics {
     uint32_t probeReplyDelaySamples=0, probeReplyDelayLastUs=0, probeReplyDelayMaxUs=0;
     uint64_t probeReplyDelayTotalUs=0;
     uint32_t probeReplyDelayHist[kProbeReplyDelayBuckets]={};
+    // Beta138: Reply frames only: enqueue (before esp_now_send) -> TX-done callback.
+    // Upper bound of the uncompensated post-stamp TX path; NOT the RF airtime itself.
+    // Same bucket bounds as probeReplyDelayHist.
+    uint32_t txReplyLatencySamples=0, txReplyLatencyLastUs=0, txReplyLatencyMaxUs=0;
+    uint32_t txReplyLatencyHist[kProbeReplyDelayBuckets]={};
     uint64_t activeTimeSource=0;  // 0=none, or tag of active coordinator/broadcaster
     uint32_t sourceChanges=0;
     uint32_t broadcasterProductionBeaconsSent=0;
