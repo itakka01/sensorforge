@@ -71,6 +71,20 @@ static bool healthForceSdRefresh=false;
 static const char *CLUSTER_LEAVE_MAGIC = "SFL1";
 static const char *CLUSTER_RESOURCE_MAGIC = "SFR1";
 static const char *CLUSTER_COORDINATION_MAGIC = "SFCO1";
+// Board capability bits carried in the existing (formerly always 0) SFCO1
+// capabilities field. Display information only; never used for election/sync.
+// Bit 0 marks the bitset as valid, so 0 from older firmware means "unknown".
+static const uint32_t CLUSTER_CAP_BOARD_INFO = 1UL << 0;
+static const uint32_t CLUSTER_CAP_PRECISION_SYNC = 1UL << 1;
+static const uint32_t CLUSTER_LOCAL_CAPABILITIES =
+    CLUSTER_CAP_BOARD_INFO | (BOARD_SUPPORTS_PRECISION_SYNC ? CLUSTER_CAP_PRECISION_SYNC : 0UL);
+
+static const char *precisionSyncName(uint32_t capabilities)
+{
+    if (!(capabilities & CLUSTER_CAP_BOARD_INFO))
+        return "unknown";
+    return (capabilities & CLUSTER_CAP_PRECISION_SYNC) ? "yes" : "no";
+}
 static const char *CLUSTER_NODE_HEARTBEAT_MAGIC = "SFNH1";
 static const char *CLUSTER_NODE_ACK_MAGIC = "SFNA1";
 // Time is an OPTIONAL sidecar to the cluster: it never adjusts the system RTC.
@@ -3531,7 +3545,7 @@ static bool sendCoordination()
     payload += '|';
     payload += String((unsigned long)runtimeCoordinatorPolicy);
     payload += '|';
-    payload += "0"; // reserved coordination/time-sync capability bitset
+    payload += String((unsigned long)CLUSTER_LOCAL_CAPABILITIES); // board capability bitset (display only)
     payload += '|';
     payload += currentCoordinatorId[0] ? currentCoordinatorId : "-";
     payload += '|';
@@ -5252,6 +5266,7 @@ String clusterStatusJson()
         String(coordinatorPolicyName(runtimeCoordinatorPolicy)) + "\"";
     json += ",\"cluster_role\":\"" +
         String(localIsCoordinator ? "coordinator" : "node") + "\"";
+    json += ",\"precision_sync\":\"" + String(precisionSyncName(CLUSTER_LOCAL_CAPABILITIES)) + "\"";
     json += ",\"direct_heartbeat_age_ms\":-1";
     json += ",\"coordinator_ack_age_ms\":";
     if (!localIsCoordinator && lastCoordinatorAckMs != 0)
@@ -5312,6 +5327,7 @@ String clusterStatusJson()
         json += peer.transportMode ? "true" : "false";
         json += ",\"coordinator_policy\":\"" +
             String(coordinatorPolicyName(peer.coordinatorPolicy)) + "\"";
+        json += ",\"precision_sync\":\"" + String(precisionSyncName(peer.coordinationCapabilities)) + "\"";
         json += ",\"cluster_role\":\"" +
             String(
                 currentCoordinatorId[0] &&

@@ -1,6 +1,7 @@
 #include "webconfig_streamer.h"
 
 #include "config.h"
+#include "board_config.h"
 #include "drone_mode.h"
 #include "streamer.h"
 #include "onvif.h"
@@ -229,6 +230,35 @@ String webconfigStreamerOperatingModeHtml(
         "Es ist unkompliziert einzubinden, aber bei dauerhaftem Betrieb meist weniger effizient als RTSP.\n\n"
         "Beide Stream-Arten dürfen gleichzeitig aktiviert sein. SensorForge verwendet dafür denselben Kameraframe. "
         "Pro Stream-Art sind aktuell maximal zwei gleichzeitig verbundene Clients vorgesehen; alle Clients teilen denselben Kameraframe.";
+    // Board function releases (UI only). A disabled option is not submitted, so
+    // the current value is re-sent via a hidden field after the select: the
+    // select's own value comes first and wins whenever an enabled option is chosen.
+    const bool camOk = BOARD_SUPPORTS_CAMERA_RECORDING;
+    const bool tbOk = BOARD_SUPPORTS_TIME_BROADCASTER;
+    // Same conditions as the 'selected' attributes below; like the browser, the
+    // last selected option in list order is the displayed (submitted) one.
+    const bool droneSel = droneModeEnabled();
+    const bool regularSel = !droneSel && !configuredStreamerMode;
+    String currentModeValue = "off";
+    if (droneSel) currentModeValue = "drone";
+    if (regularSel && !cfg_motion_recording_enabled && !cfg_shooter_enabled) currentModeValue = "off";
+    if (regularSel && cfg_motion_recording_enabled && !cfg_shooter_enabled) currentModeValue = "motion";
+    if (regularSel && !cfg_motion_recording_enabled && cfg_shooter_enabled) currentModeValue = "shooter";
+    if (regularSel && cfg_motion_recording_enabled && cfg_shooter_enabled) currentModeValue = "motion_shooter";
+    if (!droneSel && configuredStreamerMode) currentModeValue = "streamer";
+    if (cfg_operating_mode == "time_broadcaster") currentModeValue = "time_broadcaster";
+    const bool currentModeLocked =
+        (currentModeValue == "time_broadcaster") ? !tbOk
+        : (currentModeValue == "drone" || currentModeValue == "off") ? false
+        : !camOk;
+    const String operatingModeLockHtml =
+        String(currentModeLocked
+            ? "<input type='hidden' name='operating_mode_ui' value='" + currentModeValue + "'>"
+            : "") +
+        String(!camOk || !tbOk
+            ? "<div class='muted' style='margin-top:6px'>Ausgegraute Betriebsmodi: " BOARD_UNSUPPORTED_HINT "</div>"
+            : "");
+
     html +=
         "<div id='operating-mode' style='margin:0 0 18px 0;padding:14px;border:1px solid #d8dee6;border-radius:8px;background:#f8fbff'>"
         "<div style='display:flex;align-items:center;gap:6px;flex-wrap:wrap'><b>Betriebsmodus</b>" +
@@ -237,12 +267,13 @@ String webconfigStreamerOperatingModeHtml(
         "<select id='cfgOperatingMode' name='operating_mode_ui' style='min-width:320px;max-width:100%;margin-top:8px'>"
         "<option value='drone'" + String(droneModeEnabled() ? " selected" : "") + ">Drone / Bereitschaft – nur Coordinator-Aufträge</option>"
         "<option value='off'" + String(!droneModeEnabled() && !configuredStreamerMode && !cfg_motion_recording_enabled && !cfg_shooter_enabled ? " selected" : "") + ">Aus - keine automatische Aufnahme</option>"
-        "<option value='motion'" + String(!droneModeEnabled() && !configuredStreamerMode && cfg_motion_recording_enabled && !cfg_shooter_enabled ? " selected" : "") + ">Normal Recording - Motion/Alarm</option>"
-        "<option value='shooter'" + String(!droneModeEnabled() && !configuredStreamerMode && !cfg_motion_recording_enabled && cfg_shooter_enabled ? " selected" : "") + ">Power Shooter standalone</option>"
-        "<option value='motion_shooter'" + String(!droneModeEnabled() && !configuredStreamerMode && cfg_motion_recording_enabled && cfg_shooter_enabled ? " selected" : "") + ">Normal Recording + Power Shooter</option>"
-        "<option value='streamer'" + String(!droneModeEnabled() && configuredStreamerMode ? " selected" : "") + ">Netzwerk-Streamer</option>"
-        "<option value='time_broadcaster'" + String(cfg_operating_mode == "time_broadcaster" ? " selected" : "") + ">Zeit-Broadcaster (Diagnose-Standby, kein Sendebetrieb)</option>"
-        "</select>"
+        "<option value='motion'" + String(!droneModeEnabled() && !configuredStreamerMode && cfg_motion_recording_enabled && !cfg_shooter_enabled ? " selected" : "") + boardOptionDisabledAttr(camOk) + ">Normal Recording - Motion/Alarm" + boardOptionUnsupportedSuffix(camOk) + "</option>"
+        "<option value='shooter'" + String(!droneModeEnabled() && !configuredStreamerMode && !cfg_motion_recording_enabled && cfg_shooter_enabled ? " selected" : "") + boardOptionDisabledAttr(camOk) + ">Power Shooter standalone" + boardOptionUnsupportedSuffix(camOk) + "</option>"
+        "<option value='motion_shooter'" + String(!droneModeEnabled() && !configuredStreamerMode && cfg_motion_recording_enabled && cfg_shooter_enabled ? " selected" : "") + boardOptionDisabledAttr(camOk) + ">Normal Recording + Power Shooter" + boardOptionUnsupportedSuffix(camOk) + "</option>"
+        "<option value='streamer'" + String(!droneModeEnabled() && configuredStreamerMode ? " selected" : "") + boardOptionDisabledAttr(camOk) + ">Netzwerk-Streamer" + boardOptionUnsupportedSuffix(camOk) + "</option>"
+        "<option value='time_broadcaster'" + String(cfg_operating_mode == "time_broadcaster" ? " selected" : "") + boardOptionDisabledAttr(tbOk) + ">Zeit-Broadcaster (Diagnose-Standby, kein Sendebetrieb)" + boardOptionUnsupportedSuffix(tbOk) + "</option>"
+        "</select>" +
+        operatingModeLockHtml +
         "<div id='cfgStreamerOptions' style='margin-top:14px;padding:14px;border:1px solid #8fb5c9;border-radius:8px;background:#f7fbfd'>"
         "<div style='display:flex;align-items:center;gap:6px;flex-wrap:wrap'><b>Netzwerk-Streamer</b>" +
         streamerUiInfoButton("Netzwerk-Streamer", streamerSettingsInfo) +

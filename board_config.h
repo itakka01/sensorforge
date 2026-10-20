@@ -24,8 +24,8 @@ static constexpr int16_t SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10 = 85;
 // BOARD AUSWÄHLEN
 // =============================================================
 
-//#define BOARD_FREENOVE
-#define BOARD_XIAO
+#define BOARD_FREENOVE
+//#define BOARD_XIAO
 
 
 #if defined(BOARD_FREENOVE) && defined(BOARD_XIAO)
@@ -45,6 +45,18 @@ static constexpr int16_t SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10 = 85;
 
 #define BOARD_DISPLAY_NAME "Freenove FNK0085 ESP32-S3 WROOM"
 #define BOARD_HAS_ESP_NOW 1
+
+// Board function releases (WebConfig presentation only, no runtime limits).
+// COORDINATOR / TIME_BROADCASTER stay 1 until the running hardware test is
+// evaluated; GPS_TRACKER is a provisional release (no GPS mode exists yet).
+#define BOARD_SUPPORTS_COORDINATOR      0
+#define BOARD_SUPPORTS_TIME_BROADCASTER 0
+#define BOARD_SUPPORTS_CLUSTER_NODE     1
+#define BOARD_SUPPORTS_CAMERA_RECORDING 1
+#define BOARD_SUPPORTS_GPS_TRACKER      1
+// Board type qualified for high-precision, time-critical cluster actions.
+// Suitability only, never a statement about the current sync state.
+#define BOARD_SUPPORTS_PRECISION_SYNC   0
 
 // Video-codec hardware capability only. This does NOT by itself enable an
 // ONVIF/RTSP codec; the streamer must also implement and qualify that codec.
@@ -169,6 +181,14 @@ static constexpr int16_t BOARD_WIFI_TX_POWER_DEFAULT_X10 = 200;
 
 #define BOARD_DISPLAY_NAME "Seeed XIAO ESP32S3 Sense"
 #define BOARD_HAS_ESP_NOW 1
+
+// Board function releases (WebConfig presentation only, no runtime limits).
+#define BOARD_SUPPORTS_COORDINATOR      1
+#define BOARD_SUPPORTS_TIME_BROADCASTER 1
+#define BOARD_SUPPORTS_CLUSTER_NODE     1
+#define BOARD_SUPPORTS_CAMERA_RECORDING 1
+#define BOARD_SUPPORTS_GPS_TRACKER      1
+#define BOARD_SUPPORTS_PRECISION_SYNC   1
 
 // Reserved diagnostic output D1 / GPIO2. Only use during explicit test.
 // XIAO has no three-channel coordinator input assignment by default.
@@ -335,6 +355,26 @@ static constexpr int16_t BOARD_WIFI_TX_POWER_DEFAULT_X10 = 200;
 #endif
 
 #endif
+
+#if !defined(BOARD_SUPPORTS_COORDINATOR) || !defined(BOARD_SUPPORTS_TIME_BROADCASTER) || \
+    !defined(BOARD_SUPPORTS_CLUSTER_NODE) || !defined(BOARD_SUPPORTS_CAMERA_RECORDING) || \
+    !defined(BOARD_SUPPORTS_GPS_TRACKER) || !defined(BOARD_SUPPORTS_PRECISION_SYNC)
+#error "Every board profile must define all six BOARD_SUPPORTS_* flags explicitly"
+#endif
+
+// WebConfig marker for options of an unsupported board function: the option
+// stays visible but disabled, with a readable hint in its label.
+#define BOARD_UNSUPPORTED_HINT "Dieses Board unterstützt diese Funktion nicht."
+
+static inline const char *boardOptionDisabledAttr(bool supported)
+{
+    return supported ? "" : " disabled";
+}
+
+static inline const char *boardOptionUnsupportedSuffix(bool supported)
+{
+    return supported ? "" : " – " BOARD_UNSUPPORTED_HINT;
+}
 
 
 // Generic helpers for board-scoped WiFi TX-power validation.
