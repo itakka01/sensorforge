@@ -4,9 +4,12 @@
 Uses beta134 /cluster_status; no restart, flash or write requests.
 """
 from __future__ import annotations
-import argparse, datetime as dt, json, pathlib, signal, socket, sqlite3, sys, time, urllib.parse, threading, html
+import argparse, datetime as dt, json, pathlib, signal, socket, sqlite3, sys, time, urllib.parse, threading, html, getpass, shutil, queue
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from live_dashboard import Dashboard
 from collections import defaultdict
 import sensorforge_monitor as legacy
+import dynamic_discovery as discovery
 
 HOSTS = ['devfreenove1.local','devxiao1.local','devxiao2.local','devxiao3.local']
 EXTRA_KEYS = ('active_time_source','source_changes','drift_valid','drift_ppm','drift_uncertainty_ppm',
@@ -27,7 +30,9 @@ def utc(): return dt.datetime.now(dt.timezone.utc).isoformat(timespec='milliseco
 
 def cfg_read(path):
     cfg=json.loads(pathlib.Path(path).read_text(encoding='utf8'))
-    cfg.setdefault('expected_hosts',HOSTS)
+    if 'seed_host' not in cfg and 'expected_hosts' not in cfg:
+        cfg['seed_host'] = 'devxiao3.local'
+    cfg.setdefault('discovery_interval_seconds', 30)
     cfg.setdefault('interval_seconds',10)
     cfg.setdefault('timeout_seconds',5)
     cfg.setdefault('stalled_probe_seconds',120)
@@ -41,6 +46,7 @@ def init_database(path):
     db.execute('CREATE INDEX IF NOT EXISTS obs_run_host_ts ON observations(run_id,host,ts)')
     db.execute('CREATE TABLE IF NOT EXISTS runs(run_id TEXT PRIMARY KEY, start_utc TEXT, end_utc TEXT, requested_seconds REAL, interval_seconds REAL, expected_hosts TEXT)')
     db.execute('CREATE TABLE IF NOT EXISTS network_checks(run_id TEXT, ts TEXT, host TEXT, dns_ok INTEGER, dns_ips TEXT, fallback_used INTEGER, http_ok INTEGER, route TEXT, detail TEXT)')
+    db.execute('CREATE TABLE IF NOT EXISTS discovery_events(run_id TEXT,ts TEXT,integration_id TEXT,event TEXT,detail TEXT)')
     db.commit();return db
 
 def resolve(host):
@@ -92,13 +98,74 @@ def poll(host,cfg,known):
             break
     return attempts,ips,route,success
 
+COMMANDS = queue.Queue()
+
 def terminal_stop_listener():
-    # Console input only; Ctrl+C remains available even without a TTY.
+    # Dedicated thread: stdin never blocks polling. Commands are handled by the main loop.
     while not STOP_EVENT.is_set():
-        try:command=input().strip().lower()
-        except (EOFError,OSError):break
-        if command in ('q','quit','stop','x'):
-            stop();break
+        try: command = input().strip().lower()
+        except (EOFError,OSError): break
+        if command in ('q','quit','stop','x','s','p','n','b','f','a'):
+            COMMANDS.put('q' if command in ('quit','stop','x') else command)
+            if command in ('q','quit','stop','x'): break
+
+def drain_commands(dashboard, current, paused, snapshots):
+    while True:
+        try: command=COMMANDS.get_nowait()
+        except queue.Empty: break
+        if command == 'q': stop()
+        elif command == 'p':
+            paused = not paused
+            dashboard.emit('Messung pausiert' if paused else 'Messung fortgesetzt')
+        elif command == 's': snapshots.append(True)
+        else: dashboard.handle(command)
+    return paused
+
+def live_device(entry, payload, previous, ok):
+    radio=(payload or {}).get('espnow_time_local') or {}
+    clock=(payload or {}).get('cluster_time') or {}
+    local=next((x for x in (payload or {}).get('nodes',[]) if isinstance(x,dict) and x.get('local')), {})
+    def value(key):
+        try:return int(radio.get(key,0) or 0)
+        except (ValueError,TypeError):return 0
+    boot=local.get('boot_id')
+    coordinator_time = None
+    if ok and (local.get('cluster_role') == 'coordinator' or (payload or {}).get('local_role') == 'coordinator') and clock.get('valid'):
+        try:
+            coordinator_time = dt.datetime.fromtimestamp(int(clock['utc_us']) / 1_000_000, dt.timezone.utc).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] + ' UTC'
+        except (ValueError, TypeError, OverflowError, KeyError):
+            pass
+    deltas={}
+    for key in ('series_accepted','series_rejected','exchange_timeouts'):
+        before=previous.get(key) if previous and previous.get('boot')==boot else None
+        now=value(key)
+        deltas[key]=max(0,now-before) if before is not None and now>=before else 0
+    source=clock.get('source','') if ok else ''
+    lastsrc=previous.get('source') if previous else None
+    reason=''
+    if not ok:reason='HTTP nicht erreichbar'
+    elif source=='wifi_coordinator' and local.get('cluster_role')!='coordinator':reason='WiFi-Fallback'
+    elif deltas['series_rejected']:reason='Serie verworfen'
+    elif deltas['exchange_timeouts']:reason='Exchange-Timeout'
+    elif lastsrc and lastsrc!=source:reason='Zeitquelle geändert'
+    temperature = None
+    try:
+        if local.get('cpu_temp_deci_c') is not None: temperature = float(local['cpu_temp_deci_c']) / 10
+    except (ValueError, TypeError): pass
+    heap = None
+    try:
+        if local.get('free_heap_bytes') is not None: heap = int(local['free_heap_bytes'])
+    except (ValueError, TypeError): pass
+    hostname, _, hexid = entry.rpartition('@')
+    output={'name':hostname if hexid else entry, 'id_suffix':hexid if hexid else '',
+            'firmware':local.get('release') if ok else None, 'temperature_c':temperature, 'free_heap_bytes':heap,
+            'coordinator_time':coordinator_time, 'is_coordinator':local.get('cluster_role')=='coordinator',
+            'ok':ok,'offline':not ok,'source':source,'warn':bool(reason),
+            'reason':reason,'accepted_delta':deltas['series_accepted'],
+            'rejected_delta':deltas['series_rejected'],'timeout_delta':deltas['exchange_timeouts']}
+    state={'boot':boot,'source':source,**{k:value(k) for k in ('series_accepted','series_rejected','exchange_timeouts')}} if ok else previous
+    return output,state
+
 
 def live_status(hosts, status, elapsed, duration, cycle, out):
     if duration>0:
@@ -114,7 +181,174 @@ def live_status(hosts, status, elapsed, duration, cycle, out):
               f'replay={m.get("replay", "-")} source={m.get("active_time_source", "-")}',flush=True)
     print('  Abbruch: q + Enter oder einmal Ctrl+C',flush=True)
 
+
+def fetch_identity(host, cfg):
+    # hostname or IPv4; error handling is delegated to existing HTTP parser.
+    return legacy.fetch('http://' + host, cfg)
+
+
+def dynamic_probe(entry, cfg, expected_cluster):
+    # Prefer the last announced IP. A name is only a fallback; never trust it as identity.
+    targets=[]
+    if entry['ip']:
+        targets.append(('ip', entry['ip']))
+    hostname=entry.get('hostname')
+    if hostname:
+        name = hostname if '.' in hostname else hostname + '.local'
+        if name not in [t[1] for t in targets]:
+            targets.append(('dns', name))
+    attempts=[]
+    for route, target in targets:
+        payload,err,ms,_=fetch_identity(target,cfg)
+        good=bool(payload and payload.get('ok') and
+                  discovery.cluster_id(payload)==expected_cluster and
+                  discovery.identity(payload)==entry['id'])
+        if payload and payload.get('ok') and not good:
+            err='CLUSTER_OR_IDENTITY_MISMATCH'
+        attempts.append({'candidate':'http://'+target,'resolved_ip':target if route=='ip' else '',
+                         'http_ok':good,'error':err or ('' if good else 'API ok=false'),
+                         'latency_ms':ms,'payload':payload if good else None})
+        if good:
+            entry['validated']=True
+            return attempts,route,payload
+    return attempts,'none',None
+
+
+def launch_dynamic(cfg,out,minutes):
+    global STOP
+    STOP=False; STOP_EVENT.clear()
+    base=pathlib.Path(out)
+    # Every dynamic run gets its own output directory: old measurements stay intact.
+    unique=dt.datetime.now(dt.timezone.utc).strftime('run_%Y%m%d_%H%M%S_%f')
+    out=base/unique
+    out.mkdir(parents=True,exist_ok=False)
+    seed=discovery.seed_host(cfg['seed_host'])
+    expected=cfg.get('cluster_id')
+    if not expected:
+        raise ValueError('Dynamic mode needs cluster_id for safe discovery')
+    first,err,_,_=fetch_identity(seed,cfg)
+    if not first or not first.get('ok') or discovery.cluster_id(first)!=expected or not discovery.identity(first):
+        raise RuntimeError('Seed unreachable, wrong cluster ID, or missing integration_id: '+str(err))
+    known={}; events=[]; started_utc=utc()
+    discovery.observe(known,first,expected,started_utc,events)
+    db=init_database(out/'stability.sqlite3')
+    run_id=started_utc; interval=float(cfg['interval_seconds']);duration=minutes*60
+    db.execute('INSERT INTO runs VALUES(?,?,?,?,?,?)',
+               (run_id,run_id,None,duration,interval,json.dumps([])))
+    db.commit()
+    seed_id=discovery.identity(first)
+    last_discovery=-1e12
+    print(f'Dynamic cluster {expected} via {seed} | {len(known)} initial nodes',flush=True)
+    threading.Thread(target=terminal_stop_listener,daemon=True).start()
+    print("Steuerung aktiv: q / s / p / n / b / f / a + Enter (auch ohne TTY-Erkennung).",flush=True)
+    start=time.monotonic(); cycle=0; paused=False; pause_begin=None; paused_total=0.; overruns=0
+    dashboard=Dashboard(cfg.get('dashboard_page_size',12)); dashboard.emit('Cluster erkannt: '+str(len(known))+' Nodes')
+    previous={}; view={}; last_render=0.; snapshot_requests=[]
+    max_workers=max(1,min(32,int(cfg.get('max_http_workers',16))))
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            while not STOP_EVENT.is_set():
+                now=time.monotonic()
+                elapsed=(pause_begin if paused else now)-start-paused_total
+                if duration>0 and elapsed>=duration: break
+                paused=drain_commands(dashboard,view,paused,snapshot_requests)
+                if paused and pause_begin is None:pause_begin=time.monotonic()
+                if not paused and pause_begin is not None:
+                    paused_total+=time.monotonic()-pause_begin;pause_begin=None
+                if snapshot_requests:
+                    snapshot_requests.clear()
+                    db.commit()
+                    make_report(out,run_id,cfg.get('stalled_probe_seconds',120))
+                    dashboard.emit('Zwischenbericht aktualisiert: stability_report.html')
+                if paused:
+                    if time.monotonic()-last_render>=1:
+                        dashboard.render(list(view.values()),elapsed,duration,cycle,True,interval,overruns)
+                        last_render=time.monotonic()
+                    STOP_EVENT.wait(.25)
+                    continue
+                t0=time.monotonic();stamp=utc();cycle+=1
+                if t0-last_discovery>=float(cfg.get('discovery_interval_seconds',30)):
+                    providers=[]
+                    if seed_id in known:providers.append(known[seed_id])
+                    providers.extend(e for uid,e in known.items() if uid!=seed_id and e.get('validated'))
+                    for entry in providers:
+                        attempts,_,payload=dynamic_probe(entry,cfg,expected)
+                        if payload:
+                            discovery.observe(known,payload,expected,stamp,events)
+                            break
+                    last_discovery=t0
+                # Parallel independent reads; database writes and state changes only in the main thread.
+                entries=list(known.items())
+                futures={pool.submit(dynamic_probe,dict(entry),cfg,expected):(uid,entry) for uid,entry in entries}
+                successes=0
+                for future in as_completed(futures):
+                    uid,entry=futures[future]
+                    try:attempts,route,payload=future.result()
+                    except Exception as exc:
+                        attempts=[{'candidate':'','resolved_ip':'','http_ok':False,'error':repr(exc)[:160],
+                                   'latency_ms':0,'payload':None}]
+                        route='none';payload=None
+                    label=discovery.host_label(entry)
+                    if payload:
+                        successes+=1
+                        entry['validated']=True
+                        discovery.observe(known,payload,expected,stamp,events)
+                    for a in attempts or [{'candidate':'','resolved_ip':'','http_ok':False,'error':'NO_KNOWN_ROUTE','latency_ms':0,'payload':None}]:
+                        db.execute('INSERT INTO observations(run_id,ts,host,candidate,resolved_ip,http_ok,error,latency_ms,payload) VALUES(?,?,?,?,?,?,?,?,?)',
+                                   (run_id,stamp,label,a['candidate'],a['resolved_ip'],int(a['http_ok']),a['error'],a['latency_ms'],
+                                    json.dumps(a['payload'],ensure_ascii=False) if a['payload'] else None))
+                    db.execute('INSERT INTO network_checks VALUES(?,?,?,?,?,?,?,?,?)',
+                               (run_id,stamp,label,int(route=='dns'),json.dumps([]),int(route=='ip'),int(bool(payload)),route,
+                                '; '.join(a['error'] for a in attempts if a['error'])))
+                    row,state=live_device(label,payload,previous.get(uid),bool(payload))
+                    old=view.get(uid)
+                    if old and old['ok']!=row['ok']:dashboard.emit(f'{label}: '+('wieder erreichbar' if row['ok'] else 'nicht erreichbar'))
+                    if old and old['source']!=row['source'] and row['ok']:
+                        dashboard.emit(f'{label}: Zeitquelle {row["source"] or "unbekannt"}')
+                    if row['rejected_delta']:dashboard.emit(f'{label}: +{row["rejected_delta"]} verworfene Serien')
+                    view[uid]=row
+                    if state is not None:previous[uid]=state
+                if events:
+                    for event in events:
+                        if event[2]=='discovered': dashboard.emit(f'Neuer Node: {event[3]}')
+                    db.executemany('INSERT INTO discovery_events VALUES(?,?,?,?,?)',[(run_id,*event) for event in events]);events.clear()
+                labels=[discovery.host_label(e) for e in known.values()]
+                db.execute('UPDATE runs SET expected_hosts=? WHERE run_id=?',(json.dumps(labels),run_id))
+                db.commit()
+                elapsed=time.monotonic()-start-paused_total
+                spent=time.monotonic()-t0
+                if spent>interval:overruns+=1;dashboard.emit(f'Polling-Zyklus überzogen: {spent:.1f}s > {interval:.1f}s')
+                dashboard.render(list(view.values()),elapsed,duration,cycle,False,interval,overruns)
+                # Befehle während der Wartezeit sofort bearbeiten und Dashboard aktualisieren.
+                until=time.monotonic()+max(0,interval-spent)
+                while not STOP_EVENT.is_set() and time.monotonic()<until:
+                    old_page,old_filter,old_paused=dashboard.page,dashboard.only_warnings,paused
+                    was_pending=COMMANDS.qsize()
+                    paused=drain_commands(dashboard,view,paused,snapshot_requests)
+                    if paused and pause_begin is None: pause_begin=time.monotonic()
+                    if not paused and pause_begin is not None:
+                        paused_total+=time.monotonic()-pause_begin; pause_begin=None
+                    if was_pending or (old_page,old_filter,old_paused)!=(dashboard.page,dashboard.only_warnings,paused):
+                        dashboard.render(list(view.values()),time.monotonic()-start-paused_total,duration,cycle,paused,interval,overruns)
+                    if paused or snapshot_requests: break
+                    STOP_EVENT.wait(min(.15,max(0,until-time.monotonic())))
+    except KeyboardInterrupt:
+        stop()
+    finally:
+        db.execute('UPDATE runs SET end_utc=?,expected_hosts=? WHERE run_id=?',
+                   (utc(),json.dumps([discovery.host_label(e) for e in known.values()]),run_id))
+        db.commit();db.close()
+    (out/'test_metadata.json').write_text(json.dumps({'run_id':run_id,'cluster_id':expected,
+        'seed_host':seed,'hosts':[discovery.host_label(e) for e in known.values()],
+        'interval':interval,'duration_minutes':minutes},indent=2),encoding='utf8')
+    result=make_report(out,run_id,cfg.get('stalled_probe_seconds',120))
+    print('Bericht:',(out/'stability_report.html').resolve().as_uri(),flush=True)
+    return result
+
 def launch(cfg,out,minutes):
+    if cfg.get('seed_host'):
+        return launch_dynamic(cfg,out,minutes)
+
     global STOP
     STOP=False;STOP_EVENT.clear()
     out=pathlib.Path(out);out.mkdir(parents=True,exist_ok=True)
@@ -126,7 +360,7 @@ def launch(cfg,out,minutes):
         'start_utc':run_id,'duration_minutes':minutes,'firmware_expected':'v87-beta134'},indent=2),encoding='utf8')
     print('Test',run_id,'|',len(hosts),'hosts | interval',interval,'s | duration',minutes,'min',flush=True)
     print('Beenden: q + Enter oder einmal Ctrl+C',flush=True)
-    if sys.stdin.isatty():threading.Thread(target=terminal_stop_listener,daemon=True).start()
+    threading.Thread(target=terminal_stop_listener,daemon=True).start()
     started=time.monotonic(); cycle=0;known={}
     # Static fallback IPs always take precedence over learned addresses.
     while not STOP_EVENT.is_set() and (duration<=0 or time.monotonic()-started<duration):
@@ -340,8 +574,90 @@ def make_report(out,run_id=None,stall=120):
     print('Report:',out/'stability_report.md','| result:',result['result'])
     return result
 
+def ask_value(label, current, secret=False):
+    """Enter retains proposed value; secrets are never echoed."""
+    proposal = 'gespeichert' if secret and current else str(current)
+    prompt = f'  {label} [{proposal}]: '
+    entered = (getpass.getpass(prompt) if secret else input(prompt)).strip()
+    return entered if entered else current
+
+
+def startup_config(cfg):
+    """Interactive session settings, without changing the file on disk."""
+    cfg = json.loads(json.dumps(cfg))
+    print('\n' + '═'*72)
+    print('  SENSORFORGE  /  CLUSTER-VERBINDUNG')
+    print('═'*72)
+    print('  Enter übernimmt den vorgeschlagenen Wert. Änderungen gelten nur für')
+    print('  diesen Start; die JSON-Datei bleibt unverändert.\n')
+    # Prefer dynamic discovery, including when the existing config is still static.
+    cfg['cluster_id'] = ask_value('Cluster-ID', cfg.get('cluster_id',''))
+    cfg['seed_host'] = ask_value('Einstiegsgerät (Hostname/IP)', cfg.get('seed_host','devxiao3.local'))
+    auth = cfg.setdefault('auth', {})
+    auth['username'] = ask_value('HTTP-Benutzername', auth.get('username',''))
+    auth['password'] = ask_value('HTTP-Passwort', auth.get('password',''), secret=True)
+    cfg['interval_seconds'] = float(str(ask_value('Messintervall (Sekunden)', cfg.get('interval_seconds',10))).replace(',','.'))
+    cfg['timeout_seconds'] = float(str(ask_value('HTTP-Timeout (Sekunden)', cfg.get('timeout_seconds',5))).replace(',','.'))
+    cfg['discovery_interval_seconds'] = float(str(ask_value('Discovery-Intervall (Sekunden)', cfg.get('discovery_interval_seconds',30))).replace(',','.'))
+    if not cfg['cluster_id'].strip():
+        raise ValueError('Cluster-ID fehlt; eine sichere automatische Erkennung ist nicht möglich.')
+    if cfg['interval_seconds'] < 2 or cfg['timeout_seconds'] <= 0 or cfg['discovery_interval_seconds'] <= 0:
+        raise ValueError('Ungültiges Zeitintervall.')
+    return cfg
+
+
+def preview_cluster(cfg):
+    """Read-only discovery preview; never treat an announcement as confirmed access."""
+    try:
+        seed = discovery.seed_host(cfg['seed_host'])
+        payload, err, _, _ = fetch_identity(seed,cfg)
+        if not payload or not payload.get('ok'):
+            print('\n  Cluster nicht erreichbar:', err or 'API meldet ok=false')
+            return False
+        if discovery.cluster_id(payload) != cfg['cluster_id'] or not discovery.identity(payload):
+            print('\n  ABGEBROCHEN: Cluster-ID stimmt nicht oder Seed-Identität fehlt.')
+            return False
+        found={}; events=[]
+        discovery.observe(found,payload,cfg['cluster_id'],utc(),events)
+        print('\n' + '═'*72)
+        print('  CLUSTER-ÜBERSICHT')
+        print('═'*72)
+        print('  Cluster:   ', payload.get('cluster_name') or cfg['cluster_id'])
+        print('  Cluster-ID:', cfg['cluster_id'])
+        print('  Einstieg:  ', seed)
+        print('  Gefunden:  ', len(found), 'Geräte (laut Clusterübersicht)')
+        print('─'*72)
+        rows=[]
+        for uid,entry in sorted(found.items(),key=lambda x: (x[1].get('hostname') or '',x[0])):
+            announced=next((n for n in payload.get('nodes',[]) if isinstance(n,dict) and n.get('integration_id')==uid),{})
+            online='ONLINE' if announced.get('online') else 'OFFLINE'
+            role=str(announced.get('cluster_role') or '–')
+            name=str(entry.get('hostname') or 'unbekannt')
+            ip=str(entry.get('ip') or '–')
+            rows.append((name,role,online,ip,uid))
+        width=shutil.get_terminal_size((105,24)).columns
+        limit=15
+        if width>=95:
+            print(f'  {"GERÄT":<20} {"ROLLE":<13} {"STATUS":<8} {"IP":<16} ID')
+            for name,role,state,ip,uid in rows[:limit]:
+                print(f'  {name[:20]:<20} {role[:13]:<13} {state:<8} {ip:<16} {uid[:19]}…')
+        else:
+            for name,role,state,ip,uid in rows[:limit]:
+                print(f'  {name:<18} {role:<12} {state:<8} {ip}')
+        if len(rows)>limit:print(f'  … weitere {len(rows)-limit} Geräte; vollständige Messung umfasst alle Nodes.')
+        print('─'*72)
+        print('  Die Liste basiert auf Cluster-Ankündigungen. Bei der Messung wird')
+        print('  jeder Node über seine Cluster-ID und Integration-ID einzeln geprüft.')
+        return True
+    except (OSError,ValueError) as exc:
+        print('\n  Cluster-Erkennung fehlgeschlagen:',exc)
+        return False
+
+
 def menu():
-    print('\nSensorForge Test Manager (read-only)')
+    print('\n'+'═'*72)
+    print('  SENSORFORGE  /  TEST MANAGER   •   READ ONLY')
+    print('═'*72)
     print('1  Cluster-Schnelltest (5 min)\n2  Stabilität (24 h)\n3  Stabilität (72 h)\n4  Freie Laufzeit\n5  Vorhandene Messung auswerten\n0  Ende')
     return input('Auswahl: ').strip()
 
@@ -351,9 +667,18 @@ def main():
     p.add_argument('--output',default='sensorforge_tests')
     p.add_argument('--minutes',type=float)
     p.add_argument('--report',action='store_true')
+    p.add_argument('--no-prompt',action='store_true',help='Konfiguration ohne Eingabedialog verwenden')
     a=p.parse_args()
     if a.report:make_report(a.output);return
     cfg=cfg_read(a.config)
+    interactive = a.minutes is None and not a.no_prompt and sys.stdin.isatty()
+    if interactive:
+        cfg=startup_config(cfg)
+        while not preview_cluster(cfg):
+            choice=input('  [E] Eingaben korrigieren / [M] Menü trotzdem öffnen / [0] Ende: ').strip().lower()
+            if choice=='0':return
+            if choice=='m':break
+            cfg=startup_config(cfg)
     if a.minutes is None:
         opt=menu()
         if opt=='0':return

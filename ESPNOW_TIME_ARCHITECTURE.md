@@ -178,3 +178,31 @@ Vergleiche vor und nach der Schätzer-Änderung mindestens 30 gültige Serien un
 
 - Zustandsbasiertes Freigabeende anhand des *wirklich bestätigten* Abschlusses aller relevanten Coordinator-Aktionen statt einer festen lokalen 10-s-Pause.
 - Authentifizierte Node-Ergebnisberichte und zentrale Last-Sync-Diagnose ergänzen.
+
+## 15. Boardvarianten: Präzisions-Fähigkeit und diymore ESP32-S3 CAM
+
+**Semantik von `BOARD_SUPPORTS_PRECISION_SYNC`** (`board_config.h`): Das Flag setzt nur Bit 1 im bestehenden `capabilities`-Feld von SFCO1 und erscheint als `precision_sync` in `/cluster_status` sowie als Warnhinweis in der Cluster-Ansicht. Es steuert **keine** Laufzeitentscheidung: Coordinator-Wahl, Start des ESP-NOW-Zeitdienstes (nur Coordinator bzw. Node mit Drone Mode, `cluster.cpp` `ClusterEspNowRadio::service`), Qualitätsprüfungen, Grenzwerte und der Fallback auf `wifi_coordinator` sind davon unabhängig. `precision_sync=yes` heißt „Boardtyp für den ESP-NOW-Präzisionszeitdienst vorgesehen“, **nicht** „GPIO- oder Kamera-Trigger physisch vermessen“ (siehe Abschnitt 13, Punkt 6–7).
+
+| Board | `BOARD_SUPPORTS_PRECISION_SYNC` | Physische Triggergenauigkeit |
+|---|---|---|
+| XIAO ESP32S3 Sense | 1 | nicht unabhängig vermessen |
+| diymore ESP32-S3 CAM (OV5640) | 1 (seit 2026-10-22) | nicht vermessen |
+| Freenove FNK0085 | 0 | – (passives GPIO-Messgerät) |
+
+**Nachweis diymore (`c001`, 2026-10-22, 5-Minuten-Lauf, Node mit Drone Mode, Coordinator devxiao3):** HTTP 30/30, `cluster_time.source=espnow_precision` bei 30/30 Abfragen, 4 Serien akzeptiert / 0 verworfen, Median der Serien-Streuung 52 µs, Maximum 114 µs, 65 Probes, 64 Exchanges, 1 Exchange-Timeout, 0 Neustarts. Referenz im selben Lauf: XIAO 1 Median 52 µs, XIAO 2 Median 38,5 µs (je 4/0 Serien). Das ist ein kurzer Lauf und beschreibt nur die interne Zeitschätzung.
+
+**Offene Beobachtung Browser-/Kameralast (nicht bewiesen):** In einem früheren Lauf war ein Browserfenster geöffnet; das diymore zeigte deutlich schlechtere Synchronisationswerte und längere Phasen mit `wifi_coordinator`. Vor dem erfolgreichen Lauf wurden Fenster geschlossen, der Test neu gestartet **und** die Antenne geändert. Die Ursache ist deshalb nicht zuordenbar; ein bloß geöffnetes, inaktives Fenster gilt nicht als Fehlerursache.
+
+Plausible Mechanismen aus dem Code (Hypothesen, nicht gemessen):
+- WebServer (`server.handleClient()`), HTTP-MJPEG/RTSP (`streamerLoop()`) und `clusterLoop()` laufen kooperativ im selben `loopTask`. Lange HTTP-Antworten oder Stream-Frames verzögern die Abarbeitung der ESP-NOW-Empfangsqueue und das Senden von Reply/Final. Die Zeitstempel selbst werden im RX-Callback bzw. direkt vor `esp_now_send()` genommen; die Verzögerung zeigt sich in `rx_queue_delay_*_us` und `reply_final_dispatch_gap_*_us` und kann bei > 1,2 s zu `exchange_timeouts` führen.
+- Ein Kamerastream belegt Funkzeit auf demselben Kanal. Mehr Kanalbelegung verlängert/variiert die Sendeverzögerung (`probe_tx_pre_send_*_us`) und kann RTT-Asymmetrie erzeugen; die RTT-Auswahl verwirft solche Austausche, wodurch Serien länger dauern oder abgelehnt werden.
+- Regelmäßiges Web-Polling (Statusseiten mit Auto-Refresh) wirkt wie kleine, häufige Loop-Blockaden; ein Fenster ohne Polling erzeugt keine Last.
+
+Bis zur Messung werden Task-Prioritäten, WLAN-Einstellungen und Synchronisationsalgorithmus **nicht** geändert.
+
+**Vorgeschlagener Belastungstest (reproduzierbar, Antenne unverändert):** gleiche Aufstellung, je Phase 10 Minuten, Reihenfolge A–B–A–C–A, Statusabfrage `/cluster_status` alle 10 s von einem Rechner ohne sonstige Seiten:
+- A: kein Browser zum diymore.
+- B: Browser mit Cluster-/Statusseite (Auto-Refresh), kein Stream.
+- C: Browser mit aktivem HTTP-MJPEG-Stream (Auflösung und fps notieren).
+
+Je Phase erfassen: Anteil `espnow_precision`, Serien akzeptiert/verworfen, Median und Maximum der Serien-Streuung, `exchange_timeouts`, `rx_queue_delay_max_us`, `reply_final_dispatch_gap_max_us`, `probe_tx_pre_send_last_us` sowie die WLAN-RSSI (`/api/v1` bzw. WebConfig-WLAN-Seite). Alle Messwerte vollständig dokumentieren, keine Ausreißer entfernen. Die XIAOs laufen als Referenz unverändert mit. Erst wenn B oder C gegenüber beiden umgebenden A-Phasen wiederholt abweicht, gilt ein Lasteinfluss als belegt.

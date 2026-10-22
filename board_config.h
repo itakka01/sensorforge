@@ -73,9 +73,19 @@ static constexpr int16_t SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10 = 85;
 #define BOARD_SUPPORTS_CLUSTER_NODE     1
 #define BOARD_SUPPORTS_CAMERA_RECORDING 1
 #define BOARD_SUPPORTS_GPS_TRACKER      1
-// Board type qualified for high-precision, time-critical cluster actions.
-// Suitability only, never a statement about the current sync state.
+// Board type supports the ESP-NOW precision time service (capability bit in
+// SFCO1, display only). Suitability only, never a statement about the current
+// sync state, and NOT a measured GPIO/camera trigger accuracy.
+#if defined(BOARD_DIYMORE_S3CAM)
+// diymore: ESP-NOW precision sync shown in a 5-min hardware test (2026-10-22,
+// 4/4 series accepted, median spread 52 us). Trigger accuracy is unmeasured.
+// Observed once: noticeably worse sync and longer wifi_coordinator phases while
+// a browser window was open; not reproduced, antenna was changed at the same
+// time - see ESPNOW_TIME_ARCHITECTURE.md section 15.
+#define BOARD_SUPPORTS_PRECISION_SYNC   1
+#else
 #define BOARD_SUPPORTS_PRECISION_SYNC   0
+#endif
 
 // Video-codec hardware capability only. This does NOT by itself enable an
 // ONVIF/RTSP codec; the streamer must also implement and qualify that codec.

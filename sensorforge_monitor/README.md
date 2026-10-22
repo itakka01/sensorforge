@@ -1,45 +1,96 @@
-# SensorForge Test Manager v1 (beta134)
+# SensorForge Test Manager – dynamische Clustererkennung
 
-Read-only stability diagnostics, Python 3.10+, no additional packages. Existing `sensorforge_monitor.py` included as the HTTP parser for compatibility.
+Python 3.10+, Standardbibliothek, **nur lesender HTTP-Zugriff**.
 
 ## Start
 
-1. Copy `sensorforge_config.example.json` to `sensorforge_config.json` and enter local HTTP credentials **only in your private copy**. Never publish that file.
-2. Start `python sensorforge_test_manager.py` and choose a menu entry.
-3. Or use `python sensorforge_test_manager.py --minutes 360`.
-4. Reports are generated at the end (Ctrl+C also works). Rebuild with `python sensorforge_test_manager.py --report`.
+1. `sensorforge_config.example.json` nach `sensorforge_config.json` kopieren.
+2. `cluster_id` und `seed_host` eintragen (z. B. `devxiao3.local` oder die IP des Coordinators).
+3. Falls die Geräte HTTP Basic Auth verlangen: `auth.username` und `auth.password` in der privaten Datei eintragen. `chmod 600 sensorforge_config.json` setzen. **Nicht** die Datei mit Zugangsdaten weitergeben.
+4. `python3 sensorforge_test_manager.py --minutes 5` starten; alternativ `python3 sensorforge_test_manager.py` für das Menü.
+5. Jede neue Messung erhält ihr eigenes Unterverzeichnis `sensorforge_tests/run_*` mit SQLite, HTML, JSON, Markdown und Metadaten.
 
-Outputs: `sensorforge_tests/stability.sqlite3`, `stability_report.json`, `stability_report.md`, `test_metadata.json`. The SQLite DB contains full raw API payloads and connection metadata; review before sharing. It contains no configured HTTP password. Hostnames and IPs may still be present.
+## Erkennung
 
-## Stability checks
+Die `/cluster_status`-API eines erreichbaren Seed-Geräts enthält die aktuellen `nodes`-Informationen des Clusters. Das Tool fragt diese regelmäßig ab und prüft jeden Node **direkt** auf seine eigene `integration_id` und die richtige `cluster_id`. Neue Nodes werden aufgenommen, ausgefallene bleiben sichtbar. IP- und Hostnamenwechsel werden anhand der Gerätekennung abgefangen. Die HTTP-Zugangsdaten gelten für die angefragten Geräte; diese müssen die gleichen Zugangsdaten akzeptieren.
 
-- Each named device polled independently, so a failed seed or broken cluster discovery does not silently omit a node.
-- DNS hostname is retried via freshly resolved IP when available; every attempt and error is saved.
-- HTTP outages tracked per device, including unresolved outages at the end.
-- Boot and coordinator-epoch transitions recorded; counter increases for replay, rejected frames, timeouts, and source changes recorded.
-- Probe inactivity of at least 120 s (configurable) flagged if probe counter is present on non-coordinator nodes.
-- Drift estimates and broadcaster lease snapshots retained from beta134 firmware diagnostics.
+**Warum ein Seed?** SensorForge-Firmware verwendet für die eigentliche Peersuche eigene signierte Discovery-Pakete über das lokale Netz. Ein gewöhnliches Python-HTTP-Testtool kennt dieses Funk-/Multicast-Protokoll bisher nicht. Die Cluster-ID ist eine Kennung und enthält keine IP-Adresse; das Cluster-Passwort ist keine HTTP-Anmeldung. Für echte ID+Passwort-only-Erkennung müsste das Discovery-/HMAC-Protokoll anhand des Firmwarecodes exakt implementiert und getestet werden. Das ist nicht Bestandteil dieser read-only HTTP-Version.
 
-**Important:** `PASS_MONITORING_ONLY` never means absolute uptime, valid firmware behavior, time drift correction, or proven GPIO alignment. Shorter outages may occur between polls. An epoch change observed after all nodes rebooted is not proof of seamless epoch acceptance. Any failures are reported as FAIL, and missing evidence as INCOMPLETE. Controlled recovery tests and wired accuracy tests are separate future phases.
+Der Seed muss beim **ersten Start** erreichbar sein. Anschließend kann das Tool über bereits validierte Nodes weiter entdecken, auch wenn der ursprüngliche Seed ausfällt. Werden alle Geräte unerreichbar, bleiben die zuletzt erkannten Geräte im Bericht und werden weiterhin abgefragt.
 
-No automatic reboot, configuration update, flashing, or network changes. No outbound network requests except to hosts configured in the test configuration.
+## Betriebshinweise
 
-## Version 1.1 – Bedienung und Netzwerkdiagnose
+- **Read-only:** Keine Änderungen an Firmware, Drone Mode, Cluster oder Sensoren.
+- `precision_sync=no` ist eine Fähigkeitskennzeichnung, nicht die tatsächliche Zeitquelle. Entscheidend ist `cluster_time.source`.
+- Interne `last_series_spread_us` belegt keine tatsächliche GPIO-Triggergenauigkeit.
+- Bei vielen Nodes kann die sequenzielle HTTP-Abfrage länger als 10 Sekunden dauern. Das wird durch die Zyklusausgabe sichtbar; eine Parallelisierung wäre ein separater Schritt.
+- Kompatibilität: Konfigurationen mit `expected_hosts`, aber ohne `seed_host`, verwenden den alten statischen Modus. Alte SQLite-Berichte bleiben mit `--report` auswertbar.
 
-Start: `python sensorforge_test_manager.py` (im Ordner mit `sensorforge_config.json`).
+## Startdialog und Clusterübersicht
 
-Menüoption 4: Stunden und zusätzliche Minuten getrennt eingeben. Für offene Laufzeit beide 0 wählen. Während des Tests mit `q` + Enter oder einmal `Ctrl+C` beenden; Berichte werden anschließend erzeugt. Im Terminal erscheinen Laufzeitbalken, DNS-Status, HTTP-Status, verwendeter Zugriffsweg, Probes, Exchanges und Replay-Zähler.
+Bei `python3 sensorforge_test_manager.py` (mit interaktivem Terminal) fragt der Manager
+**vor dem Menü** Cluster-ID, Seed-Host, HTTP-Benutzername/-Passwort sowie Mess-,
+Timeout- und Discovery-Intervall ab. Vorhandene JSON-Werte werden vorgeschlagen;
+**Enter** übernimmt den Wert. Das Passwort wird nicht angezeigt. Änderungen
+werden nur für diesen Programmlauf verwendet, die JSON bleibt unverändert.
 
-Optional `fallback_ips` in `sensorforge_config.json` mit den *tatsächlich aktuellen* IPv4-Adressen pro `.local`-Host befüllen. Falls mDNS/DNS nicht auflöst, wird die eingetragene IP direkt abgefragt. Auch IPs aus den `nodes`-Listen anderer erreichbarer Boards werden zur Laufzeit gelernt. Ein per IP erreichbares Gerät wird nur bei passender lokaler Host-Identität anerkannt. **Ohne konfigurierte oder gelernte IP ist kein unabhängiger IP-Fallback möglich.** DNS-Fehler und HTTP-Zustand werden je Abfrage in der Tabelle `network_checks` gespeichert; eine Wiederherstellung nur per IP gilt nicht als DNS-Erfolg.
+Anschließend wird der Seed über `/cluster_status` gelesen und die erwartete
+Cluster-ID geprüft. Eine tabellarische Übersicht zeigt alle angekündigten Geräte
+mit Rolle, Online-Kennzeichen und IP. Diese Übersicht ist eine **Ankündigung**;
+im anschließenden Test prüft der Manager jeden Node separat auf Cluster-ID und
+`integration_id`. Ist der Seed nicht erreichbar, kann man die Eingaben korrigieren,
+das Menü trotzdem öffnen oder beenden.
 
-Beim Testende werden Dateipfade und eine lokale `file://`-Adresse zu `stability_report.html` angezeigt. Den Bericht auf demselben Test-PC im Browser öffnen.
+`--minutes 5` sowie `--no-prompt` unterdrücken den Startdialog (nützlich für
+automatisierte Läufe). `--report` erstellt Berichte ohne Netzwerk-Abfrage.
+Cluster-Passwort und HTTP-Passwort sind verschieden: Das Tool verwendet noch
+HTTP-Seed-Discovery und nimmt nicht selbst am signierten Multicast-Verfahren teil.
 
-Hinweis: Terminal-Ausgabe ist kein GUI; der Abbruch wird über `q` + Enter oder `Ctrl+C` ausgelöst. Ein laufender HTTP-Aufruf kann bis zum eingestellten Timeout dauern. Für echte 24/72-Stunden-Tests das Terminal und den PC wach halten. Tests verursachen keine Änderungen an den Boards.
+## Live-Diagnoseansicht (Update)
 
-## Version 1.2 – HTML-Dashboard
+Der dynamische Clustertest zeigt nun ein Terminal-Dashboard mit Laufzeitbalken,
+Restzeit, aggregierter Cluster-Gesundheit, ESP-NOW-Zeitquellen, Serien-Zuwächsen
+und Ereignissen. Standardmäßig werden **höchstens 12 Nodes gleichzeitig**
+angezeigt. Bei 100+ Nodes bleiben Erfassung, SQLite und Berichte vollständig;
+die Anzeige ist nur eine paginierte Ansicht. Die Startübersicht zeigt ebenfalls
+maximal 15 Geräte, damit das Menü sichtbar bleibt.
 
-`stability_report.html` enthält wieder eine eigenständige, offline nutzbare HTML-Auswertung mit Geräteübersicht, Netzwerkdiagnose, Vorfällen und SVG-Zeitreihendiagrammen (Probes, Exchanges, Replay, Drift, Spread, Beacons, Authentifizierung). Keine zusätzlichen Python-Pakete erforderlich. Die Diagramme zeigen Firmware-Schätzwerte und Zähler, keine GPIO-Genauigkeitsmessung.
+**Steuerung während des Tests (jeweils Taste + Enter):**
+- `n` nächste Seite, `b` vorherige Seite
+- `f` nur Warnungen/Ausfälle, `a` alle Nodes
+- `s` sofort einen Zwischenbericht (`stability_report.html`/`.json`/`.md`) erzeugen
+- `p` Messung pausieren/fortsetzen; die Pause wird nicht auf die Testdauer angerechnet
+- `q` sauber beenden und Endbericht erstellen; alternativ einmal `Ctrl+C`
 
-Aufruf wie bisher: `python sensorforge_test_manager.py`. Vorhandene Messung neu auswerten mit Menüpunkt 5 oder `python sensorforge_test_manager.py --report`.
+Alle Tastenkürzel setzen eine interaktive Konsole voraus. Beim Umleiten der
+Ausgabe in eine Datei schreibt das Tool nur eine kompakte Zeile je Zyklus.
+Der Bildschirm ist eine Diagnoseübersicht; Serien-Zähler sind **Deltas seit
+dem letzten erfolgreichen Sample**, keine kumulative Statistik. Ein fehlgeschlagener
+HTTP-Abruf bleibt sichtbar und führt nicht zu einer gefälschten Nullmessung.
+Neue Nodes werden weiterhin anhand ihrer `integration_id` identifiziert.
 
-**Achtung:** Die alte `sensorforge_results/monitor.sqlite3` ist ein anderes Datenbankformat und wird von der neuen Berichts-Funktion nicht direkt verarbeitet. Für neue Testläufe die Dateien aus `sensorforge_tests` bereitstellen.
+Für größere Cluster erfolgen HTTP-Geräteabfragen parallel (maximal 16 Worker,
+anpassbar mit `max_http_workers` in der JSON-Konfiguration). Ein Polling-Zyklus,
+der länger als das Zielintervall dauert, erscheint unter **Überläufe**; bei
+100+ Geräten sind Zykluszeiten daher vom Netzwerk, den HTTP-Timeouts und der
+Rechnerleistung abhängig. `dashboard_page_size` (Standard 12) konfiguriert die
+maximale Zeilenzahl der Ansicht. Es sind keine zusätzlichen Python-Pakete nötig.
+
+Die neue Oberfläche gilt für den dynamischen Modus mit `seed_host` und
+`cluster_id`. Der bisherige statische Kompatibilitätsmodus bleibt unverändert.
+Der Live-Dashboard-Test `python3 test_live_dashboard.py` deckt 125 Geräte und
+die Navigation/Filterung ab. Die Laufzeit wurde noch nicht in einem realen
+100-Node-Cluster belastungsgetestet.
+
+## Tastatursteuerung – Korrektur
+
+Die Steuerung wird auch dann gestartet, wenn `sys.stdin.isatty()` `False` meldet (z. B. in manchen IDE-/Windows-Terminals). Während der Messintervall-Wartezeit wird alle 150 ms nach Befehlen geschaut. `q`, `s`, `p`, `n`, `b`, `f`, `a` werden mit **Enter** bestätigt; `s` schreibt einen Zwischenbericht, `f` filtert Warnungen, `q` beendet sauber. Wenn die Konsole überhaupt kein stdin zur Verfügung stellt, verwende ein reguläres Windows-Terminal/PowerShell und starte `python sensorforge_test_manager.py` direkt. Alte Messdaten und private Konfiguration beibehalten.
+
+
+### Erweiterte Live-Diagnose (Firmware/Temperatur/Heap/Clusterzeit)
+
+Die Gerätetabelle trennt den Gerätenamen von der 8-stelligen Hex-Kennung (`integration_id`). `Firmware` stammt aus `nodes[].release`, die CPU-Temperatur aus `cpu_temp_deci_c` (°C), und `Heap` aus `free_heap_bytes` (KiB). Nicht gelieferte Werte erscheinen als `—`. Bei nicht erreichbaren Nodes wird kein veralteter Messwert als aktuell dargestellt.
+
+Der Kopfbereich zeigt die vom Coordinator in `cluster_time.utc_us` gemeldete UTC-Clusterzeit **zum Zeitpunkt der letzten erfolgreichen Abfrage**. Das ist bewusst keine fortlaufend interpolierte Uhr. Fehlt die Clusterzeit oder ist sie ungültig, erscheint `—`.
+
+Die vom Coordinator **aktuell gemeldete** Firmwareversion dient als Vergleichsreferenz (falls unbekannt: häufigste Version); abweichende Versionen werden mit `!` und (auf Farbkonsolen) gelb markiert und im `f`-Filter angezeigt. Abweichend heißt nicht automatisch *veraltet*: Bei gleichmäßig verteilten Firmwareständen entscheidet keine Versionsordnung. Bei der Terminalbreite passt sich die Anzahl der angezeigten Spalten automatisch an, die Liste bleibt immer auf maximal `dashboard_page_size` (standardmäßig 12) Zeilen begrenzt. Für alle Felder Terminal auf mindestens 136 Spalten verbreitern.

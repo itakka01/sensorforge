@@ -1,21 +1,12 @@
 {
-  "expected_hosts": [
-    "devfreenove1.local",
-    "devxiao1.local",
-    "devxiao2.local",
-    "devxiao3.local"
-  ],
+  "cluster_id": "cl-7a11e171e4af488c412643c31b0b8aa0",
+  "seed_host": "devxiao3.local",
   "interval_seconds": 10,
   "timeout_seconds": 5,
+  "discovery_interval_seconds": 30,
   "stalled_probe_seconds": 120,
   "auth": {
     "username": "",
     "password": ""
-  },
-  "fallback_ips": {
-    "devfreenove1.local": "",
-    "devxiao1.local": "",
-    "devxiao2.local": "",
-    "devxiao3.local": ""
   }
 }
