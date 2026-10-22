@@ -21,13 +21,13 @@
 // WebConfig, so a running device can be mapped back to the exact Git tag.
 
 #define SENSORFORGE_RELEASE_NUMBER 87
-#define SENSORFORGE_RELEASE_TAG "v87-beta138"
-#define SENSORFORGE_RELEASE_DATE "2026-10-20"
+#define SENSORFORGE_RELEASE_TAG "v87-beta139"
+#define SENSORFORGE_RELEASE_DATE "2026-10-23"
 #define SENSORFORGE_RELEASE_SUMMARY \
-    "Beta 138: WIFI_PS_NONE on every active cluster member; all ESP-NOW sends tracked for TX latency."
+    "Beta 139: coordinator recovery slot after a rejected precision series (no WiFi fallback from a single rejection)."
 
-// Current source-tree stage. Beta 138: cluster-wide WiFi power save rule, TX diagnostics fix.
-#define SENSORFORGE_WORKTREE_STAGE "v87-beta138"
-#define SENSORFORGE_WORKTREE_DATE "2026-10-20"
+// Current source-tree stage. Beta 139: precision slot recovery on the coordinator.
+#define SENSORFORGE_WORKTREE_STAGE "v87-beta139"
+#define SENSORFORGE_WORKTREE_DATE "2026-10-23"
 #define SENSORFORGE_WORKTREE_SUMMARY \
-    "v87 Beta 138: active cluster -> WIFI_PS_NONE; tx_callback_unmatched fix; Reply TX latency histogram."
+    "v87 Beta 139: recovery slot keeps precision after one rejected series; slot_* diagnostics."

@@ -36,6 +36,8 @@
 #include <sys/time.h>
 #include <esp_timer.h>
 #include "wifi_power_policy.h"
+#include "psram_alloc.h"
+#include <new>
 #include <stdlib.h>
 #include <string.h>
 
@@ -409,7 +411,10 @@ struct HwTimeSession {
     String nodes[3];
 };
 static HwTimeSession hwSession;
-static ClusterHwTimeSeries::History hwHistory;
+// Coordinator-only GPIO test history (~20 KB) lives in PSRAM, allocated with
+// the first stored sample. nullptr = no sample yet (or PSRAM unavailable).
+static ClusterHwTimeSeries::History *hwHistory = nullptr;
+static bool hwHistoryAllocFailed = false;
 static String hwSessionLastResult = "not_started";
 static uint32_t hwSessionCounter = 0;
 static void hwTimeSessionFinish(const char *result, bool saveEdges) {
@@ -423,7 +428,12 @@ static void hwTimeSessionFinish(const char *result, bool saveEdges) {
             sample.nodeUs[i] = edges.firstRiseUs[i];
             sample.present[i] = edges.received[i] && hwSession.armStatus[i] == 1;
         }
-        hwHistory.add(++hwSessionCounter, sample);
+        if (!hwHistory) {
+            void *mem = sfPsramCalloc(1, sizeof(ClusterHwTimeSeries::History));
+            if (mem) hwHistory = new (mem) ClusterHwTimeSeries::History();
+            hwHistoryAllocFailed = !hwHistory;
+        }
+        if (hwHistory) hwHistory->add(++hwSessionCounter, sample);
     }
     ClusterHwTimeGpioLease::release();
     hwSession.active = false;
@@ -4635,8 +4645,9 @@ bool clusterHwTimeStart(const String nodeIds[3], String &error) {
 String clusterHwTimeCsv() {
     String csv = "sample,reference_mono_us,node1_ms,node2_ms,node3_ms,node1_minus_2_ms,node1_minus_3_ms,node2_minus_3_ms\n";
     ClusterHwTimeSeries::Row row = {};
-    for (size_t i = 0; i < hwHistory.size(); ++i) {
-        if (!hwHistory.get(i, row)) continue;
+    const size_t rows = hwHistory ? hwHistory->size() : 0;
+    for (size_t i = 0; i < rows; ++i) {
+        if (!hwHistory->get(i, row)) continue;
         csv += String(row.sequence) + "," + String((long long)row.referenceUs);
         for (int ch = 0; ch < 3; ++ch) {
             csv += ",";
@@ -4655,7 +4666,8 @@ String clusterHwTimeStatusJson() {
     String json = "{\"active\":";
     json += hwSession.active ? "true" : "false";
     json += ",\"state\":\"" + hwSessionLastResult + "\"";
-    json += ",\"rows\":" + String((unsigned)hwHistory.size());
+    json += ",\"rows\":" + String((unsigned)(hwHistory ? hwHistory->size() : 0));
+    if (hwHistoryAllocFailed) json += ",\"history_error\":\"psram_unavailable\"";
     json += ",\"arm\":[";
     for (int i = 0; i < 3; ++i) {
         if (i) json += ',';
@@ -4665,15 +4677,15 @@ String clusterHwTimeStatusJson() {
     for (int i = 0; i < 3; ++i) {
         if (i) json += ',';
         double ppm = 0;
-        json += hwHistory.drift(i, ppm) ? String(ppm, 2) : String("null");
+        json += hwHistory && hwHistory->drift(i, ppm) ? String(ppm, 2) : String("null");
     }
     json += "],\"samples\":[";
     // Small bounded history for the browser; full history available as CSV.
-    const size_t total = hwHistory.size();
+    const size_t total = hwHistory ? hwHistory->size() : 0;
     const size_t first = total > 96 ? total - 96 : 0;
     ClusterHwTimeSeries::Row row = {};
     for (size_t i = first; i < total; ++i) {
-        if (!hwHistory.get(i, row)) continue;
+        if (!hwHistory->get(i, row)) continue;
         if (i != first) json += ',';
         json += "{\"n\":" + String(row.sequence) + ",\"ms\":[";
         for (int ch = 0; ch < 3; ++ch) {
@@ -5103,6 +5115,16 @@ String clusterStatusJson()
     json += ",\"series_last_rejected_spread_us\":" + String((unsigned long)esn.seriesLastRejectedSpreadUs);
     json += ",\"series_last_completed_age_ms\":" + String((unsigned long)esn.seriesLastCompletedAgeMs);
     json += ",\"series_next_in_ms\":" + String((unsigned long)esn.seriesNextInMs);
+    // Coordinator only (0 on nodes): slot rotation and recovery slots after rejected series.
+    json += ",\"slot_active_peers\":" + String((unsigned long)esn.slotActivePeers);
+    json += ",\"slot_cycle_estimate_ms\":" + String((unsigned long)esn.slotCycleEstimateMs);
+    json += ",\"slot_rotations\":" + String((unsigned long)esn.slotRotations);
+    json += ",\"slot_owner_recovery\":"; json += esn.slotOwnerRecovery ? "true" : "false";
+    json += ",\"slot_recovery_requested\":" + String((unsigned long)esn.slotRecoveryRequested);
+    json += ",\"slot_recovery_granted\":" + String((unsigned long)esn.slotRecoveryGranted);
+    json += ",\"slot_recovery_deferred\":" + String((unsigned long)esn.slotRecoveryDeferred);
+    json += ",\"slot_recovery_succeeded\":" + String((unsigned long)esn.slotRecoverySucceeded);
+    json += ",\"slot_recovery_failed\":" + String((unsigned long)esn.slotRecoveryFailed);
     // Beta136: probe RX (t2) -> reply pre-send (t3) on this device, answered probes only.
     json += ",\"probe_reply_delay_samples\":" + String((unsigned long)esn.probeReplyDelaySamples);
     json += ",\"probe_reply_delay_last_us\":" + String((unsigned long)esn.probeReplyDelayLastUs);

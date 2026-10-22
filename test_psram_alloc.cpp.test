@@ -1,0 +1,49 @@
+// Host test: psram_alloc.h (explicit PSRAM allocation, no internal fallback).
+//   g++ -std=c++17 -Wall -Wextra -I. -Itest_stubs -x c++ test_psram_alloc.cpp.test -o /tmp/test_psram_alloc
+//   /tmp/test_psram_alloc
+#include <stdio.h>
+#include <string.h>
+#include "psram_alloc.h"
+
+static int g_failures = 0;
+#define CHECK(cond, msg) do { if (cond) printf("  PASS %s\n", msg); \
+    else { printf("  FAIL %s (line %d)\n", msg, __LINE__); ++g_failures; } } while (0)
+
+int main() {
+    HostHeapStub &s = hostHeapStub();
+    printf("== sfPsramCalloc\n");
+    void *p = sfPsramCalloc(4, 100);
+    CHECK(p != nullptr, "allocation succeeds with PSRAM");
+    CHECK(s.lastCaps == (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT), "requests SPIRAM|8BIT only");
+    CHECK(!(s.lastCaps & MALLOC_CAP_INTERNAL), "never requests internal RAM");
+    bool zero = true; for (int i = 0; i < 400; ++i) zero = zero && ((unsigned char *)p)[i] == 0;
+    CHECK(zero, "memory is zeroed (same state as a static object)");
+    heap_caps_free(p);
+    s.failSpiram = true;
+    const unsigned callsBefore = s.calls;
+    CHECK(sfPsramCalloc(1, 20000) == nullptr, "PSRAM unavailable -> nullptr");
+    CHECK(s.calls == callsBefore + 1, "exactly one request, no second (internal) attempt");
+    s.failSpiram = false;
+
+    printf("== SfPsramBuffer\n");
+    {
+        SfPsramBuffer b(4096);
+        CHECK((bool)b && b.size() == 4096 && b.data(), "buffer valid with size");
+        memset(b.data(), 0xA5, b.size());
+        CHECK(s.live == 1, "one live allocation inside scope");
+    }
+    CHECK(s.live == 0, "freed on scope exit (no leak)");
+    const unsigned freesBefore = s.frees;
+    s.failSpiram = true;
+    {
+        SfPsramBuffer b(4096);
+        CHECK(!b && b.size() == 0 && b.data() == nullptr, "failure reported as empty buffer");
+    }
+    CHECK(s.frees == freesBefore && s.live == 0, "failed buffer frees nothing (no double free)");
+    s.failSpiram = false;
+    for (int i = 0; i < 1000; ++i) { SfPsramBuffer b(4224); if (!b) break; }
+    CHECK(s.live == 0, "1000 scoped allocations leave no live block");
+
+    printf("\n%s (%d failure%s)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures, g_failures == 1 ? "" : "s");
+    return g_failures ? 1 : 0;
+}

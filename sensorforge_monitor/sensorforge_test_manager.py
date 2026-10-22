@@ -4,6 +4,7 @@
 Uses beta134 /cluster_status; no restart, flash or write requests.
 """
 from __future__ import annotations
+from compact_storage import CompactRecorder
 import argparse, datetime as dt, json, pathlib, signal, socket, sqlite3, sys, time, urllib.parse, threading, html, getpass, shutil, queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from live_dashboard import Dashboard
@@ -231,6 +232,7 @@ def launch_dynamic(cfg,out,minutes):
         raise RuntimeError('Seed unreachable, wrong cluster ID, or missing integration_id: '+str(err))
     known={}; events=[]; started_utc=utc()
     discovery.observe(known,first,expected,started_utc,events)
+    compact=CompactRecorder(out/'stability_compact.sqlite3',cfg.get('compact_sample_seconds',60)) if cfg.get('compact_enabled',True) else None
     db=init_database(out/'stability.sqlite3')
     run_id=started_utc; interval=float(cfg['interval_seconds']);duration=minutes*60
     db.execute('INSERT INTO runs VALUES(?,?,?,?,?,?)',
@@ -300,6 +302,7 @@ def launch_dynamic(cfg,out,minutes):
                     db.execute('INSERT INTO network_checks VALUES(?,?,?,?,?,?,?,?,?)',
                                (run_id,stamp,label,int(route=='dns'),json.dumps([]),int(route=='ip'),int(bool(payload)),route,
                                 '; '.join(a['error'] for a in attempts if a['error'])))
+                    if compact: compact.observe(stamp,label,payload)
                     row,state=live_device(label,payload,previous.get(uid),bool(payload))
                     old=view.get(uid)
                     if old and old['ok']!=row['ok']:dashboard.emit(f'{label}: '+('wieder erreichbar' if row['ok'] else 'nicht erreichbar'))
@@ -315,6 +318,7 @@ def launch_dynamic(cfg,out,minutes):
                 labels=[discovery.host_label(e) for e in known.values()]
                 db.execute('UPDATE runs SET expected_hosts=? WHERE run_id=?',(json.dumps(labels),run_id))
                 db.commit()
+                if compact: compact.commit()
                 elapsed=time.monotonic()-start-paused_total
                 spent=time.monotonic()-t0
                 if spent>interval:overruns+=1;dashboard.emit(f'Polling-Zyklus überzogen: {spent:.1f}s > {interval:.1f}s')
@@ -338,6 +342,7 @@ def launch_dynamic(cfg,out,minutes):
         db.execute('UPDATE runs SET end_utc=?,expected_hosts=? WHERE run_id=?',
                    (utc(),json.dumps([discovery.host_label(e) for e in known.values()]),run_id))
         db.commit();db.close()
+        if compact: compact.close()
     (out/'test_metadata.json').write_text(json.dumps({'run_id':run_id,'cluster_id':expected,
         'seed_host':seed,'hosts':[discovery.host_label(e) for e in known.values()],
         'interval':interval,'duration_minutes':minutes},indent=2),encoding='utf8')

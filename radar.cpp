@@ -1,6 +1,7 @@
 #include "radar.h"
 #include "board_config.h"
 #include "drone_mode.h"
+#include "psram_alloc.h"
 
 #include <HardwareSerial.h>
 #include <Preferences.h>
@@ -197,8 +198,9 @@ struct RadarCalibrationSessionState {
 };
 
 
-static RadarCalibrationSessionState radarCalibrationQuiet;
-static RadarCalibrationSessionState radarCalibrationMotion;
+// Both calibration sessions (~13 KB) live in PSRAM, allocated once on first use
+// ([0] quiet, [1] motion). Zeroed memory equals radarCalibrationClearSession().
+static RadarCalibrationSessionState *radarCalibrationStates = nullptr;
 
 static RadarCalibrationMode radarCalibrationActive =
     RADAR_CALIBRATION_NONE;
@@ -225,13 +227,28 @@ static RadarCalibrationSessionState *radarCalibrationSession(
     RadarCalibrationMode mode
 )
 {
-    if (mode == RADAR_CALIBRATION_QUIET)
-        return &radarCalibrationQuiet;
+    if (
+        mode != RADAR_CALIBRATION_QUIET &&
+        mode != RADAR_CALIBRATION_MOTION
+    ) {
+        return nullptr;
+    }
 
-    if (mode == RADAR_CALIBRATION_MOTION)
-        return &radarCalibrationMotion;
+    if (!radarCalibrationStates) {
+        radarCalibrationStates =
+            static_cast<RadarCalibrationSessionState *>(
+                sfPsramCalloc(2, sizeof(RadarCalibrationSessionState))
+            );
+    }
 
-    return nullptr;
+    // nullptr (PSRAM unavailable) is handled by every caller; starting a
+    // calibration then reports "calibration session unavailable".
+    if (!radarCalibrationStates)
+        return nullptr;
+
+    return mode == RADAR_CALIBRATION_QUIET
+        ? &radarCalibrationStates[0]
+        : &radarCalibrationStates[1];
 }
 
 
@@ -582,7 +599,9 @@ static void resetGateTriggerHistory()
 // snapshots instead of Arduino String objects to avoid heap fragmentation.
 // Quiet periods are sampled once per second; meaningful state/threshold-zone
 // changes are captured immediately from the next standard radar report.
-static RadarDiagnosticSample radarDiagnosticBuffer[RADAR_DIAGNOSTIC_CAPACITY];
+// The ring itself (~20 KB) lives in PSRAM, allocated with the first sample.
+static RadarDiagnosticSample *radarDiagnosticBuffer = nullptr;
+static bool radarDiagnosticAllocReported = false;
 static uint16_t radarDiagnosticHead = 0;
 static uint16_t radarDiagnosticStored = 0;
 static uint32_t radarDiagnosticSequence = 0;
@@ -691,6 +710,24 @@ static void radarDiagnosticCapture(
     if (gettimeofday(&tv, nullptr) == 0 && tv.tv_sec >= 1577836800L) {
         sample.epochSec = (uint32_t)tv.tv_sec;
         sample.epochMs = (uint16_t)(tv.tv_usec / 1000L);
+    }
+
+    if (!radarDiagnosticBuffer) {
+        radarDiagnosticBuffer =
+            static_cast<RadarDiagnosticSample *>(
+                sfPsramCalloc(
+                    RADAR_DIAGNOSTIC_CAPACITY,
+                    sizeof(RadarDiagnosticSample)
+                )
+            );
+
+        if (!radarDiagnosticBuffer) {
+            if (!radarDiagnosticAllocReported) {
+                Serial.println("LD2410S diagnostics: no PSRAM ring buffer, samples not stored");
+                radarDiagnosticAllocReported = true;
+            }
+            return;
+        }
     }
 
     radarDiagnosticBuffer[radarDiagnosticHead] = sample;
@@ -3949,7 +3986,7 @@ bool radarDiagnosticGet(
     RadarDiagnosticSample &sample
 )
 {
-    if (index >= radarDiagnosticStored)
+    if (index >= radarDiagnosticStored || !radarDiagnosticBuffer)
         return false;
 
     uint16_t oldest =
@@ -4147,13 +4184,16 @@ void radarCalibrationResetAll()
     radarCalibrationActive =
         RADAR_CALIBRATION_NONE;
 
-    radarCalibrationClearSession(
-        radarCalibrationQuiet
-    );
+    // Not yet allocated means both sessions are still in the cleared state.
+    if (radarCalibrationStates) {
+        radarCalibrationClearSession(
+            radarCalibrationStates[0]
+        );
 
-    radarCalibrationClearSession(
-        radarCalibrationMotion
-    );
+        radarCalibrationClearSession(
+            radarCalibrationStates[1]
+        );
+    }
 }
 
 

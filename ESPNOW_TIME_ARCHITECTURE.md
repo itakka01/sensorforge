@@ -30,7 +30,7 @@ ESP-NOW arbeitet auf der bereits verbundenen WLAN-STA und **erzwingt keinen Kana
 ## 4. Nachrichten und Sicherheitsmodell
 
 - **Broadcast (ca. alle 10 s):** Coordinator-ID, Epoch/Boot-ID, Sequenznummer, authentifizierte UTC-/Monoton-Paarung. Der Broadcast ist grobe Referenz und keine alleinige Präzisionsmessung.
-- **Probe/Reply/Final (ca. alle 60 s pro Node; adaptiv 16/32/64 Austausche):** vier *monotone* Zeitstempel `t1` Node vor Sendung, `t2` Coordinator beim Empfang, `t3` Coordinator vor Antwort, `t4` Node beim Empfang. Die Zeiten der ESP-NOW-API bzw. Callback-Ausführung sind nicht gleich physikalischen HF-Sende-/Empfangszeiten.
+- **Probe/Reply/Final (eine Serie je Mess-Slot des Nodes; fest 16 Austausche je Serie (die frühere adaptive Erweiterung auf 32/64 wurde in beta131 entfernt)):** vier *monotone* Zeitstempel `t1` Node vor Sendung, `t2` Coordinator beim Empfang, `t3` Coordinator vor Antwort, `t4` Node beim Empfang. Die Zeiten der ESP-NOW-API bzw. Callback-Ausführung sind nicht gleich physikalischen HF-Sende-/Empfangszeiten.
 - **Authentizität:** HMAC-SHA256 mit separat aus dem laufenden Cluster-Schlüssel abgeleitetem Schlüssel und Replay-/Sequenzprüfung; kein zusätzlicher langlebiger Klartext-Schlüssel. Broadcasts sind **nicht verschlüsselt**. Offenlegung der Zeit ist unkritischer als das Einschleusen einer falschen Zeit; HMAC schützt gegen unautorisierte Änderung, nicht gegen Jamming, Verzögerung oder asymmetrische Funklaufzeiten.
 - **Callback-Regel:** Ungeprüfte Eingangsdaten zunächst in eine begrenzte Queue; HMAC/Parsing/Auswertung außerhalb des WLAN-Callbacks. Queue-Überlauf ist als Verlust zu zählen.
 
@@ -93,7 +93,7 @@ Bei unzureichender Qualität bleibt/greift die bisherige Wi-Fi-Clusterzeit, sofe
 
 Die Funk-RX-Callbacks bleiben kurz; der ESP-NOW-Empfänger kann weiterhin Pakete entgegennehmen, aber ein Node startet ohne gültige Freigabe keine neue Präzisionsserie. Die gespeicherte Drift wird während einer Pause nicht neu gemessen. `syncPermission` und `syncPermissionRemainingMs` in den lokalen Diagnostics zeigen die Node-Freigabe, nicht den Erfolg der Zeitkalibrierung.
 
-**Zeitverhalten:** Zeitbroadcasts ungefähr alle 10 s, Freigaben ungefähr alle 5 s, maximal 12 s Gültigkeit; Probe-Serien adaptiv mit 16, 32 oder 64 Austauschen, mit ungefähr 45 ms Mindestabstand bei erfolgreichem Ablauf, zuzüglich tatsächlicher Funklatenzen/Timeouts. Eine Serie kann deshalb länger dauern. Diese Intervalle sind Parameter und keine Echtzeitgarantien.
+**Zeitverhalten:** Zeitbroadcasts ungefähr alle 10 s, Freigaben ungefähr alle 5 s, maximal 12 s Gültigkeit; Probe-Serien mit fest 16 Austausche je Serie (die frühere adaptive Erweiterung auf 32/64 wurde in beta131 entfernt), mit ungefähr 45 ms Mindestabstand bei erfolgreichem Ablauf, zuzüglich tatsächlicher Funklatenzen/Timeouts. Eine Serie kann deshalb länger dauern. Diese Intervalle sind Parameter und keine Echtzeitgarantien.
 
 ## 9. Diagnose und Fehlersuche bei einer Messserie
 
@@ -134,7 +134,7 @@ Die zentrale Coordinator-Tabelle erhält noch keine vollständigen authentifizie
 - Synchronisation während und nach WLAN-Kanalwechsel, Coordinator-Reboot, Node-Reboot und HMAC-/Epoch-Änderungen testen.
 - Für zeitkritische Aufnahmen unabhängig über GPIO den tatsächlichen Node-versus-Coordinator-Versatz messen.
 
-## 12. Aktueller Präzisionsschätzer v2: RTT-Auswahl, adaptive Serien, Regression
+## 12. Aktueller Präzisionsschätzer v2: RTT-Auswahl, feste Serienlänge, Regression
 
 Diese Regeln ergänzen die in Abschnitt 4 beschriebenen Vier-Zeitstempel-Messungen. Das separate Dokument [`ESPNOW_ESTIMATOR_V2.md`](ESPNOW_ESTIMATOR_V2.md) enthält Detailbegründungen und Testanforderungen.
 
@@ -142,9 +142,9 @@ Diese Regeln ergänzen die in Abschnitt 4 beschriebenen Vier-Zeitstempel-Messung
 
 Für gültige Probe-Austausche werden **drei voneinander unterscheidbare Diagnosewerte** bestimmt: (1) Offset der einzelnen Probe mit kleinster RTT, (2) Median aller gültigen Offsets, (3) Median des unteren RTT-Quartils mit mindestens drei Messwerten. **Nur Wert (3)** fließt in die aktuelle Uhrenkalibrierung ein. Die RTT-Quartil-Spannweite (`spreadUs`) wird separat als Qualitätshinweis geprüft. Die kleinste RTT verringert üblicherweise Queue-Anteile, garantiert aber keine symmetrischen Hin-/Rücklaufzeiten und daher keine tatsächliche µs-Genauigkeit.
 
-### 12.2 Adaptive Messdauer
+### 12.2 Messdauer (feste Serienlänge)
 
-Eine Messserie startet mit **16 vollständigen Austauschen**. Genügt sie den Qualitätsbedingungen (mindestens acht gültige Probes, `spreadUs` maximal 250 µs, Median-RTT maximal 30 ms), endet sie unmittelbar. Sonst kann sie auf **32** und höchstens **64** vollständige Austausche erweitert werden. Der Probe-Mindestabstand liegt bei ungefähr **45 ms**. Bei ausbleibendem Fortschritt begrenzt ein **12-s-Limit** die Serie; Funkantworten und Timeouts können die Dauer deutlich beeinflussen. Capture-Priorität und Wegfall der authentifizierten Sync-Freigabe brechen die Serie unabhängig vom erreichten Sample-Ziel ab. Ein Abbruch erzeugt keinen neuen gültigen Offset.
+Eine Messserie umfasst **fest 16 vollständige Austausche** und wird danach bewertet (mindestens acht gültige Probes, `spreadUs` maximal 250 µs, Median-RTT maximal 30 ms). Die frühere adaptive Erweiterung auf **32** bzw. **64** Austausche wurde in beta131 entfernt (`cluster_espnow_radio.cpp`, `finishSample()`): Bei längeren Serien vergrößert die Drift die Spannweite (z. B. 22 ppm × 12 s ≈ 264 µs). Eine nicht bestandene Serie wird verworfen, nicht verlängert. Der Probe-Mindestabstand liegt bei ungefähr **45 ms**. Bei ausbleibendem Fortschritt begrenzt ein **12-s-Limit** die Serie; Funkantworten und Timeouts können die Dauer deutlich beeinflussen. Capture-Priorität und Wegfall der authentifizierten Sync-Freigabe brechen die Serie unabhängig vom erreichten Sample-Ziel ab. Ein Abbruch erzeugt keinen neuen gültigen Offset.
 
 ### 12.3 Drift aus Langzeitregression
 
@@ -195,7 +195,7 @@ Vergleiche vor und nach der Schätzer-Änderung mindestens 30 gültige Serien un
 
 Plausible Mechanismen aus dem Code (Hypothesen, nicht gemessen):
 - WebServer (`server.handleClient()`), HTTP-MJPEG/RTSP (`streamerLoop()`) und `clusterLoop()` laufen kooperativ im selben `loopTask`. Lange HTTP-Antworten oder Stream-Frames verzögern die Abarbeitung der ESP-NOW-Empfangsqueue und das Senden von Reply/Final. Die Zeitstempel selbst werden im RX-Callback bzw. direkt vor `esp_now_send()` genommen; die Verzögerung zeigt sich in `rx_queue_delay_*_us` und `reply_final_dispatch_gap_*_us` und kann bei > 1,2 s zu `exchange_timeouts` führen.
-- Ein Kamerastream belegt Funkzeit auf demselben Kanal. Mehr Kanalbelegung verlängert/variiert die Sendeverzögerung (`probe_tx_pre_send_*_us`) und kann RTT-Asymmetrie erzeugen; die RTT-Auswahl verwirft solche Austausche, wodurch Serien länger dauern oder abgelehnt werden.
+- Auf dem messenden Node selbst ist während der Präzisionssynchronisation **kein** Kamerastream möglich: Präzisionszeit läuft nur im Drone Mode, und dort stoppt die Hauptschleife Streamer und Aufnahme (`sensorforge.ino`, Drone-Zweig), `/snapshot` antwortet mit 503. Ein Kamerastream eines *anderen* Geräts (nicht im Drone Mode) auf demselben Kanal belegt jedoch Funkzeit. Mehr Kanalbelegung verlängert/variiert die Sendeverzögerung (`probe_tx_pre_send_*_us`) und kann RTT-Asymmetrie erzeugen; die RTT-Auswahl verwirft solche Austausche, wodurch Serien länger dauern oder abgelehnt werden.
 - Regelmäßiges Web-Polling (Statusseiten mit Auto-Refresh) wirkt wie kleine, häufige Loop-Blockaden; ein Fenster ohne Polling erzeugt keine Last.
 
 Bis zur Messung werden Task-Prioritäten, WLAN-Einstellungen und Synchronisationsalgorithmus **nicht** geändert.
@@ -203,6 +203,6 @@ Bis zur Messung werden Task-Prioritäten, WLAN-Einstellungen und Synchronisation
 **Vorgeschlagener Belastungstest (reproduzierbar, Antenne unverändert):** gleiche Aufstellung, je Phase 10 Minuten, Reihenfolge A–B–A–C–A, Statusabfrage `/cluster_status` alle 10 s von einem Rechner ohne sonstige Seiten:
 - A: kein Browser zum diymore.
 - B: Browser mit Cluster-/Statusseite (Auto-Refresh), kein Stream.
-- C: Browser mit aktivem HTTP-MJPEG-Stream (Auflösung und fps notieren).
+- C: Browser mit aktivem HTTP-MJPEG-Stream eines **anderen** Geräts außerhalb des Drone Mode auf demselben WLAN-Kanal (Gerät, Auflösung und fps notieren). Ein Stream vom diymore selbst ist im Drone Mode nicht möglich und daher keine Testphase.
 
 Je Phase erfassen: Anteil `espnow_precision`, Serien akzeptiert/verworfen, Median und Maximum der Serien-Streuung, `exchange_timeouts`, `rx_queue_delay_max_us`, `reply_final_dispatch_gap_max_us`, `probe_tx_pre_send_last_us` sowie die WLAN-RSSI (`/api/v1` bzw. WebConfig-WLAN-Seite). Alle Messwerte vollständig dokumentieren, keine Ausreißer entfernen. Die XIAOs laufen als Referenz unverändert mit. Erst wenn B oder C gegenüber beiden umgebenden A-Phasen wiederholt abweicht, gilt ein Lasteinfluss als belegt.

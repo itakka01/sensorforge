@@ -67,6 +67,7 @@
 #include "cluster_capture.h"
 #include "sd_presence_policy.h"
 #include "heap_monitor.h"
+#include "psram_alloc.h"
 
 
 // =============================================================
@@ -3552,7 +3553,15 @@ static bool firmwareFileContainsMarker(
         return false;
     }
 
-    static uint8_t scanBuffer[4096 + 128];
+    // Temporary PSRAM buffer (was a 4.2 KB static in internal RAM).
+    SfPsramBuffer scan(4096 + 128);
+
+    if (!scan) {
+        Serial.println("Firmware: marker scan skipped - no PSRAM buffer");
+        return false;
+    }
+
+    uint8_t *scanBuffer = scan.data();
 
     size_t carry = 0;
     size_t remaining = searchLength;
@@ -3903,6 +3912,25 @@ static bool firmwareUpdateFromSdIfPresent()
         return false;
     }
 
+    // Temporary PSRAM copy buffer (was a 4 KB static in internal RAM).
+    // Allocated before Update.begin() so a failure needs no Update.abort().
+    SfPsramBuffer update(4096);
+
+    if (!update) {
+
+        Serial.println(
+            "Firmware update: ERROR - no PSRAM copy buffer"
+        );
+
+        firmware.close();
+        firmwareUpdateLedStop();
+        firmwareMoveWorkTo(failedPath);
+        return false;
+    }
+
+    uint8_t *updateBuffer = update.data();
+    const size_t updateBufferSize = update.size();
+
     if (!Update.begin(
             firmwareSize,
             U_FLASH
@@ -3926,8 +3954,6 @@ static bool firmwareUpdateFromSdIfPresent()
         "Firmware update: flashing inactive OTA partition..."
     );
 
-    static uint8_t updateBuffer[4096];
-
     size_t totalWritten = 0;
     int lastProgress = -1;
     bool writeOk = true;
@@ -3938,9 +3964,9 @@ static bool firmwareUpdateFromSdIfPresent()
             firmwareSize - totalWritten;
 
         size_t requested =
-            remaining < sizeof(updateBuffer)
+            remaining < updateBufferSize
             ? remaining
-            : sizeof(updateBuffer);
+            : updateBufferSize;
 
         size_t got =
             firmware.read(
@@ -15178,6 +15204,7 @@ void setup() {
     sdSpiDeselect();
 
     Serial.begin(115200);
+    heapMonitorBootStage("setup_start");
     resetDiagnosticsBegin();
     droneModeBegin();
 
@@ -15559,6 +15586,7 @@ void setup() {
     loadConfig(
         sdReady
     );
+    heapMonitorBootStage("config_loaded");
 
     // Freeze the VPN runtime configuration for this boot. WireGuard settings
     // are intentionally reboot-applied so a remote configuration change cannot
@@ -15948,6 +15976,7 @@ void setup() {
     }
 
     startWebConfig();
+    heapMonitorBootStage("network_started");
 
     // WireGuard is optional and starts only on infrastructure WiFi with a
     // valid wall clock. This boot-time attempt happens before streamer clients

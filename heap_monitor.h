@@ -15,6 +15,10 @@ void heapMonitorService();
 // Force immediate heap stats logging (for debugging)
 void heapMonitorLogNow();
 
+// One serial line with internal/PSRAM free and largest block at a boot stage.
+// No allocation, no SD logging; for comparing boards in the same boot path.
+void heapMonitorBootStage(const char *stage);
+
 // Get current heap fragmentation percentage (0-100)
 // Returns 100 if largest block is < 10% of total free
 uint8_t heapMonitorGetFragmentationPercent();

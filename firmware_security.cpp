@@ -1,5 +1,6 @@
 #include "firmware_security.h"
 #include "firmware_public_key.h"
+#include "psram_alloc.h"
 
 #include <mbedtls/pk.h>
 #include <string.h>
@@ -393,15 +394,25 @@ bool firmwareSecurityVerifyPackageFile(
         return false;
     }
 
-    static uint8_t buffer[4096];
+    // Temporary PSRAM buffer (was a 4 KB static in internal RAM).
+    SfPsramBuffer hashBuffer(4096);
+
+    if (!hashBuffer) {
+        firmwareSecurityHashAbort(hashContext);
+        error = "no PSRAM buffer for firmware verification";
+        return false;
+    }
+
+    uint8_t *buffer = hashBuffer.data();
+    const size_t bufferSize = hashBuffer.size();
     uint32_t remaining =
         info.firmwareSize;
 
     while (remaining > 0) {
         size_t requested =
-            remaining < sizeof(buffer)
+            remaining < bufferSize
             ? remaining
-            : sizeof(buffer);
+            : bufferSize;
 
         size_t got =
             packageFile.read(

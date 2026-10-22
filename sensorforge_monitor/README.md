@@ -94,3 +94,32 @@ Die Gerätetabelle trennt den Gerätenamen von der 8-stelligen Hex-Kennung (`int
 Der Kopfbereich zeigt die vom Coordinator in `cluster_time.utc_us` gemeldete UTC-Clusterzeit **zum Zeitpunkt der letzten erfolgreichen Abfrage**. Das ist bewusst keine fortlaufend interpolierte Uhr. Fehlt die Clusterzeit oder ist sie ungültig, erscheint `—`.
 
 Die vom Coordinator **aktuell gemeldete** Firmwareversion dient als Vergleichsreferenz (falls unbekannt: häufigste Version); abweichende Versionen werden mit `!` und (auf Farbkonsolen) gelb markiert und im `f`-Filter angezeigt. Abweichend heißt nicht automatisch *veraltet*: Bei gleichmäßig verteilten Firmwareständen entscheidet keine Versionsordnung. Bei der Terminalbreite passt sich die Anzahl der angezeigten Spalten automatisch an, die Liste bleibt immer auf maximal `dashboard_page_size` (standardmäßig 12) Zeilen begrenzt. Für alle Felder Terminal auf mindestens 136 Spalten verbreitern.
+
+## Lange Messungen: kompakte zweite SQLite-Datei
+
+Im dynamischen Cluster-Modus wird automatisch neben `stability.sqlite3` auch
+`stability_compact.sqlite3` angelegt. Die Originaldatenbank und deren Reports
+bleiben unverändert. Die kompakte Datei enthält für jeden bekannten Node eine
+Statusprobe pro 60 Sekunden sowie **jede erkannte** Änderung von Zeitquelle,
+HTTP-Erreichbarkeit, Präzisionsstatus, Boot/Epoch und den Zählern für akzeptierte
+/ abgelehnte Serien, Timeouts und Replay. Ereignisse haben die Auflösung des
+konfigurierten HTTP-Abfrageintervalls (standardmäßig 10 Sekunden).
+
+Die Tabelle `samples` enthält u.a. Firmware, Temperatur/Heap (soweit im Status
+vorhanden), Clusterzeit und eine gezielte JSON-Auswahl an ESP-NOW-Messwerten.
+Die Tabelle `events` enthält Veränderungen einschließlich der kumulativen
+Vorher-/Nachher-Zähler. Die Datei ist direkt mit SQLite analysierbar und kann
+für die externe Analyse hochgeladen werden. Rohdaten und detaillierte HTTP-
+Fehler bleiben weiterhin ausschließlich in der vollständigen Datenbank.
+
+Optionale Einstellungen in `sensorforge_config.json`:
+
+```json
+"compact_enabled": true,
+"compact_sample_seconds": 60
+```
+
+**Wichtig:** Ein 6-Stunden-Test mit fünf Geräten ist typischerweise handlich;
+bei 100+ Nodes wachsen auch kompakte Dateien linear. Die tatsächliche Größe
+hängt von Ereignishäufigkeit und Konfiguration ab. Der kompakte Recorder wird
+im dynamischen Testpfad benutzt; der statische Legacy-Test ist unverändert.

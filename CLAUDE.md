@@ -427,7 +427,7 @@ SFJC1 empfangen → Signatur prüfen
 - `SFJCA1` - Job Receipt (HMAC)
 
 **Zeitsynchronisation (Estimator v2):**
-- Adaptive Samples: 16/32/64
+- Feste Serienlänge: 16 Austausche (adaptive 16/32/64 in beta131 entfernt)
 - RTT-Quartile-Median
 - Drift-Regression: 24 Serien, ≥3 Min
 - **⚠️ Nicht Hardware-validiert!**

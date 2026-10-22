@@ -8,6 +8,8 @@ Der Vier-Zeitstempel-Schätzer validiert kausale Zeitfolgen und begrenzt RTT. Er
 
 ## Adaptive Serien
 
+> **Hinweis (2026-10-23):** Dieser Abschnitt ist historisch. Seit beta131 verwendet der Code fest 16 Austausche je Serie; die Erweiterung auf 32/64 wurde entfernt (siehe `ESPNOW_TIME_ARCHITECTURE.md`, Abschnitt 12.2).
+
 Die Serie startet mit 16 vollständigen Austauschen. Werden die bestehenden Qualitätsgrenzen (mind. acht gültige, Spannweite höchstens 250 µs, Median-RTT höchstens 30 ms) nicht erfüllt, wird sie auf 32, nötigenfalls 64 erweitert. Das Ergebnis wird spätestens bei 64 abgeschlossenen Austauschen bewertet. Zusätzlich bricht der Node eine Serie nach zwölf Sekunden ab, wenn nicht ausreichend Antworten eintreffen. Capture-Pause und entfallene SyncControl-Freigabe verwerfen unvollständige Messungen. Empfangsbereitschaft bleibt erhalten; die letzte gültige Kalibrierung wird nicht gelöscht.
 
 ## Drift

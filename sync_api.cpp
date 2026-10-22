@@ -3815,6 +3815,7 @@ static void handleSystemExtended()
         ",\"psram_size\":" + String((unsigned long)ESP.getPsramSize()) +
         ",\"psram_free\":" + String((unsigned long)ESP.getFreePsram()) +
         ",\"psram_min_free\":" + String((unsigned long)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)) +
+        ",\"psram_largest_block\":" + String((unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)) +
         ",\"cpu_temperature_c\":" + String(thermalCpuTemperatureC(), 1) +
         ",\"rtc_temperature_valid\":" + String(rtcTempValid ? "true" : "false") +
         ",\"rtc_temperature_c\":" + String(rtcTempValid ? rtcTemp : 0.0f, 1) +

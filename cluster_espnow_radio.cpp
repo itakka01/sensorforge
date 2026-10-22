@@ -8,6 +8,7 @@
 #include "cluster_time_shadow_handover.h"
 #include "cluster_time_grant_protocol.h" // Beta131: production handover enabled
 #include "cluster_time_source_policy.h"
+#include "cluster_slot_recovery.h"
 static_assert(ClusterTimeGrantProtocol::kWireBytes == 96, "grant frame size");
 #include "board_config.h"
 #include <Arduino.h>
@@ -328,12 +329,20 @@ uint32_t permissionUntilMs=0, nextGrantMs=0;
 bool coordinatorPermissionIssued=false;
 bool sendFrame(EspNowTimePackets::Frame& f,const uint8_t mac[6],
                int64_t* txStampOut=nullptr, bool replyStamp=false);
-struct SlotPeer { uint8_t mac[6]={}; uint32_t boot=0; uint32_t seenMs=0; };
+struct SlotPeer { uint8_t mac[6]={}; uint32_t boot=0; uint32_t seenMs=0;
+                  ClusterSlotRecovery::PeerState recovery; };
 SlotPeer slotPeers[12];
 uint8_t slotNextIndex=0;
 int8_t slotOwner=-1;
 uint32_t slotStartedMs=0, slotGuardUntilMs=0;
 uint32_t slotGrantsSent=0, slotRotations=0;
+// Recovery slot after a rejected series (cluster_slot_recovery.h). A recovery
+// owner never advances the regular rotation pointer.
+constexpr uint32_t kSlotRecoveryLifetimeMs=120000; // == kPrecisionLifetimeMs (static_assert below)
+constexpr ClusterSlotRecovery::Params kSlotRecoveryParams{
+    kOwnerSlotMs+kSlotGuardMs, kOwnerSlotMs, kSlotRecoveryLifetimeMs};
+bool slotOwnerIsRecovery=false, slotLastWasRecovery=false;
+ClusterSlotRecovery::Stats slotRecoveryStats;
 void noteSlotPeer(const uint8_t mac[6], uint32_t boot) {
     if(!boot) return;
     const uint32_t now=millis();
@@ -341,8 +350,10 @@ void noteSlotPeer(const uint8_t mac[6], uint32_t boot) {
         if(p.boot && memcmp(p.mac,mac,6)==0) {
             // A different boot on the same MAC is a different owner.
             if(p.boot!=boot && slotOwner==(&p-slotPeers)) {
+                slotLastWasRecovery=slotOwnerIsRecovery;slotOwnerIsRecovery=false;
                 slotOwner=-1;slotGuardUntilMs=now+kSlotGuardMs;
             }
+            if(p.boot!=boot)p.recovery={};
             p.boot=boot; p.seenMs=now; return;
         }
     }
@@ -366,22 +377,44 @@ void sendSlotControl(uint32_t epoch,uint64_t tag,uint32_t boot,
 void endSlot(uint32_t epoch,uint64_t tag,uint32_t boot) {
     if(slotOwner>=0) {
         sendSlotControl(epoch,tag,boot,slotPeers[slotOwner].boot,0);
-        slotNextIndex=static_cast<uint8_t>((slotOwner+1)%12);
+        if(!slotOwnerIsRecovery)slotNextIndex=static_cast<uint8_t>((slotOwner+1)%12);
         ++slotRotations;
+        slotLastWasRecovery=slotOwnerIsRecovery;
     }
-    slotOwner=-1;
+    slotOwner=-1;slotOwnerIsRecovery=false;
     slotGuardUntilMs=millis()+kSlotGuardMs;
+}
+// Coordinator: precision age from a node's authenticated NodeSyncReport.
+void slotNotePrecisionReport(uint32_t boot,bool hasPrecision,uint32_t ageMs) {
+    for(auto &p:slotPeers) if(p.boot==boot) {
+        ClusterSlotRecovery::onPrecisionReport(p.recovery,hasPrecision,ageMs,millis(),
+                                              kSlotRecoveryParams,slotRecoveryStats);
+        return;
+    }
 }
 void serviceSlots(uint32_t now,uint32_t epoch,uint64_t tag,uint32_t boot) {
     if(slotOwner>=0 && (uint32_t(now-slotStartedMs)>=kOwnerSlotMs ||
        uint32_t(now-slotPeers[slotOwner].seenMs)>kPeerActiveMs)) endSlot(epoch,tag,boot);
     if(slotOwner<0) {
         if(static_cast<int32_t>(now-slotGuardUntilMs)<0) return;
+        // Active peers in regular rotation order; ordered[0] is the regular owner.
+        uint8_t order[12];
+        ClusterSlotRecovery::PeerState *ordered[12];
+        size_t count=0;
         for(unsigned offset=0;offset<12;++offset) {
             const uint8_t i=static_cast<uint8_t>((slotNextIndex+offset)%12);
             if(slotPeers[i].boot && uint32_t(now-slotPeers[i].seenMs)<=kPeerActiveMs) {
-                slotOwner=i;slotStartedMs=now;nextGrantMs=now;break;
+                order[count]=i;ordered[count]=&slotPeers[i].recovery;++count;
             }
+        }
+        if(count) {
+            const int recovery=ClusterSlotRecovery::choose(ordered,count,slotLastWasRecovery,
+                                                           now,kSlotRecoveryParams,slotRecoveryStats);
+            slotOwnerIsRecovery=recovery>0;
+            slotOwner=static_cast<int8_t>(order[slotOwnerIsRecovery ? recovery : 0]);
+            ClusterSlotRecovery::onSlotStart(slotPeers[slotOwner].recovery,slotOwnerIsRecovery,
+                                             now,slotRecoveryStats);
+            slotStartedMs=now;nextGrantMs=now;
         }
     }
     if(slotOwner>=0 && static_cast<int32_t>(now-nextGrantMs)>=0) {
@@ -463,7 +496,7 @@ void benchAdvance(uint32_t now) {
     benchNextSeq=0;
     for(auto &t:benchTxUs)t=0;
     // Reset local sync slot ownership, don't let the normal scheduler compete.
-    slotOwner=-1;slotGuardUntilMs=now+kSlotGuardMs;
+    slotOwner=-1;slotOwnerIsRecovery=false;slotGuardUntilMs=now+kSlotGuardMs;
     benchControlPhase(1,now);
 }
 void benchTick(uint32_t now){
@@ -602,6 +635,7 @@ uint32_t referenceMonoLow=0;
 int64_t referenceReceivedNodeMono=0;
 uint32_t lastPrecisionMs=0;
 constexpr uint32_t kPrecisionLifetimeMs=120000;
+static_assert(kSlotRecoveryLifetimeMs==kPrecisionLifetimeMs, "slot recovery uses the precision lifetime");
 constexpr int64_t kReferenceLifetimeUs=30000000;
 
 String referenceId;
@@ -839,6 +873,7 @@ bool start(uint8_t channel) {
     for(auto &p:slotPeers)p={};slotNextIndex=0;slotOwner=-1;
     slotStartedMs=0;slotGuardUntilMs=millis()+kSlotGuardMs;
     slotGrantsSent=slotRotations=0;
+    slotOwnerIsRecovery=slotLastWasRecovery=false;slotRecoveryStats={};
     return true;
 }
 uint32_t nextSequence(){++txSequence;if(!txSequence)++txSequence;return txSequence;}
@@ -970,6 +1005,7 @@ void acceptNodeReport(const EspNowTimePackets::Frame &f) {
             r.failureCode=static_cast<uint8_t>((f.nonce>>16)&0xffU);
             r.failedSeries=static_cast<uint8_t>((f.nonce>>24)&0xffU);
             remoteReceivedAt[slot]=millis();++reportCount;
+            slotNotePrecisionReport(boot,false,0);
             return;
         }
         r.failureCode=0;
@@ -978,6 +1014,7 @@ void acceptNodeReport(const EspNowTimePackets::Frame &f) {
         r.acceptedSamples=static_cast<uint8_t>(f.nonce&0xffU);
         r.precisionAccepted=(f.nonce&0x100U)!=0;
         r.sampleAgeMs=(f.nonce>>16)*1000UL;
+        slotNotePrecisionReport(boot,r.precisionAccepted,r.sampleAgeMs);
     } else {
         r.driftMilliPpm=static_cast<int32_t>(static_cast<uint32_t>(bits));
         r.spreadUs=static_cast<uint16_t>((bits>>32)&0xffffU);
@@ -1210,7 +1247,8 @@ void pauseForCapture(uint32_t holdMs) {
     // Coordinator notifies nodes immediately; expiry also protects against lost packets.
     revokePermissionBroadcast();
     if(wasCoordinator && slotOwner>=0) {
-        slotNextIndex=static_cast<uint8_t>((slotOwner+1)%12);
+        if(!slotOwnerIsRecovery)slotNextIndex=static_cast<uint8_t>((slotOwner+1)%12);
+        slotLastWasRecovery=slotOwnerIsRecovery;slotOwnerIsRecovery=false;
         slotOwner=-1;
         slotGuardUntilMs=captureGuardUntilMs+kSlotGuardMs;
     }
@@ -1333,6 +1371,7 @@ void stop() {
     memset(activeTimeSourceMac,0,6);  // Beta131-FIX (Seventh cycle, Problem 2)
     for(auto &p:slotPeers)p={};slotNextIndex=0;slotOwner=-1;
     slotStartedMs=slotGuardUntilMs=0;slotGrantsSent=slotRotations=0;
+    slotOwnerIsRecovery=slotLastWasRecovery=false;slotRecoveryStats={};
     previousEstimate={};latestQualityEstimate={};lastPrecisionMs=0;failedSeries=0;for(auto &r:seriesRejectByReason)r=0;lastSeriesFailure=0;lastRejectedReason=0;lastRejectedSeriesMs=0;lastRejectedHasMetrics=false;lastRejectedEstimate={};consecutiveFailures=0;
     successfulSeries=0;lastCompletedSeriesMs=0;lastCompletedSeriesResult=0;nextSeriesStatsReportMs=0;lastEstimateMs=0;
     referenceUtcUs=0;referenceMonoLow=0;referenceReceivedNodeMono=0;
@@ -1969,6 +2008,18 @@ Diagnostics diagnostics(){Diagnostics out=stats;
         static_cast<uint32_t>(llround(std::max(0.0,std::min(4294967295.0,lastRejectedEstimate.spreadUs)))) : 0;
     out.seriesLastCompletedAgeMs=lastCompletedSeriesMs ? uint32_t(now-lastCompletedSeriesMs) : 0;
     out.seriesNextInMs=nextSeriesMs && static_cast<int32_t>(nextSeriesMs-now)>0 ? nextSeriesMs-now : 0;
+    if(wasCoordinator){
+        for(const auto &p:slotPeers)
+            if(p.boot && uint32_t(now-p.seenMs)<=kPeerActiveMs)++out.slotActivePeers;
+        out.slotCycleEstimateMs=out.slotActivePeers*kSlotRecoveryParams.slotPeriodMs;
+        out.slotRotations=slotRotations;
+        out.slotOwnerRecovery=slotOwner>=0 && slotOwnerIsRecovery;
+        out.slotRecoveryRequested=slotRecoveryStats.requested;
+        out.slotRecoveryGranted=slotRecoveryStats.granted;
+        out.slotRecoveryDeferred=slotRecoveryStats.deferred;
+        out.slotRecoverySucceeded=slotRecoveryStats.succeeded;
+        out.slotRecoveryFailed=slotRecoveryStats.failed;
+    }
     out.coordinatorBeaconsSuppressed=coordinatorBeaconsSuppressed;
     out.activeTimeSource=activeTimeSourceTag;
     out.sourceChanges=sourceChanges;

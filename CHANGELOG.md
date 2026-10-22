@@ -1,3 +1,24 @@
+## v87-beta139 — 2026-10-23 (RECOVERY-SLOT NACH VERWORFENER PRÄZISIONSSERIE)
+
+**Problem (Audit 2026-10-23, Messlauf 22.10.):** Mit vier Nodes im Drone Mode dauert die Slot-Rotation 4 × (14 s Slot + 3,5 s Pause) = 70 s. Nach einer verworfenen Serie kam der nächste Slot des Nodes erst nach 70 s; die letzte gültige Schätzung war dann ~140 s alt (> 120 s Gültigkeit) → ~20 s `wifi_coordinator` mit Zeitsprung ~5,5 ms (c001: `precision_guard_other` +8 bei 21:54:08/18). Betrifft alle Boards ab vier Nodes, nicht nur diymore.
+
+**ÄNDERUNG (nur Coordinator-Verhalten):**
+- `cluster_slot_recovery.h` (neu): reine Entscheidungslogik mit Invarianten – I1 ein Slot-Inhaber, I2 nie zwei Recovery-Slots hintereinander, I3 höchstens ein Recovery-Slot je Node und regulärem Zyklus, I4 kein anderer Node wird durch die Verschiebung um einen Slot über die 120 s gedrückt, I5 nur bei noch gültiger Schätzung, nachgewiesen erfolgloser letzter Slot (Bericht nach Slot-Ende) und regulärem Slot nach Ablauf. Mehrere Bedarfe: älteste Schätzung zuerst, bei Gleichstand Rotationsposition.
+- `cluster_espnow_radio.cpp`: `serviceSlots()` wählt ggf. einen Recovery-Inhaber über die vorhandene SyncControl-Vergabe; `endSlot()`/`pauseForCapture()` rücken den Rotationszeiger nur nach regulären Slots weiter; `noteSlotPeer()` setzt den Zustand bei neuer Boot-ID zurück; `acceptNodeReport()` reicht das gemeldete Schätzungsalter (vorhandenes `NodeSyncReport`) weiter; Reset in `start()`/`stop()`; `static_assert` auf `kPrecisionLifetimeMs`.
+- `/cluster_status` → `espnow_time_local` (nur Coordinator, sonst 0): `slot_active_peers`, `slot_cycle_estimate_ms`, `slot_rotations`, `slot_owner_recovery`, `slot_recovery_requested/granted/deferred/succeeded/failed`.
+
+**UNVERÄNDERT:** Node-Code, Schätzer und RTT-Vorauswahl, ≥ 8 Exchanges, 250-µs-Grenze, 120 s Gültigkeit, 30-s-Beacon-Grenze, Drift, HMAC, Replay, Epoch/Identität, Capture-Absicherung, WLAN-Fallback, Frame-Layouts und Paketinhalte, WLAN-Power-Save, Task-Prioritäten. Gesunder Cluster: Slot-Reihenfolge identisch zur bisherigen Rotation.
+
+**KOMPATIBILITÄT:** Keine neuen Pakete oder Felder. Nodes mit beta138-Firmware bleiben kompatibel; für die Wirkung genügt das Update des Coordinators (devxiao3).
+
+**GRENZEN:** Wirkung bei 4 Nodes vollständig, bei 5 teilweise, ab 6 Nodes keine (Schätzung läuft ab, bevor ein Recovery-Slot möglich wäre); ab ~7 Nodes reicht die serielle Rotation grundsätzlich nicht. Peer-Tabelle unverändert 12. Scheitert auch die Recovery-Serie, greift der Fallback (für diesen Node ~17,5 s länger).
+
+**TESTS:** `test_slot_recovery.cpp.test` (neu) 104/104 – stabil mit 1/2/4 Nodes (Reihenfolge identisch), 1 Fehlserie (Fallback 19,9 s → 0 s), Mehrfachfehler, zwei gleichzeitige Bedarfe, dauerhaft schlechter Node, verschwindender Node, Coordinator- und Node-Neustart, gescheiterte Recovery, Modell 4–100 Nodes. Übrige 14 Host-Tests unverändert (Ausgabe identisch zur Basis). Builds XIAO/Freenove/diymore ohne neue Warnungen.
+
+**DOKU:** feste Serienlänge 16 (adaptive 16/32/64 seit beta131 entfernt) in `ESPNOW_TIME_ARCHITECTURE.md`, `ESPNOW_ESTIMATOR_V2.md`, `CLUSTER_ARCHITECTURE.md`, `README.md`, `CLAUDE.md`; `ESPNOW_TIME_ARCHITECTURE.md` Abschnitt 15: Kamerastream auf dem messenden Node im Drone Mode nicht möglich, Testphase C korrigiert.
+
+**Ebenfalls seit beta138 im Stand (bisher ohne Eintrag):** optionaler GPIO-Testimpuls im Cluster-Shot (SFJC1-Feld `tp1`), passives Freenove-GPIO-Messgerät, Board `BOARD_DIYMORE_S3CAM` (vorläufiges Profil, `BOARD_SUPPORTS_PRECISION_SYNC=1` als reine Anzeige, Triggergenauigkeit unvermessen).
+
 ## v87-beta138 — 2026-10-20 (CLUSTER-WEITER WLAN-POWER-SAVE + TX-DIAGNOSE-FIX)
 
 **Regel:** Jedes Gerät mit aktivem Cluster-Runtime (Coordinator, Time Broadcaster auch ohne Lease, normale Nodes; boardunabhängig) läuft mit `WIFI_PS_NONE`. Ohne aktiven Cluster gilt das bisherige Verhalten (`WiFi.getSleep()`, Arduino-Default `WIFI_PS_MIN_MODEM`). Rollenwechsel innerhalb des aktiven Clusters ändern nichts; Cluster-Deaktivierung stellt die Baseline wieder her; STA-Neustart/Reconnect wird erkannt und korrigiert.
