@@ -189,6 +189,8 @@ bool firmwareManifestFindCandidate(const String &url, FirmwareManifestCandidate 
     const char *localBoard = "xiao";
 #elif defined(BOARD_FREENOVE)
     const char *localBoard = "freenove";
+#elif defined(BOARD_DIYMORE_S3CAM)
+    const char *localBoard = "diymore";
 #else
     const char *localBoard = "unknown";
 #endif

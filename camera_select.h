@@ -26,9 +26,10 @@ struct camera_pins_t {
 };
 
 // -------------------------------------------------------------
-// Freenove ESP32-S3 WROOM Kamera-Pins (OV3660)
+// Freenove ESP32-S3 WROOM Kamera-Pins (OV3660); identisch beim
+// pin-kompatiblen diymore ESP32-S3 CAM (OV5640)
 // -------------------------------------------------------------
-#ifdef BOARD_FREENOVE
+#ifdef BOARD_FAMILY_S3_WROOM_CAM
 static const camera_pins_t pins_freenove = {
     .pin_pwdn     = -1,
     .pin_reset    = -1,
@@ -80,7 +81,7 @@ static const camera_pins_t pins_xiao = {
 // -------------------------------------------------------------
 inline camera_pins_t selectCamera(const String &model) {
 
-#ifdef BOARD_FREENOVE
+#ifdef BOARD_FAMILY_S3_WROOM_CAM
     return pins_freenove;
 #endif
 

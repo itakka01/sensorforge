@@ -3302,7 +3302,12 @@ static const char *FW_UPDATE_INTERRUPTED =
     "/firmware/update.interrupted.failed";
 
 
-#ifdef BOARD_FREENOVE
+#if defined(BOARD_DIYMORE_S3CAM)
+static const char FW_COMPAT_MARKER[] =
+    "SENSORFORGE|ESP32S3|DIYMORE_S3CAM|COMPAT=1";
+static const char FW_COMPAT_MARKER_LEGACY[] =
+    "OLDNAME_SENSORCAM|ESP32S3|DIYMORE_S3CAM|COMPAT=1";
+#elif defined(BOARD_FREENOVE)
 static const char FW_COMPAT_MARKER[] =
     "SENSORFORGE|ESP32S3|FREENOVE_FNK0085|COMPAT=1";
 static const char FW_COMPAT_MARKER_LEGACY[] =
@@ -5846,10 +5851,11 @@ bool initCamera(
     cfg.pin_href     = pins.pin_href;
     cfg.pin_pclk     = pins.pin_pclk;
 
-#if defined(BOARD_FREENOVE) || defined(BOARD_XIAO)
+#if defined(BOARD_FAMILY_S3_WROOM_CAM) || defined(BOARD_XIAO)
     // Configurable camera master clock. config.cpp validates the value to
     // 10/16/20 MHz. Legacy defaults remain 10 MHz on Freenove and 20 MHz
-    // on XIAO when camera_xclk_mhz is absent from an older config.txt.
+    // on XIAO (and diymore/OV5640) when camera_xclk_mhz is absent from an
+    // older config.txt.
     cfg.xclk_freq_hz =
         (uint32_t)cfg_camera_xclk_mhz * 1000000UL;
 #endif
@@ -14475,7 +14481,7 @@ static bool timeBroadcasterModeEnabled();
 
 void startWebConfig()
 {
-#if defined(BOARD_FREENOVE)
+#if defined(BOARD_FAMILY_S3_WROOM_CAM)
     // GPIO21 is sampled through the normal digital GPIO path while WebConfig
     // is active. Offline-awake mode switches it to RTC GPIO below.
     motionDiagnosticsSetPresenceRtcSampling(false);
@@ -14695,7 +14701,7 @@ void stopWebConfigWifi(
     // is already proven by reliable EXT1 wake. Use that same hardware input
     // path while WiFi is OFF even when sleep_mode=off. This avoids losing
     // presence after the radio stack is torn down.
-#if defined(BOARD_FREENOVE)
+#if defined(BOARD_FAMILY_S3_WROOM_CAM)
     offlinePresenceRtcBackendActive =
         motionDiagnosticsSetPresenceRtcSampling(true);
 #else
@@ -15189,7 +15195,9 @@ void setup() {
     Serial.println();
     Serial.println("==============================");
 
-#if defined(BOARD_FREENOVE)
+#if defined(BOARD_DIYMORE_S3CAM)
+    Serial.println("DIYMORE ESP32-S3 CAM (OV5640)");
+#elif defined(BOARD_FREENOVE)
     Serial.println("FREENOVE FNK0085 CAMERA");
 #elif defined(BOARD_XIAO)
     Serial.println("XIAO ESP32S3 SENSE CAMERA");

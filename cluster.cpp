@@ -3109,10 +3109,12 @@ static void processJobCaptureResult(char **f,size_t n,const IPAddress &ip) {
                   after->resultCode==(uint16_t)error)))
         sendCaptureReceipt(cb,epoch,seq,nb,(uint16_t)status,ip);
 }
-// Returns GPIO2 after the shot or on any abort; no-op when nothing was prepared.
+// Returns GPIO2 after the shot or on any abort. Without a prepared pin only a
+// still pending request is closed, so a final reason (not_prepared, refusal)
+// is kept and the status never shows "requested" for an ended job.
 static void releaseCaptureTestPulse(const char *state){
-    if(!clusterCapturePulsePrepared())return;
-    clusterCapturePulseRelease();
+    if(clusterCapturePulsePrepared())clusterCapturePulseRelease();
+    else if(strcmp(captureTestPulseState,"requested"))return;
     captureTestPulseState=state;
 }
 // Called by clusterLoop during regular firmware main loop. Future high precision
@@ -3157,6 +3159,7 @@ static void serviceScheduledCapture(){
             if(!clusterCapturePrepareCamera()){
                 PendingCapture p=pendingCapture;pendingCapture.active=false;
                 clusterCaptureArmedFlag=false;
+                releaseCaptureTestPulse("camera_failed");
                 queueCaptureTerminalResult(p.cb,p.epoch,p.seq,3,1,0);return;
             }
             clusterCaptureArmedFlag=true;
@@ -3966,6 +3969,10 @@ void clusterNetworkStop()
 {
     ClusterEspNowRadio::stop();
     hwTimeSessionFinish("network_stopped", false);
+    // Like the session above: every WiFi-off path (window end, thermal,
+    // streamer recovery) returns the meter pins before the caller may move
+    // GPIO21 to RTC presence sampling. No-op when the meter is not running.
+    ClusterHwTimeMeter::stop("stopped_network_stop");
     // A deliberate cluster lifecycle stop cancels the pending local dispatch.
     // Keep already produced PSRAM media until a new accepted capture job.
     releaseCaptureTestPulse("aborted");

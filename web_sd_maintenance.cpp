@@ -3694,6 +3694,8 @@ static const char *sdBenchmarkBoardName()
     return "Freenove FNK0085 ESP32-S3 WROOM";
 #elif defined(BOARD_XIAO)
     return "Seeed XIAO ESP32S3 Sense";
+#elif defined(BOARD_DIYMORE_S3CAM)
+    return "diymore ESP32-S3 CAM (OV5640)";
 #else
     return "Unknown SensorForge board";
 #endif

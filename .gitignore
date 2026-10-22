@@ -45,3 +45,6 @@ Thumbs.db
 
 # Temporary files
 temp.txt
+
+# SensorForge-Monitor: Skripte/Konfiguration werden gesichert, Testdaten nicht
+sensorforge_monitor/sensorforge_tests/

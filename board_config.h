@@ -25,15 +25,25 @@ static constexpr int16_t SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10 = 85;
 // =============================================================
 
 //#define BOARD_FREENOVE
-#define BOARD_XIAO
+//#define BOARD_XIAO
+#define BOARD_DIYMORE_S3CAM
 
 
-#if defined(BOARD_FREENOVE) && defined(BOARD_XIAO)
+#if (defined(BOARD_FREENOVE) + defined(BOARD_XIAO) + defined(BOARD_DIYMORE_S3CAM)) > 1
 #error "Nur ein Board darf aktiviert sein!"
 #endif
 
-#if !defined(BOARD_FREENOVE) && !defined(BOARD_XIAO)
+#if !defined(BOARD_FREENOVE) && !defined(BOARD_XIAO) && !defined(BOARD_DIYMORE_S3CAM)
 #error "Kein Board ausgewählt!"
+#endif
+
+// Hardware family "ESP32-S3-WROOM CAM": Freenove FNK0085 and the diymore
+// ESP32-S3 CAM, treated as pin-compatible (camera DVP pins match the published
+// mapping; SD_MMC and the external sensor wiring are provisional on diymore).
+// Use this only for shared hardware paths; Freenove-only choices (XCLK 10 MHz,
+// SR602 PIR UI, GPIO meter, LED) stay on BOARD_FREENOVE.
+#if defined(BOARD_FREENOVE) || defined(BOARD_DIYMORE_S3CAM)
+#define BOARD_FAMILY_S3_WROOM_CAM 1
 #endif
 
 
@@ -41,9 +51,18 @@ static constexpr int16_t SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10 = 85;
 // FREENOVE FNK0085
 // =============================================================
 
-#if defined(BOARD_FREENOVE)
+#if defined(BOARD_FAMILY_S3_WROOM_CAM)
 
+#if defined(BOARD_DIYMORE_S3CAM)
+// diymore ESP32-S3 CAM (ESP32-S3-WROOM-1 N16R8, OV5640, TF slot, IPEX).
+// PROVISIONAL profile: treated as a Freenove FNK0085 pin clone (camera pins match
+// the widely published ESP32-S3-WROOM CAM mapping). SD_MMC pins, LED and free
+// GPIOs are NOT yet verified on hardware. 16 MB flash is used with the shared
+// 8 MB partition layout (upper 8 MB unused) until a 16 MB table is qualified.
+#define BOARD_DISPLAY_NAME "diymore ESP32-S3 CAM (OV5640)"
+#else
 #define BOARD_DISPLAY_NAME "Freenove FNK0085 ESP32-S3 WROOM"
+#endif
 #define BOARD_HAS_ESP_NOW 1
 
 // Board function releases (WebConfig presentation only, no runtime limits).
@@ -86,6 +105,9 @@ static constexpr int16_t SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10 = 85;
 // If this board is changed to a different storage backend in the future, its
 // clock policy belongs here in the board profile, not in config.txt.
 
+// SensorForge EXTERNAL wiring (not board hardware). On diymore these pins are
+// PROVISIONALLY taken over from the Freenove wiring: same GPIO numbers on the
+// pin-compatible header, not yet checked against the diymore PCB.
 // Presence input: LD2410S OT2 or AM312 PIR (HIGH = person present).
 // PIR_PIN is retained as a compatibility alias for existing code.
 #define PRESENCE_PIN        GPIO_NUM_21      // (gelb)
@@ -116,11 +138,18 @@ static constexpr int16_t SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10 = 85;
 #define CAMERA_BASE_HMIRROR 0
 #define CAMERA_BASE_VFLIP   0
 
+#if defined(BOARD_DIYMORE_S3CAM)
+// Onboard LED position not verified on the diymore board: never drive GPIO2.
+#define STATUS_LED_AVAILABLE 0
+#else
 #define STATUS_LED_AVAILABLE 1
+#endif
 #define LED_PIN             GPIO_NUM_2
 #define LED_ON_LEVEL        HIGH
 #define LED_OFF_LEVEL       LOW
 
+// diymore: SD_MMC 1-bit on 38/39/40 is PROVISIONAL (Freenove-compatible
+// layout assumed, TF slot wiring not verified).
 #define SD_MMC_CMD          GPIO_NUM_38
 #define SD_MMC_CLK          GPIO_NUM_39
 #define SD_MMC_D0           GPIO_NUM_40
@@ -169,14 +198,25 @@ static constexpr int16_t BOARD_WIFI_TX_POWER_DEFAULT_X10 = 200;
 #define CLUSTER_HW_TIME_CANDIDATE_IN_1 14
 #define CLUSTER_HW_TIME_CANDIDATE_IN_2 21
 #define CLUSTER_HW_TIME_CANDIDATE_IN_3 41
+#if defined(BOARD_DIYMORE_S3CAM)
+// Not released on the diymore board (no test wiring qualified).
+#define CLUSTER_HW_TIME_IN_1 (-1)
+#define CLUSTER_HW_TIME_IN_2 (-1)
+#define CLUSTER_HW_TIME_IN_3 (-1)
+#else
 #define CLUSTER_HW_TIME_IN_1 14
 #define CLUSTER_HW_TIME_IN_2 21
 #define CLUSTER_HW_TIME_IN_3 41
+#endif
 // Freenove diagnostic output candidate: GPIO48 (onboard RGB LED data).
 // This is NOT conflict-free; only use after explicit hardware verification
 // and exclusive control during a future, implemented measurement.
 // The current preparation code does not configure or drive this pin.
+#if defined(BOARD_DIYMORE_S3CAM)
+#define CLUSTER_HW_TIME_OUT (-1)
+#else
 #define CLUSTER_HW_TIME_OUT 48
+#endif
 
 // =============================================================
 // XIAO ESP32S3 SENSE

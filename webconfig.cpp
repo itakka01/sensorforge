@@ -8059,7 +8059,7 @@ static void handlePreview()
         pageInfoButton("Kameramodell", cameraModelInfo) +
         "</div><select id='cameraCfgModel' name='camera'>";
 
-    if (cfg_camera != "OV2640" && cfg_camera != "OV3660") {
+    if (cfg_camera != "OV2640" && cfg_camera != "OV3660" && cfg_camera != "OV5640") {
         html +=
             "<option value='" + htmlEscape(cfg_camera) + "' selected>" +
             htmlEscape(cfg_camera) + " (bisheriger Wert)</option>";
@@ -8068,6 +8068,7 @@ static void handlePreview()
     html +=
         "<option value='OV2640'" + String(cfg_camera == "OV2640" ? " selected" : "") + ">OV2640</option>"
         "<option value='OV3660'" + String(cfg_camera == "OV3660" ? " selected" : "") + ">OV3660</option>"
+        "<option value='OV5640'" + String(cfg_camera == "OV5640" ? " selected" : "") + ">OV5640</option>"
         "</select>"
         "<label for='cameraCfgResolution'>Auflösung</label>"
         "<div><select id='cameraCfgResolution' name='resolution'>";
@@ -12142,9 +12143,9 @@ static void appendSystemOverviewSections(
         systemInfoButton("Speicherreserven", capacityInfo) +
         "</div>";
 
-#if defined(BOARD_FREENOVE)
+#if defined(BOARD_FAMILY_S3_WROOM_CAM)
     html +=
-        "Board: <b>Freenove FNK0085 ESP32-S3 WROOM</b><br>"
+        "Board: <b>" BOARD_DISPLAY_NAME "</b><br>"
         "Storage: <b>SDMMC 1-bit</b><br>";
 #elif defined(BOARD_XIAO)
     html +=
@@ -18835,9 +18836,9 @@ static void handleBoardInfo()
 
     html += "<h2>Board Info</h2>";
 
-#if defined(BOARD_FREENOVE)
+#if defined(BOARD_FAMILY_S3_WROOM_CAM)
 
-    html += "Board: Freenove FNK0085 ESP32-S3 WROOM<br>";
+    html += "Board: " BOARD_DISPLAY_NAME "<br>";
     html += "Storage: SDMMC 1-bit<br>";
 
 #elif defined(BOARD_XIAO)

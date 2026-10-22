@@ -534,6 +534,8 @@ static const char *boardApiName()
     return "xiao_esp32s3_sense";
 #elif defined(BOARD_FREENOVE)
     return "freenove_fnk0085";
+#elif defined(BOARD_DIYMORE_S3CAM)
+    return "diymore_esp32s3_cam";
 #else
     return "esp32s3_unknown";
 #endif

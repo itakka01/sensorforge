@@ -63,7 +63,9 @@ static String makeDefaultHostnameFromBranding()
     return result;
 }
 
-#ifdef BOARD_FREENOVE
+#if defined(BOARD_DIYMORE_S3CAM)
+String cfg_camera = "OV5640";
+#elif defined(BOARD_FREENOVE)
 String cfg_camera = "OV3660";
 #elif defined(BOARD_XIAO)
 String cfg_camera = "OV2640";
@@ -889,7 +891,10 @@ static void setDefaultValues(
 )
 {
 
-#ifdef BOARD_FREENOVE
+#if defined(BOARD_DIYMORE_S3CAM)
+    values.camera =
+        "OV5640";
+#elif defined(BOARD_FREENOVE)
     values.camera =
         "OV3660";
 #elif defined(BOARD_XIAO)
