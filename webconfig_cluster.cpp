@@ -4,6 +4,7 @@
 
 #include "cluster.h"
 #include "cluster_espnow_radio.h"
+#include "cluster_hw_time_meter.h"
 #include "drone_mode.h"
 #include "cluster_profiles.h"
 #include "config.h"
@@ -191,6 +192,39 @@ static String clusterPageHtml()
         "Die laufende Presence, Lease-, LEAVE- und Resource-Metadaten bleiben HMAC-authentifiziert und verändern weder Recording noch Streaming.</p>"
         "</details>";
 
+#if defined(BOARD_FREENOVE)
+    // Passive GPIO meter: works on node or coordinator, uses only the local clock.
+    html += R"__METER__(<details class='settings-section cluster-tech-details' id='sfMeter'><summary>GPIO-Messgerät (passiv)</summary>
+<p class='muted'>Erfasst die steigenden Flanken des optionalen GPIO-Testimpulses mehrerer Kamera-Nodes und berechnet ihre Differenzen ausschließlich mit der lokalen Uhr dieses Geräts. Clusterzeit und ESP-NOW werden dafür nicht verwendet; die Cluster-Rolle spielt keine Rolle. Gemessen wird der Start des aufnehmenden <code>esp_camera_fb_get()</code> auf jedem Node, <strong>nicht</strong> der Belichtungsbeginn. Voraussetzung: Drone Mode auf diesem Gerät. Magnetkontakt, Präsenz und Radar sind während der Messung ausgesetzt (automatischer Stopp nach 2 h).</p>
+<div class='cluster-table-wrap'><table class='cluster-table'><thead><tr><th>Kanal</th><th>Eingang hier</th><th>Vorher abklemmen</th><th>Quelle</th></tr></thead><tbody>
+<tr><td>1</td><td>GPIO14</td><td>Magnetkontakt</td><td>Node A D1/GPIO2 über 1 kΩ, 10 kΩ nach GND</td></tr>
+<tr><td>2</td><td>GPIO21</td><td>Präsenz (OT2/PIR)</td><td>Node B D1/GPIO2 über 1 kΩ, 10 kΩ nach GND</td></tr>
+<tr><td>3</td><td>GPIO41</td><td>Radar OT1 (UART RX)</td><td>optional Node C, sonst nur 10 kΩ nach GND</td></tr>
+</tbody></table></div>
+<p class='muted'>Alle Geräte über eine gemeinsame GND-Leitung verbinden. Nur 3,3-V-Signale. Differenzen zählen nur, wenn beide Kanäle genau eine Flanke im Fenster haben und keine verspätete Flanke auftritt; fehlende, doppelte oder verspätete Flanken machen das Ereignis ungültig.</p>
+)__METER__";
+#if CLUSTER_HW_TIME_IN_1 < 0 || CLUSTER_HW_TIME_IN_2 < 0 || CLUSTER_HW_TIME_IN_3 < 0
+    html += "<p class='muted'><strong>Messeingänge gesperrt:</strong> GPIO14/21/41 müssen nach Prüfung von Pin-Konflikten und Verdrahtung in board_config.h explizit freigegeben werden (CLUSTER_HW_TIME_IN_1..3).</p>";
+#endif
+    html += R"__METER__(<div class='cluster-select-tools'><button type='button' id='sfMeterStart'>Messung starten</button> <button type='button' id='sfMeterStop'>Messung stoppen</button> <a href='/cluster_hw_meter_csv' download='sensorforge_gpio_meter.csv'>CSV herunterladen</a></div>
+<div id='sfMeterState' class='muted' role='status'>Status wird geladen …</div>
+<div class='cluster-table-wrap'><table class='cluster-table'><thead><tr><th>Ereignis</th><th>K1 ms</th><th>K2 ms</th><th>K3 ms</th><th>K1−K2 ms</th><th>K1−K3 ms</th><th>K2−K3 ms</th><th>Flanken</th></tr></thead><tbody id='sfMeterRows'><tr><td colspan='8' class='muted'>Noch keine Ereignisse.</td></tr></tbody></table></div>
+<script>(function(){
+var box=document.getElementById('sfMeter'),st=document.getElementById('sfMeterState'),rows=document.getElementById('sfMeterRows');
+function v(x){return x===null||x===undefined?'–':Number(x).toFixed(3);}
+function esc(t){return String(t).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+function pairText(p,name){return p&&p.n?name+': n='+p.n+' min '+v(p.min_ms)+' / Mittel '+v(p.mean_ms)+' / max '+v(p.max_ms)+' ms':'';}
+function render(d){var pr=Array.isArray(d.pairs)?d.pairs:[];st.textContent=(d.active?'Aktiv':'Inaktiv')+' · Zustand '+d.state+' · Drone Mode '+(d.drone_mode?'an':'aus')+' · Eingänge '+(d.inputs||[]).join('/')+' · Ereignisfenster '+d.window_ms+' ms · Ereignisse '+d.events+' · gültig '+(d.valid_rows||0)+' / ungültig '+(d.invalid_rows||0)+[pairText(pr[0],' · K1−K2'),pairText(pr[1],' · K1−K3'),pairText(pr[2],' · K2−K3')].join('');
+ var s=Array.isArray(d.samples)?d.samples.slice().reverse():[];
+ rows.innerHTML=s.length?s.map(function(r){var multi=!r.valid;return '<tr><td>'+esc(r.n)+'</td><td>'+v(r.ms[0])+'</td><td>'+v(r.ms[1])+'</td><td>'+v(r.ms[2])+'</td><td>'+v(r.pair_ms[0])+'</td><td>'+v(r.pair_ms[1])+'</td><td>'+v(r.pair_ms[2])+'</td><td>'+(multi?'<span class="status-pill warn">':'')+esc((r.rises||[]).join('/'))+(r.late?' +'+esc(r.late)+' spät':'')+(multi?' ungültig</span>':'')+'</td></tr>';}).join(''):'<tr><td colspan="8" class="muted">Noch keine Ereignisse.</td></tr>';}
+function poll(){if(!box.open)return;fetch('/cluster_hw_meter_status',{cache:'no-store',credentials:'same-origin'}).then(function(r){if(!r.ok)throw Error();return r.json();}).then(render).catch(function(){st.textContent='Status nicht abrufbar.';});}
+function post(url){fetch(url,{method:'POST',credentials:'same-origin',cache:'no-store'}).then(function(r){return r.text().then(function(t){st.textContent=t;poll();});}).catch(function(){st.textContent='Anfrage fehlgeschlagen.';});}
+document.getElementById('sfMeterStart').addEventListener('click',function(){post('/cluster_hw_meter_start');});
+document.getElementById('sfMeterStop').addEventListener('click',function(){post('/cluster_hw_meter_stop');});
+box.addEventListener('toggle',poll);setInterval(poll,2000);
+})();</script></details>)__METER__";
+#endif
+
     html += R"__JS__(
 <script>(function(){
 var f=document.getElementById('clusterSettingsForm'),b=document.getElementById('clusterSaveBar'),s=document.getElementById('clusterSaveState'),btn=document.getElementById('clusterSaveButton'),rows=document.getElementById('clusterNodeRows'),resRows=document.getElementById('clusterResourceRows'),line=document.getElementById('clusterRuntimeLine');
@@ -296,6 +330,32 @@ static void handleClusterHwTimeCsv() {
     server.send(200, "text/csv; charset=utf-8", clusterHwTimeCsv());
 }
 
+static void handleClusterHwMeterStart() {
+    String error;
+    if (!ClusterHwTimeMeter::start(error)) {
+        server.send(409, "text/plain; charset=utf-8", error); return;
+    }
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "text/plain; charset=utf-8", "Messgeraet scharf; Flanken werden erfasst.");
+}
+
+static void handleClusterHwMeterStop() {
+    ClusterHwTimeMeter::stop("stopped_by_user");
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "text/plain; charset=utf-8", "Messgeraet gestoppt.");
+}
+
+static void handleClusterHwMeterStatus() {
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json; charset=utf-8", ClusterHwTimeMeter::statusJson());
+}
+
+static void handleClusterHwMeterCsv() {
+    server.sendHeader("Cache-Control", "no-store");
+    server.sendHeader("Content-Disposition", "attachment; filename=sensorforge_gpio_meter.csv");
+    server.send(200, "text/csv; charset=utf-8", ClusterHwTimeMeter::csv());
+}
+
 static void handleClusterStatus()
 {
     clusterDiscoveryTouch();
@@ -369,7 +429,7 @@ window.sfCoordinateStatus=function(force){
 </div>
 <div id='clusterActionHandlers' style='display:none'><button type='button' id='clusterBulkDroneOn'>Drone Mode EIN</button><button type='button' id='clusterBulkDroneOff'>Drone Mode AUS</button><button type='button' id='clusterBulkProbe'>Verbindung testen</button><button type='button' id='clusterBulkRestart'>Neustart</button><button type='button' id='clusterBulkShutdown'>Shutdown</button><button type='button' id='clusterBulkSync'>Zeitsync</button><button type='button' id='clusterBulkWipe'>SD löschen</button></div>
 <dialog id='clusterActionDialog' style='max-width:min(90vw,650px);padding:24px;border-radius:14px'><h3>Cluster-Aktionen</h3><p>Drone Mode hält Nodes passiv bereit: kein automatisches Recording, kein Power Shooter, keine Bewegungserkennung und keine Hintergrund-SD-Recovery. Laufende Aufnahmen werden beim Einschalten kontrolliert beendet. Clusterzeit, geplante Capture-Jobs, Webverwaltung und Temperaturschutz bleiben verfügbar.</p><p>Sammelaktionen werden einzeln und signiert pro Node ausgeführt. Der Coordinator ist nicht auswählbar. Remote-Shutdown benötigt RESET oder Stromversorgung zum Wiederaufwachen.</p><p>HTTP-Annahme bestätigt nicht die Ausführung. Ergebnisse bitte im Status prüfen.</p><button type='button' id='clusterActionDialogClose'>Schließen</button></dialog>
-<div class='cluster-select-tools'><strong>Foto in</strong> <label for='clusterCaptureHours'>Stunden</label> <input id='clusterCaptureHours' type='number' min='0' max='23' step='1' value='0' style='width:4.5em'> <label for='clusterCaptureMinutes'>Minuten</label> <input id='clusterCaptureMinutes' type='number' min='0' max='59' step='1' value='0' style='width:4.5em'> <label for='clusterCaptureSeconds'>Sekunden</label> <input id='clusterCaptureSeconds' type='number' min='0' max='59' step='1' value='5' style='width:4.5em'> <button type='button' id='clusterBulkCapture'>Aufnahme planen</button> <output id='clusterPlannedTime' style='font-variant-numeric:tabular-nums;font-weight:700'>UTC-Zeit wird geladen …</output></div>
+<div class='cluster-select-tools'><strong>Foto in</strong> <label for='clusterCaptureHours'>Stunden</label> <input id='clusterCaptureHours' type='number' min='0' max='23' step='1' value='0' style='width:4.5em'> <label for='clusterCaptureMinutes'>Minuten</label> <input id='clusterCaptureMinutes' type='number' min='0' max='59' step='1' value='0' style='width:4.5em'> <label for='clusterCaptureSeconds'>Sekunden</label> <input id='clusterCaptureSeconds' type='number' min='0' max='59' step='1' value='5' style='width:4.5em'> <label title='Nur XIAO-Nodes mit aktueller Firmware: Impuls an D1/GPIO2 direkt am Start des aufnehmenden fb_get(). Ältere Firmware verwirft solche Aufträge.'><input type='checkbox' id='clusterCaptureTestPulse'> GPIO-Testimpuls (D1)</label> <button type='button' id='clusterBulkCapture'>Aufnahme planen</button> <output id='clusterPlannedTime' style='font-variant-numeric:tabular-nums;font-weight:700'>UTC-Zeit wird geladen …</output></div>
 <!-- Direkte UTC-Eingabe kann später wieder aktiviert werden. sfPlanUtcTarget() akzeptiert dafür einen optionalen UTC-ISO-Termin; aktuell nutzt das Formular ausschließlich relative Zeit. -->
 <div class='cluster-select-tools'><button type='button' id='sfSyncOpen'>Sync-Testbild im Vollbild öffnen</button> <span class='muted'>Beim Capture öffnet sich automatisch ein großes Vollbild-Popup. Countdown und Balken laufen bis 5 s nach dem Auslösezeitpunkt.</span></div>
 <div id='sfSyncScreen' aria-label='Visuelle Synchronisationsanzeige' style='display:none'>
@@ -761,6 +821,7 @@ document.getElementById('clusterBulkCapture').addEventListener('click',async fun
  var galleryCount=document.getElementById('sfCaptureGalleryCount');if(galleryCount)galleryCount.textContent='0';
  var galleryDialog=document.getElementById('sfCaptureGalleryDialog');
  if(galleryDialog&&galleryDialog.open){if(galleryDialog.close)galleryDialog.close();else galleryDialog.removeAttribute('open');}
+ var testPulse=!!(document.getElementById('clusterCaptureTestPulse')||{}).checked;
  var button=this;button.disabled=true;window.sfCoordinatorBulkActive=true;var results=[],accepted=0,shown=false;
  // Use the freshly fetched pre-submit status, not the possibly stale UI poll status.
  // Otherwise an old completed JPEG can be assigned to the next capture report.
@@ -768,7 +829,7 @@ document.getElementById('clusterBulkCapture').addEventListener('click',async fun
  var names=Array.isArray((sfLatestStatus||{}).nodes)?sfLatestStatus.nodes:[];
  sfCaptureReport={target:target,rows:ids.map(function(id){var n=names.find(function(x){return String(x.integration_id)===id;});return {id:id,name:n?(n.hostname||id):id,http:'pending',job:null};})};sfRenderCaptureReport();
  try{for(var i=0;i<ids.length;i++){
-  var fd=new FormData();fd.append('node_id',ids[i]);fd.append('utc_ms',String(Math.round(target)));
+  var fd=new FormData();fd.append('node_id',ids[i]);fd.append('utc_ms',String(Math.round(target)));if(testPulse)fd.append('test_pulse','1');
   var ctrl=new AbortController(),timer=setTimeout(function(){ctrl.abort();},12000);
   try{var r=await fetch('/cluster_node_capture',{method:'POST',body:fd,credentials:'same-origin',redirect:'manual',cache:'no-store',signal:ctrl.signal});
       if(r.ok||r.status===303||r.status===0){accepted++;if(!shown){sfShowCaptureCountdown(target);shown=true;}sfCaptureReport.rows[i].http='accepted';results.push(ids[i]+': HTTP angenommen');}
@@ -776,7 +837,7 @@ document.getElementById('clusterBulkCapture').addEventListener('click',async fun
   catch(e){sfCaptureReport.rows[i].http='error';results.push(ids[i]+': Übertragungsfehler ('+(e.name==='AbortError'?'Zeitlimit':String(e.message||e))+'); Ausführung unbekannt');}
   finally{clearTimeout(timer);sfRenderCaptureReport();}
  }
- out.textContent='UTC '+new Date(target).toISOString()+' · '+accepted+'/'+ids.length+' HTTP angenommen. '+results.join(' | ')+'. Die grüne Anzeige kennzeichnet nur den geplanten Zeitpunkt; Capture-Ergebnisse stehen in der Node-Tabelle.';
+ out.textContent='UTC '+new Date(target).toISOString()+' · '+accepted+'/'+ids.length+' HTTP angenommen'+(testPulse?' · mit GPIO-Testimpuls':'')+'. '+results.join(' | ')+'. Die grüne Anzeige kennzeichnet nur den geplanten Zeitpunkt; Capture-Ergebnisse stehen in der Node-Tabelle.';
  if(accepted&&!shown)sfShowCaptureCountdown(target);
  }finally{window.sfCoordinatorBulkActive=false;button.disabled=false;sfRenderCaptureReport();window.sfCoordinateStatus().then(function(d){window.sfCaptureReportUpdate(d);}).catch(function(){});}
 });
@@ -1333,7 +1394,8 @@ static void handleClusterNodeCapture(){
     if(errno||!end||*end||ms<1600000000000LL||ms>4102444800000LL){server.send(400,"text/plain","Ungültige UTC-Zeit");return;}
     String error;
     ClusterEspNowRadio::pauseForCapture(10000UL);
-    if(!clusterRequestNodeCapture(server.arg("node_id"),(int64_t)ms*1000LL,error)){
+    const bool testPulse=server.arg("test_pulse")=="1";  // optional, default off
+    if(!clusterRequestNodeCapture(server.arg("node_id"),(int64_t)ms*1000LL,error,testPulse)){
         server.send(409,"text/plain; charset=utf-8",error);return;
     }
     server.sendHeader("Location","/cluster_coordinate");server.send(303,"text/plain","");
@@ -1639,6 +1701,10 @@ void webconfigClusterRegisterRoutes(
     serverInstance.on("/cluster_hw_time_start", HTTP_POST, handleClusterHwTimeStart);
     serverInstance.on("/cluster_hw_time_status", HTTP_GET, handleClusterHwTimeStatus);
     serverInstance.on("/cluster_hw_time_csv", HTTP_GET, handleClusterHwTimeCsv);
+    serverInstance.on("/cluster_hw_meter_start", HTTP_POST, handleClusterHwMeterStart);
+    serverInstance.on("/cluster_hw_meter_stop", HTTP_POST, handleClusterHwMeterStop);
+    serverInstance.on("/cluster_hw_meter_status", HTTP_GET, handleClusterHwMeterStatus);
+    serverInstance.on("/cluster_hw_meter_csv", HTTP_GET, handleClusterHwMeterCsv);
     serverInstance.on("/cluster_save", HTTP_POST, handleClusterSave);
     serverInstance.on("/cluster_coordinate", HTTP_GET, handleClusterCoordinatePage);
     serverInstance.on("/cluster_sync_time", HTTP_POST, handleClusterSyncTime);

@@ -24,8 +24,8 @@ static constexpr int16_t SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10 = 85;
 // BOARD AUSWÄHLEN
 // =============================================================
 
-#define BOARD_FREENOVE
-//#define BOARD_XIAO
+//#define BOARD_FREENOVE
+#define BOARD_XIAO
 
 
 #if defined(BOARD_FREENOVE) && defined(BOARD_XIAO)
@@ -47,8 +47,8 @@ static constexpr int16_t SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10 = 85;
 #define BOARD_HAS_ESP_NOW 1
 
 // Board function releases (WebConfig presentation only, no runtime limits).
-// COORDINATOR / TIME_BROADCASTER stay 1 until the running hardware test is
-// evaluated; GPS_TRACKER is a provisional release (no GPS mode exists yet).
+// FNK0085 runs as a normal node: COORDINATOR / TIME_BROADCASTER not released.
+// GPS_TRACKER is a provisional release (no GPS mode exists yet).
 #define BOARD_SUPPORTS_COORDINATOR      0
 #define BOARD_SUPPORTS_TIME_BROADCASTER 0
 #define BOARD_SUPPORTS_CLUSTER_NODE     1
@@ -155,18 +155,23 @@ static constexpr size_t BOARD_WIFI_TX_POWER_LEVEL_COUNT =
 static constexpr int16_t BOARD_WIFI_TX_POWER_DEFAULT_X10 = 200;
 
 
-// Three provisional FNK0085 measurement input candidates for a dedicated test
-// setup: GPIO14 (magnet), GPIO21 (presence) and GPIO41 (radar UART RX).
-// ALL THREE conflict with existing SensorForge functions! They must remain
-// NONE until the measurement implementation can take exclusive ownership,
-// restore the pins afterwards, and verify physical wiring. No GPIO is touched.
+// Three FNK0085 measurement inputs for the dedicated GPIO meter test setup:
+// GPIO14 (magnet), GPIO21 (presence) and GPIO41 (radar UART RX).
+// ALL THREE are shared with existing SensorForge functions. Released for the
+// passive GPIO meter / HW-time session only, which take them exclusively via
+// ClusterHwTimeGpioLease: explicit start, Drone Mode only (no sleep, no motion
+// or recorder branches), radar UART ended, presence sampling suspended, refused
+// while RTC presence sampling owns GPIO21; magnet/presence/radar are restored
+// on stop. Without an explicit start no pin is touched. Test wiring: magnet,
+// presence and radar OT1 physically disconnected, 1 kOhm series resistor from
+// each node output, 10 kOhm pull-down to GND on each input, common GND.
 // GPIO35/36/37 are unavailable with OPI PSRAM; 38/39/40 are SD_MMC.
 #define CLUSTER_HW_TIME_CANDIDATE_IN_1 14
 #define CLUSTER_HW_TIME_CANDIDATE_IN_2 21
 #define CLUSTER_HW_TIME_CANDIDATE_IN_3 41
-#define CLUSTER_HW_TIME_IN_1 (-1)
-#define CLUSTER_HW_TIME_IN_2 (-1)
-#define CLUSTER_HW_TIME_IN_3 (-1)
+#define CLUSTER_HW_TIME_IN_1 14
+#define CLUSTER_HW_TIME_IN_2 21
+#define CLUSTER_HW_TIME_IN_3 41
 // Freenove diagnostic output candidate: GPIO48 (onboard RGB LED data).
 // This is NOT conflict-free; only use after explicit hardware verification
 // and exclusive control during a future, implemented measurement.

@@ -8,8 +8,9 @@ struct Channel {
     int pin;
     volatile int64_t firstRiseUs;
     volatile bool received;
+    volatile uint32_t rises;
 };
-Channel channels[3] = {{-1, 0, false}, {-1, 0, false}, {-1, 0, false}};
+Channel channels[3] = {{-1, 0, false, 0}, {-1, 0, false, 0}, {-1, 0, false, 0}};
 bool armed = false;
 
 void IRAM_ATTR onRise(void *arg) {
@@ -17,6 +18,7 @@ void IRAM_ATTR onRise(void *arg) {
     // Time stamp as close as possible to the ISR entry. Not hardware capture.
     const int64_t nowUs = esp_timer_get_time();
     portENTER_CRITICAL_ISR(&lock);
+    ++c->rises;
     if (!c->received) {
         c->firstRiseUs = nowUs;
         c->received = true;
@@ -44,6 +46,7 @@ bool begin(const int pins[3], bool droneConfirmed, bool exclusivePinsReleased) {
         channels[i].pin = pins[i];
         channels[i].firstRiseUs = 0;
         channels[i].received = false;
+        channels[i].rises = 0;
         pinMode(pins[i], INPUT);
     }
     // Caller guarantees that the input sources are not already driving high
@@ -59,6 +62,20 @@ void snapshot(Edges &out) {
     for (int i = 0; i < 3; ++i) {
         out.firstRiseUs[i] = channels[i].firstRiseUs;
         out.received[i] = channels[i].received;
+        out.rises[i] = channels[i].rises;
+    }
+    portEXIT_CRITICAL(&lock);
+}
+
+void takeAndRearm(Edges &out) {
+    portENTER_CRITICAL(&lock);
+    for (int i = 0; i < 3; ++i) {
+        out.firstRiseUs[i] = channels[i].firstRiseUs;
+        out.received[i] = channels[i].received;
+        out.rises[i] = channels[i].rises;
+        channels[i].firstRiseUs = 0;
+        channels[i].received = false;
+        channels[i].rises = 0;
     }
     portEXIT_CRITICAL(&lock);
 }

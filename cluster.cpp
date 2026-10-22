@@ -7,6 +7,8 @@
 #include "cluster_hw_time_protocol.h"
 #include "cluster_hw_time_gpio_lease.h"
 #include "cluster_hw_time_series.h"
+#include "cluster_hw_time_meter.h"
+#include "cluster_capture_options.h"
 #include "cluster_capture.h"
 #include "drone_mode.h"
 #include "webconfig.h"
@@ -126,8 +128,11 @@ struct PendingCapture {
     int64_t anchorUtcUs=0,anchorMonoUs=0,deadlineMonoUs=0;
     // Beta131-FIX (Eighth cycle, Problem 2): Track time source generation
     uint32_t sourceGeneration=0;  // Detects source changes even within same epoch
+    bool testPulse=false;  // SFJC1 option "tp1": GPIO marker in the capture path
 };
 static PendingCapture pendingCapture;
+// Local diagnostic state of the optional capture test pulse (status JSON only).
+static const char *captureTestPulseState="off";
 bool clusterCaptureArmedFlag=false;
 // Coordinator protection extends from first dispatched shot until 5 s after its deadline.
 static uint32_t coordinatorCaptureGuardUntilMs=0;
@@ -3021,7 +3026,8 @@ static void processHwTimeAck(char **f,size_t n,const IPAddress &ip) {
                   status==1 ? "ARMED" : "NOT ARMED");
 }
 static void processJobCapture(char **f,size_t n,const IPAddress &ip) {
-    if(n!=9 || !runtimeActive || localIsCoordinator || strcmp(f[1],runtimeClusterTag)!=0 ||
+    bool testPulse=false;
+    if(!ClusterCaptureOptions::parse(n,f,testPulse) || !runtimeActive || localIsCoordinator || strcmp(f[1],runtimeClusterTag)!=0 ||
        strcmp(f[2],currentCoordinatorId)!=0 || strcmp(f[5],deviceIntegrationId().c_str())!=0 ||
        ip!=currentCoordinatorIp)return;
     uint32_t cb=0,epoch=0,nb=0,seq=0;
@@ -3054,7 +3060,8 @@ static void processJobCapture(char **f,size_t n,const IPAddress &ip) {
     // CRITICAL: Capture must detect source changes even within same epoch
     pendingCapture={true,cb,epoch,seq,utc,nowUtc,acceptedMonoUs,
                     acceptedMonoUs+remainingUs,
-                    ClusterEspNowRadio::timeSourceGeneration()};
+                    ClusterEspNowRadio::timeSourceGeneration(),testPulse};
+    captureTestPulseState=testPulse?"requested":"off";
     sendCaptureResult(cb,epoch,seq,1,0,0);
 }
 static void processJobCaptureResult(char **f,size_t n,const IPAddress &ip) {
@@ -3102,6 +3109,12 @@ static void processJobCaptureResult(char **f,size_t n,const IPAddress &ip) {
                   after->resultCode==(uint16_t)error)))
         sendCaptureReceipt(cb,epoch,seq,nb,(uint16_t)status,ip);
 }
+// Returns GPIO2 after the shot or on any abort; no-op when nothing was prepared.
+static void releaseCaptureTestPulse(const char *state){
+    if(!clusterCapturePulsePrepared())return;
+    clusterCapturePulseRelease();
+    captureTestPulseState=state;
+}
 // Called by clusterLoop during regular firmware main loop. Future high precision
 // backends must replace the dispatch mechanism, not the shared UTC contract.
 static void serviceScheduledCapture(){
@@ -3117,6 +3130,7 @@ static void serviceScheduledCapture(){
         PendingCapture p=pendingCapture;
         pendingCapture.active=false;
         clusterCaptureArmedFlag=false;
+        releaseCaptureTestPulse("aborted");
         queueCaptureTerminalResult(p.cb,p.epoch,p.seq,3,2,0);  // Aborted due to source change
         return;
     }
@@ -3128,6 +3142,7 @@ static void serviceScheduledCapture(){
         PendingCapture p=pendingCapture;
         pendingCapture.active=false;
         clusterCaptureArmedFlag=false;
+        releaseCaptureTestPulse("aborted");
         queueCaptureTerminalResult(p.cb,p.epoch,p.seq,3,2,0);  // Aborted due to source change
         return;
     }
@@ -3145,13 +3160,23 @@ static void serviceScheduledCapture(){
                 queueCaptureTerminalResult(p.cb,p.epoch,p.seq,3,1,0);return;
             }
             clusterCaptureArmedFlag=true;
+            // Configure the test-pulse output now, outside the time-critical
+            // dispatch. A refused pin never blocks the shot itself.
+            if(pendingCapture.testPulse){
+                const char *reason="";
+                captureTestPulseState=clusterCapturePulsePrepare(reason)?"prepared":reason;
+            }
         }
         return;
     }
     PendingCapture p=pendingCapture;pendingCapture.active=false;
     uint32_t bytes=0;int64_t dispatch=0;
     uint16_t rc=clusterCapturePhoto(((uint64_t)p.cb<<32)|p.seq,p.utc,dispatch,bytes,
-                                    p.anchorUtcUs,p.anchorMonoUs);
+                                    p.anchorUtcUs,p.anchorMonoUs,
+                                    p.testPulse&&clusterCapturePulsePrepared());
+    if(p.testPulse&&!clusterCapturePulsePrepared()&&!strcmp(captureTestPulseState,"requested"))
+        captureTestPulseState="not_prepared";  // arming step was never reached
+    releaseCaptureTestPulse(clusterCapturePulseEmitted()?"emitted":"not_emitted");
     captureLastDispatchOffsetUs=dispatch?dispatch-p.utc:0;
     captureLastSize=bytes;captureLastError=rc;
     clusterCaptureArmedFlag=false;
@@ -3943,6 +3968,7 @@ void clusterNetworkStop()
     hwTimeSessionFinish("network_stopped", false);
     // A deliberate cluster lifecycle stop cancels the pending local dispatch.
     // Keep already produced PSRAM media until a new accepted capture job.
+    releaseCaptureTestPulse("aborted");
     pendingCapture = PendingCapture{};
     captureResultRetry = CaptureResultRetry{};
     clusterCaptureArmedFlag = false;
@@ -4131,6 +4157,8 @@ void clusterLoop()
         }
     }
     hwTimeSessionService();
+    // Passive GPIO meter: role independent, also without cluster runtime.
+    ClusterHwTimeMeter::service();
     // Never keep a measurement output scheduled after Drone Mode has ended.
     if (clusterHwTimePulseActive() && (!runtimeActive || localIsCoordinator ||
         !droneModeEnabled())) clusterHwTimePulseCancel();
@@ -4651,7 +4679,7 @@ String clusterHwTimeStatusJson() {
     return json;
 }
 
-bool clusterRequestNodeCapture(const String &nodeId,int64_t utcUs,String &error){
+bool clusterRequestNodeCapture(const String &nodeId,int64_t utcUs,String &error,bool testPulse){
     if(!clusterLocalIsCoordinator()){error="Nur am Coordinator.";return false;}
     int64_t nowUtc=0;
     if(!clusterTimeNowUs(nowUtc)||utcUs-nowUtc<2000000LL||utcUs-nowUtc>1800000000LL){
@@ -4681,7 +4709,9 @@ bool clusterRequestNodeCapture(const String &nodeId,int64_t utcUs,String &error)
         static_cast<uint32_t>((utcUs - nowUtc) / 1000LL) + 5000UL);
     const String cmd=String(CLUSTER_JOB_CAPTURE_MAGIC)+"|"+runtimeClusterTag+"|"+
         deviceIntegrationId()+"|"+cb+"|"+String((unsigned long)currentCoordinatorEpoch)+
-        "|"+nodeId+"|"+nb+"|"+String((unsigned long)probeSeq)+"|"+when;
+        "|"+nodeId+"|"+nb+"|"+String((unsigned long)probeSeq)+"|"+when+
+        // Optional 10th field only on explicit request; default packet unchanged.
+        (testPulse?String("|")+ClusterCaptureOptions::kTestPulseToken:String());
     ClusterJobs::transition(id,currentCoordinatorEpoch,ClusterJobs::State::Sent,millis());
     if(!sendSignedPayloadTo(cmd,peer->ip,CLUSTER_COORDINATOR_PORT,"scheduled photo")){
         ClusterJobs::transition(id,currentCoordinatorEpoch,ClusterJobs::State::Failed,millis(),1);
@@ -5487,6 +5517,7 @@ String clusterStatusJson()
     json += ",\"completed\":"+String((unsigned long)captureCompleted);
     json += ",\"failed\":"+String((unsigned long)captureFailed);
     json += ",\"local_pending\":"+String(pendingCapture.active?"true":"false");
+    json += ",\"local_test_pulse\":\""+String(captureTestPulseState)+"\"";
     json += ",\"result_retry_pending\":"+String(captureResultRetry.active?"true":"false");
     json += ",\"result_retry_attempts\":"+String((unsigned)captureResultRetry.attempts);
     json += ",\"result_retransmissions\":"+String((unsigned long)captureResultRetrySent);

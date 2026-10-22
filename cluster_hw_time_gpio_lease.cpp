@@ -72,10 +72,20 @@ void release() {
 
 bool active() { return held; }
 
+void takeAndRearm(ClusterHwTimeCapture::Edges &out) {
+    for (int i = 0; i < 3; ++i) {
+        out.firstRiseUs[i] = 0;
+        out.received[i] = false;
+        out.rises[i] = 0;
+    }
+    if (held) ClusterHwTimeCapture::takeAndRearm(out);
+}
+
 void snapshot(ClusterHwTimeCapture::Edges &out) {
     for (int i = 0; i < 3; ++i) {
         out.firstRiseUs[i] = 0;
         out.received[i] = false;
+        out.rises[i] = 0;
     }
     if (held) ClusterHwTimeCapture::snapshot(out);
 }
