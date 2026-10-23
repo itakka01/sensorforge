@@ -171,6 +171,13 @@ extern String cfg_cluster_name;        // logical cluster name, 1..63 chars when
 extern uint32_t cfg_cluster_credential_epoch; // public credential generation; increments on password rotation
 extern String cfg_cluster_password;    // 8..63 chars when enabled; never advertised
 extern String cfg_cluster_coordinator_policy; // "auto", "preferred" or "node"; default auto
+// Optional mount metadata of this node (display/selection only; never used
+// for election, time sync or capture timing). Missing values are allowed.
+extern String cfg_group_id;                   // "" or e.g. "G03"
+extern String cfg_mount_position;             // "" or e.g. "P02"
+extern int32_t cfg_height_mm;                 // -1 = unknown
+extern int32_t cfg_orientation_horizontal_deci; // tenths of a degree, default 0
+extern int32_t cfg_orientation_vertical_deci;   // tenths of a degree, default 0
 
 // Hotspot / access point
 extern int cfg_hotspot_enabled;       // 1 = local AP, 0 = configured infrastructure WiFi (STA)
@@ -468,6 +475,19 @@ ConfigSaveResult configSaveClusterSettings(
     const String &coordinatorPolicy,
     bool writeToSd,
     String &error
+);
+
+// Persist only the optional mount metadata keys (strict validation). Applied
+// immediately at runtime; no reboot and no cluster restart required.
+ConfigSaveResult configSaveClusterMount(
+    const String &groupId,
+    const String &mountPosition,
+    const String &heightMm,
+    const String &orientationHorizontalDeg,
+    const String &orientationVerticalDeg,
+    bool writeToSd,
+    String &error,
+    bool *changed = nullptr
 );
 
 ConfigSaveResult configSaveWifiSettings(

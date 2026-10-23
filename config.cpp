@@ -4,6 +4,7 @@
 #include "image_motion.h"
 #include "branding.h"
 #include "camera_select.h"
+#include "cluster_group_logic.h"
 
 #include <FS.h>
 #include <LittleFS.h>
@@ -190,6 +191,11 @@ String cfg_cluster_name = "";
 uint32_t cfg_cluster_credential_epoch = 1;
 String cfg_cluster_password = "";
 String cfg_cluster_coordinator_policy = "auto";
+String cfg_group_id = "";
+String cfg_mount_position = "";
+int32_t cfg_height_mm = -1;
+int32_t cfg_orientation_horizontal_deci = 0;
+int32_t cfg_orientation_vertical_deci = 0;
 
 int cfg_hotspot_enabled = 1;
 int cfg_hotspot_fallback_enabled = 1;
@@ -621,6 +627,14 @@ static bool configClusterIdValid(const String &id)
 }
 
 
+struct MountConfigValues {
+    String groupId;
+    String mountPosition;
+    int32_t heightMm = -1;
+    int32_t orientationHorizontalDeci = 0;
+    int32_t orientationVerticalDeci = 0;
+};
+
 struct ConfigValues {
     String camera;
     String resolution;
@@ -732,6 +746,8 @@ struct ConfigValues {
     uint32_t clusterCredentialEpoch;
     String clusterPassword;
     String clusterCoordinatorPolicy;
+    // Optional mount metadata; invalid text falls back to defaults.
+    MountConfigValues mount;
 
     int hotspotEnabled;
     int hotspotFallbackEnabled;
@@ -1187,6 +1203,8 @@ static void setDefaultValues(
     values.clusterCoordinatorPolicy =
         "auto";
 
+    values.mount = MountConfigValues();
+
     values.hotspotEnabled =
         1;
 
@@ -1370,6 +1388,16 @@ static bool serializeConfigValues(
     APPEND_CONFIG_VALUE("cluster_credential_epoch", String((unsigned long)values.clusterCredentialEpoch));
     APPEND_CONFIG_VALUE("cluster_password", values.clusterPassword);
     APPEND_CONFIG_VALUE("cluster_coordinator_policy", values.clusterCoordinatorPolicy);
+    {
+        char deci[16];
+        APPEND_CONFIG_VALUE("group_id", values.mount.groupId);
+        APPEND_CONFIG_VALUE("mount_position", values.mount.mountPosition);
+        APPEND_CONFIG_VALUE("height_mm", values.mount.heightMm >= 0 ? String((long)values.mount.heightMm) : String(""));
+        ClusterGroups::formatDeci(values.mount.orientationHorizontalDeci, deci);
+        APPEND_CONFIG_VALUE("orientation_horizontal_deg", String(deci));
+        ClusterGroups::formatDeci(values.mount.orientationVerticalDeci, deci);
+        APPEND_CONFIG_VALUE("orientation_vertical_deg", String(deci));
+    }
 
     APPEND_CONFIG_VALUE("hotspot_enabled", String(values.hotspotEnabled));
     APPEND_CONFIG_VALUE("hotspot_fallback_enabled", String(values.hotspotFallbackEnabled));
@@ -3465,6 +3493,41 @@ static bool validateValues(
 }
 
 
+// Optional node mount metadata (group/position/height/orientation).
+// Returns false for invalid text; the caller keeps the default value.
+static bool parseMountConfigValue(
+    const String &key,
+    const String &value,
+    MountConfigValues &values
+)
+{
+    if (key == "group_id" || key == "mount_position") {
+        char id[ClusterGroups::kIdMaxLen + 1];
+        if (!ClusterGroups::normalizeId(value.c_str(), id))
+            return false;
+        (key == "group_id" ? values.groupId : values.mountPosition) = String(id);
+        return true;
+    }
+
+    int32_t parsed = ClusterGroups::kUnset;
+    if (key == "height_mm") {
+        if (!ClusterGroups::parseOptionalInt(value.c_str(), ClusterGroups::kHeightMaxMm, true, parsed))
+            return false;
+        values.heightMm = parsed == ClusterGroups::kUnset ? -1 : parsed;
+        return true;
+    }
+
+    const bool horizontal = key == "orientation_horizontal_deg";
+    const int32_t limit = horizontal ? ClusterGroups::kOrientHMaxDeci : ClusterGroups::kOrientVMaxDeci;
+    if (!ClusterGroups::parseDeci(value.c_str(), -limit, limit, true, parsed))
+        return false;
+    if (parsed == ClusterGroups::kUnset)
+        parsed = 0;
+    (horizontal ? values.orientationHorizontalDeci : values.orientationVerticalDeci) = parsed;
+    return true;
+}
+
+
 // =============================================================
 // PARSE COMPLETE CONFIG TEXT
 // =============================================================
@@ -5243,6 +5306,17 @@ static bool parseConfigText(
                 values.logFile =
                     value;
 
+            } else if (
+                key == "group_id" || key == "mount_position" ||
+                key == "height_mm" || key == "orientation_horizontal_deg" ||
+                key == "orientation_vertical_deg"
+            ) {
+
+                // Optional mount metadata must never invalidate the whole
+                // config: bad values fall back to the defaults.
+                if (!parseMountConfigValue(key, value, values.mount))
+                    Serial.println("Config: ignored invalid " + key);
+
             } else {
 
                 // Unknown keys are ignored intentionally.
@@ -5704,6 +5778,12 @@ static void applyValues(
 
     cfg_cluster_coordinator_policy =
         values.clusterCoordinatorPolicy;
+
+    cfg_group_id = values.mount.groupId;
+    cfg_mount_position = values.mount.mountPosition;
+    cfg_height_mm = values.mount.heightMm;
+    cfg_orientation_horizontal_deci = values.mount.orientationHorizontalDeci;
+    cfg_orientation_vertical_deci = values.mount.orientationVerticalDeci;
 
     cfg_hotspot_enabled =
         values.hotspotEnabled;
@@ -9148,6 +9228,106 @@ ConfigSaveResult configSaveClusterSettings(
         cfg_cluster_credential_epoch = credentialEpoch;
         cfg_cluster_password = clusterPassword;
         cfg_cluster_coordinator_policy = normalizedCoordinatorPolicy;
+    }
+
+    return result;
+}
+
+ConfigSaveResult configSaveClusterMount(
+    const String &groupId,
+    const String &mountPosition,
+    const String &heightMm,
+    const String &orientationHorizontalDeg,
+    const String &orientationVerticalDeg,
+    bool writeToSd,
+    String &error,
+    bool *changed
+)
+{
+    error = "";
+    if (changed)
+        *changed = false;
+
+    // Parse into a scratch copy with the same rules as config.txt loading,
+    // but reject invalid input here instead of silently dropping it.
+    MountConfigValues parsed;
+    if (!parseMountConfigValue("group_id", groupId, parsed)) {
+        error = "group_id: max. 15 Zeichen A-Z, 0-9, _ . - (erstes Zeichen Buchstabe/Ziffer)";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+    if (!parseMountConfigValue("mount_position", mountPosition, parsed)) {
+        error = "mount_position: max. 15 Zeichen A-Z, 0-9, _ . - (erstes Zeichen Buchstabe/Ziffer)";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+    if (!parseMountConfigValue("height_mm", heightMm, parsed)) {
+        error = "height_mm: leer oder ganze Millimeter 0..100000";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+    if (!parseMountConfigValue("orientation_horizontal_deg", orientationHorizontalDeg, parsed)) {
+        error = "orientation_horizontal_deg: -180..180";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+    if (!parseMountConfigValue("orientation_vertical_deg", orientationVerticalDeg, parsed)) {
+        error = "orientation_vertical_deg: -90..90";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    // Unchanged values: nothing to write (avoids a needless flash write when
+    // the mount fields are submitted together with the cluster settings).
+    if (
+        parsed.groupId == cfg_group_id &&
+        parsed.mountPosition == cfg_mount_position &&
+        parsed.heightMm == cfg_height_mm &&
+        parsed.orientationHorizontalDeci == cfg_orientation_horizontal_deci &&
+        parsed.orientationVerticalDeci == cfg_orientation_vertical_deci
+    ) {
+        return CONFIG_SAVE_INTERNAL_ONLY;
+    }
+
+    String text;
+    bool sourceRead = false;
+    if (activeConfigSource == CONFIG_SOURCE_SD && sdAvailableState && STORAGE.exists("/config.txt"))
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    if (!sourceRead && internalAvailableState && LittleFS.exists("/config.txt"))
+        sourceRead = readTextFile(LittleFS, "/config.txt", text);
+    if (!sourceRead && sdAvailableState && STORAGE.exists("/config.txt"))
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+
+    if (!sourceRead) {
+        error = "no persistent config.txt available for mount settings save";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    char horizontal[16];
+    char vertical[16];
+    ClusterGroups::formatDeci(parsed.orientationHorizontalDeci, horizontal);
+    ClusterGroups::formatDeci(parsed.orientationVerticalDeci, vertical);
+    if (
+        !replaceOrAppendConfigKey(text, "group_id", parsed.groupId) ||
+        !replaceOrAppendConfigKey(text, "mount_position", parsed.mountPosition) ||
+        !replaceOrAppendConfigKey(text, "height_mm", parsed.heightMm >= 0 ? String((long)parsed.heightMm) : String("")) ||
+        !replaceOrAppendConfigKey(text, "orientation_horizontal_deg", String(horizontal)) ||
+        !replaceOrAppendConfigKey(text, "orientation_vertical_deg", String(vertical))
+    ) {
+        error = "could not patch mount setting keys";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String validationError;
+    if (!configValidateText(text, validationError)) {
+        error = "patched config invalid: " + validationError;
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    ConfigSaveResult result = configSaveText(text, writeToSd, error);
+    if (result == CONFIG_SAVE_BOTH || result == CONFIG_SAVE_INTERNAL_ONLY) {
+        if (changed)
+            *changed = true;
+        cfg_group_id = parsed.groupId;
+        cfg_mount_position = parsed.mountPosition;
+        cfg_height_mm = parsed.heightMm;
+        cfg_orientation_horizontal_deci = parsed.orientationHorizontalDeci;
+        cfg_orientation_vertical_deci = parsed.orientationVerticalDeci;
     }
 
     return result;

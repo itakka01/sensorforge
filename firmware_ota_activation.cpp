@@ -5,6 +5,7 @@
 #include <esp_ota_ops.h>
 #include <string.h>
 #include <Preferences.h>
+#include <nvs.h>
 
 namespace {
 constexpr const char *kBootNamespace = "sfota_boot";
@@ -60,9 +61,20 @@ void reportStableBootOnce() {
   if (attempted && static_cast<uint32_t>(now - lastAttemptMs) < 10000UL) return;
   attempted = true;
   lastAttemptMs = now;
+  // The namespace only exists after an OTA update was staged. Missing means
+  // "nothing pending" (every USB-flashed device), not a read error.
+  nvs_handle_t probe = 0;
+  const esp_err_t probeErr = nvs_open(kBootNamespace, NVS_READONLY, &probe);
+  if (probeErr == ESP_ERR_NVS_NOT_FOUND) { completed = true; return; }
+  if (probeErr == ESP_OK) nvs_close(probe);
   Preferences prefs;
-  if (!prefs.begin(kBootNamespace, true)) {
-    Serial.println("[OTA] Bootstatus derzeit nicht lesbar; Pruefung wird wiederholt.");
+  if (probeErr != ESP_OK || !prefs.begin(kBootNamespace, true)) {
+    // Real read error: keep retrying, but report it only once per boot.
+    static bool reported = false;
+    if (!reported) {
+      reported = true;
+      Serial.println("[OTA] Bootstatus derzeit nicht lesbar; Pruefung wird alle 10 s wiederholt.");
+    }
     return;
   }
   const bool pending = prefs.getBool(kPendingKey, false);

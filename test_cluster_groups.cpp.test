@@ -1,0 +1,188 @@
+// Host test: cluster_group_logic.h (mount metadata, group records, lapses).
+//   g++ -std=c++17 -Wall -Wextra -I. -x c++ test_cluster_groups.cpp.test -o /tmp/test_cluster_groups
+//   /tmp/test_cluster_groups
+#include <stdio.h>
+#include <string.h>
+#include <vector>
+#include "cluster_group_logic.h"
+
+using namespace ClusterGroups;
+
+static int g_failures = 0;
+#define CHECK(cond, msg) do { if (cond) printf("  PASS %s\n", msg); \
+    else { printf("  FAIL %s (line %d)\n", msg, __LINE__); ++g_failures; } } while (0)
+
+int main() {
+    char id[kIdMaxLen + 1];
+    printf("== normalizeId\n");
+    CHECK(normalizeId("  g03 ", id) && strcmp(id, "G03") == 0, "trim + uppercase");
+    CHECK(normalizeId("", id) && id[0] == 0, "empty is valid (optional)");
+    CHECK(normalizeId(nullptr, id) && id[0] == 0, "null is empty");
+    CHECK(normalizeId("A-1_b.2", id) && strcmp(id, "A-1_B.2") == 0, "allowed separators");
+    CHECK(!normalizeId("-G03", id), "separator as first char rejected");
+    CHECK(!normalizeId("G 03", id), "inner space rejected");
+    CHECK(!normalizeId("G|03", id), "packet separator rejected");
+    CHECK(!normalizeId("G\"03", id), "quote rejected (JSON/HTML safe)");
+    CHECK(normalizeId("ABCDEFGHIJKLMNO", id), "15 chars accepted");
+    CHECK(!normalizeId("ABCDEFGHIJKLMNOP", id), "16 chars rejected");
+
+    printf("== parseDeci / parseOptionalInt / formatDeci\n");
+    int32_t v = 0;
+    CHECK(parseDeci("12.5", -1800, 1800, true, v) && v == 125, "12.5 -> 125");
+    CHECK(parseDeci("-7,25", -1800, 1800, true, v) && v == -73, "-7,25 -> -73 (comma, rounded away from zero)");
+    CHECK(parseDeci("0.04", -1800, 1800, true, v) && v == 0, "0.04 -> 0");
+    CHECK(parseDeci("", -1800, 1800, true, v) && v == kUnset, "empty -> unset");
+    CHECK(!parseDeci("", -1800, 1800, false, v), "empty rejected when required");
+    CHECK(!parseDeci("180.1", -1800, 1800, true, v), "above range rejected");
+    CHECK(!parseDeci("abc", -1800, 1800, true, v), "text rejected");
+    CHECK(!parseDeci("1.", -1800, 1800, true, v), "dangling decimal point rejected");
+    CHECK(!parseDeci("1e3", -1800, 1800, true, v), "exponent rejected");
+    CHECK(parseOptionalInt("1500", kHeightMaxMm, true, v) && v == 1500, "height 1500");
+    CHECK(!parseOptionalInt("1500.5", kHeightMaxMm, true, v), "fractional mm rejected");
+    CHECK(!parseOptionalInt("-1", kHeightMaxMm, true, v), "negative height rejected");
+    CHECK(parseOptionalInt(" ", kHeightMaxMm, true, v) && v == kUnset, "blank height -> unset");
+    char t[16];
+    formatDeci(125, t);  CHECK(strcmp(t, "12.5") == 0, "format 12.5");
+    formatDeci(-5, t);   CHECK(strcmp(t, "-0.5") == 0, "format -0.5");
+    formatDeci(-1800, t); CHECK(strcmp(t, "-180") == 0, "format -180");
+    formatDeci(0, t);    CHECK(strcmp(t, "0") == 0, "format 0");
+    formatDeci(kUnset, t); CHECK(t[0] == 0, "format unset -> empty");
+    bool roundTrip = true;
+    for (int32_t d = -1800; d <= 1800; ++d) {
+        formatDeci(d, t);
+        int32_t back = 0;
+        roundTrip = roundTrip && parseDeci(t, -1800, 1800, false, back) && back == d;
+    }
+    CHECK(roundTrip, "format/parse round trip -180.0..180.0");
+
+    printf("== packet fields\n");
+    Mount m;
+    char g[kIdMaxLen + 1], p[kIdMaxLen + 1];
+    encodeId("", g); CHECK(strcmp(g, "-") == 0, "empty id encoded as '-'");
+    CHECK(decodeMountFields("G03", "P02", "1500", "125", "-30", m) &&
+          strcmp(m.group, "G03") == 0 && strcmp(m.position, "P02") == 0 &&
+          m.heightMm == 1500 && m.orientHDeci == 125 && m.orientVDeci == -30, "full mount decoded");
+    CHECK(decodeMountFields("-", "-", "-1", "0", "0", m) && !m.group[0] && !m.position[0] &&
+          m.heightMm == kUnset, "empty mount decoded");
+    CHECK(!decodeMountFields("g03", "P02", "1", "0", "0", m), "non-canonical id rejected");
+    CHECK(!decodeMountFields("G03", "P02", "1", "1801", "0", m), "h out of range rejected");
+    CHECK(!decodeMountFields("G03", "P02", "1", "0", "901", m), "v out of range rejected");
+    CHECK(!decodeMountFields("G03", "P02", "100001", "0", "0", m), "height out of range rejected");
+    CHECK(!decodeMountFields("G03", "P02", "1x", "0", "0", m), "garbage number rejected");
+    encodeId("G03", g); encodeId("", p);
+    CHECK(decodeMountFields(g, p, "-1", "0", "0", m) && strcmp(m.group, "G03") == 0 && !m.position[0],
+          "encode/decode round trip");
+
+    printf("== store\n");
+    static Store s;
+    storeClear(s);
+    CHECK(storeUpsert(s, "g03", 900, 2500) && storeFind(s, "G03"), "upsert normalizes id");
+    Record *r = storeFind(s, "G03");
+    CHECK(r && r->confirmed == 1 && r->orientationDeci == 900 && r->distanceMm == 2500, "saved values confirmed");
+    CHECK(storeUpsert(s, "G03", kUnset, kUnset) && storeCount(s) == 1, "update keeps single record");
+    CHECK(!storeUpsert(s, "", 0, 0), "empty id rejected");
+    CHECK(!storeUpsert(s, "G04", 3600, 0), "orientation 360.0 rejected");
+    CHECK(!storeUpsert(s, "G04", 0, kDistanceMaxMm + 1), "distance too large rejected");
+    for (size_t i = 0; i < kMaxGroups + 2; ++i) {
+        char name[8];
+        snprintf(name, sizeof(name), "X%zu", i);
+        storeUpsert(s, name, 0, 0);
+    }
+    CHECK(storeCount(s) == kMaxGroups, "store bounded at kMaxGroups");
+    CHECK(!storeUpsert(s, "NEW", 0, 0), "full store rejects new group");
+    CHECK(storeUpsert(s, "G03", 10, 10) != nullptr, "full store still updates existing group");
+    CHECK(storeRemove(s, "G03") && !storeFind(s, "G03"), "remove");
+    CHECK(storeUpsert(s, "NEW", 0, 0) != nullptr, "slot reusable after remove");
+
+    printf("== store blob\n");
+    static Store loaded;
+    CHECK(storeLoad(loaded, &s, sizeof(s)) && storeCount(loaded) == storeCount(s), "valid blob loads");
+    CHECK(!storeLoad(loaded, &s, sizeof(s) - 1) && storeCount(loaded) == 0, "wrong size -> empty store");
+    static Store bad;
+    bad = s; bad.magic = 0;
+    CHECK(!storeLoad(loaded, &bad, sizeof(bad)) && storeCount(loaded) == 0, "wrong magic -> empty store");
+    bad = s; strcpy(bad.records[0].id, "bad id");
+    CHECK(!storeLoad(loaded, &bad, sizeof(bad)), "invalid id -> rejected");
+    bad = s; bad.records[1] = bad.records[0];
+    CHECK(!storeLoad(loaded, &bad, sizeof(bad)), "duplicate id -> rejected");
+    bad = s; bad.records[0].distanceMm = -5;
+    CHECK(!storeLoad(loaded, &bad, sizeof(bad)), "invalid distance -> rejected");
+    CHECK(!storeLoad(loaded, nullptr, 0), "missing blob -> empty store");
+
+    printf("== activity and states\n");
+    static ActivityTable at;
+    memset(&at, 0, sizeof(at));
+    storeClear(s);
+    storeUpsert(s, "G01", 0, 1000);
+    const uint32_t t0 = 5000;     // shortly after coordinator boot
+    activityNote(at, "G01", t0, t0);
+    Activity *a = activityFind(at, "G01");
+    CHECK(a && !a->lapsed, "first sighting soon after boot is not a lapse");
+    CHECK(groupState(storeFind(s, "G01"), a, true, t0, t0) == State::Confirmed, "stored + active -> confirmed");
+    CHECK(groupState(nullptr, a, true, t0, t0) == State::New, "unstored + active -> new");
+    CHECK(groupState(storeFind(s, "G01"), a, false, t0, t0) == State::Inactive, "no node online -> inactive");
+    // Short absence (node reboot) keeps confirmation.
+    activityNote(at, "G01", t0 + 120000, t0 + 120000);
+    CHECK(groupState(storeFind(s, "G01"), a, true, t0 + 120000, t0 + 120000) == State::Confirmed,
+          "2 min gap keeps confirmed");
+    // Long absence -> suggestion when the group comes back.
+    const uint32_t back = t0 + 120000 + kLapseMs + 1000;
+    activityNote(at, "G01", back, back);
+    CHECK(a->lapsed, "gap >= 10 min marks lapse");
+    CHECK(groupState(storeFind(s, "G01"), a, true, back, back) == State::Suggestion, "reused group -> suggestion");
+    // Inactive for long without return: shows inactive, would be suggestion later.
+    CHECK(activityLapsedNow(a, back + kLapseMs, back + kLapseMs), "lapsed while still absent");
+    // Confirming clears it.
+    storeUpsert(s, "G01", 0, 1000);
+    applyLapsesForSave(s, at, "G01", back, back);
+    CHECK(!a->lapsed && storeFind(s, "G01")->confirmed == 1, "save confirms and clears lapse");
+    CHECK(groupState(storeFind(s, "G01"), a, true, back, back) == State::Confirmed, "confirmed after save");
+
+    // Group stored earlier but not seen since boot.
+    storeUpsert(s, "G02", 450, 2000);
+    CHECK(groupState(storeFind(s, "G02"), nullptr, false, back, back) == State::Inactive, "unseen stored group inactive");
+    applyLapsesForSave(s, at, "G01", back, back);   // saving another group
+    CHECK(storeFind(s, "G02")->confirmed == 0, "unseen for >=10 min since boot loses confirmation on next save");
+    CHECK(storeFind(s, "G02")->orientationDeci == 450 && storeFind(s, "G02")->distanceMm == 2000,
+          "values kept as suggestion");
+    activityNote(at, "G02", back + 1, back + 1);
+    CHECK(groupState(storeFind(s, "G02"), activityFind(at, "G02"), true, back + 1, back + 1) == State::Suggestion,
+          "returning group shows suggestion");
+
+    // Group first seen late after boot (was absent >= 10 min) -> suggestion.
+    storeUpsert(s, "G05", 0, 0);
+    activityNote(at, "G05", kLapseMs + 1, kLapseMs + 1);
+    CHECK(groupState(storeFind(s, "G05"), activityFind(at, "G05"), true, kLapseMs + 1, kLapseMs + 1) == State::Suggestion,
+          "late first sighting after boot -> suggestion");
+
+    // Group seen early after boot stays confirmed after a save elsewhere.
+    static ActivityTable at2; memset(&at2, 0, sizeof(at2));
+    static Store s2; storeClear(s2);
+    storeUpsert(s2, "A", 0, 0); storeUpsert(s2, "B", 0, 0);
+    activityNote(at2, "A", 1000, 1000);
+    activityNote(at2, "A", 30000, 30000);
+    applyLapsesForSave(s2, at2, "B", 31000, 31000);
+    CHECK(storeFind(s2, "A")->confirmed == 1, "continuously active group stays confirmed");
+
+    // millis() wrap-around.
+    static ActivityTable at3; memset(&at3, 0, sizeof(at3));
+    const uint32_t nearWrap = 0xFFFFFFFFUL - 5000UL;
+    activityNote(at3, "W", nearWrap, 2000000UL);
+    // activityNote with uptime >= lapse marks new entries lapsed; reset for this check.
+    activityFind(at3, "W")->lapsed = 0;
+    activityNote(at3, "W", (uint32_t)(nearWrap + 60000UL), 2060000UL);
+    CHECK(!activityFind(at3, "W")->lapsed, "60 s gap across millis wrap is not a lapse");
+
+    // Activity table eviction keeps working when full.
+    static ActivityTable at4; memset(&at4, 0, sizeof(at4));
+    for (size_t i = 0; i < kMaxActivity + 5; ++i) {
+        char name[8];
+        snprintf(name, sizeof(name), "N%zu", i);
+        activityNote(at4, name, 1000 + (uint32_t)i, 1000);
+    }
+    CHECK(activityFind(at4, "N36") != nullptr && activityFind(at4, "N0") == nullptr,
+          "full activity table evicts longest-silent entry");
+
+    printf("\n%s (%d failure(s))\n", g_failures ? "FAILED" : "ALL PASSED", g_failures);
+    return g_failures ? 1 : 0;
+}

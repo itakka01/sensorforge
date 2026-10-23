@@ -1,0 +1,130 @@
+Wir haben jetzt einen entscheidenden Hinweis zur Regression:
+
+  Früher funktionierte die Inbetriebnahme problemlos: Firmware flashen, Node ins WLAN bringen, Hostname/WLAN-Einstellungen ändern, speichern – anschließend war das Gerät sofort wieder erreichbar.
+
+  Mit der aktuellen Firmware funktioniert dieser Ablauf bei mehreren diymore-Boards nicht mehr zuverlässig. Besonders nach Änderungen der WLAN-Konfiguration werden Nodes extrem langsam oder sind nicht mehr erreichbar.
+
+  Bei c004 wurden außerdem wechselnde LittleFS-Zustände beobachtet (Corrupted dir pair, teils Defaults, teils gültige gespeicherte Konfiguration).
+
+  Bitte untersuche jetzt gezielt den gesamten WLAN-Konfigurationspfad einschließlich Speichern, LittleFS, Reconnect, Neustart und WebConfig-Erreichbarkeit. Vergleiche ihn mit dem letzten funktionierenden Firmwarestand und prüfe auch die tatsächliche Flash-/Partitionskonfiguration.
+
+  Ziel: Die konkrete Regression finden und die frühere zuverlässige Inbetriebnahme wiederherstellen.
+
+  Bitte zunächst ausschließlich analysieren und die Ursache mit Belegen benennen. Keine Codeänderungen, keine Formatierung und keine Änderungen an Partitionen oder bestehenden Konfigurationsdaten. ESP-NOW und Cluster-Capture unangetastet lassen.
+
+  Searched for 2 patterns, ran 3 shell commands
+
+Ich verfolge gerade den WLAN-Speicherpfad (/wifi_settings_save → Config-Speichern → LittleFS → Neustart) im Code, danach Vergleich mit älteren Ständen und der Partitionslage.
+
+  Ran 6 shell commands
+
+Erster Befund: Der aktuelle IDE-Build lief mit EraseFlash=all und FlashMode=qio, frühere Builds mit dio ohne Löschen. Jetzt prüfe ich die Logs zu c004 sowie den Boot-/Reconnect-Pfad.
+
+  Searched for 1 pattern, listed 1 directory, ran 4 shell commands
+
+Ich vergleiche gerade die Commits seit dem 16.10. für Config-, LittleFS- und WLAN-Code (db22560 mit Partitionswechsel, fe826ab mit diymore, 2fafb99).
+
+  Searched for 1 pattern, listed 1 directory, ran 4 shell commands
+
+Ich werte gerade die Arduino-IDE-Logs aus: Daraus lässt sich ablesen, mit welchen Flash-Optionen jedes Board tatsächlich hochgeladen wurde (Löschmodus, Partitionsschema, Port).
+
+  Ran 7 shell commands
+
+Ich prüfe jetzt den Speicherzustand der diymore-Boards (laut früherer Messung nur ~20 KB interner Heap frei, Minimum ~1 KB). Das könnte WLAN-Verbindung und Dateisystem direkt beeinträchtigen.
+
+  Searched for 2 patterns, read 1 file, ran 3 shell commands
+
+Ich vergleiche jetzt startWebConfig() (WLAN-Verbindungsaufbau nach dem Neustart) zwischen einem älteren Stand vom 11.10. und dem aktuellen Stand.
+
+  Searched for 2 patterns, ran 4 shell commands
+
+Ich prüfe jetzt den Speicherpfad für den Hostnamen und danach das Boot-Laden der Konfiguration (SD → LittleFS → Defaults).
+
+  Searched for 4 patterns, ran 7 shell commands
+
+Der um 15:53 hochgeladene Build hat exakt 3.289.312 B – genau der Stand mit Gruppen-/Montagefeldern und Kamera-Phase 1, also fällt auch meine config.cpp-Änderung in den Verdachtsbereich. Ich gehe sie jetzt Zeile für Zeile durch.
+
+  Searched for 2 patterns, ran 4 shell commands
+
+Ich suche noch nach Geräte-Logs von heute (Monitor-Tool, serielle Mitschnitte), die die LittleFS-Zustände von c004 belegen könnten.
+
+  Searched for 2 patterns, ran 1 shell command
+
+Die „Corrupted dir pair“-Meldung ist wahrscheinlich nur die übliche LittleFS-Meldung nach vollständigem Flash-Löschen, wie es heute dreimal mit „Erase All Flash“ passiert ist. Ich prüfe jetzt noch den Standard-Hostnamen und die Hotspot-SSID frisch gelöschter Boards.
+
+  Searched for 1 pattern, ran 4 shell commands, wrote 1 memory
+
+Kurzfassung: Im WLAN-Speicherpfad der Firmware habe ich keine Regression gefunden. Die eindeutig belegte Änderung liegt in den Upload-Einstellungen der Arduino-IDE: Seit dem Abend des 16.10. ist dort zeitweise „Erase All Flash Before Sketch Upload“ aktiv, außerdem steht der Flash-Modus jetzt auf QIO statt DIO. Damit lassen sich die wechselnden LittleFS-Zustände von c004 erklären. Für „extrem langsam / nicht erreichbar“ habe ich keine Ursache im Code gefunden; das ist noch offen. Ich habe nichts am Code, an den Partitionen oder an Konfigurationsdaten geändert.
+
+1. Die Upload-Einstellungen haben sich geändert (belegt)
+
+Die IDE-Protokolle unter ~/.config/Arduino IDE/*_log.log enthalten zu jedem Upload die verwendeten Einstellungen:
+
+┌──────────────┬─────────────┬────────────────────────────────────────────┐
+│   Zeitraum   │ Flash-Modus │       Flash vorher komplett löschen        │
+├──────────────┼─────────────┼────────────────────────────────────────────┤
+│ bis 16.10.   │ dio         │ nein                                       │
+│ 15:45        │             │                                            │
+├──────────────┼─────────────┼────────────────────────────────────────────┤
+│ ab 16.10.    │ qio         │ zeitweise ja: 16.10., 17.10., 18.10. (2×), │
+│ 22:47        │             │  heute 15:35, 15:47 und 15:54              │
+└──────────────┴─────────────┴────────────────────────────────────────────┘
+
+Was das komplette Löschen bewirkt:
+- NVS wird gelöscht: Integration-ID (die Node erscheint im Cluster als neues Gerät), Lizenz, Trial-Zähler und Gruppen sind weg.
+- LittleFS wird gelöscht: Die interne config.txt ist weg, die Node startet mit Standardwerten und Hotspot.
+- Hostname und Hotspot-SSID gehen zurück auf „sensorforge“. Dieser Standardwert ist auf allen Boards gleich.
+
+2. Partitionstabelle (geprüft, in Ordnung)
+- Alle Uploads liefen mit PartitionScheme=default_8MB und FlashSize=8M. Die partitions.csv im Sketch-Ordner überschreibt die Menüauswahl.
+- Der zuletzt geflashte Build (heute 15:53) hat 3.289.312 B, das ist der aktuelle Stand inklusive Kamera-Phase 1.
+- Seine partitions_flashed.bin ist byte-identisch mit der Sketch-Tabelle: LittleFS liegt bei 0x790000 mit 384 KB.
+- Kurz vor 15:51 stand das Menü auf app3M_fat9M_16MB. Hochgeladen wurde damit nicht, und es hätte auch nichts geändert.
+- Außer LittleFS schreibt kein Code direkt in diese Partition (kein SPIFFS, FFat oder roher Partitionszugriff).
+
+3. c004: „Corrupted dir pair“ im Wechsel mit gültiger Konfiguration
+
+Das passt zum Löschen beim Upload, nicht zu einem Flash-Defekt:
+- Nach einem kompletten Löschen meldet LittleFS beim ersten Einbinden immer „Corrupted dir pair at {0x0, 0x1}“, weil der Bereich leer ist. Die Firmware versucht es dreimal (config.cpp:6340ff), erkennt dann den leeren Bereich und formatiert. Folge: Standardwerte.
+- Nach einem Upload ohne Löschen bleibt die gespeicherte Konfiguration erhalten.
+- Der Wechsel zwischen beiden Zuständen folgt also dem Wechsel der Upload-Einstellung.
+
+Unterscheiden lässt sich das im seriellen Boot-Log:
+- blank LittleFS partition detected - initializing first-run filesystem → harmlos, Folge des Löschens.
+- LittleFS mount failed; existing flash data preserved → echte Beschädigung. Das wäre ein neuer Befund und bisher nicht belegt.
+
+4. Code-Vergleich mit den älteren Ständen
+- Unverändert seit dem 11.10.:
+  - startWebConfig() (nur Board-Makro und der Kamera-Skip im Time-Broadcaster-Modus sind neu)
+  - der STA-Verbindungsaufbau wifiConnectConfiguredInfrastructure()
+  - handleWifiSettingsSave() mit Neustart nach 4 s
+  - der normale Konfigurations-Speicherpfad
+  - Die WLAN-Stromsparregel aus beta137/138 betrifft nur den Modem-Sleep.
+- Meine noch nicht committeten Änderungen an config.cpp fügen nur optionale Montage-Schlüssel hinzu. Ungültige Werte werden toleriert und berühren den WLAN-Pfad nicht.
+- Einzige Änderung am LittleFS-Pfad: db22560 vom 16.10.
+  - Ist die Konfiguration beim WLAN-Speichern nicht lesbar, baut configSaveWifiSettings() (config.cpp:9431–9477) sie aus Werkswerten neu auf.
+  - In diesem Fall darf sie ein nicht leeres LittleFS formatieren (initInternalConfigStorage(true)).
+  - Folge: Nach einem einzigen fehlgeschlagenen Einbinden würden beim nächsten WLAN-Speichern alle übrigen Einstellungen auf Werkswerte zurückgesetzt.
+  - Das normale Speichern (webconfig.cpp:6042ff) bricht in derselben Lage dagegen ab.
+  - Das ist ein echtes Risiko, erklärt die heutigen Symptome aber nur, wenn tatsächlich so eine Beschädigung auftritt.
+
+5. Noch offen: „extrem langsam / nicht erreichbar“
+
+Dafür gibt es keinen Beleg im Code. Wahrscheinlichste Ursachen, nach Gewicht:
+- Mehrere frisch gelöschte Boards gleichzeitig. Alle heißen „sensorforge“ und haben dieselbe Hotspot-SSID auf Kanal 1 und dieselbe IP 192.168.4.1. Laptop oder Browser landen dann auf einem anderen Board als dem gerade eingerichteten, und sensorforge.local kann auf ein beliebiges Gerät zeigen. Früher behielten die Boards ihren Namen über Uploads hinweg, deshalb trat das nicht auf.
+- Ein geänderter Hostname gilt erst nach einem Neustart. Das normale Speichern startet nur bei einem Moduswechsel neu; bis dahin ist die Node nur unter dem alten Namen erreichbar.
+- Die diymore-Boards haben einen IPEX-Antennenanschluss. Ohne passende Antenne ist der Empfang schwach, das ergibt langsame Seiten. Die Systemübersicht zeigt den RSSI-Wert (Signalstärke).
+
+Damit die Inbetriebnahme wieder zuverlässig läuft (alles nur IDE-Einstellungen, keine Code-Änderung):
+1. Werkzeuge → „Erase All Flash Before Sketch Upload“ auf Disabled stellen. Nur für einen bewussten Werksreset einschalten.
+2. Optional den Flash-Modus wieder auf DIO stellen, wie vor dem 16.10. Ursache ist QIO nach den bisherigen Daten nicht: c001 und die XIAO-Boards laufen seit einer Woche damit.
+3. Partition Scheme auf „SensorForge 3.75MB APP / 384KB SPIFFS“ stellen. Das ändert nur die Größenprüfung.
+4. Boards einzeln in Betrieb nehmen und gleich umbenennen, solange alle „sensorforge“ heißen.
+
+Um die Ursache bei c004 festzunageln, bräuchte ich zwei Angaben von dir:
+- Den seriellen Boot-Log von c004 mit den Config-Zeilen und dem Reset-Grund.
+- Ob die Zustände von c004 zu den Uploads mit und ohne Löschen passen.
+
+Ich kann danach gezielte Code-Korrekturen vorschlagen, zum Beispiel einen eindeutigen Werks-Hostnamen mit MAC-Endung, und dass das WLAN-Speichern eine unlesbare Konfiguration nicht mehr als Ersteinrichtung behandelt.
+
+Die Fundstelle der IDE-Protokolle habe ich mir für spätere Sitzungen notiert.

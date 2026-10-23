@@ -1,0 +1,132 @@
+// Host test: cluster_camera_report.h (camera transparency report, phase 1).
+//   g++ -std=c++17 -Wall -Wextra -I. -x c++ test_cluster_camera_report.cpp.test -o /tmp/test_cluster_camera_report
+//   /tmp/test_cluster_camera_report
+#include <stdio.h>
+#include <string.h>
+#include "cluster_camera_report.h"
+
+using namespace ClusterCamera;
+
+static int g_failures = 0;
+#define CHECK(cond, msg) do { if (cond) printf("  PASS %s\n", msg); \
+    else { printf("  FAIL %s (line %d)\n", msg, __LINE__); ++g_failures; } } while (0)
+
+static Report sampleOn()
+{
+    Report r;
+    reportClear(r);
+    r.camState = 1; r.drone = 1; r.pid = 0x3660; r.xclkMhz = 20; r.fromSensor = 1;
+    r.maxFramesize = 19; r.capMask = CapManualExposure | CapCrop | CapWbPresets;
+    r.framesize = 12; r.quality = 10; r.brightness = 0; r.contrast = -1; r.saturation = 2;
+    r.sharpness = 1; r.denoise = 0;
+    r.aec = 0; r.aec2 = 0; r.aecValue = 37; r.aeLevel = -2; r.agc = 0; r.agcGain = 5; r.gainCeiling = 6;
+    r.awb = 1; r.awbGain = 1; r.wbMode = 3;
+    r.rotation = 180; r.hmirror = 1; r.vflip = 0; r.cropZoomX10 = 15; r.cropX = 2; r.cropY = 0;
+    r.sourceMask = 0;
+    return r;
+}
+
+static bool roundTrip(const Report &in, Report &out)
+{
+    char g[kGroupCount][64];
+    encode(in, g);
+    const char *groups[kGroupCount];
+    for (size_t i = 0; i < kGroupCount; ++i) {
+        if (!g[i][0]) return false;              // must never produce an empty field
+        if (strchr(g[i], '|')) return false;     // must never contain the packet separator
+        groups[i] = g[i];
+    }
+    return decode(groups, out);
+}
+
+int main() {
+    printf("== encode/decode\n");
+    Report a = sampleOn(), b;
+    CHECK(roundTrip(a, b) && reportEqual(a, b), "full report round trip");
+    char g[kGroupCount][64];
+    encode(a, g);
+    CHECK(strcmp(g[0], "1,1,13920,20,1") == 0, "state group layout");
+    CHECK(strcmp(g[5], "180,1,0,15,2,0") == 0, "geometry group layout");
+
+    // Camera off: driver-only values unknown.
+    Report off;
+    reportClear(off);
+    off.camState = 0; off.drone = 0; off.xclkMhz = 20; off.fromSensor = 0; off.capMask = 0;
+    off.framesize = 12; off.quality = 12; off.aec = 1; off.aeLevel = 0;
+    off.rotation = 0; off.hmirror = 0; off.vflip = 1; off.cropZoomX10 = 10;
+    CHECK(roundTrip(off, b) && reportEqual(off, b), "camera-off report round trip");
+    CHECK(b.pid == kUnknown && b.wbMode == kUnknown && b.awb == kUnknown, "unknown values stay unknown");
+    encode(off, g);
+    CHECK(strcmp(g[4], ",,") == 0, "all-unknown group is ',,' (not empty)");
+    CHECK(strcmp(g[1], ",0") == 0, "unknown max framesize + mask");
+
+    Report blank;
+    reportClear(blank);
+    blank.camState = 0; blank.capMask = 0; blank.rotation = 0;
+    CHECK(roundTrip(blank, b) && reportEqual(blank, b), "minimal report (never-initialized camera)");
+
+    printf("== strict decode\n");
+    auto rejects = [](const char *g0, const char *g1, const char *g2, const char *g3,
+                      const char *g4, const char *g5, const char *g6) {
+        const char *groups[kGroupCount] = {g0, g1, g2, g3, g4, g5, g6};
+        Report r;
+        return !decode(groups, r);
+    };
+    const char *ok[kGroupCount] = {"1,1,13920,20,1", "19,16449", "12,10,0,-1,2,1,0",
+                                   "0,0,37,-2,0,5,6", "1,1,3", "180,1,0,15,2,0", "0"};
+    Report r;
+    CHECK(decode(ok, r), "reference fields decode");
+    CHECK(rejects("1,1,13920,20", ok[1], ok[2], ok[3], ok[4], ok[5], ok[6]), "too few elements");
+    CHECK(rejects("1,1,13920,20,1,9", ok[1], ok[2], ok[3], ok[4], ok[5], ok[6]), "too many elements");
+    CHECK(rejects("3,1,13920,20,1", ok[1], ok[2], ok[3], ok[4], ok[5], ok[6]), "camState out of range");
+    CHECK(rejects(ok[0], ok[1], "99,10,0,-1,2,1,0", ok[3], ok[4], ok[5], ok[6]), "framesize out of range");
+    CHECK(rejects(ok[0], ok[1], ok[2], ok[3], "1,1,5", ok[5], ok[6]), "wb_mode out of range");
+    CHECK(rejects(ok[0], ok[1], ok[2], ok[3], ok[4], "180,1,0,15,3,0", ok[6]), "crop position out of range");
+    {
+        // OV3660/OV5640 report the raw gain ceiling register value, not the OV2640 index 0..6.
+        const char *raw[kGroupCount] = {ok[0], ok[1], ok[2], "1,0,490,-1,1,2,248", ok[4], ok[5], ok[6]};
+        CHECK(decode(raw, r) && r.gainCeiling == 248, "raw OV3660 gain ceiling (248) accepted");
+    }
+    CHECK(rejects(ok[0], ok[1], ok[2], "1,0,490,-1,1,2,256", ok[4], ok[5], ok[6]), "gain ceiling above 8 bit");
+    CHECK(rejects(ok[0], ",", ok[2], ok[3], ok[4], ok[5], ok[6]), "missing capability mask");
+    CHECK(rejects(ok[0], ok[1], ok[2], ok[3], ok[4], ok[5], ""), "missing source mask");
+    CHECK(rejects(ok[0], ok[1], "12,1x,0,-1,2,1,0", ok[3], ok[4], ok[5], ok[6]), "non-numeric element");
+    CHECK(rejects(ok[0], ok[1], "12,-,0,-1,2,1,0", ok[3], ok[4], ok[5], ok[6]), "bare minus");
+    CHECK(rejects(ok[0], ok[1], ok[2], ok[3], ok[4], ok[5], "-32768"), "sentinel value on the wire");
+    CHECK(rejects(nullptr, ok[1], ok[2], ok[3], ok[4], ok[5], ok[6]), "null group");
+
+    printf("== provenance (prepared for phase 2)\n");
+    CHECK(groupSource(0, Group::Rotation) == Source::Local, "phase 1: local");
+    uint32_t mask = (uint32_t)Source::Cluster << (2 * (unsigned)Group::Exposure) |
+                    (uint32_t)Source::Node << (2 * (unsigned)Group::Crop);
+    CHECK(groupSource(mask, Group::Exposure) == Source::Cluster &&
+          groupSource(mask, Group::Crop) == Source::Node &&
+          groupSource(mask, Group::Resolution) == Source::Local, "per-group sources decode");
+    Report m = sampleOn();
+    m.sourceMask = (int32_t)mask;
+    CHECK(roundTrip(m, b) && b.sourceMask == (int32_t)mask, "source mask survives the wire");
+    CHECK(2 * (unsigned)Group::Count <= 31, "all groups fit into the mask");
+
+    printf("== helpers\n");
+    uint16_t w = 0, h = 0;
+    CHECK(framesizeDims(12, w, h) && w == 1024 && h == 768, "FRAMESIZE_XGA = 1024x768");
+    CHECK(framesizeDims(19, w, h) && w == 2048 && h == 1536, "FRAMESIZE_QXGA = 2048x1536");
+    CHECK(framesizeDims(24, w, h) && w == 2592 && h == 1944, "FRAMESIZE_5MP = 2592x1944");
+    CHECK(!framesizeDims(25, w, h) && !framesizeDims(-1, w, h), "invalid framesize rejected");
+    CHECK(strcmp(sensorName(0x26), "OV2640") == 0 && strcmp(sensorName(0x3660), "OV3660") == 0 &&
+          strcmp(sensorName(0x5640), "OV5640") == 0 && strcmp(sensorName(kUnknown), "unknown") == 0,
+          "sensor names");
+
+    // Packet budget: 12 fields incl. 36-char id must stay far below 511 bytes.
+    Report big;
+    reportClear(big);
+    int32_t *p = reinterpret_cast<int32_t *>(&big);
+    for (size_t i = 0; i < sizeof(Report) / sizeof(int32_t); ++i) p[i] = -32767;
+    encode(big, g);
+    size_t total = 4 + 1 + 16 + 1 + 36 + 1 + 8 + 1 + 10 + 1 + 10;
+    for (size_t i = 0; i < kGroupCount; ++i) total += 1 + strlen(g[i]);
+    CHECK(total < 400, "worst-case packet payload < 400 bytes");
+
+    printf("\n%s (%d failure(s))\n", g_failures ? "FAILED" : "ALL PASSED", g_failures);
+    return g_failures ? 1 : 0;
+}

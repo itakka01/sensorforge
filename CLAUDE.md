@@ -120,8 +120,8 @@ Physical (SD/LittleFS)
 - Cluster Capture-Media: bis ~3 MB
 
 **Flash (8 MB):**
-- app0/app1: 2x 3,2 MB (OTA-fähig)
-- LittleFS: 1,5 MB
+- app0/app1: 2x 3,75 MB (0x3C0000, OTA-fähig) aus `partitions.csv` im Sketch-Ordner
+- LittleFS: 384 KB, Coredump 64 KB (Details/Limit: `FLASH_BUDGET.md`)
 - NVS: 20 KB (WiFi, License, Integration-ID)
 
 ---
@@ -236,7 +236,7 @@ esp32:esp32:esp32s3:
   CPUFreq=240
   FlashMode=dio
   FlashSize=8M
-  PartitionScheme=default_8MB
+  PartitionScheme=sensorforge   # Menü via tools/install_ide_partition_scheme.sh; default_8MB prüft nur gegen 3,2 MB
   DebugLevel=none
   PSRAM=opi
   LoopCore=1
@@ -840,7 +840,7 @@ CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY=y
 ### Nach Implementierung
 
 - [ ] Vollständiger ESP32-Build (beide Board-Profile!)
-- [ ] Binary-Size < 3,2 MB prüfen
+- [ ] Binary-Size prüfen: `tools/check_firmware_size.py <build-pfad>` (Slot 3.932.160 B)
 - [ ] Unit-Tests (falls kritischer Pfad)
 - [ ] Hardware-Test (devxiao1/devxiao2)
 - [ ] Delta-ZIP erstellen (nur geänderte Dateien)

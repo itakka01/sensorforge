@@ -24,8 +24,8 @@ static constexpr int16_t SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10 = 85;
 // BOARD AUSWÄHLEN
 // =============================================================
 
-#define BOARD_FREENOVE
-//#define BOARD_XIAO
+//#define BOARD_FREENOVE
+#define BOARD_XIAO
 //#define BOARD_DIYMORE_S3CAM
 
 
@@ -192,6 +192,19 @@ static constexpr int16_t BOARD_WIFI_TX_POWER_LEVELS_X10[] = {
 static constexpr size_t BOARD_WIFI_TX_POWER_LEVEL_COUNT =
     sizeof(BOARD_WIFI_TX_POWER_LEVELS_X10) / sizeof(BOARD_WIFI_TX_POWER_LEVELS_X10[0]);
 static constexpr int16_t BOARD_WIFI_TX_POWER_DEFAULT_X10 = 200;
+static constexpr int16_t BOARD_WIFI_TX_POWER_MAX_X10 = 200;
+
+// Camera XCLK output drive strength (gpio_drive_cap_t 0..3), applied after
+// every esp_camera_init(); -1 keeps the driver default (2, ~20 mA).
+#if defined(BOARD_DIYMORE_S3CAM)
+// diymore: with the default drive the 20 MHz XCLK harmonics on GPIO15 block
+// WiFi reception completely (associated, but no ping/ARP/HTTP). Measured
+// 2026-10-23 with a minimal sketch: XCLK off 0 % loss, drive 2 100 % loss,
+// drive 1 0 % (higher latency), drive 0 0 %. 10 MHz at drive 2: 70 % loss.
+#define BOARD_CAMERA_XCLK_DRIVE_CAP 0
+#else
+#define BOARD_CAMERA_XCLK_DRIVE_CAP (-1)
+#endif
 
 
 // Three FNK0085 measurement inputs for the dedicated GPIO meter test setup:
@@ -398,6 +411,10 @@ static constexpr int16_t BOARD_WIFI_TX_POWER_LEVELS_X10[] = {
 static constexpr size_t BOARD_WIFI_TX_POWER_LEVEL_COUNT =
     sizeof(BOARD_WIFI_TX_POWER_LEVELS_X10) / sizeof(BOARD_WIFI_TX_POWER_LEVELS_X10[0]);
 static constexpr int16_t BOARD_WIFI_TX_POWER_DEFAULT_X10 = 200;
+static constexpr int16_t BOARD_WIFI_TX_POWER_MAX_X10 = 200;
+
+// Camera XCLK drive strength: driver default.
+#define BOARD_CAMERA_XCLK_DRIVE_CAP (-1)
 
 #define RECORDING_PRODUCTION_FPS_CAP_1024X768 4
 
@@ -476,6 +493,20 @@ static inline int16_t boardWifiTxPowerNormalizeUpX10(int16_t requestedX10)
     }
 
     return BOARD_WIFI_TX_POWER_DEFAULT_X10;
+}
+
+// BOARD_WIFI_TX_POWER_MAX_X10: hardware ceiling of a board profile. It is
+// applied when the radio is configured and never rewrites config.txt, so a
+// stored higher value stays valid and is simply limited at runtime. Must be a
+// value from BOARD_WIFI_TX_POWER_LEVELS_X10 and >= the default.
+static_assert(BOARD_WIFI_TX_POWER_DEFAULT_X10 <= BOARD_WIFI_TX_POWER_MAX_X10,
+              "board TX-power default above board maximum");
+static_assert(BOARD_WIFI_TX_POWER_MAX_X10 >= SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10,
+              "board TX-power maximum below the SensorForge safety floor");
+
+static inline bool boardWifiTxPowerCappedX10(int16_t valueX10)
+{
+    return valueX10 > BOARD_WIFI_TX_POWER_MAX_X10;
 }
 
 static inline int8_t boardWifiTxPowerQuarterDbm(int16_t valueX10)

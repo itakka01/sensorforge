@@ -18,6 +18,9 @@
 #include <string.h>
 #include <math.h>
 #include <Preferences.h>
+#include <driver/temperature_sensor.h>
+#include <soc/sens_struct.h>
+#include <esp_timer.h>
 
 #include "esp_sleep.h"
 #include "esp_timer.h"
@@ -65,8 +68,12 @@
 #include "reset_diagnostics.h"
 #include "cluster.h"
 #include "cluster_capture.h"
+#include "cluster_camera_report.h"
 #include "sd_presence_policy.h"
 #include "heap_monitor.h"
+#include "wifi_link_diag.h"
+#include "task_load_diag.h"
+#include "crash_guard.h"
 #include "psram_alloc.h"
 
 
@@ -137,6 +144,11 @@ static bool cameraSoftPowerDownActive = false;
 static bool cameraFastSleepCapabilityKnown = false;
 static bool cameraFastSleepSupported = false;
 static uint16_t cameraDetectedPid = 0;
+// Sensor crop currently programmed (cluster camera report only; reset on
+// deinit because a fresh init always starts with the full frame).
+static uint8_t cameraCropAppliedZoomX10 = 10;
+static int8_t cameraCropAppliedX = -1;
+static int8_t cameraCropAppliedY = -1;
 
 // Light-sleep wake timing diagnostics. These timestamps are collected only
 // when debug logging is enabled and the wake source is EXT1/presence. No
@@ -2296,10 +2308,80 @@ bool imageMotionWebTest(
 // THERMAL STATUS API
 // =============================================================
 
+// Chip temperature sensor with a responsiveness check.
+//
+// ESP-IDF's temperature_sensor_get_celsius() waits for the sensor's ready bit
+// without a timeout while holding a spinlock. A reset that hits the sensor in
+// the middle of a conversion (seen after a USB-JTAG chip reset) can leave it
+// stuck: ready never comes, the interrupt watchdog fires during setup(), and
+// because only a power cycle clears the sensor, every software reboot hangs
+// again. Probe the ready bit once with a timeout before the first driver read;
+// a stuck sensor then reports NAN until the next power cycle instead of
+// boot-looping the device. Range and calibration match Arduino's
+// temperatureRead() so reported values are unchanged.
+static temperature_sensor_handle_t chipTempSensor = nullptr;
+static bool chipTempSensorStarted = false;
+static bool chipTempSensorDisabled = false;
+
+static float chipTemperatureRead()
+{
+    if (chipTempSensorDisabled)
+        return NAN;
+
+    if (!chipTempSensorStarted) {
+        chipTempSensorStarted = true;
+
+        temperature_sensor_config_t config =
+            TEMPERATURE_SENSOR_CONFIG_DEFAULT(10, 50);
+
+        if (temperature_sensor_install(&config, &chipTempSensor) != ESP_OK) {
+            chipTempSensor = nullptr;
+            chipTempSensorDisabled = true;
+            Serial.println("[THERMAL] CPU temperature sensor install failed - reading disabled");
+            return NAN;
+        }
+
+        if (temperature_sensor_enable(chipTempSensor) != ESP_OK) {
+            temperature_sensor_uninstall(chipTempSensor);
+            chipTempSensor = nullptr;
+            chipTempSensorDisabled = true;
+            Serial.println("[THERMAL] CPU temperature sensor enable failed - reading disabled");
+            return NAN;
+        }
+
+        // Same register sequence as temperature_sensor_ll_get_raw_value(),
+        // but bounded. A healthy sensor answers within microseconds.
+        SENS.sar_tctrl.tsens_dump_out = 1;
+        const int64_t probeStartUs = esp_timer_get_time();
+        bool ready = false;
+        while (esp_timer_get_time() - probeStartUs < 2000) {
+            if (SENS.sar_tctrl.tsens_ready) {
+                ready = true;
+                break;
+            }
+        }
+        SENS.sar_tctrl.tsens_dump_out = 0;
+
+        if (!ready) {
+            chipTempSensorDisabled = true;
+            Serial.println(
+                "[THERMAL] CPU temperature sensor not responding - reading disabled until power cycle"
+            );
+            return NAN;
+        }
+    }
+
+    float temperatureC = NAN;
+    if (temperature_sensor_get_celsius(chipTempSensor, &temperatureC) != ESP_OK)
+        return NAN;
+
+    return temperatureC;
+}
+
 float thermalCpuTemperatureC()
 {
     float temperatureC =
-        temperatureRead();
+        chipTemperatureRead();
 
     if (isfinite(temperatureC)) {
         lastCpuTemperatureC =
@@ -2429,6 +2511,19 @@ static bool applyWifiTxPowerX10(
 {
     if (!boardWifiTxPowerSupportedX10(targetX10)) {
         targetX10 = BOARD_WIFI_TX_POWER_DEFAULT_X10;
+    }
+
+    // Board hardware ceiling (board_config.h). The stored config value is
+    // left untouched; only the radio is limited.
+    if (boardWifiTxPowerCappedX10(targetX10)) {
+        consoleWrite(
+            "WIFI",
+            String("TX power limited by board profile | context=") +
+            (context ? context : "?") +
+            " | requested=" + String(targetX10 / 10.0f, 1) +
+            " dBm | board_max=" + String(BOARD_WIFI_TX_POWER_MAX_X10 / 10.0f, 1) + " dBm"
+        );
+        targetX10 = BOARD_WIFI_TX_POWER_MAX_X10;
     }
 
     esp_err_t result =
@@ -5656,6 +5751,9 @@ bool cameraApplyCropRuntime(
 
         cameraDiscardQueuedFramesAfterCrop();
 
+        cameraCropAppliedZoomX10 = 10;
+        cameraCropAppliedX = -1;
+        cameraCropAppliedY = -1;
         return true;
     }
 
@@ -5825,6 +5923,9 @@ bool cameraApplyCropRuntime(
 
         cameraDiscardQueuedFramesAfterCrop();
 
+        cameraCropAppliedZoomX10 = 10;
+        cameraCropAppliedX = -1;
+        cameraCropAppliedY = -1;
         error =
             "OV3660 raw crop programming failed";
 
@@ -5834,9 +5935,39 @@ bool cameraApplyCropRuntime(
 
     cameraDiscardQueuedFramesAfterCrop();
 
+    cameraCropAppliedZoomX10 = normalizedZoom == "2.0" ? 20 : 15;
+    cameraCropAppliedX = (int8_t)positionX;
+    cameraCropAppliedY = (int8_t)positionY;
     return true;
 }
 
+
+// Board-specific camera XCLK drive strength (board_config.h). Applied after
+// every esp_camera_init(), successful or not: the driver configures the pin
+// itself, and a failed sensor probe can leave the clock running.
+static void cameraApplyXclkDriveStrength(int pin)
+{
+#if BOARD_CAMERA_XCLK_DRIVE_CAP >= 0
+    if (pin < 0)
+        return;
+    const esp_err_t err = gpio_set_drive_capability(
+        (gpio_num_t)pin,
+        (gpio_drive_cap_t)BOARD_CAMERA_XCLK_DRIVE_CAP
+    );
+    static bool reported = false;
+    if (!reported || err != ESP_OK) {
+        reported = true;
+        Serial.printf(
+            "Camera XCLK GPIO%d drive strength %d (board profile)%s\n",
+            pin,
+            BOARD_CAMERA_XCLK_DRIVE_CAP,
+            err == ESP_OK ? "" : " - FAILED"
+        );
+    }
+#else
+    (void)pin;
+#endif
+}
 
 bool initCamera(
     const String &model,
@@ -5924,6 +6055,7 @@ bool initCamera(
 
     esp_err_t err =
         esp_camera_init(&cfg);
+    cameraApplyXclkDriveStrength(cfg.pin_xclk);
 
     if (err != ESP_OK) {
 
@@ -6116,6 +6248,9 @@ static void cameraDeinitRuntime()
     cameraInitialized = false;
     cameraFramebufferCount = 0;
     cameraSoftPowerDownActive = false;
+    cameraCropAppliedZoomX10 = 10;
+    cameraCropAppliedX = -1;
+    cameraCropAppliedY = -1;
 }
 
 
@@ -6680,6 +6815,7 @@ static bool initTransportCheckCamera(
         esp_camera_init(
             &cfg
         );
+    cameraApplyXclkDriveStrength(cfg.pin_xclk);
 
     if (initError != ESP_OK) {
         char buffer[96];
@@ -14652,7 +14788,9 @@ void startWebConfig()
 
     // Cluster networking is optional and owns only its UDP multicast socket.
     // The central mDNS responder stays owned by this WiFi lifecycle.
-    clusterNetworkStart();
+    // Crash-loop safe mode keeps the cluster off.
+    if (!CrashGuard::safeMode())
+        clusterNetworkStart();
 
     if (MDNS.begin(cfg_hostname.c_str())) {
         consoleWrite(
@@ -15213,6 +15351,9 @@ void setup() {
     initStorageLockGuard();
     FirmwareUpdateAdmission::init();
 
+    // WiFi link diagnostics (log only): register before the first WiFi start.
+    WifiLinkDiag::begin();
+
     // Heap Optimization: Allocate buffers in PSRAM
     webplayerInit();
     mkvWriterInit();
@@ -15242,6 +15383,10 @@ void setup() {
 
     esp_reset_reason_t resetReason =
         esp_reset_reason();
+
+    // Crash-loop guard first: it must count a crash streak even when the
+    // crash happens early in the following startup steps.
+    CrashGuard::handleBoot(resetReason);
 
     const bool storageFaultTimerWake =
         resetReason == ESP_RST_DEEPSLEEP &&
@@ -15338,7 +15483,7 @@ void setup() {
         THERMAL_COOLDOWN_MAGIC
     ) {
         float cpuTempC =
-            temperatureRead();
+            chipTemperatureRead();
 
         // Initialize only the lightweight RTC/I2C path before SD, camera and
         // WiFi. This allows an RTC/enclosure-triggered emergency to remain in
@@ -15685,9 +15830,10 @@ void setup() {
     // keeps the one-time key creation out of the motion-to-first-frame path and
     // allows the hardware RNG's internal entropy source to be used safely.
     // Existing keys are only read and verified; no eFuse is written twice.
+    // Crash-loop safe mode never writes eFuses (read-only discovery below).
     // ---------------------------------------------------------
 
-    if (cfg_recording_encryption) {
+    if (cfg_recording_encryption && !CrashGuard::safeMode()) {
         if (recordingCryptoEnsureProvisioned()) {
             Serial.printf(
                 "Recording encryption hardware key: READY | eFuse KEY%d | source=%s\n",
@@ -15762,13 +15908,16 @@ void setup() {
 
     // Prime the thermal diagnostics now. The first loop iteration is allowed
     // to sample immediately so a unit that already starts hot is detected
-    // without waiting for a full sample interval.
-    thermalCpuTemperatureC();
+    // without waiting for a full sample interval. Crash-loop safe mode skips
+    // the priming; its loop still runs the thermal guard.
+    if (!CrashGuard::safeMode()) {
+        thermalCpuTemperatureC();
 
-    float initialRtcTempC = 0.0f;
-    thermalRtcTemperatureC(
-        initialRtcTempC
-    );
+        float initialRtcTempC = 0.0f;
+        thermalRtcTemperatureC(
+            initialRtcTempC
+        );
+    }
 
     lastThermalSampleMs =
         millis() -
@@ -15891,7 +16040,8 @@ void setup() {
     // only AFTER SD mount/config/logger/recovery have completed.
     // ---------------------------------------------------------
 
-    if (!streamerModeEnabled() && !timeBroadcasterModeEnabled())
+    if (!streamerModeEnabled() && !timeBroadcasterModeEnabled() &&
+        !CrashGuard::safeMode())
         radarBegin();
 
 
@@ -16002,6 +16152,21 @@ void setup() {
         );
     }
 
+
+    // ---------------------------------------------------------
+    // Crash-loop safe mode: WiFi and WebConfig only (see crash_guard.h).
+    // ---------------------------------------------------------
+    if (CrashGuard::safeMode()) {
+        logWrite(
+            "CRASH GUARD safe mode | crashes=" + String((unsigned)CrashGuard::crashCount()) +
+            " | last=" + String(CrashGuard::lastCrashReasonName()) +
+            " | camera/recording/motion/radar/cluster not started"
+        );
+        if (!webConfigStarted) {
+            Serial.println("CRASH GUARD: WebConfig unavailable");
+        }
+        return;
+    }
 
     // ---------------------------------------------------------
     // Beta115 time-broadcaster standby (fail closed, no time TX yet).
@@ -16357,6 +16522,22 @@ void loop() {
 
     // Periodic heap health monitoring (logs every 60s, warns on fragmentation)
     heapMonitorService();
+
+    // WiFi disconnect/reconnect events queued by the WiFi event handler.
+    WifiLinkDiag::service();
+
+    // Per-task CPU load (log only), to find a task starving the network stack.
+    TaskLoadDiag::service();
+
+    // Crash-loop guard: mark the boot stable after 60 s. In safe mode only the
+    // management UI and the thermal guard run (no cluster, camera or motion).
+    CrashGuard::loop();
+    if (CrashGuard::safeMode()) {
+        thermalMonitorLoop();
+        if (webConfigStarted) webConfigLoop();
+        delay(1);
+        return;
+    }
 
     // Optional cluster service is deliberately independent of recorder/streamer
     // policy and is a no-op unless cluster runtime started with WiFi. The
@@ -17483,6 +17664,98 @@ void loop() {
 // authority. Prewarm before the scheduled trigger; never start while recording.
 uint8_t clusterCaptureFrameBufferCount() {
     return cameraInitialized ? cameraFramebufferCount : 0;
+}
+
+// Cluster camera transparency (phase 1): read-only snapshot of the camera
+// state. Reads only RAM (driver status struct, config); no I2C access and no
+// setter calls, so it cannot change the camera or disturb a capture.
+void cameraFillClusterReport(ClusterCamera::Report &r)
+{
+    using namespace ClusterCamera;
+    reportClear(r);
+    static int32_t cachedMaxFramesize = kUnknown;
+    static int32_t cachedCapMask = 0;
+
+    sensor_t *sensor = cameraInitialized ? esp_camera_sensor_get() : nullptr;
+    r.camState = (int32_t)(!sensor ? CamState::Off
+        : cameraSoftPowerDownActive ? CamState::Standby : CamState::On);
+    r.drone = droneModeEnabled() ? 1 : 0;
+    r.pid = cameraDetectedPid ? (int32_t)cameraDetectedPid : kUnknown;
+    r.xclkMhz = cfg_camera_xclk_mhz;
+    r.rotation = cfg_rotation;
+
+    if (sensor) {
+        // Capabilities: driver function present; OV2640 sharpness/denoise are
+        // driver stubs. Crop is the SensorForge OV3660 raw-window path.
+        uint32_t caps = 0;
+        const bool ov2640 = sensor->id.PID == 0x26;
+        if (sensor->set_exposure_ctrl && sensor->set_aec_value) caps |= CapManualExposure;
+        if (sensor->set_ae_level) caps |= CapAeLevel;
+        if (sensor->set_aec2) caps |= CapAec2;
+        if (sensor->set_gain_ctrl && sensor->set_agc_gain) caps |= CapManualGain;
+        if (sensor->set_gainceiling) caps |= CapGainCeiling;
+        if (sensor->set_whitebal) caps |= CapAutoWb;
+        if (sensor->set_wb_mode) caps |= CapWbPresets;
+        if (sensor->set_awb_gain) caps |= CapAwbGain;
+        if (sensor->set_brightness) caps |= CapBrightness;
+        if (sensor->set_contrast) caps |= CapContrast;
+        if (sensor->set_saturation) caps |= CapSaturation;
+        if (sensor->set_sharpness && !ov2640) caps |= CapSharpness;
+        if (sensor->set_denoise && !ov2640) caps |= CapDenoise;
+        if (sensor->set_hmirror && sensor->set_vflip) caps |= CapMirror;
+        if (sensor->set_res_raw && sensor->id.PID == 0x3660) caps |= CapCrop;
+        if (sensor->set_quality) caps |= CapQuality;
+        if (sensor->set_framesize) caps |= CapFramesize;
+        cachedCapMask = (int32_t)caps;
+        camera_sensor_info_t *info = esp_camera_sensor_get_info(&sensor->id);
+        cachedMaxFramesize = info ? (int32_t)info->max_size : kUnknown;
+    }
+    r.maxFramesize = cachedMaxFramesize;
+    r.capMask = cachedCapMask;
+
+    if (sensor) {
+        const camera_status_t &st = sensor->status;
+        r.fromSensor = 1;
+        r.xclkMhz = sensor->xclk_freq_hz > 0 ? sensor->xclk_freq_hz / 1000000 : r.xclkMhz;
+        r.framesize = st.framesize;
+        r.quality = st.quality;
+        r.brightness = st.brightness;
+        r.contrast = st.contrast;
+        r.saturation = st.saturation;
+        r.sharpness = st.sharpness;
+        r.denoise = st.denoise;
+        r.aec = st.aec ? 1 : 0;
+        r.aec2 = st.aec2 ? 1 : 0;
+        r.aecValue = st.aec_value;
+        r.aeLevel = st.ae_level;
+        r.agc = st.agc ? 1 : 0;
+        r.agcGain = st.agc_gain;
+        r.gainCeiling = st.gainceiling;
+        r.awb = st.awb ? 1 : 0;
+        r.awbGain = st.awb_gain ? 1 : 0;
+        r.wbMode = st.wb_mode;
+        r.hmirror = st.hmirror ? 1 : 0;
+        r.vflip = st.vflip ? 1 : 0;
+        r.cropZoomX10 = cameraCropAppliedZoomX10;
+        r.cropX = cameraCropAppliedX >= 0 ? cameraCropAppliedX : kUnknown;
+        r.cropY = cameraCropAppliedY >= 0 ? cameraCropAppliedY : kUnknown;
+    } else {
+        // Camera off: report what the next local init would use.
+        bool hmirror = false;
+        bool vflip = false;
+        cameraEffectiveOrientation(hmirror, vflip);
+        r.fromSensor = 0;
+        r.framesize = (int32_t)getFrameSize(cfg_resolution);
+        r.quality = cfg_quality;
+        r.aec = cfg_camera_auto_exposure ? 1 : 0;
+        r.aeLevel = cfg_camera_ae_level;
+        r.hmirror = hmirror ? 1 : 0;
+        r.vflip = vflip ? 1 : 0;
+        r.cropZoomX10 = cfg_camera_crop_zoom == "2.0" ? 20 : cfg_camera_crop_zoom == "1.5" ? 15 : 10;
+        r.cropX = r.cropZoomX10 != 10 ? cfg_camera_crop_x : kUnknown;
+        r.cropY = r.cropZoomX10 != 10 ? cfg_camera_crop_y : kUnknown;
+    }
+    r.sourceMask = 0;   // phase 1: every value is the local setting
 }
 
 bool clusterCapturePrepareCamera() {

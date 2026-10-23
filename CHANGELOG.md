@@ -1,3 +1,57 @@
+## v87-beta140 — 2026-10-23 (WLAN-DIAGNOSE, EIN SPEICHERKNOPF FÜR CLUSTER-SEITE)
+
+**NEU (nur Diagnose):** `wifi_link_diag.cpp/.h` schreibt jeden STA-Verbindungsabbruch mit 802.11-Grundcode und RSSI sowie jede (Wieder-)Verbindung und IP-Vergabe mit Ausfalldauer ins serielle Log (`[WIFI-DIAG]`). Der WLAN-Ereignis-Handler legt nur einen kleinen Eintrag in eine Warteschlange; ausgegeben wird aus `loop()`. Kein Eingriff in Verbindungsaufbau, Reconnect oder Stromsparmodus.
+
+**GEÄNDERT:** Die Montagefelder auf `/cluster` gehören jetzt zum Formular der Cluster-Einstellungen und werden mit dem gemeinsamen Knopf „Speichern“ gespeichert. Eigener Knopf „Montagedaten speichern“ und Route `/cluster_mount_save` entfallen (beides war unveröffentlicht). Nur Montagedaten geändert: kein Neustart; Cluster-Einstellungen geändert: Neustart wie bisher.
+
+**BEHOBEN (diymore, Ursache der WLAN-Unerreichbarkeit):** Der Kamera-Takt XCLK (20 MHz, GPIO15) wurde mit der Standard-Treiberstärke (~20 mA) ausgegeben. Auf der diymore-Platine blockieren seine Oberwellen den WLAN-Empfang: verbunden, gute RSSI, aber kein Ping/ARP/HTTP. Nachweis mit einem Minimal-Sketch ohne SensorForge-Code (gleiches Board, gleicher Platz): XCLK aus 0 % Verlust, 20 MHz/Stufe 2 100 %, 10 MHz/Stufe 2 70 %, 20 MHz/Stufe 1 0 % (höhere Latenz), 20 MHz/Stufe 0 0 %. Neu `BOARD_CAMERA_XCLK_DRIVE_CAP` in `board_config.h` (diymore 0, sonst Treiber-Standard); gesetzt nach jedem `esp_camera_init()`, auch nach fehlgeschlagener Sensorerkennung. Ausgeschlossen wurden: Sendeleistung, SD-Init ohne Karte, Radar-UART, WLAN-Reconnect-Ablauf, mDNS, Cluster/ESP-NOW, CPU-Last.
+
+**NEU (Board-Profil):** `BOARD_WIFI_TX_POWER_MAX_X10` je Board in `board_config.h`; die Firmware begrenzt die WLAN-Sendeleistung beim Setzen darauf (Log `TX power limited by board profile`), `config.txt` bleibt unverändert und gültig. Derzeit alle Boards 20 dBm (die vorübergehende diymore-Begrenzung auf 8,5 dBm war nicht die Ursache und ist zurückgenommen). Anzeige auf der WLAN-Seite und in `/api/v1/network` (`board_max_tx_power_dbm`).
+
+**NEU (Absturz-Schutz, abgesicherter Modus):** `crash_guard.cpp/.h`. Zählt Panic-/Watchdog-Resets (`PANIC`, `INT_WDT`, `TASK_WDT`, `WDT`, `CPU_LOCKUP`), die eintreten, bevor ein Start 60 s stabil lief (NVS-Namensraum `sfcrash`, ganz am Anfang von `setup()`). Nach 3 solchen Resets in Folge startet das Gerät im abgesicherten Modus: nur WLAN und WebConfig samt Thermik-Schutz; Kamera, Aufnahme, Bewegungserkennung, Radar und Cluster starten nicht, kein eFuse-Schreiben, keine Thermik-Erstmessung im Setup. Jede WebConfig-Seite zeigt einen roten Hinweis mit Absturzzahl, letztem Grund und dem Knopf „Normal neu starten“ (`POST /crash_safe_exit`). Ein Software-Neustart bleibt im abgesicherten Modus; Stromtrennung (Power-on-Reset) oder der Knopf beenden ihn. Log: `CRASH GUARD: armed …` bzw. `CRASH GUARD: SAFE MODE …`. Unabhängig vom bestehenden Boot-Loop-Schutz für Strommangel (`bootloop_protection`), der unverändert bleibt.
+
+**BEHOBEN (Boot-Schleife durch hängenden Temperatursensor):** devxiao2 startete nach einem USB-JTAG-Chip-Reset 59-mal hintereinander neu: Interrupt-Watchdog auf Kern 1 in `temperature_sensor_ll_get_raw_value()` (aus `thermalCpuTemperatureC()` in `setup()`). ESP-IDF wartet dort ohne Zeitlimit unter Spinlock auf das Ready-Bit; ein mitten in der Messung zurückgesetzter Sensor meldet es nie mehr, und nur Stromtrennung behebt das. Neu `chipTemperatureRead()` in `sensorforge.ino`: eigener Treiber-Handle mit gleicher Kalibrierung wie Arduino `temperatureRead()` (10–50 °C), vor dem ersten Lesen einmalige Prüfung des Ready-Bits mit 2 ms Zeitlimit. Hängt der Sensor, meldet das Log `[THERMAL] CPU temperature sensor not responding` und die CPU-Temperatur ist bis zur nächsten Stromtrennung NAN (Thermik-Notfall weiter über RTC); das Gerät startet normal. Hinweis: Der Boot-Loop-Schutz zählt absichtlich nur Strom-/Brownout-Kaltstarts, Abstürze nicht.
+
+**BEHOBEN (Kamera-Transparenz Phase 1):** Der Coordinator verwarf jeden `SFK1`-Bericht eines Nodes mit OV3660/OV5640, weil die Prüfung für `gainceiling` nur die OV2640-Stufen 0–6 zuließ, diese Sensoren aber den Rohwert melden (z. B. 248). Folge: „Kameras im Cluster“ zeigte nur das eigene Gerät. Zulässig ist jetzt 0–255 (Feldbreite des Treibers); Anzeige bei Werten > 6 als „Obergrenze <Wert>“ statt 2^(n+1)×. Host-Test `test_cluster_camera_report` um zwei Fälle erweitert.
+
+**NEU (Warnung Cluster-Kapazität):** `/cluster` zeigt einen Hinweis, sobald die Grenzen der heutigen Umsetzung erreicht werden: Präzisions-Zeitsynchronisation 12 Nodes (`slotPeers[12]`, Coordinator synchronisiert reihum) und Mitgliederliste 16 fremde Geräte (`CLUSTER_MAX_PEERS`). Ab 2 Plätzen vor der Grenze gelber Hinweis; rot, wenn in den letzten 30 s bzw. 60 s ein aktiver Node keinen Synchronisationsplatz bekam bzw. ein aktives Gerät aus der Mitgliederliste verdrängt wurde. Neue Felder in `/cluster_status`: `espnow_time_local.slot_capacity`, `espnow_time_local.slot_table_full_recent`, `peer_capacity`, `peer_table_full_recent`. Reine Diagnose: Slot-Vergabe, Verdrängung, Zeitsync und Protokoll unverändert.
+
+**GEÄNDERT (SD-Seite):** „SD-Karte optional“, „Speicher / SD-Sicherheit“ und „SD-Verschlüsselung“ auf `/sd_maintenance` sind ein Formular mit der seitenweiten Speicherleiste („Speichern“, aktiv erst bei Änderungen) statt drei eigener Knöpfe. Neuer Handler `/sd_settings_save` schreibt nur geänderte Teile, mit denselben Regeln wie bisher (kein optionaler SD-Modus bei gemounteter Karte, eFuse-Schlüssel nur beim Einschalten der Verschlüsselung bzw. wenn sie an ist und der Schlüssel fehlt). Bei einem Fehler nennt die Meldung, was bereits gespeichert wurde. Die alten Routen bleiben für offene Browser-Tabs erhalten. Wartungsaktionen (Benchmark, Wipe, Format, Secure Erase, Recovery) behalten ihre eigenen Knöpfe.
+
+**GEÄNDERT (WLAN-Einrichtung):** Nach dem Speichern der WLAN-Einstellungen mit externem WLAN wartet die Neustartseite nicht mehr auf die alte Adresse (Hotspot-IP oder `sensorforge.local`, unter der ein anderes unkonfiguriertes Board antworten könnte), sondern auf `http://<gerätename>.local/` und wechselt dorthin, sobald das Gerät antwortet. Link und Hinweis für Geräte ohne `.local`-Auflösung auf der Seite. Hotspot-Modus und Gerätenamen mit anderen Zeichen als Buchstaben, Ziffern und `-`: Verhalten wie bisher.
+
+**NEU (nur Diagnose):** `task_load_diag.cpp/.h` – CPU-Anteil der aktivsten Tasks mit Kern und Priorität im seriellen Log (`[TASK-DIAG]`), in den ersten 2 Minuten alle 20 s, danach alle 10 Minuten.
+
+**BEHOBEN (Log):** `[OTA] Bootstatus derzeit nicht lesbar` erschien auf jedem per USB geflashten Gerät alle 10 s, weil der NVS-Bereich `sfota_boot` erst nach einem OTA-Update existiert. Fehlender Bereich gilt jetzt als „kein Update ausstehend“ (keine Meldung); ein echter Lesefehler wird weiter wiederholt, aber nur einmal pro Boot gemeldet. Die Bestätigung nach einem OTA-Update ist unverändert.
+
+**NEU (Werkzeug):** `tools/flash_board.sh` – Board per Menü wählen (diymore/XIAO/Freenove), bauen mit dem arduino-cli der IDE in `../sensorforge_builds/<board>/` (außerhalb des Repos, `board_config.h` im Sketch-Ordner bleibt unverändert, unveränderte Quellen werden nicht neu gebaut), Größenprüfung, Flash-Größen-Plausibilität per `esptool flash-id`, Bestätigung, Flashen wie die IDE (ohne Löschen, nie `merged.bin`), optional serieller Monitor mit Log in `../sensorforge_builds/logs/`.
+
+## v87-beta140 — 2026-10-23 (KAMERA-TRANSPARENZ IM CLUSTER, PHASE 1)
+
+**NEU (nur Anzeige):** Nodes melden Sensortyp, Fähigkeiten und wirksame Kameraeinstellungen (Auflösung, JPEG-Qualität, Belichtung, Verstärkung, Weißabgleich, Bildparameter, Drehung, Spiegelung, Crop) per authentifiziertem UDP-Seitenpaket `SFK1` – bei Änderung (≤ 2 s) und alle 30 s, nie in den 5 s vor einer Aufnahme. Coordinator: Bereich „Kameras im Cluster“ auf `/cluster_coordinate`, `GET /cluster_cameras`. Pro Parametergruppe wird bereits eine Quelle (lokal/Cluster/Node) übertragen – in Phase 1 immer lokal. Details: `CLUSTER_CAMERA.md`.
+
+**UNVERÄNDERT:** keine Kameraeinstellung wird gesetzt, lokale Konfiguration unberührt, ESP-NOW, Aufnahmepfad und -planung unverändert.
+
+**TESTS:** `test_cluster_camera_report.cpp.test` (neu, 31/31), Anzeigelogik per Node.js (16/16), übrige Host-Tests identisch zur Basis.
+
+## v87-beta140 — 2026-10-23 (FLASH-LIMIT AN ECHTE PARTITIONSTABELLE ANGEGLICHEN)
+
+**BEFUND:** Die IDE prüfte mit Menü `default_8MB` gegen 3.342.336 B, geflasht wird aber seit 2026-10-16 immer die `partitions.csv` des Sketch-Ordners mit 3.932.160-B-OTA-Slots. Gemeldete 98,3 % (Freenove) waren 83,6 % des echten Slots.
+
+**NEU:** `tools/install_ide_partition_scheme.sh` (Menüpunkt „SensorForge 3.75MB APP / 384KB SPIFFS“ per `boards.local.txt`, Limit aus `partitions.csv`, idempotent), `tools/check_firmware_size.py` (Image gegen Slot, `partitions.bin` gegen CSV). Doku `FLASH_BUDGET.md`; `CLAUDE.md`-FQBN/Speicherlayout und `PARTITION_UPGRADE_GUIDE.md` (keine „Custom“-Auswahl) korrigiert.
+
+**UNVERÄNDERT:** Firmware-Code, Partitionstabelle (byte-identisch), LittleFS, NVS, OTA-Prüfungen. Freier Platz pro Slot jetzt ca. 645–665 KB statt 55–76 KB.
+
+## v87-beta140 — 2026-10-23 (GRUPPEN- UND MONTAGEVERWALTUNG)
+
+**NEU:** Optionale Montagedaten pro Node (`group_id`, `mount_position`, `height_mm`, `orientation_horizontal_deg`, `orientation_vertical_deg`; WebConfig Cluster → „Montage und Gruppe“), Gruppenverwaltung am Coordinator (automatisch erkannte Gruppen, `orientation_deg`/`distance_mm` lokal in NVS, Zustände Neu/Bestätigt/Vorschlag/Inaktiv) und kombinierbare Filter in der Coordinator-Gerätetabelle. Details: `CLUSTER_GROUPS.md`.
+
+**TRANSPORT:** neues HMAC-authentifiziertes UDP-Seitenpaket `SFG1` je Heartbeat (Multicast, kein ESP-NOW); ältere Firmware ignoriert es. `/cluster_status` zusätzlich `mount_known`, `group_id`, `mount_position`, `height_mm`, `orientation_horizontal_deg`, `orientation_vertical_deg`.
+
+**UNVERÄNDERT:** flacher Cluster, Coordinator-Wahl, ESP-NOW-Präzisionssync, Slots/Recovery, Capture-Timing, Jobs. Bestehende `config.txt` ohne Migration; fehlerhafte Montagewerte werden ignoriert statt die Konfiguration zu verwerfen.
+
+**TESTS:** `test_cluster_groups.cpp.test` (neu), Filterlogik per Node.js geprüft, übrige Host-Tests identisch zur Basis.
+
 ## v87-beta139 — 2026-10-23 (RECOVERY-SLOT NACH VERWORFENER PRÄZISIONSSERIE)
 
 **Problem (Audit 2026-10-23, Messlauf 22.10.):** Mit vier Nodes im Drone Mode dauert die Slot-Rotation 4 × (14 s Slot + 3,5 s Pause) = 70 s. Nach einer verworfenen Serie kam der nächste Slot des Nodes erst nach 70 s; die letzte gültige Schätzung war dann ~140 s alt (> 120 s Gültigkeit) → ~20 s `wifi_coordinator` mit Zeitsprung ~5,5 ms (c001: `precision_guard_other` +8 bei 21:54:08/18). Betrifft alle Boards ab vier Nodes, nicht nur diymore.

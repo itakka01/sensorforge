@@ -130,34 +130,16 @@ cd /home/itakka/ESP32_Board/sensorforge
 
 #### 2.3 Board-Einstellungen anpassen
 
-**In Arduino IDE:**
-1. **Tools → Board → esp32 → ESP32S3 Dev Module**
-2. **Tools → Partition Scheme → Custom**
-3. **Partition File:** `/home/itakka/ESP32_Board/sensorforge/partitions.csv`
-
-**Alternativ (falls "Custom" fehlt):**
-
-Arduino IDE nutzt `boards.txt`. Neue Partition-Option hinzufügen:
+**Aktualisiert 2026-10-23 (siehe `FLASH_BUDGET.md`):**
 
 ```bash
-# Arduino15-Pfad finden:
-find ~/.arduino15 -name "boards.txt" | grep esp32
-
-# Datei bearbeiten (Backup machen!):
-cp ~/.arduino15/packages/esp32/hardware/esp32/3.3.12/boards.txt \
-   ~/.arduino15/packages/esp32/hardware/esp32/3.3.12/boards.txt.backup
-
-# Folgende Zeilen zu esp32s3-Sektion hinzufügen:
-# esp32s3.menu.PartitionScheme.sensorforge=SensorForge 3.75MB APP
-# esp32s3.menu.PartitionScheme.sensorforge.build.partitions=sensorforge
-# esp32s3.menu.PartitionScheme.sensorforge.upload.maximum_size=3932160
-
-# partitions.csv kopieren:
-cp /home/itakka/ESP32_Board/sensorforge/partitions.csv \
-   ~/.arduino15/packages/esp32/hardware/esp32/3.3.12/tools/partitions/sensorforge.csv
-
-# Arduino IDE neu starten
+tools/install_ide_partition_scheme.sh   # legt den Menüpunkt per boards.local.txt an
 ```
+
+Danach Arduino IDE neu starten und **Tools → Partition Scheme → „SensorForge 3.75MB APP / 384KB SPIFFS“** wählen.
+Die `partitions.csv` im Sketch-Ordner wird unabhängig vom Menü immer geflasht; der Menüpunkt sorgt nur dafür, dass die IDE gegen das richtige Limit (3.932.160 B) prüft.
+
+⚠️ **Nicht „Custom“ wählen:** Dieser Menüpunkt prüft gegen 16 MB, ein zu großes Image würde unbemerkt in app1 hineinragen.
 
 ---
 

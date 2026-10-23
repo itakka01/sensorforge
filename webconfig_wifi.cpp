@@ -266,7 +266,14 @@ String webconfigWifiSettingsHtml(const String &notice)
         String(BOARD_WIFI_TX_POWER_DEFAULT_X10 / 10.0f, 1) +
         " dBm</b> &nbsp;·&nbsp; Board-Minimum: <b>" +
         String(effectiveTxSafeMinX10 / 10.0f, 1) +
-        " dBm</b></div>";
+        " dBm</b> &nbsp;·&nbsp; Board-Maximum: <b>" +
+        String(BOARD_WIFI_TX_POWER_MAX_X10 / 10.0f, 1) +
+        " dBm</b>" +
+        String(boardWifiTxPowerCappedX10(configuredTxPowerX10)
+            ? "<br>Der gewählte Wert liegt über dem Board-Maximum; gesendet wird mit " +
+              String(BOARD_WIFI_TX_POWER_MAX_X10 / 10.0f, 1) + " dBm."
+            : String("")) +
+        "</div>";
 
     html +=
         "<div class='config-label'>Empfang externes WLAN</div><div class='config-control'>";

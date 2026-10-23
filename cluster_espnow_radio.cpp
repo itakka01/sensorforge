@@ -332,6 +332,8 @@ bool sendFrame(EspNowTimePackets::Frame& f,const uint8_t mac[6],
 struct SlotPeer { uint8_t mac[6]={}; uint32_t boot=0; uint32_t seenMs=0;
                   ClusterSlotRecovery::PeerState recovery; };
 SlotPeer slotPeers[12];
+// Diagnostics only: last time a node was seen while every slot was taken.
+uint32_t slotTableFullLastMs=0;
 uint8_t slotNextIndex=0;
 int8_t slotOwner=-1;
 uint32_t slotStartedMs=0, slotGuardUntilMs=0;
@@ -360,6 +362,7 @@ void noteSlotPeer(const uint8_t mac[6], uint32_t boot) {
     for(auto &p:slotPeers) if(!p.boot || uint32_t(now-p.seenMs)>kPeerActiveMs) {
         p={};memcpy(p.mac,mac,6);p.boot=boot;p.seenMs=now;return;
     }
+    slotTableFullLastMs=now?now:1;
 }
 bool slotIsOwner(const uint8_t mac[6], uint32_t boot) {
     return slotOwner>=0 && slotPeers[slotOwner].boot==boot &&
@@ -2012,6 +2015,8 @@ Diagnostics diagnostics(){Diagnostics out=stats;
         for(const auto &p:slotPeers)
             if(p.boot && uint32_t(now-p.seenMs)<=kPeerActiveMs)++out.slotActivePeers;
         out.slotCycleEstimateMs=out.slotActivePeers*kSlotRecoveryParams.slotPeriodMs;
+        out.slotCapacity=sizeof(slotPeers)/sizeof(slotPeers[0]);
+        out.slotTableFullRecent=slotTableFullLastMs && uint32_t(now-slotTableFullLastMs)<=kPeerActiveMs;
         out.slotRotations=slotRotations;
         out.slotOwnerRecovery=slotOwner>=0 && slotOwnerIsRecovery;
         out.slotRecoveryRequested=slotRecoveryStats.requested;

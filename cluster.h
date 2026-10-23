@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include "cluster_group_logic.h"
 
 // Optional local SensorForge cluster runtime.
 //
@@ -135,3 +136,18 @@ bool clusterCaptureProtectionActive();
 // Only 64-byte authenticated bodies are accepted.
 bool clusterTimeGrantSign(const uint8_t *data, size_t len, uint8_t mac[32]);
 bool clusterTimeGrantVerify(const uint8_t *data, size_t len, const uint8_t mac[32]);
+
+// Optional node mount metadata (group, position, height, orientation).
+// Carried in the authenticated SFG1 UDP side packet next to the heartbeat;
+// display/selection only, never used for election, sync or capture timing.
+struct ClusterMountEntry {
+    char integrationId[36];
+    char hostname[64];
+    bool local;
+    bool mountKnown;              // false: peer firmware sends no mount data
+    ClusterGroups::Mount mount;
+};
+
+// Local device plus authenticated online peers; returns the number written.
+size_t clusterMountSnapshot(ClusterMountEntry *out, size_t capacity);
+size_t clusterMountSnapshotCapacity();

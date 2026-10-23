@@ -1,3 +1,9 @@
+## Kamera-Transparenz (2026-10-23, nach v87-beta139, Phase 1)
+- Nodes melden Sensor, Fähigkeiten und wirksame Kameraeinstellungen per authentifiziertem UDP-Seitenpaket `SFK1` (kein ESP-NOW); Coordinator-Übersicht „Kameras im Cluster“. Nur Anzeige. Quelle je Parametergruppe (lokal/Cluster/Node) für das spätere Kameraprofil vorbereitet. Details: `CLUSTER_CAMERA.md`.
+
+## Gruppen- und Montageverwaltung (2026-10-23, nach v87-beta139)
+- Optionale Node-Montagedaten (`group_id`, `mount_position`, `height_mm`, Winkel) in `config.txt`, Transport per authentifiziertem UDP-Seitenpaket `SFG1`; Gruppenwerte (`orientation_deg`, `distance_mm`) nur am Coordinator in NVS. Reine Anzeige-/Auswahlinformation, keine Untercluster, keine Wirkung auf Wahl, Zeitsync oder Capture. Details: `CLUSTER_GROUPS.md`.
+
 ## ESP-NOW-Zeitsynchronisierung – aktueller Stand (2026-10-13, v87-beta105)
 
 Normatives Detaildokument: `ESPNOW_TIME_ARCHITECTURE.md`; Schätzer v2: `ESPNOW_ESTIMATOR_V2.md`. Coordinator-Broadcast und Node-Zweiwege-Messungen verwenden HMAC-authentifizierte ESP-NOW-Pakete. Aktive Präzisionsmessserien sind durch kurz gültige SyncControl-Freigaben und Widerrufe reguliert; Capture- und Coordinator-Aktionen haben Vorrang. Widerruf-Empfang ist auf Funk nicht garantiert; eine Lease kann noch bis zu 12 s gültig sein. Die lokale Listenaktionspause ist derzeit teils noch zeitbasiert und nicht an einen bestätigten Jobabschluss gekoppelt.

@@ -1,3 +1,8 @@
+## Stabilitätstest 6 h (2026-10-23) – v87-beta139
+- Details: `STABILITY_TEST_2026-10-23.md`. Alle 5 Geräte 100 % HTTP, keine Neustarts/Epochenwechsel, interner Heap stabil ca. 82–87 KiB.
+- XIAO 1/2 und diymore c001 durchgehend ESP-NOW-Präzisionszeit. **Freenove nur ca. 64 %** (235 verworfene Serien, 57 Fallbacks) – wichtigste offene Sync-Baustelle.
+- Recovery-Slots: 97 vergeben, 40 erfolgreich, 57 fehlgeschlagen. Interne Streuung ist keine gemessene GPIO-Genauigkeit.
+
 ## Audit-Paket 5p (2026-10-11) – SPI-Remount-Admission
 - Der Sync-API-SPI-Remount (exklusiver Clock-Wechsel und Diagnose) reserviert jetzt die gemeinsame atomare `SdAdmissionController::SpiRemount`-Lease; Cluster-Wipe, Secure Erase, Formatierung und Benchmark können während der Lease keine eigene Wartungs-Lease erhalten.
 - Exklusivmodus-Aktivierung/-Deaktivierung und Lease-Ablauf prüfen auch die aktive SD-Admission. Diagnose reserviert vor dem ersten Dateizugriff und hält die Lease bis nach dem Restore. Die bestehenden kooperativen SD-/Recording-Sperren bleiben erhalten.

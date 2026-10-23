@@ -449,6 +449,141 @@ static void handleSDEncryptionSave()
 }
 
 
+// Common save for the settings sections of /sd_maintenance (optional SD,
+// storage reserve, encryption) behind the page-wide save bar. Each part is
+// written only when its value changed, with the same rules as the former
+// per-section handlers (kept above for open browser tabs).
+static void handleSDSettingsSave()
+{
+    if (rejectWhileRecording("SD settings save"))
+        return;
+
+    String saved;
+    auto fail = [&saved](int code, const String &message) {
+        webServer().send(
+            code,
+            "text/plain; charset=utf-8",
+            message +
+            (saved.length() ? " (bereits gespeichert: " + saved + ")" : String())
+        );
+    };
+
+    configRefreshSdStatus();
+    const bool writeToSd =
+        configSdAvailable() &&
+        configSdPresent();
+
+    const int minFreeSpaceMb =
+        webServer().arg("min_free_space_mb").toInt();
+
+    String diskFullAction =
+        webServer().arg("disk_full_action");
+
+    diskFullAction.trim();
+    diskFullAction.toLowerCase();
+
+    if (
+        minFreeSpaceMb != cfg_min_free_space_mb ||
+        diskFullAction != cfg_disk_full_action
+    ) {
+        String error;
+        const ConfigSaveResult result =
+            configSaveStorageSafety(
+                minFreeSpaceMb,
+                diskFullAction,
+                writeToSd,
+                error
+            );
+
+        if (
+            result != CONFIG_SAVE_BOTH &&
+            result != CONFIG_SAVE_INTERNAL_ONLY
+        ) {
+            fail(400, error.length() ? error : String("SD safety settings save failed"));
+            return;
+        }
+
+        logWrite(
+            "SD safety settings saved | min_free_space_mb=" +
+            String(cfg_min_free_space_mb) +
+            " | disk_full_action=" +
+            cfg_disk_full_action
+        );
+        saved = "SD-Sicherheit";
+    }
+
+    const int encryptionEnabled =
+        webServer().arg("recording_encryption").toInt()
+        ? 1
+        : 0;
+
+    recordingCryptoBegin();
+
+    if (
+        encryptionEnabled != cfg_recording_encryption ||
+        (encryptionEnabled && !recordingCryptoReady())
+    ) {
+        // First activation provisions the board-bound eFuse HMAC root exactly
+        // as the former encryption save did. Existing keys are only verified.
+        if (encryptionEnabled && !recordingCryptoReady()) {
+            if (!recordingCryptoEnsureProvisioned()) {
+                fail(
+                    500,
+                    "Hardware-Schlüssel konnte nicht eingerichtet werden: " +
+                    String(recordingCryptoKeyStatusName())
+                );
+                return;
+            }
+        }
+
+        String error;
+        const ConfigSaveResult result =
+            configSaveRecordingEncryption(
+                encryptionEnabled,
+                writeToSd,
+                error
+            );
+
+        if (
+            result != CONFIG_SAVE_BOTH &&
+            result != CONFIG_SAVE_INTERNAL_ONLY
+        ) {
+            fail(400, error.length() ? error : String("SD encryption settings save failed"));
+            return;
+        }
+
+        saved += saved.length() ? ", Verschlüsselung" : "Verschlüsselung";
+    }
+
+    // The checkbox is disabled (not submitted) while a card is mounted; the
+    // mount itself already switches optional-SD mode off.
+    const bool expectNoSd =
+        webServer().arg("expect_no_sd") == "1";
+
+    if (expectNoSd != sdPresenceExpectNoCard()) {
+        // Never suppress recovery for a card that is currently mounted.
+        if (expectNoSd && sdReady) {
+            fail(409, "SD is mounted; optional-SD mode is only for devices without SD");
+            return;
+        }
+        if (!sdPresenceSetExpectNoCard(expectNoSd)) {
+            fail(500, "SD policy could not be saved");
+            return;
+        }
+    }
+
+    webServer().sendHeader(
+        "Location",
+        "/sd_maintenance?notice=sd_settings_saved"
+    );
+    webServer().send(
+        303,
+        "text/plain; charset=utf-8",
+        ""
+    );
+}
+
+
 static void handleSDRecoveryRun()
 {
     if (recording) {
@@ -2439,7 +2574,16 @@ static String sdMaintenancePage(
 
     if (webServer().arg("notice") == "sd_policy_saved") {
         html += "<div class='flash-notice'>SD-Betriebsmodus gespeichert. Beim nächsten Boot wird einmal auf SD geprüft.</div>";
+    } else if (webServer().arg("notice") == "sd_settings_saved") {
+        html +=
+            "<div class='flash-notice'><strong>SD-Einstellungen gespeichert.</strong></div>"
+            "<script>history.replaceState(null,'','/sd_maintenance');</script>";
     }
+
+    // Settings sections share one form and the page-wide save bar; the
+    // maintenance actions further down keep their own buttons.
+    html += "<form id='sdSettingsForm' method='POST' action='/sd_settings_save'>";
+
     html += "<section id='sd-presence-mode' class='settings-section'>"
             "<h3>SD-Karte optional</h3>"
             "<p>Dieses Gerät wird voraussichtlich ohne SD-Karte betrieben. "
@@ -2447,18 +2591,15 @@ static String sdMaintenancePage(
             "Bei erfolgreichem Mount wird die Option automatisch deaktiviert. "
             "Solange keine SD vorhanden ist, entfallen periodische Mount-/Recovery-Versuche. "
             "Änderungen wirken nach einem Neustart vollständig.</p>"
-            "<form method='POST' action='/sd_presence_mode_save'>"
             "<label><input type='checkbox' name='expect_no_sd' value='1'";
     if (sdPresenceExpectNoCard()) html += " checked";
     if (sdReady) html += " disabled";
-    html += "> Betrieb ohne SD-Karte erwartet</label><br><br>"
-            "<button class='primary' type='submit'>SD-Modus speichern</button>"
-            "</form></section>";
+    html += "> Betrieb ohne SD-Karte erwartet</label>"
+            "</section>";
 
     html +=
         "<section id='storage-safety' class='settings-section'>"
         "<h3>Speicher / SD-Sicherheit</h3>"
-        "<form method='POST' action='/sd_storage_safety_save'>"
         "<label><b>Freier Speicher reservieren</b></label><br>"
         "<input name='min_free_space_mb' type='number' min='0' max='1048576' value='" +
         String(cfg_min_free_space_mb) +
@@ -2467,9 +2608,8 @@ static String sdMaintenancePage(
         "<select name='disk_full_action'>"
         "<option value='rollover'" + String(cfg_disk_full_action == "rollover" ? " selected" : "") + ">Älteste Aufnahmen löschen (Rollover)</option>"
         "<option value='stop'" + String(cfg_disk_full_action == "stop" ? " selected" : "") + ">Aufnahme stoppen</option>"
-        "</select><br><br>"
-        "<button class='primary' type='submit'>SD-Sicherheit speichern</button>"
-        "</form></section>";
+        "</select>"
+        "</section>";
 
     recordingCryptoBegin();
 
@@ -2488,7 +2628,6 @@ static String sdMaintenancePage(
             encryptionInfo
         ) +
         "</div>"
-        "<form method='POST' action='/sd_encryption_save'>"
         "<label><b>" + String(de ? "Aufnahmen und Logdatei" : "Recordings and log file") + "</b></label><br>"
         "<select name='recording_encryption'>"
         "<option value='0'" + String(!cfg_recording_encryption ? " selected" : "") + ">" +
@@ -2525,10 +2664,29 @@ static String sdMaintenancePage(
     }
 
     html +=
-        "<button class='primary' type='submit'>" +
-        String(de ? "Verschlüsselung speichern" : "Save encryption") +
+        "</section>"
+        "<div class='floating-save-space'></div>"
+        "<div id='sdSaveBar' class='floating-save-bar'>"
+        "<span id='sdSaveState' class='floating-save-state'>" +
+        String(de ? "Keine ungespeicherten Änderungen" : "No unsaved changes") +
+        "</span>"
+        "<button id='sdSaveButton' type='submit' disabled>" +
+        String(de ? "Speichern" : "Save") +
         "</button>"
-        "</form></section>";
+        "</div>"
+        "</form>"
+        "<script>(function(){"
+        "var f=document.getElementById('sdSettingsForm'),b=document.getElementById('sdSaveBar'),"
+        "s=document.getElementById('sdSaveState'),btn=document.getElementById('sdSaveButton');"
+        "if(!f||!b||!s||!btn)return;"
+        "function dirty(){b.classList.add('dirty');s.textContent='" +
+        String(de ? "Ungespeicherte Änderungen" : "Unsaved changes") +
+        "';btn.disabled=false;}"
+        "f.addEventListener('input',dirty);f.addEventListener('change',dirty);"
+        "f.addEventListener('submit',function(){btn.disabled=true;s.textContent='" +
+        String(de ? "Speichert …" : "Saving …") +
+        "';});"
+        "})();</script>";
 
     html +=
         "<section id='status' class='settings-section'>"
@@ -6316,6 +6474,7 @@ void webSdMaintenanceRegisterRoutes(
     server.on("/sd_presence_mode_save", HTTP_POST, handleSdPresenceModeSave);
     server.on("/sd_storage_safety_save", HTTP_POST, handleSDStorageSafetySave);
     server.on("/sd_encryption_save", HTTP_POST, handleSDEncryptionSave);
+    server.on("/sd_settings_save", HTTP_POST, handleSDSettingsSave);
     server.on("/sdformat", HTTP_GET, handleSDFormat);
     server.on("/sdformat_do", HTTP_POST, handleSDFormatDo);
     server.on("/sd_format_do", HTTP_POST, handleSDRealFormatDo);

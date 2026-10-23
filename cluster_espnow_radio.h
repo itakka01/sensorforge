@@ -125,6 +125,10 @@ struct Diagnostics {
     uint32_t seriesNextInMs=0;              // 0 = due / not scheduled
     // Coordinator only: precision slot rotation and recovery slots (cluster_slot_recovery.h).
     uint32_t slotActivePeers=0, slotCycleEstimateMs=0, slotRotations=0;
+    // Diagnostics only: slot table size and whether an active node found no
+    // free slot within the last kPeerActiveMs (it then gets no precision series).
+    uint32_t slotCapacity=0;
+    bool slotTableFullRecent=false;
     bool slotOwnerRecovery=false;
     uint32_t slotRecoveryRequested=0, slotRecoveryGranted=0, slotRecoveryDeferred=0;
     uint32_t slotRecoverySucceeded=0, slotRecoveryFailed=0;

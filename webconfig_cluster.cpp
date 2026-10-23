@@ -7,6 +7,8 @@
 #include "cluster_hw_time_meter.h"
 #include "drone_mode.h"
 #include "cluster_profiles.h"
+#include "webconfig_cluster_groups.h"
+#include "webconfig_cluster_camera.h"
 #include "config.h"
 #include "device_identity.h"
 #include "board_config.h"
@@ -70,6 +72,11 @@ static String clusterPageHtml()
         html +=
             "<div class='flash-notice'><strong>Cluster-Einstellungen gespeichert.</strong> "
             "<span class='muted'>Geänderte Cluster-Zugehörigkeit wird beim nächsten WiFi-Neustart bzw. Geräte-Neustart aktiv.</span></div>";
+    }
+    if (server.arg("notice") == "mount_saved") {
+        html +=
+            "<div class='flash-notice'><strong>Montagedaten gespeichert.</strong> "
+            "<span class='muted'>Kein Neustart nötig; sie werden mit dem nächsten Heartbeat (max. 10 s) gemeldet.</span></div>";
     }
 
     html +=
@@ -143,7 +150,12 @@ static String clusterPageHtml()
         "<div class='cluster-label'>Technische Gerätekennung</div>"
         "<div class='cluster-id'>" + htmlEscape(deviceIntegrationId()) + "</div>"
         "<div class='cluster-note'><details><summary>Info zur Gerätekennung</summary>Stabile interne Integration-ID; unabhängig von Gerätename und Lizenz.</details></div>"
-        "</div></div></section>"
+        "</div></div></section>";
+
+    // Optional mount metadata, saved together with the cluster settings.
+    html += webconfigClusterMountFormHtml();
+
+    html +=
         "<div class='floating-save-space'></div>"
         "<div id='clusterSaveBar' class='floating-save-bar'>"
         "<span id='clusterSaveState' class='floating-save-state'>Keine ungespeicherten Änderungen</span>"
@@ -158,6 +170,9 @@ static String clusterPageHtml()
         "<span class='muted'>Mindestens ein Gerät in diesem Cluster ist nicht für hochpräzise Zeitsynchronisation freigegeben. "
         "Zeitkritische Aktionen auf diesen Geräten können größere Abweichungen aufweisen.</span>"
         "<div id='clusterPrecisionWarningDevices' class='muted' style='margin-top:4px'></div></div>"
+        "<div id='clusterCapacityWarning' class='flash-notice' hidden style='border-color:#f3d39b;border-left-color:var(--warn);background:#fff8e6'>"
+        "<strong style='color:var(--warn)'>&#9888; Cluster-Kapazität</strong>"
+        "<div id='clusterCapacityWarningText' class='muted' style='margin-top:4px'></div></div>"
         "<div class='cluster-table-wrap'><table class='cluster-table cluster-simple-table'>"
         "<thead><tr><th>Gerät</th><th>Rolle</th><th>Status</th><th>IP</th><th>Zuletzt gesehen</th></tr></thead>"
         "<tbody id='clusterSimpleRows'><tr><td colspan='5' class='muted'>Status wird geladen …</td></tr></tbody>"
@@ -283,7 +298,7 @@ function renderChoices(d){
  if(sig===choiceSignature)return;choiceSignature=sig;var selected=choice.value||current;choice.innerHTML='<option value="">Manuell / neuer Cluster</option>'+entries.map(function(e){var label=e.name+' · '+e.id+(e.online?' · '+e.nodes+' online':' · bekannt/offline')+(e.coord?' · Coordinator':'')+(e.saved&&!e.stale?' · Passwort gespeichert':'')+(e.stale?' · Passwort geändert?':'')+(e.conflict?' · CREDENTIAL-EPOCH-KONFLIKT':'')+(e.authMismatch?' · NICHT AUTHENTIFIZIERT':'');return '<option value="'+esc(e.id)+'"'+(e.conflict?' disabled':'')+'>'+esc(label)+'</option>';}).join('');if(selected&&choiceData[selected]&&!choiceData[selected].conflict)choice.value=selected;}
  if(choice){choice.addEventListener('change',function(){var e=choiceData[choice.value];if(!e)return;if(idField)idField.value=e.id;if(nameField)nameField.value=e.name;if(epochField)epochField.value=String(e.epoch||1);if(passwordField){passwordField.value='';passwordField.placeholder=(e.saved&&!e.stale)?'Gespeichertes Passwort wird verwendet':(e.stale?'Passwort erneut eingeben':'Mindestens 8 Zeichen');}if(credentialHint)credentialHint.textContent=e.stale?'Der sichtbare Cluster meldet eine andere Credential-Epoch. Das gespeicherte Passwort wird nicht automatisch verwendet.':((e.saved&&!e.stale)?'Passwort für diesen Cluster ist auf diesem Gerät hardwaregebunden gespeichert. Leeres Feld verwendet es intern.':'Für diesen Cluster ist kein passendes Passwort gespeichert.');dirty();});}
  if(idField)idField.addEventListener('input',function(){if(choice)choice.value='';});if(nameField)nameField.addEventListener('input',function(){if(choice)choice.value='';});
-function render(d){if(!rows||!line)return;renderChoices(d);var pills=[];pills.push('<span class="status-pill '+(d.runtime_active?'ok':'warn')+'">Runtime '+(d.runtime_active?'AKTIV':'AUS')+'</span>');var coord=String(d.coordinator_id||'');pills.push('<span class="status-pill '+(coord?'ok':'warn')+'">Coordinator '+(coord?esc(coord):'keiner')+(d.coordinator_epoch?(' · Epoch '+esc(d.coordinator_epoch)):'')+'</span>');var ct=d.cluster_time||{};pills.push('<span class="status-pill '+(ct.valid?'ok':'warn')+'">Clusterzeit '+(ct.valid?'aktiv':'wartet auf Zeitquelle')+'</span>');if(d.restart_required)pills.push('<span class="status-pill warn">NEUSTART ERFORDERLICH</span>');if(d.error)pills.push('<span class="status-pill danger">'+esc(d.error)+'</span>');line.innerHTML=pills.join(' ');var diag=document.getElementById('clusterAckDiagnostics'),q=d.ack_diagnostics||{};if(diag){diag.textContent='ACK-Diagnose (seit Runtime-Start, lokal): HB gesendet '+(q.hb_sent||0)+' / Sendefehler '+(q.hb_send_failed||0)+' · ACK-Sendeversuche '+(q.ack_send_attempted||0)+' / Sendefehler '+(q.ack_send_failed||0)+' · signierte ACK empfangen '+(q.ack_authenticated||0)+' / akzeptiert '+(q.ack_accepted||0)+' / abgelehnt '+(q.ack_rejected||0)+' · Coordinator-Wechsel '+(q.coordinator_changes||0)+' / Epoch-Wechsel '+(q.coordinator_epoch_changes||0)+' / ACK-Kontext-Resets '+(q.ack_context_resets||0)+' / unvollständige Coordinator-Meldungen '+(q.incomplete_coord_announcements||0)+' · letzter Ablehnungsgrund '+(q.last_reject||'none');}var jd=document.getElementById('clusterJobDiagnostics'),j=d.job_probe_diagnostics||{};if(jd)jd.textContent='Job-Probe (lokal): empfangen '+(j.received||0)+' / ACK gesendet '+(j.ack_sent||0)+' / abgelehnt '+(j.rejected||0)+' ('+(j.last_reject||'none')+') · ACK empfangen '+(j.ack_received||0)+' / abgelehnt '+(j.ack_rejected||0)+' ('+(j.last_ack_reject||'none')+')';var rd=document.getElementById('clusterRestartDiagnostics'),r=d.job_restart_diagnostics||{};if(rd)rd.textContent='Neustart-Diagnose (lokal): Aufträge empfangen '+(r.received||0)+' / geplant und ACK gesendet '+(r.accepted||0)+' / abgelehnt '+(r.rejected||0)+' ('+(r.last_reject||'none')+') · ACK empfangen '+(r.ack_received||0)+' / akzeptiert '+(r.ack_accepted||0)+' / abgelehnt '+(r.ack_rejected||0)+' ('+(r.last_ack_reject||'none')+')';var td=document.getElementById('clusterTimeDiagnostics');if(td){var t=d.cluster_time||{};td.textContent='Clusterzeit: '+(t.valid?'gültig':'noch nicht verfügbar')+' · Quelle '+(t.source||'-')+' · Messungen '+(t.accepted||0)+' / verworfen '+(t.rejected||0)+' · RTT '+(t.last_rtt_us||0)+' µs · Alter '+(t.sample_age_ms||0)+' ms · Abweichung zur Geräteuhr '+(t.local_offset_available?((Number(t.local_offset_us||0)/1000).toFixed(2)+' ms'):'nicht messbar')+' · grobe Unsicherheit ±'+(Number(t.uncertainty_estimate_us||0)/1000).toFixed(2)+' ms (Schätzung, keine Garantie; keine Frame-Synchronität)';}var tr=document.getElementById('clusterElectionTrace');if(tr){var entries=Array.isArray(d.election_trace)?d.election_trace:[];tr.textContent='Letzte Election-Übergänge (RAM):\\n'+(entries.length?entries.join('\\n'):'keine');}var a=orderedNodes(Array.isArray(d.nodes)?d.nodes:[],d);var pw=document.getElementById('clusterPrecisionWarning'),pwd=document.getElementById('clusterPrecisionWarningDevices');if(pw){var lim=a.filter(function(n){return (n.local?!!d.runtime_active:!!n.online)&&n.precision_sync==='no';});pw.hidden=!lim.length;if(pwd)pwd.textContent=lim.length?'Betroffene Geräte: '+lim.map(function(n){return n.hostname||n.integration_id||'-';}).join(', '):'';}var simple=document.getElementById('clusterSimpleRows');if(simple){simple.innerHTML=a.length?a.map(function(n){return '<tr><td><strong>'+esc(n.hostname||'-')+'</strong>'+(n.local?' <span class="status-pill ok">LOKAL</span>':'')+sfPrecisionBadge(n)+'</td><td>'+esc(displayRole(n))+nodeNavigationLink(n,d)+'</td><td>'+esc(statusText(n))+'</td><td>'+esc(n.ip||'-')+'</td><td>'+esc(age(n.age_ms,n.local))+'</td></tr>';}).join(''):'<tr><td colspan="5" class="muted">Keine Geräte sichtbar.</td></tr>';}if(!a.length){rows.innerHTML='<tr><td colspan="13" class="muted">Keine Geräte sichtbar.</td></tr>';}else{rows.innerHTML=a.map(function(n){return '<tr><td><strong>'+esc(n.hostname||'-')+'</strong>'+(n.local?' <span class="status-pill ok">LOKAL</span>':'')+sfPrecisionBadge(n)+'</td><td><strong>'+esc(displayRole(n))+'</strong></td><td>'+esc(policyText(n.coordinator_policy))+'</td><td class="cluster-id">'+esc(n.integration_id||'-')+'</td><td>'+esc(n.ip||'-')+'</td><td>'+esc(n.mode||'-')+'</td><td>'+esc(statusText(n))+'</td><td>'+esc(n.release||'-')+'</td><td>'+esc(timeText(n))+'</td><td>'+esc(leaseText(n))+'</td><td>'+esc(linkText(n,d))+'</td><td>'+esc(wifiText(n))+'</td><td>'+esc(age(n.age_ms,n.local))+'</td></tr>';}).join('');}
+function render(d){if(!rows||!line)return;renderChoices(d);var pills=[];pills.push('<span class="status-pill '+(d.runtime_active?'ok':'warn')+'">Runtime '+(d.runtime_active?'AKTIV':'AUS')+'</span>');var coord=String(d.coordinator_id||'');pills.push('<span class="status-pill '+(coord?'ok':'warn')+'">Coordinator '+(coord?esc(coord):'keiner')+(d.coordinator_epoch?(' · Epoch '+esc(d.coordinator_epoch)):'')+'</span>');var ct=d.cluster_time||{};pills.push('<span class="status-pill '+(ct.valid?'ok':'warn')+'">Clusterzeit '+(ct.valid?'aktiv':'wartet auf Zeitquelle')+'</span>');if(d.restart_required)pills.push('<span class="status-pill warn">NEUSTART ERFORDERLICH</span>');if(d.error)pills.push('<span class="status-pill danger">'+esc(d.error)+'</span>');line.innerHTML=pills.join(' ');var diag=document.getElementById('clusterAckDiagnostics'),q=d.ack_diagnostics||{};if(diag){diag.textContent='ACK-Diagnose (seit Runtime-Start, lokal): HB gesendet '+(q.hb_sent||0)+' / Sendefehler '+(q.hb_send_failed||0)+' · ACK-Sendeversuche '+(q.ack_send_attempted||0)+' / Sendefehler '+(q.ack_send_failed||0)+' · signierte ACK empfangen '+(q.ack_authenticated||0)+' / akzeptiert '+(q.ack_accepted||0)+' / abgelehnt '+(q.ack_rejected||0)+' · Coordinator-Wechsel '+(q.coordinator_changes||0)+' / Epoch-Wechsel '+(q.coordinator_epoch_changes||0)+' / ACK-Kontext-Resets '+(q.ack_context_resets||0)+' / unvollständige Coordinator-Meldungen '+(q.incomplete_coord_announcements||0)+' · letzter Ablehnungsgrund '+(q.last_reject||'none');}var jd=document.getElementById('clusterJobDiagnostics'),j=d.job_probe_diagnostics||{};if(jd)jd.textContent='Job-Probe (lokal): empfangen '+(j.received||0)+' / ACK gesendet '+(j.ack_sent||0)+' / abgelehnt '+(j.rejected||0)+' ('+(j.last_reject||'none')+') · ACK empfangen '+(j.ack_received||0)+' / abgelehnt '+(j.ack_rejected||0)+' ('+(j.last_ack_reject||'none')+')';var rd=document.getElementById('clusterRestartDiagnostics'),r=d.job_restart_diagnostics||{};if(rd)rd.textContent='Neustart-Diagnose (lokal): Aufträge empfangen '+(r.received||0)+' / geplant und ACK gesendet '+(r.accepted||0)+' / abgelehnt '+(r.rejected||0)+' ('+(r.last_reject||'none')+') · ACK empfangen '+(r.ack_received||0)+' / akzeptiert '+(r.ack_accepted||0)+' / abgelehnt '+(r.ack_rejected||0)+' ('+(r.last_ack_reject||'none')+')';var td=document.getElementById('clusterTimeDiagnostics');if(td){var t=d.cluster_time||{};td.textContent='Clusterzeit: '+(t.valid?'gültig':'noch nicht verfügbar')+' · Quelle '+(t.source||'-')+' · Messungen '+(t.accepted||0)+' / verworfen '+(t.rejected||0)+' · RTT '+(t.last_rtt_us||0)+' µs · Alter '+(t.sample_age_ms||0)+' ms · Abweichung zur Geräteuhr '+(t.local_offset_available?((Number(t.local_offset_us||0)/1000).toFixed(2)+' ms'):'nicht messbar')+' · grobe Unsicherheit ±'+(Number(t.uncertainty_estimate_us||0)/1000).toFixed(2)+' ms (Schätzung, keine Garantie; keine Frame-Synchronität)';}var tr=document.getElementById('clusterElectionTrace');if(tr){var entries=Array.isArray(d.election_trace)?d.election_trace:[];tr.textContent='Letzte Election-Übergänge (RAM):\\n'+(entries.length?entries.join('\\n'):'keine');}var a=orderedNodes(Array.isArray(d.nodes)?d.nodes:[],d);var pw=document.getElementById('clusterPrecisionWarning'),pwd=document.getElementById('clusterPrecisionWarningDevices');if(pw){var lim=a.filter(function(n){return (n.local?!!d.runtime_active:!!n.online)&&n.precision_sync==='no';});pw.hidden=!lim.length;if(pwd)pwd.textContent=lim.length?'Betroffene Geräte: '+lim.map(function(n){return n.hostname||n.integration_id||'-';}).join(', '):'';}var cw=document.getElementById('clusterCapacityWarning'),cwt=document.getElementById('clusterCapacityWarningText');if(cw&&cwt){var msgs=[],warn=false,es=d.espnow_time_local||{},slotCap=Number(es.slot_capacity)||0,peerCap=Number(d.peer_capacity)||0,others=a.filter(function(n){return !n.local&&!!n.online;}).length;if(es.slot_table_full_recent){warn=true;msgs.push('Mehr aktive Nodes als Plätze in der Präzisions-Zeitsynchronisation ('+slotCap+'). Mindestens ein Node erhält derzeit keine ESP-NOW-Präzisionssynchronisation und arbeitet nur mit der groben WLAN-Zeit.');}else if(slotCap&&others>=slotCap-2){msgs.push('Präzisions-Zeitsynchronisation: '+others+' Nodes online, Grenze '+slotCap+' Nodes. Weitere Nodes darüber hinaus werden nicht präzise synchronisiert.');}if(d.peer_table_full_recent){warn=true;msgs.push('Mehr Geräte im Cluster als die Mitgliederliste fasst ('+peerCap+' + dieses Gerät). Aktive Geräte werden aus der Liste verdrängt; Anzeige und Jobs können unvollständig sein.');}else if(peerCap&&others>=peerCap-2){msgs.push('Mitgliederliste: '+others+' von '+peerCap+' Plätzen belegt (ohne dieses Gerät).');}cw.hidden=!msgs.length;cw.style.borderLeftColor=warn?'var(--danger)':'var(--warn)';cwt.textContent=msgs.join(' ');}var simple=document.getElementById('clusterSimpleRows');if(simple){simple.innerHTML=a.length?a.map(function(n){return '<tr><td><strong>'+esc(n.hostname||'-')+'</strong>'+(n.local?' <span class="status-pill ok">LOKAL</span>':'')+sfPrecisionBadge(n)+'</td><td>'+esc(displayRole(n))+nodeNavigationLink(n,d)+'</td><td>'+esc(statusText(n))+'</td><td>'+esc(n.ip||'-')+'</td><td>'+esc(age(n.age_ms,n.local))+'</td></tr>';}).join(''):'<tr><td colspan="5" class="muted">Keine Geräte sichtbar.</td></tr>';}if(!a.length){rows.innerHTML='<tr><td colspan="13" class="muted">Keine Geräte sichtbar.</td></tr>';}else{rows.innerHTML=a.map(function(n){return '<tr><td><strong>'+esc(n.hostname||'-')+'</strong>'+(n.local?' <span class="status-pill ok">LOKAL</span>':'')+sfPrecisionBadge(n)+'</td><td><strong>'+esc(displayRole(n))+'</strong></td><td>'+esc(policyText(n.coordinator_policy))+'</td><td class="cluster-id">'+esc(n.integration_id||'-')+'</td><td>'+esc(n.ip||'-')+'</td><td>'+esc(n.mode||'-')+'</td><td>'+esc(statusText(n))+'</td><td>'+esc(n.release||'-')+'</td><td>'+esc(timeText(n))+'</td><td>'+esc(leaseText(n))+'</td><td>'+esc(linkText(n,d))+'</td><td>'+esc(wifiText(n))+'</td><td>'+esc(age(n.age_ms,n.local))+'</td></tr>';}).join('');}
 if(resRows){var byId={};a.forEach(function(n){byId[String(n.integration_id||'')]=n.hostname||n.integration_id||'-';});var rr=Array.isArray(d.resources)?d.resources:[];if(!rr.length){resRows.innerHTML='<tr><td colspan="7" class="muted">Noch keine Ressourcen angekündigt.</td></tr>';}else{resRows.innerHTML=rr.map(function(r){var owner=byId[String(r.owner_integration_id||'')]||r.owner_integration_id||'-';return '<tr><td><strong>'+esc(owner)+'</strong><div class="cluster-subtle">'+esc(r.source_ip||'-')+'</div></td><td class="cluster-id">'+esc(r.resource_id||'-')+'</td><td>'+esc(r.type||'-')+'</td><td>'+esc(resourceTime(r.timestamp_us))+'</td><td>'+esc(sizeText(r.size_bytes))+'</td><td>'+esc(duration(r.ttl_remaining_sec,'-'))+'</td><td class="cluster-id">'+esc(r.locator||'-')+'</td></tr>';}).join('');}}}
 function poll(){fetch('/cluster_status?t='+Date.now(),{cache:'no-store',credentials:'same-origin'}).then(function(r){if(!r.ok)throw new Error();return r.json();}).then(render).catch(function(e){console.error('Cluster-Status: Abruf oder Anzeige fehlgeschlagen',e);if(line)line.innerHTML='<span class="status-pill danger">Cluster-Status konnte nicht angezeigt werden</span>';});}poll();setInterval(poll,3000);document.addEventListener('visibilitychange',function(){if(!document.hidden)poll();});
 })();</script>
@@ -410,9 +425,11 @@ window.sfCoordinateStatus=function(force){
     html += ",";
     html += String(CLUSTER_HW_TIME_IN_3);
     html += "],nodeOutputs:{xiao:2,freenove:48},inputCandidates:[14,21,41],maxNodes:3};</script>";
+    html += webconfigClusterGroupsSectionHtml();
+    html += webconfigClusterCameraSectionHtml();
     html += R"__HEALTH__(<section class='settings-section'><h3>Cluster-Geräte</h3>
 <p class='muted'>Aktuelle Ressourcenwerte der verbundenen Geräte. SD-Daten werden normalerweise etwa einmal pro Minute aktualisiert, nach einem Cluster-Wipe unmittelbar erneut gemessen und signiert gemeldet. Fehlende Werte werden nicht geschätzt.</p>
-<div class='cluster-select-tools'><button type='button' id='clusterSelectAll'>Alle Nodes auswählen</button> <button type='button' id='clusterSelectNone'>Auswahl aufheben</button> <span id='clusterSelectionCount'>0 ausgewählt</span></div>
+<div class='cluster-select-tools'><button type='button' id='clusterSelectAll'>Alle sichtbaren Nodes auswählen</button> <button type='button' id='clusterSelectNone'>Auswahl aufheben</button> <span id='clusterSelectionCount'>0 ausgewählt</span></div>
 <div class='cluster-select-tools'><label for='clusterActionChoice'>Aktion für ausgewählte Nodes:</label> <select id='clusterActionChoice'><option value=''>Aktion auswählen …</option><option value='clusterBulkProbe'>Verbindung testen</option><option value='clusterBulkDroneOn'>Drone Mode einschalten</option><option value='clusterBulkDroneOff'>Drone Mode ausschalten</option><option value='clusterBulkSync'>Zeit synchronisieren</option><option value='clusterBulkRestart'>Neu starten</option><option value='clusterBulkShutdown'>Herunterfahren</option><option value='clusterBulkWipe'>SD vollständig löschen</option><option value='clusterHardwareTime'>Hardware-Zeitmessung</option></select> <button type='button' id='clusterActionRun'>Ausführen</button> <button type='button' id='clusterActionInfo' aria-label='Hinweise zu Cluster-Aktionen' title='Hinweise zu Cluster-Aktionen'>Info</button></div>
 <details class='settings-section'><summary>ESP-NOW: lokale Funkdiagnose und Node-Sync</summary><p class='muted'>Coordinator-Funkstatus sowie authentifizierte Node-Mess- oder Fehlerberichte. Nicht eingetroffene Ergebnisse werden nicht geschätzt.</p><div id='sfEspNowActionDiag' role='status'>Warte auf Status …</div><div id='sfEspNowNodeDiag'></div></details>
 <div id='clusterHardwareTimeFeedback' role='status' style='display:none;padding:10px 12px;border:1px solid #b45309;border-radius:8px;margin:8px 0'></div>
@@ -476,8 +493,10 @@ window.sfCoordinateStatus=function(force){
 <details><summary>SD-Wartung: Vorprüfung (ohne Löschen)</summary><p class='muted'>Prüft nur SD- und Recording-Status der ausgewählten Nodes. Es werden keine Dateien gelöscht.</p><button type='button' id='clusterSdPreflight'>SD-Löschung prüfen</button><p class='muted' id='clusterSdPreflightResult' role='status'>Noch nicht geprüft.</p></details>
 <div id='sfPowerActionNotice' role='status' aria-live='polite' style='display:none;position:fixed;z-index:31001;top:16px;right:16px;max-width:min(88vw,390px);box-sizing:border-box;padding:12px 16px;border:1px solid #60a5fa;border-radius:10px;background:#101c33;color:#f8fafc;box-shadow:0 6px 24px #0008;font:500 14px/1.5 system-ui,sans-serif;white-space:normal'></div>
 <div id='sfSyncNotice' role='status' aria-live='polite' style='display:none;position:fixed;z-index:31000;top:20px;left:50%;transform:translateX(-50%);width:min(90vw,640px);box-sizing:border-box;padding:20px 24px;border:2px solid #60a5fa;border-radius:16px;background:#101c33;color:#f8fafc;box-shadow:0 12px 55px #0009;font:600 clamp(16px,2vw,22px)/1.4 system-ui,sans-serif;text-align:center;white-space:normal'></div>
-<div class='cluster-table-wrap'><table class='cluster-table'><thead><tr><th>Auswahl</th><th>Gerät</th><th>Firmware</th><th>Rolle</th><th>Letzte Aktion</th><th>SD belegt</th><th>SD frei</th><th>CPU-Temperatur</th><th>Uptime</th><th>Boot-ID</th><th>Status</th></tr></thead>
-<tbody id='clusterHealthRows'><tr><td colspan='11'>Lädt …</td></tr></tbody></table></div>
+)__HEALTH__";
+    html += webconfigClusterMountFilterHtml();
+    html += R"__HEALTH__(<div class='cluster-table-wrap'><table class='cluster-table'><thead><tr><th>Auswahl</th><th>Gerät</th><th>Montage</th><th>Firmware</th><th>Rolle</th><th>Letzte Aktion</th><th>SD belegt</th><th>SD frei</th><th>CPU-Temperatur</th><th>Uptime</th><th>Boot-ID</th><th>Status</th></tr></thead>
+<tbody id='clusterHealthRows'><tr><td colspan='12'>Lädt …</td></tr></tbody></table></div>
 <section class='settings-section sf-cluster-overview'><h3>Letzte Cluster-Aktion</h3>
 <div id='clusterBulkFeedback' role='status'>Noch keine Sammelaktion gestartet.</div>
 <div id='clusterBulkActionRows' class='cluster-table-wrap' style='display:none'><table class='cluster-table'><thead><tr><th>Node</th><th>Übertragung</th><th>Nachweis</th></tr></thead><tbody id='clusterBulkActionBody'></tbody></table></div>
@@ -501,10 +520,11 @@ return action+': '+stateText;}
 function renderHealth(d){var rows=document.getElementById('clusterHealthRows');if(!rows)return;
 var ns=Array.isArray(d.nodes)?d.nodes:[],jobs=Array.isArray(d.job_probes)?d.job_probes:[];ns.sort(function(a,b){return (a.cluster_role==='coordinator'?0:1)-(b.cluster_role==='coordinator'?0:1);});
 rows.innerHTML=ns.map(function(n){var ok=!!n.health_valid,total=Number(n.sd_total_mib||0),used=Number(n.sd_used_mib||0);
-return '<tr><td>'+(isActionableNode(n)?'<input type="checkbox" class="cluster-node-choice" value="'+esc(n.integration_id)+'" '+(window.sfSelectedNodes&&window.sfSelectedNodes.has(String(n.integration_id))?'checked':'')+'>':'–')+'</td><td>'+(nodeUrl(n)?'<a href="'+nodeUrl(n)+'" target="_blank" rel="noopener noreferrer">'+esc(n.hostname||n.integration_id)+'</a>':esc(n.hostname||n.integration_id))+(window.sfPrecisionBadge?window.sfPrecisionBadge(n):'')+'</td><td>'+esc(n.release||'–')+'</td><td>'+esc(isStandbyBroadcaster(n)?'Zeit-Broadcaster (Standby)':(n.cluster_role||'–'))+'</td><td>'+esc(latestJob(n,jobs))+'</td><td>'+(ok&&total?fmt(used):'–')+'</td><td>'+(ok&&total?fmt(Math.max(0,total-used)):'–')+'</td><td>'+(ok&&Number(n.cpu_temp_deci_c)>-1000?(Number(n.cpu_temp_deci_c)/10).toFixed(1)+' °C':'–')+'</td><td>'+esc(up(n.uptime_seconds))+'</td><td><code>'+esc(n.boot_id||'–')+'</code></td><td>'+esc(n.recording?'Recording':'Bereit')+'</td></tr>';}).join('');
+return '<tr data-node-id="'+esc(n.integration_id||'')+'"><td>'+(isActionableNode(n)?'<input type="checkbox" class="cluster-node-choice" value="'+esc(n.integration_id)+'" '+(window.sfSelectedNodes&&window.sfSelectedNodes.has(String(n.integration_id))?'checked':'')+'>':'–')+'</td><td>'+(nodeUrl(n)?'<a href="'+nodeUrl(n)+'" target="_blank" rel="noopener noreferrer">'+esc(n.hostname||n.integration_id)+'</a>':esc(n.hostname||n.integration_id))+(window.sfPrecisionBadge?window.sfPrecisionBadge(n):'')+'</td><td>'+esc(window.sfMountText?window.sfMountText(n):'–')+'</td><td>'+esc(n.release||'–')+'</td><td>'+esc(isStandbyBroadcaster(n)?'Zeit-Broadcaster (Standby)':(n.cluster_role||'–'))+'</td><td>'+esc(latestJob(n,jobs))+'</td><td>'+(ok&&total?fmt(used):'–')+'</td><td>'+(ok&&total?fmt(Math.max(0,total-used)):'–')+'</td><td>'+(ok&&Number(n.cpu_temp_deci_c)>-1000?(Number(n.cpu_temp_deci_c)/10).toFixed(1)+' °C':'–')+'</td><td>'+esc(up(n.uptime_seconds))+'</td><td><code>'+esc(n.boot_id||'–')+'</code></td><td>'+esc(n.recording?'Recording':'Bereit')+'</td></tr>';}).join('');
 var extra=document.getElementById('clusterHealthExtra');if(extra)extra.textContent=ns.map(function(n){return (n.hostname||n.integration_id)+': freier Heap '+(n.health_valid?Math.round(Number(n.free_heap_bytes||0)/1024)+' KiB':'unbekannt');}).join(' · ');
 sfRenderEspNowDiag(d);
 if(window.sfCaptureReportUpdate)window.sfCaptureReportUpdate(d);
+if(window.sfMountApplyFilter)window.sfMountApplyFilter(ns);
 if(window.sfSelectionUpdate)window.sfSelectionUpdate();
 
 }
@@ -556,7 +576,7 @@ function sfRenderHwTimeInfo(){
   status.textContent=text;
 }
 document.addEventListener('change',function(e){if(e.target.classList.contains('cluster-node-choice')){if(e.target.checked)window.sfSelectedNodes.add(e.target.value);else window.sfSelectedNodes.delete(e.target.value);window.sfSelectionUpdate();}else if(e.target.id==='clusterActionChoice'){sfRenderHwTimeInfo();}else if(e.target.classList.contains('sf-hwtime-node-board')){window.sfHwTimeNodeBoards[e.target.getAttribute('data-node-id')]=e.target.value;sfRenderHwTimeInfo();}});
-function setAll(v){document.querySelectorAll('.cluster-node-choice').forEach(function(e){e.checked=v;if(v)window.sfSelectedNodes.add(e.value);else window.sfSelectedNodes.delete(e.value);});window.sfSelectionUpdate();}
+function setAll(v){document.querySelectorAll('.cluster-node-choice').forEach(function(e){var tr=e.closest('tr');if(v&&tr&&tr.style.display==='none')return;e.checked=v;if(v)window.sfSelectedNodes.add(e.value);else window.sfSelectedNodes.delete(e.value);});window.sfSelectionUpdate();}
 document.getElementById('clusterSelectAll').addEventListener('click',function(){setAll(true);});
 document.getElementById('clusterSelectNone').addEventListener('click',function(){setAll(false);});
 var actionBusy=false,sfSyncNoticeTimer=null,sfPowerNoticeTimer=null;
@@ -1625,6 +1645,33 @@ static void handleClusterSave()
     const bool legacyCurrentWithoutPersistedId =
         cfg_cluster_enabled && !cfg_cluster_id.length() && sameClusterId;
 
+    // Cluster membership/policy exactly as already persisted: only the mount
+    // fields can have changed, which apply without a reboot.
+    const bool clusterSettingsUnchanged =
+        !generatedNewId && !legacyCurrentWithoutPersistedId &&
+        enabled == cfg_cluster_enabled &&
+        clusterId == cfg_cluster_id &&
+        clusterName == cfg_cluster_name &&
+        credentialEpoch == cfg_cluster_credential_epoch &&
+        password == cfg_cluster_password &&
+        coordinatorPolicy == cfg_cluster_coordinator_policy;
+
+    // Optional mount metadata from the same form. Saved first (strictly
+    // validated); configSaveClusterSettings() below re-reads config.txt and
+    // therefore keeps these keys.
+    bool mountChanged = false;
+    String mountError;
+    if (!webconfigClusterMountSaveFromRequest(server, writeToSd, mountChanged, mountError)) {
+        server.send(400, "text/plain; charset=utf-8", "Montagedaten: " + mountError);
+        return;
+    }
+
+    if (clusterSettingsUnchanged && mountChanged) {
+        server.sendHeader("Location", "/cluster?notice=mount_saved");
+        server.send(303, "text/plain; charset=utf-8", "");
+        return;
+    }
+
     String error;
     ConfigSaveResult result = configSaveClusterSettings(
         enabled,
@@ -1638,11 +1685,11 @@ static void handleClusterSave()
     );
 
     if (result == CONFIG_SAVE_INTERNAL_FAILED || result == CONFIG_SAVE_SD_FAILED) {
-        server.send(
-            400,
-            "text/plain; charset=utf-8",
-            error.length() ? error : String("Cluster-Einstellungen konnten nicht gespeichert werden")
-        );
+        String message =
+            error.length() ? error : String("Cluster-Einstellungen konnten nicht gespeichert werden");
+        if (mountChanged)
+            message += " (Montagedaten wurden gespeichert.)";
+        server.send(400, "text/plain; charset=utf-8", message);
         return;
     }
 
@@ -1732,4 +1779,6 @@ void webconfigClusterRegisterRoutes(
     serverInstance.on("/cluster_node_capture", HTTP_POST, handleClusterNodeCapture);
     serverInstance.on("/cluster_node_drone", HTTP_POST, handleClusterNodeDrone);
     serverInstance.on("/cluster_local_drone", HTTP_POST, handleClusterLocalDrone);
+    webconfigClusterGroupsRegisterRoutes(serverInstance);
+    webconfigClusterCameraRegisterRoutes(serverInstance);
 }

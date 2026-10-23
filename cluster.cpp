@@ -19,6 +19,8 @@
 #include "thermal.h"
 #include <math.h>
 #include "cluster_profiles.h"
+#include "cluster_groups.h"
+#include "cluster_camera.h"
 #include "device_identity.h"
 #include "logger.h"
 #include "recorder.h"
@@ -70,6 +72,14 @@ static const char *CLUSTER_DISCOVERY_MAGIC = "SFD1";
 static const char *CLUSTER_PACKET_MAGIC = "SFC1";
 static const char *CLUSTER_META_MAGIC = "SFM1";
 static const char *CLUSTER_HEALTH_MAGIC = "SFH1";
+// Optional mount metadata side packet; older firmware ignores unknown magics.
+static const char *CLUSTER_GROUP_MAGIC = "SFG1";
+// Camera transparency side packet (read-only report, phase 1).
+static const char *CLUSTER_CAMERA_MAGIC = "SFK1";
+static const uint32_t CLUSTER_CAMERA_CHECK_MS = 1000UL;
+static const uint32_t CLUSTER_CAMERA_MIN_GAP_MS = 2000UL;
+static const uint32_t CLUSTER_CAMERA_PERIOD_MS = 30000UL;
+static const int64_t CLUSTER_CAMERA_CAPTURE_QUIET_US = 5000000LL;
 static uint32_t healthLocalTotalMiB=0, healthLocalUsedMiB=0;
 static bool healthForceSdRefresh=false;
 static const char *CLUSTER_LEAVE_MAGIC = "SFL1";
@@ -265,6 +275,8 @@ struct ClusterPeer {
     uint32_t sdUsedMiB;
     int32_t cpuTempDeciC;
     uint32_t freeHeapBytes;
+    bool mountValid;
+    ClusterGroups::Mount mount;
     bool timeReportValid;
     uint32_t timeReportMs;
     uint32_t timeReportEpoch;
@@ -1089,6 +1101,10 @@ static void rememberDiscoveryPresenceProof(
     proof->packet[packetLength] = '\0';
 }
 
+// Diagnostics only: last time a still active peer was displaced because the
+// peer table was full (more devices in the cluster than CLUSTER_MAX_PEERS).
+static uint32_t peerTableEvictionLastMs = 0;
+
 static ClusterPeer *peerSlotFor(const char *integrationId, uint32_t now)
 {
     ClusterPeer *unused = nullptr;
@@ -1114,6 +1130,9 @@ static ClusterPeer *peerSlotFor(const char *integrationId, uint32_t now)
 
     if (unused)
         return unused;
+
+    if (oldest && oldestAge <= CLUSTER_LEGACY_PEER_TIMEOUT_MS)
+        peerTableEvictionLastMs = now ? now : 1;
 
     return oldest;
 }
@@ -1847,6 +1866,11 @@ static void processPresence(
     const uint32_t preservedSdUsedMiB = preservedHealthValid ? peer->sdUsedMiB : 0;
     const int32_t preservedCpuTempDeciC = preservedHealthValid ? peer->cpuTempDeciC : 0;
     const uint32_t preservedFreeHeapBytes = preservedHealthValid ? peer->freeHeapBytes : 0;
+    const bool preservedMountValid = sameBoot && peer->mountValid;
+    ClusterGroups::Mount preservedMount;
+    ClusterGroups::mountClear(preservedMount);
+    if (preservedMountValid)
+        preservedMount = peer->mount;
     const bool preservedTimeReportValid = sameBoot && peer->timeReportValid;
     const uint32_t preservedTimeReportMs = preservedTimeReportValid ? peer->timeReportMs : 0;
     const uint32_t preservedTimeReportEpoch = preservedTimeReportValid ? peer->timeReportEpoch : 0;
@@ -1893,6 +1917,8 @@ static void processPresence(
     peer->sdUsedMiB = preservedSdUsedMiB;
     peer->cpuTempDeciC = preservedCpuTempDeciC;
     peer->freeHeapBytes = preservedFreeHeapBytes;
+    peer->mountValid = preservedMountValid;
+    peer->mount = preservedMount;
     peer->timeReportValid = preservedTimeReportValid;
     peer->timeReportMs = preservedTimeReportMs;
     peer->timeReportEpoch = preservedTimeReportEpoch;
@@ -1992,6 +2018,72 @@ static void processHealth(char **fields, size_t count)
     peer->sdUsedMiB=used;
     peer->cpuTempDeciC=temp;
     peer->freeHeapBytes=heap;
+}
+
+// SFK1|tag|integration_id|boot|presence_sequence|report_seq|state|caps|img|exp|wb|geo|src
+static void processCameraReport(char **fields, size_t count)
+{
+    if (count != 6 + ClusterCamera::kGroupCount || strcmp(fields[0], CLUSTER_CAMERA_MAGIC) ||
+        strcmp(fields[1], runtimeClusterTag) || !integrationIdValid(fields[2])) return;
+    uint32_t boot=0,seq=0,reportSeq=0;
+    if (!parseUint32Strict(fields[3],boot,16) ||
+        !parseUint32Strict(fields[4],seq) ||
+        !parseUint32Strict(fields[5],reportSeq)) return;
+    ClusterCamera::Report report;
+    if (!ClusterCamera::decode(fields + 6, report)) return;
+    const ClusterPeer *peer=findPeer(fields[2]);
+    if (!peer || peer->bootNonce!=boot || seq != peer->sequence) return;
+    clusterCameraStoreReport(fields[2], boot, reportSeq, report);
+}
+
+// SFG1|tag|integration_id|boot|presence_sequence|group|position|height_mm|h_deci|v_deci
+static void processMount(char **fields, size_t count)
+{
+    if (count != 10 || strcmp(fields[0], CLUSTER_GROUP_MAGIC) ||
+        strcmp(fields[1], runtimeClusterTag) || !integrationIdValid(fields[2])) return;
+    uint32_t boot=0,seq=0;
+    ClusterGroups::Mount mount;
+    if (!parseUint32Strict(fields[3],boot,16) ||
+        !parseUint32Strict(fields[4],seq) ||
+        !ClusterGroups::decodeMountFields(fields[5],fields[6],fields[7],fields[8],fields[9],mount)) return;
+    ClusterPeer *peer=findPeer(fields[2]);
+    if (!peer || peer->bootNonce!=boot || seq != peer->sequence) return;
+    peer->mountValid=true;
+    peer->mount=mount;
+    clusterGroupsNoteActive(mount.group);
+}
+
+static void localMount(ClusterGroups::Mount &m)
+{
+    ClusterGroups::mountClear(m);
+    // cfg values are normalized by the config parser; re-check defensively.
+    if (!ClusterGroups::normalizeId(cfg_group_id.c_str(), m.group))
+        m.group[0] = '\0';
+    if (!ClusterGroups::normalizeId(cfg_mount_position.c_str(), m.position))
+        m.position[0] = '\0';
+    m.heightMm = cfg_height_mm >= 0 && cfg_height_mm <= ClusterGroups::kHeightMaxMm
+        ? cfg_height_mm : ClusterGroups::kUnset;
+    m.orientHDeci = cfg_orientation_horizontal_deci;
+    m.orientVDeci = cfg_orientation_vertical_deci;
+    if (!ClusterGroups::mountValid(m)) {
+        m.orientHDeci = 0;
+        m.orientVDeci = 0;
+    }
+}
+
+static void appendMountJson(String &json, bool known, const ClusterGroups::Mount &m)
+{
+    char deci[16];
+    json += ",\"mount_known\":";
+    json += known ? "true" : "false";
+    json += ",\"group_id\":\"" + String(known ? m.group : "") + "\"";
+    json += ",\"mount_position\":\"" + String(known ? m.position : "") + "\"";
+    json += ",\"height_mm\":";
+    json += known && m.heightMm != ClusterGroups::kUnset ? String((long)m.heightMm) : String("null");
+    ClusterGroups::formatDeci(known ? m.orientHDeci : 0, deci);
+    json += ",\"orientation_horizontal_deg\":" + String(known ? deci : "null");
+    ClusterGroups::formatDeci(known ? m.orientVDeci : 0, deci);
+    json += ",\"orientation_vertical_deg\":" + String(known ? deci : "null");
 }
 
 static void processLeave(
@@ -3203,6 +3295,56 @@ static void serviceScheduledCapture(){
 // SFJW1|tag|coordinator|coord_boot|epoch|target|target_boot|seq
 // Every accepted destructive command is consumed before queuing. No retries.
 static void sendHeartbeat();
+// Sequence of the last SFC1 presence; side packets sent between heartbeats
+// must carry it, because receivers bind them to the peer's presence sequence.
+static uint32_t lastPresenceSequence = 0;
+
+// Sends the camera report on change (checked every second, at most every 2 s)
+// and every 30 s. Never inside the 5 s before an armed/pending capture, so the
+// synchronized shot sees no additional work or radio traffic from this.
+static void serviceCameraReport(uint32_t now)
+{
+    static uint32_t lastCheckMs = 0;
+    static uint32_t lastSentMs = 0;
+    static bool sentOnce = false;
+    static uint32_t reportSeq = 0;
+    static ClusterCamera::Report lastSent;
+    if (!runtimeActive || !lastPresenceSequence)
+        return;
+    if (sentOnce && (uint32_t)(now - lastCheckMs) < CLUSTER_CAMERA_CHECK_MS)
+        return;
+    lastCheckMs = now;
+    if (clusterCaptureArmedFlag ||
+        (pendingCapture.active &&
+         pendingCapture.deadlineMonoUs - esp_timer_get_time() <= CLUSTER_CAMERA_CAPTURE_QUIET_US))
+        return;
+    ClusterCamera::Report report;
+    cameraFillClusterReport(report);
+    const bool changed = !sentOnce || !ClusterCamera::reportEqual(report, lastSent);
+    const uint32_t sinceSent = now - lastSentMs;
+    if (sentOnce && !(changed && sinceSent >= CLUSTER_CAMERA_MIN_GAP_MS) &&
+        sinceSent < CLUSTER_CAMERA_PERIOD_MS)
+        return;
+    char groups[ClusterCamera::kGroupCount][64];
+    ClusterCamera::encode(report, groups);
+    char bootText[9];
+    snprintf(bootText, sizeof(bootText), "%08lx", (unsigned long)bootNonce);
+    String packet = String(CLUSTER_CAMERA_MAGIC) + "|" + runtimeClusterTag + "|" +
+        deviceIntegrationId() + "|" + bootText + "|" + String(lastPresenceSequence) + "|" +
+        String(++reportSeq);
+    // Never an empty field (the splitter would collapse it): every group has
+    // either a separator or an always-known value (camState, capMask, rotation,
+    // sourceMask).
+    for (size_t g = 0; g < ClusterCamera::kGroupCount; ++g) {
+        packet += '|';
+        packet += groups[g];
+    }
+    if (sendSignedPayload(packet, "cluster camera")) {
+        lastSent = report;
+        lastSentMs = now;
+        sentOnce = true;
+    }
+}
 static void sendClusterWipeResult(uint32_t cb, uint32_t epoch, uint32_t seq,
                                   uint32_t /*unused*/, uint16_t result)
 {
@@ -3351,6 +3493,10 @@ static void processPacket(
         processMeta(fields, fieldCount);
     } else if (strcmp(fields[0], CLUSTER_HEALTH_MAGIC) == 0) {
         processHealth(fields, fieldCount);
+    } else if (strcmp(fields[0], CLUSTER_GROUP_MAGIC) == 0) {
+        processMount(fields, fieldCount);
+    } else if (strcmp(fields[0], CLUSTER_CAMERA_MAGIC) == 0) {
+        processCameraReport(fields, fieldCount);
     } else if (strcmp(fields[0], CLUSTER_LEAVE_MAGIC) == 0) {
         processLeave(fields, fieldCount);
     } else if (strcmp(fields[0], CLUSTER_RESOURCE_MAGIC) == 0) {
@@ -3471,6 +3617,7 @@ static void sendHeartbeat()
     snprintf(bootText, sizeof(bootText), "%08lx", (unsigned long)bootNonce);
 
     const uint32_t heartbeatSequence = ++sequenceNumber;
+    lastPresenceSequence = heartbeatSequence;
 
     // Keep the original SFC1 presence packet wire-compatible with Beta 34/35.
     // New lease metadata is sent as a second tiny authenticated packet.
@@ -3550,6 +3697,21 @@ static void sendHeartbeat()
     healthLocalTotalMiB=totalMiB;
     healthLocalUsedMiB=usedMiB;
     sendSignedPayload(health, "cluster health");
+    {
+        ClusterGroups::Mount m;
+        localMount(m);
+        char group[ClusterGroups::kIdMaxLen + 1];
+        char position[ClusterGroups::kIdMaxLen + 1];
+        ClusterGroups::encodeId(m.group, group);
+        ClusterGroups::encodeId(m.position, position);
+        String mountPacket=String(CLUSTER_GROUP_MAGIC)+"|"+runtimeClusterTag+"|"+
+            deviceIntegrationId()+"|"+bootText+"|"+String(heartbeatSequence)+"|"+
+            group+"|"+position+"|"+
+            String((long)(m.heightMm == ClusterGroups::kUnset ? -1 : m.heightMm))+"|"+
+            String((long)m.orientHDeci)+"|"+String((long)m.orientVDeci);
+        sendSignedPayload(mountPacket, "cluster mount");
+        clusterGroupsNoteActive(m.group);
+    }
     sendDiscoveryAnnouncement();
 
     if (
@@ -4309,6 +4471,7 @@ void clusterLoop()
     } else if (coordinationDirty) {
         sendCoordination();
     }
+    serviceCameraReport(now);
 
     if (!localIsCoordinator &&
         currentCoordinatorId[0] &&
@@ -5118,6 +5281,8 @@ String clusterStatusJson()
     // Coordinator only (0 on nodes): slot rotation and recovery slots after rejected series.
     json += ",\"slot_active_peers\":" + String((unsigned long)esn.slotActivePeers);
     json += ",\"slot_cycle_estimate_ms\":" + String((unsigned long)esn.slotCycleEstimateMs);
+    json += ",\"slot_capacity\":" + String((unsigned long)esn.slotCapacity);
+    json += ",\"slot_table_full_recent\":"; json += esn.slotTableFullRecent ? "true" : "false";
     json += ",\"slot_rotations\":" + String((unsigned long)esn.slotRotations);
     json += ",\"slot_owner_recovery\":"; json += esn.slotOwnerRecovery ? "true" : "false";
     json += ",\"slot_recovery_requested\":" + String((unsigned long)esn.slotRecoveryRequested);
@@ -5277,6 +5442,11 @@ String clusterStatusJson()
         String((unsigned long)(CLUSTER_HEARTBEAT_MS / 1000UL));
     json += ",\"default_lease_sec\":" +
         String((unsigned long)CLUSTER_DEFAULT_LEASE_SEC);
+    json += ",\"peer_capacity\":" + String((unsigned long)CLUSTER_MAX_PEERS);
+    json += ",\"peer_table_full_recent\":";
+    json += peerTableEvictionLastMs &&
+            (uint32_t)(millis() - peerTableEvictionLastMs) <= CLUSTER_LEGACY_PEER_TIMEOUT_MS
+        ? "true" : "false";
     json += ",\"password_configured\":";
     json += cfg_cluster_password.length() ? "true" : "false";
     json += ",\"error\":\"" + jsonEscape(lastError) + "\"";
@@ -5326,6 +5496,11 @@ String clusterStatusJson()
     json += ",\"cluster_role\":\"" +
         String(localIsCoordinator ? "coordinator" : "node") + "\"";
     json += ",\"precision_sync\":\"" + String(precisionSyncName(CLUSTER_LOCAL_CAPABILITIES)) + "\"";
+    {
+        ClusterGroups::Mount m;
+        localMount(m);
+        appendMountJson(json, true, m);
+    }
     json += ",\"direct_heartbeat_age_ms\":-1";
     json += ",\"coordinator_ack_age_ms\":";
     if (!localIsCoordinator && lastCoordinatorAckMs != 0)
@@ -5387,6 +5562,7 @@ String clusterStatusJson()
         json += ",\"coordinator_policy\":\"" +
             String(coordinatorPolicyName(peer.coordinatorPolicy)) + "\"";
         json += ",\"precision_sync\":\"" + String(precisionSyncName(peer.coordinationCapabilities)) + "\"";
+        appendMountJson(json, peer.mountValid, peer.mount);
         json += ",\"cluster_role\":\"" +
             String(
                 currentCoordinatorId[0] &&
@@ -5693,4 +5869,45 @@ bool clusterEspNowTimeVerify(const uint8_t *data, size_t len,
     const bool valid = constantTimeEqual(expected, mac, sizeof(expected));
     secureWipe(expected, sizeof(expected));
     return valid;
+}
+
+size_t clusterMountSnapshotCapacity()
+{
+    return CLUSTER_MAX_PEERS + 1;
+}
+
+size_t clusterMountSnapshot(ClusterMountEntry *out, size_t capacity)
+{
+    if (!out || capacity == 0)
+        return 0;
+    size_t n = 0;
+    ClusterMountEntry &self = out[n++];
+    memset(&self, 0, sizeof(self));
+    strncpy(self.integrationId, deviceIntegrationId().c_str(), sizeof(self.integrationId) - 1);
+    strncpy(self.hostname, cfg_hostname.c_str(), sizeof(self.hostname) - 1);
+    self.local = true;
+    self.mountKnown = true;
+    localMount(self.mount);
+    if (!runtimeActive)
+        return n;
+
+    const uint32_t nowMs = millis();
+    for (size_t i = 0; i < CLUSTER_MAX_PEERS && n < capacity; ++i) {
+        const ClusterPeer &peer = peers[i];
+        if (!peer.used)
+            continue;
+        // Same online rule as clusterStatusJson(): lease not expired.
+        if ((uint64_t)(nowMs - peer.lastSeenMs) > (uint64_t)peerLeaseSeconds(peer) * 1000ULL)
+            continue;
+        ClusterMountEntry &e = out[n++];
+        memset(&e, 0, sizeof(e));
+        strncpy(e.integrationId, peer.integrationId, sizeof(e.integrationId) - 1);
+        strncpy(e.hostname, peer.hostname, sizeof(e.hostname) - 1);
+        e.mountKnown = peer.mountValid;
+        if (peer.mountValid)
+            e.mount = peer.mount;
+        else
+            ClusterGroups::mountClear(e.mount);
+    }
+    return n;
 }

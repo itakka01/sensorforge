@@ -3278,6 +3278,7 @@ static void handleNetworkStatus()
         ",\"wifi_alive_schedule\":\"" + jsonEscape(cfg_wifi_alive_schedule) +
         "\",\"configured_tx_power_dbm\":" + String(cfg_wifi_tx_power_dbm, 1) +
         ",\"board_default_tx_power_dbm\":" + String((float)BOARD_WIFI_TX_POWER_DEFAULT_X10 / 10.0f, 1) +
+        ",\"board_max_tx_power_dbm\":" + String((float)BOARD_WIFI_TX_POWER_MAX_X10 / 10.0f, 1) +
         ",\"fallback_ap_full_board_power\":true" +
         ",\"hotspot_enabled\":" + String(cfg_hotspot_enabled ? "true" : "false") +
         ",\"hotspot_fallback_enabled\":" + String(cfg_hotspot_fallback_enabled ? "true" : "false") +

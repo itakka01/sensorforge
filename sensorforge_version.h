@@ -21,13 +21,13 @@
 // WebConfig, so a running device can be mapped back to the exact Git tag.
 
 #define SENSORFORGE_RELEASE_NUMBER 87
-#define SENSORFORGE_RELEASE_TAG "v87-beta139"
+#define SENSORFORGE_RELEASE_TAG "v87-beta140"
 #define SENSORFORGE_RELEASE_DATE "2026-10-23"
 #define SENSORFORGE_RELEASE_SUMMARY \
-    "Beta 139: coordinator recovery slot after a rejected precision series (no WiFi fallback from a single rejection)."
+    "Beta 140: diymore camera XCLK drive strength fix (WiFi reachability), WiFi/task diagnostics, cluster groups and camera report."
 
-// Current source-tree stage. Beta 139: precision slot recovery on the coordinator.
-#define SENSORFORGE_WORKTREE_STAGE "v87-beta139"
+// Current source-tree stage. Beta 140: diymore XCLK fix and diagnostics.
+#define SENSORFORGE_WORKTREE_STAGE "v87-beta140"
 #define SENSORFORGE_WORKTREE_DATE "2026-10-23"
 #define SENSORFORGE_WORKTREE_SUMMARY \
-    "v87 Beta 139: recovery slot keeps precision after one rejected series; slot_* diagnostics."
+    "v87 Beta 140: diymore XCLK drive strength fix, WIFI-DIAG/TASK-DIAG, cluster groups, camera report phase 1."

@@ -1,4 +1,5 @@
 #include "webconfig.h"
+#include "crash_guard.h"
 #include "web_log_reader.h"
 #include "web_sd_maintenance.h"
 #include "config.h"
@@ -1745,6 +1746,8 @@ static String htmlHeader()
 
     html +=
         "<main class='page'><div class='box'>";
+
+    html += CrashGuard::bannerHtml();
 
     return html;
 }
@@ -12890,6 +12893,24 @@ static void handleRebooting()
     bool afterClusterSettingsChange =
         reason == "cluster_settings";
 
+    // After switching to an external WLAN the device is no longer reachable
+    // under the address this page was loaded from (hotspot IP or the default
+    // name, which another unconfigured board may still answer). Follow the
+    // configured mDNS name instead. Only plain DNS labels are used in the URL.
+    String rebootTarget;
+    if (afterWifiSettingsChange && !cfg_hotspot_enabled && cfg_hostname.length()) {
+        bool plainLabel = true;
+        for (size_t i = 0; i < cfg_hostname.length(); ++i) {
+            const char c = cfg_hostname[i];
+            if (!isalnum((unsigned char)c) && c != '-') {
+                plainLabel = false;
+                break;
+            }
+        }
+        if (plainLabel)
+            rebootTarget = "http://" + cfg_hostname + ".local/";
+    }
+
     html +=
         "<div class='operation-card'>"
         "<span class='status-pill warn'>SYSTEM RESTART</span>";
@@ -12943,6 +12964,14 @@ static void handleRebooting()
             "<p class='muted' style='margin-top:14px'>Wenn sich SSID, Gerätename oder Netzwerkmodus geändert haben, muss sich dieses Browser-Gerät gegebenenfalls mit dem neuen WLAN verbinden. "
             "Bei aktiviertem Fallback werden zuerst die gespeicherten externen WLAN-Profile versucht; der Fallback-Hotspot kann deshalb erst nach einigen Sekunden sichtbar werden.</p>";
 
+        if (!rebootTarget.isEmpty()) {
+            html +=
+                "<p class='muted'>Nach dem Neustart wechselt diese Seite automatisch zu "
+                "<a href='" + rebootTarget + "'>" + rebootTarget + "</a>, sobald das Gerät dort erreichbar ist. "
+                "Öffnet sich die Adresse nicht (manche Android-Geräte kennen keine .local-Namen), "
+                "die IP-Adresse des Geräts im Router nachsehen.</p>";
+        }
+
     } else if (afterClusterSettingsChange) {
         html +=
             "<h2 style='margin-top:16px'>Cluster-Einstellungen gespeichert</h2>"
@@ -12973,6 +13002,7 @@ static void handleRebooting()
         "history.replaceState(null,'','/');"
         "(function(){"
             "var seconds=10;"
+            "var target='" + rebootTarget + "';"
             "var el=document.getElementById('rebootCountdown');"
             "var timer=setInterval(function(){"
                 "seconds--;"
@@ -12981,6 +13011,14 @@ static void handleRebooting()
                 "if(seconds===0){clearInterval(timer);tryHome();}"
             "},1000);"
             "function tryHome(){"
+                // Cross-origin probe: an opaque no-cors response still proves
+                // that the device answers under its new name.
+                "if(target){"
+                    "fetch(target+'?reconnect='+Date.now(),{mode:'no-cors',cache:'no-store'})"
+                    ".then(function(){location.replace(target);})"
+                    ".catch(function(){setTimeout(tryHome,2000);});"
+                    "return;"
+                "}"
                 "fetch('/?reconnect='+Date.now(),{cache:'no-store'})"
                 ".then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);location.replace('/');})"
                 ".catch(function(){setTimeout(tryHome,1000);});"
@@ -13001,6 +13039,18 @@ static void handleRebooting()
         "text/html; charset=utf-8",
         html
     );
+}
+
+
+// Crash-loop safe mode: clear the crash streak and restart normally.
+static void handleCrashSafeExit()
+{
+    CrashGuard::clearForNormalBoot();
+    logWrite("CRASH GUARD safe mode left by WebConfig | normal restart");
+    rebootScheduled = true;
+    rebootAtMs = millis() + 3000UL;
+    server.sendHeader("Location", "/rebooting");
+    server.send(303, "text/plain; charset=utf-8", "");
 }
 
 
@@ -19168,6 +19218,7 @@ void webConfigStart()
 
     server.on("/reboot", HTTP_GET, handleReboot);
     server.on("/rebooting", HTTP_GET, handleRebooting);
+    server.on("/crash_safe_exit", HTTP_POST, handleCrashSafeExit);
     server.on("/reboot_do", HTTP_POST, handleRebootDo);
     server.on("/shutdown", HTTP_GET, handleShutdown);
     server.on("/shutting_down", HTTP_GET, handleShuttingDown);
