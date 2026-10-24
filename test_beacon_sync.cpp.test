@@ -1,0 +1,236 @@
+// Host test + simulation for the one-way beacon time estimator (beta147).
+//   g++ -std=c++17 -O2 -Wall -Wextra -I. -x c++ test_beacon_sync.cpp.test cluster_beacon_sync.cpp -o /tmp/test_beacon_sync
+//
+// The simulation uses the disturbances measured on the hardware cluster
+// (beta146, 100 ms beacon experiment, 9 nodes):
+//   - quartz offsets of the nodes against the coordinator: 4..36 ppm
+//   - per beacon and node receive callback jitter: typically 10..40 us,
+//     5..15 % of the beacons 100..300 us late on a single node
+//   - common TX-side delay (stamp -> air) usually small, sometimes up to
+//     2.2 ms for all nodes at once
+// A two-way calibration with its own error (bias + noise) gives each node
+// its path delay; nodes without one use the cluster median.
+#include "cluster_beacon_sync.h"
+#include <cassert>
+#include <cmath>
+#include <cstdio>
+#include <random>
+#include <vector>
+#include <algorithm>
+
+using namespace ClusterBeaconSync;
+
+static int failures = 0;
+#define CHECK(cond) do { if (!(cond)) { std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); ++failures; } } while (0)
+
+// ---------------------------------------------------------------- unit tests
+static void testBasics() {
+    Estimator e;
+    e.reset();
+    CHECK(!e.model().valid);
+    // Perfect link: offset 1000 us, drift +10 ppm, delay 0.
+    const int64_t t0 = 5000000;
+    for (int i = 0; i < 10; ++i) {
+        const int64_t node = t0 + i * 1000000LL;
+        const int64_t coord = node + 1000 + static_cast<int64_t>(10.0 * i);
+        CHECK(e.add({node, coord, 1200}) == AddResult::Accepted);
+    }
+    CHECK(e.model().valid);
+    CHECK(std::fabs(e.model().driftPpm - 10.0) < 0.01);
+    CHECK(std::fabs(e.envelopeOffsetUs(t0 + 9000000LL) - 1090.0) < 0.5);
+    // Not monotonic.
+    CHECK(e.add({t0 + 9000000LL, t0 + 9000000LL + 1090, 1200}) == AddResult::NotMonotonic);
+    // Late TX path.
+    CHECK(e.add({t0 + 10000000LL, t0 + 10000000LL + 1100, 1200 + kTxPathSlackUs + 1}) == AddResult::TxPathLate);
+    // Early sample (above the envelope by 400 us).
+    CHECK(e.add({t0 + 11000000LL, t0 + 11000000LL + 1110 + 400, 1200}) == AddResult::Early);
+    // A late sample is accepted but does not move the envelope.
+    CHECK(e.add({t0 + 12000000LL, t0 + 12000000LL + 1120 - 300, 1200}) == AddResult::Accepted);
+    CHECK(std::fabs(e.envelopeOffsetUs(t0 + 12000000LL) - 1120.0) < 20.0);
+    // Clock step: five early samples in a row restart the model.
+    AddResult last = AddResult::Accepted;
+    for (int i = 0; i < kEarlyResetCount; ++i) {
+        const int64_t node = t0 + (13 + i) * 1000000LL;
+        last = e.add({node, node + 5000, 1200});
+    }
+    CHECK(last == AddResult::Reset);
+    CHECK(e.stats().resets == 1);
+    CHECK(!e.model().valid);  // one sample only
+}
+
+static void testMedianAndDelay() {
+    const double v[] = {5, 1, 4, 2, 3};
+    CHECK(median(v, 5) == 3);
+    CHECK(median(v, 4) == 3);  // 1,2,4,5 -> 3
+    DelayCalibration d;
+    CHECK(!d.known());
+    d.add(1500, 1); d.add(1520, 2); d.add(4000, 3);
+    CHECK(d.known());
+    CHECK(d.value() == 1520);
+}
+
+// ---------------------------------------------------------------- simulation
+struct SimNode {
+    double ppm = 0;            // node clock rate error vs. true time
+    double offsetUs = 0;       // node clock = true*(1+ppm) + offset
+    double rxBiasUs = 0;       // constant per-node receive latency difference
+    Estimator est;
+    DelayCalibration cal;
+    int64_t firstValidUs = -1;
+    double nodeAt(double trueUs) const { return trueUs * (1.0 + ppm * 1e-6) + offsetUs; }
+    double trueAt(double nodeUs) const { return (nodeUs - offsetUs) / (1.0 + ppm * 1e-6); }
+};
+
+struct SimResult {
+    double pairP50 = 0, pairP95 = 0, pairMax = 0;      // node-to-node error
+    double absP95 = 0;                                  // vs. coordinator time, common bias removed
+    double firstValidS = 0;                             // time until the last node was valid
+    double validFraction = 0;
+};
+
+static double percentile(std::vector<double> v, double p) {
+    if (v.empty()) return 0;
+    std::sort(v.begin(), v.end());
+    const size_t i = static_cast<size_t>(p * (v.size() - 1) + 0.5);
+    return v[std::min(i, v.size() - 1)];
+}
+
+// Coordinator clock = true time (ppm 0). Airtime + base latency 1300 us.
+static SimResult simulate(int nodes, int seconds, unsigned seed, int pauseFromS, int pauseLenS,
+                          bool calibrateAll, double coordPpm = 0.0) {
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<double> uni(0, 1);
+    std::normal_distribution<double> gauss(0, 1);
+    std::vector<SimNode> n(nodes);
+    for (auto &x : n) {
+        x.ppm = (uni(rng) < 0.5 ? -1 : 1) * (4 + 32 * uni(rng));
+        x.offsetUs = 1e6 * (1 + 100 * uni(rng));
+        x.rxBiasUs = 8 * gauss(rng);
+        x.est.reset();
+    }
+    const double baseDelayUs = 1300;
+    const double twoWayBiasUs = 25;   // asymmetry of the two-way method, same for all
+    const double twoWayNoiseUs = 12;  // per calibration
+    SimResult res;
+    std::vector<double> pair, absErr;
+    size_t validChecks = 0, validCount = 0;
+    double clusterDelay = NAN;
+    int calibrated = 0;
+    for (int s = 0; s < seconds; ++s) {
+        const double tTx = 1e6 * (s + 1) + 20000 * uni(rng);   // true time of the stamp
+        const double coordStamp = tTx * (1 + coordPpm * 1e-6);
+        const bool paused = s >= pauseFromS && s < pauseFromS + pauseLenS;
+        // Common TX-side delay; usually small, sometimes up to 2.2 ms.
+        double q = 15 * uni(rng);
+        if (uni(rng) < 0.04) q += 300 + 1900 * uni(rng);
+        const int32_t txPath = static_cast<int32_t>(1000 + q + 20 * uni(rng));
+        if (!paused) {
+            for (auto &x : n) {
+                if (uni(rng) < 0.01) continue;  // lost frame
+                double rx = 12 + 20 * uni(rng);
+                if (uni(rng) < 0.10) rx += 100 + 200 * uni(rng);
+                const double tRx = tTx + q + baseDelayUs + x.rxBiasUs + rx;
+                Sample smp;
+                smp.nodeUs = static_cast<int64_t>(llround(x.nodeAt(tRx)));
+                smp.coordUs = static_cast<int64_t>(llround(coordStamp));
+                smp.txPathUs = txPath;
+                x.est.add(smp);
+            }
+        }
+        // Two-way calibration, one node at a time every 3 s (staggered).
+        if (!paused && (calibrateAll || calibrated < nodes / 2) && s >= 10 && s % 3 == 0) {
+            const int i = (s / 3) % nodes;
+            SimNode &x = n[i];
+            if (x.est.model().valid && x.est.model().samples >= kMinCalibrationSamples &&
+                (calibrateAll || !x.cal.known())) {
+                const double nodeRef = x.nodeAt(1e6 * s + 500000);
+                const double trueCoord = x.trueAt(nodeRef) * (1 + coordPpm * 1e-6);
+                const double theta = trueCoord - nodeRef + twoWayBiasUs + twoWayNoiseUs * gauss(rng);
+                const int64_t nodeRefI = static_cast<int64_t>(llround(nodeRef));
+                const double d = theta - x.est.envelopeOffsetUs(nodeRefI);
+                if (!x.cal.known()) ++calibrated;
+                x.cal.add(d, nodeRefI);
+            }
+        }
+        // Cluster median of the calibrated delays.
+        std::vector<double> ds;
+        for (auto &x : n) if (x.cal.known()) ds.push_back(x.cal.value());
+        if (!ds.empty()) clusterDelay = median(ds.data(), ds.size());
+        // Evaluate at a random true time inside this second.
+        const double tEval = 1e6 * (s + 1) + 1e6 * uni(rng);
+        std::vector<double> est;
+        bool allValid = true;
+        for (auto &x : n) {
+            const int64_t nodeNow = static_cast<int64_t>(llround(x.nodeAt(tEval)));
+            const double delay = x.cal.known() ? x.cal.value() : clusterDelay;
+            bool ok = x.est.model().valid && std::isfinite(delay);
+            // Holdover: last sample at most 15 s old.
+            if (ok && nodeNow - x.est.model().refNodeUs > 15000000LL) ok = false;
+            ++validChecks;
+            if (!ok) { allValid = false; continue; }
+            ++validCount;
+            if (x.firstValidUs < 0) x.firstValidUs = static_cast<int64_t>(tEval);
+            const double coordEst = nodeNow + x.est.envelopeOffsetUs(nodeNow) + delay;
+            const double coordTrue = tEval * (1 + coordPpm * 1e-6);
+            est.push_back(coordEst - coordTrue);
+        }
+        (void)allValid;
+        if (s >= 60 && est.size() >= 2) {
+            for (size_t i = 0; i < est.size(); ++i) {
+                absErr.push_back(std::fabs(est[i] - twoWayBiasUs));
+                for (size_t j = i + 1; j < est.size(); ++j) pair.push_back(std::fabs(est[i] - est[j]));
+            }
+        }
+    }
+    double lastFirst = 0;
+    for (auto &x : n) lastFirst = std::max(lastFirst, x.firstValidUs < 0 ? 1e12 : x.firstValidUs / 1e6);
+    res.firstValidS = lastFirst;
+    res.pairP50 = percentile(pair, 0.5);
+    res.pairP95 = percentile(pair, 0.95);
+    res.pairMax = percentile(pair, 1.0);
+    res.absP95 = percentile(absErr, 0.95);
+    res.validFraction = validChecks ? double(validCount) / double(validChecks) : 0;
+    return res;
+}
+
+static void print(const char *name, const SimResult &r) {
+    std::printf("%-34s pair p50 %6.1f us  p95 %6.1f us  max %6.1f us | |err-bias| p95 %6.1f us | all valid after %5.1f s | valid %5.1f %%\n",
+                name, r.pairP50, r.pairP95, r.pairMax, r.absP95, r.firstValidS, 100 * r.validFraction);
+}
+
+int main() {
+    testBasics();
+    testMedianAndDelay();
+
+    const SimResult a = simulate(9, 900, 1, 100000, 0, true);
+    print("9 nodes, all calibrated", a);
+    CHECK(a.pairP95 < 60);
+    CHECK(a.pairMax < 150);
+    CHECK(a.firstValidS < 60);
+    CHECK(a.validFraction > 0.93);
+
+    const SimResult b = simulate(100, 900, 2, 100000, 0, true);
+    print("100 nodes, all calibrated", b);
+    CHECK(b.pairP95 < 70);
+    CHECK(b.firstValidS < 60);
+
+    const SimResult c = simulate(100, 600, 3, 100000, 0, false);
+    print("100 nodes, half on cluster median", c);
+    CHECK(c.pairP95 < 80);
+    CHECK(c.firstValidS < 60);
+
+    // Beacon pause (capture hold) of 12 s at t=300 s: holdover keeps time.
+    const SimResult d = simulate(9, 600, 4, 300, 12, true);
+    print("9 nodes, 12 s beacon pause", d);
+    CHECK(d.pairP95 < 60);
+    CHECK(d.validFraction > 0.93);
+
+    // Coordinator quartz itself off by 30 ppm.
+    const SimResult e = simulate(9, 600, 5, 100000, 0, true, 30.0);
+    print("9 nodes, coordinator +30 ppm", e);
+    CHECK(e.pairP95 < 60);
+
+    if (failures) { std::printf("%d check(s) failed\n", failures); return 1; }
+    std::printf("all beacon sync tests passed\n");
+    return 0;
+}

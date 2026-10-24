@@ -11,7 +11,7 @@ namespace LoopLoadDiag {
 enum Section : uint8_t {
     Prelude = 0,       // watchdog, license, LED, heap/WiFi/task diagnostics, crash guard
     ClusterWifiPolicy,
-    ClusterEspNow,     // ClusterEspNowRadio::service / serviceDiagnosticBroadcaster
+    ClusterEspNow,     // ClusterEspNowRadio::service
     ClusterHwTime,     // hardware time session + GPIO meter
     ClusterCapture,    // scheduled cluster capture
     ClusterUdpGroup,   // multicast receive + packet processing

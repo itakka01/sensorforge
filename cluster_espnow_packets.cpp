@@ -8,7 +8,7 @@ void put(uint8_t* b, size_t pos, uint64_t value, unsigned count) {
 uint64_t get(const uint8_t* b, size_t pos, unsigned count) {
   uint64_t v=0; for(unsigned i=0;i<count;++i) v |= uint64_t(b[pos+i]) << (8*i); return v;
 }
-bool typeValid(Type t) { return t==Type::Beacon || t==Type::Probe || t==Type::Reply || t==Type::Final || t==Type::SyncControl || t==Type::NodeSyncReport || t==Type::NodeDriftReport || t==Type::BenchControl || t==Type::BenchDown || t==Type::BenchUp || t==Type::BenchAck; }
+bool typeValid(Type t) { return t==Type::Beacon || t==Type::Probe || t==Type::Reply || t==Type::Final || t==Type::SyncControl || t==Type::NodeSyncReport || t==Type::NodeDriftReport || t==Type::BenchControl || t==Type::BenchDown || t==Type::BenchUp || t==Type::BenchAck || t==Type::FollowUp || t==Type::BeaconSyncReport; }
 }
 bool encode(const Frame &f, uint8_t out[kPacketSize], SignMac sign, void* user) {
   if (!out || !sign || !typeValid(f.type) || !f.epoch || !f.coordinatorTag || !f.senderBoot || !f.sequence) return false;
@@ -17,6 +17,7 @@ bool encode(const Frame &f, uint8_t out[kPacketSize], SignMac sign, void* user) 
   put(out,8,f.epoch,4);put(out,12,f.sequence,4);put(out,16,f.coordinatorTag,8);
   put(out,24,f.senderBoot,8);put(out,32,static_cast<uint64_t>(f.timeUs),8);put(out,40,f.nonce,4);
   put(out,44,f.preSendDelayUs,4);  // V2: Software timestamp correction
+  put(out,48,static_cast<uint64_t>(f.auxUs),8);  // V3
   return sign(out,kPayloadSize,out+kPayloadSize,user);
 }
 bool decode(const uint8_t* b, size_t len, Frame &out, VerifyMac verify, void* user) {
@@ -27,6 +28,7 @@ bool decode(const uint8_t* b, size_t len, Frame &out, VerifyMac verify, void* us
   Frame f;f.type=type;f.epoch=static_cast<uint32_t>(get(b,8,4));f.sequence=static_cast<uint32_t>(get(b,12,4));
   f.coordinatorTag=get(b,16,8);f.senderBoot=get(b,24,8);f.timeUs=static_cast<int64_t>(get(b,32,8));f.nonce=static_cast<uint32_t>(get(b,40,4));
   f.preSendDelayUs=static_cast<uint32_t>(get(b,44,4));  // V2: Software timestamp correction
+  f.auxUs=static_cast<int64_t>(get(b,48,8));  // V3
   if(!f.epoch||!f.sequence||!f.coordinatorTag||!f.senderBoot) return false;
   out=f;return true;
 }

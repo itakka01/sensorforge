@@ -1,8 +1,45 @@
 # SensorForge / exapan C1 – ESP-NOW-Zeitsynchronisation
 
-**Stand:** 2026-10-13; Architektur-/Betriebsdokument zum Entwicklungsstand `v87-beta105` mit den ESP-NOW-Deltas bis `espnow_adaptive_rtt_regression_delta`.
+**Stand:** 2026-10-24, `v87-beta147` (Zeitsignal-Verfahren, Abschnitt 0). Die Abschnitte 4–6 und 12 beschreiben in Teilen das bis beta146 verwendete Verfahren; wo sie Abschnitt 0 widersprechen, gilt Abschnitt 0.
 
 **Validierungsstatus:** Der integrierte Code ist **noch nicht** durch einen vollständigen Arduino-ESP32-Build beider Boards und reale Funk-/GPIO-Tests bestätigt. Aussagen unten über Programmverhalten beschreiben den beabsichtigten und implementierten Codepfad, **keinen nachgewiesenen Genauigkeitswert**.
+
+## 0. Verfahren ab v87-beta147: Zeitsignal + seltene Laufzeit-Einmessung
+
+**Warum:** Bis beta146 bekam jeder Node seine Präzisionszeit nur aus eigenen Hin-und-zurück-Serien (Probe/Reply/Final), immer ein Node nach dem anderen (~3,5 s je Node), gültig 120 s. Das reicht lückenlos für ~24 Nodes; bei 100 Nodes wären die Nodes nur ~32 % der Zeit präzise. Ziel: 100 Nodes, Cluster in wenigen Minuten (praktisch: Sekunden) synchron.
+
+**Messung vorab (beta146, 9 Nodes, 128 Zeitsignale im 100-ms-Takt):** Zwei Nodes empfangen dasselbe Signal typisch 4–40 µs auseinander (Median aller Paare 17,5 µs). 5–15 % der Signale kommen an einem einzelnen Node 100–300 µs zu spät, nie zu früh. Zwischen Zeitstempel und tatsächlichem Senden am Coordinator lagen gelegentlich bis 2,2 ms, dann für alle Nodes gleich. Quarzabweichungen 4–36 ppm.
+
+**Ablauf**
+
+1. **Zeitsignal (Coordinator, `sendBeacon()`):** jede Sekunde ein signiertes `Beacon` (Typ 1) an alle. Es trägt selbst keine Zeit, nur den Cluster-Mittelwert der Funklaufzeit (`auxUs`, ns; unbekannt = INT64_MIN). Zeitstempel unmittelbar **vor** `esp_now_send()`, also nach der HMAC-Berechnung.
+2. **Folgepaket (`serviceFollowUp()`):** sobald der TX-Done-Callback des Beacons da ist (höchstens 30 ms Wartezeit) ein `FollowUp` (Typ 12): `nonce` = Sequenz des Beacons, `timeUs` = Zeitstempel (Coordinator-Monotonzeit), `auxUs` = Coordinator-UTC zu diesem Zeitstempel, `preSendDelayUs` = Sendeweg Zeitstempel → TX-Done (µs, `UINT32_MAX` = unbekannt).
+3. **Node-Modell (`cluster_beacon_sync.*`, reine Logik):** je Signal ein Messpunkt `y = Zeitstempel − Empfangszeit`. Alle Störungen sind Verspätungen, daher sind die **größten** `y` die sauberen. Gleitendes Fenster der letzten 64 Punkte (≤ 120 s); Gerade (Versatz + Gangabweichung) durch die obere Hälfte, dreimal nachgeschärft („obere Hüllkurve“). Verworfen werden Punkte, deren Sendeweg mehr als 150 µs über dem kürzesten der letzten 32 lag (Coordinator hat spät gesendet), und Punkte mehr als 150 µs über der Hüllkurve (physikalisch unmöglich; 5 in Folge = Modell neu aufbauen). Gültig ab 8 Punkten über ≥ 4 s, Streuung (RMS der oberen Hälfte) ≤ 150 µs, Gangabweichung ≤ 500 ppm.
+4. **Funklaufzeit:** Aus Zeitsignalen allein ist die konstante Laufzeit (Luftzeit ~1 ms + Empfangsweg) nicht bestimmbar. Sie wird mit einer Hin-und-zurück-Serie eingemessen: `Laufzeit = Zwei-Wege-Versatz − Hüllkurven-Versatz` (zum Mittelzeitpunkt der Serie). Der Node nutzt den Median seiner letzten 5 Einmessungen (eigen, höchstens 60 min alt), sonst den Cluster-Mittelwert aus dem Beacon (Median der eigenen Laufzeiten aller Nodes, Berichte ≤ 60 s, Einmessung ≤ 60 min). Plausibel: 0–10 ms.
+5. **Coordinator-Zeit am Node:** `Coordinator = Node + Hüllkurven-Versatz(Node) + Laufzeit`; UTC über das UTC/Monoton-Paar des neuesten Folgepakets (`precisionUtcNow()`).
+6. **Gültigkeit (`precision_state`):** Modell gültig, neuester Messpunkt ≤ 15 s alt (Überbrückung, z. B. Capture-Pause), Laufzeit (eigen oder Cluster) bekannt, UTC vom Coordinator vorhanden. Die 120-s-Gültigkeit einer Serie entfällt.
+7. **Einmess-Plan:** Slot-Planung aus 8.1 unverändert, aber fällig erst nach **10 min** (`kSlotRefreshAgeMs`), „abgelaufen“ (Diagnose) nach 30 min. Ein Node meldet sich erst zur Einmessung (`NodeSyncReport`), wenn sein Zeitsignal-Modell mindestens 32 Signale hat (`kMinCalibrationSamples`); eine früher fertige Serie wird bis 120 s lang aufgehoben. Grund: Auf der Hardware lag die erste Einmessung mit nur 8 Signalen bis 150 µs daneben, spätere streuten nur ±30 µs. Erfolg im Sinne des Plans = eigene Laufzeit vorhanden. Bei 100 Nodes (~3,5 s je Einmessung) dauert eine Runde ~6 min < 10 min.
+8. **Berichte:** `BeaconSyncReport` (Typ 13) alle 10 s: Modell gültig, Präzision gültig, Zustand, Laufzeitquelle, Punkte, Alter, Streuung, Gangabweichung, eigene Laufzeit + Alter, Streuung der letzten Serie. `NodeSyncReport` (Einmessung) alle 10 s und sofort nach jeder Serie, Serienstatistik alle 30 s.
+
+**Paketformat V3:** 56 Byte Nutzdaten (+8 Byte `auxUs`) + 32 Byte HMAC = 88 Byte, `kVersion` 3. Ältere Firmware wird nicht verstanden (alle Boards neu flashen).
+
+**Entfernt (beta147):** Zeit-Broadcaster mit Grant/Ack/Lease (`cluster_time_grant_protocol.h`, `cluster_time_shadow_handover.h`, `cluster_time_source_policy.h`, 80-Byte-SFDB-Diagnosebeacons `cluster_time_diagnostic_beacon.*`), Beacon-Intervalltest, passive Beacon-Vorhersage/Shared-Events, Drift-Regression über Serien (`cluster_espnow_regression.*`) und NVS-Driftspeicher (`cluster_espnow_drift.*`; die Gangabweichung kommt jetzt laufend aus dem Zeitsignal). Die Betriebsart „Zeit-Broadcaster“ bleibt als Standby-Betriebsart erhalten, verhält sich funkseitig aber wie ein normaler Node.
+
+**Simulation** (`test_beacon_sync.cpp.test`, Störungen wie gemessen, Zwei-Wege-Fehler 25 µs Versatz + 12 µs Rauschen je Einmessung, 1 % Verlust):
+
+| Szenario | Node-zu-Node p50 / p95 / max | alle gültig nach |
+|---|---|---|
+| 9 Nodes, alle eingemessen | 7 / 19 / 34 µs | 14 s |
+| 100 Nodes, alle eingemessen | 9 / 28 / 69 µs | 14 s |
+| 100 Nodes, Hälfte nur mit Cluster-Mittel | 12 / 33 / 68 µs | 14 s |
+| 9 Nodes, 12 s ohne Zeitsignal | 8 / 22 / 39 µs | 13 s |
+| 9 Nodes, Coordinator-Quarz +30 ppm | 7 / 20 / 35 µs | 13 s |
+
+Das sind Software-Zeitstempel in einem Modell; die Abnahme braucht den GPIO-Messaufbau (Abschnitt 13).
+
+**Erster Hardwarelauf (beta147, 9 Nodes, 13 dBm):** alle Nodes `valid`, Streuung des Zeitsignals 8–26 µs, keine unplausibel frühen Signale, je Node 1–2 % Signale wegen spätem Senden verworfen. Eingemessene Laufzeiten nach 2–3 Einmessungen 2041–2127 µs (erste Einmessung mit 8 Signalen bis 2240 µs, behoben durch die 32-Signal-Regel); Cluster-Mittel 2129 µs.
+
+**Diagnose:** `/cluster_status` → `espnow_time_local` (`precision_state`, `beacon_*`, `delay_source`, `own_delay_*`, `cluster_delay_*`, `beacon_tx_path_*`), je Node in `espnow_node_reports` (`precision_valid`, `precision_state`, `beacon_jitter_us`, `drift_ppm`, `own_delay_us`, `delay_source`, `calibrated`, …). Rohdaten der letzten 128 Zeitsignale je Gerät: `GET /cluster_espnow_beacon_trace_csv` (`sequence` ist auf allen Geräten gleich; `est_coord_us` = geschätzte Coordinator-Zeit beim Empfang vor dem Einrechnen des Punkts).
 
 ## 1. Ziel und Grenzen
 
@@ -17,8 +54,7 @@ Ziel ist eine gemeinsame, möglichst ruhige **Cluster-UTC-Zeitbasis** für zeitg
 | `cluster.cpp`, `cluster.h` | Clusteridentität, Epoch/Boot-ID, HMAC-Key-Ableitung, Anbindung an `clusterTimeNowUs()` |
 | `cluster_espnow_radio.*` | ESP-NOW-Initialisierung, Kanalbindung, begrenzte Empfangsqueue, Beacon/Probe/Reply/Final, SyncControl-Freigaben/Widerruf, Qualitätszustand |
 | `cluster_espnow_twoway.*` | Vier-Zeitstempel-Offset, RTT, RTT-Quartilsaggregation und Vergleichsschätzer |
-| `cluster_espnow_regression.*` | Gewichtete lineare Regression aus mehreren angenommenen Messserien für Drift in ppm |
-| `cluster_espnow_drift.*` | Coordinator-bezogene NVS-Kalibrierung und Validierung |
+| `cluster_beacon_sync.*` | Zeitsignal-Modell (obere Hüllkurve, Versatz + Gangabweichung) und Laufzeit-Einmessung, ab beta147 (Abschnitt 0) |
 | `webconfig_cluster.cpp` | Lokale Funkdiagnose; **noch keine authentifizierten Node-Einzelberichte im Coordinator** |
 
 `ESPNOW_*_STATUS.md` und `ESPNOW_*_INTEGRATION.md` dokumentieren historische Zwischenstände. Sie sind nicht als aktuelle Funktionsübersicht zu lesen; dieses Dokument beschreibt die zusammengesetzte Zielarchitektur.
@@ -29,7 +65,7 @@ ESP-NOW arbeitet auf der bereits verbundenen WLAN-STA und **erzwingt keinen Kana
 
 ## 4. Nachrichten und Sicherheitsmodell
 
-- **Broadcast (ca. alle 10 s):** Coordinator-ID, Epoch/Boot-ID, Sequenznummer, authentifizierte UTC-/Monoton-Paarung. Der Broadcast ist grobe Referenz und keine alleinige Präzisionsmessung.
+- **Zeitsignal (ab beta147 jede Sekunde, Beacon + Folgepaket):** siehe Abschnitt 0. Bis beta146: Beacon alle 10 s nur als UTC-Anker.
 - **Probe/Reply/Final (eine Serie je Mess-Slot des Nodes; fest 16 Austausche je Serie (die frühere adaptive Erweiterung auf 32/64 wurde in beta131 entfernt)):** vier *monotone* Zeitstempel `t1` Node vor Sendung, `t2` Coordinator beim Empfang, `t3` Coordinator vor Antwort, `t4` Node beim Empfang. Die Zeiten der ESP-NOW-API bzw. Callback-Ausführung sind nicht gleich physikalischen HF-Sende-/Empfangszeiten.
 - **Authentizität:** HMAC-SHA256 mit separat aus dem laufenden Cluster-Schlüssel abgeleitetem Schlüssel und Replay-/Sequenzprüfung; kein zusätzlicher langlebiger Klartext-Schlüssel. Broadcasts sind **nicht verschlüsselt**. Offenlegung der Zeit ist unkritischer als das Einschleusen einer falschen Zeit; HMAC schützt gegen unautorisierte Änderung, nicht gegen Jamming, Verzögerung oder asymmetrische Funklaufzeiten.
 - **Callback-Regel:** Ungeprüfte Eingangsdaten zunächst in eine begrenzte Queue; HMAC/Parsing/Auswertung außerhalb des WLAN-Callbacks. Queue-Überlauf ist als Verlust zu zählen.
@@ -97,6 +133,8 @@ Die Funk-RX-Callbacks bleiben kurz; der ESP-NOW-Empfänger kann weiterhin Pakete
 
 ### 8.1 Slot-Planung der Präzisionsserien (Coordinator, ab v87-beta141)
 
+**Ab beta147** sind die Serien nur noch Laufzeit-Einmessungen (Abschnitt 0): fällig nach 10 min statt 45 s, „abgelaufen“ nach 30 min statt 120 s, Ergebnis-Timeout 12 s (Berichte alle 10 s und sofort nach der Serie), ein Node probt nach Erfolg frühestens nach 30 s wieder. Die Tabellen unten zeigen das Verhalten des alten Verfahrens (120-s-Gültigkeit).
+
 Der Coordinator beantwortet Probes nur vom jeweiligen **Slot-Inhaber**; immer nur ein Node misst. Die Planung liegt in `cluster_slot_scheduler.h` (reine Logik, Host-Test `test_slot_scheduler.cpp.test`), angebunden in `serviceSlots()` von `cluster_espnow_radio.cpp`. Node-Firmware, Paketformate, Messverfahren (16 Austausche, Qualitätsgrenzen, Schätzer) und die 120-s-Gültigkeit sind unverändert; alte Nodes arbeiten mit einem neuen Coordinator zusammen.
 
 **Problem bis beta140:** feste Reihum-Vergabe, jeder aktive Node 14 s Slot + 3,5 s Pause, also ein Zyklus von N × 17,5 s (9 Nodes: 157,5 s). Eine Serie braucht aber nur rund 2 s (Start etwa 1 s nach der ersten Freigabe, 16 Austausche ≈ 0,8 s). Ab 7 Nodes war der Zyklus länger als die Gültigkeit von 120 s; Nodes fielen trotz erfolgreicher Serien auf `wifi_coordinator` zurück. Zusätzlich fassten Slot-Tabelle und Wiedergabeschutz nur 12 Nodes, und ESP-NOW-Partner (max. 20 in ESP-IDF) wurden nie freigegeben.
@@ -142,7 +180,7 @@ Faustregel: dauerhaft lückenlos, solange `Nodes × Slot-Dauer` deutlich unter 1
 | Jobs (`ClusterJobs::kMaxJobs`) | 256 | zwei Foto-Aufträge an 100 Nodes passen; volle Tabelle aktiver Jobs lehnt neue ab („Job-Liste voll“) |
 | Ressourcen / Discovery / Kamera-Übersicht | 256 / 128 / 128 | älteste bzw. abgelaufene Einträge werden ersetzt |
 | ESP-NOW-Partner für Antworten | 18 + Broadcast | am längsten unbenutzter Partner wird ersetzt (`unicastPeerEvictions` intern) |
-| **Präzisionszeit (Funkzeit)** | lückenlos bis ~24 Nodes | darüber gerecht verteilt, aber zeitweise WLAN-Zeit (Tabelle oben); gelbe Warnung ab 25 Nodes, rot bei Zyklus ≥ 120 s. Abhilfe erst mit dem geplanten Broadcast-Zeitverfahren |
+| **Präzisionszeit (Funkzeit)** | ab beta147 unabhängig von der Node-Zahl (Zeitsignal an alle) | Einmess-Runde je Node ~3,5 s; gelbe Warnung, wenn eine Runde länger als 10 min dauert, rot ab 30 min (ab ~500 Nodes). Bis beta146: lückenlos bis ~24 Nodes |
 
 Speicher: Die Tabellen belegen rund 250 KB PSRAM (von 8 MB) und haben ~28 KB statischen internen RAM freigegeben. `/cluster_status` wird in 4-KB-Teilen gesendet (100 Nodes ≈ 200 KB), Kamera- und Gruppenliste ebenso; zwischen den Teilen bedient der Coordinator den ESP-NOW-Funk (`clusterServiceTimeCritical()`), damit Zeitmessungen nicht ausfallen.
 

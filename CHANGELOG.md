@@ -1,3 +1,43 @@
+## v87-beta148 — 2026-10-24 (EINE ZEITANSICHT, GERÄTELISTE MIT ZEITSTATUS)
+
+**Anlass:** Auf der Coordinator-Seite gab es mehrere Zeitansichten (alte Sync-Tabelle, ESP-NOW-Diagnose, Hardware-Zeitmessung, manueller Zeitabgleich), und alle Widgets fragten `/cluster_status` alle 2–10 s ab. Der Status war schon bei 10 Geräten 35 KB groß (davon 20 KB Zeitberichte), bei 100 Nodes wären es ~350 KB je Abfrage gewesen.
+
+**NEU:**
+- Geräteliste: Spalte „Zeit“ (präzise / präzise mit Cluster-Wert / startet / nicht präzise / Meldung fehlt / offline), Sortierung „Probleme zuerst“ (Standard), „Name“, „Gruppe“, Filter „nur Probleme“. Ein Klick auf den Zeitstatus öffnet die Details.
+- Laden nur über „Aktualisieren“, optional „automatisch alle 30 s“ (aus), und während Aktionen kurz alle 3 s (Sammelaktion 30 s, Probe 20 s, Aufnahme bis 60 s nach dem Termin). Alle Bereiche zeichnen sich aus jeder Statusabfrage neu (`sfOnStatus`); der Benchmark-Status wird nur bei geöffnetem Bereich abgefragt.
+- Abschnitt „Zeitsynchronisation“ (`webconfig_cluster_time.*`): Coordinator-Zeile (Zeitsignale, Sendeweg, Cluster-Laufzeit, Dauer der Einmess-Runde) und je Node Zustand, Streuung, Gangabweichung, Funklaufzeit, **Langzeitwerte seit Start** (Anteil präzise, Ausfälle mit Zeitpunkt, größte Streuung, Einmessungen ok/verworfen); dazu Anleitung „Genauigkeit mit GPIO prüfen“.
+- Langzeitwerte führt der Coordinator aus den Zeitberichten der Nodes (alle 10 s, kein zusätzlicher Funkverkehr); fehlt ein Bericht länger als 30 s, zählt das als Ausfall.
+- `GET /cluster_time_nodes` (kompakt, ~200 Byte je Node) und `GET /cluster_time_csv` (Langzeitwerte, ersetzt die Stabilitätsmessung mit `sensorforge_monitor`).
+
+**ENTFERNT:** manueller Zeitabgleich (`SFTS1`/`SFTD1`, `/cluster_sync_time`, `/cluster_node_sync_time`, Aktion „Zeit synchronisieren“, Peer-Felder `time_report_*`/`selected_sync_*`, `manual_sync_*`) – die Zeit läuft automatisch über das Zeitsignal. `espnow_node_reports` aus `/cluster_status` (jetzt `/cluster_time_nodes`). Aus der Oberfläche: Tabelle „Zeitmessungen und Sync-Diagnose“, „ESP-NOW: lokale Funkdiagnose und Node-Sync“, Aktion „Hardware-Zeitmessung“ (braucht freigegebene Eingänge am Coordinator, mit devxiao3 als Coordinator nicht nutzbar; die Endpunkte `/cluster_hw_time_*` bleiben vorerst). Das passive GPIO-Messgerät (Freenove, `/cluster`) bleibt.
+
+**Hinweis:** Nur der Coordinator braucht beta148 für die neue Ansicht; die Nodes können beta147 behalten (kein Paketformat geändert). Die Seite `/cluster` fragt weiter alle 3 s ab (dort hängt die Clustersuche daran).
+
+**beta147 Nachmessung (32-Signal-Regel):** nach 2–3 Einmessungen eigene Laufzeiten 2033–2123 µs über 9 Nodes (vorher 2029–2240 µs).
+
+## v87-beta147 — 2026-10-24 (ZEITSIGNAL-VERFAHREN FÜR 100 NODES)
+
+**Anlass:** Das Hin-und-zurück-Verfahren hält die Präzisionszeit nur für ~24 Nodes lückenlos (100 Nodes: ~32 % der Zeit). Ziel: 100 Nodes, Cluster nach dem Start schnell synchron. Vorab gemessen (beta146, 9 Nodes): zwei Nodes empfangen dasselbe Signal typisch 4–40 µs auseinander, Ausreißer nur als Verspätung.
+
+**NEU (Details: `ESPNOW_TIME_ARCHITECTURE.md` Abschnitt 0):**
+- Coordinator sendet jede Sekunde ein signiertes Zeitsignal (`Beacon`) und direkt danach ein `FollowUp` mit dem echten Sendezeitpunkt (Stempel unmittelbar vor `esp_now_send()`), der Coordinator-UTC dazu und dem Sendeweg bis zum TX-Done-Callback.
+- `cluster_beacon_sync.h/.cpp` (reine Logik): Modell je Node aus den letzten 64 Zeitsignalen, obere Hüllkurve (Versatz + Gangabweichung), verwirft spät gesendete und unplausibel frühe Signale; Laufzeit-Einmessung (Median der letzten 5).
+- Hin-und-zurück-Serien messen nur noch die Funklaufzeit ein (alle 10 min reihum, Neulinge zuerst); bis dahin gilt der Cluster-Mittelwert, den der Coordinator im Zeitsignal mitschickt.
+- Präzisionszeit gültig, solange das Modell stimmt und das letzte Zeitsignal ≤ 15 s alt ist (statt 120 s je Serie). Simulation: alle Nodes nach ~14 s synchron, Node-zu-Node 95 % unter 20–33 µs (9/100 Nodes).
+- Neuer Bericht `BeaconSyncReport` je Node (alle 10 s); Coordinator-Seite zeigt je Node Zustand, Streuung, Gangabweichung, Laufzeit (eigen/Cluster).
+- `GET /cluster_espnow_beacon_trace_csv`: letzte 128 Zeitsignale je Gerät (Rohdaten für den Vergleich zwischen Nodes).
+- Paketformat V3 (88 Byte, `auxUs`); Empfangsqueue 24 statt 12 Pakete.
+
+**ENTFERNT:** Zeit-Broadcaster mit Grant/Ack/Lease und Diagnosebeacons, Beacon-Intervalltest samt Endpunkten (`/cluster_espnow_beacon_test_*`, `/cluster_espnow_beacons_csv`, `/cluster_espnow_beacon_stats_csv`, `/cluster_espnow_shared_events_csv`, `/cluster_espnow_diagnostic_*`, `/cluster_espnow_ab_prediction_json`), Drift-Regression über Serien und NVS-Driftspeicher. JSON: `espnow_grant_diagnostic`, `broadcaster_*`, `precision_guard_*`, `coordinator_*beacon*`, `precision_rtt_us` (jetzt `precision_jitter_us`), je Node `precision_accepted` (jetzt `calibrated`), `using_espnow_time`/`has_time_source`/`has_drift_report`. Tests `test_80byte_dispatch`, `test_lease_state_machine`, `test_time_source_flapping`, `test_v2_bootstrap_recovery`, `test_v2_condition_based_suppression`. Die Betriebsart „Zeit-Broadcaster“ bleibt (Standby), funkt aber wie ein normaler Node.
+
+**Warnung Kapazität:** „mehr als 24 Nodes“ entfällt; gelb, wenn eine Einmess-Runde länger als 10 min dauert, rot ab 30 min.
+
+**Erster Hardwarelauf:** alle 9 Nodes präzise, Streuung 8–26 µs; die erste Laufzeit-Einmessung jedes Nodes (Modell erst 8 Signale) lag bis 150 µs daneben, spätere ±30 µs. Fix im selben Stand: Einmessung erst ab 32 Signalen im Modell (`kMinCalibrationSamples`), Node meldet sich erst dann zur Einmessung; fertige Serie wird bis 120 s aufgehoben.
+
+**Hinweis:** Alle Boards brauchen beta147 (neues Paketformat). Abnahme mit dem GPIO-Messaufbau ausstehend.
+
+**Tests:** `test_beacon_sync.cpp.test` neu (Einheitstests + Simulation 9/100 Nodes, Pause, Coordinator-Quarzfehler); `test_v2_espnow_size`/`test_v2_protocol` auf V3; alle Host-Tests bestanden.
+
 ## v87-beta146 — 2026-10-24 (FIX: SENDELEISTUNGS-ERGEBNISSE AM COORDINATOR)
 
 **Fehler in beta145:** Die Rückmeldungen der Nodes zur Sendeleistung wurden am Coordinator angenommen, aber beim nächsten Heartbeat des Nodes (≤ 10 s) gelöscht: `processPresence()` baut den Peer-Eintrag neu auf und übernahm die neuen `tx*`-Felder nicht. Tabelle und `/api/v1/cluster/wifi_tx_power` zeigten deshalb „–“, obwohl alle Nodes den Wert gesetzt (und bei „dauerhaft“ gespeichert) hatten.

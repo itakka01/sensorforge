@@ -77,9 +77,6 @@ String clusterHwTimeStatusJson();
 String clusterHwTimeCsv();
 bool clusterRuntimeActive();
 bool clusterLocalIsCoordinator();
-// Sends an authenticated advisory time-sync trigger; no system-clock changes.
-bool clusterRequestTimeSync(String &error);
-bool clusterRequestNodeTimeSync(const String &nodeId, String &error);
 bool clusterRestartRequired();
 const char *clusterLastError();
 
@@ -179,17 +176,13 @@ bool clusterEspNowTimeVerify(const uint8_t *data, size_t length,
 // Storage/OTA admission must treat this as stronger than the 2s armed flag.
 bool clusterCaptureProtectionActive();
 
-// Grant/Ack/Revoke authentication adapters (no transport or TX permissions).
-// Only 64-byte authenticated bodies are accepted.
-bool clusterTimeGrantSign(const uint8_t *data, size_t len, uint8_t mac[32]);
-bool clusterTimeGrantVerify(const uint8_t *data, size_t len, const uint8_t mac[32]);
-
 // Optional node mount metadata (group, position, height, orientation).
 // Carried in the authenticated SFG1 UDP side packet next to the heartbeat;
 // display/selection only, never used for election, sync or capture timing.
 struct ClusterMountEntry {
     char integrationId[36];
     char hostname[64];
+    uint32_t bootNonce;           // current boot of the device (joins ESP-NOW reports)
     bool local;
     bool mountKnown;              // false: peer firmware sends no mount data
     ClusterGroups::Mount mount;

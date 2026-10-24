@@ -1,5 +1,4 @@
 #include "cluster.h"
-#include "cluster_time_grant_protocol.h"
 #include "cluster_espnow_packets.h"
 #include "cluster_espnow_radio.h"
 #include "cluster_jobs.h"
@@ -111,8 +110,6 @@ static const char *CLUSTER_NODE_ACK_MAGIC = "SFNA1";
 // Time is an OPTIONAL sidecar to the cluster: it never adjusts the system RTC.
 static const char *CLUSTER_TIME_REQUEST_MAGIC = "SFTQ1";
 static const char *CLUSTER_TIME_REPLY_MAGIC = "SFTR1";
-static const char *CLUSTER_TIME_SYNC_COMMAND_MAGIC = "SFTS1";
-static const char *CLUSTER_TIME_REPORT_MAGIC = "SFTD1";
 // Beta72: authenticated, non-destructive transport probe only.
 static const char *CLUSTER_JOB_PROBE_MAGIC = "SFJP1";
 static const char *CLUSTER_JOB_ACK_MAGIC = "SFJA1";
@@ -302,16 +299,6 @@ struct ClusterPeer {
     uint32_t freeHeapBytes;
     bool mountValid;
     ClusterGroups::Mount mount;
-    bool timeReportValid;
-    uint32_t timeReportMs;
-    uint32_t timeReportEpoch;
-    uint32_t timeReportCommandSeq;
-    uint32_t selectedSyncSeq;
-    uint32_t selectedSyncRequestedMs;
-    int64_t timeReportUtcUs;
-    int64_t timeReportOffsetUs;
-    int64_t timeReportRttUs;
-    int64_t timeReportUncertaintyUs;
     // Last TX-power result reported by this node (coordinator side).
     int16_t txRequestedX10;
     int16_t txActualX10;
@@ -431,19 +418,10 @@ static char timeAuthorityId[36] = {};
 static uint32_t timeAuthorityEpoch = 0;
 static uint32_t timeAcceptedSamples = 0;
 static uint32_t timeRejectedSamples = 0;
-// Coordinator-only manual sync: volatile monotonic command IDs per boot/epoch.
-static uint32_t timeSyncCommandSeq = 0;
-static uint32_t timeSyncLastReceivedSeq = 0;
-static uint32_t timeSyncLastCoordinatorBoot = 0;
-static uint32_t timeSyncLastCommandMs = 0;
-static uint32_t timeSyncCommandsReceived = 0;
-static uint32_t timeSyncCommandsSent = 0;
 
 static void resetClusterTimeEstimate()
 {
     timeLastRequestMs = 0; // new coordinator/epoch: synchronize immediately
-    timeSyncLastReceivedSeq = 0;
-    timeSyncLastCoordinatorBoot = 0;
     timePendingSeq = 0;
     timeEstimateValid = false;
     timeAnchorUtcUs = 0;
@@ -830,34 +808,6 @@ static bool espNowTimeMac(const uint8_t *data, size_t len, uint8_t mac[32])
     if (!runtimeActive || !runtimeHmacKey || !data || !mac ||
         len != EspNowTimePackets::kPayloadSize) return false;
     static const uint8_t context[] = "SensorForge/ESP-NOW/time/HMAC/v1";
-    uint8_t subkey[32] = {};
-    if (!computePacketMac(context, sizeof(context) - 1, subkey)) return false;
-    const bool ok = computePacketMacWithRawKey(subkey, data, len, mac);
-    secureWipe(subkey, sizeof(subkey));
-    return ok;
-}
-
-// Diagnostics-only 80-byte broadcaster frames. A separate derived key and
-// non-production frame size prevent the existing 76-byte clock RX path from
-// accepting these as time authority messages.
-static bool diagnosticBeaconMac(const uint8_t *data, size_t len, uint8_t mac[32])
-{
-    if (!runtimeActive || !runtimeHmacKey || !data || !mac || len != 48) return false;
-    static const uint8_t context[] = "SensorForge/ESP-NOW/diagnostic-beacon/HMAC/v1";
-    uint8_t subkey[32] = {};
-    if (!computePacketMac(context, sizeof(context) - 1, subkey)) return false;
-    const bool ok = computePacketMacWithRawKey(subkey, data, len, mac);
-    secureWipe(subkey, sizeof(subkey));
-    return ok;
-}
-
-// Separate HMAC key for SF-TG grant/ack/revoke protocol. No radio action is
-// enabled by this adapter. Never reuse the production time-beacon subkey.
-static bool grantProtocolMac(const uint8_t *data, size_t len, uint8_t mac[32])
-{
-    if (!runtimeActive || !runtimeHmacKey || !data || !mac ||
-        len != ClusterTimeGrantProtocol::kBodyBytes) return false;
-    static const uint8_t context[] = "SensorForge/ESP-NOW/time-grant/HMAC/v1";
     uint8_t subkey[32] = {};
     if (!computePacketMac(context, sizeof(context) - 1, subkey)) return false;
     const bool ok = computePacketMacWithRawKey(subkey, data, len, mac);
@@ -2003,16 +1953,6 @@ static void processPresence(
     ClusterGroups::mountClear(preservedMount);
     if (preservedMountValid)
         preservedMount = peer->mount;
-    const bool preservedTimeReportValid = sameBoot && peer->timeReportValid;
-    const uint32_t preservedTimeReportMs = preservedTimeReportValid ? peer->timeReportMs : 0;
-    const uint32_t preservedTimeReportEpoch = preservedTimeReportValid ? peer->timeReportEpoch : 0;
-    const uint32_t preservedTimeReportCommandSeq = preservedTimeReportValid ? peer->timeReportCommandSeq : 0;
-    const uint32_t preservedSelectedSyncSeq = sameBoot ? peer->selectedSyncSeq : 0;
-    const uint32_t preservedSelectedSyncRequestedMs = sameBoot ? peer->selectedSyncRequestedMs : 0;
-    const int64_t preservedTimeReportUtcUs = preservedTimeReportValid ? peer->timeReportUtcUs : 0;
-    const int64_t preservedTimeReportOffsetUs = preservedTimeReportValid ? peer->timeReportOffsetUs : 0;
-    const int64_t preservedTimeReportRttUs = preservedTimeReportValid ? peer->timeReportRttUs : 0;
-    const int64_t preservedTimeReportUncertaintyUs = preservedTimeReportValid ? peer->timeReportUncertaintyUs : 0;
     // Last TX-power job result of this boot (cluster TX-power page/API).
     const int16_t preservedTxRequestedX10 = sameBoot ? peer->txRequestedX10 : 0;
     const int16_t preservedTxActualX10 = sameBoot ? peer->txActualX10 : 0;
@@ -2058,16 +1998,6 @@ static void processPresence(
     peer->freeHeapBytes = preservedFreeHeapBytes;
     peer->mountValid = preservedMountValid;
     peer->mount = preservedMount;
-    peer->timeReportValid = preservedTimeReportValid;
-    peer->timeReportMs = preservedTimeReportMs;
-    peer->timeReportEpoch = preservedTimeReportEpoch;
-    peer->timeReportCommandSeq = preservedTimeReportCommandSeq;
-    peer->selectedSyncSeq = preservedSelectedSyncSeq;
-    peer->selectedSyncRequestedMs = preservedSelectedSyncRequestedMs;
-    peer->timeReportUtcUs = preservedTimeReportUtcUs;
-    peer->timeReportOffsetUs = preservedTimeReportOffsetUs;
-    peer->timeReportRttUs = preservedTimeReportRttUs;
-    peer->timeReportUncertaintyUs = preservedTimeReportUncertaintyUs;
     peer->txRequestedX10 = preservedTxRequestedX10;
     peer->txActualX10 = preservedTxActualX10;
     peer->txState = preservedTxState;
@@ -2710,19 +2640,6 @@ static void processTimeReply(char **f, size_t n, const IPAddress &ip)
     strncpy(timeAuthorityId, currentCoordinatorId, sizeof(timeAuthorityId)-1);
     timeAuthorityEpoch = currentCoordinatorEpoch;
     ++timeAcceptedSamples;
-    // One compact signed report per accepted measurement; no periodic telemetry.
-    const int64_t wallUs = localUnixTimeUs();
-    const int64_t offsetUs = wallUs ? (referenceMidpoint + (t4 - localMidpoint) - wallUs) : -86400000000LL;
-    const int64_t uncertaintyUs = rtt / 2;
-    char ownBootText[9];
-    snprintf(ownBootText, sizeof(ownBootText), "%08lx", (unsigned long)bootNonce);
-    const String report = String(CLUSTER_TIME_REPORT_MAGIC) + "|" + runtimeClusterTag + "|" +
-        deviceIntegrationId() + "|" + ownBootText + "|" +
-        String((unsigned long)currentCoordinatorEpoch) + "|" +
-        String((unsigned long)timeSyncLastReceivedSeq) + "|" +
-        int64Text(referenceMidpoint) + "|" + int64Text(offsetUs) + "|" +
-        int64Text(rtt) + "|" + int64Text(uncertaintyUs);
-    sendSignedPayloadTo(report, currentCoordinatorIp, CLUSTER_COORDINATOR_PORT, "cluster time report");
 }
 
 static void requestClusterTime(uint32_t now)
@@ -2746,68 +2663,6 @@ static void requestClusterTime(uint32_t now)
     if (!sendSignedPayloadTo(payload, currentCoordinatorIp,
                              CLUSTER_COORDINATOR_PORT, "cluster time request"))
         timePendingSeq = 0;
-}
-
-// Signed multicast command: only the currently elected coordinator, with the
-// current boot nonce and epoch, may request an immediate time sample.
-// This is an advisory trigger, NOT a remote system-clock change.
-// SFTD1 is HMAC-authenticated in processPacket, and additionally bound to
-// a live peer, its current boot nonce and the coordinator's current epoch.
-static void processTimeReport(char **f, size_t n, const IPAddress &ip)
-{
-    if (n != 10 || !runtimeActive || !localIsCoordinator ||
-        strcmp(f[1], runtimeClusterTag) != 0 || !integrationIdValid(f[2])) return;
-    uint32_t senderBoot=0, epoch=0, commandSeq=0;
-    int64_t utc=0, offset=0, rtt=0, uncertainty=0;
-    if (!parseUint32Strict(f[3], senderBoot, 16) ||
-        !parseUint32Strict(f[4], epoch) ||
-        !parseUint32Strict(f[5], commandSeq) ||
-        !parseInt64Strict(f[6], utc) || !parseInt64Strict(f[7], offset) ||
-        !parseInt64Strict(f[8], rtt) || !parseInt64Strict(f[9], uncertainty) ||
-        epoch != currentCoordinatorEpoch || senderBoot == 0 ||
-        utc < 1577836800000000LL || rtt < 0 || rtt > CLUSTER_TIME_MAX_RTT_US ||
-        uncertainty < 0 || uncertainty > CLUSTER_TIME_MAX_RTT_US ||
-        offset < -86400000000LL || offset > 86400000000LL ||
-        commandSeq > timeSyncCommandSeq) return;
-    ClusterPeer *peer = findPeer(f[2]);
-    if (!peer || peer->bootNonce != senderBoot || peer->ip != ip ||
-        (uint32_t)(millis() - peer->lastSeenMs) > 60000UL) return;
-    // A delayed report from a previous request may not overwrite a newer one.
-    if (peer->timeReportValid && peer->timeReportCommandSeq > commandSeq) return;
-    peer->timeReportValid = true;
-    peer->timeReportMs = millis();
-    peer->timeReportEpoch = epoch;
-    peer->timeReportCommandSeq = commandSeq;
-    peer->timeReportUtcUs = utc;
-    peer->timeReportOffsetUs = offset;
-    peer->timeReportRttUs = rtt;
-    peer->timeReportUncertaintyUs = uncertainty;
-}
-
-static void processTimeSyncCommand(char **f, size_t n, const IPAddress &ip)
-{
-    // SFTS1|tag|coordinator_id|boot_hex|coordinator_epoch|sequence
-    if (n != 6 || !runtimeActive || localIsCoordinator ||
-        strcmp(f[1], runtimeClusterTag) != 0 ||
-        strcmp(f[2], currentCoordinatorId) != 0 ||
-        ip != currentCoordinatorIp) return;
-    uint32_t senderBoot = 0, epoch = 0, seq = 0;
-    if (!parseUint32Strict(f[3], senderBoot, 16) ||
-        !parseUint32Strict(f[4], epoch) ||
-        !parseUint32Strict(f[5], seq) || senderBoot == 0 || seq == 0 ||
-        epoch == 0 || epoch != currentCoordinatorEpoch) return;
-    const ClusterPeer *peer = findPeer(f[2]);
-    if (!peer || peer->bootNonce != senderBoot || peer->ip != ip ||
-        (uint32_t)(millis() - peer->lastSeenMs) > 60000UL) return;
-    if (timeSyncLastCoordinatorBoot == senderBoot &&
-        seq <= timeSyncLastReceivedSeq) return;
-    timeSyncLastCoordinatorBoot = senderBoot;
-    timeSyncLastReceivedSeq = seq;
-    timeSyncLastCommandMs = millis();
-    ++timeSyncCommandsReceived;
-    // Bypass the regular 15-minute interval. A failed request continues
-    // through the existing bounded 30-second retry path.
-    timeLastRequestMs = 0;
 }
 
 // A probe has NO executor and cannot restart, power down or delete anything.
@@ -3922,8 +3777,6 @@ static void processPacket(
         processNodeAck(fields, fieldCount, remoteIp);
     } else if (strcmp(fields[0], CLUSTER_TIME_REQUEST_MAGIC) == 0) {
         processTimeRequest(fields, fieldCount, remoteIp);
-    } else if (strcmp(fields[0], CLUSTER_TIME_SYNC_COMMAND_MAGIC) == 0) {
-        processTimeSyncCommand(fields, fieldCount, remoteIp);
     } else if (strcmp(fields[0], CLUSTER_TIME_REPLY_MAGIC) == 0) {
         processTimeReply(fields, fieldCount, remoteIp);
     } else if (strcmp(fields[0], CLUSTER_JOB_PROBE_MAGIC) == 0) {
@@ -3962,8 +3815,6 @@ static void processPacket(
         processJobWipeResult(fields,fieldCount,remoteIp);
     } else if (strcmp(fields[0], CLUSTER_JOB_REJECT_MAGIC) == 0) {
         processJobRefusal(fields, fieldCount, remoteIp);
-    } else if (strcmp(fields[0], CLUSTER_TIME_REPORT_MAGIC) == 0) {
-        processTimeReport(fields, fieldCount, remoteIp);
     }
 }
 
@@ -4660,10 +4511,6 @@ void clusterNetworkStop()
         runtimeHmacKey = 0;
     }
     resetClusterTimeEstimate();
-    timeSyncCommandSeq = 0;
-    timeSyncLastCommandMs = 0;
-    timeSyncCommandsReceived = 0;
-    timeSyncCommandsSent = 0;
 }
 
 void clusterMdnsAdvertise()
@@ -4768,21 +4615,10 @@ void clusterLoop()
     // Capture deadline takes precedence over any radio work.
     if (!clusterCaptureProtectionActive()) {
         LoopLoadDiag::Scope loadScope(LoopLoadDiag::ClusterEspNow);
-        if (cfg_operating_mode == "time_broadcaster") {
-            // Beta131-CORRECTED (Third cycle): Broadcaster receives BOTH IDs (Problem 1 & 2 FIX)
-            // 1. Own device ID - for diagnostic beacons and Grant identity verification
-            // 2. Coordinator ID - for time reference validation in precisionUtcNow()
-            ClusterEspNowRadio::serviceDiagnosticBroadcaster(runtimeActive && !localIsCoordinator,
-                                                              currentCoordinatorEpoch,
-                                                              deviceIntegrationId().c_str(),  // Broadcaster's OWN ID
-                                                              currentCoordinatorId,  // Coordinator's ID
-                                                              bootNonce);
-        } else {
-            ClusterEspNowRadio::service(runtimeActive && (localIsCoordinator || droneModeEnabled()),
-                                       localIsCoordinator, currentCoordinatorEpoch,
-                                       localIsCoordinator ? deviceIntegrationId().c_str() : currentCoordinatorId,
-                                       bootNonce);
-        }
+        ClusterEspNowRadio::service(runtimeActive && (localIsCoordinator || droneModeEnabled()),
+                                   localIsCoordinator, currentCoordinatorEpoch,
+                                   localIsCoordinator ? deviceIntegrationId().c_str() : currentCoordinatorId,
+                                   bootNonce);
     }
     {
         LoopLoadDiag::Scope loadScope(LoopLoadDiag::ClusterHwTime);
@@ -4961,74 +4797,6 @@ bool clusterLocalIsCoordinator()
     return runtimeActive && localIsCoordinator &&
            currentCoordinatorEpoch != 0 &&
            strcmp(currentCoordinatorId, deviceIntegrationId().c_str()) == 0;
-}
-
-bool clusterRequestTimeSync(String &error)
-{
-    if (!clusterLocalIsCoordinator()) {
-        error = "Dieses Gerät ist nicht der aktive Coordinator.";
-        return false;
-    }
-    if (!localUnixTimeUs()) {
-        error = "Coordinator hat noch keine gültige Systemzeit.";
-        return false;
-    }
-    // Limit interactive command rate. This affects only manual sync commands.
-    const uint32_t now = millis();
-    if (timeSyncLastCommandMs && (uint32_t)(now - timeSyncLastCommandMs) < 10000UL) {
-        error = "Zeit-Sync wurde gerade erst angefordert.";
-        return false;
-    }
-    char bootText[9];
-    snprintf(bootText, sizeof(bootText), "%08lx", (unsigned long)bootNonce);
-    const uint32_t seq = ++timeSyncCommandSeq;
-    const String payload = String(CLUSTER_TIME_SYNC_COMMAND_MAGIC) + "|" +
-        runtimeClusterTag + "|" + deviceIntegrationId() + "|" + bootText +
-        "|" + String((unsigned long)currentCoordinatorEpoch) + "|" +
-        String((unsigned long)seq);
-    if (!sendSignedPayload(payload, "manual cluster time sync")) {
-        error = String(lastError);
-        return false;
-    }
-    timeSyncLastCommandMs = now;
-    ++timeSyncCommandsSent;
-    return true;
-}
-
-// Manual selected-node time sync: same signed SFTS1 format as multicast,
-// delivered by authenticated unicast. Other nodes do not receive the command.
-bool clusterRequestNodeTimeSync(const String &nodeId, String &error)
-{
-    if (!clusterLocalIsCoordinator()) {
-        error = "Nur der aktive Coordinator darf einen Zeitabgleich anfordern."; return false;
-    }
-    if (!localUnixTimeUs()) {
-        error = "Coordinator hat noch keine gültige Systemzeit."; return false;
-    }
-    const ClusterPeer *peer = findPeer(nodeId.c_str());
-    if (!peer || !peer->used || !usableIp(peer->ip) || peer->bootNonce == 0 ||
-        (uint32_t)(millis() - peer->lastSeenMs) > 60000UL) {
-        error = "Node ist nicht authentifiziert erreichbar."; return false;
-    }
-    if (rejectStandbyNodeAction(peer, error)) return false;
-    char bootText[9];
-    snprintf(bootText, sizeof(bootText), "%08lx", (unsigned long)bootNonce);
-    if (++timeSyncCommandSeq == 0) ++timeSyncCommandSeq;
-    const String payload = String(CLUSTER_TIME_SYNC_COMMAND_MAGIC) + "|" +
-        runtimeClusterTag + "|" + deviceIntegrationId() + "|" + bootText + "|" +
-        String((unsigned long)currentCoordinatorEpoch) + "|" +
-        String((unsigned long)timeSyncCommandSeq);
-    if (!sendSignedPayloadTo(payload, peer->ip, CLUSTER_COORDINATOR_PORT,
-                             "selected node time sync")) {
-        error = String(lastError); return false;
-    }
-    ClusterPeer *updatedPeer = findPeer(nodeId.c_str());
-    if (updatedPeer) {
-        updatedPeer->selectedSyncSeq = timeSyncCommandSeq;
-        updatedPeer->selectedSyncRequestedMs = millis();
-    }
-    ++timeSyncCommandsSent;
-    return true;
 }
 
 // Administrator-triggerable transport test; no destructive operations.
@@ -5794,10 +5562,10 @@ static String buildClusterStatusJson(ClusterStatusChunkSink sink, void *ctx)
     json += "\"valid\":";
     json += clusterClockValid ? "true" : "false";
     json += ",\"source\":\"";
-    uint32_t sourceAge=0; double sourceRtt=0; int64_t sourceUtc=0;
+    uint32_t sourceAge=0; double sourceJitter=0; int64_t sourceUtc=0;
     const bool espSource=!localIsCoordinator && droneModeEnabled() &&
         ClusterEspNowRadio::precisionUtcNow(currentCoordinatorEpoch,currentCoordinatorId,
-                                              sourceUtc,sourceAge,sourceRtt);
+                                              sourceUtc,sourceAge,sourceJitter);
     json += localIsCoordinator ? "local_coordinator" : (espSource ? "espnow_precision" : "wifi_coordinator");
     json += "\"";
     json += ",\"utc_us\":" + int64Text(clusterClockValid ? clusterUtc : 0);
@@ -5815,133 +5583,146 @@ static String buildClusterStatusJson(ClusterStatusChunkSink sink, void *ctx)
         (timeLastRttUs / 2 + (int64_t)sampleAgeMs * 50LL / 1000LL) : 0);
     json += ",\"uncertainty_estimate_us\":" + int64Text(estimatedUncertaintyUs);
     json += ",\"sync_interval_sec\":900";
-    json += ",\"manual_sync_sequence\":" + String((unsigned long)timeSyncCommandSeq);
-    json += ",\"manual_sync_sent\":" + String((unsigned long)timeSyncCommandsSent);
-    json += ",\"manual_sync_received\":" + String((unsigned long)timeSyncCommandsReceived);
     json += ",\"last_rtt_us\":" + int64Text(timeLastRttUs);
     json += ",\"sample_age_ms\":" + String(timeEstimateValid ? (unsigned long)(nowMs-timeLastSampleMs) : 0UL);
     json += ",\"accepted\":" + String((unsigned long)timeAcceptedSamples);
     json += ",\"rejected\":" + String((unsigned long)timeRejectedSamples);
     json += "}";
-    // Local radio diagnostics only. Node-specific ESP-NOW estimates are NOT
-    // present in coordinator discovery reports and must not be fabricated.
+    // Local radio diagnostics (beta147 beacon sync, ESPNOW_TIME_ARCHITECTURE.md).
     const ClusterEspNowRadio::Diagnostics esn = ClusterEspNowRadio::diagnostics();
+    auto jb = [&json](const char *key, bool v) { json += ",\""; json += key; json += "\":"; json += v ? "true" : "false"; };
+    auto ju = [&json](const char *key, unsigned long v) { json += ",\""; json += key; json += "\":"; json += String(v); };
+    auto jd = [&json](const char *key, double v, unsigned digits) { json += ",\""; json += key; json += "\":"; json += String(v, digits); };
+    auto js = [&json](const char *key, const char *v) { json += ",\""; json += key; json += "\":\""; json += v; json += "\""; };
     json += ",\"espnow_time_local\":{";
     json += "\"active\":"; json += esn.active ? "true" : "false";
-    json += ",\"channel\":" + String((unsigned int)esn.channel);
-    json += ",\"sent\":" + String((unsigned long)esn.sent);
-    json += ",\"received\":" + String((unsigned long)esn.received);
-    json += ",\"authenticated\":" + String((unsigned long)esn.authenticated);
-    json += ",\"rejected\":" + String((unsigned long)esn.rejected);
-    json += ",\"replay\":" + String((unsigned long)esn.replay);
-    json += ",\"dropped\":" + String((unsigned long)esn.dropped);
-    json += ",\"probes_sent\":" + String((unsigned long)esn.probesSent);
-    json += ",\"probes_answered\":" + String((unsigned long)esn.probesAnswered);
-    json += ",\"exchanges_complete\":" + String((unsigned long)esn.exchangesComplete);
-    json += ",\"exchange_timeouts\":" + String((unsigned long)esn.exchangeTimeouts);
-    json += ",\"rx_queue_delay_last_us\":" + String((unsigned long)esn.rxQueueDelayLastUs);
-    json += ",\"rx_queue_delay_max_us\":" + String((unsigned long)esn.rxQueueDelayMaxUs);
-    json += ",\"reply_final_dispatch_gap_last_us\":" + String((unsigned long)esn.replyFinalDispatchGapLastUs);
-    json += ",\"reply_final_dispatch_gap_max_us\":" + String((unsigned long)esn.replyFinalDispatchGapMaxUs);
-    json += ",\"probe_tx_pre_send_last_us\":" + String((unsigned long)esn.probeTxPreSendLastUs);
-    json += ",\"probe_tx_pre_send_max_us\":" + String((unsigned long)esn.probeTxPreSendMaxUs);
-    json += ",\"probe_tx_pre_send_samples\":" + String((unsigned long)esn.probeTxPreSendSamples);
-    json += ",\"probe_tx_pre_send_mean_us\":" + String(esn.probeTxPreSendSamples ? double(esn.probeTxPreSendTotalUs)/esn.probeTxPreSendSamples : 0.0, 2);
-    json += ",\"reply_tx_pre_send_last_us\":" + String((unsigned long)esn.replyTxPreSendLastUs);
-    json += ",\"reply_tx_pre_send_max_us\":" + String((unsigned long)esn.replyTxPreSendMaxUs);
-    json += ",\"reply_tx_pre_send_samples\":" + String((unsigned long)esn.replyTxPreSendSamples);
-    json += ",\"reply_tx_pre_send_mean_us\":" + String(esn.replyTxPreSendSamples ? double(esn.replyTxPreSendTotalUs)/esn.replyTxPreSendSamples : 0.0, 2);
-    json += ",\"tx_callback_delay_last_us\":" + String((unsigned long)esn.txCallbackLatencyLastUs);
-    json += ",\"tx_callback_delay_max_us\":" + String((unsigned long)esn.txCallbackLatencyMaxUs);
-    json += ",\"tx_callback_samples\":" + String((unsigned long)esn.txCallbackSamples);
-    json += ",\"tx_callback_failed\":" + String((unsigned long)esn.txCallbackFailed);
-    json += ",\"tx_pending_overflow\":" + String((unsigned long)esn.txPendingOverflow);
-    json += ",\"tx_callback_unmatched\":" + String((unsigned long)esn.txCallbackUnmatched);
-    json += ",\"last_exchange_valid\":"; json += esn.lastExchangeValid ? "true" : "false";
-    json += ",\"last_offset_us\":" + String(esn.lastOffsetUs, 3);
-    json += ",\"last_rtt_us\":" + String(esn.lastRttUs, 3);
-    json += ",\"last_series_estimate_available\":"; json += esn.lastSeriesEstimateAvailable ? "true" : "false";
-    json += ",\"last_series_estimate_age_ms\":" + String((unsigned long)esn.lastSeriesEstimateAgeMs);
-    json += ",\"last_series_selected\":" + String((unsigned int)esn.lastSeriesSelected);
-    json += ",\"last_series_spread_us\":" + String(esn.lastSeriesSpreadUs, 3);
-    json += ",\"last_series_rtt_min_us\":" + String(esn.lastSeriesRttMinUs, 3);
-    json += ",\"last_series_rtt_max_us\":" + String(esn.lastSeriesRttMaxUs, 3);
-    json += ",\"last_series_offset_p10_relative_us\":" + String(esn.lastSeriesOffsetP10Us, 3);
-    json += ",\"last_series_offset_p90_relative_us\":" + String(esn.lastSeriesOffsetP90Us, 3);
-    json += ",\"drift_valid\":"; json += esn.driftValid ? "true" : "false";
-    json += ",\"stored_drift_available\":"; json += esn.storedDriftAvailable ? "true" : "false";
-    json += ",\"drift_ppm\":" + String(esn.driftPpm, 4);
-    json += ",\"drift_uncertainty_ppm\":" + String(esn.driftUncertaintyPpm, 4);
-    json += ",\"drift_samples\":" + String((unsigned long)esn.driftSamples);
-    json += ",\"drift_persisted\":" + String((unsigned long)esn.driftPersisted);
-    json += ",\"last_accepted_age_ms\":" + String((unsigned long)esn.lastAcceptedAgeMs);
-    json += ",\"precision_recently_accepted\":"; json += esn.precisionRecentlyAccepted ? "true" : "false";
-    json += ",\"action_pause_remaining_ms\":" + String((unsigned long)esn.capturePauseRemainingMs);
-    json += ",\"precision_clock_active\":";json += espSource ? "true" : "false";
-    json += ",\"precision_sample_age_ms\":" + String(espSource ? (unsigned long)sourceAge : 0UL);
-    json += ",\"precision_rtt_us\":" + String(espSource ? sourceRtt : 0.0, 3);
-    // Beta131: Broadcaster handover diagnostics (minimal addition for verification)
-    json += ",\"broadcaster_lease_active\":"; json += esn.broadcasterLeaseActive ? "true" : "false";
-    json += ",\"broadcaster_lease_remaining_ms\":" + String((unsigned long)esn.broadcasterLeaseRemainingMs);
-    json += ",\"broadcaster_production_beacons_sent\":" + String((unsigned long)esn.broadcasterProductionBeaconsSent);
-    json += ",\"coordinator_suppressing_beacons\":"; json += esn.coordinatorSuppressingBeacons ? "true" : "false";
-    json += ",\"coordinator_beacons_suppressed\":" + String((unsigned long)esn.coordinatorBeaconsSuppressed);
-    // Beta136: coordinator_suppressing_beacons = actual suppression; lease state separately.
-    json += ",\"coordinator_broadcaster_lease_active\":"; json += esn.coordinatorBroadcasterLeaseActive ? "true" : "false";
-    json += ",\"coordinator_broadcaster_beacon_age_ms\":" + String((unsigned long)esn.coordinatorBroadcasterBeaconAgeMs);
-    json += ",\"coordinator_beacons_sent\":" + String((unsigned long)esn.coordinatorBeaconsSent);
-    json += ",\"coordinator_early_resumes\":" + String((unsigned long)esn.coordinatorEarlyResumes);
-    // Beta136: series quality since radio start (reason: 0 none, 1 invalid, 2 spread, 3 rtt, 4 deadline)
-    json += ",\"series_accepted\":" + String((unsigned long)esn.seriesAccepted);
-    json += ",\"series_rejected\":" + String((unsigned long)esn.seriesRejected);
-    json += ",\"series_reject_invalid\":" + String((unsigned long)esn.seriesRejectInvalid);
-    json += ",\"series_reject_spread\":" + String((unsigned long)esn.seriesRejectSpread);
-    json += ",\"series_reject_rtt\":" + String((unsigned long)esn.seriesRejectRtt);
-    json += ",\"series_reject_deadline\":" + String((unsigned long)esn.seriesRejectDeadline);
-    json += ",\"series_consecutive_failures\":" + String((unsigned int)esn.seriesConsecutiveFailures);
-    json += ",\"series_last_failure_reason\":" + String((unsigned int)esn.seriesLastFailureReason);
-    json += ",\"series_last_rejected_age_ms\":" + String((unsigned long)esn.seriesLastRejectedAgeMs);
-    json += ",\"series_last_rejected_spread_us\":" + String((unsigned long)esn.seriesLastRejectedSpreadUs);
-    json += ",\"series_last_completed_age_ms\":" + String((unsigned long)esn.seriesLastCompletedAgeMs);
-    json += ",\"series_next_in_ms\":" + String((unsigned long)esn.seriesNextInMs);
-    // Coordinator only (0 on nodes): precision slot scheduling (cluster_slot_scheduler.h).
-    json += ",\"slot_active_peers\":" + String((unsigned long)esn.slotActivePeers);
-    json += ",\"slot_cycle_estimate_ms\":" + String((unsigned long)esn.slotCycleEstimateMs);
-    json += ",\"slot_capacity\":" + String((unsigned long)esn.slotCapacity);
-    json += ",\"slot_table_full_recent\":"; json += esn.slotTableFullRecent ? "true" : "false";
-    json += ",\"slot_rotations\":" + String((unsigned long)esn.slotRotations);
-    json += ",\"slot_owner_recovery\":"; json += esn.slotOwnerRecovery ? "true" : "false";
-    json += ",\"slot_recovery_requested\":" + String((unsigned long)esn.slotRecoveryRequested);
-    json += ",\"slot_recovery_granted\":" + String((unsigned long)esn.slotRecoveryGranted);
-    json += ",\"slot_recovery_deferred\":" + String((unsigned long)esn.slotRecoveryDeferred);
-    json += ",\"slot_recovery_succeeded\":" + String((unsigned long)esn.slotRecoverySucceeded);
-    json += ",\"slot_recovery_failed\":" + String((unsigned long)esn.slotRecoveryFailed);
-    json += ",\"slot_succeeded\":" + String((unsigned long)esn.slotSucceeded);
-    json += ",\"slot_failed\":" + String((unsigned long)esn.slotFailed);
-    json += ",\"slot_ended_series_over\":" + String((unsigned long)esn.slotEndedSeriesOver);
-    json += ",\"slot_ended_no_activity\":" + String((unsigned long)esn.slotEndedNoActivity);
-    json += ",\"slot_ended_hard_cap\":" + String((unsigned long)esn.slotEndedHardCap);
-    json += ",\"slot_ended_owner_lost\":" + String((unsigned long)esn.slotEndedOwnerLost);
-    json += ",\"slot_last_ms\":" + String((unsigned long)esn.slotLastMs);
-    json += ",\"slot_mean_ms\":" + String((unsigned long)esn.slotMeanMs);
-    json += ",\"slot_period_mean_ms\":" + String((unsigned long)esn.slotPeriodMeanMs);
-    json += ",\"slot_due_peers\":" + String((unsigned long)esn.slotDuePeers);
-    json += ",\"slot_expired_peers\":" + String((unsigned long)esn.slotExpiredPeers);
-    json += ",\"slot_oldest_age_ms\":" + String((unsigned long)esn.slotOldestAgeMs);
-    // Beta136: probe RX (t2) -> reply pre-send (t3) on this device, answered probes only.
-    json += ",\"probe_reply_delay_samples\":" + String((unsigned long)esn.probeReplyDelaySamples);
-    json += ",\"probe_reply_delay_last_us\":" + String((unsigned long)esn.probeReplyDelayLastUs);
-    json += ",\"probe_reply_delay_max_us\":" + String((unsigned long)esn.probeReplyDelayMaxUs);
-    json += ",\"probe_reply_delay_mean_us\":" + String(esn.probeReplyDelaySamples ?
+    ju("channel", esn.channel);
+    ju("sent", esn.sent); ju("received", esn.received); ju("authenticated", esn.authenticated);
+    ju("rejected", esn.rejected); ju("replay", esn.replay); ju("dropped", esn.dropped);
+    // Precision time of this device (node only).
+    jb("precision_clock_active", espSource);
+    js("precision_state", ClusterEspNowRadio::precisionStateName(esn.precisionState));
+    ju("precision_sample_age_ms", espSource ? sourceAge : 0UL);
+    jd("precision_jitter_us", espSource ? sourceJitter : 0.0, 1);
+    // Coordinator: beacon transmitter and cluster median delay.
+    ju("beacons_sent", esn.beaconsSent); ju("follow_ups_sent", esn.followUpsSent);
+    ju("follow_ups_without_tx_done", esn.followUpsWithoutTxDone);
+    ju("beacon_tx_path_last_us", esn.beaconTxPathLastUs);
+    ju("beacon_tx_path_min_us", esn.beaconTxPathMinUs);
+    ju("beacon_tx_path_max_us", esn.beaconTxPathMaxUs);
+    jb("cluster_delay_known", esn.clusterDelayKnown);
+    jd("cluster_delay_us", esn.clusterDelayUs, 1);
+    ju("cluster_delay_contributors", esn.clusterDelayContributors);
+    // Node: beacon model.
+    ju("beacons_received", esn.beaconsReceived); ju("follow_ups_received", esn.followUpsReceived);
+    ju("follow_ups_unmatched", esn.followUpsUnmatched);
+    ju("beacon_samples_accepted", esn.beaconSamplesAccepted);
+    ju("beacon_samples_tx_path_late", esn.beaconSamplesTxPathLate);
+    ju("beacon_samples_early", esn.beaconSamplesEarly);
+    ju("beacon_model_resets", esn.beaconModelResets);
+    jb("beacon_model_valid", esn.beaconModelValid);
+    ju("beacon_model_samples", esn.beaconModelSamples);
+    ju("beacon_model_selected", esn.beaconModelSelected);
+    ju("beacon_last_age_ms", esn.beaconLastAgeMs);
+    ju("beacon_model_span_ms", esn.beaconModelSpanMs);
+    jd("beacon_offset_us", esn.beaconOffsetUs, 1);
+    jd("beacon_jitter_us", esn.beaconJitterUs, 1);
+    json += ",\"beacon_tx_path_min_node_us\":" + String((long)esn.beaconTxPathMinNodeUs);
+    jb("drift_valid", esn.beaconModelValid);
+    jd("drift_ppm", esn.beaconDriftPpm, 3);
+    js("delay_source", ClusterEspNowRadio::delaySourceName(esn.delaySource));
+    jd("delay_used_us", esn.delayUsedUs, 1);
+    jb("own_delay_known", esn.ownDelayKnown);
+    jd("own_delay_us", esn.ownDelayUs, 1);
+    ju("own_delay_age_ms", esn.ownDelayAgeMs);
+    ju("own_delay_calibrations", esn.ownDelayCalibrations);
+    ju("calibrations_discarded", esn.calibrationsDiscarded);
+    jb("calibration_pending", esn.calibrationPending);
+    ju("source_changes", esn.sourceChanges);
+    // Two-way calibration series.
+    ju("probes_sent", esn.probesSent); ju("probes_answered", esn.probesAnswered);
+    ju("exchanges_complete", esn.exchangesComplete); ju("exchange_timeouts", esn.exchangeTimeouts);
+    jb("last_exchange_valid", esn.lastExchangeValid);
+    jd("last_offset_us", esn.lastOffsetUs, 3);
+    jd("last_rtt_us", esn.lastRttUs, 3);
+    jb("last_series_estimate_available", esn.lastSeriesEstimateAvailable);
+    ju("last_series_estimate_age_ms", esn.lastSeriesEstimateAgeMs);
+    ju("last_series_selected", esn.lastSeriesSelected);
+    jd("last_series_spread_us", esn.lastSeriesSpreadUs, 3);
+    jd("last_series_rtt_min_us", esn.lastSeriesRttMinUs, 3);
+    jd("last_series_rtt_max_us", esn.lastSeriesRttMaxUs, 3);
+    jd("last_series_offset_p10_relative_us", esn.lastSeriesOffsetP10Us, 3);
+    jd("last_series_offset_p90_relative_us", esn.lastSeriesOffsetP90Us, 3);
+    ju("last_accepted_age_ms", esn.lastAcceptedAgeMs);
+    ju("series_accepted", esn.seriesAccepted); ju("series_rejected", esn.seriesRejected);
+    ju("series_reject_invalid", esn.seriesRejectInvalid);
+    ju("series_reject_spread", esn.seriesRejectSpread);
+    ju("series_reject_rtt", esn.seriesRejectRtt);
+    ju("series_reject_deadline", esn.seriesRejectDeadline);
+    ju("series_consecutive_failures", esn.seriesConsecutiveFailures);
+    ju("series_last_failure_reason", esn.seriesLastFailureReason);
+    ju("series_last_rejected_age_ms", esn.seriesLastRejectedAgeMs);
+    ju("series_last_rejected_spread_us", esn.seriesLastRejectedSpreadUs);
+    ju("series_last_completed_age_ms", esn.seriesLastCompletedAgeMs);
+    ju("series_next_in_ms", esn.seriesNextInMs);
+    ju("action_pause_remaining_ms", esn.capturePauseRemainingMs);
+    // Coordinator only (0 on nodes): calibration slot scheduling (cluster_slot_scheduler.h).
+    ju("slot_active_peers", esn.slotActivePeers);
+    ju("slot_cycle_estimate_ms", esn.slotCycleEstimateMs);
+    ju("slot_refresh_ms", esn.slotRefreshMs);
+    ju("slot_lifetime_ms", esn.slotLifetimeMs);
+    ju("slot_capacity", esn.slotCapacity);
+    jb("slot_table_full_recent", esn.slotTableFullRecent);
+    ju("slot_rotations", esn.slotRotations);
+    jb("slot_owner_recovery", esn.slotOwnerRecovery);
+    ju("slot_recovery_requested", esn.slotRecoveryRequested);
+    ju("slot_recovery_granted", esn.slotRecoveryGranted);
+    ju("slot_recovery_deferred", esn.slotRecoveryDeferred);
+    ju("slot_recovery_succeeded", esn.slotRecoverySucceeded);
+    ju("slot_recovery_failed", esn.slotRecoveryFailed);
+    ju("slot_succeeded", esn.slotSucceeded); ju("slot_failed", esn.slotFailed);
+    ju("slot_ended_series_over", esn.slotEndedSeriesOver);
+    ju("slot_ended_no_activity", esn.slotEndedNoActivity);
+    ju("slot_ended_hard_cap", esn.slotEndedHardCap);
+    ju("slot_ended_owner_lost", esn.slotEndedOwnerLost);
+    ju("slot_last_ms", esn.slotLastMs); ju("slot_mean_ms", esn.slotMeanMs);
+    ju("slot_period_mean_ms", esn.slotPeriodMeanMs);
+    ju("slot_due_peers", esn.slotDuePeers);
+    ju("slot_expired_peers", esn.slotExpiredPeers);
+    ju("slot_oldest_age_ms", esn.slotOldestAgeMs);
+    // Firmware timing of this device.
+    ju("rx_queue_delay_last_us", esn.rxQueueDelayLastUs);
+    ju("rx_queue_delay_max_us", esn.rxQueueDelayMaxUs);
+    ju("reply_final_dispatch_gap_last_us", esn.replyFinalDispatchGapLastUs);
+    ju("reply_final_dispatch_gap_max_us", esn.replyFinalDispatchGapMaxUs);
+    ju("probe_tx_pre_send_last_us", esn.probeTxPreSendLastUs);
+    ju("probe_tx_pre_send_max_us", esn.probeTxPreSendMaxUs);
+    ju("probe_tx_pre_send_samples", esn.probeTxPreSendSamples);
+    jd("probe_tx_pre_send_mean_us", esn.probeTxPreSendSamples ? double(esn.probeTxPreSendTotalUs)/esn.probeTxPreSendSamples : 0.0, 2);
+    ju("reply_tx_pre_send_last_us", esn.replyTxPreSendLastUs);
+    ju("reply_tx_pre_send_max_us", esn.replyTxPreSendMaxUs);
+    ju("reply_tx_pre_send_samples", esn.replyTxPreSendSamples);
+    jd("reply_tx_pre_send_mean_us", esn.replyTxPreSendSamples ? double(esn.replyTxPreSendTotalUs)/esn.replyTxPreSendSamples : 0.0, 2);
+    ju("tx_callback_delay_last_us", esn.txCallbackLatencyLastUs);
+    ju("tx_callback_delay_max_us", esn.txCallbackLatencyMaxUs);
+    ju("tx_callback_samples", esn.txCallbackSamples);
+    ju("tx_callback_failed", esn.txCallbackFailed);
+    ju("tx_pending_overflow", esn.txPendingOverflow);
+    ju("tx_callback_unmatched", esn.txCallbackUnmatched);
+    ju("probe_reply_delay_samples", esn.probeReplyDelaySamples);
+    ju("probe_reply_delay_last_us", esn.probeReplyDelayLastUs);
+    ju("probe_reply_delay_max_us", esn.probeReplyDelayMaxUs);
+    jd("probe_reply_delay_mean_us", esn.probeReplyDelaySamples ?
         (double)esn.probeReplyDelayTotalUs / (double)esn.probeReplyDelaySamples : 0.0, 1);
     json += ",\"probe_reply_delay_hist\":[";
     for (uint8_t i = 0; i < ClusterEspNowRadio::Diagnostics::kProbeReplyDelayBuckets; ++i) {
         if (i) json += ",";
         json += String((unsigned long)esn.probeReplyDelayHist[i]);
     }
-    json += "],\"tx_reply_latency_samples\":" + String((unsigned long)esn.txReplyLatencySamples);
-    json += ",\"tx_reply_latency_last_us\":" + String((unsigned long)esn.txReplyLatencyLastUs);
-    json += ",\"tx_reply_latency_max_us\":" + String((unsigned long)esn.txReplyLatencyMaxUs);
+    json += "]";
+    ju("tx_reply_latency_samples", esn.txReplyLatencySamples);
+    ju("tx_reply_latency_last_us", esn.txReplyLatencyLastUs);
+    ju("tx_reply_latency_max_us", esn.txReplyLatencyMaxUs);
     json += ",\"tx_reply_latency_hist\":[";
     for (uint8_t i = 0; i < ClusterEspNowRadio::Diagnostics::kProbeReplyDelayBuckets; ++i) {
         if (i) json += ",";
@@ -5953,10 +5734,7 @@ static String buildClusterStatusJson(ClusterStatusChunkSink sink, void *ctx)
         json += String((unsigned long)ClusterEspNowRadio::kProbeReplyDelayBucketUpperUs[i]);
     }
     json += "]";
-    char activeSourceText[17]; snprintf(activeSourceText,sizeof(activeSourceText),"%016llx",(unsigned long long)esn.activeTimeSource);
-    json += ",\"active_time_source\":\"" + String(activeSourceText) + "\"";
-    json += ",\"source_changes\":" + String((unsigned long)esn.sourceChanges);
-    // Beta137: role-based WiFi power save (actual value read via esp_wifi_get_ps()).
+    // Role-based WiFi power save (actual value read via esp_wifi_get_ps()).
     {
         const WifiPowerPolicy::Status wps = WifiPowerPolicy::status();
         json += ",\"wifi_ps_mode\":\""; json += WifiPowerPolicy::modeName(wps.actual); json += "\"";
@@ -5967,95 +5745,8 @@ static String buildClusterStatusJson(ClusterStatusChunkSink sink, void *ctx)
         json += ",\"wifi_ps_read_failures\":" + String((unsigned long)wps.readFailures);
         json += ",\"wifi_ps_last_error\":" + String((long)wps.lastError);
     }
-    // Beta131-DIAGNOSIS (Seventeenth cycle): Production beacon blocking diagnostics
-    json += ",\"broadcaster_time_base_invalid\":" + String((unsigned long)esn.broadcasterTimeBaseInvalid);
-    json += ",\"broadcaster_precision_failed\":" + String((unsigned long)esn.broadcasterPrecisionFailed);
-    json += ",\"precision_guard_was_coordinator\":" + String((unsigned long)esn.precisionGuardWasCoordinator);
-    json += ",\"precision_guard_epoch_mismatch\":" + String((unsigned long)esn.precisionGuardEpochMismatch);
-    json += ",\"precision_guard_tag_mismatch\":" + String((unsigned long)esn.precisionGuardTagMismatch);
-    json += ",\"precision_guard_not_valid\":" + String((unsigned long)esn.precisionGuardNotValid);
-    json += ",\"precision_guard_other\":" + String((unsigned long)esn.precisionGuardOther);
-    // Beta131-DIAGNOSIS (Nineteenth cycle): Separate "other" guards for precise diagnosis
-    json += ",\"precision_guard_ref_lifetime\":" + String((unsigned long)esn.precisionGuardRefLifetime);
-    json += ",\"precision_guard_estimate_age\":" + String((unsigned long)esn.precisionGuardEstimateAge);
-    json += ",\"precision_guard_drift\":" + String((unsigned long)esn.precisionGuardDrift);
-    json += ",\"precision_guard_mono_reconstruct\":" + String((unsigned long)esn.precisionGuardMonoReconstruct);
-    json += ",\"precision_guard_utc_range\":" + String((unsigned long)esn.precisionGuardUtcRange);
     json += '}';
-    // ESP-NOW result frames are verified by the radio HMAC and replay gate.
-    // Bind to the node boot nonce at presentation time; do not infer identity from MAC.
-    // Beta128: fixed-size, observation-only Grant/Ack counters. No new buffers,
-    // authority, capture-clock changes or productive beacon control.
-    const ClusterEspNowRadio::GrantDiagnosticStats grantStats =
-        ClusterEspNowRadio::grantDiagnosticStats();
-    json += ",\"espnow_grant_diagnostic\":{";
-    // Beta131-FIX: Show actual handover capability status
-    const bool handoverCapable = (cfg_operating_mode == "time_broadcaster") || localIsCoordinator;
-    json += "\"handover_enabled\":";
-    json += handoverCapable ? "true" : "false";
-    json += ",\"received\":" + String((unsigned long)grantStats.received);
-    json += ",\"authenticated\":" + String((unsigned long)grantStats.authenticated);
-    json += ",\"rejected\":" + String((unsigned long)grantStats.rejected);
-    json += ",\"replay\":" + String((unsigned long)grantStats.replay);
-    json += ",\"dropped\":" + String((unsigned long)grantStats.dropped);
-    json += ",\"grants_sent\":" + String((unsigned long)grantStats.grantsSent);
-    json += ",\"acks_sent\":" + String((unsigned long)grantStats.acksSent);
-    json += ",\"acks_verified\":" + String((unsigned long)grantStats.acksVerified);
-    json += ",\"timeouts\":" + String((unsigned long)grantStats.timeouts);
-    json += ",\"send_failed\":" + String((unsigned long)grantStats.sendFailed);
-    json += '}';
-    json += ",\"espnow_node_reports\":[";
-    SfPsramBuffer reportBuffer(ClusterEspNowRadio::kNodeReportCapacity *
-                               sizeof(ClusterEspNowRadio::NodeSyncReport));
-    ClusterEspNowRadio::NodeSyncReport *reports =
-        reinterpret_cast<ClusterEspNowRadio::NodeSyncReport *>(reportBuffer.data());
-    const size_t reportCount = reports
-        ? ClusterEspNowRadio::nodeSyncReports(reports, ClusterEspNowRadio::kNodeReportCapacity)
-        : 0;
-    for(size_t i=0;i<reportCount;++i){
-        if(i)json+=',';
-        const auto &r=reports[i];
-        char bootText[9];snprintf(bootText,sizeof(bootText),"%08lx",(unsigned long)r.bootNonce);
-        json += "{\"boot_id\":\""+String(bootText)+"\"";
-        json += ",\"received_age_ms\":"+String((unsigned long)r.receivedAgeMs);
-        json += ",\"sample_age_ms\":"+String((unsigned long)r.sampleAgeMs);
-        json += ",\"offset_us\":"+String((long)r.offsetUs);
-        json += ",\"rtt_us\":"+String((unsigned long)r.rttUs);
-        json += ",\"accepted_samples\":"+String((unsigned int)r.acceptedSamples);
-        json += ",\"precision_accepted\":";json+=r.precisionAccepted?"true":"false";
-        json += ",\"probes_sent\":"+String((unsigned long)r.probesSent);
-        json += ",\"exchanges_complete\":"+String((unsigned long)r.exchangesComplete);
-        json += ",\"failure_code\":"+String((unsigned int)r.failureCode);
-        json += ",\"failed_series\":"+String((unsigned int)r.failedSeries);
-        json += ",\"has_series_statistics\":";json+=r.hasSeriesStatistics?"true":"false";
-        json += ",\"series_successful\":"+String((unsigned long)r.successfulSeries);
-        json += ",\"series_rejected\":"+String((unsigned long)r.rejectedSeries);
-        json += ",\"last_series_result\":"+String((unsigned int)r.lastSeriesResult);
-        json += ",\"last_series_age_ms\":"+String((unsigned long)r.lastSeriesAgeMs);
-        json += ",\"has_last_rejected_series\":";json+=r.hasLastRejectedSeries?"true":"false";
-        json += ",\"last_rejected_reason\":"+String((unsigned int)r.lastRejectedReason);
-        json += ",\"last_rejected_age_ms\":"+String((unsigned long)r.lastRejectedAgeMs);
-        json += ",\"last_rejected_metrics_valid\":";json+=r.lastRejectedMetricsValid?"true":"false";
-        json += ",\"last_rejected_spread_us\":"+String((unsigned long)r.lastRejectedSpreadUs);
-        json += ",\"last_rejected_rtt_us\":"+String((unsigned long)r.lastRejectedRttUs);
-        json += ",\"has_failure_metrics\":";json+=r.hasFailureMetrics?"true":"false";
-        json += ",\"failed_spread_us\":"+String((unsigned long)r.failedSpreadUs);
-        json += ",\"failed_rtt_us\":"+String((unsigned long)r.failedRttUs);
-        json += ",\"has_failure_offsets\":";json+=r.hasFailureOffsets?"true":"false";
-        json += ",\"failed_min_rtt_offset_us\":"+String((long)r.failedMinRttOffsetUs);
-        json += ",\"failed_selected_offset_us\":"+String((long)r.failedSelectedOffsetUs);
-        json += ",\"failed_accepted\":"+String((unsigned int)r.failedAccepted);
-        json += ",\"failed_selected\":"+String((unsigned int)r.failedSelected);
-        json += ",\"has_time_source\":";json+=r.hasTimeSource?"true":"false";
-        json += ",\"using_espnow_time\":";json+=r.usingEspNowTime?"true":"false";
-        json += ",\"has_drift_report\":";json+=r.hasDriftReport?"true":"false";
-        json += ",\"drift_valid\":";json+=r.driftValid?"true":"false";
-        json += ",\"drift_ppm\":"+String(r.driftMilliPpm/1000.0,3);
-        json += ",\"spread_us\":"+String((unsigned int)r.spreadUs);
-        json += '}';
-        statusFlushIfLarge(json, sink, ctx);
-    }
-    json += ']';
+    // Per-node time reports: /cluster_time_nodes (webconfig_cluster_time.cpp).
     json += ",\"ack_diagnostics\":{";
     json += "\"hb_sent\":" + String((unsigned long)diagHbSent);
     json += ",\"hb_send_failed\":" + String((unsigned long)diagHbSendFailed);
@@ -6244,21 +5935,6 @@ static String buildClusterStatusJson(ClusterStatusChunkSink sink, void *ctx)
         else
             json += "-1";
         json += ",\"coordinator_ack_age_ms\":-1";
-        json += ",\"selected_sync_seq\":" + String((unsigned long)peer.selectedSyncSeq);
-        json += ",\"selected_sync_age_ms\":" + String((unsigned long)(peer.selectedSyncSeq ? nowMs-peer.selectedSyncRequestedMs : 0));
-        json += ",\"time_report_valid\":";
-        const bool reportValid = peer.timeReportValid &&
-            peer.timeReportEpoch == currentCoordinatorEpoch &&
-            (uint32_t)(nowMs - peer.timeReportMs) <= CLUSTER_TIME_HOLDOVER_MS;
-        json += reportValid ? "true" : "false";
-        json += ",\"time_report_command_seq\":" +
-            String((unsigned long)(reportValid ? peer.timeReportCommandSeq : 0UL));
-        json += ",\"time_report_age_ms\":" +
-            String((unsigned long)(reportValid ? (nowMs - peer.timeReportMs) : 0UL));
-        json += ",\"time_report_utc_us\":" + int64Text(reportValid ? peer.timeReportUtcUs : 0);
-        json += ",\"time_report_offset_us\":" + int64Text(reportValid ? peer.timeReportOffsetUs : 0);
-        json += ",\"time_report_rtt_us\":" + int64Text(reportValid ? peer.timeReportRttUs : 0);
-        json += ",\"time_report_uncertainty_us\":" + int64Text(reportValid ? peer.timeReportUncertaintyUs : 0);
         json += ",\"lease_sec\":" + String((unsigned long)leaseSeconds);
         json += ",\"lease_remaining_sec\":" +
             String((unsigned long)leaseRemainingSeconds);
@@ -6478,7 +6154,7 @@ void clusterStatusJsonStream(ClusterStatusChunkSink sink, void *ctx)
 // independent of the cluster tables, so this is safe between JSON parts.
 void clusterServiceTimeCritical()
 {
-    if (clusterCaptureProtectionActive() || cfg_operating_mode == "time_broadcaster")
+    if (clusterCaptureProtectionActive())
         return;
     ClusterEspNowRadio::service(runtimeActive && (localIsCoordinator || droneModeEnabled()),
                                localIsCoordinator, currentCoordinatorEpoch,
@@ -6521,38 +6197,6 @@ bool clusterCaptureProtectionActive() {
            static_cast<int32_t>(millis()-coordinatorCaptureGuardUntilMs)<0;
 }
 
-// Beta126: codec callbacks only. These do NOT authorize a sender, accept a
-// grant, queue a packet, or alter the production ESP-NOW beacon schedule.
-bool clusterTimeGrantSign(const uint8_t *data, size_t len, uint8_t mac[32])
-{
-    return grantProtocolMac(data, len, mac);
-}
-
-bool clusterTimeGrantVerify(const uint8_t *data, size_t len, const uint8_t mac[32])
-{
-    if (!mac) return false;
-    uint8_t expected[32] = {};
-    if (!grantProtocolMac(data, len, expected)) return false;
-    const bool valid = constantTimeEqual(expected, mac, sizeof(expected));
-    secureWipe(expected, sizeof(expected));
-    return valid;
-}
-
-bool clusterEspNowDiagnosticBeaconSign(const uint8_t *data, size_t len, uint8_t mac[32])
-{
-    return diagnosticBeaconMac(data, len, mac);
-}
-
-bool clusterEspNowDiagnosticBeaconVerify(const uint8_t *data, size_t len, const uint8_t mac[32])
-{
-    uint8_t expected[32] = {};
-    if (!mac || !diagnosticBeaconMac(data, len, expected)) return false;
-    uint8_t difference = 0;
-    for (size_t i=0;i<sizeof(expected);++i) difference |= expected[i]^mac[i];
-    secureWipe(expected,sizeof(expected));
-    return difference==0;
-}
-
 // Callbacks for EspNowTimePackets::encode/decode. Never call from the
 // ESP-NOW WiFi task: queue frames and verify in the ordinary cluster loop.
 bool clusterEspNowTimeSign(const uint8_t *data, size_t len,
@@ -6588,6 +6232,7 @@ size_t clusterMountSnapshot(ClusterMountEntry *out, size_t capacity)
     memset(&self, 0, sizeof(self));
     strncpy(self.integrationId, deviceIntegrationId().c_str(), sizeof(self.integrationId) - 1);
     strncpy(self.hostname, cfg_hostname.c_str(), sizeof(self.hostname) - 1);
+    self.bootNonce = bootNonce;
     self.local = true;
     self.mountKnown = true;
     localMount(self.mount);
@@ -6606,6 +6251,7 @@ size_t clusterMountSnapshot(ClusterMountEntry *out, size_t capacity)
         memset(&e, 0, sizeof(e));
         strncpy(e.integrationId, peer.integrationId, sizeof(e.integrationId) - 1);
         strncpy(e.hostname, peer.hostname, sizeof(e.hostname) - 1);
+        e.bootNonce = peer.bootNonce;
         e.mountKnown = peer.mountValid;
         if (peer.mountValid)
             e.mount = peer.mount;

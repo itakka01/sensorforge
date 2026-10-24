@@ -2,69 +2,39 @@
 #include <stdint.h>
 #include <stddef.h>
 namespace ClusterEspNowRadio {
-// ESP-NOW clock candidate with strict freshness/quality gate; Wi-Fi remains fallback.
-// Called from ordinary cluster loop, not from Wi-Fi callbacks.
+// ESP-NOW cluster time (beta147, ESPNOW_TIME_ARCHITECTURE.md):
+// - coordinator: signed beacon about once per second plus a follow-up with the
+//   real send time; answers two-way probes of the current calibration slot owner
+// - node: one-way beacon model (offset + drift, cluster_beacon_sync.h); the path
+//   delay of the link is calibrated rarely by a two-way series, until then the
+//   cluster median delay from the beacon is used
+// Wi-Fi time remains the fallback. Called from the ordinary cluster loop, never
+// from Wi-Fi callbacks.
 void service(bool allowed, bool coordinator, uint32_t epoch,
              const char *coordinatorId, uint32_t localBootNonce);
-// Beta131-CORRECTED (Third cycle): Broadcaster does THREE things:
-// 1. Sends diagnostic beacons (own identity) so coordinator can observe
-// 2. Syncs WITH coordinator (coordinatorId) as node via Probe/Reply/Final
-// 3. Sends production beacons when lease active
-// CRITICAL: Must receive BOTH broadcaster's own ID AND coordinator ID
-void serviceDiagnosticBroadcaster(bool allowed, uint32_t epoch,
-                                  const char *broadcasterDeviceId, const char *coordinatorId,
-                                  uint32_t localBootNonce);
-struct GrantDiagnosticStats {
-    uint32_t received=0,authenticated=0,rejected=0,replay=0,dropped=0;
-    uint32_t grantsSent=0,acksSent=0,acksVerified=0,timeouts=0,sendFailed=0;
-};
-GrantDiagnosticStats grantDiagnosticStats();
 void stop();
 // Revoke short-lived permission, cancel samples, suppress TX during protected work.
-// Keeps the last accepted clock estimate for holdover.
+// Keeps the last beacon model for holdover.
 void pauseForCapture(uint32_t holdMs); // also used for coordinator list actions
 bool capturePaused();
 // A live, authenticated permission lease is required for node probes.
 bool syncPermissionValid();
-// Authenticated UTC anchored to coordinator monotonic clock. False = use Wi-Fi.
+// Authenticated UTC from the beacon model of the current coordinator.
+// False = use Wi-Fi time. sampleAgeMs = age of the newest beacon sample,
+// jitterUs = RMS residual of the model (quality, NOT an accuracy bound).
 bool precisionUtcNow(uint32_t epoch, const char *coordinatorId,
-                     int64_t &utcUs, uint32_t &sampleAgeMs, double &rttUs);
-// Passive diagnostic snapshots of existing authenticated beacons; not a clock source.
-struct BeaconObservation {
-    uint32_t sequence=0, epoch=0, coordinatorMonoLow=0;
-    uint64_t coordinatorBoot=0;
-    int64_t coordinatorUtcUs=0, nodeRxCallbackUs=0;
-    // One-step-ahead, trained only on earlier beacons. Not a capture clock.
-    int32_t predictionErrorUs=0;
-    int32_t driftPpmX100=0;
-    uint8_t predictionSamples=0; // 0 = no valid prediction
-    uint8_t predictionStatus=0; // 0=valid, 1=warmup, 2=identity, 3=span, 4=node time, 5=history, 6=regression, 7=slope, 8=range
+                     int64_t &utcUs, uint32_t &sampleAgeMs, double &jitterUs);
 
+// Why precisionUtcNow() is false on a node (0 = valid).
+enum class PrecisionState : uint8_t {
+    Valid = 0, Inactive, Coordinator, NoBeacons, TooFewSamples, SpanTooShort,
+    JitterTooHigh, DriftOutOfRange, Stale, NoDelay, NoUtc,
 };
-// Constant-memory lifetime statistics of passive beacon predictions.
-// Aggregated values cannot replace synchronized per-beacon raw traces.
-struct BeaconPredictionStats {
-    uint32_t received=0, valid=0, firstSequence=0, lastSequence=0;
-    uint32_t epoch=0;
-    uint64_t coordinatorBoot=0;
-    int32_t minErrorUs=0, maxErrorUs=0;
-    double meanErrorUs=0, errorM2=0, meanAbsErrorUs=0;
-    double meanDriftPpm=0;
-    uint32_t statusCounts[9]={};
-};
-// Compact, passive, authenticated shared-event trace (last 128 beacons).
-// Timestamp is ESP-NOW RX callback time, NOT PHY arrival or camera exposure.
-struct BeaconSharedEvent {
-    uint32_t sequence=0, epoch=0, coordinatorMonoLow=0;
-    uint64_t nodeRxCallbackUs=0;
-    uint32_t coordinatorBootLow=0;
-};
-size_t beaconSharedEventCount();
-bool beaconSharedEventAt(size_t index, BeaconSharedEvent &out);
-uint64_t beaconSharedEventBoot();
-BeaconPredictionStats beaconPredictionStats();
-size_t beaconObservationCount();
-bool beaconObservationAt(size_t index, BeaconObservation &out);
+const char *precisionStateName(PrecisionState s);
+// Delay used for the coordinator time: none, own two-way calibration, cluster median.
+enum class DelaySource : uint8_t { None = 0, Own = 1, Cluster = 2 };
+const char *delaySourceName(DelaySource s);
+
 struct Diagnostics {
     uint32_t sent=0, received=0, authenticated=0, rejected=0, replay=0, dropped=0;
     uint32_t probesSent=0, probesAnswered=0, exchangesComplete=0, exchangeTimeouts=0;
@@ -78,44 +48,54 @@ struct Diagnostics {
     uint32_t probeTxPreSendLastUs=0, probeTxPreSendMaxUs=0, probeTxPreSendSamples=0;
     uint32_t replyTxPreSendLastUs=0, replyTxPreSendMaxUs=0, replyTxPreSendSamples=0;
     uint64_t probeTxPreSendTotalUs=0, replyTxPreSendTotalUs=0;
-    int64_t lastLocalRxUs=0;
-    int64_t lastRemoteStampUs=0;
-    double lastOffsetUs=0, lastRttUs=0;
     uint8_t channel=0;
     bool active=false;
+    uint32_t capturePauseRemainingMs=0;
+    bool syncPermission=false;
+    uint32_t syncPermissionRemainingMs=0;
+
+    // --- Beacon, coordinator side
+    uint32_t beaconsSent=0, followUpsSent=0, followUpsWithoutTxDone=0;
+    uint32_t beaconTxPathLastUs=0, beaconTxPathMinUs=0, beaconTxPathMaxUs=0;
+    bool clusterDelayKnown=false;     // coordinator: median of node calibrations; node: from beacon
+    double clusterDelayUs=0;
+    uint32_t clusterDelayContributors=0;  // coordinator only
+
+    // --- Beacon, node side
+    uint32_t beaconsReceived=0, followUpsReceived=0, followUpsUnmatched=0;
+    uint32_t beaconSamplesAccepted=0, beaconSamplesTxPathLate=0, beaconSamplesEarly=0;
+    uint32_t beaconModelResets=0;
+    bool beaconModelValid=false;
+    uint8_t beaconModelSamples=0, beaconModelSelected=0;
+    uint32_t beaconLastAgeMs=0;          // 0 = never
+    uint32_t beaconModelSpanMs=0;
+    double beaconOffsetUs=0;             // envelope offset (coordinator - node, without delay)
+    double beaconDriftPpm=0;
+    double beaconJitterUs=0;
+    int32_t beaconTxPathMinNodeUs=-1;    // shortest TX path seen in follow-ups
+    DelaySource delaySource=DelaySource::None;
+    double delayUsedUs=0;
+    bool ownDelayKnown=false;
+    double ownDelayUs=0;
+    uint32_t ownDelayAgeMs=0;
+    uint8_t ownDelayCalibrations=0;
+    uint32_t calibrationsDiscarded=0;    // two-way series without usable beacon model
+    bool calibrationPending=false;
+    PrecisionState precisionState=PrecisionState::Inactive;
+    bool precisionValid=false;
+    uint32_t sourceChanges=0;
+
+    // Two-way calibration series quality (since radio start). Reasons:
+    // 1=invalid/insufficient, 2=spread, 3=RTT, 4=series deadline.
     bool lastExchangeValid=false;
-    // Last completed estimate, including failed quality checks, local HTTP only.
+    double lastOffsetUs=0, lastRttUs=0;
     bool lastSeriesEstimateAvailable=false;
     uint32_t lastSeriesEstimateAgeMs=0;
     uint8_t lastSeriesSelected=0;
     double lastSeriesSpreadUs=0;
     double lastSeriesRttMinUs=0, lastSeriesRttMaxUs=0;
     double lastSeriesOffsetP10Us=0, lastSeriesOffsetP90Us=0;
-    bool driftValid=false;             // derived from fresh precision series
-    bool storedDriftAvailable=false;   // prior estimate; NOT synchronization
-    double driftPpm=0;
-    double driftUncertaintyPpm=0;
-    uint32_t driftSamples=0;
-    uint32_t driftPersisted=0;
     uint32_t lastAcceptedAgeMs=0;
-    bool precisionRecentlyAccepted=false;
-    uint32_t capturePauseRemainingMs=0;
-    bool syncPermission=false;
-    uint32_t syncPermissionRemainingMs=0;
-    // Beta131: Production broadcaster handover state
-    bool handoverEnabled=true;
-    bool broadcasterLeaseActive=false;
-    uint32_t broadcasterLeaseRemainingMs=0;
-    // Beta136: TRUE only while the coordinator actually suppresses its own beacons
-    // (lease active, grace elapsed, leased broadcaster heard < 2 s ago).
-    bool coordinatorSuppressingBeacons=false;
-    uint32_t coordinatorBeaconsSuppressed=0;
-    bool coordinatorBroadcasterLeaseActive=false;    // former meaning of coordinatorSuppressingBeacons
-    uint32_t coordinatorBroadcasterBeaconAgeMs=0;    // 0 = never heard since lease start
-    uint32_t coordinatorBeaconsSent=0;               // coordinator production beacons since boot
-    uint32_t coordinatorEarlyResumes=0;              // beacons sent early after confirmation loss
-    // Beta136: series quality (since radio start). Reasons: 1=invalid/insufficient,
-    // 2=spread, 3=RTT, 4=series deadline. Quality thresholds are NOT exposed/changed here.
     uint32_t seriesAccepted=0, seriesRejected=0;
     uint32_t seriesRejectInvalid=0, seriesRejectSpread=0, seriesRejectRtt=0, seriesRejectDeadline=0;
     uint8_t seriesConsecutiveFailures=0, seriesLastFailureReason=0;
@@ -123,89 +103,54 @@ struct Diagnostics {
     uint32_t seriesLastRejectedSpreadUs=0;  // 0 = no metrics (reason 1/4)
     uint32_t seriesLastCompletedAgeMs=0;    // 0 = none
     uint32_t seriesNextInMs=0;              // 0 = due / not scheduled
-    // Coordinator only: precision slot scheduling (cluster_slot_scheduler.h).
+
+    // Coordinator only: calibration slot scheduling (cluster_slot_scheduler.h).
     // slotCycleEstimateMs = active peers x measured mean start-to-start slot period
     // (0 until two slots started). slotRotations = finished slots.
     uint32_t slotActivePeers=0, slotCycleEstimateMs=0, slotRotations=0;
+    uint32_t slotRefreshMs=0, slotLifetimeMs=0;
     // Diagnostics only: slot table size and whether an active node found no
-    // free slot within the last kPeerActiveMs (it then gets no precision series).
+    // free slot within the last kPeerActiveMs (it then gets no calibration).
     uint32_t slotCapacity=0;
     bool slotTableFullRecent=false;
-    // Retry bookkeeping, kept under the former recovery-slot names:
-    // owner_recovery = current slot follows a failed one; requested = slots without
-    // accepted series; granted/succeeded/failed = retry slots and their outcome;
-    // deferred = active peers currently waiting in failure back-off.
     bool slotOwnerRecovery=false;
     uint32_t slotRecoveryRequested=0, slotRecoveryGranted=0, slotRecoveryDeferred=0;
     uint32_t slotRecoverySucceeded=0, slotRecoveryFailed=0;
     uint32_t slotSucceeded=0, slotFailed=0;
     uint32_t slotEndedSeriesOver=0, slotEndedNoActivity=0, slotEndedHardCap=0, slotEndedOwnerLost=0;
     uint32_t slotLastMs=0, slotMeanMs=0, slotPeriodMeanMs=0;
-    // Active peers: due for a series now / without valid precision / oldest estimate.
+    // Active peers: due for a calibration now / without calibration / oldest calibration.
     uint32_t slotDuePeers=0, slotExpiredPeers=0, slotOldestAgeMs=0;
-    // Beta136: local probe RX callback (t2) -> reply pre-send stamp (t3), answered probes only.
+    // Local probe RX callback (t2) -> reply pre-send stamp (t3), answered probes only.
     // Firmware service latency (cancels in the offset math); buckets: upper bounds in us.
     static constexpr uint8_t kProbeReplyDelayBuckets=9;
     uint32_t probeReplyDelaySamples=0, probeReplyDelayLastUs=0, probeReplyDelayMaxUs=0;
     uint64_t probeReplyDelayTotalUs=0;
     uint32_t probeReplyDelayHist[kProbeReplyDelayBuckets]={};
-    // Beta138: Reply frames only: enqueue (before esp_now_send) -> TX-done callback.
-    // Upper bound of the uncompensated post-stamp TX path; NOT the RF airtime itself.
-    // Same bucket bounds as probeReplyDelayHist.
+    // Reply frames only: enqueue (before esp_now_send) -> TX-done callback.
     uint32_t txReplyLatencySamples=0, txReplyLatencyLastUs=0, txReplyLatencyMaxUs=0;
     uint32_t txReplyLatencyHist[kProbeReplyDelayBuckets]={};
-    uint64_t activeTimeSource=0;  // 0=none, or tag of active coordinator/broadcaster
-    uint32_t sourceChanges=0;
-    uint32_t broadcasterProductionBeaconsSent=0;
-    // Beta131-DIAGNOSIS (Seventeenth cycle): Production beacon blocking diagnostics
-    uint32_t broadcasterTimeBaseInvalid=0;  // Line 2342 blocked: !broadcasterTimeBaseValid
-    uint32_t broadcasterPrecisionFailed=0;  // Line 2350 blocked: precisionUtcNow() returned false
-    uint32_t precisionGuardWasCoordinator=0;  // precisionUtcNow guard: wasCoordinator
-    uint32_t precisionGuardEpochMismatch=0;  // precisionUtcNow guard: epoch != lastEpoch
-    uint32_t precisionGuardTagMismatch=0;  // precisionUtcNow guard: idTag(coordinatorId) != lastTag
-    uint32_t precisionGuardNotValid=0;  // precisionUtcNow guard: !latestQualityEstimate.valid
-    uint32_t precisionGuardOther=0;  // precisionUtcNow guard: basic initialization
-    // Beta131-DIAGNOSIS (Nineteenth cycle): Separate "other" guards
-    uint32_t precisionGuardRefLifetime=0;  // referenceReceivedNodeMono > 30s
-    uint32_t precisionGuardEstimateAge=0;  // estimate age > 120s
-    uint32_t precisionGuardDrift=0;  // drift invalid or > 500ppm
-    uint32_t precisionGuardMonoReconstruct=0;  // reference mono reconstruction failed
-    uint32_t precisionGuardUtcRange=0;  // UTC target out of valid range
 };
 // Upper bounds (us) of probeReplyDelayHist buckets 0..7; bucket 8 = above the last bound.
 constexpr uint32_t kProbeReplyDelayBucketUpperUs[Diagnostics::kProbeReplyDelayBuckets-1]=
     {500,1000,2000,5000,10000,20000,50000,100000};
 Diagnostics diagnostics();
-// Diagnostic SFDB receiver only; never used by precisionUtcNow() or capture.
-struct DiagnosticBeaconRxStats {
-    uint32_t received=0, authenticated=0, rejected=0, replay=0, dropped=0;
-    uint32_t lastSequence=0, lastEpoch=0;
-    uint64_t lastSenderTag=0, lastSenderBoot=0;
-    int64_t lastRxCallbackUs=0, lastRemoteMonotonicUs=0, lastRemoteUtcUs=0;
-    // Observation only: consecutive signed frames and local freshness. NOT authority.
-    uint32_t candidateConsecutive=0, candidateAgeMs=0;
-    bool candidateFresh=false;
-    // Passive simulation only: never grants TX authority or changes clocks.
-    bool shadowActive=false;
-    uint32_t shadowActivations=0, shadowFallbacks=0, shadowSourceChanges=0;
-    // Constant-memory interval residuals, callback timestamps only; NOT clock accuracy.
-    uint32_t intervalSamples=0, intervalSkipped=0;
-    int32_t intervalMinUs=0, intervalMaxUs=0;
-    double intervalMeanUs=0, intervalM2=0;
+
+// Last 128 beacons (PSRAM), for offline analysis across nodes: the same
+// sequence identifies the same beacon on every node. Software timestamps only.
+struct BeaconTraceEntry {
+    uint32_t sequence=0;      // beacon frame sequence
+    int64_t localUs=0;        // node: receive callback; coordinator: pre-send stamp
+    int64_t coordUs=0;        // coordinator pre-send stamp (node: from the follow-up)
+    int32_t txPathUs=-1;      // coordinator stamp -> TX-done callback, -1 unknown
+    int32_t residualUs=0;     // node: sample minus envelope before adding (0 = no model)
+    int64_t estCoordUs=0;     // node: estimated coordinator time at localUs before adding (0 = not valid)
+    uint8_t result=0;         // node: ClusterBeaconSync::AddResult; 255 = follow-up missing
 };
-// Passive one-step-ahead prediction, separate from production clock/capture.
-struct DiagnosticPredictionStats {
-    uint32_t valid=0, warmup=0, invalid=0;
-    int32_t minErrorUs=0, maxErrorUs=0;
-    double meanErrorUs=0, errorM2=0, meanAbsErrorUs=0;
-};
-DiagnosticPredictionStats diagnosticPredictionStats();
-DiagnosticBeaconRxStats diagnosticBeaconRxStats();
-// Coordinator-only, manual beacon interval experiment; max 15 s, no Wi-Fi disconnect.
-struct BeaconExperimentState { bool active=false, quiet=false; uint32_t intervalMs=0, sent=0, remainingMs=0; };
-bool beaconExperimentStart(uint32_t intervalMs, bool quiet=false);
-void beaconExperimentAbort();
-BeaconExperimentState beaconExperimentSnapshot();
+size_t beaconTraceCount();
+bool beaconTraceAt(size_t index, BeaconTraceEntry &out);  // 0 = oldest
+uint64_t beaconTraceCoordinatorBoot();
+
 // Controlled authenticated bidirectional transport benchmark. Only the coordinator
 // may start a run; Capture always aborts it. One discovered node at a time.
 struct BenchmarkPeer {
@@ -234,14 +179,16 @@ bool benchmarkExchangeAt(size_t index, BenchmarkExchange &out);
 uint32_t benchmarkNodeRun();
 void benchmarkLocalTransport(uint32_t &runId,uint32_t &downReceived,uint32_t &upAcknowledged);
 bool benchmarkLocalPacket(size_t seq,bool &downReceived,bool &upAcked,uint32_t &upAckRttUs);
+
 struct NodeSyncReport {
-    uint32_t bootNonce=0, receivedAgeMs=0, sampleAgeMs=0;
+    uint32_t bootNonce=0, receivedAgeMs=0;
+    // Two-way calibration (NodeSyncReport frames): sampleAgeMs = age of the
+    // last successful calibration, precisionAccepted = node has its own delay.
+    uint32_t sampleAgeMs=0;
     int32_t offsetUs=0;
     uint32_t rttUs=0;
-    int32_t driftMilliPpm=0;
-    uint16_t spreadUs=0;
     uint8_t acceptedSamples=0;
-    bool precisionAccepted=false, driftValid=false, hasDriftReport=false;
+    bool precisionAccepted=false;
     // Only meaningful when precisionAccepted=false and diagnostic frame flag set.
     uint32_t probesSent=0, exchangesComplete=0;
     uint8_t failureCode=0, failedSeries=0;
@@ -256,8 +203,31 @@ struct NodeSyncReport {
     uint32_t failedSpreadUs=0, failedRttUs=0;
     uint8_t failedAccepted=0, failedSelected=0;
     int32_t failedMinRttOffsetUs=0, failedSelectedOffsetUs=0;
-    bool hasFailureMetrics=false, hasFailureOffsets=false, hasTimeSource=false, usingEspNowTime=false;
+    bool hasFailureMetrics=false, hasFailureOffsets=false;
+    // Beacon sync (BeaconSyncReport frames).
+    bool hasBeaconReport=false;
+    uint32_t beaconReceivedAgeMs=0;    // local age of the beacon report
+    bool beaconModelValid=false, precisionValid=false;
+    PrecisionState precisionState=PrecisionState::Inactive;
+    DelaySource delaySource=DelaySource::None;
+    uint8_t beaconSamples=0;
+    uint32_t beaconAgeMs=0;            // node: age of its newest beacon sample at report time
+    double beaconJitterUs=0;
+    int32_t driftMilliPpm=0;
+    bool ownDelayKnown=false;
+    double ownDelayUs=0;
+    uint32_t ownDelayAgeS=0;
+    uint16_t spreadUs=0;               // last accepted two-way series
+    // Coordinator-side statistics of this node boot, from its beacon reports.
+    // A report gap longer than kReportGapMs counts as not precise.
+    uint32_t monitoredS=0;             // since the first beacon report
+    uint32_t preciseS=0;
+    uint32_t precisionLosses=0;        // precise -> not precise or silent
+    uint32_t lastLossAgeS=UINT32_MAX;  // UINT32_MAX = no loss yet
+    double maxJitterUs=0;              // largest jitter reported while precise
 };
+// Beacon reports arrive every 10 s; a longer silence than this is a loss.
+constexpr uint32_t kReportGapMs = 30000;
 // Coordinator-side table size for node reports, slots and replay state
 // (100-node cluster plus rebooted/left nodes).
 constexpr size_t kNodeReportCapacity = 128;
@@ -265,9 +235,8 @@ constexpr size_t kNodeReportCapacity = 128;
 // Never infer a sync from Probes or from Wi-Fi status.
 size_t nodeSyncReports(NodeSyncReport* out, size_t capacity);
 
-// Beta131-FIX (Eighth cycle, Problem 2): Time source generation for capture validation
-// Returns monotonic counter that increments on every time source switch
-// Used to detect source changes even within same epoch
+// Monotonic counter that increments on every time source change (radio
+// restart, coordinator boot change). Captures compare it to detect a switch.
 uint32_t timeSourceGeneration();
 
 }

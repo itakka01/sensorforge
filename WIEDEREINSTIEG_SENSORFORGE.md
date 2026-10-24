@@ -1,3 +1,10 @@
+## Eine Zeitansicht (2026-10-24) – v87-beta148
+Coordinator-Seite: Geräteliste mit Spalte „Zeit“, Sortierung (Probleme zuerst/Name/Gruppe), „nur Probleme“, Laden nur per „Aktualisieren“ (optional 30 s) statt Dauerabfrage. Abschnitt „Zeitsynchronisation“ mit Langzeitwerten je Node (Anteil präzise, Ausfälle, größte Streuung) aus den Zeitberichten, CSV `/cluster_time_csv`. Manueller Zeitabgleich und alte Zeittabellen entfernt. `sensorforge_monitor` soll nach Sichtung der neuen Ansicht gelöscht werden (Entscheidung des Users ausstehend).
+
+## Zeitsignal-Verfahren (2026-10-24) – v87-beta147
+
+Präzisionszeit kommt jetzt aus einem Zeitsignal des Coordinators (jede Sekunde Beacon + Folgepaket mit echtem Sendezeitpunkt); jeder Node führt Versatz und Gangabweichung über die letzten 64 Signale (obere Hüllkurve, `cluster_beacon_sync.*`). Hin-und-zurück-Serien messen nur noch die Funklaufzeit ein (alle 10 min, Neulinge zuerst; bis dahin Cluster-Mittelwert). Gültig, solange das letzte Signal ≤ 15 s alt ist. Ausgelegt für 100 Nodes; Simulation: alle nach ~14 s synchron, Node-zu-Node 95 % < 20–33 µs. Zeit-Broadcaster/Grant/Lease, Beacon-Intervalltest und NVS-Drift entfernt; Paketformat V3 (88 Byte) – alle Boards neu flashen. Offen: Hardwaretest, danach GPIO-Abnahme. Details: `ESPNOW_TIME_ARCHITECTURE.md` Abschnitt 0, `CHANGELOG.md`.
+
 ## Zentrale WLAN-Sendeleistung (2026-10-24) – v87-beta145
 - Coordinator-Seite „Sendeleistung (WLAN)“ und API `/api/v1/cluster/wifi_tx_power`: alle Nodes auf einen dBm-Wert, nur Sitzung oder dauerhaft (30 s Probezeit mit Kontaktnachweis, sonst Selbst-Rücksetzung). Ziel: prüfen, ob niedrigere Sendeleistung das unruhige WLAN (c002/c004) beruhigt; danach Schritt 2 (Broadcast-Zeitverfahren).
 - Alle Boards brauchen beta145. Freenove-Image ist mit 3,35 MB über der Grenze des IDE-Schemas `default_8MB` (3,34 MB) – nur mit Schema `sensorforge` bauen (`tools/flash_board.sh` tut das).

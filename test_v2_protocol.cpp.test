@@ -41,7 +41,7 @@ void test_basic_encode_decode() {
     assert(encode(f, packet, testSign, nullptr));
 
     // Verify version
-    assert(packet[4] == 2);  // kVersion = 2
+    assert(packet[4] == 3);  // kVersion = 3
 
     Frame decoded;
     assert(decode(packet, kPacketSize, decoded, testVerify, nullptr));
@@ -192,13 +192,13 @@ void test_realistic_delays() {
 }
 
 void test_packet_size() {
-    printf("Test 7: V2 packet size is 80 bytes (48+32)... ");
+    printf("Test 7: V3 packet size is 88 bytes (56+32)... ");
 
     using namespace EspNowTimePackets;
-    assert(kPayloadSize == 48);
+    assert(kPayloadSize == 56);
     assert(kMacSize == 32);
-    assert(kPacketSize == 80);
-    assert(kVersion == 2);
+    assert(kPacketSize == 88);
+    assert(kVersion == 3);
 
     printf("PASSED\n");
 }
