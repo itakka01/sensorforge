@@ -515,7 +515,7 @@ window.sfOnStatus(function(d){sfRenderCapacity('sfCoordCapacityWarning',d);});
  <h4 style='margin:0 0 8px'>Capture-Fertigstellungsbericht</h4>
  <div id='clusterCaptureReportSummary' role='status'>Noch kein Auftrag gestartet.</div>
  <button type='button' id='sfShowAllCaptureResults' style='margin:8px 0'>Alle Ergebnisse anzeigen (<span id='sfCaptureGalleryCount'>0</span>)</button>
- <div class='cluster-table-wrap'><table class='cluster-table'><thead><tr><th>Node</th><th>Auftrag</th><th>Ergebnis</th><th>Foto / Zeitpunkt / Abruf</th></tr></thead><tbody id='clusterCaptureReportRows'></tbody></table></div>
+ <div class='cluster-table-wrap'><table class='cluster-table' style='min-width:0'><thead><tr><th>Node</th><th>Auftrag</th><th>Ergebnis</th><th>Foto / Zeitpunkt / Abruf</th></tr></thead><tbody id='clusterCaptureReportRows'></tbody></table></div>
  <p class='muted' style='margin-bottom:0'>„JPEG erfolgreich“ bestätigt die Kamera-Rückmeldung des Nodes; kein Nachweis für exakten Belichtungsbeginn oder langfristige Speicherung. Bericht nur während dieser Browser-Sitzung; Job-Verlauf im Coordinator-RAM ist begrenzt.</p>
 </div>
 <dialog id='sfCaptureGalleryDialog' style='width:min(96vw,1250px);max-width:1250px;max-height:90vh;box-sizing:border-box;padding:18px;border-radius:14px'>
@@ -523,7 +523,7 @@ window.sfOnStatus(function(d){sfRenderCapacity('sfCoordCapacityWarning',d);});
  <p class='muted'>Nur vom Node bestätigte JPEGs seit dem Öffnen dieser Seite. Die Bilder liegen auf den Nodes und können später nicht mehr verfügbar sein. Ein fehlgeschlagener Abruf ist kein erfolgreicher Snapshot.</p>
  <div id='sfCaptureGalleryItems' style='display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px'></div>
 </dialog>
-<details><summary>SD-Wartung: Vorprüfung (ohne Löschen)</summary><p class='muted'>Prüft nur SD- und Recording-Status der ausgewählten Nodes. Es werden keine Dateien gelöscht.</p><button type='button' id='clusterSdPreflight'>SD-Löschung prüfen</button><p class='muted' id='clusterSdPreflightResult' role='status'>Noch nicht geprüft.</p></details>
+<dialog id='sfCaptureInfoDialog' style='width:min(94vw,520px);box-sizing:border-box;padding:16px;border-radius:12px'><div style='display:flex;justify-content:space-between;align-items:center;gap:12px'><h3 id='sfCaptureInfoTitle' style='margin:0'></h3><button type='button' id='sfCaptureInfoClose'>Schließen</button></div><div id='sfCaptureInfoBody' style='margin-top:10px;overflow-wrap:anywhere'></div></dialog>
 <div id='sfPowerActionNotice' role='status' aria-live='polite' style='display:none;position:fixed;z-index:31001;top:16px;right:16px;max-width:min(88vw,390px);box-sizing:border-box;padding:12px 16px;border:1px solid #60a5fa;border-radius:10px;background:#101c33;color:#f8fafc;box-shadow:0 6px 24px #0008;font:500 14px/1.5 system-ui,sans-serif;white-space:normal'></div>
 )__HEALTH__";
     html += webconfigClusterMountFilterHtml();
@@ -658,7 +658,7 @@ function sfCaptureState(row,now,target){
  var j=row.job;
  if(!j){return now>target+200000?['Unbestätigt','Kein zugeordneter Capture-Job mehr sichtbar',false]:['Warten','Warte auf signierten Auftragsstatus',false];}
  var st=Number(j.state),rc=Number(j.result||0);
- if(st===5)return ['JPEG erfolgreich','Signierter Abschluss vom Node bestätigt',true];
+ if(st===5)return ['JPEG erfolgreich','',true];
  if(st===6)return ['Fehlgeschlagen','Node meldet Fehlercode '+rc,false];
  if(st===7)return ['Zeitüberschreitung','Keine bestätigte Fertigstellung',false];
  if(st===8)return ['Abgebrochen','Auftrag abgebrochen',false];
@@ -667,10 +667,15 @@ function sfCaptureState(row,now,target){
  if(st===2)return ['Gesendet','Warte auf Node-Bestätigung',false];
  return ['Geplant','Auftrag im Coordinator vorgemerkt',false];
 }
+document.getElementById('clusterCaptureReportRows').addEventListener('click',function(e){var b=e.target.closest('.sf-cap-info');if(!b)return;
+ document.getElementById('sfCaptureInfoTitle').textContent=b.getAttribute('data-name');
+ document.getElementById('sfCaptureInfoBody').innerHTML='<p><strong>Foto-UUID</strong><br>'+esc(b.getAttribute('data-uuid'))+'</p><p><strong>Software-Auslösung (UTC)</strong><br>'+esc(b.getAttribute('data-utc'))+'</p><p class=\"muted\">Zeitpunkt, zu dem der Node die Kamera abgefragt hat; nicht der gemessene Belichtungsbeginn.</p>';
+ var d=document.getElementById('sfCaptureInfoDialog');if(d.showModal)d.showModal();else d.setAttribute('open','');});
+document.getElementById('sfCaptureInfoClose').addEventListener('click',function(){var d=document.getElementById('sfCaptureInfoDialog');if(d.close)d.close();else d.removeAttribute('open');});
 function sfRenderCaptureReport(){
  var report=sfCaptureReport,box=document.getElementById('clusterCaptureReport');if(!report||!box)return;
  box.style.display='block';var successes=0,failed=0,pending=0,now=Date.now();
- var html=report.rows.map(function(r){
+ var html=report.rows.slice().sort(function(a,b){return String(a.name).localeCompare(String(b.name),'de',{numeric:true,sensitivity:'base'});}).map(function(r){
   var v=sfCaptureState(r,now,report.target);
   if(v[2])successes++;else if(v[0]==='Fehlgeschlagen'||v[0]==='Zeitüberschreitung'||v[0]==='Abgebrochen'||v[0]==='HTTP-Fehler')failed++;else pending++;
   var color=v[2]?'#16a34a':failed&&['Fehlgeschlagen','Zeitüberschreitung','Abgebrochen','HTTP-Fehler'].indexOf(v[0])>=0?'#dc2626':'#b45309';
@@ -678,8 +683,8 @@ function sfRenderCaptureReport(){
   if(v[2])sfRememberCapture(r);
   var time=String(j.dispatch_utc_us||'0'),utcText='';
   if(/^\d{16}$/.test(time)){var millis=Number(time.slice(0,-3));if(Number.isFinite(millis))utcText=new Date(millis).toISOString();}
-  var media=mediaLink?'<div class=\"muted\">UUID: '+esc(mediaLink.uuid)+'</div><div class=\"muted\">Software-Trigger UTC: '+esc(utcText||'unbekannt')+'</div><a href=\"'+esc(mediaLink.download)+'\" target=\"_blank\" rel=\"noopener noreferrer\">Herunterladen</a> · <a href=\"'+esc(mediaLink.view)+'\" target=\"_blank\" rel=\"noopener noreferrer\">Ansehen</a>':'–';
-  return '<tr><td><strong>'+esc(r.name)+'</strong></td><td>'+esc(r.http==='error'?'HTTP ungeklärt':r.http==='accepted'?'HTTP angenommen':'Wird übertragen')+'</td><td><strong style=\"color:'+color+'\">'+esc(v[0])+'</strong><div class=\"muted\">'+esc(v[1])+'</div></td><td>'+media+'</td></tr>';
+  var media=mediaLink?'<a href=\"'+esc(mediaLink.download)+'\" target=\"_blank\" rel=\"noopener noreferrer\">Herunterladen</a> · <a href=\"'+esc(mediaLink.view)+'\" target=\"_blank\" rel=\"noopener noreferrer\">Ansehen</a> <button type=\"button\" class=\"sf-cap-info\" title=\"UUID und Auslösezeit\" data-name=\"'+esc(r.name)+'\" data-uuid=\"'+esc(mediaLink.uuid)+'\" data-utc=\"'+esc(utcText||'unbekannt')+'\">ⓘ</button>':'–';
+  return '<tr><td><strong>'+esc(r.name)+'</strong></td><td>'+esc(r.http==='error'?'unklar':r.http==='accepted'?'angenommen':'wird gesendet')+'</td><td><strong style=\"color:'+color+'\">'+esc(v[0])+'</strong>'+(v[1]?'<div class=\"muted\">'+esc(v[1])+'</div>':'')+'</td><td>'+media+'</td></tr>';
  }).join('');
  document.getElementById('clusterCaptureReportRows').innerHTML=html;
  var overall=pending?'Läuft / ausstehend':failed?'Abgeschlossen mit Fehlern':'Alle JPEGs bestätigt';
@@ -788,12 +793,12 @@ document.getElementById('clusterBulkCapture').addEventListener('click',async fun
   var fd=new FormData();fd.append('node_id',ids[i]);fd.append('utc_ms',String(Math.round(target)));if(testPulse)fd.append('test_pulse','1');
   var ctrl=new AbortController(),timer=setTimeout(function(){ctrl.abort();},12000);
   try{var r=await fetch('/cluster_node_capture',{method:'POST',body:fd,credentials:'same-origin',redirect:'manual',cache:'no-store',signal:ctrl.signal});
-      if(r.ok||r.status===303||r.status===0){accepted++;if(!shown){sfShowCaptureCountdown(target);shown=true;}sfCaptureReport.rows[i].http='accepted';results.push(ids[i]+': HTTP angenommen');}
+      if(r.ok||r.status===303||r.status===0){accepted++;if(!shown){sfShowCaptureCountdown(target);shown=true;}sfCaptureReport.rows[i].http='accepted';results.push(ids[i]+': angenommen');}
       else{sfCaptureReport.rows[i].http='error';var msg='';try{msg=(await r.text()).slice(0,110);}catch(ignored){}results.push(ids[i]+': HTTP '+r.status+(msg?' '+msg:''));}}
   catch(e){sfCaptureReport.rows[i].http='error';results.push(ids[i]+': Übertragungsfehler ('+(e.name==='AbortError'?'Zeitlimit':String(e.message||e))+'); Ausführung unbekannt');}
   finally{clearTimeout(timer);sfRenderCaptureReport();}
  }
- out.textContent='UTC '+new Date(target).toISOString()+' · '+accepted+'/'+ids.length+' HTTP angenommen'+(testPulse?' · mit GPIO-Testimpuls':'')+'. '+results.join(' | ')+'. Die grüne Anzeige kennzeichnet nur den geplanten Zeitpunkt; Capture-Ergebnisse stehen in der Node-Tabelle.';
+ out.textContent='UTC '+new Date(target).toISOString()+' · '+accepted+'/'+ids.length+' angenommen'+(testPulse?' · mit GPIO-Testimpuls':'')+'. '+results.join(' | ')+'. Die grüne Anzeige kennzeichnet nur den geplanten Zeitpunkt; Capture-Ergebnisse stehen in der Node-Tabelle.';
  if(accepted&&!shown)sfShowCaptureCountdown(target);
  }finally{window.sfCoordinatorBulkActive=false;button.disabled=false;sfRenderCaptureReport();window.sfCoordinateStatus(true).catch(function(){});if(accepted)window.sfStatusBurst(Math.min(300000,Math.max(0,target-sfCaptureUtcNow())+60000));}
 });
@@ -811,22 +816,6 @@ document.getElementById('clusterBulkProbe').addEventListener('click',function(){
 document.getElementById('clusterBulkRestart').addEventListener('click',function(){runBulk('/cluster_node_restart','Neustart',false);});
 document.getElementById('clusterBulkShutdown').addEventListener('click',function(){runBulk('/cluster_node_shutdown','Shutdown',true);});
 document.getElementById('clusterBulkWipe').addEventListener('click',function(){runBulk('/cluster_node_wipe','SD-Wipe',true);});
-document.getElementById('clusterSdPreflight').addEventListener('click',function(){
- var out=document.getElementById('clusterSdPreflightResult'),ids=sfActionableSelectedIds();
- if(!ids.length){out.textContent='Bitte mindestens einen entfernten Node auswählen.';return;}
- out.textContent='SD-Status wird geprüft …';
- window.sfCoordinateStatus().then(function(d){
-  var ns=Array.isArray(d.nodes)?d.nodes:[];
-  out.textContent=ids.map(function(id){
-   var n=ns.find(function(x){return String(x.integration_id||'')===id;});
-   if(!n)return id+': nicht erreichbar / keine Statusdaten';
-   var name=n.hostname||id;
-   if(n.recording)return name+': GESPERRT – Aufnahme läuft';
-   if(!n.health_valid||Number(n.sd_total_mib||0)<=0)return name+': SD nicht verfügbar / Daten unbekannt – keine Löschung möglich';
-   return name+': SD verfügbar ('+fmt(n.sd_used_mib||0)+' belegt, '+fmt(Math.max(0,Number(n.sd_total_mib||0)-Number(n.sd_used_mib||0)))+' frei); keine laufende Aufnahme gemeldet. Vollständiger Wipe über die Auswahl oben möglich.';
-  }).join(' | ');
- }).catch(function(e){out.textContent='Statusprüfung fehlgeschlagen: '+String(e.message||e)+'; keine Löschung erfolgt.';});
-});
 refreshAll();
 })();
 </script>)__HEALTH__";

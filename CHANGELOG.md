@@ -12,6 +12,10 @@
 
 **DOKU:** `ESPNOW_TIME_ARCHITECTURE.md` neu, beschreibt nur noch das aktuelle Verfahren. `TESTS_README.md` mit allen Host-Tests. Verweise in `README.md`, `CLAUDE.md`, `CLUSTER_ARCHITECTURE.md` angepasst.
 
+**Coordinator-Seite:** Abschnitt „SD-Wartung: Vorprüfung“ entfernt (zeigte nur die SD-Werte der Geräteliste an; der Wipe am Node reserviert die SD selbst und lehnt ab, wenn sie belegt oder nicht bereit ist). „Kameras im Cluster“: kompakte Tabelle (Gerät, Sensor, Kamera, Auflösung, Belichtung/Verstärkung, Stand), alle Werte und Fähigkeiten über „Details“ im Popup, alphabetisch sortiert; „Sensorfähigkeiten“ alphabetisch mit Spalten „Unterstützt“/„Nicht unterstützt“, beide Tabellen ohne Mindestbreite. Capture-Fertigstellungsbericht: Nodes alphabetisch, Auftrag „angenommen“/„wird gesendet“/„unklar“, Hinweis „Signierter Abschluss vom Node bestätigt“ entfernt, UUID und Software-Auslösung hinter der Schaltfläche ⓘ.
+
+**Ausfall-Statistik:** Funkpausen des Coordinators (Aufnahme, Listenaktion) zählen nicht mehr als Ausfall, wenn in dieser Zeit keine Zeitberichte ankommen. Ein Node meldet nach einer eigenen Funkpause erst nach 3 s wieder (vorher meldete er „Zeitsignal ausgeblieben“, sobald die Pause länger als 15 s war). Neu: Grund des letzten Ausfalls (`lr` in `/cluster_time_nodes`, Spalte `last_loss_reason` in der CSV, Anzeige unter „Ausfälle“).
+
 **Unverändert:** Zeitstempel-Rechnung, Schätzer, Grenzwerte, Slot-Planung, Wi-Fi-Zeit als Rückfall. Paketformat V3 bleibt; die verbliebenen Pakete sind bitgleich. Ein Coordinator mit beta149 arbeitet mit Nodes auf beta147/148 zusammen (deren Zusatzberichte werden ignoriert), trotzdem alle Boards flashen.
 
 ## v87-beta148 — 2026-10-24 (EINE ZEITANSICHT, GERÄTELISTE MIT ZEITSTATUS)

@@ -164,6 +164,8 @@ struct NodeSyncReport {
     uint32_t preciseS=0;
     uint32_t precisionLosses=0;        // precise -> not precise or silent
     uint32_t lastLossAgeS=UINT32_MAX;  // UINT32_MAX = no loss yet
+    bool lastLossGap=false;            // last loss: reports stopped for longer than kReportGapMs
+    PrecisionState lastLossState=PrecisionState::Valid;  // else: state the node reported
     double maxJitterUs=0;              // largest jitter reported while precise
 };
 // Beacon reports arrive every 10 s; a longer silence than this is a loss.

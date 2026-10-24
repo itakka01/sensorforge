@@ -177,6 +177,8 @@ bool initialized=false, wasCoordinator=false;
 uint8_t boundChannel=0;
 uint32_t nextBeaconMs=0,nextSeriesMs=0,nextProbeMs=0,txSequence=0,lastEpoch=0;
 uint32_t captureGuardUntilMs=0;
+// Last own radio pause (capture/list action), for the report gap allowance.
+uint32_t pauseStartedMs=0, pauseEndedMs=0;
 uint32_t permissionUntilMs=0, nextGrantMs=0;
 bool sendFrame(EspNowTimePackets::Frame& f,const uint8_t mac[6],
                int64_t* txStampOut=nullptr, bool replyStamp=false);
@@ -505,6 +507,8 @@ struct RemoteReport {
     // first beacon report and the moment of the last precision loss.
     uint64_t preciseMs=0;
     uint32_t firstBeaconAt=0, lastLossAt=0;
+    bool lastLossGap=false;                      // reason of the last loss: report gap
+    PrecisionState lastLossState=PrecisionState::Valid;  // else the reported state
 };
 SfPsramArray<RemoteReport> remoteReports;
 
@@ -928,6 +932,16 @@ RemoteReport *reportSlot(uint32_t boot) {
     if(rr.report.bootNonce!=boot){rr={};rr.report.bootNonce=boot;}
     return &rr;
 }
+// Reports are not processed while this coordinator pauses its radio
+// (capture, list action); that silence is no loss of the node.
+uint32_t reportGapAllowanceMs(uint32_t lastReportMs, uint32_t nowMs) {
+    uint32_t allowance=kReportGapMs;
+    if(pauseStartedMs) {
+        const uint32_t end=pauseEndedMs ? pauseEndedMs : nowMs;
+        if(int32_t(end-lastReportMs)>0) allowance+=end-pauseStartedMs;
+    }
+    return allowance;
+}
 void acceptBeaconSyncReport(const EspNowTimePackets::Frame &f) {
     RemoteReport *rr=reportSlot(static_cast<uint32_t>(f.senderBoot));
     if(!rr) return;
@@ -936,13 +950,15 @@ void acceptBeaconSyncReport(const EspNowTimePackets::Frame &f) {
     const bool precise=(f.nonce&2U)!=0;
     if(rr->beaconReceivedAt) {
         const uint32_t dt=nowMs-rr->beaconReceivedAt;
-        const bool gap=dt>kReportGapMs;
+        const bool gap=dt>reportGapAllowanceMs(rr->beaconReceivedAt,nowMs);
         // The interval since the last report keeps that report's state;
         // a silent node is not precise from the end of the gap allowance.
         if(r.precisionValid) rr->preciseMs+=gap ? kReportGapMs : dt;
         if(r.precisionValid && (gap || !precise)) {
             ++r.precisionLosses;
             rr->lastLossAt=gap ? rr->beaconReceivedAt+kReportGapMs : nowMs;
+            rr->lastLossGap=gap;
+            rr->lastLossState=static_cast<PrecisionState>((f.nonce>>4)&0x0fU);
         }
     } else {
         rr->firstBeaconAt=nowMs;
@@ -1138,6 +1154,7 @@ void pauseForCapture(uint32_t holdMs) {
     if (holdMs > 1805000UL) holdMs = 1805000UL;
     if (holdMs < 1000UL) holdMs = 1000UL;
     const uint32_t until = millis() + holdMs;
+    if (!capturePaused()) { pauseStartedMs = millis(); pauseEndedMs = 0; }
     if (captureGuardUntilMs == 0 ||
         static_cast<int32_t>(until - captureGuardUntilMs) > 0)
         captureGuardUntilMs = until;
@@ -1162,7 +1179,7 @@ bool capturePaused() {
 void stop() {
     benchAbortInternal(true);
     benchRawCount=0;
-    captureGuardUntilMs = 0;
+    captureGuardUntilMs = 0;pauseStartedMs=pauseEndedMs=0;
     permissionUntilMs=0;localBootNonceForControl=0;
     if(initialized){esp_now_deinit();initialized=false;}
     txTimingReset();
@@ -1223,11 +1240,15 @@ size_t nodeSyncReports(NodeSyncReport* out,size_t capacity){
             out[count].monitoredS=(nowMs-rr.firstBeaconAt)/1000UL;
             out[count].preciseS=static_cast<uint32_t>(precise/1000ULL);
             uint32_t losses=rr.report.precisionLosses, lossAt=rr.lastLossAt;
-            if(rr.report.precisionValid && open>kReportGapMs) {
+            bool lossGap=rr.lastLossGap;
+            if(rr.report.precisionValid && open>reportGapAllowanceMs(rr.beaconReceivedAt,nowMs)) {
                 ++losses;  // currently silent
                 lossAt=rr.beaconReceivedAt+kReportGapMs;
+                lossGap=true;
             }
             out[count].precisionLosses=losses;
+            out[count].lastLossGap=lossGap;
+            out[count].lastLossState=rr.lastLossState;
             out[count].lastLossAgeS=losses ? (nowMs-lossAt)/1000UL : UINT32_MAX;
         }
         ++count;
@@ -1552,6 +1573,11 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
         clearQueue(); // Discard frames received while processing was paused.
         nextBeaconMs = millis();
         nextSeriesMs = millis() + 1000UL;
+        pauseEndedMs = millis() ? millis() : 1;
+        // Report only after fresh beacons: right after a long pause the
+        // model is older than the holdover and would report "stale".
+        if (static_cast<int32_t>(nextBeaconReportMs - (millis() + 3000UL)) < 0)
+            nextBeaconReportMs = millis() + 3000UL;
     }
     int64_t loadMarkUs=esp_timer_get_time();
     Queued item;unsigned budget=0;

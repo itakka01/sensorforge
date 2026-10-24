@@ -58,7 +58,8 @@ static String fixed(double v, unsigned digits) { return String(v, digits); }
 //   ds delay source, n beacon samples, j jitter us, dp drift ppm,
 //   od own delay us (null = not calibrated), oa own delay age s,
 //   mo monitored s, pr precise s, lo precision losses, la last loss age s
-//   (null = none), mj max jitter us, ss/sr two-way series ok/rejected
+//   (null = none), lr reason of the last loss ("gap" = reports missing, else
+//   the precision state the node reported), mj max jitter us, ss/sr two-way series ok/rejected
 static void handleTimeNodesJson()
 {
     if (!clusterLocalIsCoordinator()) {
@@ -117,6 +118,8 @@ static void handleTimeNodesJson()
         json += ",\"lo\":" + String((unsigned long)r->precisionLosses);
         json += ",\"la\":";
         json += r->lastLossAgeS == UINT32_MAX ? String("null") : String((unsigned long)r->lastLossAgeS);
+        if (r->lastLossAgeS != UINT32_MAX)
+            json += ",\"lr\":\"" + String(r->lastLossGap ? "gap" : ClusterEspNowRadio::precisionStateName(r->lastLossState)) + "\"";
         json += ",\"mj\":" + fixed(r->maxJitterUs, 1);
         json += ",\"ss\":" + String((unsigned long)r->successfulSeries);
         json += ",\"sr\":" + String((unsigned long)r->rejectedSeries);
@@ -143,7 +146,7 @@ static void handleTimeCsv()
     csv.reserve(256 + v.snapCount * 160);
     csv += "hostname,integration_id,group,boot_id,role,report_age_ms,precise,precision_state,"
            "delay_source,own_delay_us,own_delay_age_s,jitter_us,drift_ppm,monitored_s,precise_s,"
-           "precise_percent,precision_losses,last_loss_age_s,max_jitter_us,series_ok,series_rejected\n";
+           "precise_percent,precision_losses,last_loss_age_s,last_loss_reason,max_jitter_us,series_ok,series_rejected\n";
     for (size_t i = 0; i < v.snapCount; ++i) {
         const ClusterMountEntry &e = v.snap[i];
         char boot[9];
@@ -152,11 +155,11 @@ static void handleTimeCsv()
             (e.mountKnown ? safeText(e.mount.group) : String()) + "," + boot + ",";
         const ClusterEspNowRadio::NodeSyncReport *r = e.local ? nullptr : v.reportFor(e.bootNonce);
         if (e.local) {
-            csv += "coordinator,,,,,,,,,,,,,,,,\n";
+            csv += "coordinator,,,,,,,,,,,,,,,,,\n";
             continue;
         }
         if (!r || !r->hasBeaconReport) {
-            csv += "node,,,no_report,,,,,,,,,,,,,\n";
+            csv += "node,,,no_report,,,,,,,,,,,,,,\n";
             continue;
         }
         csv += "node," + String((unsigned long)r->beaconReceivedAgeMs) + "," +
@@ -170,6 +173,8 @@ static void handleTimeCsv()
             (r->monitoredS ? fixed(100.0 * r->preciseS / r->monitoredS, 2) : String()) + "," +
             String((unsigned long)r->precisionLosses) + "," +
             (r->lastLossAgeS == UINT32_MAX ? String() : String((unsigned long)r->lastLossAgeS)) + "," +
+            (r->lastLossAgeS == UINT32_MAX ? String() :
+                String(r->lastLossGap ? "gap" : ClusterEspNowRadio::precisionStateName(r->lastLossState))) + "," +
             fixed(r->maxJitterUs, 1) + "," + String((unsigned long)r->successfulSeries) + "," +
             String((unsigned long)r->rejectedSeries) + "\n";
     }
@@ -185,7 +190,7 @@ String webconfigClusterTimeSectionHtml()
     return R"__TIME__(<details class='settings-section' id='sfTimeBox'><summary><strong>Zeitsynchronisation</strong> <span id='sfTimeSummary' class='muted'></span></summary>
 <p class='muted'>Jeder Node führt seine Uhr anhand der Zeitsignale des Coordinators (etwa eins pro Sekunde). Die Funklaufzeit misst jeder Node alle 10 Minuten per Hin-und-zurück-Messung ein; bis zur ersten eigenen Einmessung gilt der Cluster-Mittelwert. Die Nodes melden ihren Zustand alle 10 s an den Coordinator. Diese Ansicht verursacht keinen zusätzlichen Funkverkehr. Alle Werte sind Software-Zeitstempel; die echte Auslösegenauigkeit zeigt nur die GPIO-Prüfung unten.</p>
 <div id='sfTimeCoord' class='muted' role='status'>Wird mit „Aktualisieren“ in der Geräteliste geladen.</div>
-<p class='muted'>Langzeitwerte gelten seit dem letzten Start des Nodes bzw. des Coordinators. „Präzise“ zählt die Zeit, in der der Node präzise Zeit gemeldet hat; bleibt seine Meldung länger als 30 s aus, zählt das als Ausfall. <a href='/cluster_time_csv' download='sensorforge_cluster_time.csv'>Langzeitwerte als CSV herunterladen</a></p>
+<p class='muted'>Langzeitwerte gelten seit dem letzten Start des Nodes bzw. des Coordinators. „Präzise“ zählt die Zeit, in der der Node präzise Zeit gemeldet hat; bleibt seine Meldung länger als 30 s aus, zählt das als Ausfall (Funkpausen des Coordinators bei Aufnahmen und Listenaktionen ausgenommen). Unter „Ausfälle“ steht der Grund des letzten Ausfalls. <a href='/cluster_time_csv' download='sensorforge_cluster_time.csv'>Langzeitwerte als CSV herunterladen</a></p>
 <div class='cluster-table-wrap'><table class='cluster-table'><thead><tr><th>Gerät</th><th>Zustand</th><th>Streuung</th><th>Gangabweichung</th><th>Funklaufzeit</th><th>Präzise seit Start</th><th>Ausfälle</th><th>Größte Streuung</th><th>Einmessungen ok / verworfen</th><th>Meldung</th></tr></thead>
 <tbody id='sfTimeRows'><tr><td colspan='10' class='muted'>Noch nicht geladen.</td></tr></tbody></table></div>
 <details><summary>Genauigkeit mit GPIO prüfen</summary>
@@ -201,6 +206,7 @@ function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,function(c){retur
 function dur(s){s=Number(s)||0;if(s<120)return Math.round(s)+' s';if(s<7200)return Math.round(s/60)+' min';if(s<172800)return (s/3600).toFixed(1)+' h';return (s/86400).toFixed(1)+' d';}
 function num(v,u,d){return v==null||!Number.isFinite(Number(v))?'–':Number(v).toFixed(d||0)+' '+u;}
 var STATE={valid:'präzise',inactive:'ESP-NOW inaktiv (Drone Mode aus?)',no_beacons:'kein Zeitsignal',too_few_samples:'startet (sammelt Zeitsignale)',span_too_short:'startet',jitter_too_high:'Zeitsignal zu unruhig',drift_out_of_range:'Gangabweichung unplausibel',stale:'Zeitsignal ausgeblieben',no_delay:'Laufzeit unbekannt',no_utc:'Coordinator ohne UTC'};
+function lossReason(n){return n.lr==='gap'?'Zeitberichte ausgeblieben':(STATE[n.lr]||n.lr||'');}
 var byId={};
 // Severity: 0 ok, 1 hint, 2 starting, 3 problem, 4 offline/unknown.
 function info(id,online){
@@ -213,7 +219,7 @@ function info(id,online){
  var recent=n.la!=null&&n.la<3600,loss=recent?' · Ausfall vor '+dur(n.la):'';
  if(!n.pv){var st=n.st==='too_few_samples'||n.st==='span_too_short';return {sev:st?2:3,cls:st?'warn':'danger',text:st?'startet':'nicht präzise',title:(STATE[n.st]||n.st)};}
  if(n.ds!=='own')return {sev:recent?2:1,cls:'warn',text:'präzise (Cluster-Wert)'+loss,title:'Funklaufzeit noch nicht selbst eingemessen'};
- if(recent)return {sev:2,cls:'warn',text:'präzise'+loss,title:n.lo+' Ausfall/Ausfälle seit Start'};
+ if(recent)return {sev:2,cls:'warn',text:'präzise'+loss,title:n.lo+' Ausfall/Ausfälle seit Start'+(n.lr?' · letzter: '+lossReason(n):'')};
  return {sev:0,cls:'ok',text:'präzise',title:'Streuung '+num(n.j,'µs',0)};
 }
 window.sfTimeInfo=info;
@@ -233,7 +239,7 @@ function render(d){
   '<td>'+(has?num(n.j,'µs',0):'–')+'</td><td>'+(has?num(n.dp,'ppm',1):'–')+'</td>'+
   '<td>'+(has?(n.od!=null?num(n.od,'µs',0)+'<div class="muted">eigen, vor '+dur(n.oa)+'</div>':'Cluster-Wert'):'–')+'</td>'+
   '<td>'+(has&&n.mo?(100*n.pr/n.mo).toFixed(n.pr<n.mo?2:0)+' %<div class="muted">von '+dur(n.mo)+'</div>':'–')+'</td>'+
-  '<td>'+(has?String(n.lo)+(n.la!=null?'<div class="muted">zuletzt vor '+dur(n.la)+'</div>':''):'–')+'</td>'+
+  '<td>'+(has?String(n.lo)+(n.la!=null?'<div class="muted">zuletzt vor '+dur(n.la)+(n.lr?' · '+esc(lossReason(n)):'')+'</div>':''):'–')+'</td>'+
   '<td>'+(has?num(n.mj,'µs',0):'–')+'</td><td>'+(has?n.ss+' / '+n.sr:'–')+'</td>'+
   '<td>'+(has?'vor '+dur(n.ra/1000):'keine')+'</td></tr>';}).join(''):'<tr><td colspan="10" class="muted">Keine Nodes online.</td></tr>';
 }
