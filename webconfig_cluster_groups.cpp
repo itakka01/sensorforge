@@ -3,6 +3,7 @@
 #include "cluster.h"
 #include "cluster_group_logic.h"
 #include "cluster_groups.h"
+#include "webconfig_cluster.h"
 #include "config.h"
 #include "logger.h"
 
@@ -48,7 +49,7 @@ static void handleGroupsJson()
     if (!requireCoordinator())
         return;
     g_server->sendHeader("Cache-Control", "no-store");
-    g_server->send(200, "application/json; charset=utf-8", clusterGroupsJson());
+    webconfigClusterSendLargeJson(*g_server, clusterGroupsJson());
 }
 
 static void handleGroupSave()

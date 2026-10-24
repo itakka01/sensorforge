@@ -9,7 +9,8 @@ namespace {
 
 using namespace ClusterCamera;
 
-static const size_t kMaxEntries = 24;
+// One entry per reporting device (100-node cluster + rebooted/left ones).
+static const size_t kMaxEntries = 128;
 
 struct Entry {
     char integrationId[36];

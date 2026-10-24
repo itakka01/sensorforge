@@ -10,6 +10,7 @@
 #include "cluster_time_source_policy.h"
 #include "cluster_slot_scheduler.h"
 #include "loop_load_diag.h"
+#include "psram_alloc.h"
 static_assert(ClusterTimeGrantProtocol::kWireBytes == 96, "grant frame size");
 #include "board_config.h"
 #include <Arduino.h>
@@ -334,11 +335,16 @@ struct SlotPeer { uint8_t mac[6]={}; uint32_t boot=0; uint32_t seenMs=0;
                   ClusterSlotScheduler::PeerState sched; };
 // Precision slot scheduling (cluster_slot_scheduler.h): a slot ends when the
 // owner's series is over; the next owner is the most urgent due node.
-constexpr size_t kSlotPeerCapacity=32;
-SlotPeer slotPeers[kSlotPeerCapacity];
+// Per-node tables sized for a 100-node cluster plus headroom for nodes that
+// rebooted (new boot ID) or left. They live in PSRAM (allocated in start(),
+// see ensureNodeTables()); without PSRAM they stay empty and no node is
+// scheduled. Only loopTask touches them, never the receive callback.
+constexpr size_t kNodeTableCapacity=kNodeReportCapacity;
+constexpr size_t kSlotPeerCapacity=kNodeTableCapacity;
+SfPsramArray<SlotPeer> slotPeers;
 // Diagnostics only: last time a node was seen while every slot was taken.
 uint32_t slotTableFullLastMs=0;
-int8_t slotOwner=-1;
+int16_t slotOwner=-1;
 uint32_t slotStartedMs=0, slotGuardUntilMs=0;
 uint32_t slotGrantsSent=0, slotRotations=0;
 constexpr uint32_t kSlotLifetimeMs=120000;      // == kPrecisionLifetimeMs (static_assert below)
@@ -457,11 +463,12 @@ void serviceSlots(uint32_t now,uint32_t epoch,uint64_t tag,uint32_t boot) {
     if(slotOwner<0) {
         if(static_cast<int32_t>(now-slotGuardUntilMs)<0) return;
         ClusterSlotScheduler::PeerState *peers[kSlotPeerCapacity];
-        for(size_t i=0;i<kSlotPeerCapacity;++i)
+        const size_t peerCount=slotPeers.size();
+        for(size_t i=0;i<peerCount;++i)
             peers[i]=slotPeerActive(slotPeers[i],now) ? &slotPeers[i].sched : nullptr;
-        const int next=ClusterSlotScheduler::choose(peers,kSlotPeerCapacity,now,kSlotParams,slotStats);
+        const int next=ClusterSlotScheduler::choose(peers,peerCount,now,kSlotParams,slotStats);
         if(next>=0) {
-            slotOwner=static_cast<int8_t>(next);
+            slotOwner=static_cast<int16_t>(next);
             ClusterSlotScheduler::onSlotStart(slotState,slotPeers[slotOwner].sched,now,slotStats);
             if(slotLastStartMs){slotPeriodTotalMs+=uint32_t(now-slotLastStartMs);++slotPeriodCount;}
             slotLastStartMs=now;
@@ -633,8 +640,8 @@ struct PeerReplay {
     uint8_t activeBootIndex=0; // Index of currently active boot in history
 };
 // One entry per node MAC for the whole radio session (never evicted, so replay
-// state of a known node is never lost). Sized like the slot table.
-PeerReplay peerReplay[32];
+// state of a known node is never lost). Sized like the slot table (PSRAM).
+SfPsramArray<PeerReplay> peerReplay;
 ClusterEspNowTwoWay::Exchange exchanges[kMaxSamplesPerSeries];
 uint8_t seriesCount=0;
 uint8_t seriesTarget=kInitialSamples;
@@ -643,9 +650,17 @@ ClusterEspNowRegression::Point driftHistory[ClusterEspNowRegression::kHistory];
 size_t driftHistoryCount=0;
 uint32_t nextReportMs=0;
 bool seriesPrecisionAccepted=false;
-NodeSyncReport remoteReports[12];
-uint32_t remoteReceivedAt[12]={};
-uint8_t remoteNext=0;
+// One entry per reporting node boot ID (PSRAM); when full, the entry heard
+// from longest ago is replaced, so stale boot IDs go first.
+struct RemoteReport { NodeSyncReport report; uint32_t receivedAt=0; };
+SfPsramArray<RemoteReport> remoteReports;
+
+void ensureNodeTables() {
+    if(!slotPeers.allocate(kNodeTableCapacity) ||
+       !peerReplay.allocate(kNodeTableCapacity) ||
+       !remoteReports.allocate(kNodeTableCapacity))
+        Serial.println("[ESPNOW] PSRAM node tables unavailable");
+}
 uint32_t reportCount=0;
 uint32_t retrySerial=0;
 uint32_t qualityRetryDelayMs() {
@@ -908,6 +923,7 @@ bool pop(Queued &v) {
 }
 void clearQueue(){portENTER_CRITICAL(&queueMux);head=tail=0;diagnosticHead=diagnosticTail=0;grantHead=grantTail=0;drops=0;portEXIT_CRITICAL(&queueMux);}
 bool start(uint8_t channel) {
+    ensureNodeTables();
     if(esp_now_init()!=ESP_OK)return false;
     if(esp_now_register_recv_cb(onReceive)!=ESP_OK){esp_now_deinit();return false;}
     txTimingReset();
@@ -1022,11 +1038,18 @@ bool ensurePeer(const uint8_t mac[6]) {
 void acceptNodeReport(const EspNowTimePackets::Frame &f) {
     const uint32_t boot=static_cast<uint32_t>(f.senderBoot);
     if(!boot)return;
-    size_t slot=12;
-    for(size_t i=0;i<12;++i)if(remoteReports[i].bootNonce==boot){slot=i;break;}
-    if(slot==12){for(size_t i=0;i<12;++i)if(!remoteReports[i].bootNonce){slot=i;break;}}
-    if(slot==12)slot=(remoteNext++%12);
-    auto &r=remoteReports[slot];
+    const size_t n=remoteReports.size();
+    if(!n)return;
+    size_t slot=n;
+    for(size_t i=0;i<n;++i)if(remoteReports[i].report.bootNonce==boot){slot=i;break;}
+    if(slot==n){for(size_t i=0;i<n;++i)if(!remoteReports[i].report.bootNonce){slot=i;break;}}
+    if(slot==n){
+        const uint32_t nowMs=millis();
+        slot=0;
+        for(size_t i=1;i<n;++i)
+            if(uint32_t(nowMs-remoteReports[i].receivedAt)>uint32_t(nowMs-remoteReports[slot].receivedAt))slot=i;
+    }
+    auto &r=remoteReports[slot].report;
     if(r.bootNonce!=boot)r={};
     r.bootNonce=boot;
     const uint64_t bits=static_cast<uint64_t>(f.timeUs);
@@ -1039,7 +1062,7 @@ void acceptNodeReport(const EspNowTimePackets::Frame &f) {
         r.lastRejectedMetricsValid=r.lastRejectedReason!=1 && r.lastRejectedReason!=4;
         r.lastRejectedSpreadUs=static_cast<uint32_t>(bits>>32);
         r.lastRejectedRttUs=static_cast<uint32_t>(bits);
-        remoteReceivedAt[slot]=millis();++reportCount;return;
+        remoteReports[slot].receivedAt=millis();++reportCount;return;
     }
     if(f.type==EspNowTimePackets::Type::NodeSyncReport && (f.nonce&0x1000U)!=0) {
         r.successfulSeries=static_cast<uint32_t>(bits>>32);
@@ -1048,13 +1071,13 @@ void acceptNodeReport(const EspNowTimePackets::Frame &f) {
         const uint32_t ageSeconds=(f.nonce>>20)&0x0fffU;
         r.lastSeriesAgeMs=ageSeconds*1000UL;
         r.hasSeriesStatistics=true;
-        remoteReceivedAt[slot]=millis();++reportCount;return;
+        remoteReports[slot].receivedAt=millis();++reportCount;return;
     }
     if(f.type==EspNowTimePackets::Type::NodeDriftReport && (f.nonce&0x800U)!=0){
         r.failedMinRttOffsetUs=static_cast<int32_t>(static_cast<uint32_t>(bits>>32));
         r.failedSelectedOffsetUs=static_cast<int32_t>(static_cast<uint32_t>(bits));
         r.hasFailureOffsets=true;
-        remoteReceivedAt[slot]=millis();++reportCount;return;
+        remoteReports[slot].receivedAt=millis();++reportCount;return;
     }
     if(f.type==EspNowTimePackets::Type::NodeDriftReport && (f.nonce&0x400U)!=0){
         r.failedSpreadUs=static_cast<uint32_t>(bits>>32);
@@ -1062,7 +1085,7 @@ void acceptNodeReport(const EspNowTimePackets::Frame &f) {
         r.failedAccepted=static_cast<uint8_t>((f.nonce>>16)&0xffU);
         r.failedSelected=static_cast<uint8_t>((f.nonce>>24)&0xffU);
         r.hasFailureMetrics=true;
-        remoteReceivedAt[slot]=millis();++reportCount;return;
+        remoteReports[slot].receivedAt=millis();++reportCount;return;
     }
     if(f.type==EspNowTimePackets::Type::NodeSyncReport){
         if ((f.nonce&0x200U)!=0) { // Diagnostic-only frame: NOT a successful clock sync.
@@ -1076,7 +1099,7 @@ void acceptNodeReport(const EspNowTimePackets::Frame &f) {
             r.exchangesComplete=static_cast<uint32_t>(bits);
             r.failureCode=static_cast<uint8_t>((f.nonce>>16)&0xffU);
             r.failedSeries=static_cast<uint8_t>((f.nonce>>24)&0xffU);
-            remoteReceivedAt[slot]=millis();++reportCount;
+            remoteReports[slot].receivedAt=millis();++reportCount;
             slotNotePrecisionReport(boot,false,0);
             return;
         }
@@ -1095,7 +1118,7 @@ void acceptNodeReport(const EspNowTimePackets::Frame &f) {
         r.hasTimeSource=true;
         r.hasDriftReport=true;
     }
-    remoteReceivedAt[slot]=millis();++reportCount;
+    remoteReports[slot].receivedAt=millis();++reportCount;
 }
 void sendSeriesStatistics(uint32_t epoch,uint64_t tag,uint32_t boot) {
     // One additional small authenticated frame per 15 s. No SD/NVS writes.
@@ -1447,7 +1470,7 @@ void stop() {
     referenceUtcUs=0;referenceMonoLow=0;referenceReceivedNodeMono=0;
     beaconObsCount=beaconObsWrite=0;beaconStats={};sharedEventCount=sharedEventWrite=0;sharedEventBoot=0;sharedEventEpoch=0;
     referenceId=String();goodDriftPairs=0;driftHistoryCount=0;
-    for(auto &r:remoteReports)r={};for(auto &x:remoteReceivedAt)x=0;remoteNext=0;reportCount=0;
+    for(auto &r:remoteReports)r={};reportCount=0;
     stats.driftValid=false;stats.storedDriftAvailable=false;stats.driftPpm=0;
     stats.driftUncertaintyPpm=0;stats.driftSamples=0;
 }
@@ -1580,10 +1603,10 @@ bool precisionUtcNow(uint32_t epoch, const char *coordinatorId,
 size_t nodeSyncReports(NodeSyncReport* out,size_t capacity){
     if(!out||!capacity||!initialized||!wasCoordinator)return 0;
     size_t count=0;
-    for(size_t i=0;i<12&&count<capacity;++i){
-        if(!remoteReports[i].bootNonce)continue;
-        out[count]=remoteReports[i];
-        out[count].receivedAgeMs=static_cast<uint32_t>(millis()-remoteReceivedAt[i]);
+    for(size_t i=0;i<remoteReports.size()&&count<capacity;++i){
+        if(!remoteReports[i].report.bootNonce)continue;
+        out[count]=remoteReports[i].report;
+        out[count].receivedAgeMs=static_cast<uint32_t>(millis()-remoteReports[i].receivedAt);
         ++count;
     }
     return count;
@@ -2092,7 +2115,7 @@ Diagnostics diagnostics(){Diagnostics out=stats;
         }
         out.slotPeriodMeanMs=slotPeriodCount ? static_cast<uint32_t>(slotPeriodTotalMs/slotPeriodCount) : 0;
         out.slotCycleEstimateMs=out.slotActivePeers*out.slotPeriodMeanMs;
-        out.slotCapacity=kSlotPeerCapacity;
+        out.slotCapacity=slotPeers.size();
         out.slotTableFullRecent=slotTableFullLastMs && uint32_t(now-slotTableFullLastMs)<=kPeerActiveMs;
         out.slotRotations=slotRotations;
         out.slotOwnerRecovery=slotOwner>=0 && slotPeers[slotOwner].sched.lastSlotWasRetry;

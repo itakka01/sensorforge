@@ -125,20 +125,26 @@ Der Coordinator beantwortet Probes nur vom jeweiligen **Slot-Inhaber**; immer nu
 | 24 | 3,6 s | 100 % | 0 | 111 s |
 | 28 | 3,5 s | 99,8 % | vereinzelt | 132 s |
 | 32 | 3,6 s | 98,4 % | ja (gesättigt, gleichmäßig verteilt) | 140 s |
+| 48 | 3,6 s | 67 % | ja (gesättigt, gleichmäßig verteilt) | 224 s |
+| 100 (Auslegung ab beta144) | 3,6 s | 32 % | ja (gesättigt, gleichmäßig verteilt) | 396 s |
+| 140 (über Tabellengröße 128) | 3,6 s | 128 Nodes eingeplant, 12 gar nicht | ja | 507 s |
 | 9 bei 5 % Verlust, 15 % verworfen | 5,0 s | 100 % | 0 | 104 s |
 | 16 bei 5 % Verlust, 15 % verworfen | 4,9 s | 96,9 % | ja | 188 s |
 
 Faustregel: dauerhaft lückenlos, solange `Nodes × Slot-Dauer` deutlich unter 120 s bleibt (bei ~3,6 s je Slot bis etwa 24 Nodes). Darüber ist die Funkzeit ausgeschöpft: Alle Nodes werden weiter gleichmäßig nachgemessen (Fairness bleibt, kein Node fällt dauerhaft heraus), aber einzelne laufen zeitweise über 120 s. Ein Slot ist zu etwa 1 s durch den Node-Start nach der Freigabe bestimmt (Node-Firmware, bewusst unverändert) – ein künftiger Node-seitiger Sofortstart wäre der nächste Hebel (~25 % kürzere Slots).
 
-**Harte Grenzen**
+**Harte Grenzen** (ab v87-beta144 für 100 Geräte ausgelegt; alle Tabellen im PSRAM)
 
 | Grenze | Wert | Verhalten darüber |
 |---|---|---|
-| Slot-Tabelle (`kSlotPeerCapacity`) | 32 aktive Nodes | weitere Nodes bekommen keinen Slot; `slot_table_full_recent`, Warnung auf `/cluster` |
-| Wiedergabeschutz (`peerReplay`) | 32 Node-MACs je Funk-Sitzung, nie verdrängt | Pakete weiterer MACs werden verworfen |
+| Cluster-Mitgliederliste (`CLUSTER_MAX_PEERS`, cluster.cpp) | 100 fremde Geräte | **Auslegungsgrenze**: weitere Geräte werden abgewiesen (aktive Mitglieder werden nie verdrängt), `peer_rejected`-Liste und rote Warnung auf `/cluster` und `/cluster_coordinate` |
+| Slot-Tabelle, Wiedergabeschutz, Node-Berichte (`kNodeReportCapacity`) | 128 (100 + neu gestartete/verschwundene) | Slot: kein Slot, `slot_table_full_recent`; Wiedergabeschutz: Pakete weiterer MACs verworfen; Berichte: der am längsten nicht gehörte wird ersetzt |
+| Jobs (`ClusterJobs::kMaxJobs`) | 256 | zwei Foto-Aufträge an 100 Nodes passen; volle Tabelle aktiver Jobs lehnt neue ab („Job-Liste voll“) |
+| Ressourcen / Discovery / Kamera-Übersicht | 256 / 128 / 128 | älteste bzw. abgelaufene Einträge werden ersetzt |
 | ESP-NOW-Partner für Antworten | 18 + Broadcast | am längsten unbenutzter Partner wird ersetzt (`unicastPeerEvictions` intern) |
-| Cluster-Mitgliederliste (`CLUSTER_MAX_PEERS`, cluster.cpp) | 16 fremde Geräte | **jetzt die engste Grenze**: verdrängt Mitglieder (Anzeige, Jobs); Erweiterung kostet ~400 B internen RAM je Eintrag und ist offen |
-| Node-Berichtsanzeige (`remoteReports`) | 12 | nur Diagnoseanzeige `espnow_node_reports`; Planung unabhängig davon |
+| **Präzisionszeit (Funkzeit)** | lückenlos bis ~24 Nodes | darüber gerecht verteilt, aber zeitweise WLAN-Zeit (Tabelle oben); gelbe Warnung ab 25 Nodes, rot bei Zyklus ≥ 120 s. Abhilfe erst mit dem geplanten Broadcast-Zeitverfahren |
+
+Speicher: Die Tabellen belegen rund 250 KB PSRAM (von 8 MB) und haben ~28 KB statischen internen RAM freigegeben. `/cluster_status` wird in 4-KB-Teilen gesendet (100 Nodes ≈ 200 KB), Kamera- und Gruppenliste ebenso; zwischen den Teilen bedient der Coordinator den ESP-NOW-Funk (`clusterServiceTimeCritical()`), damit Zeitmessungen nicht ausfallen.
 
 **Diagnose** (`/cluster_status` → `espnow_time_local`, nur Coordinator):
 

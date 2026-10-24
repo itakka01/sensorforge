@@ -107,6 +107,12 @@ bool clusterAnnounceResource(
 // Contains the local node, only authenticated peers from the same cluster and
 // currently valid resource announcements.
 String clusterStatusJson();
+// Same JSON in parts (each >= 4 KB except the last) for chunked HTTP, so a
+// 100-node status never has to exist as one String.
+typedef void (*ClusterStatusChunkSink)(String &chunk, void *ctx);
+void clusterStatusJsonStream(ClusterStatusChunkSink sink, void *ctx);
+// ESP-NOW time service only; call between parts of long HTTP responses.
+void clusterServiceTimeCritical();
 
 // Independent UTC estimate, not applied to system clock/RTC or recording.
 // false if authority time is missing or estimate too old.

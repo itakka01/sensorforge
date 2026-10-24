@@ -1,3 +1,8 @@
+## Cluster für 100 Geräte (2026-10-24) – v87-beta144
+- Alle Cluster-Tabellen für 100 Geräte im PSRAM; volle Mitgliederliste weist ab (rote Warnung mit Geräteliste auf `/cluster` und `/cluster_coordinate`); `/cluster_status` gestreamt. Details: `CHANGELOG.md`, Grenzen: `ESPNOW_TIME_ARCHITECTURE.md` 8.1.
+- Präzisionszeit weiter nur bis ~24 Nodes lückenlos. **Nächster Schritt (Schritt 2):** Broadcast-Zeitverfahren (Coordinator sendet ~1/s Zeitsignal + Folgepaket mit echtem Sendezeitpunkt, Zwei-Wege-Messung nur zum Einmessen der Laufzeit), erst Konzept, dann Messung mit den vorhandenen Beacon-Experimenten.
+- beta143 committet als `v87-beta143_slotplanung_lastdiagnose`; beta144 noch nicht.
+
 ## Last-Diagnose über das Netzwerk (2026-10-24) – v87-beta142
 - `GET /load_diag`: CPU-Anteil je Loop-Abschnitt (10-s-Fenster) und die 10 busiest FreeRTOS-Tasks; Ziel: Ursache der ~30 % loopTask-Last auf dem Coordinator devxiao3 finden, ohne den seriellen Port zu öffnen. Details: `CHANGELOG.md`.
 - beta141 (Slot-Planung) läuft seit 24.10. auf allen diymore-Boards und devxiao3; im ersten Hardwaretest 9/9 Nodes auf Präzisionszeit, Ø-Slot 3,3 s, Zyklus ~45–55 s.

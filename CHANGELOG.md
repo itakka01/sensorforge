@@ -1,3 +1,24 @@
+## v87-beta144 — 2026-10-24 (CLUSTER FÜR 100 GERÄTE AUSGELEGT)
+
+**Ziel:** Grundgerüst für 100 Cluster-Geräte (Schritt 1 vor dem geplanten Broadcast-Zeitverfahren). Bisher: Mitgliederliste 16 (ein 17. Gerät verdrängte aktive Mitglieder), Jobs 16 (ein Cluster-Foto erreichte höchstens 16 Nodes gleichzeitig), Ressourcen 24, Discovery 32, Kamera-Übersicht 24, Slot-Tabelle/Wiedergabeschutz 32, Sync-Berichte 12.
+
+**GEÄNDERT:**
+- `cluster.cpp`: `CLUSTER_MAX_PEERS` 100, `CLUSTER_MAX_RESOURCES` 256, `CLUSTER_MAX_DISCOVERY_NODES` 128; Tabellen im PSRAM (`ensureClusterTables()`, Elemente per placement new konstruiert), bis zur Reservierung bzw. ohne PSRAM Kapazität 0 (alle Schleifen leer, kein Absturz). Neustart-Nachweise (128) im PSRAM, Probe-Retries fest 16.
+- **Volle Mitgliederliste weist ab statt zu verdrängen:** Nur Einträge mit abgelaufener Lease werden ersetzt. Abgewiesene Geräte (Kennung, Hostname, IP, Anzahl) in `peer_rejected` (letzte 10 min), `peer_rejected_total`; Konsolenmeldung.
+- `cluster_jobs`: `kMaxJobs` 256 im PSRAM (zwei Foto-Aufträge an 100 Nodes passen); volle Tabelle aktiver Jobs lehnt weiter ab.
+- `cluster_espnow_radio.cpp`: Slot-Tabelle, Wiedergabeschutz und Node-Berichte je 128 (`kNodeReportCapacity`) im PSRAM (`SfPsramArray`); Berichte ersetzen bei voller Tabelle den am längsten nicht gehörten Eintrag (statt reihum). `slotOwner` int16.
+- `cluster_camera.cpp`: 128 Einträge.
+- `/cluster_status` wird gestreamt (Chunked HTTP, 4-KB-Teile, `clusterStatusJsonStream()`); zwischen den Teilen bedient der Coordinator den ESP-NOW-Funk (`clusterServiceTimeCritical()`). Kamera- und Gruppenliste werden in 4-KB-Teilen gesendet (`webconfigClusterSendLargeJson()`). Node-Berichte und Job-Liste im Status per PSRAM-Puffer statt Stack.
+- **Warnung** (gemeinsam für `/cluster` und neu oben auf `/cluster_coordinate`): rot und groß bei abgewiesenen Geräten („CLUSTER-GRENZE ÜBERSCHRITTEN“ mit Geräteliste), fehlender Mitgliederliste, voller Slot-Tabelle oder Synchronisationszyklus ≥ 120 s; gelb bei fast voller Mitgliederliste (≥ 95), mehr als 24 Nodes („Präzisionszeit nicht mehr lückenlos“) oder Zyklus > 100 s.
+- `psram_alloc.h`: `SfPsramArray<T>` (feste PSRAM-Tabelle, leer bis zur Reservierung, range-for-fähig).
+- Neue JSON-Felder: `peer_design_capacity`, `peer_rejected_total`, `peer_rejected[]`; `peer_capacity` ist jetzt die tatsächlich reservierte Größe.
+
+**Speicher:** statischer interner RAM −28,5 KB (XIAO 148.564 → 120.020 B); PSRAM rund 250 KB.
+
+**Tests:** `test_cluster_jobs.cpp.test` neu (mit/ohne PSRAM); `test_slot_scheduler` um 48/100/140 Nodes erweitert (100 Nodes: alle eingeplant, gerecht, Präzision ≥ 32 % der Zeit; 140: 128 eingeplant, Tabelle-voll erkannt); alle übrigen Host-Tests bestanden; Builds XIAO/diymore/Freenove ohne neue Warnungen.
+
+**Grenzen:** Präzisionszeit bleibt durch die Funkzeit auf ~24 Nodes lückenlos begrenzt (Abhilfe: Broadcast-Zeitverfahren, Schritt 2). Mit mehr als 16 Geräten nur auf echter Hardware prüfbar; WLAN-Router-Kapazität bei 100 Clients ungeprüft.
+
 ## v87-beta143 — 2026-10-24 (COORDINATOR-LAST: WAHL GEDROSSELT)
 
 **Messung mit beta142 auf devxiao3 (Coordinator, Drone Mode):** loopTask 32–33 % eines Kerns bei ~325 Loop-Durchläufen/s. Echte Rechenzeit: `cluster_espnow` 10,5 % (Ø 0,32 ms), `cluster_election` 4,9 % (Ø 0,15 ms), UDP 3,5 %, `prelude` 2,8 %, `drone_misc` 2,3 %, Rest WebConfig. Der Abschnitt `webconfig` zeigt ~42 %, das ist überwiegend das `delay(1)` in `WebServer::handleClient()` ohne Client, keine Rechenzeit.

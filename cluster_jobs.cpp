@@ -1,10 +1,21 @@
 #include "cluster_jobs.h"
+#include "psram_alloc.h"
 #include <string.h>
 
 namespace ClusterJobs {
 namespace {
-Entry entries[kMaxJobs] = {};
+// Allocated in PSRAM on first use; never freed. nullptr = no job table.
+Entry *entries = nullptr;
 size_t count = 0;
+bool allocTried = false;
+
+bool ensureTable() {
+    if (!entries && !allocTried) {
+        allocTried = true;
+        entries = static_cast<Entry *>(sfPsramCalloc(kMaxJobs, sizeof(Entry)));
+    }
+    return entries != nullptr;
+}
 
 bool validNode(const char *node) {
     if (!node || strlen(node) != kNodeIdLength - 1 ||
@@ -31,7 +42,7 @@ bool allowed(State from, State to) {
     }
 }
 } // namespace
-void reset() { memset(entries, 0, sizeof(entries)); count = 0; }
+void reset() { if (ensureTable()) memset(entries, 0, kMaxJobs * sizeof(Entry)); count = 0; }
 const Entry *find(uint64_t id) {
     if (!id) return nullptr;
     for (size_t i = 0; i < count; ++i) if (entries[i].jobId == id) return &entries[i];
@@ -39,7 +50,7 @@ const Entry *find(uint64_t id) {
 }
 bool enqueue(uint64_t id, uint32_t epoch, const char *node, Kind kind,
              uint32_t now, uint32_t timeout) {
-    if (!id || !epoch || !validNode(node) || kind == Kind::None ||
+    if (!ensureTable() || !id || !epoch || !validNode(node) || kind == Kind::None ||
         timeout < 1000 || timeout > 3600000 || find(id)) return false;
     // Expire outstanding jobs before evaluating capacity. Reuse only a
     // terminal slot; an active job must never disappear from the table.

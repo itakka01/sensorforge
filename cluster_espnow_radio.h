@@ -258,6 +258,9 @@ struct NodeSyncReport {
     int32_t failedMinRttOffsetUs=0, failedSelectedOffsetUs=0;
     bool hasFailureMetrics=false, hasFailureOffsets=false, hasTimeSource=false, usingEspNowTime=false;
 };
+// Coordinator-side table size for node reports, slots and replay state
+// (100-node cluster plus rebooted/left nodes).
+constexpr size_t kNodeReportCapacity = 128;
 // Copy up to capacity reports, one per last authenticated node boot ID.
 // Never infer a sync from Probes or from Wi-Fi status.
 size_t nodeSyncReports(NodeSyncReport* out, size_t capacity);

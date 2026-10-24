@@ -3,7 +3,7 @@
 //   /tmp/test_slot_scheduler
 //
 // Part 1: unit checks of the pure decisions.
-// Part 2: millisecond simulation of coordinator + nodes for 4..48 nodes with
+// Part 2: millisecond simulation of coordinator + nodes for 4..140 nodes with
 //         packet loss, rejected series, a permanently failing node, a node that
 //         ignores grants, a node that disappears and a node reboot. The
 //         coordinator side mirrors serviceSlots()/endSlot()/noteSlotPeer() in
@@ -148,7 +148,7 @@ struct Scenario {
 
 static const uint32_t kSimMs = 2u * 3600u * 1000u;
 static const uint32_t kWarmupMs = 10u * 60u * 1000u;
-static const size_t kCapacity = 32;  // kSlotPeerCapacity
+static const size_t kCapacity = 128;  // kSlotPeerCapacity (kNodeReportCapacity)
 
 struct Node {
     uint32_t boot = 0;
@@ -369,6 +369,7 @@ struct Result {
     uint64_t foreignProbeMs;
     uint32_t tableFull;
     int valid95Nodes;         // healthy nodes with >= 95 % validity
+    int servedNodes;          // healthy nodes that got precision at all
 };
 
 static Result simulate(const Scenario &sc, bool print)
@@ -392,6 +393,7 @@ static Result simulate(const Scenario &sc, bool print)
         r.minSeries = std::min(r.minSeries, n.series);
         r.maxSeries = std::max(r.maxSeries, n.series);
         if (v >= 0.95) ++r.valid95Nodes;
+        if (n.validMs > 0) ++r.servedNodes;
     }
     r.failingSlotsPerHour = sc.permanentlyFailing
         ? (double)failingSeries / sc.permanentlyFailing / (kSimMs / 3600000.0) : 0.0;
@@ -406,7 +408,7 @@ static Result simulate(const Scenario &sc, bool print)
                sim.stats.noActivity, sim.stats.hardCap, sim.stats.ownerLost, sim.stats.failed,
                sim.stats.retrySucceeded, sim.stats.retrySlots);
         if (sc.permanentlyFailing) printf(" failingSlots/h=%.1f", r.failingSlotsPerHour);
-        if (r.tableFull) printf(" tableFull=%u valid95=%d", r.tableFull, r.valid95Nodes);
+        if (r.tableFull) printf(" tableFull=%u valid95=%d served=%d", r.tableFull, r.valid95Nodes, r.servedNodes);
         printf(" foreignProbeMs=%llu\n", (unsigned long long)r.foreignProbeMs);
     }
     return r;
@@ -442,17 +444,33 @@ static void simulationTests()
         CHECK(r.minHealthyValid >= 0.995, "28 nodes: precision valid >= 99.5 % of the time");
     }
     {
-        Scenario sc{"32 nodes (table full)", 32, 0.01, 0.03, 0, -1, -1, -1};
+        Scenario sc{"32 nodes", 32, 0.01, 0.03, 0, -1, -1, -1};
         Result r = simulate(sc, true);
         CHECK(r.minHealthyValid >= 0.95, "32 nodes: every node valid >= 95 % (saturated, still fair)");
         CHECK(r.minSeries * 4 >= r.maxSeries * 3, "32 nodes: fair under saturation");
     }
     {
-        Scenario sc{"48 nodes (beyond 32)", 48, 0.01, 0.03, 0, -1, -1, -1};
+        Scenario sc{"48 nodes (saturated)", 48, 0.01, 0.03, 0, -1, -1, -1};
         Result r = simulate(sc, true);
-        CHECK(r.tableFull > 0, "48 nodes: slot table full is detected (warning)");
-        CHECK(r.valid95Nodes >= 30 && r.valid95Nodes <= 32,
-              "48 nodes: the 32 nodes in the table keep >= 95 % validity, the rest none");
+        CHECK(r.tableFull == 0, "48 nodes: fit in the slot table");
+        CHECK(r.minSeries * 4 >= r.maxSeries * 3, "48 nodes: radio time shared fairly");
+        CHECK(r.minHealthyValid >= 0.60, "48 nodes: every node still valid >= 60 % of the time");
+    }
+    {
+        Scenario sc{"100 nodes (design capacity)", 100, 0.01, 0.03, 0, -1, -1, -1};
+        Result r = simulate(sc, true);
+        CHECK(r.tableFull == 0, "100 nodes: fit in the slot table");
+        CHECK(r.servedNodes == 100, "100 nodes: every node gets precision series");
+        CHECK(r.minSeries * 4 >= r.maxSeries * 3, "100 nodes: radio time shared fairly");
+        CHECK(r.minHealthyValid >= 0.25, "100 nodes: every node valid >= 25 % (radio limit, warning)");
+        CHECK(r.foreignProbeMs == 0, "100 nodes: no probing outside the own slot");
+    }
+    {
+        Scenario sc{"140 nodes (beyond 128)", 140, 0.01, 0.03, 0, -1, -1, -1};
+        Result r = simulate(sc, true);
+        CHECK(r.tableFull > 0, "140 nodes: slot table full is detected (warning)");
+        CHECK(r.servedNodes >= 120 && r.servedNodes <= 128,
+              "140 nodes: only the nodes in the table are scheduled, the rest none");
     }
     {
         Scenario sc{"9 nodes, 5 % loss, 15 % rejected", 9, 0.05, 0.15, 0, -1, -1, -1};

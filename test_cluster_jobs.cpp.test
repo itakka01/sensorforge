@@ -1,0 +1,114 @@
+// Host test: cluster_jobs.cpp (job table sized for a 100-node cluster, in
+// PSRAM) and SfPsramArray from psram_alloc.h. The table is allocated once per
+// boot, so the "no PSRAM" case is a separate build:
+//   g++ -std=c++17 -Wall -Wextra -I. -Itest_stubs -x c++ test_cluster_jobs.cpp.test -o /tmp/test_cluster_jobs
+//   g++ -std=c++17 -Wall -Wextra -I. -Itest_stubs -DNO_PSRAM -x c++ test_cluster_jobs.cpp.test -o /tmp/test_cluster_jobs_nopsram
+//   /tmp/test_cluster_jobs && /tmp/test_cluster_jobs_nopsram
+#include <stdio.h>
+#include <string.h>
+#include "psram_alloc.h"
+#include "cluster_jobs.cpp"
+
+static int failures = 0;
+#define CHECK(cond, msg) do { if (cond) printf("  PASS %s\n", msg); else { printf("  FAIL %s\n", msg); ++failures; } } while (0)
+
+using namespace ClusterJobs;
+
+static void nodeId(char out[kNodeIdLength], unsigned n)
+{
+    snprintf(out, kNodeIdLength, "sf-%032x", n);
+}
+
+#ifdef NO_PSRAM
+static void tests()
+{
+    printf("== job table without PSRAM\n");
+    hostHeapStub().failSpiram = true;
+    char id[kNodeIdLength];
+    nodeId(id, 1);
+    CHECK(!enqueue(1, 7, id, Kind::Probe, 1000, 5000), "enqueue fails");
+    CHECK(find(1) == nullptr, "nothing stored");
+    Entry snap[4];
+    CHECK(snapshot(snap, 4) == 0, "empty snapshot");
+    expire(2000);
+    reset();
+    CHECK(!transition(1, 7, State::Sent, 2000), "transition on empty table is refused");
+    CHECK(hostHeapStub().calls == 1, "a single allocation attempt per boot");
+
+    SfPsramArray<int> arr;
+    CHECK(!arr.allocate(8) && arr.size() == 0 && arr.begin() == arr.end(),
+          "SfPsramArray stays empty without PSRAM");
+    int loops = 0;
+    for (int &x : arr) { (void)x; ++loops; }
+    CHECK(loops == 0, "range-for over an empty SfPsramArray does nothing");
+}
+#else
+struct WithInit { int a = 5; char b[3] = {'x', 'y', 0}; };
+
+static void tests()
+{
+    printf("== job table, 100-node cluster\n");
+    const uint32_t epoch = 7;
+    char id[kNodeIdLength];
+    CHECK(kMaxJobs >= 200, "capacity covers two captures of 100 nodes");
+
+    // One capture of the full cluster: 100 jobs plus some single-node jobs.
+    uint64_t next = 1;
+    bool allQueued = true;
+    for (unsigned n = 0; n < 100; ++n) {
+        nodeId(id, n);
+        allQueued &= enqueue(next++, epoch, id, Kind::Capture, 1000, 1830000);
+    }
+    CHECK(allQueued, "capture of 100 nodes: 100 jobs registered");
+    CHECK(hostHeapStub().lastCaps & MALLOC_CAP_SPIRAM, "table allocated in PSRAM");
+
+    // A second capture while the first is still pending also fits.
+    for (unsigned n = 0; n < 100; ++n) {
+        nodeId(id, n);
+        allQueued &= enqueue(next++, epoch, id, Kind::Capture, 2000, 1830000);
+    }
+    CHECK(allQueued, "second capture of 100 nodes fits");
+
+    // Fill the rest, then the table is full of active jobs: refuse, never drop.
+    while (next <= kMaxJobs) {
+        nodeId(id, 500 + (unsigned)next);
+        if (!enqueue(next, epoch, id, Kind::Probe, 3000, 600000)) break;
+        ++next;
+    }
+    CHECK(next == kMaxJobs + 1, "table fills to kMaxJobs");
+    nodeId(id, 999);
+    CHECK(!enqueue(next, epoch, id, Kind::Probe, 3000, 600000),
+          "full table of active jobs refuses a new job");
+    CHECK(find(1) != nullptr, "active jobs are never displaced");
+
+    // Completing one job makes room: its terminal entry is reused.
+    CHECK(transition(1, epoch, State::Failed, 4000, 3), "job 1 completes");
+    CHECK(enqueue(next, epoch, id, Kind::Probe, 5000, 600000), "terminal slot is reused");
+    CHECK(find(1) == nullptr && find(next) != nullptr, "oldest terminal entry was evicted");
+
+    SfPsramBuffer buf(kMaxJobs * sizeof(Entry));
+    Entry *snap = reinterpret_cast<Entry *>(buf.data());
+    CHECK(snapshot(snap, kMaxJobs) == kMaxJobs, "snapshot returns the whole table");
+
+    reset();
+    CHECK(snapshot(snap, kMaxJobs) == 0 && find(2) == nullptr, "reset empties the table");
+    nodeId(id, 1);
+    CHECK(enqueue(1, epoch, id, Kind::Restart, 6000, 15000), "table usable after reset");
+
+    SfPsramArray<WithInit> arr;
+    CHECK(arr.allocate(4) && arr.size() == 4, "SfPsramArray allocates");
+    bool constructed = true;
+    for (const WithInit &w : arr) constructed &= w.a == 5 && strcmp(w.b, "xy") == 0;
+    CHECK(constructed, "SfPsramArray constructs every element");
+    WithInit *p = arr;
+    CHECK(&arr[2] == p + 2 && (&arr[3] - arr) == 3, "indexing and pointer arithmetic");
+    CHECK(arr.allocate(16) && arr.size() == 4, "second allocate keeps the table");
+}
+#endif
+
+int main()
+{
+    tests();
+    printf(failures ? "FAILURES: %d\n" : "ALL PASSED\n", failures);
+    return failures ? 1 : 0;
+}

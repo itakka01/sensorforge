@@ -21,13 +21,13 @@
 // WebConfig, so a running device can be mapped back to the exact Git tag.
 
 #define SENSORFORGE_RELEASE_NUMBER 87
-#define SENSORFORGE_RELEASE_TAG "v87-beta143"
+#define SENSORFORGE_RELEASE_TAG "v87-beta144"
 #define SENSORFORGE_RELEASE_DATE "2026-10-24"
 #define SENSORFORGE_RELEASE_SUMMARY \
-    "Beta 143: periodic cluster expiry/election at most every 100 ms (coordinator CPU); ESP-NOW load split in /load_diag."
+    "Beta 144: cluster laid out for 100 devices - member/job/slot tables in PSRAM, refused devices warned in red, status JSON streamed."
 
-// Current source-tree stage. Beta 143: election throttle + ESP-NOW load split.
-#define SENSORFORGE_WORKTREE_STAGE "v87-beta143"
+// Current source-tree stage. Beta 144: 100-device cluster tables.
+#define SENSORFORGE_WORKTREE_STAGE "v87-beta144"
 #define SENSORFORGE_WORKTREE_DATE "2026-10-24"
 #define SENSORFORGE_WORKTREE_SUMMARY \
-    "v87 Beta 143: clusterLoop expiry/election throttled to 100 ms unless packets arrived; /load_diag adds espnow_rx and espnow_slots."
+    "v87 Beta 144: CLUSTER_MAX_PEERS 100, kMaxJobs 256, ESP-NOW node tables 128 (SfPsramArray); full table refuses instead of evicting."

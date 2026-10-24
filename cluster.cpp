@@ -60,9 +60,14 @@ static const uint32_t CLUSTER_DISCOVERY_SCAN_LEASE_MS = 12000UL;
 static const uint32_t CLUSTER_DISCOVERY_NODE_TTL_MS = 35000UL;
 static const uint32_t CLUSTER_LEGACY_PEER_TIMEOUT_MS = 60000UL;
 static const uint32_t CLUSTER_RESOURCE_TTL_MAX_SEC = 3600UL;
-static const size_t CLUSTER_MAX_PEERS = 16;
-static const size_t CLUSTER_MAX_RESOURCES = 24;
-static const size_t CLUSTER_MAX_DISCOVERY_NODES = 32;
+// Design capacity: 100 cluster devices. The tables live in PSRAM (~42 KB
+// peers, ~78 KB resources, ~29 KB discovery) and are allocated once by
+// ensureClusterTables(); until then (or without PSRAM) the *Slots counts
+// below are 0 and every table loop is empty. A full peer table rejects new
+// devices instead of displacing live ones (see peerSlotFor()).
+static const size_t CLUSTER_MAX_PEERS = 100;
+static const size_t CLUSTER_MAX_RESOURCES = 256;
+static const size_t CLUSTER_MAX_DISCOVERY_NODES = 128;
 static const size_t CLUSTER_DISCOVERY_PROOF_SLOTS = 8;
 static const uint32_t CLUSTER_DISCOVERY_PROOF_TTL_MS = 35000UL;
 static const uint32_t CLUSTER_DISCOVERY_PROOF_PAIR_WINDOW_MS = 3000UL;
@@ -198,8 +203,21 @@ struct RestartEvidence {
     uint32_t expectedOldBoot;
     uint32_t observedNewBoot;
 };
-static RestartEvidence restartEvidence[ClusterJobs::kMaxJobs] = {};
+// One entry per issued restart (100-node cluster: "restart all" fits).
+// PSRAM, allocated on first restart; without PSRAM no evidence is kept.
+static const size_t CLUSTER_RESTART_EVIDENCE_MAX = 128;
+static RestartEvidence *restartEvidence = nullptr;
 static size_t restartEvidenceCount = 0;
+static bool restartEvidenceAllocTried = false;
+
+static bool ensureRestartEvidence() {
+    if (!restartEvidence && !restartEvidenceAllocTried) {
+        restartEvidenceAllocTried = true;
+        restartEvidence = static_cast<RestartEvidence *>(
+            sfPsramCalloc(CLUSTER_RESTART_EVIDENCE_MAX, sizeof(RestartEvidence)));
+    }
+    return restartEvidence != nullptr;
+}
 
 static void rejectRestart(const char *reason) {
     ++restartRejected; restartLastReject = reason;
@@ -218,7 +236,10 @@ struct ProbeRetry {
     uint32_t lastSendMs;
     uint8_t attempts;
 };
-static ProbeRetry probeRetries[ClusterJobs::kMaxJobs] = {};
+// Probe retries are a diagnostic convenience; when all slots are busy a
+// probe still works as a single-shot request.
+static const size_t CLUSTER_PROBE_RETRY_SLOTS = 16;
+static ProbeRetry probeRetries[CLUSTER_PROBE_RETRY_SLOTS] = {};
 static uint32_t probeRetransmissions = 0;
 static uint32_t probeJobsStarted = 0; // Counts successful job registration, independent of bounded snapshot.
 static const uint32_t PROBE_RETRY_INTERVAL_MS = 3000UL;
@@ -329,9 +350,41 @@ struct ClusterDiscoveryProof {
 
 static WiFiUDP clusterUdp;
 static WiFiUDP coordinatorUdp;
-static ClusterPeer peers[CLUSTER_MAX_PEERS] = {};
-static ClusterResource resources[CLUSTER_MAX_RESOURCES] = {};
-static ClusterDiscoveryNode discoveryNodes[CLUSTER_MAX_DISCOVERY_NODES] = {};
+static ClusterPeer *peers = nullptr;
+static ClusterResource *resources = nullptr;
+static ClusterDiscoveryNode *discoveryNodes = nullptr;
+static size_t peerSlots = 0;
+static size_t resourceSlots = 0;
+static size_t discoverySlots = 0;
+static bool clusterTablesAllocTried = false;
+
+// PSRAM table with every element constructed (IPAddress has a vtable, so
+// zeroed memory alone is not a valid object).
+template <typename T>
+static T *allocPsramTable(size_t count)
+{
+    T *table = static_cast<T *>(sfPsramCalloc(count, sizeof(T)));
+    if (!table)
+        return nullptr;
+    for (size_t i = 0; i < count; ++i)
+        new (&table[i]) T();
+    return table;
+}
+
+static void ensureClusterTables()
+{
+    if (clusterTablesAllocTried)
+        return;
+    clusterTablesAllocTried = true;
+    peers = allocPsramTable<ClusterPeer>(CLUSTER_MAX_PEERS);
+    resources = allocPsramTable<ClusterResource>(CLUSTER_MAX_RESOURCES);
+    discoveryNodes = allocPsramTable<ClusterDiscoveryNode>(CLUSTER_MAX_DISCOVERY_NODES);
+    peerSlots = peers ? CLUSTER_MAX_PEERS : 0;
+    resourceSlots = resources ? CLUSTER_MAX_RESOURCES : 0;
+    discoverySlots = discoveryNodes ? CLUSTER_MAX_DISCOVERY_NODES : 0;
+    if (!peers || !resources || !discoveryNodes)
+        Serial.println("[CLUSTER] PSRAM tables unavailable - cluster peers disabled");
+}
 static ClusterDiscoveryProof discoveryProofs[CLUSTER_DISCOVERY_PROOF_SLOTS] = {};
 static bool runtimeConfiguredEnabled = false;
 static bool runtimeActive = false;
@@ -980,19 +1033,19 @@ static uint32_t makeCoordinatorEpoch()
 
 static void clearPeers()
 {
-    for (size_t i = 0; i < CLUSTER_MAX_PEERS; ++i)
+    for (size_t i = 0; i < peerSlots; ++i)
         peers[i] = ClusterPeer{};
 }
 
 static void clearResources()
 {
-    for (size_t i = 0; i < CLUSTER_MAX_RESOURCES; ++i)
+    for (size_t i = 0; i < resourceSlots; ++i)
         resources[i] = ClusterResource{};
 }
 
 static void clearDiscoveryNodes()
 {
-    for (size_t i = 0; i < CLUSTER_MAX_DISCOVERY_NODES; ++i)
+    for (size_t i = 0; i < discoverySlots; ++i)
         discoveryNodes[i] = ClusterDiscoveryNode{};
 }
 
@@ -1006,7 +1059,7 @@ static ClusterDiscoveryNode *discoverySlotFor(
     ClusterDiscoveryNode *oldest = nullptr;
     uint32_t oldestAge = 0;
 
-    for (size_t i = 0; i < CLUSTER_MAX_DISCOVERY_NODES; ++i) {
+    for (size_t i = 0; i < discoverySlots; ++i) {
         ClusterDiscoveryNode &node = discoveryNodes[i];
         if (node.used &&
             strcmp(node.clusterId, clusterId) == 0 &&
@@ -1029,7 +1082,7 @@ static ClusterDiscoveryNode *discoverySlotFor(
 
 static void expireDiscoveryNodes(uint32_t now)
 {
-    for (size_t i = 0; i < CLUSTER_MAX_DISCOVERY_NODES; ++i) {
+    for (size_t i = 0; i < discoverySlots; ++i) {
         ClusterDiscoveryNode &node = discoveryNodes[i];
         if (node.used &&
             (uint32_t)(now - node.lastSeenMs) > CLUSTER_DISCOVERY_NODE_TTL_MS) {
@@ -1108,9 +1161,67 @@ static void rememberDiscoveryPresenceProof(
     proof->packet[packetLength] = '\0';
 }
 
-// Diagnostics only: last time a still active peer was displaced because the
+// Diagnostics: last time an authenticated device was refused because the
 // peer table was full (more devices in the cluster than CLUSTER_MAX_PEERS).
 static uint32_t peerTableEvictionLastMs = 0;
+
+// Recently refused devices, shown as a warning on the coordinator page.
+// Identity and address only (no secrets).
+struct RejectedPeer {
+    bool used;
+    char integrationId[36];
+    char hostname[64];
+    IPAddress ip;
+    uint32_t lastMs;
+    uint32_t count;
+};
+static const size_t CLUSTER_REJECTED_PEER_SLOTS = 8;
+static const uint32_t CLUSTER_REJECTED_PEER_SHOW_MS = 600000UL; // 10 minutes
+static RejectedPeer rejectedPeers[CLUSTER_REJECTED_PEER_SLOTS] = {};
+static uint32_t rejectedPeerTotal = 0;
+
+static void notePeerRejected(const char *integrationId, const char *hostname,
+                             const IPAddress &ip, uint32_t now)
+{
+    if (!integrationId || !integrationId[0])
+        return;
+    ++rejectedPeerTotal;
+    peerTableEvictionLastMs = now ? now : 1;
+    RejectedPeer *slot = nullptr;
+    RejectedPeer *reuse = nullptr; // free slot first, else least recently seen
+    for (size_t i = 0; i < CLUSTER_REJECTED_PEER_SLOTS; ++i) {
+        RejectedPeer &r = rejectedPeers[i];
+        if (r.used && strcmp(r.integrationId, integrationId) == 0) {
+            slot = &r;
+            break;
+        }
+        if (!r.used) {
+            if (!reuse || reuse->used)
+                reuse = &r;
+        } else if (!reuse || (reuse->used && (uint32_t)(now - r.lastMs) > (uint32_t)(now - reuse->lastMs))) {
+            reuse = &r;
+        }
+    }
+    if (!slot) {
+        slot = reuse;
+        *slot = RejectedPeer{};
+        slot->used = true;
+        strncpy(slot->integrationId, integrationId, sizeof(slot->integrationId) - 1);
+        consoleWrite("CLUSTER", String("Peer table full (") + String((unsigned)CLUSTER_MAX_PEERS) +
+                     ") - device refused: " + integrationId);
+    }
+    if (hostname && hostname[0])
+        strncpy(slot->hostname, hostname, sizeof(slot->hostname) - 1);
+    slot->ip = ip;
+    slot->lastMs = now;
+    ++slot->count;
+}
+
+// Returns the existing entry, a free one, or one whose lease has run out.
+// A full table of live peers returns nullptr: live members are never
+// displaced (that made >capacity clusters churn); the caller records the
+// refusal with notePeerRejected().
+static uint32_t peerLeaseSeconds(const ClusterPeer &peer);
 
 static ClusterPeer *peerSlotFor(const char *integrationId, uint32_t now)
 {
@@ -1118,7 +1229,7 @@ static ClusterPeer *peerSlotFor(const char *integrationId, uint32_t now)
     ClusterPeer *oldest = nullptr;
     uint32_t oldestAge = 0;
 
-    for (size_t i = 0; i < CLUSTER_MAX_PEERS; ++i) {
+    for (size_t i = 0; i < peerSlots; ++i) {
         ClusterPeer &peer = peers[i];
         if (peer.used && strcmp(peer.integrationId, integrationId) == 0)
             return &peer;
@@ -1138,10 +1249,10 @@ static ClusterPeer *peerSlotFor(const char *integrationId, uint32_t now)
     if (unused)
         return unused;
 
-    if (oldest && oldestAge <= CLUSTER_LEGACY_PEER_TIMEOUT_MS)
-        peerTableEvictionLastMs = now ? now : 1;
+    if (oldest && (uint64_t)oldestAge > (uint64_t)peerLeaseSeconds(*oldest) * 1000ULL)
+        return oldest;
 
-    return oldest;
+    return nullptr;
 }
 
 static uint32_t clampSeconds(
@@ -1171,7 +1282,7 @@ static uint32_t peerLeaseSeconds(const ClusterPeer &peer)
 
 static void expirePeers(uint32_t now)
 {
-    for (size_t i = 0; i < CLUSTER_MAX_PEERS; ++i) {
+    for (size_t i = 0; i < peerSlots; ++i) {
         ClusterPeer &peer = peers[i];
         if (!peer.used)
             continue;
@@ -1191,7 +1302,7 @@ static void expirePeers(uint32_t now)
             );
             peer = ClusterPeer{};
 
-            for (size_t r = 0; r < CLUSTER_MAX_RESOURCES; ++r) {
+            for (size_t r = 0; r < resourceSlots; ++r) {
                 if (
                     resources[r].used &&
                     strcmp(
@@ -1208,7 +1319,7 @@ static void expirePeers(uint32_t now)
 
 static void expireResources(uint32_t now)
 {
-    for (size_t i = 0; i < CLUSTER_MAX_RESOURCES; ++i) {
+    for (size_t i = 0; i < resourceSlots; ++i) {
         ClusterResource &resource = resources[i];
         if (!resource.used)
             continue;
@@ -1231,7 +1342,7 @@ static ClusterPeer *findPeer(const char *integrationId)
     if (!integrationId)
         return nullptr;
 
-    for (size_t i = 0; i < CLUSTER_MAX_PEERS; ++i) {
+    for (size_t i = 0; i < peerSlots; ++i) {
         if (peers[i].used && strcmp(peers[i].integrationId, integrationId) == 0)
             return &peers[i];
     }
@@ -1269,8 +1380,10 @@ static ClusterPeer *ensurePeerForAuthenticatedPacket(
     ClusterPeer *peer = findPeer(integrationId);
     if (!peer) {
         peer = peerSlotFor(integrationId, now);
-        if (!peer)
+        if (!peer) {
+            notePeerRejected(integrationId, nullptr, remoteIp, now);
             return nullptr;
+        }
         *peer = ClusterPeer{};
         peer->used = true;
         strncpy(peer->integrationId, integrationId, sizeof(peer->integrationId) - 1);
@@ -1305,7 +1418,7 @@ static void recomputeCoordinator(uint32_t now)
         bestPolicy = runtimeCoordinatorPolicy;
     }
 
-    for (size_t i = 0; i < CLUSTER_MAX_PEERS; ++i) {
+    for (size_t i = 0; i < peerSlots; ++i) {
         ClusterPeer &peer = peers[i];
         if (!peer.used || peer.coordinatorPolicy == COORDINATOR_POLICY_NODE_ONLY)
             continue;
@@ -1439,7 +1552,7 @@ static ClusterResource *resourceSlotFor(
     ClusterResource *oldest = nullptr;
     uint32_t oldestAge = 0;
 
-    for (size_t i = 0; i < CLUSTER_MAX_RESOURCES; ++i) {
+    for (size_t i = 0; i < resourceSlots; ++i) {
         ClusterResource &resource = resources[i];
 
         if (
@@ -1806,8 +1919,10 @@ static void processPresence(
 
     const uint32_t now = millis();
     ClusterPeer *peer = peerSlotFor(fields[2], now);
-    if (!peer)
+    if (!peer) {
+        notePeerRejected(fields[2], fields[11], remoteIp, now);
         return;
+    }
 
     if (
         peer->used &&
@@ -2126,7 +2241,7 @@ static void processLeave(
     *peer = ClusterPeer{};
 
     // Resources from a node that explicitly left are no longer reachable.
-    for (size_t i = 0; i < CLUSTER_MAX_RESOURCES; ++i) {
+    for (size_t i = 0; i < resourceSlots; ++i) {
         if (
             resources[i].used &&
             strcmp(resources[i].ownerIntegrationId, fields[2]) == 0
@@ -2766,7 +2881,7 @@ static void serviceProbeRetries(uint32_t nowMs)
     if (!localIsCoordinator || !runtimeActive) return;
     char cb[9];
     snprintf(cb, sizeof(cb), "%08lx", (unsigned long)bootNonce);
-    for (size_t i = 0; i < ClusterJobs::kMaxJobs; ++i) {
+    for (size_t i = 0; i < CLUSTER_PROBE_RETRY_SLOTS; ++i) {
         ProbeRetry &r = probeRetries[i];
         if (!r.id || r.attempts >= PROBE_MAX_ATTEMPTS ||
             (uint32_t)(nowMs - r.lastSendMs) < PROBE_RETRY_INTERVAL_MS) continue;
@@ -3885,6 +4000,7 @@ String clusterGenerateId()
 
 void clusterDiscoveryTouch()
 {
+    ensureClusterTables();
     const uint32_t now = millis();
     discoveryScanLeaseUntilMs = now + CLUSTER_DISCOVERY_SCAN_LEASE_MS;
 
@@ -3911,7 +4027,7 @@ size_t clusterAuthenticatedPeerCount()
 {
     size_t count = 0;
     const uint32_t now = millis();
-    for (size_t i = 0; i < CLUSTER_MAX_PEERS; ++i) {
+    for (size_t i = 0; i < peerSlots; ++i) {
         if (!peers[i].used)
             continue;
         const uint64_t ageMs = (uint64_t)(uint32_t)(now - peers[i].lastSeenMs);
@@ -3947,7 +4063,7 @@ ClusterCredentialCheckResult clusterVerifyDiscoveredCredentials(
     bool clusterVisible = false;
     uint32_t discoveredEpoch = 0;
     bool conflictingEpochVisible = false;
-    for (size_t i = 0; i < CLUSTER_MAX_DISCOVERY_NODES; ++i) {
+    for (size_t i = 0; i < discoverySlots; ++i) {
         const ClusterDiscoveryNode &node = discoveryNodes[i];
         if (!node.used ||
             (uint32_t)(now - node.lastSeenMs) > CLUSTER_DISCOVERY_NODE_TTL_MS ||
@@ -3980,7 +4096,7 @@ ClusterCredentialCheckResult clusterVerifyDiscoveredCredentials(
     }
 
     bool proofAvailable = false;
-    for (size_t i = 0; i < CLUSTER_MAX_DISCOVERY_NODES; ++i) {
+    for (size_t i = 0; i < discoverySlots; ++i) {
         const ClusterDiscoveryNode &node = discoveryNodes[i];
         if (!node.used ||
             (uint32_t)(now - node.lastSeenMs) > CLUSTER_DISCOVERY_NODE_TTL_MS ||
@@ -4029,6 +4145,7 @@ ClusterCredentialCheckResult clusterVerifyDiscoveredCredentials(
 
 void clusterNetworkStart()
 {
+    ensureClusterTables();
     clusterNetworkStop();
 
     runtimeConfiguredEnabled = cfg_cluster_enabled != 0;
@@ -4174,7 +4291,8 @@ void clusterNetworkStop()
     shutdownAckReceived = shutdownAckAccepted = shutdownAckRejected = 0;
     shutdownLastReject = shutdownAckLastReject = "none";
     restartEvidenceCount = 0;
-    memset(restartEvidence, 0, sizeof(restartEvidence));
+    if (restartEvidence)
+        memset(restartEvidence, 0, CLUSTER_RESTART_EVIDENCE_MAX * sizeof(RestartEvidence));
     probeJobsStarted = 0;
     probeReceived = probeAckSent = probeAckReceived = 0;
     probeRejected = probeAckRejected = 0;
@@ -4316,6 +4434,7 @@ void clusterMdnsAdvertise()
 
 void clusterLoop()
 {
+    ensureClusterTables();
     // Beta138: every device with an ACTIVE cluster runtime (coordinator, time
     // broadcaster - also without lease - and normal nodes) runs without WiFi modem
     // sleep (WIFI_PS_NONE); outside active cluster operation the Arduino default is
@@ -4632,7 +4751,7 @@ bool clusterSendJobProbe(const String &nodeId, String &error)
                             ClusterJobs::State::Sent, millis());
     // Slots are bounded by the same job table; if full, the probe still works
     // as a single-shot request rather than allocating extra memory.
-    for (size_t i = 0; i < ClusterJobs::kMaxJobs; ++i) {
+    for (size_t i = 0; i < CLUSTER_PROBE_RETRY_SLOTS; ++i) {
         if (probeRetries[i].id == 0 ||
             !ClusterJobs::find(probeRetries[i].id) ||
             ClusterJobs::find(probeRetries[i].id)->state != ClusterJobs::State::Sent) {
@@ -4674,7 +4793,7 @@ bool clusterRequestNodeRestart(const String &nodeId, String &error)
         error = "Neustartauftrag konnte nicht gesendet werden."; return false;
     }
     // Keep original boot ID even when ACK is lost and the job times out.
-    if (restartEvidenceCount < ClusterJobs::kMaxJobs) {
+    if (ensureRestartEvidence() && restartEvidenceCount < CLUSTER_RESTART_EVIDENCE_MAX) {
         RestartEvidence &e = restartEvidence[restartEvidenceCount++];
         e = RestartEvidence{};
         e.jobId = id;
@@ -5145,7 +5264,20 @@ bool clusterAnnounceResource(
     return true;
 }
 
-String clusterStatusJson()
+// Hands a finished part of the status JSON to the stream sink once it has
+// grown past CLUSTER_STATUS_CHUNK_BYTES (100 nodes give ~200 KB in total).
+static const size_t CLUSTER_STATUS_CHUNK_BYTES = 4096;
+static void statusFlushIfLarge(String &json, ClusterStatusChunkSink sink, void *ctx)
+{
+    if (!sink || json.length() < CLUSTER_STATUS_CHUNK_BYTES)
+        return;
+    sink(json, ctx);
+    json = "";
+}
+
+// Builds the status JSON. With a sink, completed parts are handed over while
+// building and the returned String holds only the remainder.
+static String buildClusterStatusJson(ClusterStatusChunkSink sink, void *ctx)
 {
     const uint32_t nowMs = millis();
     // Read-only snapshot: election and ACK ownership belong to clusterLoop().
@@ -5406,8 +5538,13 @@ String clusterStatusJson()
     json += ",\"send_failed\":" + String((unsigned long)grantStats.sendFailed);
     json += '}';
     json += ",\"espnow_node_reports\":[";
-    ClusterEspNowRadio::NodeSyncReport reports[12];
-    const size_t reportCount=ClusterEspNowRadio::nodeSyncReports(reports,12);
+    SfPsramBuffer reportBuffer(ClusterEspNowRadio::kNodeReportCapacity *
+                               sizeof(ClusterEspNowRadio::NodeSyncReport));
+    ClusterEspNowRadio::NodeSyncReport *reports =
+        reinterpret_cast<ClusterEspNowRadio::NodeSyncReport *>(reportBuffer.data());
+    const size_t reportCount = reports
+        ? ClusterEspNowRadio::nodeSyncReports(reports, ClusterEspNowRadio::kNodeReportCapacity)
+        : 0;
     for(size_t i=0;i<reportCount;++i){
         if(i)json+=',';
         const auto &r=reports[i];
@@ -5449,6 +5586,7 @@ String clusterStatusJson()
         json += ",\"drift_ppm\":"+String(r.driftMilliPpm/1000.0,3);
         json += ",\"spread_us\":"+String((unsigned int)r.spreadUs);
         json += '}';
+        statusFlushIfLarge(json, sink, ctx);
     }
     json += ']';
     json += ",\"ack_diagnostics\":{";
@@ -5481,14 +5619,36 @@ String clusterStatusJson()
         String((unsigned long)(CLUSTER_HEARTBEAT_MS / 1000UL));
     json += ",\"default_lease_sec\":" +
         String((unsigned long)CLUSTER_DEFAULT_LEASE_SEC);
-    json += ",\"peer_capacity\":" + String((unsigned long)CLUSTER_MAX_PEERS);
+    json += ",\"peer_capacity\":" + String((unsigned long)peerSlots);
+    json += ",\"peer_design_capacity\":" + String((unsigned long)CLUSTER_MAX_PEERS);
     json += ",\"peer_table_full_recent\":";
     json += peerTableEvictionLastMs &&
             (uint32_t)(millis() - peerTableEvictionLastMs) <= CLUSTER_LEGACY_PEER_TIMEOUT_MS
         ? "true" : "false";
+    // Devices refused because the member table was full (last 10 minutes).
+    json += ",\"peer_rejected_total\":" + String((unsigned long)rejectedPeerTotal);
+    json += ",\"peer_rejected\":[";
+    {
+        bool firstRejected = true;
+        for (size_t i = 0; i < CLUSTER_REJECTED_PEER_SLOTS; ++i) {
+            const RejectedPeer &r = rejectedPeers[i];
+            if (!r.used || (uint32_t)(nowMs - r.lastMs) > CLUSTER_REJECTED_PEER_SHOW_MS)
+                continue;
+            if (!firstRejected)
+                json += ',';
+            firstRejected = false;
+            json += "{\"integration_id\":\"" + jsonEscape(String(r.integrationId)) + "\"";
+            json += ",\"hostname\":\"" + jsonEscape(String(r.hostname)) + "\"";
+            json += ",\"ip\":\"" + r.ip.toString() + "\"";
+            json += ",\"count\":" + String((unsigned long)r.count);
+            json += ",\"age_ms\":" + String((unsigned long)(nowMs - r.lastMs)) + "}";
+        }
+    }
+    json += "]";
     json += ",\"password_configured\":";
     json += cfg_cluster_password.length() ? "true" : "false";
     json += ",\"error\":\"" + jsonEscape(lastError) + "\"";
+    statusFlushIfLarge(json, sink, ctx);
     json += ",\"nodes\":[";
 
     json += "{\"local\":true";
@@ -5554,7 +5714,7 @@ String clusterStatusJson()
         String((long)localWifiRemainingSeconds);
     json += ",\"age_ms\":0}";
 
-    for (size_t i = 0; i < CLUSTER_MAX_PEERS; ++i) {
+    for (size_t i = 0; i < peerSlots; ++i) {
         const ClusterPeer &peer = peers[i];
         if (!peer.used)
             continue;
@@ -5637,12 +5797,13 @@ String clusterStatusJson()
             String((long)peer.wifiRemainingSeconds);
         json += ",\"age_ms\":" + String((unsigned long)ageMs);
         json += '}';
+        statusFlushIfLarge(json, sink, ctx);
     }
 
     json += "],\"resources\":[";
 
     bool firstResource = true;
-    for (size_t i = 0; i < CLUSTER_MAX_RESOURCES; ++i) {
+    for (size_t i = 0; i < resourceSlots; ++i) {
         const ClusterResource &resource = resources[i];
         if (!resource.used)
             continue;
@@ -5686,12 +5847,13 @@ String clusterStatusJson()
         json += ",\"locator\":\"" +
             jsonEscape(String(resource.locator)) + "\"";
         json += '}';
+        statusFlushIfLarge(json, sink, ctx);
     }
 
     json += "],\"discovered_nodes\":[";
 
     bool firstDiscovery = true;
-    for (size_t i = 0; i < CLUSTER_MAX_DISCOVERY_NODES; ++i) {
+    for (size_t i = 0; i < discoverySlots; ++i) {
         const ClusterDiscoveryNode &node = discoveryNodes[i];
         if (!node.used)
             continue;
@@ -5723,6 +5885,7 @@ String clusterStatusJson()
         json += ",\"authenticated\":" + String(authenticated ? "true" : "false");
         json += ",\"age_ms\":" + String((unsigned long)ageMs);
         json += '}';
+        statusFlushIfLarge(json, sink, ctx);
     }
 
     json += "],\"job_probe_diagnostics\":{";
@@ -5772,8 +5935,11 @@ String clusterStatusJson()
     json += ",\"last_error\":"+String((unsigned)captureLastError);
     json += ",\"local_frames\":"+clusterCaptureLocalJson();
     json += "},\"job_probes\":[";
-    ClusterJobs::Entry probeEntries[ClusterJobs::kMaxJobs];
-    const size_t probeCount = ClusterJobs::snapshot(probeEntries, ClusterJobs::kMaxJobs);
+    SfPsramBuffer jobBuffer(ClusterJobs::kMaxJobs * sizeof(ClusterJobs::Entry));
+    ClusterJobs::Entry *probeEntries = reinterpret_cast<ClusterJobs::Entry *>(jobBuffer.data());
+    const size_t probeCount = probeEntries
+        ? ClusterJobs::snapshot(probeEntries, ClusterJobs::kMaxJobs)
+        : 0;
     for (size_t j = 0; j < probeCount; ++j) {
         if (j) json += ',';
         const ClusterJobs::Entry &e = probeEntries[j];
@@ -5815,11 +5981,37 @@ String clusterStatusJson()
         }
 
         json += '}';
+        statusFlushIfLarge(json, sink, ctx);
     }
     json += "],\"known_clusters\":";
     json += clusterProfilesJson();
     json += '}';
     return json;
+}
+
+String clusterStatusJson()
+{
+    return buildClusterStatusJson(nullptr, nullptr);
+}
+
+void clusterStatusJsonStream(ClusterStatusChunkSink sink, void *ctx)
+{
+    String rest = buildClusterStatusJson(sink, ctx);
+    if (sink && rest.length())
+        sink(rest, ctx);
+}
+
+// Keeps ESP-NOW time exchanges answered while a long HTTP response is
+// produced in loopTask (same call as in clusterLoop()). The radio module is
+// independent of the cluster tables, so this is safe between JSON parts.
+void clusterServiceTimeCritical()
+{
+    if (clusterCaptureProtectionActive() || cfg_operating_mode == "time_broadcaster")
+        return;
+    ClusterEspNowRadio::service(runtimeActive && (localIsCoordinator || droneModeEnabled()),
+                               localIsCoordinator, currentCoordinatorEpoch,
+                               localIsCoordinator ? deviceIntegrationId().c_str() : currentCoordinatorId,
+                               bootNonce);
 }
 
 
@@ -5931,7 +6123,7 @@ size_t clusterMountSnapshot(ClusterMountEntry *out, size_t capacity)
         return n;
 
     const uint32_t nowMs = millis();
-    for (size_t i = 0; i < CLUSTER_MAX_PEERS && n < capacity; ++i) {
+    for (size_t i = 0; i < peerSlots && n < capacity; ++i) {
         const ClusterPeer &peer = peers[i];
         if (!peer.used)
             continue;

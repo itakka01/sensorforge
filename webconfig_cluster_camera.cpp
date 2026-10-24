@@ -2,6 +2,7 @@
 
 #include "cluster.h"
 #include "cluster_camera.h"
+#include "webconfig_cluster.h"
 
 namespace {
 
@@ -14,7 +15,7 @@ static void handleCameraJson()
         return;
     }
     g_server->sendHeader("Cache-Control", "no-store");
-    g_server->send(200, "application/json; charset=utf-8", clusterCameraJson());
+    webconfigClusterSendLargeJson(*g_server, clusterCameraJson());
 }
 
 } // namespace

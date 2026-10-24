@@ -6,7 +6,10 @@
 // Caller must authenticate coordinator identity/epoch and node replies BEFORE
 // invoking this module. No storage, recording or power operation is performed.
 namespace ClusterJobs {
-static const size_t kMaxJobs = 16;
+// Sized for 100 nodes: one capture creates one job per node, so two captures
+// of a full cluster plus single-node jobs fit. The table lives in PSRAM
+// (~33 KB); without PSRAM no job can be registered (enqueue fails).
+static const size_t kMaxJobs = 256;
 static const size_t kNodeIdLength = 36; // "sf-" + 32 hex + NUL
 
 enum class Kind : uint8_t { None, Restart, Shutdown, ClearRecordings, FirmwareUpdate, Probe, Capture, Drone };
