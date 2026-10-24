@@ -1,5 +1,6 @@
 #include "webconfig.h"
 #include "crash_guard.h"
+#include "loop_load_diag.h"
 #include "web_log_reader.h"
 #include "web_sd_maintenance.h"
 #include "config.h"
@@ -19415,6 +19416,7 @@ bool webConfigInactiveFor(
 
 void webConfigLoop()
 {
+    LoopLoadDiag::Scope loadScope(LoopLoadDiag::WebConfig);
     systemLoadUpdate();
 
     if (

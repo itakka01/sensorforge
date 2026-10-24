@@ -73,6 +73,7 @@
 #include "heap_monitor.h"
 #include "wifi_link_diag.h"
 #include "task_load_diag.h"
+#include "loop_load_diag.h"
 #include "crash_guard.h"
 #include "psram_alloc.h"
 
@@ -13465,6 +13466,7 @@ static void enterThermalEmergencySleep(
 
 static void thermalMonitorLoop()
 {
+    LoopLoadDiag::Scope loadScope(LoopLoadDiag::Thermal);
     if (thermalEmergencyState)
         return;
 
@@ -16505,6 +16507,10 @@ static void serviceStreamerNetworkRecovery()
 
 void loop() {
 
+    // Loop section timing for GET /load_diag (diagnostics only).
+    LoopLoadDiag::tick();
+    int64_t loadMarkUs = esp_timer_get_time();
+
     feedWatchdog();
 
     // Extremely light usage bookkeeping: active uptime is accumulated in
@@ -16532,6 +16538,7 @@ void loop() {
     // Crash-loop guard: mark the boot stable after 60 s. In safe mode only the
     // management UI and the thermal guard run (no cluster, camera or motion).
     CrashGuard::loop();
+    LoopLoadDiag::lap(LoopLoadDiag::Prelude, loadMarkUs);
     if (CrashGuard::safeMode()) {
         thermalMonitorLoop();
         if (webConfigStarted) webConfigLoop();
@@ -16583,9 +16590,12 @@ void loop() {
         if (webConfigStarted) webConfigLoop();
         // Node OTA checks use the Drone Mode maintenance window only.
         // Compiled fail-closed until OTA/rollback tests are complete.
-        firmwareAutoSchedulerLoop();
-        // Retain minimal networking service; no automatic SD reads/writes here.
-        wireguardService(false);
+        {
+            LoopLoadDiag::Scope loadScope(LoopLoadDiag::DroneMisc);
+            firmwareAutoSchedulerLoop();
+            // Retain minimal networking service; no automatic SD reads/writes here.
+            wireguardService(false);
+        }
         delay(1);
         return;
     }

@@ -1,3 +1,12 @@
+## Last-Diagnose über das Netzwerk (2026-10-24) – v87-beta142
+- `GET /load_diag`: CPU-Anteil je Loop-Abschnitt (10-s-Fenster) und die 10 busiest FreeRTOS-Tasks; Ziel: Ursache der ~30 % loopTask-Last auf dem Coordinator devxiao3 finden, ohne den seriellen Port zu öffnen. Details: `CHANGELOG.md`.
+- beta141 (Slot-Planung) läuft seit 24.10. auf allen diymore-Boards und devxiao3; im ersten Hardwaretest 9/9 Nodes auf Präzisionszeit, Ø-Slot 3,3 s, Zyklus ~45–55 s.
+
+## Slot-Planung der Präzisionsserien (2026-10-24) – v87-beta141
+- Feste Rotation (N × 17,5 s, bei 9 Nodes 157,5 s > 120 s Gültigkeit) ersetzt durch `cluster_slot_scheduler.h`: Slot endet mit der Serie (~3,6 s), dann der dringendste fällige Node. Details, Kapazität, Diagnosefelder: `ESPNOW_TIME_ARCHITECTURE.md` Abschnitt 8.1.
+- Simulation: lückenlos bis ~24 Nodes, 32 Nodes 98 % (gesättigt, fair). Tabellen auf 32 Nodes. Engste Grenze jetzt `CLUSTER_MAX_PEERS = 16` (Mitgliederliste).
+- Nur Coordinator geändert; Node-Firmware, Pakete, Messverfahren unverändert. Hardwaretest ausstehend.
+
 ## Stabilitätstest 6 h (2026-10-23) – v87-beta139
 - Details: `STABILITY_TEST_2026-10-23.md`. Alle 5 Geräte 100 % HTTP, keine Neustarts/Epochenwechsel, interner Heap stabil ca. 82–87 KiB.
 - XIAO 1/2 und diymore c001 durchgehend ESP-NOW-Präzisionszeit. **Freenove nur ca. 64 %** (235 verworfene Serien, 57 Fallbacks) – wichtigste offene Sync-Baustelle.

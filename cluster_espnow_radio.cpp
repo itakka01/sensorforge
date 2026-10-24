@@ -8,7 +8,8 @@
 #include "cluster_time_shadow_handover.h"
 #include "cluster_time_grant_protocol.h" // Beta131: production handover enabled
 #include "cluster_time_source_policy.h"
-#include "cluster_slot_recovery.h"
+#include "cluster_slot_scheduler.h"
+#include "loop_load_diag.h"
 static_assert(ClusterTimeGrantProtocol::kWireBytes == 96, "grant frame size");
 #include "board_config.h"
 #include <Arduino.h>
@@ -330,36 +331,73 @@ bool coordinatorPermissionIssued=false;
 bool sendFrame(EspNowTimePackets::Frame& f,const uint8_t mac[6],
                int64_t* txStampOut=nullptr, bool replyStamp=false);
 struct SlotPeer { uint8_t mac[6]={}; uint32_t boot=0; uint32_t seenMs=0;
-                  ClusterSlotRecovery::PeerState recovery; };
-SlotPeer slotPeers[12];
+                  ClusterSlotScheduler::PeerState sched; };
+// Precision slot scheduling (cluster_slot_scheduler.h): a slot ends when the
+// owner's series is over; the next owner is the most urgent due node.
+constexpr size_t kSlotPeerCapacity=32;
+SlotPeer slotPeers[kSlotPeerCapacity];
 // Diagnostics only: last time a node was seen while every slot was taken.
 uint32_t slotTableFullLastMs=0;
-uint8_t slotNextIndex=0;
 int8_t slotOwner=-1;
 uint32_t slotStartedMs=0, slotGuardUntilMs=0;
 uint32_t slotGrantsSent=0, slotRotations=0;
-// Recovery slot after a rejected series (cluster_slot_recovery.h). A recovery
-// owner never advances the regular rotation pointer.
-constexpr uint32_t kSlotRecoveryLifetimeMs=120000; // == kPrecisionLifetimeMs (static_assert below)
-constexpr ClusterSlotRecovery::Params kSlotRecoveryParams{
-    kOwnerSlotMs+kSlotGuardMs, kOwnerSlotMs, kSlotRecoveryLifetimeMs};
-bool slotOwnerIsRecovery=false, slotLastWasRecovery=false;
-ClusterSlotRecovery::Stats slotRecoveryStats;
+constexpr uint32_t kSlotLifetimeMs=120000;      // == kPrecisionLifetimeMs (static_assert below)
+constexpr uint32_t kSlotRefreshAgeMs=45000;     // same cadence as a node's own re-measurement
+constexpr uint32_t kSlotStartTimeoutMs=3000;    // node starts ~1 s after its first grant
+constexpr uint32_t kSlotIdleEndMs=1500;         // > one lost exchange (1200 + 45 ms) + margin
+constexpr uint32_t kSlotShortGuardMs=0;        // next owner starts ~1 s after its grant
+constexpr uint32_t kSlotOutcomeTimeoutMs=8000;  // node reports every 5 s
+constexpr ClusterSlotScheduler::Params kSlotParams{
+    kSlotLifetimeMs, kSlotRefreshAgeMs, kSlotStartTimeoutMs, kSlotIdleEndMs,
+    kOwnerSlotMs, kSlotShortGuardMs, kSlotGuardMs, kSlotOutcomeTimeoutMs, 5000, 60000};
+static_assert(kSlotIdleEndMs > kExchangeTimeoutMs + kProbeGapMs,
+              "one lost exchange must not end the slot");
+// The short guard relies on a node not probing again right after its series:
+// accepted -> 45 s, rejected/aborted -> >= kRetryBaseMs, both beyond a grant lease.
+static_assert(kRetryBaseMs > kGrantLeaseMs + kSlotShortGuardMs,
+              "a finished owner must not probe again within its lease");
+static_assert(kSlotStartTimeoutMs > kGrantEveryMs + 1000,
+              "a node starts its series about 1 s after the first grant");
+ClusterSlotScheduler::SlotState slotState;
+// Unicast ESP-NOW peers added for replies. ESP-IDF holds at most
+// ESP_NOW_MAX_TOTAL_PEER_NUM peers (broadcast included) and they were never
+// removed, so from about the 19th node the coordinator could not answer. When
+// the list is full the least recently used reply peer is replaced.
+struct UnicastPeer { bool used=false; uint8_t mac[6]={}; uint32_t lastUseMs=0; };
+constexpr size_t kUnicastPeerSlots=ESP_NOW_MAX_TOTAL_PEER_NUM-2;  // broadcast + one spare
+UnicastPeer unicastPeers[kUnicastPeerSlots];
+uint32_t unicastPeerEvictions=0;
+ClusterSlotScheduler::Stats slotStats;
+uint32_t slotLastStartMs=0;
+uint64_t slotPeriodTotalMs=0;
+uint32_t slotPeriodCount=0;
+bool slotPeerActive(const SlotPeer &p, uint32_t now) {
+    return p.boot && uint32_t(now-p.seenMs)<=kPeerActiveMs;
+}
+void sendSlotControl(uint32_t epoch,uint64_t tag,uint32_t boot,
+                     uint32_t targetBoot,uint32_t leaseMs);
+// Ends the running slot without judging its outcome (capture pause, benchmark).
+void slotAbortWithoutOutcome(uint32_t guardUntilMs) {
+    if(slotOwner>=0) {
+        slotPeers[slotOwner].sched.lastSlotEndMs=millis();
+        ++slotRotations;
+    }
+    slotState={};
+    slotOwner=-1;
+    slotGuardUntilMs=guardUntilMs;
+}
 void noteSlotPeer(const uint8_t mac[6], uint32_t boot) {
     if(!boot) return;
     const uint32_t now=millis();
     for(auto &p:slotPeers) {
         if(p.boot && memcmp(p.mac,mac,6)==0) {
             // A different boot on the same MAC is a different owner.
-            if(p.boot!=boot && slotOwner==(&p-slotPeers)) {
-                slotLastWasRecovery=slotOwnerIsRecovery;slotOwnerIsRecovery=false;
-                slotOwner=-1;slotGuardUntilMs=now+kSlotGuardMs;
-            }
-            if(p.boot!=boot)p.recovery={};
+            if(p.boot!=boot && slotOwner==(&p-slotPeers)) slotAbortWithoutOutcome(now+kSlotGuardMs);
+            if(p.boot!=boot)p.sched={};
             p.boot=boot; p.seenMs=now; return;
         }
     }
-    for(auto &p:slotPeers) if(!p.boot || uint32_t(now-p.seenMs)>kPeerActiveMs) {
+    for(auto &p:slotPeers) if(!slotPeerActive(p,now) && (&p-slotPeers)!=slotOwner) {
         p={};memcpy(p.mac,mac,6);p.boot=boot;p.seenMs=now;return;
     }
     slotTableFullLastMs=now?now:1;
@@ -369,6 +407,10 @@ bool slotIsOwner(const uint8_t mac[6], uint32_t boot) {
            memcmp(slotPeers[slotOwner].mac,mac,6)==0 &&
            uint32_t(millis()-slotStartedMs)<kOwnerSlotMs;
 }
+// The coordinator answered a probe of the current slot owner.
+void slotNoteOwnerProbe() {
+    ClusterSlotScheduler::onOwnerProbe(slotState,millis());
+}
 void sendSlotControl(uint32_t epoch,uint64_t tag,uint32_t boot,
                      uint32_t targetBoot,uint32_t leaseMs) {
     EspNowTimePackets::Frame f;
@@ -377,46 +419,52 @@ void sendSlotControl(uint32_t epoch,uint64_t tag,uint32_t boot,
     f.nonce=targetBoot;f.timeUs=leaseMs;
     if(sendFrame(f,kBroadcastMac) && leaseMs) ++slotGrantsSent;
 }
-void endSlot(uint32_t epoch,uint64_t tag,uint32_t boot) {
+void endSlot(uint32_t epoch,uint64_t tag,uint32_t boot,ClusterSlotScheduler::EndReason reason) {
+    const uint32_t now=millis();
     if(slotOwner>=0) {
         sendSlotControl(epoch,tag,boot,slotPeers[slotOwner].boot,0);
-        if(!slotOwnerIsRecovery)slotNextIndex=static_cast<uint8_t>((slotOwner+1)%12);
+        ClusterSlotScheduler::onSlotEnd(slotState,&slotPeers[slotOwner].sched,reason,now,
+                                        kSlotParams,slotStats);
         ++slotRotations;
-        slotLastWasRecovery=slotOwnerIsRecovery;
     }
-    slotOwner=-1;slotOwnerIsRecovery=false;
-    slotGuardUntilMs=millis()+kSlotGuardMs;
+    slotState={};
+    slotOwner=-1;
+    slotGuardUntilMs=now+ClusterSlotScheduler::guardMs(reason,kSlotParams);
+}
+// Diagnostic experiments (beacon test, benchmark) take the radio: revoke the
+// owner, do not judge the slot, keep the long guard so its lease expires.
+void revokeSlotWithoutOutcome(uint32_t epoch,uint64_t tag,uint32_t boot) {
+    if(slotOwner>=0) sendSlotControl(epoch,tag,boot,slotPeers[slotOwner].boot,0);
+    slotAbortWithoutOutcome(millis()+kSlotGuardMs);
 }
 // Coordinator: precision age from a node's authenticated NodeSyncReport.
 void slotNotePrecisionReport(uint32_t boot,bool hasPrecision,uint32_t ageMs) {
     for(auto &p:slotPeers) if(p.boot==boot) {
-        ClusterSlotRecovery::onPrecisionReport(p.recovery,hasPrecision,ageMs,millis(),
-                                              kSlotRecoveryParams,slotRecoveryStats);
+        ClusterSlotScheduler::onPrecisionReport(p.sched,hasPrecision,ageMs,millis(),
+                                                kSlotParams,slotStats);
         return;
     }
 }
 void serviceSlots(uint32_t now,uint32_t epoch,uint64_t tag,uint32_t boot) {
-    if(slotOwner>=0 && (uint32_t(now-slotStartedMs)>=kOwnerSlotMs ||
-       uint32_t(now-slotPeers[slotOwner].seenMs)>kPeerActiveMs)) endSlot(epoch,tag,boot);
+    for(auto &p:slotPeers)
+        if(p.boot) ClusterSlotScheduler::serviceOutcome(p.sched,now,kSlotParams,slotStats);
+    if(slotOwner>=0) {
+        const ClusterSlotScheduler::EndReason reason=
+            !slotPeerActive(slotPeers[slotOwner],now) ? ClusterSlotScheduler::EndReason::OwnerLost :
+            ClusterSlotScheduler::checkEnd(slotState,now,kSlotParams);
+        if(reason!=ClusterSlotScheduler::EndReason::None) endSlot(epoch,tag,boot,reason);
+    }
     if(slotOwner<0) {
         if(static_cast<int32_t>(now-slotGuardUntilMs)<0) return;
-        // Active peers in regular rotation order; ordered[0] is the regular owner.
-        uint8_t order[12];
-        ClusterSlotRecovery::PeerState *ordered[12];
-        size_t count=0;
-        for(unsigned offset=0;offset<12;++offset) {
-            const uint8_t i=static_cast<uint8_t>((slotNextIndex+offset)%12);
-            if(slotPeers[i].boot && uint32_t(now-slotPeers[i].seenMs)<=kPeerActiveMs) {
-                order[count]=i;ordered[count]=&slotPeers[i].recovery;++count;
-            }
-        }
-        if(count) {
-            const int recovery=ClusterSlotRecovery::choose(ordered,count,slotLastWasRecovery,
-                                                           now,kSlotRecoveryParams,slotRecoveryStats);
-            slotOwnerIsRecovery=recovery>0;
-            slotOwner=static_cast<int8_t>(order[slotOwnerIsRecovery ? recovery : 0]);
-            ClusterSlotRecovery::onSlotStart(slotPeers[slotOwner].recovery,slotOwnerIsRecovery,
-                                             now,slotRecoveryStats);
+        ClusterSlotScheduler::PeerState *peers[kSlotPeerCapacity];
+        for(size_t i=0;i<kSlotPeerCapacity;++i)
+            peers[i]=slotPeerActive(slotPeers[i],now) ? &slotPeers[i].sched : nullptr;
+        const int next=ClusterSlotScheduler::choose(peers,kSlotPeerCapacity,now,kSlotParams,slotStats);
+        if(next>=0) {
+            slotOwner=static_cast<int8_t>(next);
+            ClusterSlotScheduler::onSlotStart(slotState,slotPeers[slotOwner].sched,now,slotStats);
+            if(slotLastStartMs){slotPeriodTotalMs+=uint32_t(now-slotLastStartMs);++slotPeriodCount;}
+            slotLastStartMs=now;
             slotStartedMs=now;nextGrantMs=now;
         }
     }
@@ -499,7 +547,7 @@ void benchAdvance(uint32_t now) {
     benchNextSeq=0;
     for(auto &t:benchTxUs)t=0;
     // Reset local sync slot ownership, don't let the normal scheduler compete.
-    slotOwner=-1;slotOwnerIsRecovery=false;slotGuardUntilMs=now+kSlotGuardMs;
+    slotAbortWithoutOutcome(now+kSlotGuardMs);
     benchControlPhase(1,now);
 }
 void benchTick(uint32_t now){
@@ -584,7 +632,9 @@ struct PeerReplay {
     BootHistory bootHistory[3]; // Track last 3 (boot, epoch) sessions (both random, not sequential)
     uint8_t activeBootIndex=0; // Index of currently active boot in history
 };
-PeerReplay peerReplay[12];
+// One entry per node MAC for the whole radio session (never evicted, so replay
+// state of a known node is never lost). Sized like the slot table.
+PeerReplay peerReplay[32];
 ClusterEspNowTwoWay::Exchange exchanges[kMaxSamplesPerSeries];
 uint8_t seriesCount=0;
 uint8_t seriesTarget=kInitialSamples;
@@ -638,7 +688,7 @@ uint32_t referenceMonoLow=0;
 int64_t referenceReceivedNodeMono=0;
 uint32_t lastPrecisionMs=0;
 constexpr uint32_t kPrecisionLifetimeMs=120000;
-static_assert(kSlotRecoveryLifetimeMs==kPrecisionLifetimeMs, "slot recovery uses the precision lifetime");
+static_assert(kSlotLifetimeMs==kPrecisionLifetimeMs, "slot scheduling uses the precision lifetime");
 constexpr int64_t kReferenceLifetimeUs=30000000;
 
 String referenceId;
@@ -873,10 +923,11 @@ bool start(uint8_t channel) {
     initialized=true;boundChannel=channel;stats.active=true;stats.channel=channel;
     nextBroadcastMs=millis()+1000;nextSeriesMs=millis()+2000;nextGrantMs=millis();
     permissionUntilMs=0;coordinatorPermissionIssued=false;nextReportMs=millis()+1500UL;
-    for(auto &p:slotPeers)p={};slotNextIndex=0;slotOwner=-1;
+    for(auto &p:slotPeers)p={};slotOwner=-1;slotState={};
     slotStartedMs=0;slotGuardUntilMs=millis()+kSlotGuardMs;
     slotGrantsSent=slotRotations=0;
-    slotOwnerIsRecovery=slotLastWasRecovery=false;slotRecoveryStats={};
+    slotStats={};slotLastStartMs=0;slotPeriodTotalMs=0;slotPeriodCount=0;
+    for(auto &u:unicastPeers)u={};
     return true;
 }
 uint32_t nextSequence(){++txSequence;if(!txSequence)++txSequence;return txSequence;}
@@ -944,9 +995,27 @@ bool sendFrame(EspNowTimePackets::Frame& f,const uint8_t mac[6],
     ++stats.sent;return true;
 }
 bool ensurePeer(const uint8_t mac[6]) {
-    if(esp_now_is_peer_exist(mac))return true;
+    const uint32_t now=millis();
+    UnicastPeer *entry=nullptr;
+    for(auto &u:unicastPeers) if(u.used && memcmp(u.mac,mac,6)==0){entry=&u;break;}
+    if(esp_now_is_peer_exist(mac)) {
+        if(entry) entry->lastUseMs=now;
+        return true;
+    }
+    if(!entry) {
+        for(auto &u:unicastPeers) if(!u.used){entry=&u;break;}
+        if(!entry) {
+            // Full: replace the least recently used reply peer.
+            entry=&unicastPeers[0];
+            for(auto &u:unicastPeers) if(int32_t(u.lastUseMs-entry->lastUseMs)<0) entry=&u;
+            if(esp_now_is_peer_exist(entry->mac)) esp_now_del_peer(entry->mac);
+            ++unicastPeerEvictions;
+        }
+    }
     esp_now_peer_info_t p={};memcpy(p.peer_addr,mac,6);p.channel=0;p.ifidx=WIFI_IF_STA;
-    return esp_now_add_peer(&p)==ESP_OK;
+    if(esp_now_add_peer(&p)!=ESP_OK){entry->used=false;return false;}
+    entry->used=true;memcpy(entry->mac,mac,6);entry->lastUseMs=now;
+    return true;
 }
 // Reports share the HMAC/replay protection and Coordinator epoch of Probes.
 // timeUs is two packed 32-bit values, NOT a timestamp for report frames.
@@ -1250,10 +1319,8 @@ void pauseForCapture(uint32_t holdMs) {
     // Coordinator notifies nodes immediately; expiry also protects against lost packets.
     revokePermissionBroadcast();
     if(wasCoordinator && slotOwner>=0) {
-        if(!slotOwnerIsRecovery)slotNextIndex=static_cast<uint8_t>((slotOwner+1)%12);
-        slotLastWasRecovery=slotOwnerIsRecovery;slotOwnerIsRecovery=false;
-        slotOwner=-1;
-        slotGuardUntilMs=captureGuardUntilMs+kSlotGuardMs;
+        // Capture has priority; not a failure of the node.
+        slotAbortWithoutOutcome(captureGuardUntilMs+kSlotGuardMs);
     }
     coordinatorPermissionIssued=false;
     permissionUntilMs=0;
@@ -1372,9 +1439,9 @@ void stop() {
     // Monotonic generation prevents old captures from matching new generation values
     ++sourceChanges;
     memset(activeTimeSourceMac,0,6);  // Beta131-FIX (Seventh cycle, Problem 2)
-    for(auto &p:slotPeers)p={};slotNextIndex=0;slotOwner=-1;
+    for(auto &p:slotPeers)p={};slotOwner=-1;slotState={};
     slotStartedMs=slotGuardUntilMs=0;slotGrantsSent=slotRotations=0;
-    slotOwnerIsRecovery=slotLastWasRecovery=false;slotRecoveryStats={};
+    slotStats={};slotLastStartMs=0;slotPeriodTotalMs=0;slotPeriodCount=0;
     previousEstimate={};latestQualityEstimate={};lastPrecisionMs=0;failedSeries=0;for(auto &r:seriesRejectByReason)r=0;lastSeriesFailure=0;lastRejectedReason=0;lastRejectedSeriesMs=0;lastRejectedHasMetrics=false;lastRejectedEstimate={};consecutiveFailures=0;
     successfulSeries=0;lastCompletedSeriesMs=0;lastCompletedSeriesResult=0;nextSeriesStatsReportMs=0;lastEstimateMs=0;
     referenceUtcUs=0;referenceMonoLow=0;referenceReceivedNodeMono=0;
@@ -2012,18 +2079,35 @@ Diagnostics diagnostics(){Diagnostics out=stats;
     out.seriesLastCompletedAgeMs=lastCompletedSeriesMs ? uint32_t(now-lastCompletedSeriesMs) : 0;
     out.seriesNextInMs=nextSeriesMs && static_cast<int32_t>(nextSeriesMs-now)>0 ? nextSeriesMs-now : 0;
     if(wasCoordinator){
-        for(const auto &p:slotPeers)
-            if(p.boot && uint32_t(now-p.seenMs)<=kPeerActiveMs)++out.slotActivePeers;
-        out.slotCycleEstimateMs=out.slotActivePeers*kSlotRecoveryParams.slotPeriodMs;
-        out.slotCapacity=sizeof(slotPeers)/sizeof(slotPeers[0]);
+        for(const auto &p:slotPeers) {
+            if(!slotPeerActive(p,now)) continue;
+            ++out.slotActivePeers;
+            if(ClusterSlotScheduler::due(p.sched,now,kSlotParams)) ++out.slotDuePeers;
+            if(p.sched.backoffActive && !ClusterSlotScheduler::reached(now,p.sched.eligibleAtMs))
+                ++out.slotRecoveryDeferred;
+            if(!p.sched.ageKnown) { ++out.slotExpiredPeers; continue; }
+            const uint32_t age=ClusterSlotScheduler::estimatedAgeMs(p.sched,now);
+            if(age>=kSlotLifetimeMs) ++out.slotExpiredPeers;
+            if(age>out.slotOldestAgeMs) out.slotOldestAgeMs=age;
+        }
+        out.slotPeriodMeanMs=slotPeriodCount ? static_cast<uint32_t>(slotPeriodTotalMs/slotPeriodCount) : 0;
+        out.slotCycleEstimateMs=out.slotActivePeers*out.slotPeriodMeanMs;
+        out.slotCapacity=kSlotPeerCapacity;
         out.slotTableFullRecent=slotTableFullLastMs && uint32_t(now-slotTableFullLastMs)<=kPeerActiveMs;
         out.slotRotations=slotRotations;
-        out.slotOwnerRecovery=slotOwner>=0 && slotOwnerIsRecovery;
-        out.slotRecoveryRequested=slotRecoveryStats.requested;
-        out.slotRecoveryGranted=slotRecoveryStats.granted;
-        out.slotRecoveryDeferred=slotRecoveryStats.deferred;
-        out.slotRecoverySucceeded=slotRecoveryStats.succeeded;
-        out.slotRecoveryFailed=slotRecoveryStats.failed;
+        out.slotOwnerRecovery=slotOwner>=0 && slotPeers[slotOwner].sched.lastSlotWasRetry;
+        out.slotRecoveryRequested=slotStats.failed;
+        out.slotRecoveryGranted=slotStats.retrySlots;
+        out.slotRecoverySucceeded=slotStats.retrySucceeded;
+        out.slotRecoveryFailed=slotStats.retryFailed;
+        out.slotSucceeded=slotStats.succeeded;
+        out.slotFailed=slotStats.failed;
+        out.slotEndedSeriesOver=slotStats.seriesOver;
+        out.slotEndedNoActivity=slotStats.noActivity;
+        out.slotEndedHardCap=slotStats.hardCap;
+        out.slotEndedOwnerLost=slotStats.ownerLost;
+        out.slotLastMs=slotStats.lastSlotMs;
+        out.slotMeanMs=slotStats.finishedSlots ? static_cast<uint32_t>(slotStats.totalSlotMs/slotStats.finishedSlots) : 0;
     }
     out.coordinatorBeaconsSuppressed=coordinatorBeaconsSuppressed;
     out.activeTimeSource=activeTimeSourceTag;
@@ -2052,7 +2136,7 @@ bool beaconExperimentStart(uint32_t intervalMs, bool quiet){
     beaconExperimentIntervalMs=intervalMs;
     beaconExperimentQuiet=quiet;
     // Revoke the current owner once. No further grants during quiet mode.
-    if(quiet && slotOwner>=0)endSlot(lastEpoch,lastTag,localBootNonceForControl);
+    if(quiet && slotOwner>=0)revokeSlotWithoutOutcome(lastEpoch,lastTag,localBootNonceForControl);
     beaconExperimentLastDurationMs=15000;
     beaconExperimentSent=0;
     beaconExperimentUntilMs=millis()+beaconExperimentLastDurationMs;
@@ -2087,7 +2171,7 @@ bool benchmarkStart(uint32_t intervalMs,uint32_t targetBoot){
     }
     if(!bench.peerCount)return false;
     bench.running=true;bench.startedMs=now;bench.phase=0;
-    if(slotOwner>=0)endSlot(lastEpoch,lastTag,localBootNonceForControl);
+    if(slotOwner>=0)revokeSlotWithoutOutcome(lastEpoch,lastTag,localBootNonceForControl);
     // Let all outstanding 3-s sync permission leases expire before measuring.
     benchQuietUntilMs=now+kGrantLeaseMs+500UL;
     return true;
@@ -2221,6 +2305,7 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
         nextBroadcastMs = millis() + kBroadcastEveryMs;
         nextSeriesMs = millis() + 1000UL;
     }
+    int64_t loadMarkUs=esp_timer_get_time();
     serviceDiagnosticReceive();
     serviceGrantDiagnostic(localBootNonce);
     Queued item;unsigned budget=0;
@@ -2359,6 +2444,7 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
             }
             r.type=EspNowTimePackets::Type::Final;r.timeUs=replyDispatchBeforeUs;
             if(sendFrame(r,item.mac))++stats.probesAnswered;
+            if(slotIsOwner(item.mac,static_cast<uint32_t>(f.senderBoot))) slotNoteOwnerProbe();
             continue;
         }
 
@@ -2668,6 +2754,7 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
             }
         }
     }
+    LoopLoadDiag::lap(LoopLoadDiag::EspNowRx,loadMarkUs);
     uint32_t now=millis();
 
     // Beta131-CORRECTED: Broadcaster production service FIRST (Problem 1 FIX)
@@ -2777,7 +2864,10 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
             Serial.println("[COORDINATOR] Broadcaster lease EXPIRED - resuming own beacons");
         }
 
-        if(!(beaconExperimentUntilMs && beaconExperimentQuiet))serviceSlots(now,epoch,tag,localBootNonce);
+        if(!(beaconExperimentUntilMs && beaconExperimentQuiet)){
+            LoopLoadDiag::Scope loadScope(LoopLoadDiag::EspNowSlots);
+            serviceSlots(now,epoch,tag,localBootNonce);
+        }
         // Beta136: resume immediately (normal send path below) once suppression stops holding,
         // instead of leaving nodes without any beacon source for up to kBroadcastEveryMs.
         if(ClusterTimeSourcePolicy::coordinatorShouldResumeEarly(coordinatorLastSlotSuppressed,

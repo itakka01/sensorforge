@@ -39,6 +39,7 @@
 #include <esp_timer.h>
 #include "wifi_power_policy.h"
 #include "psram_alloc.h"
+#include "loop_load_diag.h"
 #include <new>
 #include <stdlib.h>
 #include <string.h>
@@ -341,6 +342,12 @@ static bool runtimeProfileRemembered = false;
 static uint32_t bootNonce = 0;
 static uint32_t sequenceNumber = 0;
 static uint32_t nextHeartbeatMs = 0;
+// Periodic expiry/election in clusterLoop runs at most every
+// CLUSTER_ELECTION_SERVICE_MS unless packets arrived in that iteration.
+// Leases are seconds long; packet handlers still recompute immediately.
+static const uint32_t CLUSTER_ELECTION_SERVICE_MS = 100UL;
+static uint32_t lastElectionServiceMs = 0;
+static bool electionServiceStarted = false;
 static uint32_t nextCoordinatorHeartbeatMs = 0;
 static uint32_t directHeartbeatSequence = 0;
 static uint32_t lastCoordinatorAckMs = 0;
@@ -4314,11 +4321,13 @@ void clusterLoop()
     // sleep (WIFI_PS_NONE); outside active cluster operation the Arduino default is
     // restored. Never touched while a capture deadline is protected.
     if (!clusterCaptureProtectionActive()) {
+        LoopLoadDiag::Scope loadScope(LoopLoadDiag::ClusterWifiPolicy);
         WifiPowerPolicy::service(runtimeActive);
     }
     // Diagnostic ESP-NOW time transport only; never changes cluster clock.
     // Capture deadline takes precedence over any radio work.
     if (!clusterCaptureProtectionActive()) {
+        LoopLoadDiag::Scope loadScope(LoopLoadDiag::ClusterEspNow);
         if (cfg_operating_mode == "time_broadcaster") {
             // Beta131-CORRECTED (Third cycle): Broadcaster receives BOTH IDs (Problem 1 & 2 FIX)
             // 1. Own device ID - for diagnostic beacons and Grant identity verification
@@ -4335,9 +4344,12 @@ void clusterLoop()
                                        bootNonce);
         }
     }
-    hwTimeSessionService();
-    // Passive GPIO meter: role independent, also without cluster runtime.
-    ClusterHwTimeMeter::service();
+    {
+        LoopLoadDiag::Scope loadScope(LoopLoadDiag::ClusterHwTime);
+        hwTimeSessionService();
+        // Passive GPIO meter: role independent, also without cluster runtime.
+        ClusterHwTimeMeter::service();
+    }
     // Never keep a measurement output scheduled after Drone Mode has ended.
     if (clusterHwTimePulseActive() && (!runtimeActive || localIsCoordinator ||
         !droneModeEnabled())) clusterHwTimePulseCancel();
@@ -4346,7 +4358,10 @@ void clusterLoop()
     // heartbeat and clock-maintenance work. Packet handling must never be
     // permitted to push an armed photo past its local deadline.
     if (runtimeActive && pendingCapture.active) {
-        serviceScheduledCapture();
+        {
+            LoopLoadDiag::Scope loadScope(LoopLoadDiag::ClusterCapture);
+            serviceScheduledCapture();
+        }
         if (pendingCapture.active && clusterCaptureArmedFlag &&
             pendingCapture.deadlineMonoUs - esp_timer_get_time() <= 50000LL) {
             // Reserve the last 50 ms for the local camera dispatcher.
@@ -4376,6 +4391,7 @@ void clusterLoop()
     // Process any already queued authenticated Presence/ACK traffic BEFORE
     // expiring a peer. Otherwise a delayed loop can discard a live Coordinator
     // just before consuming its waiting ACK, causing avoidable role churn.
+    int64_t loadMarkUs = esp_timer_get_time();
     int processed = 0;
     while (processed < 4) {
         int packetSize = clusterUdp.parsePacket();
@@ -4424,6 +4440,8 @@ void clusterLoop()
         ++processed;
     }
 
+    LoopLoadDiag::lap(LoopLoadDiag::ClusterUdpGroup, loadMarkUs);
+
     // Passive scanner mode stops here. It never opens the coordinator socket,
     // never authenticates/join clusters and never transmits cluster traffic.
     if (!runtimeActive)
@@ -4452,17 +4470,24 @@ void clusterLoop()
         }
         ++directProcessed;
     }
+    LoopLoadDiag::lap(LoopLoadDiag::ClusterUdpDirect, loadMarkUs);
 
     // Packet handlers have now refreshed authenticated liveness. Expire only
     // after draining the bounded receive queues, using a fresh timestamp.
     // This retains the 60-second lease on actual silence and does not let
     // discovery-only packets or unauthenticated traffic renew membership.
     const uint32_t electionNow = millis();
-    expirePeers(electionNow);
-    expireResources(electionNow);
-    recomputeCoordinator(electionNow);
-    ClusterJobs::expire(electionNow);
-    serviceProbeRetries(electionNow);
+    if (processed > 0 || directProcessed > 0 || !electionServiceStarted ||
+        (uint32_t)(electionNow - lastElectionServiceMs) >= CLUSTER_ELECTION_SERVICE_MS) {
+        electionServiceStarted = true;
+        lastElectionServiceMs = electionNow;
+        expirePeers(electionNow);
+        expireResources(electionNow);
+        recomputeCoordinator(electionNow);
+        ClusterJobs::expire(electionNow);
+        serviceProbeRetries(electionNow);
+    }
+    LoopLoadDiag::lap(LoopLoadDiag::ClusterElection, loadMarkUs);
 
     if (nextHeartbeatMs == 0 || (int32_t)(now - nextHeartbeatMs) >= 0) {
         sendHeartbeat();
@@ -4471,7 +4496,9 @@ void clusterLoop()
     } else if (coordinationDirty) {
         sendCoordination();
     }
+    LoopLoadDiag::lap(LoopLoadDiag::ClusterHeartbeat, loadMarkUs);
     serviceCameraReport(now);
+    LoopLoadDiag::lap(LoopLoadDiag::ClusterCameraReport, loadMarkUs);
 
     if (!localIsCoordinator &&
         currentCoordinatorId[0] &&
@@ -4486,7 +4513,7 @@ void clusterLoop()
     // Newly accepted jobs are handled on the next loop iteration. Do not
     // spend additional UDP/clock work before dispatching an armed capture.
     serviceCaptureResultRetry(millis());
-
+    LoopLoadDiag::lap(LoopLoadDiag::ClusterTimeRequest, loadMarkUs);
 }
 
 bool clusterLocalIsCoordinator()
@@ -5278,7 +5305,7 @@ String clusterStatusJson()
     json += ",\"series_last_rejected_spread_us\":" + String((unsigned long)esn.seriesLastRejectedSpreadUs);
     json += ",\"series_last_completed_age_ms\":" + String((unsigned long)esn.seriesLastCompletedAgeMs);
     json += ",\"series_next_in_ms\":" + String((unsigned long)esn.seriesNextInMs);
-    // Coordinator only (0 on nodes): slot rotation and recovery slots after rejected series.
+    // Coordinator only (0 on nodes): precision slot scheduling (cluster_slot_scheduler.h).
     json += ",\"slot_active_peers\":" + String((unsigned long)esn.slotActivePeers);
     json += ",\"slot_cycle_estimate_ms\":" + String((unsigned long)esn.slotCycleEstimateMs);
     json += ",\"slot_capacity\":" + String((unsigned long)esn.slotCapacity);
@@ -5290,6 +5317,18 @@ String clusterStatusJson()
     json += ",\"slot_recovery_deferred\":" + String((unsigned long)esn.slotRecoveryDeferred);
     json += ",\"slot_recovery_succeeded\":" + String((unsigned long)esn.slotRecoverySucceeded);
     json += ",\"slot_recovery_failed\":" + String((unsigned long)esn.slotRecoveryFailed);
+    json += ",\"slot_succeeded\":" + String((unsigned long)esn.slotSucceeded);
+    json += ",\"slot_failed\":" + String((unsigned long)esn.slotFailed);
+    json += ",\"slot_ended_series_over\":" + String((unsigned long)esn.slotEndedSeriesOver);
+    json += ",\"slot_ended_no_activity\":" + String((unsigned long)esn.slotEndedNoActivity);
+    json += ",\"slot_ended_hard_cap\":" + String((unsigned long)esn.slotEndedHardCap);
+    json += ",\"slot_ended_owner_lost\":" + String((unsigned long)esn.slotEndedOwnerLost);
+    json += ",\"slot_last_ms\":" + String((unsigned long)esn.slotLastMs);
+    json += ",\"slot_mean_ms\":" + String((unsigned long)esn.slotMeanMs);
+    json += ",\"slot_period_mean_ms\":" + String((unsigned long)esn.slotPeriodMeanMs);
+    json += ",\"slot_due_peers\":" + String((unsigned long)esn.slotDuePeers);
+    json += ",\"slot_expired_peers\":" + String((unsigned long)esn.slotExpiredPeers);
+    json += ",\"slot_oldest_age_ms\":" + String((unsigned long)esn.slotOldestAgeMs);
     // Beta136: probe RX (t2) -> reply pre-send (t3) on this device, answered probes only.
     json += ",\"probe_reply_delay_samples\":" + String((unsigned long)esn.probeReplyDelaySamples);
     json += ",\"probe_reply_delay_last_us\":" + String((unsigned long)esn.probeReplyDelayLastUs);

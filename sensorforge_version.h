@@ -21,13 +21,13 @@
 // WebConfig, so a running device can be mapped back to the exact Git tag.
 
 #define SENSORFORGE_RELEASE_NUMBER 87
-#define SENSORFORGE_RELEASE_TAG "v87-beta140"
-#define SENSORFORGE_RELEASE_DATE "2026-10-23"
+#define SENSORFORGE_RELEASE_TAG "v87-beta143"
+#define SENSORFORGE_RELEASE_DATE "2026-10-24"
 #define SENSORFORGE_RELEASE_SUMMARY \
-    "Beta 140: diymore camera XCLK drive strength fix (WiFi reachability), WiFi/task diagnostics, cluster groups and camera report."
+    "Beta 143: periodic cluster expiry/election at most every 100 ms (coordinator CPU); ESP-NOW load split in /load_diag."
 
-// Current source-tree stage. Beta 140: diymore XCLK fix and diagnostics.
-#define SENSORFORGE_WORKTREE_STAGE "v87-beta140"
-#define SENSORFORGE_WORKTREE_DATE "2026-10-23"
+// Current source-tree stage. Beta 143: election throttle + ESP-NOW load split.
+#define SENSORFORGE_WORKTREE_STAGE "v87-beta143"
+#define SENSORFORGE_WORKTREE_DATE "2026-10-24"
 #define SENSORFORGE_WORKTREE_SUMMARY \
-    "v87 Beta 140: diymore XCLK drive strength fix, WIFI-DIAG/TASK-DIAG, cluster groups, camera report phase 1."
+    "v87 Beta 143: clusterLoop expiry/election throttled to 100 ms unless packets arrived; /load_diag adds espnow_rx and espnow_slots."

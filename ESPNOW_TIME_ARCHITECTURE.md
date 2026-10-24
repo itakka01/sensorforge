@@ -83,17 +83,82 @@ Bei unzureichender Qualität bleibt/greift die bisherige Wi-Fi-Clusterzeit, sofe
 
 | Ereignis | Coordinator | Node |
 |---|---|---|
-| Keine priorisierte Aktion / kein Schutzfenster | Sendet etwa alle 5 s eine Freigabe für max. 12 s | Darf während der gültigen Freigabe neue Probes starten |
+| Keine priorisierte Aktion / kein Schutzfenster | Sendet dem aktuellen Slot-Inhaber jede Sekunde eine Freigabe für 3 s (Abschnitt 8.1) | Darf während der gültigen Freigabe neue Probes starten |
 | Coordinator-Aktion wird gestartet | Setzt lokale Schutzphase und sendet signierten Widerruf | Bricht Serie **nach Empfang** des gültigen Widerrufs ab |
 | Capture wird geplant/angenommen | Lokaler Capture-Schutz und Widerruf; Funkaktivität im Schutzfenster pausiert | Eigener Capture-Schutz stoppt aktive Probes, sobald der Capture-Zustand lokal bekannt ist |
-| Widerruf geht verloren | Kein unmittelbarer Stop auf dem entfernten Node garantiert | Die Freigabe verfällt spätestens nach 12 s seit der letzten gültigen Freigabe |
+| Widerruf geht verloren | Kein unmittelbarer Stop auf dem entfernten Node garantiert | Die Freigabe verfällt spätestens 3 s nach der letzten gültigen Freigabe |
 | Schutzfenster endet | Coordinator kann wieder Freigaben versenden | Misst erst wieder mit neuer gültiger Freigabe |
 
 **Aktuelle Implementierungsgrenzen:** Die lokale Pause bei Listenaktionen ist noch zeitbasiert (typisch 10 s), nicht an den nachgewiesenen Abschluss des Jobs gekoppelt. Die Funkfreigabe ist daher noch **keine umfassende, clusterweit atomare Jobsperre**. Eine sofortige Stilllegung auf allen entfernten Nodes kann ein unzuverlässiger Funkbroadcast nicht gewährleisten. Insbesondere dürfen wir aus einem gesendeten Widerruf keinen bestätigten Empfang ableiten.
 
 Die Funk-RX-Callbacks bleiben kurz; der ESP-NOW-Empfänger kann weiterhin Pakete entgegennehmen, aber ein Node startet ohne gültige Freigabe keine neue Präzisionsserie. Die gespeicherte Drift wird während einer Pause nicht neu gemessen. `syncPermission` und `syncPermissionRemainingMs` in den lokalen Diagnostics zeigen die Node-Freigabe, nicht den Erfolg der Zeitkalibrierung.
 
-**Zeitverhalten:** Zeitbroadcasts ungefähr alle 10 s, Freigaben ungefähr alle 5 s, maximal 12 s Gültigkeit; Probe-Serien mit fest 16 Austausche je Serie (die frühere adaptive Erweiterung auf 32/64 wurde in beta131 entfernt), mit ungefähr 45 ms Mindestabstand bei erfolgreichem Ablauf, zuzüglich tatsächlicher Funklatenzen/Timeouts. Eine Serie kann deshalb länger dauern. Diese Intervalle sind Parameter und keine Echtzeitgarantien.
+**Zeitverhalten:** Zeitbroadcasts ungefähr alle 10 s, Freigaben jede Sekunde an den Slot-Inhaber, 3 s Gültigkeit; Probe-Serien mit fest 16 Austausche je Serie (die frühere adaptive Erweiterung auf 32/64 wurde in beta131 entfernt), mit ungefähr 45 ms Mindestabstand bei erfolgreichem Ablauf, zuzüglich tatsächlicher Funklatenzen/Timeouts. Eine Serie kann deshalb länger dauern. Diese Intervalle sind Parameter und keine Echtzeitgarantien.
+
+### 8.1 Slot-Planung der Präzisionsserien (Coordinator, ab v87-beta141)
+
+Der Coordinator beantwortet Probes nur vom jeweiligen **Slot-Inhaber**; immer nur ein Node misst. Die Planung liegt in `cluster_slot_scheduler.h` (reine Logik, Host-Test `test_slot_scheduler.cpp.test`), angebunden in `serviceSlots()` von `cluster_espnow_radio.cpp`. Node-Firmware, Paketformate, Messverfahren (16 Austausche, Qualitätsgrenzen, Schätzer) und die 120-s-Gültigkeit sind unverändert; alte Nodes arbeiten mit einem neuen Coordinator zusammen.
+
+**Problem bis beta140:** feste Reihum-Vergabe, jeder aktive Node 14 s Slot + 3,5 s Pause, also ein Zyklus von N × 17,5 s (9 Nodes: 157,5 s). Eine Serie braucht aber nur rund 2 s (Start etwa 1 s nach der ersten Freigabe, 16 Austausche ≈ 0,8 s). Ab 7 Nodes war der Zyklus länger als die Gültigkeit von 120 s; Nodes fielen trotz erfolgreicher Serien auf `wifi_coordinator` zurück. Zusätzlich fassten Slot-Tabelle und Wiedergabeschutz nur 12 Nodes, und ESP-NOW-Partner (max. 20 in ESP-IDF) wurden nie freigegeben.
+
+**Ablauf eines Slots**
+
+1. Start: Freigabe sofort, danach jede Sekunde (Lease 3 s, unverändert).
+2. Ende, sobald zuerst eintritt:
+   - **Serie vorbei** – der Inhaber hat geprobt und seit 1,5 s keine Probe mehr gesendet (`kSlotIdleEndMs` > Austausch-Timeout 1,2 s + 45 ms; ein verlorener Austausch beendet den Slot nicht). Keine Pause danach: Der nächste Node probt ohnehin erst ~1 s nach seiner Freigabe, und ein fertiger Node probt frühestens nach 12 s wieder (Retry) bzw. 45 s (Erfolg) – weit jenseits seiner 3-s-Lease. Ein verlorener Widerruf kann also keine zwei gleichzeitig messenden Nodes erzeugen (per `static_assert` abgesichert).
+   - **Keine Aktivität** – 3 s ohne Probe (Freigaben verloren, Node ausgelastet): Pause 3,5 s.
+   - **Obergrenze** 14 s (unverändert): Pause 3,5 s.
+   - **Inhaber verschwunden** (30 s ohne Bericht) oder neuer Boot: Pause 3,5 s.
+3. Capture-Pause, Benchmark und Beacon-Experiment brechen den Slot ohne Bewertung ab (wie bisher mit 3,5 s Pause).
+
+**Wer ist der nächste Inhaber?** Nur Nodes, die *fällig* sind: keine Präzision bekannt oder Präzisionsalter ≥ 45 s (gleicher Takt wie die Nachmessung eines Nodes nach Erfolg). Unter den fälligen der dringendste: ohne Präzision zuerst, dann das älteste geschätzte Alter (Alter aus dem letzten `NodeSyncReport` + seither vergangene Zeit), bei Gleichstand wer am längsten auf einen Slot wartet. Ist niemand fällig, wird kein Slot vergeben (weniger Funklast als die alte Dauerrotation).
+
+**Ergebnis und Wiederholung.** Nach einem Slot wird der Node erst wieder gewählt, wenn ein Bericht das Ergebnis zeigt (Berichte alle 5 s; ohne Bericht nach 8 s gilt der Slot als fehlgeschlagen). Erfolg = berichtetes Alter ≤ Zeit seit Slot-Beginn. Erster Fehlschlag: sofort wieder wählbar (eine einzelne verworfene Serie ist häufig). Ab dem zweiten Fehlschlag in Folge Wartezeit 5 s, dann 10, 20, 40, höchstens 60 s – ein dauerhaft scheiternder Node kostet so rund einen Slot pro Minute und hungert die anderen nicht aus. Der frühere „Recovery-Slot“ (`cluster_slot_recovery.h`) ist in dieser Planung aufgegangen und entfällt.
+
+**Kapazität und Annahmen** (Simulation `test_slot_scheduler.cpp.test`, 2 h je Szenario, 1 % Paketverlust, 3 % verworfene Serien; Node-Verhalten wie in der Firmware):
+
+| Nodes | Slot Ø | Präzision gültig (schlechtester Node) | Rückfälle auf WLAN-Zeit | ältestes Alter |
+|---|---|---|---|---|
+| 4 | 3,6 s | 100 % | 0 | 55 s |
+| 9 | 3,6 s | 100 % | 0 | 74 s |
+| 16 | 3,5 s | 100 % | 0 | 78 s |
+| 24 | 3,6 s | 100 % | 0 | 111 s |
+| 28 | 3,5 s | 99,8 % | vereinzelt | 132 s |
+| 32 | 3,6 s | 98,4 % | ja (gesättigt, gleichmäßig verteilt) | 140 s |
+| 9 bei 5 % Verlust, 15 % verworfen | 5,0 s | 100 % | 0 | 104 s |
+| 16 bei 5 % Verlust, 15 % verworfen | 4,9 s | 96,9 % | ja | 188 s |
+
+Faustregel: dauerhaft lückenlos, solange `Nodes × Slot-Dauer` deutlich unter 120 s bleibt (bei ~3,6 s je Slot bis etwa 24 Nodes). Darüber ist die Funkzeit ausgeschöpft: Alle Nodes werden weiter gleichmäßig nachgemessen (Fairness bleibt, kein Node fällt dauerhaft heraus), aber einzelne laufen zeitweise über 120 s. Ein Slot ist zu etwa 1 s durch den Node-Start nach der Freigabe bestimmt (Node-Firmware, bewusst unverändert) – ein künftiger Node-seitiger Sofortstart wäre der nächste Hebel (~25 % kürzere Slots).
+
+**Harte Grenzen**
+
+| Grenze | Wert | Verhalten darüber |
+|---|---|---|
+| Slot-Tabelle (`kSlotPeerCapacity`) | 32 aktive Nodes | weitere Nodes bekommen keinen Slot; `slot_table_full_recent`, Warnung auf `/cluster` |
+| Wiedergabeschutz (`peerReplay`) | 32 Node-MACs je Funk-Sitzung, nie verdrängt | Pakete weiterer MACs werden verworfen |
+| ESP-NOW-Partner für Antworten | 18 + Broadcast | am längsten unbenutzter Partner wird ersetzt (`unicastPeerEvictions` intern) |
+| Cluster-Mitgliederliste (`CLUSTER_MAX_PEERS`, cluster.cpp) | 16 fremde Geräte | **jetzt die engste Grenze**: verdrängt Mitglieder (Anzeige, Jobs); Erweiterung kostet ~400 B internen RAM je Eintrag und ist offen |
+| Node-Berichtsanzeige (`remoteReports`) | 12 | nur Diagnoseanzeige `espnow_node_reports`; Planung unabhängig davon |
+
+**Diagnose** (`/cluster_status` → `espnow_time_local`, nur Coordinator):
+
+| Feld | Bedeutung |
+|---|---|
+| `slot_active_peers`, `slot_capacity`, `slot_table_full_recent` | aktive Nodes, Tabellengröße, Tabelle zuletzt voll |
+| `slot_due_peers` | jetzt fällige Nodes (Warteschlange) |
+| `slot_expired_peers` | aktive Nodes ohne gültige Präzision (≥ 120 s oder nie) |
+| `slot_oldest_age_ms` | ältestes geschätztes Präzisionsalter |
+| `slot_mean_ms`, `slot_last_ms`, `slot_period_mean_ms` | Slot-Dauer Ø/zuletzt, Abstand Slot-Beginn zu Slot-Beginn |
+| `slot_cycle_estimate_ms` | aktive Nodes × `slot_period_mean_ms` (Zeit, bis jeder einmal dran war; soll deutlich < 120 000 bleiben) |
+| `slot_ended_series_over` / `_no_activity` / `_hard_cap` / `_owner_lost` | Gründe des Slot-Endes |
+| `slot_succeeded`, `slot_failed` | Slots mit / ohne akzeptierte Serie |
+| `slot_recovery_requested` | = `slot_failed` (Slots, die eine Wiederholung brauchen) |
+| `slot_recovery_granted` / `_succeeded` / `_failed` | Wiederholungs-Slots nach Fehlschlag und ihr Ergebnis |
+| `slot_recovery_deferred` | Nodes, die gerade in der Fehlschlag-Wartezeit sind |
+| `slot_owner_recovery` | laufender Slot ist eine Wiederholung |
+| `slot_rotations` | beendete Slots |
+
+**Auf Hardware zu prüfen:** reale Slot-Dauer (Erwartung 3–4 s), `slot_ended_no_activity` und `slot_ended_hard_cap` nahe 0, `slot_cycle_estimate_ms` und `slot_expired_peers` im Langzeittest, keine Verschlechterung der Serienqualität (Streuung, verworfene Serien) durch die dichtere Folge von Messungen verschiedener Nodes.
 
 ## 9. Diagnose und Fehlersuche bei einer Messserie
 

@@ -123,15 +123,26 @@ struct Diagnostics {
     uint32_t seriesLastRejectedSpreadUs=0;  // 0 = no metrics (reason 1/4)
     uint32_t seriesLastCompletedAgeMs=0;    // 0 = none
     uint32_t seriesNextInMs=0;              // 0 = due / not scheduled
-    // Coordinator only: precision slot rotation and recovery slots (cluster_slot_recovery.h).
+    // Coordinator only: precision slot scheduling (cluster_slot_scheduler.h).
+    // slotCycleEstimateMs = active peers x measured mean start-to-start slot period
+    // (0 until two slots started). slotRotations = finished slots.
     uint32_t slotActivePeers=0, slotCycleEstimateMs=0, slotRotations=0;
     // Diagnostics only: slot table size and whether an active node found no
     // free slot within the last kPeerActiveMs (it then gets no precision series).
     uint32_t slotCapacity=0;
     bool slotTableFullRecent=false;
+    // Retry bookkeeping, kept under the former recovery-slot names:
+    // owner_recovery = current slot follows a failed one; requested = slots without
+    // accepted series; granted/succeeded/failed = retry slots and their outcome;
+    // deferred = active peers currently waiting in failure back-off.
     bool slotOwnerRecovery=false;
     uint32_t slotRecoveryRequested=0, slotRecoveryGranted=0, slotRecoveryDeferred=0;
     uint32_t slotRecoverySucceeded=0, slotRecoveryFailed=0;
+    uint32_t slotSucceeded=0, slotFailed=0;
+    uint32_t slotEndedSeriesOver=0, slotEndedNoActivity=0, slotEndedHardCap=0, slotEndedOwnerLost=0;
+    uint32_t slotLastMs=0, slotMeanMs=0, slotPeriodMeanMs=0;
+    // Active peers: due for a series now / without valid precision / oldest estimate.
+    uint32_t slotDuePeers=0, slotExpiredPeers=0, slotOldestAgeMs=0;
     // Beta136: local probe RX callback (t2) -> reply pre-send stamp (t3), answered probes only.
     // Firmware service latency (cancels in the offset math); buckets: upper bounds in us.
     static constexpr uint8_t kProbeReplyDelayBuckets=9;

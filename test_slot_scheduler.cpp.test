@@ -1,0 +1,507 @@
+// Host test: cluster_slot_scheduler.h (ESP-NOW precision slot scheduling).
+//   g++ -std=c++17 -O2 -Wall -Wextra -I. -x c++ test_slot_scheduler.cpp.test -o /tmp/test_slot_scheduler
+//   /tmp/test_slot_scheduler
+//
+// Part 1: unit checks of the pure decisions.
+// Part 2: millisecond simulation of coordinator + nodes for 4..48 nodes with
+//         packet loss, rejected series, a permanently failing node, a node that
+//         ignores grants, a node that disappears and a node reboot. The
+//         coordinator side mirrors serviceSlots()/endSlot()/noteSlotPeer() in
+//         cluster_espnow_radio.cpp; the node side mirrors the series logic there
+//         (start ~1 s after the grant, 45 ms probe gap, 1.2 s exchange timeout,
+//         16 exchanges, 12 s series limit, next series after 45 s or 12-24 s,
+//         3 s grant lease, reports every 5 s with the age in whole seconds).
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include <vector>
+#include <algorithm>
+#include "cluster_slot_scheduler.h"
+
+using namespace ClusterSlotScheduler;
+
+static int g_failures = 0;
+#define CHECK(cond, msg) do { if (cond) printf("  PASS %s\n", msg); \
+    else { printf("  FAIL %s (line %d)\n", msg, __LINE__); ++g_failures; } } while (0)
+
+// Same values as kSlotParams in cluster_espnow_radio.cpp.
+static const Params P{120000, 45000, 3000, 1500, 14000, 0, 3500, 8000, 5000, 60000};
+
+// ---------------------------------------------------------------- part 1
+
+static void unitTests()
+{
+    printf("== unit: due / urgency / choose\n");
+    PeerState a, b, c;
+    uint32_t now = 100000;
+    CHECK(due(a, now, P), "unknown precision is due");
+    b.ageKnown = true; b.reportedAgeMs = 10000; b.reportRxMs = now;
+    CHECK(!due(b, now, P), "fresh precision (10 s) is not due");
+    c.ageKnown = true; c.reportedAgeMs = 50000; c.reportRxMs = now - 2000;
+    CHECK(due(c, now, P) && estimatedAgeMs(c, now) == 52000, "age is extrapolated from the report");
+    PeerState *peers[3] = {&a, &b, &c};
+    Stats st;
+    CHECK(choose(peers, 3, now, P, st) == 0, "no precision wins over an old estimate");
+    a.backoffActive = true; a.eligibleAtMs = now + 1000;
+    CHECK(choose(peers, 3, now, P, st) == 2, "node in back-off is skipped");
+    CHECK(choose(peers, 3, now + 1000, P, st) == 0, "back-off ends at eligibleAtMs");
+    a.backoffActive = false; a.outcomePending = true;
+    CHECK(choose(peers, 3, now, P, st) == 2, "node with pending outcome is skipped");
+    a.outcomePending = false;
+    PeerState *none[3] = {nullptr, &b, nullptr};
+    CHECK(choose(none, 3, now, P, st) == -1, "nobody due -> no slot");
+    PeerState d = c, e = c;
+    d.hadSlot = true; d.lastSlotEndMs = now - 1000;
+    e.hadSlot = true; e.lastSlotEndMs = now - 9000;
+    PeerState *tie[2] = {&d, &e};
+    CHECK(choose(tie, 2, now, P, st) == 1, "same age: longer wait wins");
+
+    printf("== unit: slot end\n");
+    SlotState s; PeerState p; Stats st2;
+    onSlotStart(s, p, 0, st2);
+    CHECK(checkEnd(s, 2999, P) == EndReason::None && checkEnd(s, 3000, P) == EndReason::NoActivity,
+          "no probe within startTimeoutMs -> NoActivity");
+    onOwnerProbe(s, 1000);
+    CHECK(checkEnd(s, 2499, P) == EndReason::None && checkEnd(s, 2500, P) == EndReason::SeriesOver,
+          "silent idleEndMs after the last probe -> SeriesOver");
+    for (uint32_t t = 1000; t < 14000; t += 45) onOwnerProbe(s, t);
+    CHECK(checkEnd(s, 14000, P) == EndReason::HardCap, "hard cap at 14 s");
+    CHECK(guardMs(EndReason::SeriesOver, P) == 0 && guardMs(EndReason::NoActivity, P) == 3500 &&
+          guardMs(EndReason::HardCap, P) == 3500 && guardMs(EndReason::OwnerLost, P) == 3500,
+          "short guard only after a finished series");
+    CHECK(P.idleEndMs > 1200 + 45, "one lost exchange (1.2 s timeout) does not end the slot");
+
+    printf("== unit: outcome and back-off\n");
+    {
+        SlotState sl; PeerState q; Stats t;
+        q.ageKnown = true; q.reportedAgeMs = 60000; q.reportRxMs = 0;
+        onSlotStart(sl, q, 1000, t); onOwnerProbe(sl, 2000);
+        onSlotEnd(sl, &q, EndReason::SeriesOver, 4000, P, t);
+        CHECK(q.outcomePending, "outcome waits for the next report");
+        onPrecisionReport(q, true, 2000, 5000, P, t);
+        CHECK(!q.outcomePending && t.succeeded == 1 && q.consecutiveFailures == 0,
+              "report with a new series -> success");
+    }
+    {
+        SlotState sl; PeerState q; Stats t;
+        q.ageKnown = true; q.reportedAgeMs = 60000; q.reportRxMs = 0;
+        onSlotStart(sl, q, 1000, t); onOwnerProbe(sl, 2000);
+        onSlotEnd(sl, &q, EndReason::SeriesOver, 4000, P, t);
+        onPrecisionReport(q, true, 65000, 5000, P, t);
+        CHECK(t.failed == 1 && !q.backoffActive && q.consecutiveFailures == 1,
+              "report with the old series -> failure, first one without back-off");
+        CHECK(backoffMs(1, P) == 0 && backoffMs(2, P) == 5000 && backoffMs(3, P) == 10000 &&
+              backoffMs(5, P) == 40000 && backoffMs(6, P) == 60000 && backoffMs(200, P) == 60000,
+              "back-off from the 2nd failure: 5 s doubling up to 60 s");
+        onSlotStart(sl, q, 20000, t);
+        CHECK(t.retrySlots == 1 && q.lastSlotWasRetry, "next slot after a failure is a retry slot");
+    }
+    {
+        SlotState sl; PeerState q; Stats t;
+        onSlotStart(sl, q, 0, t); onOwnerProbe(sl, 1000);
+        onSlotEnd(sl, &q, EndReason::SeriesOver, 3000, P, t);
+        serviceOutcome(q, 3000 + 7999, P, t);
+        CHECK(q.outcomePending, "outcome still pending before outcomeTimeoutMs");
+        serviceOutcome(q, 3000 + 8000, P, t);
+        CHECK(!q.outcomePending && t.failed == 1, "missing report -> failure after outcomeTimeoutMs");
+    }
+    {
+        SlotState sl; PeerState q; Stats t;
+        onSlotStart(sl, q, 0, t);
+        onSlotEnd(sl, &q, EndReason::NoActivity, 3000, P, t);
+        CHECK(!q.outcomePending && t.failed == 1, "no activity -> immediate failure");
+        onSlotStart(sl, q, 4000, t);
+        onSlotEnd(sl, &q, EndReason::NoActivity, 7000, P, t);
+        CHECK(q.backoffActive && q.eligibleAtMs == 7000 + 5000, "second failure in a row -> 5 s back-off");
+    }
+    {
+        // Report arrived during the slot, after the series: success at slot end.
+        SlotState sl; PeerState q; Stats t;
+        q.ageKnown = true; q.reportedAgeMs = 70000; q.reportRxMs = 0;
+        onSlotStart(sl, q, 1000, t); onOwnerProbe(sl, 2800);
+        onPrecisionReport(q, true, 0, 2900, P, t);
+        onSlotEnd(sl, &q, EndReason::SeriesOver, 4800, P, t);
+        CHECK(t.succeeded == 1 && !q.outcomePending, "report inside the slot is used at slot end");
+    }
+}
+
+// ---------------------------------------------------------------- part 2
+
+struct Rng {
+    uint64_t s;
+    explicit Rng(uint64_t seed) : s(seed * 6364136223846793005ULL + 1442695040888963407ULL) {}
+    uint32_t next() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return (uint32_t)(s >> 33); }
+    bool chance(double p) { return (next() % 1000000U) < (uint32_t)(p * 1000000.0); }
+    uint32_t below(uint32_t n) { return n ? next() % n : 0; }
+};
+
+struct Scenario {
+    const char *name;
+    int nodes;
+    double frameLoss;        // per frame (probe, reply, grant, revoke, report)
+    double seriesReject;     // completed series rejected by the quality gate
+    int permanentlyFailing;  // nodes 0..k-1 never pass the quality gate
+    int ignoringGrant;       // node index that reports but never probes (-1 none)
+    int disappearing;        // node index that goes silent at 30 min (-1 none)
+    int rebooting;           // node index that reboots at 40 min (-1 none)
+};
+
+static const uint32_t kSimMs = 2u * 3600u * 1000u;
+static const uint32_t kWarmupMs = 10u * 60u * 1000u;
+static const size_t kCapacity = 32;  // kSlotPeerCapacity
+
+struct Node {
+    uint32_t boot = 0;
+    bool alive = true;
+    uint32_t permUntil = 0;
+    uint32_t nextSeries = 0;
+    int count = 0;
+    uint32_t seriesStart = 0;
+    bool pending = false;
+    uint32_t pendingStart = 0, replyAt = 0;
+    bool replyComing = false;
+    uint32_t nextProbe = 0;
+    bool hasPrecision = false;
+    uint32_t precisionAt = 0;
+    uint32_t nextReport = 0;
+    // metrics
+    uint64_t validMs = 0, countedMs = 0;
+    uint32_t series = 0, accepted = 0, fallbacks = 0;
+    uint32_t maxAge = 0;
+    bool wasValid = false;
+};
+
+struct CoordPeer {
+    bool used = false;
+    int node = -1;
+    uint32_t boot = 0;
+    uint32_t seenMs = 0;
+    PeerState sched;
+};
+
+struct Sim {
+    Scenario sc;
+    Rng rng;
+    std::vector<Node> nodes;
+    CoordPeer peers[kCapacity];
+    int owner = -1;
+    uint32_t slotStartedMs = 0, guardUntil = 0, nextGrant = 0;
+    SlotState slot;
+    Stats stats;
+    uint32_t tableFull = 0;
+    uint64_t foreignProbeMs = 0;   // ms in which a non-owner probed (should be ~0)
+    uint32_t maxSlotsBetween = 0;
+
+    explicit Sim(const Scenario &s) : sc(s), rng(1234 + s.nodes) {
+        nodes.resize(s.nodes);
+        for (int i = 0; i < s.nodes; ++i) {
+            nodes[i].boot = 0x1000 + i;
+            nodes[i].nextReport = 1500 + rng.below(5000);
+        }
+    }
+
+    bool active(const CoordPeer &p, uint32_t now) const {
+        return p.used && (uint32_t)(now - p.seenMs) <= 30000;
+    }
+    bool validPrecision(const Node &n, uint32_t now) const {
+        return n.hasPrecision && (uint32_t)(now - n.precisionAt) <= P.lifetimeMs;
+    }
+
+    // ---- coordinator (mirrors cluster_espnow_radio.cpp)
+    CoordPeer *notePeer(int node, uint32_t boot, uint32_t now) {
+        for (size_t i = 0; i < kCapacity; ++i) {
+            CoordPeer &p = peers[i];
+            if (p.used && p.node == node) {
+                if (p.boot != boot && owner == (int)i) abortSlot(now + P.longGuardMs, now);
+                if (p.boot != boot) p.sched = PeerState{};
+                p.boot = boot; p.seenMs = now; return &p;
+            }
+        }
+        for (size_t i = 0; i < kCapacity; ++i) {
+            CoordPeer &p = peers[i];
+            if (!active(p, now) && (int)i != owner) {
+                p = CoordPeer{}; p.used = true; p.node = node; p.boot = boot; p.seenMs = now; return &p;
+            }
+        }
+        ++tableFull;
+        return nullptr;
+    }
+    void abortSlot(uint32_t guard, uint32_t now) {
+        if (owner >= 0) peers[owner].sched.lastSlotEndMs = now;
+        slot = SlotState{}; owner = -1; guardUntil = guard;
+    }
+    void onReport(int node, uint32_t boot, bool has, uint32_t ageMs, uint32_t now) {
+        CoordPeer *p = notePeer(node, boot, now);
+        if (p) onPrecisionReport(p->sched, has, ageMs, now, P, stats);
+    }
+    bool isOwner(int node, uint32_t boot, uint32_t now) const {
+        return owner >= 0 && peers[owner].node == node && peers[owner].boot == boot &&
+               (uint32_t)(now - slotStartedMs) < P.maxSlotMs;
+    }
+    void sendControl(int node, uint32_t lease, uint32_t now) {
+        if (rng.chance(sc.frameLoss)) return;
+        Node &n = nodes[node];
+        if (!n.alive || node == sc.ignoringGrant) return;
+        if (lease == 0) {
+            n.permUntil = 0; n.count = 0; n.seriesStart = 0; n.pending = false; n.replyComing = false;
+            n.nextSeries = now + 1000;
+        } else {
+            n.permUntil = now + lease;
+        }
+    }
+    void endSlot(EndReason r, uint32_t now) {
+        if (owner >= 0) {
+            sendControl(peers[owner].node, 0, now);
+            onSlotEnd(slot, &peers[owner].sched, r, now, P, stats);
+        }
+        slot = SlotState{}; owner = -1; guardUntil = now + guardMs(r, P);
+    }
+    void serviceSlots(uint32_t now) {
+        for (auto &p : peers) if (p.used) serviceOutcome(p.sched, now, P, stats);
+        if (owner >= 0) {
+            EndReason r = !active(peers[owner], now) ? EndReason::OwnerLost : checkEnd(slot, now, P);
+            if (r != EndReason::None) endSlot(r, now);
+        }
+        if (owner < 0) {
+            if ((int32_t)(now - guardUntil) < 0) return;
+            PeerState *ps[kCapacity];
+            for (size_t i = 0; i < kCapacity; ++i) ps[i] = active(peers[i], now) ? &peers[i].sched : nullptr;
+            int next = choose(ps, kCapacity, now, P, stats);
+            if (next >= 0) {
+                owner = next;
+                onSlotStart(slot, peers[owner].sched, now, stats);
+                slotStartedMs = now; nextGrant = now;
+            }
+        }
+        if (owner >= 0 && (int32_t)(now - nextGrant) >= 0) {
+            nextGrant = now + 1000;
+            sendControl(peers[owner].node, 3000, now);
+        }
+    }
+
+    // ---- node (mirrors the node branch of service())
+    void nodeTick(int i, uint32_t now) {
+        Node &n = nodes[i];
+        if (!n.alive) return;
+        if ((int32_t)(now - n.nextReport) >= 0) {
+            n.nextReport = now + 5000;
+            if (!rng.chance(sc.frameLoss)) {
+                const uint32_t age = n.hasPrecision ? (now - n.precisionAt) / 1000u * 1000u : 0;
+                onReport(i, n.boot, n.hasPrecision, age, now);
+            }
+        }
+        const bool perm = n.permUntil != 0 && (int32_t)(now - n.permUntil) < 0;
+        if (!perm) {
+            n.count = 0; n.seriesStart = 0; n.pending = false; n.replyComing = false;
+            n.nextSeries = now + 1000;
+            return;
+        }
+        if (n.pending && n.replyComing && (int32_t)(now - n.replyAt) >= 0) {
+            n.pending = false; n.replyComing = false;
+            if (++n.count >= 16) {
+                ++n.series;
+                const bool failing = i < sc.permanentlyFailing;
+                if (!failing && !rng.chance(sc.seriesReject)) {
+                    n.hasPrecision = true; n.precisionAt = now; ++n.accepted;
+                    n.nextSeries = now + 45000;
+                } else {
+                    n.nextSeries = now + 12000 + rng.below(12000);
+                }
+                n.count = 0; n.seriesStart = 0;
+            }
+        }
+        if (n.pending && (uint32_t)(now - n.pendingStart) >= 1200) { n.pending = false; n.replyComing = false; }
+        if (n.count == 0 && (int32_t)(now - n.nextSeries) < 0) return;
+        if (n.count > 0 && (uint32_t)(now - n.seriesStart) > 12000) {
+            n.count = 0; n.seriesStart = 0; n.pending = false; n.replyComing = false;
+            n.nextSeries = now + 12000 + rng.below(12000);
+            return;
+        }
+        if (n.count == 0 && !n.pending && n.seriesStart == 0) n.seriesStart = now;
+        if (n.pending || (int32_t)(now - n.nextProbe) < 0) return;
+        n.nextProbe = now + 45;
+        n.pending = true; n.pendingStart = now; n.replyComing = false;
+        if (!isOwner(i, n.boot, now)) ++foreignProbeMs;
+        if (rng.chance(sc.frameLoss)) return;                       // probe lost
+        if (!isOwner(i, n.boot, now)) return;                       // coordinator ignores
+        onOwnerProbe(slot, now);
+        if (rng.chance(sc.frameLoss)) return;                       // reply lost
+        n.replyComing = true; n.replyAt = now + 4;
+    }
+
+    void run() {
+        for (uint32_t now = 1; now <= kSimMs; ++now) {
+            if (sc.disappearing >= 0 && now == 30u * 60u * 1000u) nodes[sc.disappearing].alive = false;
+            if (sc.rebooting >= 0 && now == 40u * 60u * 1000u) {
+                Node &n = nodes[sc.rebooting];
+                const uint64_t vm = n.validMs, cm = n.countedMs;
+                const uint32_t se = n.series, ac = n.accepted, fb = n.fallbacks, ma = n.maxAge;
+                n = Node{}; n.boot = 0x9000 + sc.rebooting; n.nextReport = now + 1500;
+                n.validMs = vm; n.countedMs = cm; n.series = se; n.accepted = ac; n.fallbacks = fb; n.maxAge = ma;
+            }
+            serviceSlots(now);
+            for (int i = 0; i < sc.nodes; ++i) nodeTick(i, now);
+            if (now > kWarmupMs) {
+                for (int i = 0; i < sc.nodes; ++i) {
+                    Node &n = nodes[i];
+                    if (!n.alive) continue;
+                    const bool v = validPrecision(n, now);
+                    ++n.countedMs;
+                    if (v) n.validMs += 1;
+                    if (n.wasValid && !v) ++n.fallbacks;
+                    n.wasValid = v;
+                    if (n.hasPrecision && now - n.precisionAt > n.maxAge) n.maxAge = now - n.precisionAt;
+                }
+            } else {
+                for (auto &n : nodes) n.wasValid = validPrecision(n, now);
+            }
+        }
+    }
+};
+
+struct Result {
+    double minHealthyValid;   // lowest validity among healthy nodes
+    uint32_t healthyFallbacks;
+    uint32_t maxHealthyAge;
+    uint32_t minSeries, maxSeries;
+    double failingSlotsPerHour;
+    double meanSlotMs;
+    uint64_t foreignProbeMs;
+    uint32_t tableFull;
+    int valid95Nodes;         // healthy nodes with >= 95 % validity
+};
+
+static Result simulate(const Scenario &sc, bool print)
+{
+    Sim sim(sc);
+    sim.run();
+    Result r{};
+    r.minHealthyValid = 1.0;
+    r.minSeries = UINT32_MAX;
+    uint32_t failingSeries = 0;
+    for (int i = 0; i < sc.nodes; ++i) {
+        const Node &n = sim.nodes[i];
+        const bool healthy = i >= sc.permanentlyFailing && i != sc.ignoringGrant &&
+                             i != sc.disappearing && i != sc.rebooting;
+        if (i < sc.permanentlyFailing) failingSeries += n.series;
+        if (!healthy) continue;
+        const double v = n.countedMs ? (double)n.validMs / (double)n.countedMs : 0.0;
+        r.minHealthyValid = std::min(r.minHealthyValid, v);
+        r.healthyFallbacks += n.fallbacks;
+        r.maxHealthyAge = std::max(r.maxHealthyAge, n.maxAge);
+        r.minSeries = std::min(r.minSeries, n.series);
+        r.maxSeries = std::max(r.maxSeries, n.series);
+        if (v >= 0.95) ++r.valid95Nodes;
+    }
+    r.failingSlotsPerHour = sc.permanentlyFailing
+        ? (double)failingSeries / sc.permanentlyFailing / (kSimMs / 3600000.0) : 0.0;
+    r.meanSlotMs = sim.stats.finishedSlots ? (double)sim.stats.totalSlotMs / sim.stats.finishedSlots : 0.0;
+    r.foreignProbeMs = sim.foreignProbeMs;
+    r.tableFull = sim.tableFull;
+    if (print) {
+        printf("  %-34s valid(min)=%6.2f%% fallbacks=%u maxAge=%5.1fs series/node=%u..%u "
+               "slot=%4.0fms slots=%u seriesOver=%u noAct=%u cap=%u lost=%u fail=%u retry=%u/%u",
+               sc.name, r.minHealthyValid * 100.0, r.healthyFallbacks, r.maxHealthyAge / 1000.0,
+               r.minSeries, r.maxSeries, r.meanSlotMs, sim.stats.slots, sim.stats.seriesOver,
+               sim.stats.noActivity, sim.stats.hardCap, sim.stats.ownerLost, sim.stats.failed,
+               sim.stats.retrySucceeded, sim.stats.retrySlots);
+        if (sc.permanentlyFailing) printf(" failingSlots/h=%.1f", r.failingSlotsPerHour);
+        if (r.tableFull) printf(" tableFull=%u valid95=%d", r.tableFull, r.valid95Nodes);
+        printf(" foreignProbeMs=%llu\n", (unsigned long long)r.foreignProbeMs);
+    }
+    return r;
+}
+
+static void simulationTests()
+{
+    printf("== simulation: 2 h per scenario, 10 min warm-up, 1 %% frame loss, 3 %% rejected series\n");
+    for (int n : {4, 9, 16}) {
+        char name[48]; snprintf(name, sizeof(name), "%d nodes", n);
+        Scenario sc{name, n, 0.01, 0.03, 0, -1, -1, -1};
+        Result r = simulate(sc, true);
+        char msg[96];
+        snprintf(msg, sizeof(msg), "%d nodes: precision valid 100 %% of the time, no fallback", n);
+        CHECK(r.minHealthyValid >= 0.9999 && r.healthyFallbacks == 0, msg);
+        snprintf(msg, sizeof(msg), "%d nodes: oldest precision < 90 s (lifetime 120 s)", n);
+        CHECK(r.maxHealthyAge < 90000, msg);
+        snprintf(msg, sizeof(msg), "%d nodes: fair (series per node within 25 %%)", n);
+        CHECK(r.minSeries * 4 >= r.maxSeries * 3, msg);
+        snprintf(msg, sizeof(msg), "%d nodes: no probing outside the own slot", n);
+        CHECK(r.foreignProbeMs == 0, msg);
+    }
+    {
+        Scenario sc{"24 nodes", 24, 0.01, 0.03, 0, -1, -1, -1};
+        Result r = simulate(sc, true);
+        CHECK(r.minHealthyValid >= 0.9999 && r.healthyFallbacks == 0 && r.maxHealthyAge < 120000,
+              "24 nodes: precision valid 100 % of the time, no fallback");
+        CHECK(r.minSeries * 4 >= r.maxSeries * 3, "24 nodes: fair");
+    }
+    {
+        Scenario sc{"28 nodes", 28, 0.01, 0.03, 0, -1, -1, -1};
+        Result r = simulate(sc, true);
+        CHECK(r.minHealthyValid >= 0.995, "28 nodes: precision valid >= 99.5 % of the time");
+    }
+    {
+        Scenario sc{"32 nodes (table full)", 32, 0.01, 0.03, 0, -1, -1, -1};
+        Result r = simulate(sc, true);
+        CHECK(r.minHealthyValid >= 0.95, "32 nodes: every node valid >= 95 % (saturated, still fair)");
+        CHECK(r.minSeries * 4 >= r.maxSeries * 3, "32 nodes: fair under saturation");
+    }
+    {
+        Scenario sc{"48 nodes (beyond 32)", 48, 0.01, 0.03, 0, -1, -1, -1};
+        Result r = simulate(sc, true);
+        CHECK(r.tableFull > 0, "48 nodes: slot table full is detected (warning)");
+        CHECK(r.valid95Nodes >= 30 && r.valid95Nodes <= 32,
+              "48 nodes: the 32 nodes in the table keep >= 95 % validity, the rest none");
+    }
+    {
+        Scenario sc{"9 nodes, 5 % loss, 15 % rejected", 9, 0.05, 0.15, 0, -1, -1, -1};
+        Result r = simulate(sc, true);
+        CHECK(r.minHealthyValid >= 0.999, "9 nodes with heavy loss: precision valid >= 99.9 %");
+    }
+    {
+        Scenario sc{"16 nodes, 5 % loss, 15 % rejected", 16, 0.05, 0.15, 0, -1, -1, -1};
+        Result r = simulate(sc, true);
+        CHECK(r.minHealthyValid >= 0.95, "16 nodes with heavy loss: precision valid >= 95 %");
+    }
+    {
+        Scenario sc{"9 nodes, 1 always failing", 9, 0.01, 0.03, 1, -1, -1, -1};
+        Result r = simulate(sc, true);
+        CHECK(r.minHealthyValid >= 0.9999 && r.healthyFallbacks == 0,
+              "failing node does not affect the other 8");
+        CHECK(r.failingSlotsPerHour >= 50 && r.failingSlotsPerHour <= 130,
+              "failing node keeps being retried, limited by back-off (about 1/min)");
+    }
+    {
+        Scenario sc{"16 nodes, 2 always failing", 16, 0.01, 0.03, 2, -1, -1, -1};
+        Result r = simulate(sc, true);
+        CHECK(r.minHealthyValid >= 0.9999, "2 failing nodes do not affect the other 14");
+    }
+    {
+        Scenario sc{"9 nodes, 1 ignores grants", 9, 0.01, 0.03, 0, 4, -1, -1};
+        Result r = simulate(sc, true);
+        CHECK(r.minHealthyValid >= 0.9999, "a node that never probes does not affect the others");
+    }
+    {
+        Scenario sc{"16 nodes, 1 disappears, 1 reboots", 16, 0.01, 0.03, 0, -1, 5, 7};
+        Result r = simulate(sc, true);
+        CHECK(r.minHealthyValid >= 0.9999, "disappearing / rebooting nodes do not affect the others");
+    }
+    {
+        // Rebooted node regains precision quickly (no precision = most urgent).
+        Scenario sc{"9 nodes, reboot", 9, 0.01, 0.03, 0, -1, -1, 3};
+        Sim sim(sc);
+        sim.run();
+        const Node &n = sim.nodes[3];
+        CHECK(n.hasPrecision && n.validMs + 30000 >= n.countedMs * 98 / 100,
+              "rebooted node is valid again within seconds");
+    }
+}
+
+int main()
+{
+    unitTests();
+    simulationTests();
+    printf(g_failures ? "\n%d FAILED\n" : "\nALL PASSED\n", g_failures);
+    return g_failures ? 1 : 0;
+}

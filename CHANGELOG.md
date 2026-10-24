@@ -1,3 +1,43 @@
+## v87-beta143 — 2026-10-24 (COORDINATOR-LAST: WAHL GEDROSSELT)
+
+**Messung mit beta142 auf devxiao3 (Coordinator, Drone Mode):** loopTask 32–33 % eines Kerns bei ~325 Loop-Durchläufen/s. Echte Rechenzeit: `cluster_espnow` 10,5 % (Ø 0,32 ms), `cluster_election` 4,9 % (Ø 0,15 ms), UDP 3,5 %, `prelude` 2,8 %, `drone_misc` 2,3 %, Rest WebConfig. Der Abschnitt `webconfig` zeigt ~42 %, das ist überwiegend das `delay(1)` in `WebServer::handleClient()` ohne Client, keine Rechenzeit.
+
+**GEÄNDERT:** Ablaufprüfung von Peers/Ressourcen/Jobs, `recomputeCoordinator()` und Probe-Retries laufen in `clusterLoop()` höchstens alle 100 ms (`CLUSTER_ELECTION_SERVICE_MS`), sofort jedoch in jedem Durchlauf, in dem UDP-Pakete verarbeitet wurden. Leases (Sekunden), Probe-Retry (3 s) und die direkten Wahl-Aufrufe in Paket-Handlern und beim Start bleiben unverändert.
+
+**NEU in `/load_diag`:** Teilabschnitte `espnow_rx` (Empfangs-Queue: Prüfen/Authentifizieren, Probes beantworten, Berichte) und `espnow_slots` (Slot-Planung), Kennzeichnung `part_of`; sie zählen nicht doppelt in `measured_pct`.
+
+## v87-beta142 — 2026-10-24 (LAST-DIAGNOSE ÜBER DAS NETZWERK)
+
+**Anlass:** Der Coordinator devxiao3 zeigt im `[TASK-DIAG]`-Log ~30 % loopTask-Last, ein normaler Node ~3,5 %. Die Ursache war nur über den seriellen Port sichtbar (dessen Öffnen den XIAO zurücksetzt) und nicht nach Loop-Abschnitten aufgeschlüsselt.
+
+**NEU:** `GET /load_diag` (JSON, keine Geheimnisse, reine Diagnose, kein geändertes Verhalten):
+- `loop`: Zeitanteil je Loop-Abschnitt im letzten abgeschlossenen 10-s-Fenster (`pct` = % eines Kerns, `calls`, `mean_us`, `max_us`), dazu `iterations_per_s` und `measured_pct` (Summe aller Abschnitte). Abschnitte: `prelude`, `cluster_wifi_policy`, `cluster_espnow`, `cluster_hw_time`, `cluster_capture`, `cluster_udp_group`, `cluster_udp_direct`, `cluster_election`, `cluster_heartbeat`, `cluster_camera_report`, `cluster_time_request` (inkl. Coordinator-Heartbeat und Capture-Result-Retry), `thermal`, `webconfig`, `drone_misc`. Der Rest des Normal-/Streamer-Modus (Motion, Recorder, Shooter) ist nicht aufgeschlüsselt.
+- `tasks`: die 10 CPU-intensivsten FreeRTOS-Tasks der letzten 10 s (`pct`, `core`, `prio`), unabhängig von der seriellen `[TASK-DIAG]`-Ausgabe (deren Intervalle unverändert).
+- Neue Dateien `loop_load_diag.h/.cpp`; `task_load_diag.cpp` mit zweitem Messfenster für das Netzwerk; Messpunkte in `loop()`, `clusterLoop()`, `thermalMonitorLoop()`, `webConfigLoop()`.
+
+**Hinweis:** Der Abruf von `/load_diag` selbst erscheint im Abschnitt `webconfig`; seltener als alle 10 s abfragen. Ein Abruf von `/cluster_status` (~26 KB JSON) kostet messbar CPU und taucht ebenfalls dort auf.
+
+## v87-beta141 — 2026-10-24 (SLOT-PLANUNG DER ESP-NOW-PRÄZISIONSSERIEN SKALIERT)
+
+**Problem:** Feste Reihum-Vergabe der Mess-Slots, jeder aktive Node 14 s Slot + 3,5 s Pause → Zyklus N × 17,5 s. Im Langzeittest mit 9 Nodes 157,5 s bei 120 s Gültigkeit einer Präzisionsmessung: Nodes fielen trotz erfolgreicher Serien regelmäßig auf `wifi_coordinator` zurück. Eine Serie belegt real nur ~2 s des Slots. Zusätzlich: Slot-Tabelle und Wiedergabeschutz (`peerReplay`) nur 12 Nodes (13. Node: keine Slots bzw. alle Pakete verworfen), ESP-NOW-Antwortpartner nie freigegeben (ESP-IDF max. 20 → ab ~19 Nodes keine Antworten).
+
+**NEU:** `cluster_slot_scheduler.h` (reine Logik), angebunden in `serviceSlots()` (`cluster_espnow_radio.cpp`), nur auf dem Coordinator:
+- Slot endet, sobald die Serie vorbei ist (Inhaber 1,5 s ohne Probe; > Austausch-Timeout 1,2 s), ohne weitere Pause; Ø ~3,6 s statt 17,5 s. Ohne Aktivität (3 s), an der unveränderten 14-s-Obergrenze oder bei verschwundenem Inhaber bleibt die 3,5-s-Pause. Sicherheit gegen überlappende Freigaben per `static_assert` (fertiger Node probt frühestens nach 12 s, Lease 3 s).
+- Nächster Inhaber = dringendster *fälliger* Node (keine Präzision oder Alter ≥ 45 s; ohne Präzision zuerst, dann ältestes Alter, dann längste Wartezeit). Niemand fällig → kein Slot.
+- Ergebnis aus dem nächsten `NodeSyncReport` (8 s ohne Bericht = Fehlschlag); bis dahin wird der Node nicht erneut gewählt. Erster Fehlschlag sofort wiederholbar, ab dem zweiten in Folge Wartezeit 5/10/20/40/60 s.
+- Tabellen auf 32 Nodes (`kSlotPeerCapacity`, `peerReplay`); ESP-NOW-Antwortpartner bei voller Liste nach „am längsten unbenutzt“ ersetzt.
+- Capture-Pause, Benchmark und Beacon-Experiment brechen einen Slot ohne Bewertung ab.
+
+**ENTFÄLLT:** `cluster_slot_recovery.h` und `test_slot_recovery.cpp.test` – der Recovery-Slot ist in der neuen Planung aufgegangen (Wiederholung nach Fehlschlag mit Vorrang). Die JSON-Felder `slot_recovery_*` bleiben mit angepasster Bedeutung erhalten (siehe Doku).
+
+**NEU (Diagnose `/cluster_status` → `espnow_time_local`):** `slot_succeeded`, `slot_failed`, `slot_ended_series_over`, `slot_ended_no_activity`, `slot_ended_hard_cap`, `slot_ended_owner_lost`, `slot_last_ms`, `slot_mean_ms`, `slot_period_mean_ms`, `slot_due_peers`, `slot_expired_peers`, `slot_oldest_age_ms`; `slot_cycle_estimate_ms` jetzt gemessen (aktive Nodes × Ø Slot-Abstand). Warnung auf `/cluster`, wenn der Zyklus 100 s übersteigt (rot ab 120 s).
+
+**UNVERÄNDERT:** Node-Firmware, Paketformate, Probe/Reply/Final, 16 Austausche je Serie, Qualitätsgrenzen, Schätzer, 120-s-Gültigkeit, WLAN-Rückfall, Capture-Auslösung. Alte Nodes arbeiten mit neuem Coordinator.
+
+**TESTS:** `test_slot_scheduler.cpp.test` (neu, 52/52): Einzelprüfungen plus 2-h-Millisekunden-Simulation (Node-Verhalten wie Firmware, 1 % Paketverlust, 3 % verworfene Serien). Lückenlos (100 %, 0 Rückfälle): 4, 9, 16, 24 Nodes; 28 Nodes 99,8 %; 32 Nodes 98,4 % (gesättigt, fair); 48 Nodes: 32 in der Tabelle ≥ 95 %, Rest erkannt und gewarnt; 9 Nodes bei 5 % Verlust/15 % verworfen 100 %, 16 Nodes 96,9 %; dauerhaft scheiternde, nicht reagierende, verschwindende und neu startende Nodes beeinträchtigen die anderen nicht. Übrige ESP-NOW-Host-Tests mit byte-identischer Ausgabe zu beta140. Builds XIAO/diymore/Freenove ohne Fehler; Flash +~5 KB, statischer RAM +3,2 KB (Tabellen), Slot-Reserve > 600 KB.
+
+**GRENZEN:** Cluster-Mitgliederliste (`CLUSTER_MAX_PEERS = 16`) ist jetzt die engste Grenze; Diagnoseanzeige `espnow_node_reports` zeigt max. 12 Nodes. Hardwarevalidierung ausstehend (siehe `ESPNOW_TIME_ARCHITECTURE.md` 8.1).
+
 ## v87-beta140 — 2026-10-23 (WLAN-DIAGNOSE, EIN SPEICHERKNOPF FÜR CLUSTER-SEITE)
 
 **NEU (nur Diagnose):** `wifi_link_diag.cpp/.h` schreibt jeden STA-Verbindungsabbruch mit 802.11-Grundcode und RSSI sowie jede (Wieder-)Verbindung und IP-Vergabe mit Ausfalldauer ins serielle Log (`[WIFI-DIAG]`). Der WLAN-Ereignis-Handler legt nur einen kleinen Eintrag in eine Warteschlange; ausgegeben wird aus `loop()`. Kein Eingriff in Verbindungsaufbau, Reconnect oder Stromsparmodus.
