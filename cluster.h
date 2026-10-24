@@ -25,6 +25,47 @@ void clusterLoop();
 
 bool clusterRequestNodeWipe(const String &nodeId,String &error);
 bool clusterRequestNodeDrone(const String &nodeId, bool enabled, String &error);
+
+// --- Central WiFi TX power (cluster job SFJT1, WebConfig and API) ---
+// Mode: Session = until reboot; Persistent = node applies, keeps the value
+// only if it still reaches the coordinator after CLUSTER_TX_PROBATION_MS and
+// then writes wifi_tx_power_dbm to its config (otherwise reverts itself);
+// Config = drop a session value and return to the stored config value.
+enum ClusterTxPowerMode : uint8_t {
+    CLUSTER_TX_MODE_SESSION = 0,
+    CLUSTER_TX_MODE_PERSISTENT = 1,
+    CLUSTER_TX_MODE_CONFIG = 2
+};
+enum ClusterTxPowerState : uint8_t {
+    CLUSTER_TX_STATE_NONE = 0,
+    CLUSTER_TX_STATE_SENT = 1,       // coordinator: request sent, no answer yet
+    CLUSTER_TX_STATE_SESSION = 2,    // applied until reboot
+    CLUSTER_TX_STATE_PROBATION = 3,  // applied, waiting for link proof before saving
+    CLUSTER_TX_STATE_PERSISTED = 4,  // applied and saved in config
+    CLUSTER_TX_STATE_REVERTED = 5,   // link lost during probation, old value back
+    CLUSTER_TX_STATE_CONFIG = 6,     // session value dropped, config value active
+    CLUSTER_TX_STATE_FAILED = 7
+};
+enum ClusterTxPowerResult : uint8_t {
+    CLUSTER_TX_RESULT_OK = 0,
+    CLUSTER_TX_RESULT_APPLY_FAILED = 1,
+    CLUSTER_TX_RESULT_SAVE_FAILED = 2,
+    CLUSTER_TX_RESULT_INVALID = 3,
+    CLUSTER_TX_RESULT_NO_ANSWER = 4
+};
+bool clusterTxPowerModeFromText(const String &text, ClusterTxPowerMode &mode);
+const char *clusterTxPowerStateName(uint8_t state);
+// One node (coordinator only).
+bool clusterRequestNodeTxPower(const String &nodeId, int16_t valueX10,
+                               ClusterTxPowerMode mode, String &error);
+// This device (coordinator or node), same rules incl. probation.
+bool clusterApplyLocalTxPower(int16_t valueX10, ClusterTxPowerMode mode, String &error);
+// All online nodes (coordinator only), optionally this device too. Returns
+// the number of requests sent; failed counts nodes that could not be sent.
+size_t clusterRequestTxPowerAll(int16_t valueX10, ClusterTxPowerMode mode,
+                                bool includeLocal, size_t &failed, String &error);
+// Board limits, local state and the last result per node.
+String clusterTxPowerJson();
 // Capture time in UTC microseconds; shared across all selected nodes.
 // testPulse: request the optional GPIO test pulse (SFJC1 field "tp1"), default off.
 bool clusterRequestNodeCapture(const String &nodeId, int64_t utcUs, String &error, bool testPulse = false);

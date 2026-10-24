@@ -479,6 +479,15 @@ ConfigSaveResult configSaveClusterSettings(
 
 // Persist only the optional mount metadata keys (strict validation). Applied
 // immediately at runtime; no reboot and no cluster restart required.
+// Persists only wifi_tx_power_dbm (cluster TX-power job, API). The value must
+// be a board-supported level >= the SensorForge safety floor. Unchanged values
+// write nothing. Does not touch the radio; the caller applies it.
+ConfigSaveResult configSaveWifiTxPower(
+    float txPowerDbm,
+    bool writeToSd,
+    String &error
+);
+
 ConfigSaveResult configSaveClusterMount(
     const String &groupId,
     const String &mountPosition,

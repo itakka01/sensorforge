@@ -21,13 +21,13 @@
 // WebConfig, so a running device can be mapped back to the exact Git tag.
 
 #define SENSORFORGE_RELEASE_NUMBER 87
-#define SENSORFORGE_RELEASE_TAG "v87-beta144"
+#define SENSORFORGE_RELEASE_TAG "v87-beta146"
 #define SENSORFORGE_RELEASE_DATE "2026-10-24"
 #define SENSORFORGE_RELEASE_SUMMARY \
-    "Beta 144: cluster laid out for 100 devices - member/job/slot tables in PSRAM, refused devices warned in red, status JSON streamed."
+    "Beta 146: central WiFi TX power (beta 145) - coordinator keeps node TX-power results across heartbeats."
 
-// Current source-tree stage. Beta 144: 100-device cluster tables.
-#define SENSORFORGE_WORKTREE_STAGE "v87-beta144"
+// Current source-tree stage. Beta 146: TX-power result display fix.
+#define SENSORFORGE_WORKTREE_STAGE "v87-beta146"
 #define SENSORFORGE_WORKTREE_DATE "2026-10-24"
 #define SENSORFORGE_WORKTREE_SUMMARY \
-    "v87 Beta 144: CLUSTER_MAX_PEERS 100, kMaxJobs 256, ESP-NOW node tables 128 (SfPsramArray); full table refuses instead of evicting."
+    "v87 Beta 145: cluster job SFJT1/SFJTA1, wifi_tx_control.cpp session override, configSaveWifiTxPower, /cluster_tx_power + /api/v1/cluster/wifi_tx_power."

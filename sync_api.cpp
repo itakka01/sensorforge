@@ -22,6 +22,8 @@
 #include "web_sd_maintenance.h"
 #include "sensorforge_version.h"
 #include "wireguard_manager.h"
+#include "cluster.h"
+#include "webconfig_cluster.h"
 
 #include <Arduino.h>
 #include <FS.h>
@@ -3848,6 +3850,31 @@ static void handleSystemReboot()
     server().send(202, "application/json; charset=utf-8", "{\"ok\":true,\"reboot_scheduled\":true,\"delay_ms\":1500}");
 }
 
+// Central WiFi TX power (same rules as /cluster_tx_power on the WebConfig):
+// GET state of this device and, on the coordinator, of every node;
+// POST dbm, mode=session|persistent|config, scope=all|node|local, node_id,
+// include_local=0|1.
+static void handleClusterWifiTxPowerGet()
+{
+    if (!authenticate())
+        return;
+    sendApiVersionHeader();
+    server().sendHeader("Cache-Control", "no-store");
+    server().send(200, "application/json; charset=utf-8", clusterTxPowerJson());
+}
+
+static void handleClusterWifiTxPowerPost()
+{
+    if (!authenticate())
+        return;
+    touchExclusiveLease();
+    String json;
+    const int code = clusterTxPowerRequestFromArgs(server(), json);
+    sendApiVersionHeader();
+    server().sendHeader("Cache-Control", "no-store");
+    server().send(code, "application/json; charset=utf-8", json);
+}
+
 static void handleSystemShutdown()
 {
     if (!authenticate())
@@ -4049,6 +4076,8 @@ void syncApiRegisterRoutes(WebServer &webServer)
     webServer.on("/api/v1/system", HTTP_GET, handleSystemExtended);
     webServer.on("/api/v1/system/reboot", HTTP_POST, handleSystemReboot);
     webServer.on("/api/v1/system/shutdown", HTTP_POST, handleSystemShutdown);
+    webServer.on("/api/v1/cluster/wifi_tx_power", HTTP_GET, handleClusterWifiTxPowerGet);
+    webServer.on("/api/v1/cluster/wifi_tx_power", HTTP_POST, handleClusterWifiTxPowerPost);
 
     webServer.on("/api/v1/status", HTTP_GET, handleStatus);
     webServer.on("/api/v1/storage", HTTP_GET, handleStorageStatus);

@@ -534,6 +534,48 @@ Schedules the same software-off/deep-sleep shutdown path used by WebConfig and
 blocks new recording starts during the short HTTP grace period. Active recording
 causes HTTP 409 rather than forced termination.
 
+## Cluster WiFi TX power (since v87-beta145)
+
+Same function as the "Sendeleistung (WLAN)" section of `/cluster_coordinate`.
+Every board uses the next TX-power level it supports, never below 8.5 dBm,
+and reports the value read back from the driver.
+
+### GET /api/v1/cluster/wifi_tx_power
+
+Board levels of this device (`board_levels_x10`, tenths of dBm), safety floor
+(`safe_min_x10`), probation length (`probation_ms`), this device (`local`:
+`config_x10`, `session_override_x10` (0 = none), `driver_x10`, `state`,
+`probation_remaining_ms`) and, on the coordinator, the last result of every
+online node (`nodes[]`: `requested_x10`, `actual_x10` (-1 unknown), `state`,
+`result`, `age_ms`).
+
+`state`: `none`, `sent`, `session` (until reboot), `probation` (applied,
+waiting for proof of contact), `persisted` (saved in config.txt), `reverted`
+(no contact during probation, previous value restored), `config` (session
+value dropped), `failed`. `result`: 0 ok, 1 apply failed, 2 save failed,
+3 invalid value, 4 no answer.
+
+### POST /api/v1/cluster/wifi_tx_power
+
+Form or query parameters:
+
+| Parameter | Values |
+|---|---|
+| `dbm` | 8.5 … 20.0 (not needed for `mode=config`) |
+| `mode` | `session` (until reboot), `persistent` (30 s probation, then saved), `config` (back to the stored value) |
+| `scope` | `all` (coordinator only: every online node), `node` (with `node_id`), `local` (this device) |
+| `include_local` | `1` (default) / `0`, only with `scope=all`: also this coordinator |
+
+Answer `202 {"ok":true,"sent":N,"failed":M,"error":"..."}`; results arrive
+asynchronously, read them with GET. `400` invalid parameter, `403`
+`scope=all` on a non-coordinator, `409` nothing could be sent.
+
+Persistent requests are written to config.txt only when the device still has
+contact after the probation (node: a signed coordinator ACK newer than the
+change; coordinator: any node heard; stand-alone: WiFi still associated).
+Otherwise the device restores its previous value itself, so a too low value
+cannot lock it out.
+
 ## API-exclusive transfer mode
 
 ### GET /api/v1/exclusive

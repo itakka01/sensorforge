@@ -1,3 +1,7 @@
+## Zentrale WLAN-Sendeleistung (2026-10-24) – v87-beta145
+- Coordinator-Seite „Sendeleistung (WLAN)“ und API `/api/v1/cluster/wifi_tx_power`: alle Nodes auf einen dBm-Wert, nur Sitzung oder dauerhaft (30 s Probezeit mit Kontaktnachweis, sonst Selbst-Rücksetzung). Ziel: prüfen, ob niedrigere Sendeleistung das unruhige WLAN (c002/c004) beruhigt; danach Schritt 2 (Broadcast-Zeitverfahren).
+- Alle Boards brauchen beta145. Freenove-Image ist mit 3,35 MB über der Grenze des IDE-Schemas `default_8MB` (3,34 MB) – nur mit Schema `sensorforge` bauen (`tools/flash_board.sh` tut das).
+
 ## Cluster für 100 Geräte (2026-10-24) – v87-beta144
 - Alle Cluster-Tabellen für 100 Geräte im PSRAM; volle Mitgliederliste weist ab (rote Warnung mit Geräteliste auf `/cluster` und `/cluster_coordinate`); `/cluster_status` gestreamt. Details: `CHANGELOG.md`, Grenzen: `ESPNOW_TIME_ARCHITECTURE.md` 8.1.
 - Präzisionszeit weiter nur bis ~24 Nodes lückenlos. **Nächster Schritt (Schritt 2):** Broadcast-Zeitverfahren (Coordinator sendet ~1/s Zeitsignal + Folgepaket mit echtem Sendezeitpunkt, Zwei-Wege-Messung nur zum Einmessen der Laufzeit), erst Konzept, dann Messung mit den vorhandenen Beacon-Experimenten.

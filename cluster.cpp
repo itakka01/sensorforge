@@ -40,6 +40,7 @@
 #include "wifi_power_policy.h"
 #include "psram_alloc.h"
 #include "loop_load_diag.h"
+#include "wifi_tx_control.h"
 #include <new>
 #include <stdlib.h>
 #include <string.h>
@@ -131,6 +132,8 @@ static ClusterHwTimeProtocol::ReplayGuard hwTimeSeen;
 static const char *CLUSTER_JOB_CAPTURE_MAGIC="SFJC1";
 static const char *CLUSTER_JOB_CAPTURE_RESULT_MAGIC="SFJCR1";
 static const char *CLUSTER_JOB_CAPTURE_RECEIPT_MAGIC="SFJCA1";
+static const char *CLUSTER_JOB_TXPOWER_MAGIC = "SFJT1";
+static const char *CLUSTER_JOB_TXPOWER_ACK_MAGIC = "SFJTA1";
 static const char *CLUSTER_JOB_DRONE_MAGIC = "SFJD1";
 static const char *CLUSTER_JOB_DRONE_ACK_MAGIC = "SFJDA1";
 static uint32_t droneSeenBoot=0,droneSeenEpoch=0,droneSeenSeq=0;
@@ -309,6 +312,13 @@ struct ClusterPeer {
     int64_t timeReportOffsetUs;
     int64_t timeReportRttUs;
     int64_t timeReportUncertaintyUs;
+    // Last TX-power result reported by this node (coordinator side).
+    int16_t txRequestedX10;
+    int16_t txActualX10;
+    uint8_t txState;   // ClusterTxPowerState
+    uint8_t txResult;  // 0 ok, else ClusterTxPowerResult
+    uint8_t txMode;
+    uint32_t txUpdatedMs;
 };
 
 struct ClusterResource {
@@ -2003,6 +2013,13 @@ static void processPresence(
     const int64_t preservedTimeReportOffsetUs = preservedTimeReportValid ? peer->timeReportOffsetUs : 0;
     const int64_t preservedTimeReportRttUs = preservedTimeReportValid ? peer->timeReportRttUs : 0;
     const int64_t preservedTimeReportUncertaintyUs = preservedTimeReportValid ? peer->timeReportUncertaintyUs : 0;
+    // Last TX-power job result of this boot (cluster TX-power page/API).
+    const int16_t preservedTxRequestedX10 = sameBoot ? peer->txRequestedX10 : 0;
+    const int16_t preservedTxActualX10 = sameBoot ? peer->txActualX10 : 0;
+    const uint8_t preservedTxState = sameBoot ? peer->txState : 0;
+    const uint8_t preservedTxResult = sameBoot ? peer->txResult : 0;
+    const uint8_t preservedTxMode = sameBoot ? peer->txMode : 0;
+    const uint32_t preservedTxUpdatedMs = sameBoot ? peer->txUpdatedMs : 0;
 
     *peer = ClusterPeer{};
     peer->used = true;
@@ -2051,6 +2068,12 @@ static void processPresence(
     peer->timeReportOffsetUs = preservedTimeReportOffsetUs;
     peer->timeReportRttUs = preservedTimeReportRttUs;
     peer->timeReportUncertaintyUs = preservedTimeReportUncertaintyUs;
+    peer->txRequestedX10 = preservedTxRequestedX10;
+    peer->txActualX10 = preservedTxActualX10;
+    peer->txState = preservedTxState;
+    peer->txResult = preservedTxResult;
+    peer->txMode = preservedTxMode;
+    peer->txUpdatedMs = preservedTxUpdatedMs;
     peer->lastSeenMs = now;
 
     if (!runtimeProfileRemembered) {
@@ -3588,6 +3611,274 @@ static void processJobDroneAck(char **f,size_t n,const IPAddress &ip){
     }else ClusterJobs::transition(id,epoch,ClusterJobs::State::Failed,millis(),(uint16_t)result);
 }
 
+// ---------------------------------------------------------------------------
+// Central WiFi TX power (SFJT1). Applied on the node like Drone Mode:
+// authenticated unicast from the live coordinator, replay-protected, one
+// answer per state change. Persistent requests only reach config.txt after a
+// probation period with proven coordinator contact, so a too low value cannot
+// lock a node out permanently.
+// Payload SFJT1|tag|coordinator|coord_boot|epoch|node|node_boot|seq|value_x10|mode
+// Reply   SFJTA1|tag|coordinator|coord_boot|epoch|node|node_boot|seq|actual_x10|state|result
+// ---------------------------------------------------------------------------
+static const uint32_t CLUSTER_TX_PROBATION_MS = 30000UL;
+static const uint32_t CLUSTER_TX_SESSION_TIMEOUT_MS = 20000UL;
+static const uint32_t CLUSTER_TX_PERSISTENT_TIMEOUT_MS = 60000UL;
+
+struct LocalTxState {
+    int16_t requestedX10;
+    int16_t actualX10;
+    uint8_t state;
+    uint8_t result;
+    uint8_t mode;
+    uint32_t updatedMs;
+};
+static LocalTxState localTx = {};
+
+struct TxProbation {
+    bool active;
+    bool remote;  // requested by the coordinator: send the final answer there
+    int16_t targetX10;
+    int16_t prevOverrideX10;
+    uint32_t startMs;
+    char coordBoot[9];
+    char epoch[12];
+    char seq[12];
+};
+static TxProbation txProbation = {};
+static uint32_t txSeenBoot = 0, txSeenEpoch = 0, txSeenSeq = 0;
+
+static int16_t configTxX10()
+{
+    return (int16_t)lroundf(cfg_wifi_tx_power_dbm * 10.0f);
+}
+
+static void noteLocalTx(int16_t requestedX10, int16_t actualX10, uint8_t state, uint8_t result, uint8_t mode)
+{
+    localTx.requestedX10 = requestedX10;
+    localTx.actualX10 = actualX10;
+    localTx.state = state;
+    localTx.result = result;
+    localTx.mode = mode;
+    localTx.updatedMs = millis();
+}
+
+// Applies a request on this device; returns the resulting state.
+static uint8_t localTxApply(int16_t requestedX10, ClusterTxPowerMode mode, bool remote,
+                            int16_t &actualX10, uint8_t &result)
+{
+    result = CLUSTER_TX_RESULT_OK;
+    actualX10 = -1;
+    // The value to fall back to is the last confirmed one, also when a new
+    // request interrupts a running probation.
+    const int16_t prevOverride = txProbation.active ? txProbation.prevOverrideX10
+                                                    : WifiTxControl::sessionOverrideX10();
+    txProbation.active = false;
+
+    if (mode == CLUSTER_TX_MODE_CONFIG) {
+        WifiTxControl::setSessionOverrideX10(0);
+        const int16_t target = WifiTxControl::normalizeX10(WifiTxControl::effectiveX10());
+        if (!WifiTxControl::applyX10(target, "cluster config", actualX10)) {
+            result = CLUSTER_TX_RESULT_APPLY_FAILED;
+            noteLocalTx(target, WifiTxControl::driverX10(), CLUSTER_TX_STATE_FAILED, result, mode);
+            return CLUSTER_TX_STATE_FAILED;
+        }
+        noteLocalTx(target, actualX10, CLUSTER_TX_STATE_CONFIG, result, mode);
+        return CLUSTER_TX_STATE_CONFIG;
+    }
+
+    const int16_t target = WifiTxControl::normalizeX10(requestedX10);
+    WifiTxControl::setSessionOverrideX10(target);
+    if (!WifiTxControl::applyX10(target, "cluster", actualX10)) {
+        WifiTxControl::setSessionOverrideX10(prevOverride);
+        int16_t restored = -1;
+        WifiTxControl::applyX10(WifiTxControl::normalizeX10(WifiTxControl::effectiveX10()),
+                                "cluster restore", restored);
+        result = CLUSTER_TX_RESULT_APPLY_FAILED;
+        noteLocalTx(target, restored, CLUSTER_TX_STATE_FAILED, result, mode);
+        return CLUSTER_TX_STATE_FAILED;
+    }
+
+    if (mode == CLUSTER_TX_MODE_SESSION) {
+        noteLocalTx(target, actualX10, CLUSTER_TX_STATE_SESSION, result, mode);
+        return CLUSTER_TX_STATE_SESSION;
+    }
+
+    // Persistent: the stored value already matches, nothing to prove or save.
+    if (target == configTxX10()) {
+        WifiTxControl::setSessionOverrideX10(0);
+        noteLocalTx(target, actualX10, CLUSTER_TX_STATE_PERSISTED, result, mode);
+        return CLUSTER_TX_STATE_PERSISTED;
+    }
+    txProbation = TxProbation{};
+    txProbation.active = true;
+    txProbation.remote = remote;
+    txProbation.targetX10 = target;
+    txProbation.prevOverrideX10 = prevOverride;
+    txProbation.startMs = millis();
+    noteLocalTx(target, actualX10, CLUSTER_TX_STATE_PROBATION, result, mode);
+    consoleWrite("WIFI", String("TX power probation ") + String(CLUSTER_TX_PROBATION_MS / 1000UL) +
+                 " s | value=" + String(target / 10.0f, 1) + " dBm");
+    return CLUSTER_TX_STATE_PROBATION;
+}
+
+static void sendTxPowerAnswer(const char *coordBoot, const char *epoch, const char *seq,
+                              int16_t actualX10, uint8_t state, uint8_t result)
+{
+    if (!usableIp(currentCoordinatorIp))
+        return;
+    char own[9];
+    snprintf(own, sizeof(own), "%08lx", (unsigned long)bootNonce);
+    const String msg = String(CLUSTER_JOB_TXPOWER_ACK_MAGIC) + "|" + runtimeClusterTag + "|" +
+        currentCoordinatorId + "|" + coordBoot + "|" + epoch + "|" + deviceIntegrationId() + "|" +
+        own + "|" + seq + "|" + String((int)actualX10) + "|" + String((unsigned)state) + "|" +
+        String((unsigned)result);
+    sendSignedPayloadTo(msg, currentCoordinatorIp, CLUSTER_COORDINATOR_PORT, "tx power result");
+}
+
+// Ends a probation: keep and save the value with proven contact, else revert.
+static void serviceTxProbation()
+{
+    if (!txProbation.active)
+        return;
+    const uint32_t now = millis();
+    if ((uint32_t)(now - txProbation.startMs) < CLUSTER_TX_PROBATION_MS)
+        return;
+    txProbation.active = false;
+
+    // Contact must be newer than the change (2 s margin for in-flight packets).
+    const uint32_t proofAfter = txProbation.startMs + 2000UL;
+    // Without cluster runtime (API on a stand-alone device) the proof is a
+    // WiFi association that survived the probation.
+    bool linkOk = WiFi.status() == WL_CONNECTED;
+    if (linkOk && !runtimeActive) {
+        // association is the proof
+    } else if (linkOk && localIsCoordinator) {
+        // Any node heard after the change proves the radio still works; a
+        // coordinator without nodes falls back to the WiFi association.
+        bool anyPeer = false, heard = false;
+        for (size_t i = 0; i < peerSlots && !heard; ++i) {
+            anyPeer |= peers[i].used;
+            heard = peers[i].used && (int32_t)(peers[i].lastSeenMs - proofAfter) > 0;
+        }
+        linkOk = heard || !anyPeer;
+    } else if (linkOk) {
+        linkOk = lastCoordinatorAckMs != 0 && (int32_t)(lastCoordinatorAckMs - proofAfter) > 0;
+    }
+
+    int16_t actual = WifiTxControl::driverX10();
+    uint8_t state = CLUSTER_TX_STATE_PERSISTED;
+    uint8_t result = CLUSTER_TX_RESULT_OK;
+    if (linkOk) {
+        String error;
+        const ConfigSaveResult saved = configSaveWifiTxPower(
+            txProbation.targetX10 / 10.0f, configSdAvailable() && configSdPresent(), error);
+        if (saved == CONFIG_SAVE_BOTH || saved == CONFIG_SAVE_INTERNAL_ONLY) {
+            WifiTxControl::setSessionOverrideX10(0);  // config now holds the value
+        } else {
+            state = CLUSTER_TX_STATE_SESSION;  // stays active until reboot
+            result = CLUSTER_TX_RESULT_SAVE_FAILED;
+            consoleWrite("WIFI", "TX power save failed | " + error);
+        }
+    } else {
+        WifiTxControl::setSessionOverrideX10(txProbation.prevOverrideX10);
+        WifiTxControl::applyX10(WifiTxControl::normalizeX10(WifiTxControl::effectiveX10()),
+                                "cluster revert", actual);
+        state = CLUSTER_TX_STATE_REVERTED;
+        consoleWrite("WIFI", "TX power reverted: no coordinator contact during probation");
+    }
+    noteLocalTx(txProbation.targetX10, actual, state, result, CLUSTER_TX_MODE_PERSISTENT);
+    // A reverted node may still get this through on the old power.
+    if (txProbation.remote && runtimeActive && !localIsCoordinator)
+        sendTxPowerAnswer(txProbation.coordBoot, txProbation.epoch, txProbation.seq, actual, state, result);
+}
+
+static void processJobTxPower(char **f, size_t n, const IPAddress &ip)
+{
+    if (n != 10 || !runtimeActive || localIsCoordinator ||
+        strcmp(f[1], runtimeClusterTag) != 0 || strcmp(f[2], currentCoordinatorId) != 0 ||
+        strcmp(f[5], deviceIntegrationId().c_str()) != 0 || ip != currentCoordinatorIp)
+        return;
+    uint32_t cb = 0, epoch = 0, nb = 0, seq = 0, value = 0, mode = 0;
+    if (!parseUint32Strict(f[3], cb, 16) || !parseUint32Strict(f[4], epoch) ||
+        !parseUint32Strict(f[6], nb, 16) || !parseUint32Strict(f[7], seq) ||
+        !parseUint32Strict(f[8], value) || !parseUint32Strict(f[9], mode) ||
+        mode > CLUSTER_TX_MODE_CONFIG || !cb || !epoch || !seq ||
+        nb != bootNonce || epoch != currentCoordinatorEpoch)
+        return;
+    const ClusterPeer *coord = findPeer(f[2]);
+    if (!coord || coord->bootNonce != cb || coord->ip != ip ||
+        (uint32_t)(millis() - coord->lastSeenMs) > 60000UL)
+        return;
+    if (txSeenBoot == cb && txSeenEpoch == epoch && seq <= txSeenSeq)
+        return;
+    txSeenBoot = cb; txSeenEpoch = epoch; txSeenSeq = seq;
+
+    int16_t actual = -1;
+    uint8_t result = CLUSTER_TX_RESULT_OK;
+    uint8_t state;
+    if (mode != CLUSTER_TX_MODE_CONFIG &&
+        (value < (uint32_t)SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10 || value > 200U)) {
+        state = CLUSTER_TX_STATE_FAILED;
+        result = CLUSTER_TX_RESULT_INVALID;
+        actual = WifiTxControl::driverX10();
+    } else {
+        state = localTxApply((int16_t)value, (ClusterTxPowerMode)mode, true, actual, result);
+        if (txProbation.active) {
+            strncpy(txProbation.coordBoot, f[3], sizeof(txProbation.coordBoot) - 1);
+            strncpy(txProbation.epoch, f[4], sizeof(txProbation.epoch) - 1);
+            strncpy(txProbation.seq, f[7], sizeof(txProbation.seq) - 1);
+        }
+    }
+    sendTxPowerAnswer(f[3], f[4], f[7], actual, state, result);
+    Serial.printf("[CLUSTER TX] seq=%lu value=%lu mode=%lu state=%s result=%u actual=%d\n",
+                  (unsigned long)seq, (unsigned long)value, (unsigned long)mode,
+                  clusterTxPowerStateName(state), (unsigned)result, (int)actual);
+}
+
+static void processJobTxPowerAck(char **f, size_t n, const IPAddress &ip)
+{
+    if (n != 11 || !runtimeActive || !localIsCoordinator ||
+        strcmp(f[1], runtimeClusterTag) != 0 || strcmp(f[2], deviceIntegrationId().c_str()) != 0 ||
+        !integrationIdValid(f[5]))
+        return;
+    uint32_t cb = 0, epoch = 0, nb = 0, seq = 0, state = 0, result = 0;
+    int64_t actual = 0;
+    if (!parseUint32Strict(f[3], cb, 16) || !parseUint32Strict(f[4], epoch) ||
+        !parseUint32Strict(f[6], nb, 16) || !parseUint32Strict(f[7], seq) ||
+        !parseInt64Strict(f[8], actual) || !parseUint32Strict(f[9], state) ||
+        !parseUint32Strict(f[10], result) || actual < -1 || actual > 400 ||
+        state > CLUSTER_TX_STATE_FAILED || result > CLUSTER_TX_RESULT_NO_ANSWER ||
+        cb != bootNonce || epoch != currentCoordinatorEpoch || !nb || !seq)
+        return;
+    ClusterPeer *node = findPeer(f[5]);
+    if (!node || node->bootNonce != nb || node->ip != ip ||
+        (uint32_t)(millis() - node->lastSeenMs) > 60000UL)
+        return;
+    const uint64_t id = ((uint64_t)cb << 32) | seq;
+    const ClusterJobs::Entry *e = ClusterJobs::find(id);
+    if (!e || e->kind != ClusterJobs::Kind::TxPower || strcmp(e->nodeId, f[5]) != 0 ||
+        (e->state != ClusterJobs::State::Sent && e->state != ClusterJobs::State::Running))
+        return;
+    node->txActualX10 = (int16_t)actual;
+    node->txState = (uint8_t)state;
+    node->txResult = (uint8_t)result;
+    node->txUpdatedMs = millis();
+    const uint32_t now = millis();
+    if (state == CLUSTER_TX_STATE_PROBATION && result == CLUSTER_TX_RESULT_OK) {
+        ClusterJobs::transition(id, epoch, ClusterJobs::State::Accepted, now);
+        ClusterJobs::transition(id, epoch, ClusterJobs::State::Running, now);
+    } else if (result == CLUSTER_TX_RESULT_OK &&
+               (state == CLUSTER_TX_STATE_SESSION || state == CLUSTER_TX_STATE_PERSISTED ||
+                state == CLUSTER_TX_STATE_CONFIG)) {
+        ClusterJobs::transition(id, epoch, ClusterJobs::State::Accepted, now);
+        ClusterJobs::transition(id, epoch, ClusterJobs::State::Running, now);
+        ClusterJobs::transition(id, epoch, ClusterJobs::State::Succeeded, now, (uint16_t)actual);
+    } else {
+        ClusterJobs::transition(id, epoch, ClusterJobs::State::Failed, now,
+                                (uint16_t)(result ? result : CLUSTER_TX_RESULT_APPLY_FAILED));
+    }
+}
+
 static void processPacket(
     char *packet,
     size_t packetLength,
@@ -3657,6 +3948,10 @@ static void processPacket(
         processJobCaptureResult(fields,fieldCount,remoteIp);
     } else if (strcmp(fields[0], CLUSTER_JOB_CAPTURE_RECEIPT_MAGIC) == 0) {
         processCaptureReceipt(fields,fieldCount,remoteIp);
+    } else if (strcmp(fields[0], CLUSTER_JOB_TXPOWER_MAGIC) == 0) {
+        processJobTxPower(fields, fieldCount, remoteIp);
+    } else if (strcmp(fields[0], CLUSTER_JOB_TXPOWER_ACK_MAGIC) == 0) {
+        processJobTxPowerAck(fields, fieldCount, remoteIp);
     } else if (strcmp(fields[0], CLUSTER_JOB_DRONE_MAGIC) == 0) {
         processJobDrone(fields,fieldCount,remoteIp);
     } else if (strcmp(fields[0], CLUSTER_JOB_DRONE_ACK_MAGIC) == 0) {
@@ -3969,6 +4264,29 @@ static bool configTag(char tag[17])
 }
 
 } // namespace
+
+bool clusterTxPowerModeFromText(const String &text, ClusterTxPowerMode &mode)
+{
+    if (text == "session" || text == "0") { mode = CLUSTER_TX_MODE_SESSION; return true; }
+    if (text == "persistent" || text == "1") { mode = CLUSTER_TX_MODE_PERSISTENT; return true; }
+    if (text == "config" || text == "2") { mode = CLUSTER_TX_MODE_CONFIG; return true; }
+    return false;
+}
+
+const char *clusterTxPowerStateName(uint8_t state)
+{
+    switch (state) {
+        case CLUSTER_TX_STATE_SENT: return "sent";
+        case CLUSTER_TX_STATE_SESSION: return "session";
+        case CLUSTER_TX_STATE_PROBATION: return "probation";
+        case CLUSTER_TX_STATE_PERSISTED: return "persisted";
+        case CLUSTER_TX_STATE_REVERTED: return "reverted";
+        case CLUSTER_TX_STATE_CONFIG: return "config";
+        case CLUSTER_TX_STATE_FAILED: return "failed";
+        default: return "none";
+    }
+}
+
 
 bool clusterIdValid(const String &clusterId)
 {
@@ -4435,6 +4753,9 @@ void clusterMdnsAdvertise()
 void clusterLoop()
 {
     ensureClusterTables();
+    // TX-power probation also runs without cluster runtime (API on a
+    // stand-alone device).
+    serviceTxProbation();
     // Beta138: every device with an ACTIVE cluster runtime (coordinator, time
     // broadcaster - also without lease - and normal nodes) runs without WiFi modem
     // sleep (WIFI_PS_NONE); outside active cluster operation the Arduino default is
@@ -5067,6 +5388,152 @@ bool clusterRequestNodeDrone(const String &nodeId,bool enabled,String &error){
         ClusterJobs::transition(id,currentCoordinatorEpoch,ClusterJobs::State::Failed,millis(),1);
         error="Drone-Auftrag nicht gesendet.";return false;
     }    return true;
+}
+
+static bool txPowerValueValid(int16_t valueX10, ClusterTxPowerMode mode, String &error)
+{
+    if (mode == CLUSTER_TX_MODE_CONFIG)
+        return true;
+    if (valueX10 < SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10 || valueX10 > 200) {
+        error = "Sendeleistung muss zwischen " + String(SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10 / 10.0f, 1) +
+                " und 20.0 dBm liegen.";
+        return false;
+    }
+    return true;
+}
+
+bool clusterRequestNodeTxPower(const String &nodeId, int16_t valueX10,
+                               ClusterTxPowerMode mode, String &error)
+{
+    if (!clusterLocalIsCoordinator()) { error = "Nur am Coordinator."; return false; }
+    if (!txPowerValueValid(valueX10, mode, error)) return false;
+    ClusterPeer *peer = findPeer(nodeId.c_str());
+    if (!peer || !peer->used || !usableIp(peer->ip) || !peer->bootNonce ||
+        (uint32_t)(millis() - peer->lastSeenMs) > 60000UL) {
+        error = "Node nicht erreichbar/authentifiziert."; return false;
+    }
+    if (rejectStandbyNodeAction(peer, error)) return false;
+    if (++probeSeq == 0) ++probeSeq;
+    const uint64_t id = ((uint64_t)bootNonce << 32) | probeSeq;
+    const uint32_t timeout = mode == CLUSTER_TX_MODE_PERSISTENT
+        ? CLUSTER_TX_PERSISTENT_TIMEOUT_MS : CLUSTER_TX_SESSION_TIMEOUT_MS;
+    if (!ClusterJobs::enqueue(id, currentCoordinatorEpoch, peer->integrationId,
+                              ClusterJobs::Kind::TxPower, millis(), timeout)) {
+        error = "Job-Tabelle voll."; return false;
+    }
+    char cb[9], nb[9];
+    snprintf(cb, sizeof(cb), "%08lx", (unsigned long)bootNonce);
+    snprintf(nb, sizeof(nb), "%08lx", (unsigned long)peer->bootNonce);
+    const String msg = String(CLUSTER_JOB_TXPOWER_MAGIC) + "|" + runtimeClusterTag + "|" +
+        deviceIntegrationId() + "|" + cb + "|" + String((unsigned long)currentCoordinatorEpoch) +
+        "|" + nodeId + "|" + nb + "|" + String((unsigned long)probeSeq) + "|" +
+        String((int)valueX10) + "|" + String((unsigned)mode);
+    ClusterJobs::transition(id, currentCoordinatorEpoch, ClusterJobs::State::Sent, millis());
+    peer->txRequestedX10 = mode == CLUSTER_TX_MODE_CONFIG ? 0 : valueX10;
+    peer->txMode = mode;
+    peer->txState = CLUSTER_TX_STATE_SENT;
+    peer->txResult = CLUSTER_TX_RESULT_OK;
+    peer->txUpdatedMs = millis();
+    if (!sendSignedPayloadTo(msg, peer->ip, CLUSTER_COORDINATOR_PORT, "tx power")) {
+        ClusterJobs::transition(id, currentCoordinatorEpoch, ClusterJobs::State::Failed, millis(), 1);
+        peer->txState = CLUSTER_TX_STATE_FAILED;
+        error = "Sendeleistungs-Auftrag nicht gesendet."; return false;
+    }
+    return true;
+}
+
+bool clusterApplyLocalTxPower(int16_t valueX10, ClusterTxPowerMode mode, String &error)
+{
+    if (!txPowerValueValid(valueX10, mode, error)) return false;
+    int16_t actual = -1;
+    uint8_t result = CLUSTER_TX_RESULT_OK;
+    const uint8_t state = localTxApply(valueX10, mode, false, actual, result);
+    if (state == CLUSTER_TX_STATE_FAILED) {
+        error = "Sendeleistung konnte nicht gesetzt werden.";
+        return false;
+    }
+    return true;
+}
+
+size_t clusterRequestTxPowerAll(int16_t valueX10, ClusterTxPowerMode mode,
+                                bool includeLocal, size_t &failed, String &error)
+{
+    failed = 0;
+    if (!clusterLocalIsCoordinator()) { error = "Nur am Coordinator."; return 0; }
+    if (!txPowerValueValid(valueX10, mode, error)) return 0;
+    size_t sent = 0;
+    const uint32_t now = millis();
+    for (size_t i = 0; i < peerSlots; ++i) {
+        const ClusterPeer &peer = peers[i];
+        if (!peer.used || (uint32_t)(now - peer.lastSeenMs) > 60000UL ||
+            peerIsStandbyTimeBroadcaster(&peer))
+            continue;
+        String nodeError;
+        if (clusterRequestNodeTxPower(String(peer.integrationId), valueX10, mode, nodeError)) ++sent;
+        else { ++failed; error = nodeError; }
+        // Many nodes: keep ESP-NOW time exchanges answered between sends.
+        clusterServiceTimeCritical();
+    }
+    if (includeLocal) {
+        String localError;
+        if (clusterApplyLocalTxPower(valueX10, mode, localError)) ++sent;
+        else { ++failed; error = localError; }
+    }
+    return sent;
+}
+
+String clusterTxPowerJson()
+{
+    const uint32_t now = millis();
+    String json = "{\"ok\":true,\"coordinator\":";
+    json += clusterLocalIsCoordinator() ? "true" : "false";
+    json += ",\"safe_min_x10\":" + String((int)SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10);
+    json += ",\"probation_ms\":" + String((unsigned long)CLUSTER_TX_PROBATION_MS);
+    json += ",\"board_levels_x10\":[";
+    for (size_t i = 0; i < BOARD_WIFI_TX_POWER_LEVEL_COUNT; ++i) {
+        if (i) json += ',';
+        json += String((int)BOARD_WIFI_TX_POWER_LEVELS_X10[i]);
+    }
+    json += "],\"local\":{\"hostname\":\"" + jsonEscape(cfg_hostname) + "\"";
+    json += ",\"config_x10\":" + String((int)configTxX10());
+    json += ",\"session_override_x10\":" + String((int)WifiTxControl::sessionOverrideX10());
+    json += ",\"driver_x10\":" + String((int)WifiTxControl::driverX10());
+    json += ",\"requested_x10\":" + String((int)localTx.requestedX10);
+    json += ",\"state\":\"" + String(clusterTxPowerStateName(localTx.state)) + "\"";
+    json += ",\"result\":" + String((unsigned)localTx.result);
+    json += ",\"probation_remaining_ms\":";
+    json += txProbation.active
+        ? String((unsigned long)(CLUSTER_TX_PROBATION_MS - min(CLUSTER_TX_PROBATION_MS, (uint32_t)(now - txProbation.startMs))))
+        : String("0");
+    json += ",\"age_ms\":" + String(localTx.updatedMs ? (unsigned long)(now - localTx.updatedMs) : 0UL) + "}";
+    json += ",\"nodes\":[";
+    bool first = true;
+    for (size_t i = 0; i < peerSlots; ++i) {
+        const ClusterPeer &peer = peers[i];
+        if (!peer.used || (uint32_t)(now - peer.lastSeenMs) > (uint64_t)peerLeaseSeconds(peer) * 1000ULL)
+            continue;
+        uint8_t state = peer.txState;
+        uint8_t result = peer.txResult;
+        const uint32_t timeout = peer.txMode == CLUSTER_TX_MODE_PERSISTENT
+            ? CLUSTER_TX_PERSISTENT_TIMEOUT_MS : CLUSTER_TX_SESSION_TIMEOUT_MS;
+        if (state == CLUSTER_TX_STATE_SENT && (uint32_t)(now - peer.txUpdatedMs) > timeout) {
+            state = CLUSTER_TX_STATE_FAILED;
+            result = CLUSTER_TX_RESULT_NO_ANSWER;
+        }
+        if (!first) json += ',';
+        first = false;
+        json += "{\"integration_id\":\"" + jsonEscape(String(peer.integrationId)) + "\"";
+        json += ",\"hostname\":\"" + jsonEscape(String(peer.hostname)) + "\"";
+        json += ",\"ip\":\"" + peer.ip.toString() + "\"";
+        json += ",\"requested_x10\":" + String((int)peer.txRequestedX10);
+        json += ",\"actual_x10\":" + String(peer.txUpdatedMs && peer.txState != CLUSTER_TX_STATE_SENT ? (int)peer.txActualX10 : -1);
+        json += ",\"mode\":" + String((unsigned)peer.txMode);
+        json += ",\"state\":\"" + String(clusterTxPowerStateName(state)) + "\"";
+        json += ",\"result\":" + String((unsigned)result);
+        json += ",\"age_ms\":" + String(peer.txUpdatedMs ? (unsigned long)(now - peer.txUpdatedMs) : 0UL) + "}";
+    }
+    json += "]}";
+    return json;
 }
 
 bool clusterRequestNodeWipe(const String &nodeId,String &error)
@@ -5712,6 +6179,8 @@ static String buildClusterStatusJson(ClusterStatusChunkSink sink, void *ctx)
         String((unsigned long)CLUSTER_DEFAULT_LEASE_SEC);
     json += ",\"wifi_remaining_sec\":" +
         String((long)localWifiRemainingSeconds);
+    json += ",\"tx_power_x10\":" + String((int)WifiTxControl::driverX10());
+    json += ",\"tx_power_state\":\"" + String(clusterTxPowerStateName(localTx.state)) + "\"";
     json += ",\"age_ms\":0}";
 
     for (size_t i = 0; i < peerSlots; ++i) {
@@ -5795,6 +6264,9 @@ static String buildClusterStatusJson(ClusterStatusChunkSink sink, void *ctx)
             String((unsigned long)leaseRemainingSeconds);
         json += ",\"wifi_remaining_sec\":" +
             String((long)peer.wifiRemainingSeconds);
+        // Last TX power the node reported for a TX-power job (-1 unknown).
+        json += ",\"tx_power_x10\":" + String(peer.txUpdatedMs && peer.txState != CLUSTER_TX_STATE_SENT ? (int)peer.txActualX10 : -1);
+        json += ",\"tx_power_state\":\"" + String(clusterTxPowerStateName(peer.txState)) + "\"";
         json += ",\"age_ms\":" + String((unsigned long)ageMs);
         json += '}';
         statusFlushIfLarge(json, sink, ctx);

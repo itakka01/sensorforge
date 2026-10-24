@@ -9333,6 +9333,54 @@ ConfigSaveResult configSaveClusterMount(
     return result;
 }
 
+ConfigSaveResult configSaveWifiTxPower(
+    float txPowerDbm,
+    bool writeToSd,
+    String &error
+)
+{
+    error = "";
+    const int16_t txPowerX10 = (int16_t)lroundf(txPowerDbm * 10.0f);
+    if (
+        fabsf(txPowerDbm * 10.0f - txPowerX10) > 0.01f ||
+        txPowerX10 < SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10 ||
+        !boardWifiTxPowerSupportedX10(txPowerX10)
+    ) {
+        error = "wifi_tx_power_dbm is not a supported value for this board";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+    if ((int16_t)lroundf(cfg_wifi_tx_power_dbm * 10.0f) == txPowerX10)
+        return CONFIG_SAVE_INTERNAL_ONLY;
+
+    String text;
+    bool sourceRead = false;
+    if (activeConfigSource == CONFIG_SOURCE_SD && sdAvailableState && STORAGE.exists("/config.txt"))
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    if (!sourceRead && internalAvailableState && LittleFS.exists("/config.txt"))
+        sourceRead = readTextFile(LittleFS, "/config.txt", text);
+    if (!sourceRead && sdAvailableState && STORAGE.exists("/config.txt"))
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    if (!sourceRead) {
+        error = "no persistent config.txt available for TX power save";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    const float stored = txPowerX10 / 10.0f;
+    if (!replaceOrAppendConfigKey(text, "wifi_tx_power_dbm", String(stored, 1))) {
+        error = "could not patch wifi_tx_power_dbm";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+    String validationError;
+    if (!configValidateText(text, validationError)) {
+        error = "patched config invalid: " + validationError;
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+    ConfigSaveResult result = configSaveText(text, writeToSd, error);
+    if (result == CONFIG_SAVE_BOTH || result == CONFIG_SAVE_INTERNAL_ONLY)
+        cfg_wifi_tx_power_dbm = stored;
+    return result;
+}
+
 ConfigSaveResult configSaveWifiSettings(
     const String &hostname,
     const String &wifiOnSystemStart,

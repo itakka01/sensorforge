@@ -16,6 +16,11 @@ struct WebConfigClusterUiHooks {
 // keeps ESP-NOW time exchanges answered in between.
 void webconfigClusterSendLargeJson(WebServer &server, const String &json);
 
+// Central WiFi TX power request from form/query args (WebConfig and API):
+// dbm, mode=session|persistent|config, scope=all|node|local, node_id,
+// include_local=0|1 (scope=all). Fills json, returns the HTTP status.
+int clusterTxPowerRequestFromArgs(WebServer &server, String &json);
+
 void webconfigClusterRegisterRoutes(
     WebServer &server,
     const WebConfigClusterUiHooks &uiHooks

@@ -12,7 +12,7 @@ namespace ClusterJobs {
 static const size_t kMaxJobs = 256;
 static const size_t kNodeIdLength = 36; // "sf-" + 32 hex + NUL
 
-enum class Kind : uint8_t { None, Restart, Shutdown, ClearRecordings, FirmwareUpdate, Probe, Capture, Drone };
+enum class Kind : uint8_t { None, Restart, Shutdown, ClearRecordings, FirmwareUpdate, Probe, Capture, Drone, TxPower };
 enum class State : uint8_t { Empty, Queued, Sent, Accepted, Running, Succeeded, Failed, TimedOut, Cancelled };
 
 struct Entry {

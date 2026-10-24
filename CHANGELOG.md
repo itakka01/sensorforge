@@ -1,3 +1,25 @@
+## v87-beta146 — 2026-10-24 (FIX: SENDELEISTUNGS-ERGEBNISSE AM COORDINATOR)
+
+**Fehler in beta145:** Die Rückmeldungen der Nodes zur Sendeleistung wurden am Coordinator angenommen, aber beim nächsten Heartbeat des Nodes (≤ 10 s) gelöscht: `processPresence()` baut den Peer-Eintrag neu auf und übernahm die neuen `tx*`-Felder nicht. Tabelle und `/api/v1/cluster/wifi_tx_power` zeigten deshalb „–“, obwohl alle Nodes den Wert gesetzt (und bei „dauerhaft“ gespeichert) hatten.
+**Fix:** `tx*`-Felder werden bei gleicher Boot-ID übernommen. Nur der Coordinator braucht beta146.
+**Oberfläche:** Bereich „Sendeleistung (WLAN)“ neu angeordnet: Die globale Regel `input{width:280px}` hatte Auswahlknöpfe und Haken weit von ihren Texten weggeschoben, und die Tabellen-Styles von `/cluster` fehlten auf `/cluster_coordinate`. Jetzt eigene Styles (`sf-tx-*`), Gültigkeit als Gruppe mit Erklärung je Option, Knopftext nennt Wert und Modus („13.0 dBm bis zum Neustart auf alle Nodes anwenden“), dBm-Auswahl bei „zurück auf gespeicherten Wert“ gesperrt.
+
+**Erste Messung (je 3 min, 9 Nodes, alle Boards dicht beieinander):** 20 dBm → 13 dBm: Ping im Mittel 4,6–8,3 → 3,0–7,0 ms, 95-%-Wert 9–22 → 5–15 ms; Median-Streuung der Zeitmessung bei 8 von 9 Nodes kleiner (z. B. devfreenove1 90 → 42 µs, devxiao1 50 → 10 µs), devxiao2 10 → 64 µs; keine Paketverluste, keine verworfenen Serien in beiden Läufen. Kurze Läufe, noch kein Langzeitbeleg.
+
+## v87-beta145 — 2026-10-24 (ZENTRALE WLAN-SENDELEISTUNG)
+
+**Anlass:** Unruhiges WLAN einzelner Nodes (c002/c004: Ping 20–65 ms, Streuung der Zeitmessung bis 690 µs) bei dicht stehenden Boards mit 20 dBm. Sendeleistung soll zentral und versuchsweise absenkbar sein.
+
+**NEU:**
+- Cluster-Auftrag `SFJT1`/`SFJTA1` (signiert, Wiederholschutz, Rückmeldung je Zustandswechsel), Job-Art `TxPower`. Modi: **Sitzung** (bis Neustart), **dauerhaft** (sofort aktiv, 30 s Probezeit; gespeichert wird nur mit nachgewiesenem Kontakt: signierte Coordinator-Bestätigung nach der Umstellung; sonst stellt sich der Node selbst zurück und meldet `reverted`), **zurück auf gespeicherten Wert**.
+- `wifi_tx_control.h/.cpp`: Sitzungswert, der bei jedem WLAN-Neuaufbau statt des Config-Werts gilt (`applyConfiguredWifiTxPower`); Normierung auf die nächste Board-Stufe ≥ 8,5 dBm, höchstens Board-Maximum.
+- `configSaveWifiTxPower()` (nur `wifi_tx_power_dbm`, gleiche Prüfung wie die WLAN-Seite).
+- Coordinator-Seite: Bereich „Sendeleistung (WLAN)“ (Wert, Modus, Coordinator einbeziehen, Tabelle je Gerät mit angefordert/eingestellt/Zustand).
+- WebConfig `GET/POST /cluster_tx_power`, API `GET/POST /api/v1/cluster/wifi_tx_power` (gleicher Parser `clusterTxPowerRequestFromArgs()`, API mit Anmeldung); `scope=all|node|local`. Doku: `SENSORFORGE_API_V1.md`.
+- `/cluster_status`: `tx_power_x10`, `tx_power_state` je Gerät.
+
+**Hinweis:** Alle Boards brauchen beta145 (neues Paket); keine Rückwärtskompatibilität vorgesehen.
+
 ## v87-beta144 — 2026-10-24 (CLUSTER FÜR 100 GERÄTE AUSGELEGT)
 
 **Ziel:** Grundgerüst für 100 Cluster-Geräte (Schritt 1 vor dem geplanten Broadcast-Zeitverfahren). Bisher: Mitgliederliste 16 (ein 17. Gerät verdrängte aktive Mitglieder), Jobs 16 (ein Cluster-Foto erreichte höchstens 16 Nodes gleichzeitig), Ressourcen 24, Discovery 32, Kamera-Übersicht 24, Slot-Tabelle/Wiedergabeschutz 32, Sync-Berichte 12.

@@ -440,6 +440,21 @@ static void handleLoadDiag()
     server.send(200, "application/json; charset=utf-8", LoopLoadDiag::json());
 }
 
+// Central WiFi TX power: GET state, POST request (same rules as the API).
+static void handleClusterTxPowerGet()
+{
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json; charset=utf-8", clusterTxPowerJson());
+}
+
+static void handleClusterTxPowerPost()
+{
+    String json;
+    const int code = clusterTxPowerRequestFromArgs(server, json);
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(code, "application/json; charset=utf-8", json);
+}
+
 static void handleClusterCoordinatePage()
 {
     if (!clusterLocalIsCoordinator()) {
@@ -999,6 +1014,91 @@ document.getElementById('clusterSdPreflight').addEventListener('click',function(
 pollHealth();setInterval(pollHealth,10000);
 })();
 </script>)__HEALTH__";
+    // Central WiFi TX power for all nodes (cluster job SFJT1). Own styles:
+    // the global input rule (width:280px) would push radios away from their
+    // labels, and the cluster table styles live on /cluster only.
+    html += "<style>"
+        ".sf-tx-form{display:grid;gap:12px;max-width:680px;margin:14px 0}"
+        ".sf-tx-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}"
+        ".sf-tx-row>label{font-weight:600;min-width:130px}"
+        ".sf-tx-row select{width:auto;min-width:140px;margin:0}"
+        ".sf-tx-modes{border:1px solid var(--border);border-radius:8px;padding:6px 14px 8px;margin:0}"
+        ".sf-tx-modes legend{font-weight:600;padding:0 4px}"
+        ".sf-tx-opt{display:flex;align-items:flex-start;gap:10px;padding:6px 0;cursor:pointer;font-weight:400}"
+        ".sf-tx-opt input{width:auto;margin:3px 0 0;flex:none}"
+        ".sf-tx-opt small{display:block;color:var(--muted);font-size:.85rem}"
+        ".sf-tx-actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap}"
+        ".sf-tx-actions button{margin:0}"
+        "#sfTxState{margin:4px 0 10px}"
+        ".sf-tx-table{border-collapse:collapse;width:100%;min-width:680px}"
+        ".sf-tx-table th,.sf-tx-table td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--border);white-space:nowrap}"
+        ".sf-tx-table th{font-size:.82rem;color:var(--muted);font-weight:600}"
+        "</style>";
+    html += "<details class='settings-section' id='sfTxPower'><summary><strong>Sendeleistung (WLAN)</strong> <span id='sfTxSummary' class='muted'></span></summary>"
+        "<p class='muted'>Stellt die WLAN-Sendeleistung aller Nodes zentral ein. Jedes Board nimmt die nächste von ihm unterstützte Stufe "
+        "(nie unter " + String(SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10 / 10.0f, 1) + " dBm) und meldet den eingestellten Wert zurück.</p>"
+        "<div class='sf-tx-form'>"
+        "<div class='sf-tx-row'><label for='sfTxValue'>Sendeleistung</label><select id='sfTxValue'>";
+    for (size_t i = 0; i < BOARD_WIFI_TX_POWER_LEVEL_COUNT; ++i) {
+        const int16_t level = BOARD_WIFI_TX_POWER_LEVELS_X10[i];
+        if (level < SENSORFORGE_WIFI_TX_POWER_SAFE_MIN_X10)
+            continue;
+        html += "<option value='" + String(level / 10.0f, 1) + "'" + (level == 130 ? " selected" : "") + ">" +
+            String(level / 10.0f, 1) + " dBm</option>";
+    }
+    html += "</select></div>"
+        "<fieldset class='sf-tx-modes'><legend>Gültigkeit</legend>"
+        "<label class='sf-tx-opt'><input type='radio' name='sfTxMode' value='session' checked>"
+        "<span><strong>Nur diese Sitzung</strong><small>Gilt bis zum nächsten Neustart, die Konfiguration bleibt unverändert.</small></span></label>"
+        "<label class='sf-tx-opt'><input type='radio' name='sfTxMode' value='persistent'>"
+        "<span><strong>Dauerhaft</strong><small>Jedes Gerät prüft 30 s lang, ob es den Coordinator noch erreicht, und speichert erst dann. Sonst stellt es sich selbst zurück.</small></span></label>"
+        "<label class='sf-tx-opt'><input type='radio' name='sfTxMode' value='config'>"
+        "<span><strong>Zurück auf gespeicherten Wert</strong><small>Hebt eine Sitzungs-Einstellung auf; die dBm-Auswahl oben wird nicht verwendet.</small></span></label>"
+        "</fieldset>"
+        "<label class='sf-tx-opt'><input type='checkbox' id='sfTxLocal' checked>"
+        "<span><strong>Coordinator einbeziehen</strong><small>Dieses Gerät wird ebenfalls umgestellt.</small></span></label>"
+        "<div class='sf-tx-actions'><button type='button' class='primary' id='sfTxApply'>Auf alle Nodes anwenden</button></div>"
+        "</div>"
+        "<div id='sfTxState' class='muted' role='status'></div>"
+        "<div class='cluster-table-wrap' style='overflow:auto'><table class='sf-tx-table'><thead><tr><th>Gerät</th><th>IP</th><th>Angefordert</th><th>Eingestellt</th><th>Zustand</th><th>Stand</th></tr></thead>"
+        "<tbody id='sfTxRows'><tr><td colspan='6' class='muted'>Zum Laden öffnen.</td></tr></tbody></table></div></details>";
+    html += R"__TXJS__(<script>
+(function(){
+var box=document.getElementById('sfTxPower'),rows=document.getElementById('sfTxRows'),st=document.getElementById('sfTxState'),sum=document.getElementById('sfTxSummary');
+var names={none:'–',sent:'gesendet, wartet',session:'aktiv bis Neustart',probation:'Probezeit läuft',persisted:'dauerhaft gespeichert',reverted:'ZURÜCKGESETZT (kein Kontakt)',config:'gespeicherter Wert aktiv',failed:'FEHLER'};
+var results={1:'Setzen fehlgeschlagen',2:'Speichern fehlgeschlagen',3:'ungültiger Wert',4:'keine Antwort'};
+function esc(s){return String(s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+function dbm(x){x=Number(x);return x>0?(x/10).toFixed(1)+' dBm':'–';}
+function stateText(s,r){var t=names[s]||s;if(r&&results[r])t+=' ('+results[r]+')';return t;}
+function age(ms){ms=Number(ms)||0;return ms?Math.round(ms/1000)+' s':'–';}
+function row(name,ip,req,act,s,r,a,bad){return '<tr'+(bad?' style="background:#fde8e8"':'')+'><td><strong>'+esc(name)+'</strong></td><td>'+esc(ip)+'</td><td>'+dbm(req)+'</td><td>'+dbm(act)+'</td><td>'+esc(stateText(s,r))+'</td><td>'+age(a)+'</td></tr>';}
+function render(d){var l=d.local||{},n=Array.isArray(d.nodes)?d.nodes:[];
+ var html=row((l.hostname||'Coordinator')+' (Coordinator)','lokal',l.requested_x10,l.driver_x10,l.state,l.result,l.age_ms,l.state==='reverted'||l.state==='failed');
+ html+=n.map(function(x){return row(x.hostname||x.integration_id,x.ip||'-',x.requested_x10,x.actual_x10,x.state,x.result,x.age_ms,x.state==='reverted'||x.state==='failed');}).join('');
+ rows.innerHTML=html;
+ var wait=n.filter(function(x){return x.state==='sent'||x.state==='probation';}).length+(l.state==='probation'?1:0);
+ sum.textContent=wait?('· '+wait+' Gerät(e) in Arbeit'):'';
+ if(wait&&!timer)timer=setInterval(load,3000);if(!wait&&timer){clearInterval(timer);timer=null;}}
+var timer=null;
+function load(){return fetch('/cluster_tx_power?t='+Date.now(),{cache:'no-store',credentials:'same-origin'}).then(function(r){if(!r.ok)throw Error('HTTP '+r.status);return r.json();}).then(render).catch(function(e){st.textContent='Status nicht lesbar: '+(e.message||e);});}
+box.addEventListener('toggle',function(){if(box.open)load();});
+function label(){var mode=(document.querySelector('input[name=sfTxMode]:checked')||{}).value||'session',sel=document.getElementById('sfTxValue'),b=document.getElementById('sfTxApply');
+ sel.disabled=mode==='config';b.textContent=mode==='config'?'Alle Nodes auf gespeicherten Wert zurücksetzen':(sel.value+' dBm '+(mode==='persistent'?'dauerhaft':'bis zum Neustart')+' auf alle Nodes anwenden');}
+Array.prototype.forEach.call(document.querySelectorAll('input[name=sfTxMode]'),function(r){r.addEventListener('change',label);});
+document.getElementById('sfTxValue').addEventListener('change',label);label();
+document.getElementById('sfTxApply').addEventListener('click',async function(){
+ var b=this,mode=(document.querySelector('input[name=sfTxMode]:checked')||{}).value||'session',val=document.getElementById('sfTxValue').value,loc=document.getElementById('sfTxLocal').checked;
+ var label=mode==='config'?'zurück auf den gespeicherten Wert':(val+' dBm '+(mode==='persistent'?'DAUERHAFT':'bis zum Neustart'));
+ if(!confirm('Sendeleistung aller Nodes'+(loc?' und des Coordinators':'')+' '+label+' setzen?'))return;
+ b.disabled=true;st.textContent='Aufträge werden gesendet …';
+ try{var fd=new FormData();fd.append('dbm',val);fd.append('mode',mode);fd.append('scope','all');fd.append('include_local',loc?'1':'0');
+  var r=await fetch('/cluster_tx_power',{method:'POST',body:fd,credentials:'same-origin'}),d=await r.json().catch(function(){return {};});
+  st.textContent=r.ok?('Gesendet an '+(d.sent||0)+' Gerät(e)'+(d.failed?(', '+d.failed+' nicht erreichbar: '+(d.error||'')):'')+(mode==='persistent'?'. Dauerhaft gespeichert wird nach 30 s Probezeit.':'.')):('Fehler: '+(d.error||('HTTP '+r.status)));
+  if(!timer)timer=setInterval(load,3000);await load();
+ }catch(e){st.textContent='Senden fehlgeschlagen: '+(e.message||e);}finally{b.disabled=false;}
+});
+})();
+</script>)__TXJS__";
     html += R"__PROBE__(<details class='settings-section'><summary>Verbindungsdiagnose und Einzeltests</summary>
 <p class='muted'>Ein signierter, harmloser Probeauftrag prüft die Zustellung und die individuelle Antwort. Er startet keine Geräte neu und verändert keine Dateien.</p>
 <details><summary>ESP-NOW Benchmark: 100 Pakete je Richtung und Node</summary>
@@ -1801,6 +1901,64 @@ static void handleClusterSave()
 
 } // namespace
 
+static String jsonEscapeLocal(const String &value)
+{
+    String out;
+    out.reserve(value.length() + 8);
+    for (size_t i = 0; i < value.length(); ++i) {
+        const char c = value[i];
+        if (c == '"' || c == '\\') { out += '\\'; out += c; }
+        else if ((uint8_t)c < 0x20) out += ' ';
+        else out += c;
+    }
+    return out;
+}
+
+int clusterTxPowerRequestFromArgs(WebServer &srv, String &json)
+{
+    auto fail = [&json](int code, const char *key, const String &message) {
+        json = String("{\"ok\":false,\"error\":\"") + key + "\",\"message\":\"" +
+            jsonEscapeLocal(message) + "\"}";
+        return code;
+    };
+    ClusterTxPowerMode mode;
+    if (!clusterTxPowerModeFromText(srv.arg("mode"), mode))
+        return fail(400, "invalid_mode", "mode muss session, persistent oder config sein");
+    int16_t valueX10 = 0;
+    if (mode != CLUSTER_TX_MODE_CONFIG) {
+        String text = srv.arg("dbm");
+        text.trim();
+        char *end = nullptr;
+        const float dbm = strtof(text.c_str(), &end);
+        if (!text.length() || !end || *end != '\0' || !isfinite(dbm))
+            return fail(400, "invalid_dbm", "dbm fehlt oder ist keine Zahl");
+        valueX10 = (int16_t)lroundf(dbm * 10.0f);
+    }
+    String scope = srv.arg("scope");
+    if (!scope.length())
+        scope = "all";
+    String error;
+    size_t sent = 0, failed = 0;
+    if (scope == "local") {
+        if (clusterApplyLocalTxPower(valueX10, mode, error)) sent = 1;
+        else failed = 1;
+    } else if (scope == "node") {
+        if (clusterRequestNodeTxPower(srv.arg("node_id"), valueX10, mode, error)) sent = 1;
+        else failed = 1;
+    } else if (scope == "all") {
+        if (!clusterLocalIsCoordinator())
+            return fail(403, "not_coordinator", "scope=all nur am Coordinator");
+        sent = clusterRequestTxPowerAll(valueX10, mode, srv.arg("include_local") != "0", failed, error);
+    } else {
+        return fail(400, "invalid_scope", "scope muss all, node oder local sein");
+    }
+    if (!sent && failed)
+        return fail(409, "rejected", error);
+    json = "{\"ok\":true,\"sent\":" + String((unsigned long)sent) + ",\"failed\":" +
+        String((unsigned long)failed) + ",\"error\":\"" + jsonEscapeLocal(error) + "\"}";
+    return 202;
+}
+
 void webconfigClusterSendLargeJson(WebServer &serverInstance, const String &json)
 {
     static const size_t kPartBytes = 4096;
@@ -1858,6 +2016,8 @@ void webconfigClusterRegisterRoutes(
     serverInstance.on("/cluster_node_wipe", HTTP_POST, handleClusterNodeWipe);
     serverInstance.on("/cluster_node_capture", HTTP_POST, handleClusterNodeCapture);
     serverInstance.on("/cluster_node_drone", HTTP_POST, handleClusterNodeDrone);
+    serverInstance.on("/cluster_tx_power", HTTP_GET, handleClusterTxPowerGet);
+    serverInstance.on("/cluster_tx_power", HTTP_POST, handleClusterTxPowerPost);
     serverInstance.on("/cluster_local_drone", HTTP_POST, handleClusterLocalDrone);
     webconfigClusterGroupsRegisterRoutes(serverInstance);
     webconfigClusterCameraRegisterRoutes(serverInstance);

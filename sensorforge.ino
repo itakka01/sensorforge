@@ -74,6 +74,7 @@
 #include "wifi_link_diag.h"
 #include "task_load_diag.h"
 #include "loop_load_diag.h"
+#include "wifi_tx_control.h"
 #include "crash_guard.h"
 #include "psram_alloc.h"
 
@@ -2566,10 +2567,9 @@ static bool applyWifiTxPowerX10(
 
 static bool applyConfiguredWifiTxPower(const char *context)
 {
-    int16_t configuredX10 =
-        (int16_t)lroundf(cfg_wifi_tx_power_dbm * 10.0f);
-
-    return applyWifiTxPowerX10(configuredX10, context);
+    // Config value, or the session override set by a cluster/API TX-power
+    // request (wifi_tx_control.h) until reboot.
+    return applyWifiTxPowerX10(WifiTxControl::effectiveX10(), context);
 }
 
 
