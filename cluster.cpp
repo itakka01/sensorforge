@@ -3,9 +3,6 @@
 #include "cluster_espnow_radio.h"
 #include "cluster_jobs.h"
 #include "cluster_hw_time_pulse.h"
-#include "cluster_hw_time_protocol.h"
-#include "cluster_hw_time_gpio_lease.h"
-#include "cluster_hw_time_series.h"
 #include "cluster_hw_time_meter.h"
 #include "cluster_capture_options.h"
 #include "cluster_capture.h"
@@ -121,10 +118,6 @@ static const char *CLUSTER_JOB_SHUTDOWN_MAGIC = "SFJS1";
 static const char *CLUSTER_JOB_SHUTDOWN_ACK_MAGIC = "SFJSA1";
 // Signed negative ACKs only after full coordinator authentication and replay consumption.
 static const char *CLUSTER_JOB_REJECT_MAGIC = "SFJX1";
-static const char *CLUSTER_JOB_HW_TIME_MAGIC="SFHT1";
-static const char *CLUSTER_JOB_HW_TIME_ACK_MAGIC="SFHTA1"; // 1 armed; 2 rejected (not armed)
-// Separate SFHT1 replay state; ordinary cluster-job sequences are unaffected.
-static ClusterHwTimeProtocol::ReplayGuard hwTimeSeen;
 
 static const char *CLUSTER_JOB_CAPTURE_MAGIC="SFJC1";
 static const char *CLUSTER_JOB_CAPTURE_RESULT_MAGIC="SFJCR1";
@@ -459,59 +452,6 @@ static uint32_t localCoordinatorEpoch = 0;
 static char currentCoordinatorId[36] = {};
 static IPAddress currentCoordinatorIp;
 static uint32_t currentCoordinatorEpoch = 0;
-// Coordinator-only one-shot diagnostic session. Never shares capture jobs.
-struct HwTimeSession {
-    bool active = false;
-    int64_t targetUtcUs = 0;
-    int64_t referenceMonoUs = 0;
-    uint32_t epoch = 0;
-    uint32_t startedMs = 0;
-    uint32_t seq[3] = {};
-    uint8_t armStatus[3] = {}; // 0 pending, 1 armed, 2 rejected
-    String nodes[3];
-};
-static HwTimeSession hwSession;
-// Coordinator-only GPIO test history (~20 KB) lives in PSRAM, allocated with
-// the first stored sample. nullptr = no sample yet (or PSRAM unavailable).
-static ClusterHwTimeSeries::History *hwHistory = nullptr;
-static bool hwHistoryAllocFailed = false;
-static String hwSessionLastResult = "not_started";
-static uint32_t hwSessionCounter = 0;
-static void hwTimeSessionFinish(const char *result, bool saveEdges) {
-    if (!hwSession.active) return;
-    if (saveEdges) {
-        ClusterHwTimeCapture::Edges edges = {};
-        ClusterHwTimeGpioLease::snapshot(edges);
-        ClusterHwTimeMath::Sample sample = {};
-        sample.referenceUs = hwSession.referenceMonoUs;
-        for (int i = 0; i < 3; ++i) {
-            sample.nodeUs[i] = edges.firstRiseUs[i];
-            sample.present[i] = edges.received[i] && hwSession.armStatus[i] == 1;
-        }
-        if (!hwHistory) {
-            void *mem = sfPsramCalloc(1, sizeof(ClusterHwTimeSeries::History));
-            if (mem) hwHistory = new (mem) ClusterHwTimeSeries::History();
-            hwHistoryAllocFailed = !hwHistory;
-        }
-        if (hwHistory) hwHistory->add(++hwSessionCounter, sample);
-    }
-    ClusterHwTimeGpioLease::release();
-    hwSession.active = false;
-    hwSessionLastResult = result;
-}
-static void hwTimeSessionService() {
-    if (!hwSession.active) return;
-    if (!runtimeActive || !localIsCoordinator || !droneModeEnabled() ||
-        currentCoordinatorEpoch != hwSession.epoch) {
-        hwTimeSessionFinish("aborted_mode_or_epoch", false);
-        return;
-    }
-    const int64_t now = esp_timer_get_time();
-    // Reserve enough time for the 2-ms pulses, UART/UDP jitter and ISR handling.
-    if (now >= hwSession.referenceMonoUs + 250000LL) {
-        hwTimeSessionFinish("complete", true);
-    }
-}
 
 
 static bool coordinationDirty = false;
@@ -3056,77 +2996,6 @@ static void processCaptureReceipt(char **f,size_t n,const IPAddress &ip){
     ++captureResultReceiptReceived;
     captureResultRetry=CaptureResultRetry{};
 }
-// SFHT1|tag|coordinator|coord_boot_hex|epoch|target|target_boot_hex|seq|channel|utc_us
-// Signed transport preparation only. Deliberately does not arm GPIOs until the
-// coordinator-side measurement session and safe peripheral handoff exist.
-static void processHwTimeRequest(char **f,size_t n,const IPAddress &ip) {
-    if(n!=10 || !runtimeActive || localIsCoordinator ||
-       strcmp(f[1],runtimeClusterTag)!=0 ||
-       strcmp(f[2],currentCoordinatorId)!=0 ||
-       strcmp(f[5],deviceIntegrationId().c_str())!=0 ||
-       ip!=currentCoordinatorIp)return;
-    uint32_t cb=0,epoch=0,nb=0,seq=0,channel=0;
-    int64_t utc=0,nowUtc=0;
-    if(!parseUint32Strict(f[3],cb,16)||!parseUint32Strict(f[4],epoch)||
-       !parseUint32Strict(f[6],nb,16)||!parseUint32Strict(f[7],seq)||
-       !parseUint32Strict(f[8],channel)||!parseInt64Strict(f[9],utc)||
-       !cb||!epoch||!seq||nb!=bootNonce||epoch!=currentCoordinatorEpoch||
-       channel>255)return;
-    const ClusterPeer *coord=findPeer(f[2]);
-    if(!coord||coord->bootNonce!=cb||coord->ip!=ip||
-       (uint32_t)(millis()-coord->lastSeenMs)>60000UL)return;
-    ClusterHwTimeProtocol::Request req={cb,epoch,seq,(uint8_t)channel,utc};
-    if(!clusterTimeNowUs(nowUtc)||
-       !ClusterHwTimeProtocol::validate(req,nowUtc,
-           (hwTimeSeen.boot==cb && hwTimeSeen.epoch==epoch) ? hwTimeSeen.sequence : 0,
-           droneModeEnabled(), CLUSTER_HW_TIME_OUT>=0))return;
-    // Consume authenticated sequences before any future GPIO/resource operation.
-    // Retransmissions must never produce a second impulse.
-    if(!hwTimeSeen.accept(req))return;
-    // Only XIAO GPIO2 currently has a dedicated output. Freenove GPIO48
-    // shares the RGB LED and must NOT be driven before an explicit handoff.
-    // The arm function freezes the UTC->monotonic mapping at acceptance.
-    bool armed = false;
-#if defined(BOARD_XIAO) && CLUSTER_HW_TIME_OUT == 2
-    if (!clusterHwTimePulseActive()) armed = clusterHwTimePulseArm(utc);
-#endif
-    // ACK status 1 means the timer was actually armed, NOT that an edge was
-    // observed. Status 2 explicitly means no output was armed.
-    char nodeBoot[9];
-    snprintf(nodeBoot,sizeof(nodeBoot),"%08lx",(unsigned long)bootNonce);
-    const String ack=String(CLUSTER_JOB_HW_TIME_ACK_MAGIC)+"|"+runtimeClusterTag+"|"+
-        currentCoordinatorId+"|"+f[3]+"|"+f[4]+"|"+deviceIntegrationId()+"|"+
-        nodeBoot+"|"+f[7]+"|"+f[8]+"|"+(armed ? "1" : "2");
-    sendSignedPayloadTo(ack,ip,CLUSTER_COORDINATOR_PORT,"hardware time arm ACK");
-}
-// SFHTA1|tag|coordinator|coord_boot|epoch|node|node_boot|seq|channel|status
-// status 1 means timer armed; status 2 means output unavailable.
-static void processHwTimeAck(char **f,size_t n,const IPAddress &ip) {
-    if(n!=10||!runtimeActive||!localIsCoordinator||
-       strcmp(f[1],runtimeClusterTag)!=0||
-       strcmp(f[2],deviceIntegrationId().c_str())!=0||
-       !integrationIdValid(f[5]))return;
-    uint32_t cb=0,epoch=0,nb=0,seq=0,channel=0,status=0;
-    if(!parseUint32Strict(f[3],cb,16)||!parseUint32Strict(f[4],epoch)||
-       !parseUint32Strict(f[6],nb,16)||!parseUint32Strict(f[7],seq)||
-       !parseUint32Strict(f[8],channel)||!parseUint32Strict(f[9],status)||
-       cb!=bootNonce||epoch!=currentCoordinatorEpoch||!nb||!seq||
-       channel<1||channel>3||(status!=1&&status!=2))return;
-    const ClusterPeer *node=findPeer(f[5]);
-    if(!node||node->bootNonce!=nb||node->ip!=ip||
-       (uint32_t)(millis()-node->lastSeenMs)>60000UL)return;
-    if (hwSession.active && epoch == hwSession.epoch) {
-        const uint8_t idx = (uint8_t)(channel - 1);
-        if (hwSession.nodes[idx] == f[5] && hwSession.seq[idx] == seq &&
-            hwSession.armStatus[idx] == 0) {
-            hwSession.armStatus[idx] = (uint8_t)status;
-        }
-    }
-    // Informational only until a coordinator measurement session is wired.
-    Serial.printf("[CLUSTER HW TIME] node=%s seq=%lu channel=%lu timer=%s\n",
-                  f[5],(unsigned long)seq,(unsigned long)channel,
-                  status==1 ? "ARMED" : "NOT ARMED");
-}
 static void processJobCapture(char **f,size_t n,const IPAddress &ip) {
     bool testPulse=false;
     if(!ClusterCaptureOptions::parse(n,f,testPulse) || !runtimeActive || localIsCoordinator || strcmp(f[1],runtimeClusterTag)!=0 ||
@@ -3791,10 +3660,6 @@ static void processPacket(
         processJobShutdown(fields, fieldCount, remoteIp);
     } else if (strcmp(fields[0], CLUSTER_JOB_SHUTDOWN_ACK_MAGIC) == 0) {
         processJobShutdownAck(fields, fieldCount, remoteIp);
-    } else if (strcmp(fields[0], CLUSTER_JOB_HW_TIME_MAGIC) == 0) {
-        processHwTimeRequest(fields,fieldCount,remoteIp);
-    } else if (strcmp(fields[0], CLUSTER_JOB_HW_TIME_ACK_MAGIC) == 0) {
-        processHwTimeAck(fields,fieldCount,remoteIp);
     } else if (strcmp(fields[0], CLUSTER_JOB_CAPTURE_MAGIC) == 0) {
         processJobCapture(fields,fieldCount,remoteIp);
     } else if (strcmp(fields[0], CLUSTER_JOB_CAPTURE_RESULT_MAGIC) == 0) {
@@ -4433,8 +4298,7 @@ void clusterNetworkStart()
 void clusterNetworkStop()
 {
     ClusterEspNowRadio::stop();
-    hwTimeSessionFinish("network_stopped", false);
-    // Like the session above: every WiFi-off path (window end, thermal,
+    // Every WiFi-off path (window end, thermal,
     // streamer recovery) returns the meter pins before the caller may move
     // GPIO21 to RTC presence sampling. No-op when the meter is not running.
     ClusterHwTimeMeter::stop("stopped_network_stop");
@@ -4475,7 +4339,6 @@ void clusterNetworkStop()
 
     clusterUdp.stop();
     coordinatorUdp.stop();
-    clusterHwTimePulseCancel();
     runtimeActive = false;
     discoverySocketActive = false;
     discoveryScanLeaseUntilMs = 0;
@@ -4622,13 +4485,9 @@ void clusterLoop()
     }
     {
         LoopLoadDiag::Scope loadScope(LoopLoadDiag::ClusterHwTime);
-        hwTimeSessionService();
         // Passive GPIO meter: role independent, also without cluster runtime.
         ClusterHwTimeMeter::service();
     }
-    // Never keep a measurement output scheduled after Drone Mode has ended.
-    if (clusterHwTimePulseActive() && (!runtimeActive || localIsCoordinator ||
-        !droneModeEnabled())) clusterHwTimePulseCancel();
     // A previously accepted capture has an immutable monotonic deadline.
     // Service it BEFORE potentially expensive UDP authentication, peer expiry,
     // heartbeat and clock-maintenance work. Packet handling must never be
@@ -4926,174 +4785,6 @@ bool clusterRequestNodeShutdown(const String &nodeId, String &error)
     ++shutdownSent;
     ClusterJobs::transition(id,currentCoordinatorEpoch,ClusterJobs::State::Sent,millis());
     return true;
-}
-
-// Signed hardware-clock diagnostic request. Transport only: deliberately not
-// exposed in WebConfig until ACK, GPIO ownership, and capture are integrated.
-bool clusterRequestNodeHwTime(const String &nodeId, uint8_t channel,
-                              int64_t utcUs, String &error, uint32_t *sequenceOut) {
-    if (!clusterLocalIsCoordinator() || !droneModeEnabled()) {
-        error = "Hardware-Zeitmessung nur am Coordinator im Drone Mode.";
-        return false;
-    }
-    // Do not send any requests while the local measurement pins are disabled.
-    if (CLUSTER_HW_TIME_IN_1 < 0 || CLUSTER_HW_TIME_IN_2 < 0 ||
-        CLUSTER_HW_TIME_IN_3 < 0) {
-        error = "Hardware-Messeingaenge am Coordinator nicht konfiguriert.";
-        return false;
-    }
-    int64_t nowUtc=0;
-    if (channel < 1 || channel > ClusterHwTimeProtocol::kChannels ||
-        !clusterTimeNowUs(nowUtc) || nowUtc <= 0 ||
-        utcUs-nowUtc < ClusterHwTimeProtocol::kMinLeadUs ||
-        utcUs-nowUtc > ClusterHwTimeProtocol::kMaxLeadUs) {
-        error = "Ungueltiger Messkanal oder geplanter Messzeitpunkt.";
-        return false;
-    }
-    const ClusterPeer *peer=findPeer(nodeId.c_str());
-    if (!peer || !peer->used || !usableIp(peer->ip) || !peer->bootNonce ||
-        (uint32_t)(millis()-peer->lastSeenMs)>60000UL) {
-        error = "Mess-Node nicht erreichbar.";
-        return false;
-    }
-    if (rejectStandbyNodeAction(peer, error)) return false;
-    if (++probeSeq==0) ++probeSeq;
-    char cb[9],nb[9],when[30];
-    snprintf(cb,sizeof(cb),"%08lx",(unsigned long)bootNonce);
-    snprintf(nb,sizeof(nb),"%08lx",(unsigned long)peer->bootNonce);
-    snprintf(when,sizeof(when),"%lld",(long long)utcUs);
-    const String cmd=String(CLUSTER_JOB_HW_TIME_MAGIC)+"|"+runtimeClusterTag+"|"+
-        deviceIntegrationId()+"|"+cb+"|"+String((unsigned long)currentCoordinatorEpoch)+
-        "|"+nodeId+"|"+nb+"|"+String((unsigned long)probeSeq)+"|"+
-        String((unsigned)channel)+"|"+when;
-    if (!sendSignedPayloadTo(cmd,peer->ip,CLUSTER_COORDINATOR_PORT,
-                             "hardware clock diagnostic")) {
-        error = "Hardware-Messauftrag nicht gesendet.";
-        return false;
-    }
-    if (sequenceOut) *sequenceOut = probeSeq;
-    return true;
-}
-
-// Safe coordinator-side one-shot session; no automatic repeated triggering.
-// Deliberately callable only after explicit GPIO pin map qualification.
-bool clusterHwTimeStart(const String nodeIds[3], String &error) {
-    if (!nodeIds) { error = "Node-Liste fehlt."; return false; }
-    if (hwSession.active) { error = "Messung bereits aktiv."; return false; }
-    if (!clusterLocalIsCoordinator() || !droneModeEnabled()) {
-        error = "Coordinator muss im Drone Mode sein."; return false;
-    }
-    for (int i = 0; i < 3; ++i) {
-        if (nodeIds[i].isEmpty()) { error = "Drei Nodes erforderlich."; return false; }
-        for (int j = 0; j < i; ++j) if (nodeIds[i] == nodeIds[j]) {
-            error = "Nodes muessen unterschiedlich sein."; return false;
-        }
-        const ClusterPeer *peer = findPeer(nodeIds[i].c_str());
-        if (!peer || !peer->used || !usableIp(peer->ip) || !peer->bootNonce ||
-            (uint32_t)(millis() - peer->lastSeenMs) > 60000UL) {
-            error = "Mess-Node nicht erreichbar: " + nodeIds[i]; return false;
-        }
-        if (rejectStandbyNodeAction(peer, error)) return false;
-    }
-    int64_t nowUtc = 0;
-    if (!clusterTimeNowUs(nowUtc)) { error = "Cluster-Uhr nicht bereit."; return false; }
-    if (!ClusterHwTimeGpioLease::acquire(error)) return false;
-    // Bind UTC and mono clock as closely as possible. No RTC adjustment.
-    const int64_t anchorMono = esp_timer_get_time();
-    int64_t anchorUtc = 0;
-    if (!clusterTimeNowUs(anchorUtc)) {
-        ClusterHwTimeGpioLease::release();
-        error = "Cluster-Uhr verloren."; return false;
-    }
-    const int64_t utc = anchorUtc + 5000000LL; // 5 seconds lead
-    hwSession = HwTimeSession{};
-    hwSession.active = true;
-    hwSession.targetUtcUs = utc;
-    hwSession.referenceMonoUs = anchorMono + 5000000LL;
-    hwSession.epoch = currentCoordinatorEpoch;
-    hwSession.startedMs = millis();
-    for (int i = 0; i < 3; ++i) hwSession.nodes[i] = nodeIds[i];
-    // Never send a partial set by accident if the pins could not be acquired.
-    // Once sent, failed peers cannot be cancelled remotely; keep sampling and
-    // mark missing edges, rather than claiming an atomic multi-node command.
-    bool sentAll = true;
-    for (int i = 0; i < 3; ++i) {
-        uint32_t seq = 0;
-        String sendError;
-        if (!clusterRequestNodeHwTime(nodeIds[i], (uint8_t)(i + 1), utc,
-                                     sendError, &seq)) {
-            sentAll = false;
-            error = "Kanal " + String(i + 1) + ": " + sendError;
-            break;
-        }
-        hwSession.seq[i] = seq;
-    }
-    if (!sentAll) {
-        // No new commands issued for remaining nodes. Previously sent nodes
-        // can still pulse; keep inputs reserved through the deadline.
-        hwSessionLastResult = "partially_sent";
-        return false;
-    }
-    hwSessionLastResult = "waiting_for_edges";
-    return true;
-}
-
-// CSV output uses the coordinator's monotonic timestamp as an observation axis.
-// It is not an absolute UTC timestamp or a calibrated hardware-capture clock.
-String clusterHwTimeCsv() {
-    String csv = "sample,reference_mono_us,node1_ms,node2_ms,node3_ms,node1_minus_2_ms,node1_minus_3_ms,node2_minus_3_ms\n";
-    ClusterHwTimeSeries::Row row = {};
-    const size_t rows = hwHistory ? hwHistory->size() : 0;
-    for (size_t i = 0; i < rows; ++i) {
-        if (!hwHistory->get(i, row)) continue;
-        csv += String(row.sequence) + "," + String((long long)row.referenceUs);
-        for (int ch = 0; ch < 3; ++ch) {
-            csv += ",";
-            if (row.offsets.valid[ch]) csv += String(row.offsets.offsetMs[ch], 4);
-        }
-        for (int pair = 0; pair < 3; ++pair) {
-            csv += ",";
-            if (row.offsets.pairValid[pair]) csv += String(row.offsets.pairOffsetMs[pair], 4);
-        }
-        csv += "\n";
-    }
-    return csv;
-}
-
-String clusterHwTimeStatusJson() {
-    String json = "{\"active\":";
-    json += hwSession.active ? "true" : "false";
-    json += ",\"state\":\"" + hwSessionLastResult + "\"";
-    json += ",\"rows\":" + String((unsigned)(hwHistory ? hwHistory->size() : 0));
-    if (hwHistoryAllocFailed) json += ",\"history_error\":\"psram_unavailable\"";
-    json += ",\"arm\":[";
-    for (int i = 0; i < 3; ++i) {
-        if (i) json += ',';
-        json += String(hwSession.armStatus[i]);
-    }
-    json += "],\"drift_ppm\":[";
-    for (int i = 0; i < 3; ++i) {
-        if (i) json += ',';
-        double ppm = 0;
-        json += hwHistory && hwHistory->drift(i, ppm) ? String(ppm, 2) : String("null");
-    }
-    json += "],\"samples\":[";
-    // Small bounded history for the browser; full history available as CSV.
-    const size_t total = hwHistory ? hwHistory->size() : 0;
-    const size_t first = total > 96 ? total - 96 : 0;
-    ClusterHwTimeSeries::Row row = {};
-    for (size_t i = first; i < total; ++i) {
-        if (!hwHistory->get(i, row)) continue;
-        if (i != first) json += ',';
-        json += "{\"n\":" + String(row.sequence) + ",\"ms\":[";
-        for (int ch = 0; ch < 3; ++ch) {
-            if (ch) json += ',';
-            json += row.offsets.valid[ch] ? String(row.offsets.offsetMs[ch], 4) : String("null");
-        }
-        json += "]}";
-    }
-    json += "]}";
-    return json;
 }
 
 bool clusterRequestNodeCapture(const String &nodeId,int64_t utcUs,String &error,bool testPulse){
@@ -5642,29 +5333,8 @@ static String buildClusterStatusJson(ClusterStatusChunkSink sink, void *ctx)
     // Two-way calibration series.
     ju("probes_sent", esn.probesSent); ju("probes_answered", esn.probesAnswered);
     ju("exchanges_complete", esn.exchangesComplete); ju("exchange_timeouts", esn.exchangeTimeouts);
-    jb("last_exchange_valid", esn.lastExchangeValid);
-    jd("last_offset_us", esn.lastOffsetUs, 3);
-    jd("last_rtt_us", esn.lastRttUs, 3);
-    jb("last_series_estimate_available", esn.lastSeriesEstimateAvailable);
-    ju("last_series_estimate_age_ms", esn.lastSeriesEstimateAgeMs);
-    ju("last_series_selected", esn.lastSeriesSelected);
-    jd("last_series_spread_us", esn.lastSeriesSpreadUs, 3);
-    jd("last_series_rtt_min_us", esn.lastSeriesRttMinUs, 3);
-    jd("last_series_rtt_max_us", esn.lastSeriesRttMaxUs, 3);
-    jd("last_series_offset_p10_relative_us", esn.lastSeriesOffsetP10Us, 3);
-    jd("last_series_offset_p90_relative_us", esn.lastSeriesOffsetP90Us, 3);
-    ju("last_accepted_age_ms", esn.lastAcceptedAgeMs);
     ju("series_accepted", esn.seriesAccepted); ju("series_rejected", esn.seriesRejected);
-    ju("series_reject_invalid", esn.seriesRejectInvalid);
-    ju("series_reject_spread", esn.seriesRejectSpread);
-    ju("series_reject_rtt", esn.seriesRejectRtt);
-    ju("series_reject_deadline", esn.seriesRejectDeadline);
-    ju("series_consecutive_failures", esn.seriesConsecutiveFailures);
     ju("series_last_failure_reason", esn.seriesLastFailureReason);
-    ju("series_last_rejected_age_ms", esn.seriesLastRejectedAgeMs);
-    ju("series_last_rejected_spread_us", esn.seriesLastRejectedSpreadUs);
-    ju("series_last_completed_age_ms", esn.seriesLastCompletedAgeMs);
-    ju("series_next_in_ms", esn.seriesNextInMs);
     ju("action_pause_remaining_ms", esn.capturePauseRemainingMs);
     // Coordinator only (0 on nodes): calibration slot scheduling (cluster_slot_scheduler.h).
     ju("slot_active_peers", esn.slotActivePeers);
@@ -5674,66 +5344,10 @@ static String buildClusterStatusJson(ClusterStatusChunkSink sink, void *ctx)
     ju("slot_capacity", esn.slotCapacity);
     jb("slot_table_full_recent", esn.slotTableFullRecent);
     ju("slot_rotations", esn.slotRotations);
-    jb("slot_owner_recovery", esn.slotOwnerRecovery);
-    ju("slot_recovery_requested", esn.slotRecoveryRequested);
-    ju("slot_recovery_granted", esn.slotRecoveryGranted);
-    ju("slot_recovery_deferred", esn.slotRecoveryDeferred);
-    ju("slot_recovery_succeeded", esn.slotRecoverySucceeded);
-    ju("slot_recovery_failed", esn.slotRecoveryFailed);
     ju("slot_succeeded", esn.slotSucceeded); ju("slot_failed", esn.slotFailed);
-    ju("slot_ended_series_over", esn.slotEndedSeriesOver);
-    ju("slot_ended_no_activity", esn.slotEndedNoActivity);
-    ju("slot_ended_hard_cap", esn.slotEndedHardCap);
-    ju("slot_ended_owner_lost", esn.slotEndedOwnerLost);
-    ju("slot_last_ms", esn.slotLastMs); ju("slot_mean_ms", esn.slotMeanMs);
-    ju("slot_period_mean_ms", esn.slotPeriodMeanMs);
     ju("slot_due_peers", esn.slotDuePeers);
     ju("slot_expired_peers", esn.slotExpiredPeers);
     ju("slot_oldest_age_ms", esn.slotOldestAgeMs);
-    // Firmware timing of this device.
-    ju("rx_queue_delay_last_us", esn.rxQueueDelayLastUs);
-    ju("rx_queue_delay_max_us", esn.rxQueueDelayMaxUs);
-    ju("reply_final_dispatch_gap_last_us", esn.replyFinalDispatchGapLastUs);
-    ju("reply_final_dispatch_gap_max_us", esn.replyFinalDispatchGapMaxUs);
-    ju("probe_tx_pre_send_last_us", esn.probeTxPreSendLastUs);
-    ju("probe_tx_pre_send_max_us", esn.probeTxPreSendMaxUs);
-    ju("probe_tx_pre_send_samples", esn.probeTxPreSendSamples);
-    jd("probe_tx_pre_send_mean_us", esn.probeTxPreSendSamples ? double(esn.probeTxPreSendTotalUs)/esn.probeTxPreSendSamples : 0.0, 2);
-    ju("reply_tx_pre_send_last_us", esn.replyTxPreSendLastUs);
-    ju("reply_tx_pre_send_max_us", esn.replyTxPreSendMaxUs);
-    ju("reply_tx_pre_send_samples", esn.replyTxPreSendSamples);
-    jd("reply_tx_pre_send_mean_us", esn.replyTxPreSendSamples ? double(esn.replyTxPreSendTotalUs)/esn.replyTxPreSendSamples : 0.0, 2);
-    ju("tx_callback_delay_last_us", esn.txCallbackLatencyLastUs);
-    ju("tx_callback_delay_max_us", esn.txCallbackLatencyMaxUs);
-    ju("tx_callback_samples", esn.txCallbackSamples);
-    ju("tx_callback_failed", esn.txCallbackFailed);
-    ju("tx_pending_overflow", esn.txPendingOverflow);
-    ju("tx_callback_unmatched", esn.txCallbackUnmatched);
-    ju("probe_reply_delay_samples", esn.probeReplyDelaySamples);
-    ju("probe_reply_delay_last_us", esn.probeReplyDelayLastUs);
-    ju("probe_reply_delay_max_us", esn.probeReplyDelayMaxUs);
-    jd("probe_reply_delay_mean_us", esn.probeReplyDelaySamples ?
-        (double)esn.probeReplyDelayTotalUs / (double)esn.probeReplyDelaySamples : 0.0, 1);
-    json += ",\"probe_reply_delay_hist\":[";
-    for (uint8_t i = 0; i < ClusterEspNowRadio::Diagnostics::kProbeReplyDelayBuckets; ++i) {
-        if (i) json += ",";
-        json += String((unsigned long)esn.probeReplyDelayHist[i]);
-    }
-    json += "]";
-    ju("tx_reply_latency_samples", esn.txReplyLatencySamples);
-    ju("tx_reply_latency_last_us", esn.txReplyLatencyLastUs);
-    ju("tx_reply_latency_max_us", esn.txReplyLatencyMaxUs);
-    json += ",\"tx_reply_latency_hist\":[";
-    for (uint8_t i = 0; i < ClusterEspNowRadio::Diagnostics::kProbeReplyDelayBuckets; ++i) {
-        if (i) json += ",";
-        json += String((unsigned long)esn.txReplyLatencyHist[i]);
-    }
-    json += "],\"probe_reply_delay_hist_upper_us\":[";
-    for (uint8_t i = 0; i + 1 < ClusterEspNowRadio::Diagnostics::kProbeReplyDelayBuckets; ++i) {
-        if (i) json += ",";
-        json += String((unsigned long)ClusterEspNowRadio::kProbeReplyDelayBucketUpperUs[i]);
-    }
-    json += "]";
     // Role-based WiFi power save (actual value read via esp_wifi_get_ps()).
     {
         const WifiPowerPolicy::Status wps = WifiPowerPolicy::status();

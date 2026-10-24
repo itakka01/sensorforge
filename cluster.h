@@ -69,12 +69,6 @@ String clusterTxPowerJson();
 // Capture time in UTC microseconds; shared across all selected nodes.
 // testPulse: request the optional GPIO test pulse (SFJC1 field "tp1"), default off.
 bool clusterRequestNodeCapture(const String &nodeId, int64_t utcUs, String &error, bool testPulse = false);
-// Transport-only SFHT1 sender; not enabled in WebConfig until measurement safety is complete.
-bool clusterRequestNodeHwTime(const String &nodeId, uint8_t channel, int64_t utcUs, String &error, uint32_t *sequenceOut = nullptr);
-// Three-node one-shot GPIO diagnostic, disabled by default hardware pin mapping.
-bool clusterHwTimeStart(const String nodeIds[3], String &error);
-String clusterHwTimeStatusJson();
-String clusterHwTimeCsv();
 bool clusterRuntimeActive();
 bool clusterLocalIsCoordinator();
 bool clusterRestartRequired();

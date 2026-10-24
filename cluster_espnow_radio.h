@@ -38,21 +38,9 @@ const char *delaySourceName(DelaySource s);
 struct Diagnostics {
     uint32_t sent=0, received=0, authenticated=0, rejected=0, replay=0, dropped=0;
     uint32_t probesSent=0, probesAnswered=0, exchangesComplete=0, exchangeTimeouts=0;
-    // Firmware service latency, NOT RF/MAC airtime; max values since radio start.
-    uint32_t rxQueueDelayLastUs=0, rxQueueDelayMaxUs=0;
-    uint32_t replyFinalDispatchGapLastUs=0, replyFinalDispatchGapMaxUs=0;
-    // esp_now_send() enqueue-to-driver-callback timing (NOT PHY TX timestamp).
-    uint32_t txCallbackLatencyLastUs=0, txCallbackLatencyMaxUs=0, txCallbackSamples=0;
-    uint32_t txCallbackFailed=0, txPendingOverflow=0, txCallbackUnmatched=0;
-    // t1/t3 software timestamp -> immediately before esp_now_send() (NOT RF airtime).
-    uint32_t probeTxPreSendLastUs=0, probeTxPreSendMaxUs=0, probeTxPreSendSamples=0;
-    uint32_t replyTxPreSendLastUs=0, replyTxPreSendMaxUs=0, replyTxPreSendSamples=0;
-    uint64_t probeTxPreSendTotalUs=0, replyTxPreSendTotalUs=0;
     uint8_t channel=0;
     bool active=false;
     uint32_t capturePauseRemainingMs=0;
-    bool syncPermission=false;
-    uint32_t syncPermissionRemainingMs=0;
 
     // --- Beacon, coordinator side
     uint32_t beaconsSent=0, followUpsSent=0, followUpsWithoutTxDone=0;
@@ -85,55 +73,24 @@ struct Diagnostics {
     bool precisionValid=false;
     uint32_t sourceChanges=0;
 
-    // Two-way calibration series quality (since radio start). Reasons:
-    // 1=invalid/insufficient, 2=spread, 3=RTT, 4=series deadline.
-    bool lastExchangeValid=false;
-    double lastOffsetUs=0, lastRttUs=0;
-    bool lastSeriesEstimateAvailable=false;
-    uint32_t lastSeriesEstimateAgeMs=0;
-    uint8_t lastSeriesSelected=0;
-    double lastSeriesSpreadUs=0;
-    double lastSeriesRttMinUs=0, lastSeriesRttMaxUs=0;
-    double lastSeriesOffsetP10Us=0, lastSeriesOffsetP90Us=0;
-    uint32_t lastAcceptedAgeMs=0;
+    // Two-way calibration series (since radio start). Last failure reason:
+    // 0=none, 1=invalid/insufficient, 2=spread, 3=RTT, 4=series deadline.
     uint32_t seriesAccepted=0, seriesRejected=0;
-    uint32_t seriesRejectInvalid=0, seriesRejectSpread=0, seriesRejectRtt=0, seriesRejectDeadline=0;
-    uint8_t seriesConsecutiveFailures=0, seriesLastFailureReason=0;
-    uint32_t seriesLastRejectedAgeMs=0;     // 0 = none
-    uint32_t seriesLastRejectedSpreadUs=0;  // 0 = no metrics (reason 1/4)
-    uint32_t seriesLastCompletedAgeMs=0;    // 0 = none
-    uint32_t seriesNextInMs=0;              // 0 = due / not scheduled
+    uint8_t seriesLastFailureReason=0;
 
     // Coordinator only: calibration slot scheduling (cluster_slot_scheduler.h).
     // slotCycleEstimateMs = active peers x measured mean start-to-start slot period
     // (0 until two slots started). slotRotations = finished slots.
     uint32_t slotActivePeers=0, slotCycleEstimateMs=0, slotRotations=0;
     uint32_t slotRefreshMs=0, slotLifetimeMs=0;
-    // Diagnostics only: slot table size and whether an active node found no
-    // free slot within the last kPeerActiveMs (it then gets no calibration).
+    // Slot table size and whether an active node found no free slot within
+    // the last kPeerActiveMs (it then gets no calibration).
     uint32_t slotCapacity=0;
     bool slotTableFullRecent=false;
-    bool slotOwnerRecovery=false;
-    uint32_t slotRecoveryRequested=0, slotRecoveryGranted=0, slotRecoveryDeferred=0;
-    uint32_t slotRecoverySucceeded=0, slotRecoveryFailed=0;
     uint32_t slotSucceeded=0, slotFailed=0;
-    uint32_t slotEndedSeriesOver=0, slotEndedNoActivity=0, slotEndedHardCap=0, slotEndedOwnerLost=0;
-    uint32_t slotLastMs=0, slotMeanMs=0, slotPeriodMeanMs=0;
     // Active peers: due for a calibration now / without calibration / oldest calibration.
     uint32_t slotDuePeers=0, slotExpiredPeers=0, slotOldestAgeMs=0;
-    // Local probe RX callback (t2) -> reply pre-send stamp (t3), answered probes only.
-    // Firmware service latency (cancels in the offset math); buckets: upper bounds in us.
-    static constexpr uint8_t kProbeReplyDelayBuckets=9;
-    uint32_t probeReplyDelaySamples=0, probeReplyDelayLastUs=0, probeReplyDelayMaxUs=0;
-    uint64_t probeReplyDelayTotalUs=0;
-    uint32_t probeReplyDelayHist[kProbeReplyDelayBuckets]={};
-    // Reply frames only: enqueue (before esp_now_send) -> TX-done callback.
-    uint32_t txReplyLatencySamples=0, txReplyLatencyLastUs=0, txReplyLatencyMaxUs=0;
-    uint32_t txReplyLatencyHist[kProbeReplyDelayBuckets]={};
 };
-// Upper bounds (us) of probeReplyDelayHist buckets 0..7; bucket 8 = above the last bound.
-constexpr uint32_t kProbeReplyDelayBucketUpperUs[Diagnostics::kProbeReplyDelayBuckets-1]=
-    {500,1000,2000,5000,10000,20000,50000,100000};
 Diagnostics diagnostics();
 
 // Last 128 beacons (PSRAM), for offline analysis across nodes: the same
@@ -185,25 +142,9 @@ struct NodeSyncReport {
     // Two-way calibration (NodeSyncReport frames): sampleAgeMs = age of the
     // last successful calibration, precisionAccepted = node has its own delay.
     uint32_t sampleAgeMs=0;
-    int32_t offsetUs=0;
-    uint32_t rttUs=0;
-    uint8_t acceptedSamples=0;
     bool precisionAccepted=false;
-    // Only meaningful when precisionAccepted=false and diagnostic frame flag set.
-    uint32_t probesSent=0, exchangesComplete=0;
-    uint8_t failureCode=0, failedSeries=0;
-    // Authenticated, additive telemetry; per-node radio runtime, reset on radio restart.
+    // Series counters of the node, per radio runtime.
     uint32_t successfulSeries=0, rejectedSeries=0;
-    uint32_t lastSeriesAgeMs=0;
-    uint8_t lastSeriesResult=0; // 0=no completed series, 1=accepted, 2=rejected, 3=deadline
-    bool hasSeriesStatistics=false;
-    bool hasLastRejectedSeries=false, lastRejectedMetricsValid=false;
-    uint8_t lastRejectedReason=0;
-    uint32_t lastRejectedAgeMs=0, lastRejectedSpreadUs=0, lastRejectedRttUs=0;
-    uint32_t failedSpreadUs=0, failedRttUs=0;
-    uint8_t failedAccepted=0, failedSelected=0;
-    int32_t failedMinRttOffsetUs=0, failedSelectedOffsetUs=0;
-    bool hasFailureMetrics=false, hasFailureOffsets=false;
     // Beacon sync (BeaconSyncReport frames).
     bool hasBeaconReport=false;
     uint32_t beaconReceivedAgeMs=0;    // local age of the beacon report
@@ -217,7 +158,6 @@ struct NodeSyncReport {
     bool ownDelayKnown=false;
     double ownDelayUs=0;
     uint32_t ownDelayAgeS=0;
-    uint16_t spreadUs=0;               // last accepted two-way series
     // Coordinator-side statistics of this node boot, from its beacon reports.
     // A report gap longer than kReportGapMs counts as not precise.
     uint32_t monitoredS=0;             // since the first beacon report

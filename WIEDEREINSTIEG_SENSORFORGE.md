@@ -1,5 +1,8 @@
+## Alter Zeit-Code entfernt (2026-10-24) – v87-beta149
+Nur noch ein Zeitverfahren im Projekt: SFHT1-Hardwaremessung, alte Zwei-Wege-Diagnosepakete (`NodeDriftReport`), ungenutzte Funkdiagnose, `sensorforge_monitor`, 67 alte Notizen und 3 veraltete Tests entfernt. `ESPNOW_TIME_ARCHITECTURE.md` neu geschrieben. GPIO-Testimpuls und Freenove-Messgerät bleiben. Hardwaretest nach Flash offen.
+
 ## Eine Zeitansicht (2026-10-24) – v87-beta148
-Coordinator-Seite: Geräteliste mit Spalte „Zeit“, Sortierung (Probleme zuerst/Name/Gruppe), „nur Probleme“, Laden nur per „Aktualisieren“ (optional 30 s) statt Dauerabfrage. Abschnitt „Zeitsynchronisation“ mit Langzeitwerten je Node (Anteil präzise, Ausfälle, größte Streuung) aus den Zeitberichten, CSV `/cluster_time_csv`. Manueller Zeitabgleich und alte Zeittabellen entfernt. `sensorforge_monitor` soll nach Sichtung der neuen Ansicht gelöscht werden (Entscheidung des Users ausstehend).
+Coordinator-Seite: Geräteliste mit Spalte „Zeit“, Sortierung (Probleme zuerst/Name/Gruppe), „nur Probleme“, Laden nur per „Aktualisieren“ (optional 30 s) statt Dauerabfrage. Abschnitt „Zeitsynchronisation“ mit Langzeitwerten je Node (Anteil präzise, Ausfälle, größte Streuung) aus den Zeitberichten, CSV `/cluster_time_csv`. Manueller Zeitabgleich und alte Zeittabellen entfernt. `sensorforge_monitor` in beta149 gelöscht.
 
 ## Zeitsignal-Verfahren (2026-10-24) – v87-beta147
 

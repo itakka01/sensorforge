@@ -360,34 +360,6 @@ static void handleClusterPage()
     server.send(200, "text/html; charset=utf-8", html);
 }
 
-static void handleClusterHwTimeStart() {
-    if (!clusterLocalIsCoordinator() || !droneModeEnabled()) {
-        server.send(403, "text/plain; charset=utf-8", "Coordinator muss im Drone Mode sein."); return;
-    }
-    String ids[3] = {server.arg("node1"), server.arg("node2"), server.arg("node3")};
-    String error;
-    ClusterEspNowRadio::pauseForCapture(10000UL);
-    if (!clusterHwTimeStart(ids, error)) {
-        server.send(409, "text/plain; charset=utf-8", error); return;
-    }
-    server.sendHeader("Cache-Control", "no-store");
-    server.send(200, "text/plain; charset=utf-8", "Messfenster gestartet; ARM-Rueckmeldungen und Flanken im Status pruefen.");
-}
-
-static void handleClusterHwTimeStatus() {
-    server.sendHeader("Cache-Control", "no-store");
-    server.send(200, "application/json; charset=utf-8", clusterHwTimeStatusJson());
-}
-
-static void handleClusterHwTimeCsv() {
-    if (!clusterLocalIsCoordinator()) {
-        server.send(403, "text/plain; charset=utf-8", "Nur am Coordinator verfuegbar."); return;
-    }
-    server.sendHeader("Cache-Control", "no-store");
-    server.sendHeader("Content-Disposition", "attachment; filename=sensorforge_hw_time.csv");
-    server.send(200, "text/csv; charset=utf-8", clusterHwTimeCsv());
-}
-
 static void handleClusterHwMeterStart() {
     String error;
     if (!ClusterHwTimeMeter::start(error)) {
@@ -1587,9 +1559,6 @@ void webconfigClusterRegisterRoutes(
     serverInstance.on("/cluster", HTTP_GET, handleClusterPage);
     serverInstance.on("/cluster_status", HTTP_GET, handleClusterStatus);
     serverInstance.on("/load_diag", HTTP_GET, handleLoadDiag);
-    serverInstance.on("/cluster_hw_time_start", HTTP_POST, handleClusterHwTimeStart);
-    serverInstance.on("/cluster_hw_time_status", HTTP_GET, handleClusterHwTimeStatus);
-    serverInstance.on("/cluster_hw_time_csv", HTTP_GET, handleClusterHwTimeCsv);
     serverInstance.on("/cluster_hw_meter_start", HTTP_POST, handleClusterHwMeterStart);
     serverInstance.on("/cluster_hw_meter_stop", HTTP_POST, handleClusterHwMeterStop);
     serverInstance.on("/cluster_hw_meter_status", HTTP_GET, handleClusterHwMeterStatus);

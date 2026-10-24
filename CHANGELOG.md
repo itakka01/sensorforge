@@ -1,3 +1,19 @@
+## v87-beta149 — 2026-10-24 (ALTEN ZEIT-CODE ENTFERNT)
+
+**Anlass:** Seit beta147 gibt es nur noch ein Zeitverfahren (Zeitsignal + Laufzeit-Einmessung). Code, Pakete, Tests und Doku der früheren Verfahren lagen noch im Projekt.
+
+**ENTFERNT (Code):**
+- Hardware-Zeitmessung über drei Coordinator-Eingänge (`SFHT1`/`SFHTA1`, `/cluster_hw_time_start|status|csv`, `clusterRequestNodeHwTime`, `clusterHwTimeStart`, Sitzungsverlauf, `cluster_hw_time_protocol.h`, `cluster_hw_time_series.h`, zeitgesteuerter Impuls `clusterHwTimePulseArm` und Driftfunktion in `cluster_hw_time_math.h`; die Firmware-Update-Sperre prüft den entfallenen Impuls nicht mehr). Es bleiben der GPIO-Testimpuls bei Aufnahmen und das passive Freenove-Messgerät.
+- Alte Diagnosepakete der Zwei-Wege-Messung: Pakettyp `NodeDriftReport` (7), Bericht der letzten verworfenen Serie, Fehler-Metriken und Zähler im Bericht „noch nicht eingemessen“, Versatz/RTT im Einmessbericht, Serien-Streuung im Zeitsignal-Bericht (Bits jetzt 0). `NodeSyncReport` trägt nur noch: eingemessen + Alter (0x100), nicht eingemessen (0x200), Serien ok/verworfen (0x1000).
+- Lokale Funkdiagnose ohne Anzeige: Sende-/Empfangs-Latenzen, Histogramme Probe→Reply und Reply-TX, Vorlaufzeiten, Detailwerte der letzten Serie, Recovery- und Slot-Ende-Zähler. `/cluster_status` → `espnow_time_local` ist dadurch etwa halb so groß.
+- Veraltete Host-Tests `test_software_correction`, `test_tx_timestamp_precision(_v2)` (eigenständige Machbarkeitsrechnungen von beta131).
+
+**ENTFERNT (sonstiges):** Ordner `sensorforge_monitor` (ersetzt durch Abschnitt „Zeitsynchronisation“ und `/cluster_time_csv`; lokale, nicht versionierte Messläufe unter `sensorforge_monitor/sensorforge_tests/` bleiben liegen). 67 überholte Notizen: alle `ESPNOW_*.md` außer `ESPNOW_TIME_ARCHITECTURE.md`, `BETA131_*.md`, `CYCLE22_*.md`, `V2_*.md`, `HW_TIME_MESSSTART.md`.
+
+**DOKU:** `ESPNOW_TIME_ARCHITECTURE.md` neu, beschreibt nur noch das aktuelle Verfahren. `TESTS_README.md` mit allen Host-Tests. Verweise in `README.md`, `CLAUDE.md`, `CLUSTER_ARCHITECTURE.md` angepasst.
+
+**Unverändert:** Zeitstempel-Rechnung, Schätzer, Grenzwerte, Slot-Planung, Wi-Fi-Zeit als Rückfall. Paketformat V3 bleibt; die verbliebenen Pakete sind bitgleich. Ein Coordinator mit beta149 arbeitet mit Nodes auf beta147/148 zusammen (deren Zusatzberichte werden ignoriert), trotzdem alle Boards flashen.
+
 ## v87-beta148 — 2026-10-24 (EINE ZEITANSICHT, GERÄTELISTE MIT ZEITSTATUS)
 
 **Anlass:** Auf der Coordinator-Seite gab es mehrere Zeitansichten (alte Sync-Tabelle, ESP-NOW-Diagnose, Hardware-Zeitmessung, manueller Zeitabgleich), und alle Widgets fragten `/cluster_status` alle 2–10 s ab. Der Status war schon bei 10 Geräten 35 KB groß (davon 20 KB Zeitberichte), bei 100 Nodes wären es ~350 KB je Abfrage gewesen.

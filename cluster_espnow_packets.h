@@ -12,7 +12,7 @@ constexpr size_t kPacketSize = kPayloadSize + kMacSize;
 constexpr uint8_t kVersion = 3;  // V3: one-way beacon sync (beta147)
 // Beacon/FollowUp: one-way time signal of the coordinator (ESPNOW_TIME_ARCHITECTURE.md).
 // BeaconSyncReport: node -> coordinator state of the beacon sync.
-enum class Type : uint8_t { Beacon=1, Probe=2, Reply=3, Final=4, SyncControl=5, NodeSyncReport=6, NodeDriftReport=7, BenchControl=8, BenchDown=9, BenchUp=10, BenchAck=11, FollowUp=12, BeaconSyncReport=13 };
+enum class Type : uint8_t { Beacon=1, Probe=2, Reply=3, Final=4, SyncControl=5, NodeSyncReport=6, BenchControl=8, BenchDown=9, BenchUp=10, BenchAck=11, FollowUp=12, BeaconSyncReport=13 };
 struct Frame {
   Type type = Type::Beacon;
   uint32_t epoch = 0;

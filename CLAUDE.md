@@ -70,7 +70,8 @@ Physical (SD/LittleFS)
 - `cluster_espnow_radio.cpp` (91 KB) - ESP-NOW Transport, Two-Way-Ranging
 - `cluster_capture.cpp` - UTC-terminierte Foto-Jobs + **Array Bounds Defense-in-Depth (V3)**
 - `cluster_jobs.cpp` - Signierte Remote-Befehle (Ed25519)
-- `cluster_hw_time_*.cpp` (7 Module) - Hardware-Zeitsync (⚠️ µs-Genauigkeit unbewiesen)
+- `cluster_beacon_sync.cpp/h` - Zeitsignal-Modell (Hüllkurve, Versatz + Gangabweichung)
+- `cluster_hw_time_*` (10 Dateien) - GPIO-Testimpuls bei Capture + passives Freenove-Messgerät
 - `streamer.cpp/h` (105 KB) - RTSP/RTP-JPEG, HTTP-MJPEG + **Timer Overflow Protection (V3)**
 - `sync_api.cpp/h` (136 KB) - REST API `/api/v1` + **Integer Overflow Protection (V3)**
 
@@ -205,7 +206,7 @@ Physical (SD/LittleFS)
 
 #### 6. ESP-NOW Zeitsync - µs-Genauigkeit unbewiesen
 **Problem:** Hardware-Validierung fehlt
-**Status:** Estimator v2 implementiert, nicht charakterisiert
+**Status:** Zeitsignal-Verfahren (beta147) auf 9 Nodes softwareseitig 8–26 µs Streuung; GPIO-Nachweis offen
 **Code:** `cluster_espnow_radio.cpp` (91 KB)
 
 ### P2 - Mittlere Risiken
@@ -426,17 +427,16 @@ SFJC1 empfangen → Signatur prüfen
 - `SFJCR1` - Job Result (Ed25519)
 - `SFJCA1` - Job Receipt (HMAC)
 
-**Zeitsynchronisation (Estimator v2):**
-- Feste Serienlänge: 16 Austausche (adaptive 16/32/64 in beta131 entfernt)
-- RTT-Quartile-Median
-- Drift-Regression: 24 Serien, ≥3 Min
-- **⚠️ Nicht Hardware-validiert!**
+**Zeitsynchronisation (seit beta147):**
+- Coordinator-Zeitsignal jede Sekunde (Beacon + FollowUp), Node-Modell aus oberer Hüllkurve
+- Funklaufzeit alle 10 min per Hin-und-zurück-Serie (16 Austausche, RTT-Quartil-Median), sonst Cluster-Mittelwert
+- Anzeige: `/cluster_coordinate` (Spalte „Zeit“, Abschnitt „Zeitsynchronisation“, CSV)
+- **⚠️ GPIO-Nachweis der Auslösegenauigkeit offen**
 
 ### Jobs
 
 **Typen:**
 - Restart, Shutdown
-- Time-Sync (Precision RTT)
 - **Capture** (UTC-terminiert, PSRAM-Media)
 - SD-Wipe, Node-Probe
 
@@ -650,7 +650,6 @@ PCLK = GPIO13
 #### System Architecture
 - `SD_RECORDER_HANDOFF_AUDIT.md` - SD-Admission-Details (P1)
 - `ESPNOW_TIME_ARCHITECTURE.md` - Zeitsync-Architektur
-- `ESPNOW_ESTIMATOR_V2.md` - Estimator-Spezifikation
 - `OTA_AUTO_UPDATE.md` - Auto-Update-Design
 - `SENSORFORGE_API_V1.md` - REST API-Vertrag
 - `FIRMWARE_SIGNING.txt` - Signatur-Prozess

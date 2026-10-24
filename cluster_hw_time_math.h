@@ -30,14 +30,4 @@ inline Result compare(const Sample &s) {
     }
     return result;
 }
-// Two-point relative drift. Returns false for missing samples, reversed or
-// equal timestamps. Positive ppm means the measured offset grows over time.
-inline bool driftPpm(int64_t firstReferenceUs, double firstOffsetMs,
-                     int64_t lastReferenceUs, double lastOffsetMs,
-                     double &ppm) {
-    if (lastReferenceUs <= firstReferenceUs) return false;
-    const double elapsedMs = (double)(lastReferenceUs - firstReferenceUs) / 1000.0;
-    ppm = ((lastOffsetMs - firstOffsetMs) / elapsedMs) * 1000000.0;
-    return true;
-}
 }

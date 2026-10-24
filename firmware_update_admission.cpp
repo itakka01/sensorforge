@@ -2,7 +2,6 @@
 #include "drone_mode.h"
 #include "recorder.h"
 #include "cluster.h"
-#include "cluster_hw_time_pulse.h"
 #include "cluster_hw_time_gpio_lease.h"
 #include "web_sd_maintenance.h"
 #include "storage_guard.h"
@@ -74,7 +73,7 @@ bool tryAcquire(String &reason) {
     return false;
   }
 
-  if (clusterCaptureProtectionActive() || clusterHwTimePulseActive() ||
+  if (clusterCaptureProtectionActive() ||
       ClusterHwTimeGpioLease::active()) {
     xSemaphoreGive(admissionMutex);
     reason = "Cluster capture or time measurement active";
@@ -91,7 +90,7 @@ bool tryAcquire(String &reason) {
   if (recording || recorderIsOpen() || recordingLoadTestIsActive() ||
       g_storageLocked || webSdMaintenanceBusy() ||
       webSdAdmissionController().busy() || syncApiExclusiveActive() ||
-      clusterCaptureProtectionActive() || clusterHwTimePulseActive() ||
+      clusterCaptureProtectionActive() ||
       ClusterHwTimeGpioLease::active() || !droneModeEnabled()) {
     delete recordingGuard;
     recordingGuard = nullptr;

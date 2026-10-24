@@ -4,11 +4,9 @@
 ## Gruppen- und Montageverwaltung (2026-10-23, nach v87-beta139)
 - Optionale Node-Montagedaten (`group_id`, `mount_position`, `height_mm`, Winkel) in `config.txt`, Transport per authentifiziertem UDP-Seitenpaket `SFG1`; Gruppenwerte (`orientation_deg`, `distance_mm`) nur am Coordinator in NVS. Reine Anzeige-/Auswahlinformation, keine Untercluster, keine Wirkung auf Wahl, Zeitsync oder Capture. Details: `CLUSTER_GROUPS.md`.
 
-## ESP-NOW-Zeitsynchronisierung – aktueller Stand (2026-10-13, v87-beta105)
+## ESP-NOW-Zeitsynchronisierung (seit v87-beta147, bereinigt in beta149)
 
-Normatives Detaildokument: `ESPNOW_TIME_ARCHITECTURE.md`; Schätzer v2: `ESPNOW_ESTIMATOR_V2.md`. Coordinator-Broadcast und Node-Zweiwege-Messungen verwenden HMAC-authentifizierte ESP-NOW-Pakete. Aktive Präzisionsmessserien sind durch kurz gültige SyncControl-Freigaben und Widerrufe reguliert; Capture- und Coordinator-Aktionen haben Vorrang. Widerruf-Empfang ist auf Funk nicht garantiert; eine Lease kann noch bis zu 12 s gültig sein. Die lokale Listenaktionspause ist derzeit teils noch zeitbasiert und nicht an einen bestätigten Jobabschluss gekoppelt.
-
-Der Schätzer berechnet drei Offset-Vergleichswerte und verwendet den Median des niedrigsten RTT-Quartils für die Zeitkorrektur. Pro Serie fest 16 vollständige Austausche (adaptive Erweiterung auf 32/64 in beta131 entfernt); Abbruchgrenze 12 s. Drift aus gewichteter Regression bis zu 24 gültiger Serien, akzeptiert frühestens nach 4 Serien über 3 Minuten. Gespeicherter Drift ist keine nach Reboot nachgewiesene Kalibrierung. Wi-Fi-Zeit bleibt Fallback. Die zentrale Node-spezifische ESP-NOW-Ergebnisdarstellung ist **nicht** fertig; lokal verfügbare Diagnosewerte sind nicht mit verifizierten Node-Berichten gleichzusetzen. Kein vollständiger ESP32-Build oder Hardware-Genauigkeitsnachweis.
+Einziges Verfahren: Zeitsignal des Coordinators jede Sekunde (Beacon + Folgepaket), Node-Modell aus der oberen Hüllkurve, Funklaufzeit alle 10 min per Hin-und-zurück-Serie eingemessen (bis dahin Cluster-Mittelwert). Wi-Fi-Zeit bleibt Fallback. Anzeige auf `/cluster_coordinate` (Spalte „Zeit“, Abschnitt „Zeitsynchronisation“, CSV). Detaildokument: `ESPNOW_TIME_ARCHITECTURE.md`.
 
 ## Audit-Paket 5p (2026-10-11) – SPI-Remount-Admission
 - Der Sync-API-SPI-Remount (exklusiver Clock-Wechsel und Diagnose) reserviert jetzt die gemeinsame atomare `SdAdmissionController::SpiRemount`-Lease; Cluster-Wipe, Secure Erase, Formatierung und Benchmark können während der Lease keine eigene Wartungs-Lease erhalten.

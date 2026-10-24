@@ -106,29 +106,20 @@ volatile uint8_t head=0,tail=0;
 volatile uint32_t drops=0;
 Diagnostics stats;
 
-// Callback-safe TX latency sampling. Entries are inserted before esp_now_send().
+// Callback-safe TX-done matching. Entries are inserted before esp_now_send().
 // Match by destination MAC and FIFO; no per-packet sequence is supplied to TX callbacks.
 constexpr size_t kTxPendingCapacity=24;
 // Every esp_now_send() registers an entry, so callbacks of other frames to the
 // same MAC cannot consume another frame's entry.
-constexpr uint8_t kTxClassOther=0, kTxClassReply=1, kTxClassBeacon=2;
+constexpr uint8_t kTxClassOther=0, kTxClassBeacon=1;
 struct TxPending { bool used=false; uint8_t mac[6]={}; int64_t enqueueUs=0; uint8_t frameClass=kTxClassOther; };
 TxPending txPending[kTxPendingCapacity];
 portMUX_TYPE txMux=portMUX_INITIALIZER_UNLOCKED;
-uint32_t txLatencyLastUs=0,txLatencyMaxUs=0,txLatencySamples=0;
-uint32_t txCallbackFailed=0,txPendingOverflow=0,txCallbackUnmatched=0;
-// Enqueue -> TX-done callback of Reply frames only (NOT the RF airtime).
-uint32_t txReplyLatencyLastUs=0,txReplyLatencyMaxUs=0,txReplyLatencySamples=0;
-uint32_t txReplyLatencyHist[Diagnostics::kProbeReplyDelayBuckets]={};
 // TX-done callback of the last beacon, matched by its enqueue time.
 int64_t beaconTxDoneEnqueueUs=0, beaconTxDoneUs=0;
 void txTimingReset() {
     portENTER_CRITICAL(&txMux);
     for(auto &entry:txPending)entry={};
-    txLatencyLastUs=txLatencyMaxUs=txLatencySamples=0;
-    txCallbackFailed=txPendingOverflow=txCallbackUnmatched=0;
-    txReplyLatencyLastUs=txReplyLatencyMaxUs=txReplyLatencySamples=0;
-    for(auto &bucket:txReplyLatencyHist)bucket=0;
     beaconTxDoneEnqueueUs=beaconTxDoneUs=0;
     portEXIT_CRITICAL(&txMux);
 }
@@ -145,7 +136,7 @@ size_t txPendingRegister(const uint8_t mac[6],uint8_t frameClass,int64_t enqueue
         memcpy(txPending[slot].mac,mac,6);
         txPending[slot].enqueueUs=enqueueUs;
         txPending[slot].frameClass=frameClass;
-    } else ++txPendingOverflow;
+    }
     portEXIT_CRITICAL(&txMux);
     return slot;
 }
@@ -164,30 +155,13 @@ void onSentMac(const uint8_t* mac,esp_now_send_status_t status) {
     for(size_t i=0;i<kTxPendingCapacity;++i)
         if(txPending[i].used && (!mac || memcmp(txPending[i].mac,mac,6)==0) &&
            txPending[i].enqueueUs<oldest){match=i;oldest=txPending[i].enqueueUs;}
-    if(match==kTxPendingCapacity)++txCallbackUnmatched;
-    else {
-        const int64_t elapsed=now-txPending[match].enqueueUs;
+    if(match!=kTxPendingCapacity) {
         txPending[match].used=false;
         if(txPending[match].frameClass==kTxClassBeacon && status==ESP_NOW_SEND_SUCCESS) {
             beaconTxDoneEnqueueUs=txPending[match].enqueueUs;
             beaconTxDoneUs=now;
         }
-        if(elapsed>=0 && elapsed<=UINT32_MAX){
-            txLatencyLastUs=static_cast<uint32_t>(elapsed);
-            if(txLatencyLastUs>txLatencyMaxUs)txLatencyMaxUs=txLatencyLastUs;
-            ++txLatencySamples;
-            if(txPending[match].frameClass==kTxClassReply) {
-                const uint32_t us=txLatencyLastUs;
-                uint8_t bucket=0;
-                while(bucket<Diagnostics::kProbeReplyDelayBuckets-1 && us>kProbeReplyDelayBucketUpperUs[bucket])++bucket;
-                ++txReplyLatencyHist[bucket];
-                ++txReplyLatencySamples;
-                txReplyLatencyLastUs=us;
-                if(us>txReplyLatencyMaxUs)txReplyLatencyMaxUs=us;
-            }
-        }
     }
-    if(status!=ESP_NOW_SEND_SUCCESS)++txCallbackFailed;
     portEXIT_CRITICAL(&txMux);
 }
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5,5,0)
@@ -564,32 +538,6 @@ uint32_t qualityRetryDelayMs() {
     const uint32_t mixed=(x ^ (x>>16))*0x7feb352dUL;
     return kRetryBaseMs + ((mixed ^ (mixed>>15)) % kRetryJitterMs);
 }
-uint32_t failedSeries=0;
-// Probe RX callback (t2) -> reply pre-send stamp (t3). Observation only.
-void recordProbeReplyDelay(int64_t rxUs, int64_t replyStampUs) {
-    if(replyStampUs<rxUs) return;
-    const uint64_t delta=static_cast<uint64_t>(replyStampUs-rxUs);
-    const uint32_t us=delta>UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(delta);
-    uint8_t bucket=0;
-    while(bucket<Diagnostics::kProbeReplyDelayBuckets-1 && us>kProbeReplyDelayBucketUpperUs[bucket]) ++bucket;
-    ++stats.probeReplyDelayHist[bucket];
-    ++stats.probeReplyDelaySamples;
-    stats.probeReplyDelayLastUs=us;
-    if(us>stats.probeReplyDelayMaxUs) stats.probeReplyDelayMaxUs=us;
-    stats.probeReplyDelayTotalUs+=us;
-}
-uint32_t successfulSeries=0, lastCompletedSeriesMs=0, nextSeriesStatsReportMs=0;
-uint32_t lastEstimateMs=0;
-uint8_t lastCompletedSeriesResult=0;
-uint8_t lastSeriesFailure=0; // 1=invalid/insufficient; 2=spread; 3=RTT; 4=series deadline
-uint8_t lastRejectedReason=0;
-uint32_t lastRejectedSeriesMs=0;
-bool lastRejectedHasMetrics=false;
-ClusterEspNowTwoWay::Estimate lastRejectedEstimate;
-uint8_t consecutiveFailures=0;
-uint32_t seriesRejectByReason[5]={};  // index = lastSeriesFailure (1..4)
-ClusterEspNowTwoWay::Estimate latestQualityEstimate;
-uint32_t lastPrecisionMs=0;   // last accepted two-way series
 
 // --- Coordinator beacon transmitter
 struct FollowUpPending {
@@ -676,42 +624,21 @@ void resetBeaconReceiver() {
     pendingCalibration={};
 }
 
+uint32_t successfulSeries=0, failedSeries=0, nextSeriesStatsReportMs=0;
+uint8_t lastSeriesFailure=0; // 1=invalid/insufficient; 2=spread; 3=RTT; 4=series deadline
+void seriesFailed(uint8_t reason) {
+    ++failedSeries;lastSeriesFailure=reason;reportSoon=true;
+}
 void acceptEstimate(const ClusterEspNowTwoWay::Estimate &e) {
-    lastEstimateMs=millis();
-    stats.lastExchangeValid = e.valid;
-    // Diagnostic snapshot only; no effect on estimate acceptance, retries or slots.
-    stats.lastSeriesEstimateAvailable = e.valid && e.selected > 0;
-    stats.lastSeriesSelected=e.selected;
-    stats.lastSeriesSpreadUs=e.spreadUs;
-    stats.lastSeriesRttMinUs=e.selectedRttMinUs;
-    stats.lastSeriesRttMaxUs=e.selectedRttMaxUs;
-    stats.lastSeriesOffsetP10Us=e.selectedOffsetP10Us;
-    stats.lastSeriesOffsetP90Us=e.selectedOffsetP90Us;
     seriesPrecisionAccepted=false;
-    lastCompletedSeriesMs=millis();
-    lastCompletedSeriesResult=2;
-    reportSoon=true;
-    if (!e.valid) { ++failedSeries; lastSeriesFailure=1; ++seriesRejectByReason[1]; lastRejectedReason=1; lastRejectedSeriesMs=millis(); lastRejectedHasMetrics=false; lastRejectedEstimate=e; consecutiveFailures=static_cast<uint8_t>(std::min(8U,unsigned(consecutiveFailures)+1U)); return; }
-    stats.lastOffsetUs = e.offsetUs;
-    stats.lastRttUs = e.medianRttUs;
     // A wide offset range indicates RF/software timing jitter.
-    if (!std::isfinite(e.spreadUs) || e.spreadUs > 250.0 || e.accepted < 8 ||
-        !std::isfinite(e.medianRttUs) || e.medianRttUs > 30000.0) {
-        ++failedSeries;
-        lastSeriesFailure=(e.accepted<8?1:(e.spreadUs>250.0?2:3));
-        ++seriesRejectByReason[lastSeriesFailure];
-        lastRejectedEstimate=e;
-        lastRejectedReason=lastSeriesFailure; lastRejectedSeriesMs=millis(); lastRejectedHasMetrics=true;
-        consecutiveFailures=static_cast<uint8_t>(std::min(8U,unsigned(consecutiveFailures)+1U));
-        return;
-    }
+    if(!e.valid || e.accepted<8){seriesFailed(1);return;}
+    if(!std::isfinite(e.spreadUs) || e.spreadUs>250.0){seriesFailed(2);return;}
+    if(!std::isfinite(e.medianRttUs) || e.medianRttUs>30000.0){seriesFailed(3);return;}
     lastSeriesFailure=0;
     ++successfulSeries;
-    lastCompletedSeriesResult=1;
-    consecutiveFailures=0;
-    latestQualityEstimate=e;
     seriesPrecisionAccepted=true;
-    lastPrecisionMs=millis();
+    reportSoon=true;
     // Path delay of this link = two-way offset minus beacon envelope offset.
     if(!resolveCalibration(e.offsetUs,e.nodeReferenceUs))
         pendingCalibration={true,e.offsetUs,e.nodeReferenceUs,millis()};
@@ -757,11 +684,6 @@ bool start(uint8_t channel) {
     esp_now_peer_info_t peer={};
     memcpy(peer.peer_addr,kBroadcastMac,6);peer.channel=0;peer.ifidx=WIFI_IF_STA;
     if(esp_now_add_peer(&peer)!=ESP_OK){esp_now_deinit();return false;}
-    stats.rxQueueDelayLastUs=stats.rxQueueDelayMaxUs=0;
-    stats.replyFinalDispatchGapLastUs=stats.replyFinalDispatchGapMaxUs=0;
-    stats.probeTxPreSendLastUs=stats.probeTxPreSendMaxUs=stats.probeTxPreSendSamples=0;
-    stats.replyTxPreSendLastUs=stats.replyTxPreSendMaxUs=stats.replyTxPreSendSamples=0;
-    stats.probeTxPreSendTotalUs=stats.replyTxPreSendTotalUs=0;
     initialized=true;boundChannel=channel;stats.active=true;stats.channel=channel;
     const uint32_t now=millis();
     nextBeaconMs=now+500;nextSeriesMs=now+2000;nextGrantMs=now;
@@ -782,8 +704,7 @@ bool sendFrame(EspNowTimePackets::Frame& f,const uint8_t mac[6],
     // Prepare callback bookkeeping BEFORE sampling the transmission timestamp.
     // Otherwise queue bookkeeping unnecessarily biases t1/t3.
     const int64_t queuedAtUs=esp_timer_get_time();
-    const size_t slot=txPendingRegister(mac,
-        f.type==EspNowTimePackets::Type::Reply ? kTxClassReply : kTxClassOther,queuedAtUs);
+    const size_t slot=txPendingRegister(mac,kTxClassOther,queuedAtUs);
     // V2 Software Timestamp Correction:
     // - Probe: carries t1 (early) + delay from PREVIOUS Probe
     // - Reply: carries t2 (RX timestamp, no correction needed)
@@ -814,14 +735,6 @@ bool sendFrame(EspNowTimePackets::Frame& f,const uint8_t mac[6],
             const uint32_t delta=static_cast<uint32_t>(preSendUs);
             if(f.type==EspNowTimePackets::Type::Probe) lastProbePreSendUs=delta;
             else if(f.type==EspNowTimePackets::Type::Reply) lastReplyPreSendUs=delta;
-            uint32_t &last=replyStamp ? stats.replyTxPreSendLastUs : stats.probeTxPreSendLastUs;
-            uint32_t &max=replyStamp ? stats.replyTxPreSendMaxUs : stats.probeTxPreSendMaxUs;
-            uint32_t &count=replyStamp ? stats.replyTxPreSendSamples : stats.probeTxPreSendSamples;
-            uint64_t &total=replyStamp ? stats.replyTxPreSendTotalUs : stats.probeTxPreSendTotalUs;
-            last=delta;
-            if(delta>max)max=delta;
-            ++count;
-            total+=delta;
         }
     }
     ++stats.sent;return true;
@@ -984,7 +897,7 @@ void onFollowUp(const EspNowTimePackets::Frame &f,uint32_t nowMs) {
     if(r==ClusterBeaconSync::AddResult::Reset) ++sourceChanges;
     if(pendingCalibration.active) {
         if(uint32_t(nowMs-pendingCalibration.atMs)>kPendingCalibrationMs) {
-            pendingCalibration={};++calibrationsDiscarded;lastPrecisionMs=0;
+            pendingCalibration={};++calibrationsDiscarded;
         } else if(resolveCalibration(pendingCalibration.thetaUs,pendingCalibration.nodeRefUs)) {
             pendingCalibration={};
         }
@@ -1046,138 +959,54 @@ void acceptBeaconSyncReport(const EspNowTimePackets::Frame &f) {
     r.ownDelayUs=r.ownDelayKnown ? static_cast<double>(f.timeUs)/1000.0 : 0;
     const uint64_t aux=static_cast<uint64_t>(f.auxUs);
     r.ownDelayAgeS=static_cast<uint32_t>(aux>>48);
-    r.spreadUs=static_cast<uint16_t>((aux>>32)&0xffffU);
     r.beaconJitterUs=static_cast<double>(static_cast<uint32_t>(aux))/10.0;
     if(precise && r.beaconJitterUs>r.maxJitterUs) r.maxJitterUs=r.beaconJitterUs;
     rr->beaconReceivedAt=nowMs;
     if(!rr->receivedAt) rr->receivedAt=rr->beaconReceivedAt;
     ++reportCount;
 }
+// NodeSyncReport flags in nonce: 0x100 own delay calibrated (bits 16..31 =
+// age in s), 0x200 not calibrated yet, 0x1000 series counters in timeUs.
+constexpr uint32_t kReportCalibrated=0x100U, kReportUncalibrated=0x200U, kReportSeriesCounters=0x1000U;
 void acceptNodeReport(const EspNowTimePackets::Frame &f) {
     const uint32_t boot=static_cast<uint32_t>(f.senderBoot);
     RemoteReport *rr=reportSlot(boot);
     if(!rr) return;
     auto &r=rr->report;
-    const uint64_t bits=static_cast<uint64_t>(f.timeUs);
     rr->receivedAt=millis();++reportCount;
-    // Extra report type marker, carried inside the authenticated frame.
-    if(f.type==EspNowTimePackets::Type::NodeSyncReport && (f.nonce&0x2000U)!=0) {
-        r.hasLastRejectedSeries=true;
-        r.lastRejectedReason=static_cast<uint8_t>((f.nonce>>16)&0x0fU);
-        r.lastRejectedAgeMs=((f.nonce>>20)&0x0fffU)*1000UL;
-        r.lastRejectedMetricsValid=r.lastRejectedReason!=1 && r.lastRejectedReason!=4;
-        r.lastRejectedSpreadUs=static_cast<uint32_t>(bits>>32);
-        r.lastRejectedRttUs=static_cast<uint32_t>(bits);
-        return;
-    }
-    if(f.type==EspNowTimePackets::Type::NodeSyncReport && (f.nonce&0x1000U)!=0) {
+    if((f.nonce&kReportSeriesCounters)!=0) {
+        const uint64_t bits=static_cast<uint64_t>(f.timeUs);
         r.successfulSeries=static_cast<uint32_t>(bits>>32);
         r.rejectedSeries=static_cast<uint32_t>(bits);
-        r.lastSeriesResult=static_cast<uint8_t>((f.nonce>>16)&0x0fU);
-        r.lastSeriesAgeMs=((f.nonce>>20)&0x0fffU)*1000UL;
-        r.hasSeriesStatistics=true;
-        return;
-    }
-    if(f.type==EspNowTimePackets::Type::NodeDriftReport && (f.nonce&0x800U)!=0){
-        r.failedMinRttOffsetUs=static_cast<int32_t>(static_cast<uint32_t>(bits>>32));
-        r.failedSelectedOffsetUs=static_cast<int32_t>(static_cast<uint32_t>(bits));
-        r.hasFailureOffsets=true;
-        return;
-    }
-    if(f.type==EspNowTimePackets::Type::NodeDriftReport && (f.nonce&0x400U)!=0){
-        r.failedSpreadUs=static_cast<uint32_t>(bits>>32);
-        r.failedRttUs=static_cast<uint32_t>(bits);
-        r.failedAccepted=static_cast<uint8_t>((f.nonce>>16)&0xffU);
-        r.failedSelected=static_cast<uint8_t>((f.nonce>>24)&0xffU);
-        r.hasFailureMetrics=true;
-        return;
-    }
-    if(f.type!=EspNowTimePackets::Type::NodeSyncReport) return;
-    if ((f.nonce&0x200U)!=0) { // No calibration yet: counters, not time.
+    } else if((f.nonce&kReportUncalibrated)!=0) {
         r.precisionAccepted=false;
-        r.acceptedSamples=0;
         r.sampleAgeMs=0;
-        r.offsetUs=0;
-        r.rttUs=0;
-        r.probesSent=static_cast<uint32_t>(bits>>32);
-        r.exchangesComplete=static_cast<uint32_t>(bits);
-        r.failureCode=static_cast<uint8_t>((f.nonce>>16)&0xffU);
-        r.failedSeries=static_cast<uint8_t>((f.nonce>>24)&0xffU);
         slotNotePrecisionReport(boot,false,0);
-        return;
+    } else if((f.nonce&kReportCalibrated)!=0) {
+        r.precisionAccepted=true;
+        r.sampleAgeMs=(f.nonce>>16)*1000UL;
+        slotNotePrecisionReport(boot,true,r.sampleAgeMs);
     }
-    r.failureCode=0;
-    r.offsetUs=static_cast<int32_t>(static_cast<uint32_t>(bits>>32));
-    r.rttUs=static_cast<uint32_t>(bits);
-    r.acceptedSamples=static_cast<uint8_t>(f.nonce&0xffU);
-    r.precisionAccepted=(f.nonce&0x100U)!=0;
-    r.sampleAgeMs=(f.nonce>>16)*1000UL;
-    slotNotePrecisionReport(boot,r.precisionAccepted,r.sampleAgeMs);
 }
 void sendSeriesStatistics(uint32_t epoch,uint64_t tag,uint32_t boot) {
     EspNowTimePackets::Frame f;
     f.type=EspNowTimePackets::Type::NodeSyncReport;
     f.epoch=epoch;f.coordinatorTag=tag;f.senderBoot=boot;
     f.timeUs=static_cast<int64_t>((static_cast<uint64_t>(successfulSeries)<<32)|failedSeries);
-    const uint32_t ageSeconds=lastCompletedSeriesMs ?
-        std::min(4095UL,static_cast<unsigned long>((millis()-lastCompletedSeriesMs)/1000UL)) : 0;
-    f.nonce=0x1000U | (static_cast<uint32_t>(lastCompletedSeriesResult)<<16) | (ageSeconds<<20);
+    f.nonce=kReportSeriesCounters;
     sendFrame(f,kBroadcastMac);
-    // Last rejection telemetry. Never affects grants, timestamp math or slots.
-    if(lastRejectedSeriesMs && failedSeries){
-        EspNowTimePackets::Frame reject=f;
-        const uint32_t rejectAge=std::min(4095UL,static_cast<unsigned long>((millis()-lastRejectedSeriesMs)/1000UL));
-        reject.nonce=0x2000U | (static_cast<uint32_t>(lastRejectedReason)<<16) | (rejectAge<<20);
-        // Metrics may be unavailable for deadlines and invalid estimators.
-        const uint32_t spread=lastRejectedHasMetrics && std::isfinite(lastRejectedEstimate.spreadUs) ?
-            static_cast<uint32_t>(llround(std::max(0.0,std::min(4294967295.0,lastRejectedEstimate.spreadUs)))) : 0;
-        const uint32_t rtt=lastRejectedHasMetrics && std::isfinite(lastRejectedEstimate.medianRttUs) ?
-            static_cast<uint32_t>(llround(std::max(0.0,std::min(4294967295.0,lastRejectedEstimate.medianRttUs)))) : 0;
-        reject.timeUs=static_cast<int64_t>((static_cast<uint64_t>(spread)<<32)|rtt);
-        sendFrame(reject,kBroadcastMac);
-        if(lastRejectedHasMetrics){
-            EspNowTimePackets::Frame offsets=f;
-            offsets.type=EspNowTimePackets::Type::NodeDriftReport;
-            offsets.nonce=0x800U;
-            const int32_t minOff=static_cast<int32_t>(llround(std::max(-2147483647.0,std::min(2147483647.0,lastRejectedEstimate.minRttOffsetUs))));
-            const int32_t selectedOff=static_cast<int32_t>(llround(std::max(-2147483647.0,std::min(2147483647.0,lastRejectedEstimate.offsetUs))));
-            offsets.timeUs=static_cast<int64_t>((static_cast<uint64_t>(static_cast<uint32_t>(minOff))<<32)|static_cast<uint32_t>(selectedOff));
-            sendFrame(offsets,kBroadcastMac);
-        }
-    }
 }
 // Calibration state; joins the coordinator's slot schedule.
 void sendNodeReports(uint32_t epoch,uint64_t tag,uint32_t boot) {
-    if(!ownDelay.known() || !ownDelayLastMs){
-        // No own delay yet: counters only. 0x200 flags diagnostics.
-        EspNowTimePackets::Frame d;
-        d.epoch=epoch;d.coordinatorTag=tag;d.senderBoot=boot;
-        d.type=EspNowTimePackets::Type::NodeSyncReport;
-        d.timeUs=static_cast<int64_t>((static_cast<uint64_t>(stats.probesSent)<<32)|stats.exchangesComplete);
-        d.nonce=0x200U | (static_cast<uint32_t>(lastSeriesFailure)<<16) |
-           (static_cast<uint32_t>(std::min(255UL,static_cast<unsigned long>(failedSeries)))<<24);
-        sendFrame(d,kBroadcastMac);
-        if(lastRejectedEstimate.valid || lastRejectedEstimate.accepted){
-            EspNowTimePackets::Frame m=d;
-            m.type=EspNowTimePackets::Type::NodeDriftReport;
-            const uint32_t spread=static_cast<uint32_t>(llround(std::max(0.0,std::min(4294967295.0,lastRejectedEstimate.spreadUs))));
-            const uint32_t rtt=static_cast<uint32_t>(llround(std::max(0.0,std::min(4294967295.0,lastRejectedEstimate.medianRttUs))));
-            m.timeUs=static_cast<int64_t>((static_cast<uint64_t>(spread)<<32)|rtt);
-            m.nonce=0x400U | (static_cast<uint32_t>(lastRejectedEstimate.accepted)<<16) |
-                (static_cast<uint32_t>(lastRejectedEstimate.selected)<<24);
-            sendFrame(m,kBroadcastMac);
-        }
-        return;
-    }
-    const uint32_t age=static_cast<uint32_t>(millis()-ownDelayLastMs);
     EspNowTimePackets::Frame f;
-    f.epoch=epoch;f.coordinatorTag=tag;f.senderBoot=boot;
     f.type=EspNowTimePackets::Type::NodeSyncReport;
-    const int32_t offset=static_cast<int32_t>(llround(std::max(-2147483647.0,std::min(2147483647.0,latestQualityEstimate.offsetUs))));
-    const uint32_t rtt=static_cast<uint32_t>(llround(std::max(0.0,std::min(4294967295.0,latestQualityEstimate.medianRttUs))));
-    f.timeUs=static_cast<int64_t>((static_cast<uint64_t>(static_cast<uint32_t>(offset))<<32)|rtt);
-    f.nonce= (std::min(65535UL,static_cast<unsigned long>(age/1000UL))<<16) |
-        0x100U | static_cast<uint32_t>(std::min(255U,static_cast<unsigned>(latestQualityEstimate.accepted)));
+    f.epoch=epoch;f.coordinatorTag=tag;f.senderBoot=boot;
+    if(!ownDelay.known() || !ownDelayLastMs) {
+        f.nonce=kReportUncalibrated;
+    } else {
+        const uint32_t ageS=static_cast<uint32_t>(millis()-ownDelayLastMs)/1000UL;
+        f.nonce=(std::min<uint32_t>(65535U,ageS)<<16) | kReportCalibrated;
+    }
     sendFrame(f,kBroadcastMac);
 }
 void sendBeaconSyncReport(uint32_t epoch,uint64_t tag,uint32_t boot) {
@@ -1198,9 +1027,8 @@ void sendBeaconSyncReport(uint32_t epoch,uint64_t tag,uint32_t boot) {
     const double driftMilli=std::max(-2147483647.0,std::min(2147483647.0,m.driftPpm*1000.0));
     f.preSendDelayUs=static_cast<uint32_t>(static_cast<int32_t>(llround(driftMilli)));
     const uint64_t delayAge=ownDelayLastMs ? std::min<uint64_t>(0xffffU,uint32_t(nowMs-ownDelayLastMs)/1000U) : 0xffffU;
-    const uint64_t spread=static_cast<uint64_t>(llround(std::max(0.0,std::min(65535.0,latestQualityEstimate.spreadUs))));
     const uint64_t jitter=static_cast<uint64_t>(llround(std::max(0.0,std::min(4294967295.0,m.jitterUs*10.0))));
-    f.auxUs=static_cast<int64_t>((delayAge<<48)|(spread<<32)|jitter);
+    f.auxUs=static_cast<int64_t>((delayAge<<48)|jitter);
     sendFrame(f,kBroadcastMac);
 }
 bool acceptPeer(const uint8_t mac[6],const EspNowTimePackets::Frame &f) {
@@ -1339,11 +1167,6 @@ void stop() {
     if(initialized){esp_now_deinit();initialized=false;}
     txTimingReset();
     boundChannel=0;lastEpoch=0;lastTag=0;stats.active=false;
-    stats.lastExchangeValid=false;stats.lastOffsetUs=0;stats.lastRttUs=0;
-    stats.lastSeriesEstimateAvailable=false;stats.lastSeriesEstimateAgeMs=0;
-    stats.lastSeriesSelected=0;stats.lastSeriesSpreadUs=0;
-    stats.lastSeriesRttMinUs=stats.lastSeriesRttMaxUs=0;
-    stats.lastSeriesOffsetP10Us=stats.lastSeriesOffsetP90Us=0;
     stats.beaconsSent=stats.followUpsSent=stats.followUpsWithoutTxDone=0;
     stats.beaconTxPathLastUs=stats.beaconTxPathMinUs=stats.beaconTxPathMaxUs=0;
     stats.clusterDelayKnown=false;stats.clusterDelayUs=0;stats.clusterDelayContributors=0;
@@ -1354,8 +1177,7 @@ void stop() {
     for(auto &p:slotPeers)p={};slotOwner=-1;slotState={};
     slotStartedMs=slotGuardUntilMs=0;slotGrantsSent=slotRotations=0;
     slotStats={};slotLastStartMs=0;slotPeriodTotalMs=0;slotPeriodCount=0;
-    latestQualityEstimate={};lastPrecisionMs=0;failedSeries=0;for(auto &r:seriesRejectByReason)r=0;lastSeriesFailure=0;lastRejectedReason=0;lastRejectedSeriesMs=0;lastRejectedHasMetrics=false;lastRejectedEstimate={};consecutiveFailures=0;
-    successfulSeries=0;lastCompletedSeriesMs=0;lastCompletedSeriesResult=0;nextSeriesStatsReportMs=0;lastEstimateMs=0;
+    successfulSeries=failedSeries=0;lastSeriesFailure=0;nextSeriesStatsReportMs=0;
     for(auto &r:remoteReports)r={};reportCount=0;
     followUp={};clusterDelayNsTx=kNoDelayNs;
     resetBeaconReceiver();
@@ -1421,24 +1243,8 @@ bool beaconTraceAt(size_t index, BeaconTraceEntry &out){
 }
 uint64_t beaconTraceCoordinatorBoot(){return traceBoot;}
 Diagnostics diagnostics(){Diagnostics out=stats;
-    portENTER_CRITICAL(&txMux);
-    out.txCallbackLatencyLastUs=txLatencyLastUs;
-    out.txCallbackLatencyMaxUs=txLatencyMaxUs;
-    out.txCallbackSamples=txLatencySamples;
-    out.txCallbackFailed=txCallbackFailed;
-    out.txPendingOverflow=txPendingOverflow;
-    out.txCallbackUnmatched=txCallbackUnmatched;
-    out.txReplyLatencySamples=txReplyLatencySamples;
-    out.txReplyLatencyLastUs=txReplyLatencyLastUs;
-    out.txReplyLatencyMaxUs=txReplyLatencyMaxUs;
-    for(uint8_t i=0;i<Diagnostics::kProbeReplyDelayBuckets;++i)out.txReplyLatencyHist[i]=txReplyLatencyHist[i];
-    portEXIT_CRITICAL(&txMux);
     const uint32_t now=millis();
-    out.lastSeriesEstimateAgeMs=lastEstimateMs ? uint32_t(now-lastEstimateMs) : 0;
-    out.lastAcceptedAgeMs=lastPrecisionMs ? uint32_t(now-lastPrecisionMs) : 0;
     out.capturePauseRemainingMs=capturePaused() ? uint32_t(captureGuardUntilMs-now) : 0;
-    out.syncPermission=syncPermissionValid();
-    out.syncPermissionRemainingMs=out.syncPermission?uint32_t(permissionUntilMs-now):0;
     portENTER_CRITICAL(&queueMux);out.dropped=drops;portEXIT_CRITICAL(&queueMux);
     // Beacon receiver (nodes; zero on the coordinator).
     const auto &m=beaconModel.model();
@@ -1476,17 +1282,7 @@ Diagnostics diagnostics(){Diagnostics out=stats;
     }
     out.seriesAccepted=successfulSeries;
     out.seriesRejected=failedSeries;
-    out.seriesRejectInvalid=seriesRejectByReason[1];
-    out.seriesRejectSpread=seriesRejectByReason[2];
-    out.seriesRejectRtt=seriesRejectByReason[3];
-    out.seriesRejectDeadline=seriesRejectByReason[4];
-    out.seriesConsecutiveFailures=consecutiveFailures;
     out.seriesLastFailureReason=lastSeriesFailure;
-    out.seriesLastRejectedAgeMs=lastRejectedSeriesMs ? uint32_t(now-lastRejectedSeriesMs) : 0;
-    out.seriesLastRejectedSpreadUs=lastRejectedHasMetrics && std::isfinite(lastRejectedEstimate.spreadUs) ?
-        static_cast<uint32_t>(llround(std::max(0.0,std::min(4294967295.0,lastRejectedEstimate.spreadUs)))) : 0;
-    out.seriesLastCompletedAgeMs=lastCompletedSeriesMs ? uint32_t(now-lastCompletedSeriesMs) : 0;
-    out.seriesNextInMs=nextSeriesMs && static_cast<int32_t>(nextSeriesMs-now)>0 ? nextSeriesMs-now : 0;
     out.slotRefreshMs=kSlotRefreshAgeMs;
     out.slotLifetimeMs=kSlotLifetimeMs;
     if(wasCoordinator){
@@ -1494,31 +1290,18 @@ Diagnostics diagnostics(){Diagnostics out=stats;
             if(!slotPeerActive(p,now)) continue;
             ++out.slotActivePeers;
             if(ClusterSlotScheduler::due(p.sched,now,kSlotParams)) ++out.slotDuePeers;
-            if(p.sched.backoffActive && !ClusterSlotScheduler::reached(now,p.sched.eligibleAtMs))
-                ++out.slotRecoveryDeferred;
             if(!p.sched.ageKnown) { ++out.slotExpiredPeers; continue; }
             const uint32_t age=ClusterSlotScheduler::estimatedAgeMs(p.sched,now);
             if(age>=kSlotLifetimeMs) ++out.slotExpiredPeers;
             if(age>out.slotOldestAgeMs) out.slotOldestAgeMs=age;
         }
-        out.slotPeriodMeanMs=slotPeriodCount ? static_cast<uint32_t>(slotPeriodTotalMs/slotPeriodCount) : 0;
-        out.slotCycleEstimateMs=out.slotActivePeers*out.slotPeriodMeanMs;
+        const uint32_t periodMeanMs=slotPeriodCount ? static_cast<uint32_t>(slotPeriodTotalMs/slotPeriodCount) : 0;
+        out.slotCycleEstimateMs=out.slotActivePeers*periodMeanMs;
         out.slotCapacity=slotPeers.size();
         out.slotTableFullRecent=slotTableFullLastMs && uint32_t(now-slotTableFullLastMs)<=kPeerActiveMs;
         out.slotRotations=slotRotations;
-        out.slotOwnerRecovery=slotOwner>=0 && slotPeers[slotOwner].sched.lastSlotWasRetry;
-        out.slotRecoveryRequested=slotStats.failed;
-        out.slotRecoveryGranted=slotStats.retrySlots;
-        out.slotRecoverySucceeded=slotStats.retrySucceeded;
-        out.slotRecoveryFailed=slotStats.retryFailed;
         out.slotSucceeded=slotStats.succeeded;
         out.slotFailed=slotStats.failed;
-        out.slotEndedSeriesOver=slotStats.seriesOver;
-        out.slotEndedNoActivity=slotStats.noActivity;
-        out.slotEndedHardCap=slotStats.hardCap;
-        out.slotEndedOwnerLost=slotStats.ownerLost;
-        out.slotLastMs=slotStats.lastSlotMs;
-        out.slotMeanMs=slotStats.finishedSlots ? static_cast<uint32_t>(slotStats.totalSlotMs/slotStats.finishedSlots) : 0;
     }
     return out;}
 bool benchmarkStart(uint32_t intervalMs,uint32_t targetBoot){
@@ -1597,14 +1380,12 @@ void coordinatorReceive(const Queued &item,const EspNowTimePackets::Frame &f,
     }
     if((f.type!=EspNowTimePackets::Type::Probe &&
         f.type!=EspNowTimePackets::Type::NodeSyncReport &&
-        f.type!=EspNowTimePackets::Type::NodeDriftReport &&
         f.type!=EspNowTimePackets::Type::BeaconSyncReport)||!acceptPeer(item.mac,f)){
         ++stats.rejected;return;
     }
     ++stats.authenticated;
     if(f.type==EspNowTimePackets::Type::BeaconSyncReport){acceptBeaconSyncReport(f);return;}
-    if(f.type==EspNowTimePackets::Type::NodeSyncReport ||
-       f.type==EspNowTimePackets::Type::NodeDriftReport){
+    if(f.type==EspNowTimePackets::Type::NodeSyncReport){
         noteSlotPeer(item.mac,static_cast<uint32_t>(f.senderBoot));
         acceptNodeReport(f);return;
     }
@@ -1624,14 +1405,6 @@ void coordinatorReceive(const Queued &item,const EspNowTimePackets::Frame &f,
     int64_t replyDispatchBeforeUs=0;
     // t3 denotes the Reply send path, NOT the later Final send call.
     if(!sendFrame(r,item.mac,&replyDispatchBeforeUs,true))return;
-    recordProbeReplyDelay(item.rxUs,replyDispatchBeforeUs);
-    const int64_t finalDispatchUs=esp_timer_get_time();
-    if(finalDispatchUs>=replyDispatchBeforeUs){
-        const uint64_t delta=static_cast<uint64_t>(finalDispatchUs-replyDispatchBeforeUs);
-        const uint32_t gapUs=delta>UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(delta);
-        stats.replyFinalDispatchGapLastUs=gapUs;
-        if(gapUs>stats.replyFinalDispatchGapMaxUs)stats.replyFinalDispatchGapMaxUs=gapUs;
-    }
     r.type=EspNowTimePackets::Type::Final;r.timeUs=replyDispatchBeforeUs;
     if(sendFrame(r,item.mac))++stats.probesAnswered;
     if(slotIsOwner(item.mac,static_cast<uint32_t>(f.senderBoot))) slotNoteOwnerProbe();
@@ -1737,9 +1510,7 @@ void nodeSeries(uint32_t now,uint32_t epoch,uint64_t tag,uint32_t localBootNonce
     if(seriesCount>0 && uint32_t(now-seriesStartedMs)>kMaxSeriesDurationMs) {
         // Never extend a busy/failed measurement series indefinitely.
         seriesCount=0;seriesStartedMs=0;
-        pending={};++failedSeries;lastSeriesFailure=4;++seriesRejectByReason[4];lastRejectedReason=4;lastRejectedSeriesMs=now;lastRejectedHasMetrics=false;
-        lastCompletedSeriesMs=now;lastCompletedSeriesResult=3;reportSoon=true;
-        consecutiveFailures=static_cast<uint8_t>(std::min(8U,unsigned(consecutiveFailures)+1U));
+        pending={};seriesFailed(4);
         nextSeriesMs=now+qualityRetryDelayMs();return;
     }
     if(seriesCount==0 && !pending.active && seriesStartedMs==0)
@@ -1785,14 +1556,6 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
     int64_t loadMarkUs=esp_timer_get_time();
     Queued item;unsigned budget=0;
     while(budget++<8&&pop(item)) {
-        // RX was timestamped at callback entry. Record service/queue latency.
-        const int64_t serviceRxUs=esp_timer_get_time();
-        if(serviceRxUs>=item.rxUs){
-            const uint64_t delta=static_cast<uint64_t>(serviceRxUs-item.rxUs);
-            const uint32_t waitUs=delta>UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(delta);
-            stats.rxQueueDelayLastUs=waitUs;
-            if(waitUs>stats.rxQueueDelayMaxUs)stats.rxQueueDelayMaxUs=waitUs;
-        }
         ++stats.received;
         EspNowTimePackets::Frame f;
         if(!EspNowTimePackets::decode(item.bytes,sizeof(item.bytes),f,clusterEspNowTimeVerify,nullptr)){

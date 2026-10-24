@@ -20,7 +20,7 @@
 
 ### ESP-NOW Precision Cluster Time (Experimental)
 
-For current architecture, design rationale, coordinator-specific persistent drift, authentication, time-source selection, known limitations and hardware acceptance tests, see [`ESPNOW_TIME_ARCHITECTURE.md`](ESPNOW_TIME_ARCHITECTURE.md), including authenticated SyncControl priority and estimator v2 (fixed 16-exchange series - the adaptive 16/32/64 extension was removed in beta131 -, RTT-quartile median, and weighted drift regression). The estimator-specific specification is [`ESPNOW_ESTIMATOR_V2.md`](ESPNOW_ESTIMATOR_V2.md). The older `ESPNOW_*_STATUS.md` files describe historical intermediate patches; they are not the current end-to-end status. The ESP-NOW path is not yet board-build/hardware validated and microsecond accuracy must not be assumed. The architecture document also records the current authenticated SyncControl grant/revoke lease, capture/action priority and its known non-atomic limitations.
+The coordinator broadcasts an authenticated time signal every second; each node fits offset and drift from it and calibrates its radio path delay every 10 minutes with a short two-way series. Wi-Fi cluster time remains the fallback. Status per node: `/cluster_coordinate` (column "Zeit", section "Zeitsynchronisation", CSV `/cluster_time_csv`). Details: [`ESPNOW_TIME_ARCHITECTURE.md`](ESPNOW_TIME_ARCHITECTURE.md). Software timestamps only; trigger accuracy is not yet verified with the GPIO meter.
 
 SensorForge is an ESP32-S3 camera/sensor firmware for autonomous event recording
 and optional local network streaming.

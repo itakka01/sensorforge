@@ -90,8 +90,9 @@ void test_all_packet_types() {
 
     using namespace EspNowTimePackets;
     Type types[] = {Type::Beacon, Type::Probe, Type::Reply, Type::Final,
-                    Type::SyncControl, Type::NodeSyncReport, Type::NodeDriftReport,
-                    Type::BenchControl, Type::BenchDown, Type::BenchUp, Type::BenchAck};
+                    Type::SyncControl, Type::NodeSyncReport,
+                    Type::BenchControl, Type::BenchDown, Type::BenchUp, Type::BenchAck,
+                    Type::FollowUp, Type::BeaconSyncReport};
 
     for(auto type : types) {
         Frame f;

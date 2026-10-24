@@ -1,74 +1,26 @@
-# SensorForge v87-beta131 – Test Suite
+# SensorForge – Host-Tests
 
-## Offline Regression Tests
+Die Tests sind **nicht** Teil des Arduino-Builds. Die Endung `.cpp.test` verhindert, dass die Arduino IDE sie mitkompiliert (jeder Test hat ein eigenes `main()`). Kompiliert wird mit `g++ -x c++` direkt aus dem Sketch-Ordner, ohne Umbenennen.
 
-Diese Tests sind **NICHT** Teil des Arduino-Builds. Sie werden separat mit `g++` kompiliert.
+| Test | Prüft | Zusätzliche Quellen |
+|---|---|---|
+| `test_beacon_sync.cpp.test` | Zeitsignal-Modell und Simulation 9/100 Nodes | `cluster_beacon_sync.cpp` |
+| `test_fixed_series.cpp.test` | Zwei-Wege-Schätzer (16er-Serie) der Laufzeit-Einmessung | `cluster_espnow_twoway.cpp` |
+| `test_slot_scheduler.cpp.test` | Slot-Planung der Einmessung, Simulation bis 140 Nodes | – |
+| `test_v2_protocol.cpp.test` | ESP-NOW-Paketcodec, HMAC-Rahmen, Replay | `cluster_espnow_packets.cpp` |
+| `test_v2_espnow_size.cpp.test` | Paketgröße 88 Byte | `cluster_espnow_packets.cpp` |
+| `test_cluster_capture_pulse.cpp.test` | Testimpuls-Option in SFJC1, Ereignisbildung des GPIO-Messgeräts | – |
+| `test_cluster_jobs.cpp.test` | Job-Tabelle (100 Nodes) | `-Itest_stubs` |
+| `test_cluster_groups.cpp.test` | Gruppen-/Montagedaten | – |
+| `test_cluster_camera_report.cpp.test` | Kamera-Bericht SFK1 | – |
+| `test_psram_alloc.cpp.test` | PSRAM-Zuteilung ohne internen Rückfall | `-Itest_stubs` |
+| `test_wifi_power_policy.cpp.test` | WLAN-Stromsparmodus je Rolle | – |
+| `test_day_archive_tools.cpp.test` | EXAPAN-Konverter im Tages-ZIP | – |
 
-### Test-Dateien
-
-1. **test_fixed_series.cpp.test** (Cycle 21)
-   - Tests für feste 16-Sample-Serien
-   - Drift-Akkumulation-Verifikation
-   - nodeReferenceUs-Konsistenz
-   - Forward-Propagation-Kompatibilität
-
-2. **test_lease_state_machine.cpp.test** (Cycles 8-20)
-   - Broadcaster-Lease-State-Machine
-   - Coordinator-Suppression-Timing
-   - Source-Switching-Validierung
-   - Capture-Invalidierung
-
-### Tests ausführen
+Beispiel:
 
 ```bash
-# Test 1: Fixed Series (Cycle 21)
-mv test_fixed_series.cpp.test test_fixed_series.cpp
-g++ -o test_fixed_series test_fixed_series.cpp cluster_espnow_twoway.cpp -std=c++17 -I.
-./test_fixed_series
-mv test_fixed_series.cpp test_fixed_series.cpp.test
-
-# Test 2: Lease State Machine
-mv test_lease_state_machine.cpp.test test_lease_state_machine.cpp
-g++ -o test_lease_state_machine test_lease_state_machine.cpp -std=c++17
-./test_lease_state_machine
-mv test_lease_state_machine.cpp test_lease_state_machine.cpp.test
+g++ -std=c++17 -O2 -Wall -Wextra -I. -x c++ test_beacon_sync.cpp.test -x none cluster_beacon_sync.cpp -o /tmp/test_beacon_sync && /tmp/test_beacon_sync
 ```
 
-### Warum `.test` Endung?
-
-Die Arduino IDE kompiliert **ALLE** `.cpp` Dateien im Projekt-Verzeichnis. Beide Test-Dateien enthalten eine `main()` Funktion, was zu einem Linker-Fehler führt:
-
-```
-multiple definition of `main'
-```
-
-Durch Umbenennung zu `.cpp.test` werden sie vom Arduino-Build ausgeschlossen.
-
-### Erwartete Ergebnisse
-
-**test_fixed_series:**
-```
-Test Results: 6/6 PASSED
-```
-
-**test_lease_state_machine:**
-```
-Test Results: 13 PASSED, 0 FAILED
-```
-
-### Bei Test-Fehlern
-
-Falls ein Test fehlschlägt:
-1. Prüfe, ob `cluster_espnow_twoway.cpp` unverändert ist
-2. Prüfe, ob `cluster_espnow_radio.cpp` die Cycle 21 Änderungen enthält
-3. Vergleiche Test-Output mit erwarteten Werten in Dokumentation
-
-### Integration mit Arduino-Build
-
-Die Tests sind **OFFLINE** und simulieren die ESP-NOW-Logik ohne Hardware. Sie können:
-- ✓ Mathematische Korrektheit verifizieren
-- ✓ State-Machine-Logik testen
-- ✓ Timing-Verhalten simulieren
-- ✗ **NICHT** testen: Echte ESP-NOW-Kommunikation, WiFi-Delays, Hardware-Interrupts
-
-Für Hardware-Tests: Firmware flashen und Serial-Monitor überwachen.
+Bei Tests mit zusätzlichen Quellen muss vor den `.cpp`-Dateien `-x none` stehen, sonst behandelt `g++` sie ebenfalls als Testquelle mit Endung `.test`.
