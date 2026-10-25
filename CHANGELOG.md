@@ -1,3 +1,9 @@
+## v87-beta150 — 2026-10-24 (FIX GLEICHZEITIGE AUSFÄLLE)
+
+**FIX gleichzeitige Ausfälle aller Nodes („Zeitsignal ausgeblieben“):** Der Filter für spät gesendete Zeitsignale verglich mit dem kürzesten Sendeweg der letzten 32 Signale. Ein einzelner ungewöhnlich schneller TX-Done (gemessen 1724 µs bei sonst ~2000 µs) ließ danach ~30 s lang fast alle Signale als „zu spät“ verwerfen; nach 15 s ohne gültiges Signal verloren alle Nodes gleichzeitig die Präzision (Hardware 2026-10-24: 4–5 Ausfälle je Node in 20 min, verworfene Signale 22 % statt 8 %). Bezug ist jetzt das untere Viertel der letzten 32 Sendewege (`txPathReferenceUs()`); Host-Test `testFastTxPathOutlier`. Die Simulation ist unverändert (gültig nach ~35 s wegen der 32-Signal-Regel; die Tabelle in der Doku zeigte noch 14 s).
+
+Nur Node-Firmware betroffen; alle Boards flashen.
+
 ## v87-beta149 — 2026-10-24 (ALTEN ZEIT-CODE ENTFERNT)
 
 **Anlass:** Seit beta147 gibt es nur noch ein Zeitverfahren (Zeitsignal + Laufzeit-Einmessung). Code, Pakete, Tests und Doku der früheren Verfahren lagen noch im Projekt.
@@ -15,6 +21,8 @@
 **Coordinator-Seite:** Abschnitt „SD-Wartung: Vorprüfung“ entfernt (zeigte nur die SD-Werte der Geräteliste an; der Wipe am Node reserviert die SD selbst und lehnt ab, wenn sie belegt oder nicht bereit ist). „Kameras im Cluster“: kompakte Tabelle (Gerät, Sensor, Kamera, Auflösung, Belichtung/Verstärkung, Stand), alle Werte und Fähigkeiten über „Details“ im Popup, alphabetisch sortiert; „Sensorfähigkeiten“ alphabetisch mit Spalten „Unterstützt“/„Nicht unterstützt“, beide Tabellen ohne Mindestbreite. Capture-Fertigstellungsbericht: Nodes alphabetisch, Auftrag „angenommen“/„wird gesendet“/„unklar“, Hinweis „Signierter Abschluss vom Node bestätigt“ entfernt, UUID und Software-Auslösung hinter der Schaltfläche ⓘ.
 
 **Ausfall-Statistik:** Funkpausen des Coordinators (Aufnahme, Listenaktion) zählen nicht mehr als Ausfall, wenn in dieser Zeit keine Zeitberichte ankommen. Ein Node meldet nach einer eigenen Funkpause erst nach 3 s wieder (vorher meldete er „Zeitsignal ausgeblieben“, sobald die Pause länger als 15 s war). Neu: Grund des letzten Ausfalls (`lr` in `/cluster_time_nodes`, Spalte `last_loss_reason` in der CSV, Anzeige unter „Ausfälle“).
+
+**Freenove freigegeben:** `BOARD_SUPPORTS_PRECISION_SYNC` jetzt auch für Freenove 1 (mit dem Zeitsignal-Verfahren gleichauf mit den XIAO-Nodes: 98,5 % präzise inkl. Startphase, 0 Ausfälle, Streuung ~12 µs). Der Hinweis „Präzisionssynchronisation für diesen Boardtyp nicht freigegeben“ entfällt damit.
 
 **Unverändert:** Zeitstempel-Rechnung, Schätzer, Grenzwerte, Slot-Planung, Wi-Fi-Zeit als Rückfall. Paketformat V3 bleibt; die verbliebenen Pakete sind bitgleich. Ein Coordinator mit beta149 arbeitet mit Nodes auf beta147/148 zusammen (deren Zusatzberichte werden ignoriert), trotzdem alle Boards flashen.
 

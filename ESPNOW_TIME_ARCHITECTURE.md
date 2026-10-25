@@ -12,7 +12,7 @@
 
 1. **Zeitsignal (Coordinator, `sendBeacon()`):** jede Sekunde ein signiertes `Beacon` (Typ 1) an alle. Es trägt selbst keine Zeit, nur den Cluster-Mittelwert der Funklaufzeit (`auxUs`, ns; unbekannt = INT64_MIN). Zeitstempel unmittelbar **vor** `esp_now_send()`, also nach der HMAC-Berechnung.
 2. **Folgepaket (`serviceFollowUp()`):** sobald der TX-Done-Callback des Beacons da ist (höchstens 30 ms) ein `FollowUp` (Typ 12): `nonce` = Sequenz des Beacons, `timeUs` = Zeitstempel (Coordinator-Monotonzeit), `auxUs` = Coordinator-UTC zu diesem Zeitstempel, `preSendDelayUs` = Sendeweg Zeitstempel → TX-Done (µs, `UINT32_MAX` = unbekannt).
-3. **Node-Modell (`cluster_beacon_sync.*`, reine Logik):** je Signal ein Messpunkt `y = Zeitstempel − Empfangszeit`. Alle Störungen sind Verspätungen, daher sind die **größten** `y` die sauberen. Gleitendes Fenster der letzten 64 Punkte (≤ 120 s); Gerade (Versatz + Gangabweichung) durch die obere Hälfte („obere Hüllkurve“). Verworfen werden Punkte, deren Sendeweg mehr als 150 µs über dem kürzesten der letzten 32 lag (Coordinator hat spät gesendet), und Punkte mehr als 150 µs über der Hüllkurve (physikalisch unmöglich; 5 in Folge = Modell neu aufbauen). Gültig ab 8 Punkten über ≥ 4 s, Streuung (RMS der oberen Hälfte) ≤ 150 µs, Gangabweichung ≤ 500 ppm.
+3. **Node-Modell (`cluster_beacon_sync.*`, reine Logik):** je Signal ein Messpunkt `y = Zeitstempel − Empfangszeit`. Alle Störungen sind Verspätungen, daher sind die **größten** `y` die sauberen. Gleitendes Fenster der letzten 64 Punkte (≤ 120 s); Gerade (Versatz + Gangabweichung) durch die obere Hälfte („obere Hüllkurve“). Verworfen werden Punkte, deren Sendeweg mehr als 150 µs über dem unteren Viertel der letzten 32 lag (Coordinator hat spät gesendet; bis beta148 Bezug = kürzester Sendeweg, ein einzelner ungewöhnlich schneller Wert ließ dann ~30 s lang fast alle Signale verwerfen und alle Nodes gleichzeitig „Zeitsignal ausgeblieben“ melden), und Punkte mehr als 150 µs über der Hüllkurve (physikalisch unmöglich; 5 in Folge = Modell neu aufbauen). Gültig ab 8 Punkten über ≥ 4 s, Streuung (RMS der oberen Hälfte) ≤ 150 µs, Gangabweichung ≤ 500 ppm.
 4. **Funklaufzeit:** Aus Zeitsignalen allein ist die konstante Laufzeit (Luftzeit ~1 ms + Empfangsweg) nicht bestimmbar. Sie wird mit einer Hin-und-zurück-Serie eingemessen (Abschnitt 2): `Laufzeit = Zwei-Wege-Versatz − Hüllkurven-Versatz` (zum Mittelzeitpunkt der Serie). Der Node nutzt den Median seiner letzten 5 Einmessungen (eigen, höchstens 60 min alt), sonst den Cluster-Mittelwert aus dem Beacon (Median der eigenen Laufzeiten aller Nodes, Berichte ≤ 60 s, Einmessung ≤ 60 min). Plausibel: 0–10 ms.
 5. **Coordinator-Zeit am Node:** `Coordinator = Node + Hüllkurven-Versatz(Node) + Laufzeit`; UTC über das UTC/Monoton-Paar des neuesten Folgepakets (`precisionUtcNow()`).
 6. **Gültigkeit (`precision_state`):** Modell gültig, neuester Messpunkt ≤ 15 s alt (Überbrückung, z. B. Capture-Pause), Laufzeit (eigen oder Cluster) bekannt, UTC vom Coordinator vorhanden.
@@ -22,11 +22,11 @@
 
 | Szenario | Node-zu-Node p50 / p95 / max | alle gültig nach |
 |---|---|---|
-| 9 Nodes, alle eingemessen | 7 / 19 / 34 µs | 14 s |
-| 100 Nodes, alle eingemessen | 9 / 28 / 69 µs | 14 s |
-| 100 Nodes, Hälfte nur mit Cluster-Mittel | 12 / 33 / 68 µs | 14 s |
-| 9 Nodes, 12 s ohne Zeitsignal | 8 / 22 / 39 µs | 13 s |
-| 9 Nodes, Coordinator-Quarz +30 ppm | 7 / 20 / 35 µs | 13 s |
+| 9 Nodes, alle eingemessen | 6 / 19 / 39 µs | 35 s |
+| 100 Nodes, alle eingemessen | 11 / 32 / 84 µs | 35 s |
+| 100 Nodes, Hälfte nur mit Cluster-Mittel | 10 / 30 / 71 µs | 35 s |
+| 9 Nodes, 12 s ohne Zeitsignal | 7 / 22 / 56 µs | 34 s |
+| 9 Nodes, Coordinator-Quarz +30 ppm | 7 / 21 / 38 µs | 35 s |
 
 **Hardware (beta147, 9 Nodes, 13 dBm):** alle Nodes `valid`, Streuung des Zeitsignals 8–26 µs, je Node 1–2 % Signale wegen späten Sendens verworfen. Eigene Laufzeiten nach 3–4 Einmessungen 2052–2098 µs (vor der 32-Signal-Regel bis 2240 µs). 22 Minuten ohne Ausfall.
 
@@ -95,6 +95,6 @@ Freenove als passives Messgerät (Seite `/cluster`, „GPIO-Messgerät (passiv)�
 |---|---|---|
 | XIAO ESP32S3 Sense | 1 | nicht unabhängig vermessen |
 | diymore ESP32-S3 CAM (OV5640) | 1 | nicht vermessen |
-| Freenove FNK0085 | 0 | – (passives GPIO-Messgerät) |
+| Freenove FNK0085 | 1 (seit beta149; vorher 0, mit dem alten Verfahren nur ~64 % präzise) | nicht vermessen (dient selbst als passives GPIO-Messgerät) |
 
 Präzisionszeit läuft auf Nodes nur im Drone Mode; dort sind Streamer und Aufnahme gestoppt. Web-Abfragen und Streams anderer Geräte auf demselben Kanal können den Empfang verzögern; das Zeitsignal-Modell verwirft verspätete Signale, die Einmessung verspätete Austausche.

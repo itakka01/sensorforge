@@ -58,6 +58,23 @@ static void testBasics() {
     CHECK(!e.model().valid);  // one sample only
 }
 
+// One unusually fast TX path (hardware 2026-10-24: 1724 us among ~2000 us)
+// must not mark the following normal beacons as late.
+static void testFastTxPathOutlier() {
+    Estimator e;
+    e.reset();
+    const int64_t t0 = 5000000;
+    int late = 0;
+    for (int i = 0; i < 60; ++i) {
+        const int64_t node = t0 + i * 1000000LL;
+        const int32_t path = i == 20 ? 1724 : 1990 + (i * 7) % 40;
+        if (e.add({node, node + 1000, path}) == AddResult::TxPathLate) ++late;
+    }
+    CHECK(late == 0);
+    // A really late beacon is still skipped.
+    CHECK(e.add({t0 + 61000000LL, t0 + 61000000LL + 1000, 2400}) == AddResult::TxPathLate);
+}
+
 static void testMedianAndDelay() {
     const double v[] = {5, 1, 4, 2, 3};
     CHECK(median(v, 5) == 3);
@@ -201,6 +218,7 @@ static void print(const char *name, const SimResult &r) {
 int main() {
     testBasics();
     testMedianAndDelay();
+    testFastTxPathOutlier();
 
     const SimResult a = simulate(9, 900, 1, 100000, 0, true);
     print("9 nodes, all calibrated", a);

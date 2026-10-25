@@ -1,3 +1,6 @@
+## Fix gleichzeitige Ausfälle (2026-10-24) – v87-beta150
+TX-Pfad-Filter des Zeitsignal-Modells nutzt das untere Viertel statt des Minimums der letzten 32 Sendewege; ein einzelner schneller Wert ließ vorher ~30 s lang alle Signale verwerfen. Hardwaretest offen.
+
 ## Alter Zeit-Code entfernt (2026-10-24) – v87-beta149
 Nur noch ein Zeitverfahren im Projekt: SFHT1-Hardwaremessung, alte Zwei-Wege-Diagnosepakete (`NodeDriftReport`), ungenutzte Funkdiagnose, `sensorforge_monitor`, 67 alte Notizen und 3 veraltete Tests entfernt. `ESPNOW_TIME_ARCHITECTURE.md` neu geschrieben. GPIO-Testimpuls und Freenove-Messgerät bleiben. Hardwaretest nach Flash offen.
 

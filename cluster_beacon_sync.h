@@ -31,8 +31,8 @@ constexpr size_t kMinSamples = 8;
 constexpr int64_t kMinSpanUs = 4000000LL;
 constexpr double kMaxJitterUs = 150.0;      // RMS of the selected upper half
 constexpr double kMaxDriftPpm = 500.0;
-// A sample whose TX path (stamp -> TX-done) is longer than the shortest one in
-// the recent history by more than this left the coordinator late (busy
+// A sample whose TX path (stamp -> TX-done) is longer than the lower quartile
+// of the recent history by more than this left the coordinator late (busy
 // channel, queue): its stamp is too early, the sample is skipped.
 constexpr int32_t kTxPathSlackUs = 150;
 constexpr size_t kTxPathHistory = 32;
@@ -94,8 +94,10 @@ public:
     // Residual of a sample against the current model (y - envelope); 0 if the
     // model is invalid.
     double residualUs(const Sample &s) const;
-    // Shortest TX path in the recent history, -1 if none known.
+    // Shortest TX path in the recent history, -1 if none known (diagnostics).
     int32_t txPathMinUs() const;
+    // Reference for the late-TX filter: lower quartile of the history.
+    int32_t txPathReferenceUs() const;
     size_t count() const { return count_; }
     bool sampleAt(size_t index, Sample &out) const;  // 0 = oldest
 

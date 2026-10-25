@@ -64,6 +64,17 @@ int32_t Estimator::txPathMinUs() const {
     return m;
 }
 
+// Lower quartile of the TX path history: a single unusually fast TX-done
+// callback must not move the reference (with the minimum it made about 32 s
+// of normal beacons "late", all nodes lost precision together, beta149).
+int32_t Estimator::txPathReferenceUs() const {
+    if (!txPathCount_) return -1;
+    double v[kTxPathHistory];
+    for (size_t i = 0; i < txPathCount_; ++i) v[i] = txPaths_[i];
+    sortValues(v, txPathCount_);
+    return static_cast<int32_t>(v[(txPathCount_ - 1) / 4]);
+}
+
 bool Estimator::sampleAt(size_t index, Sample &out) const {
     if (index >= count_) return false;
     out = ring_[(first_ + index) % kWindow];
@@ -97,11 +108,11 @@ AddResult Estimator::add(const Sample &s) {
     }
     // TX path: compare against the history before adding this value.
     if (s.txPathUs >= 0) {
-        const int32_t minPath = txPathMinUs();
+        const int32_t refPath = txPathReferenceUs();
         txPaths_[txPathWrite_] = s.txPathUs;
         txPathWrite_ = (txPathWrite_ + 1) % kTxPathHistory;
         if (txPathCount_ < kTxPathHistory) ++txPathCount_;
-        if (minPath >= 0 && txPathCount_ >= 4 && s.txPathUs > minPath + kTxPathSlackUs) {
+        if (refPath >= 0 && txPathCount_ >= 4 && s.txPathUs > refPath + kTxPathSlackUs) {
             ++stats_.txPathLate;
             return AddResult::TxPathLate;
         }
