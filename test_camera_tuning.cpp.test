@@ -44,6 +44,37 @@ int main()
     CHECK(!parse("1,412,0,7,3,1,2,0,-1,2,-2x", v));      // garbage
     CHECK(!v.set);
 
+    // Colour temperature in wb_mode.
+    CHECK(parse("1,412,0,7,3,1,4500,0,-1,2,-2", v) && v.wbMode == 4500 && isKelvin(v.wbMode));
+    CHECK(parse("1,412,0,7,3,1,2000,0,-1,2,-2", v) && parse("1,412,0,7,3,1,10000,0,-1,2,-2", v));
+    CHECK(!parse("1,412,0,7,3,1,1999,0,-1,2,-2", v));
+    CHECK(!parse("1,412,0,7,3,1,10001,0,-1,2,-2", v));
+    CHECK(!parse("1,412,0,7,3,1,100,0,-1,2,-2", v));
+    CHECK(!isKelvin(4));
+
+    // Gains: 5500 K = the sensor's sunny gains; warmer = less red / more blue
+    // correction, monotone; anchors of the OV5640 presets reproduced.
+    int gr = 0, gb = 0;
+    kelvinGains(5500, 1564, 1267, gr, gb);
+    CHECK(gr == 1564 && gb == 1267);
+    kelvinGains(5500, 1500, 1300, gr, gb);
+    CHECK(gr == 1500 && gb == 1300);
+    kelvinGains(2800, 1564, 1267, gr, gb);
+    CHECK(gr == 1040 && gb == 2112);
+    kelvinGains(6500, 1564, 1267, gr, gb);
+    CHECK(gr == 1608 && gb == 1235);
+    int prevR = 0, prevB = 100000;
+    for (int k = kWbKelvinMin; k <= kWbKelvinMax; k += 100) {
+        kelvinGains(k, 1564, 1267, gr, gb);
+        CHECK(gr >= prevR && gb <= prevB && gr >= 1 && gr <= 4095 && gb >= 1 && gb <= 4095);
+        prevR = gr;
+        prevB = gb;
+    }
+    kelvinGains(500, 1564, 1267, gr, gb);  // clamped to 2000 K
+    int r2 = 0, b2 = 0;
+    kelvinGains(2000, 1564, 1267, r2, b2);
+    CHECK(gr == r2 && gb == b2);
+
     std::printf(failures ? "camera tuning: %d failures\n" : "camera tuning: ok\n", failures);
     return failures ? 1 : 0;
 }

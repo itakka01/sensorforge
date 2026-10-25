@@ -594,17 +594,25 @@ and white balance for uniform cluster cameras).
 
 | Parameter | Values |
 |---|---|
-| `mode` | `session` (apply now, until reboot), `save` (config.txt + apply), `reset` (remove the saved tuning; driver defaults from the next camera start) |
+| `mode` | `session` (apply now, until reboot), `save` (config.txt + apply), `resolution` (since beta157: `resolution=WxH` from 160x120 … 2048x1536 within the sensor's maximum; saved like the camera page, the recording fps is lowered to the board's limit if needed, the camera restarts; `409` while a cluster camera profile is active), `reset` (since beta157: firmware defaults – saved tuning removed, `camera_auto_exposure=1`, `camera_ae_level=-1`, saved and applied now) |
 | `aec`, `agc`, `awb`, `awb_gain` | 0 / 1 |
 | `ae_level`, `brightness`, `contrast`, `saturation` | -2 … 2 |
 | `aec_value` | 0 … 65535 sensor lines (OV2640 0 … 1200), used while `aec=0` |
 | `agc_gain` | 0 … 30, used while `agc=0` |
 | `gainceiling` | 0 … 6 (2× … 128×), used while `agc=1` |
-| `wb_mode` | 0 auto, 1 sunny, 2 cloudy, 3 office, 4 home |
+| `wb_mode` | 0 auto, 1 sunny, 2 cloudy, 3 office, 4 home, or (since beta157) 2000 … 10000 = colour temperature in kelvin (OV3660/OV5640 only; approximate, 5500 K = the sensor's sunny preset). `current.wb_mode` reports the kelvin value while it is applied. |
 
-All value fields are required except for `mode=reset`. Answer
+All value fields are required except for `mode=reset` and `mode=resolution`. Answer
 `{"ok":true|false,"message":"..."}`: `200`, `400` invalid/missing value, `409`
 camera off (session) or cluster capture planned, `500` save failed.
+
+### GET /api/v1/camera/line_time (since v87-beta157)
+
+Measures the duration of one sensor line on OV3660/OV5640 (shortest gap of 6
+consecutive frames divided by the frame length register 0x380E/0x380F), so
+exposure time ≈ `aec_value` × `line_us`. Takes about 6 frames.
+`{"ok":true,"line_us":29.6,"vts":1000,"frame_ms":29.6,"aec_max":65535}` or
+`{"ok":false,"message":"..."}` (camera off/busy, other sensor).
 
 ## Cluster camera profile (since v87-beta156, coordinator only)
 

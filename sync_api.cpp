@@ -3908,6 +3908,15 @@ static void handleCameraTuningGet()
     server().send(200, "application/json; charset=utf-8", cameraTuningJson());
 }
 
+static void handleCameraLineTimeGet()
+{
+    if (!authenticate())
+        return;
+    sendApiVersionHeader();
+    server().sendHeader("Cache-Control", "no-store");
+    server().send(200, "application/json; charset=utf-8", cameraLineTimeJson());
+}
+
 static void handleCameraTuningPost()
 {
     if (!authenticate())
@@ -4128,6 +4137,7 @@ void syncApiRegisterRoutes(WebServer &webServer)
     webServer.on("/api/v1/cluster/camera_profile", HTTP_POST, handleClusterCameraProfilePost);
     webServer.on("/api/v1/camera/tuning", HTTP_GET, handleCameraTuningGet);
     webServer.on("/api/v1/camera/tuning", HTTP_POST, handleCameraTuningPost);
+    webServer.on("/api/v1/camera/line_time", HTTP_GET, handleCameraLineTimeGet);
 
     webServer.on("/api/v1/status", HTTP_GET, handleStatus);
     webServer.on("/api/v1/storage", HTTP_GET, handleStorageStatus);

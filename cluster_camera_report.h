@@ -51,6 +51,7 @@ enum Cap : uint32_t {
     CapCrop           = 1u << 14,  // SensorForge sensor crop (currently OV3660 only)
     CapQuality        = 1u << 15,
     CapFramesize      = 1u << 16,
+    CapWbKelvin       = 1u << 17,  // manual WB gains (OV3660/OV5640), wbMode 2000..10000 K
 };
 
 struct Report {
@@ -252,7 +253,7 @@ inline bool decode(const char *const groups[kGroupCount], Report &out)
         !in(r.aec, 0, 1) || !in(r.aec2, 0, 1) || !in(r.aecValue, 0, 65535) ||
         !in(r.aeLevel, -5, 5) || !in(r.agc, 0, 1) || !in(r.agcGain, 0, 255) ||
         !in(r.gainCeiling, 0, 255) || !in(r.awb, 0, 1) || !in(r.awbGain, 0, 1) ||
-        !in(r.wbMode, 0, 4) || !in(r.rotation, 0, 359) || !in(r.hmirror, 0, 1) ||
+        !(in(r.wbMode, 0, 4) || in(r.wbMode, 2000, 10000)) || !in(r.rotation, 0, 359) || !in(r.hmirror, 0, 1) ||
         !in(r.vflip, 0, 1) || !in(r.cropZoomX10, 10, 40) || !in(r.cropX, 0, 2) ||
         !in(r.cropY, 0, 2))
         return false;

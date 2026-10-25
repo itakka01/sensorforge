@@ -39,7 +39,7 @@ Konfiguration geschrieben.
 | Fähigkeiten | max. Auflösung (`esp_camera_sensor_get_info`), Bitmaske der vorhandenen Treiberfunktionen |
 | Bild | Auflösung, JPEG-Qualität, Helligkeit, Kontrast, Sättigung, Schärfe, Rauschfilter |
 | Belichtung / Verstärkung | Belichtungsautomatik, AEC2, Belichtungswert (Zeilen), AE-Korrektur, Verstärkungsautomatik, Verstärkung, Verstärkungsobergrenze |
-| Weißabgleich | Weißabgleich-Automatik, AWB-Gain, WB-Modus (Auto / Sonne / Wolken / Büro / Glühlampe) |
+| Weißabgleich | Weißabgleich-Automatik, AWB-Gain, WB-Modus (Auto / Sonne / Wolken / Büro / Glühlampe; OV3660/OV5640 zusätzlich Farbtemperatur 2000–10000 K, `wb_mode` ≥ 2000) |
 | Geometrie | konfigurierte Drehung, wirksame Spiegelung H/V, Crop (Zoom 1,0/1,5/2,0, Position) |
 | Quelle | 2 Bit je Parametergruppe: `local` / `cluster` / `node`; in Phase 1 immer `local` |
 
@@ -104,10 +104,10 @@ Umgesetzt in Schritt 1:
 
 | Teil | Datei | Inhalt |
 |---|---|---|
-| Abstimmung | `camera_tuning.h`, `webconfig_camera_tuning.cpp` | Schlüssel `camera_tuning` (`1,aec_value,agc,agc_gain,gainceiling,awb,wb_mode,awb_gain,brightness,contrast,saturation`), Seite `/camera_tuning`, POST `/camera_tuning_apply` (`mode=session|save|reset`) |
+| Abstimmung | `camera_tuning.h`, `webconfig_camera_tuning.cpp` | Schlüssel `camera_tuning` (`1,aec_value,agc,agc_gain,gainceiling,awb,wb_mode,awb_gain,brightness,contrast,saturation`), Seite `/camera_tuning`, POST `/camera_tuning_apply` (`mode=session|save|reset|resolution`, `reset` = Standardwerte speichern und anwenden, `resolution` = Auflösung speichern + Kamera-Neustart), `/camera_line_time` (gemessene Zeilendauer für die Belichtungszeit) |
 | Anwenden | `sensorforge.ino` | `cameraApplyTuning()` am Ende der Belichtungseinstellung in `initCamera()`; `cameraApplyTuningRuntime()` ohne Kameraneustart |
 | Live-Bild | `cluster_capture.cpp` (`clusterCaptureLiveFrame`), `/camera_frame` | frisches Bild, `size=small` (≈1/8, Standard), `medium` (≥ 800 px breit) oder `full`; gleiche Sperren wie eine Cluster-Aufnahme |
-| Kleinbild | `camera_thumbnail.cpp`, `jpeg_mini_encoder.cpp` | Dekodieren direkt in 1/2, 1/4 oder 1/8 (≥ 160 px breit), Neukodierung Qualität 80, 4:4:4 |
+| Kleinbild | `camera_thumbnail.cpp` (`esp_new_jpeg`, Rückfall `jpeg_mini_encoder.cpp`) | Verkleinern um 1/2, 1/4 oder 1/8 (≥ 160 px breit) direkt beim Dekodieren, Neukodierung Qualität 80, 4:2:0 (Rückfall 4:4:4); Zeiten im Header `X-SF-Frame-Timing` |
 | Übersicht | `webconfig_cluster_camera.cpp` | Raster aller Kameras, nacheinander geladen, optional laufend |
 
 Hinweise:
@@ -122,7 +122,7 @@ Hinweise:
 | Profilformat | `camera_profile.h` | `P1,<version>,<pid>,<WxH>,<quality>,<aec>,<ae_level>,<tuning>`, Ergebniscodes |
 | Node-Speicher | `camera_profile_store.cpp` | Sitzung (RAM) / dauerhaft (NVS `sf_camprof`) |
 | Node-Anwendung | `sensorforge.ino` | `cameraProfileWanted()` (Drone Mode + gleicher Sensor), Übernahme in `initCamera()`, `cameraProfileService()` startet die Kamera bei Änderung neu, `cameraProfileApplyJob()` |
-| Protokoll | `cluster.cpp` | `SFJP1` Coordinator → Node (Modus 0 Sitzung, 1 dauerhaft, 2 entfernen), `SFJPA1` Antwort; Job-Art 9 |
+| Protokoll | `cluster.cpp` | `SFJK1` Coordinator → Node (Modus 0 Sitzung, 1 dauerhaft, 2 entfernen), `SFJKA1` Antwort; Job-Art 9 (bis beta156 `SFJP1`/`SFJPA1`, kollidierte mit dem Verbindungstest) |
 | Coordinator | `cluster_camera_profile.cpp` | Referenz + letztes Profil je Sensortyp (NVS `sf_camref`), Profil aus der Referenz-Meldung, Verteilung |
 | Meldung | `cluster_camera_report.h` | Gruppe `src` = `sourceMask,profileVersion,profileState` |
 | Oberfläche/API | `webconfig_cluster_camera.cpp`, `sync_api.cpp` | Herz, Übertragen/Entfernen, Spalte „Profil“; `/api/v1/cluster/camera_profile`, `/api/v1/cluster/cameras`, `/api/v1/camera/tuning` |

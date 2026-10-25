@@ -948,10 +948,10 @@ static void setDefaultValues(
 #endif
 
     values.cameraAutoExposure =
-        1;
+        CameraTuning::kDefaultAutoExposure;
 
     values.cameraAeLevel =
-        -1;
+        CameraTuning::kDefaultAeLevel;
 
     values.cameraCropZoom =
         "1.0";

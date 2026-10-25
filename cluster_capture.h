@@ -18,6 +18,17 @@ bool clusterCaptureGetThumb(const String &uuid,const uint8_t *&bytes,size_t &len
 constexpr uint16_t kLiveFrameSmall=160;
 constexpr uint16_t kLiveFrameMedium=800;
 bool clusterCaptureLiveFrame(uint16_t minWidth,const uint8_t *&bytes,size_t &length,String &reason);
+// Timing of the last fresh live frame (cached answers keep it): camera grab,
+// thumbnail decode/encode (camera_thumbnail.h), source and output size.
+struct ClusterLiveFrameStats{uint32_t grabUs;uint32_t decodeUs;uint32_t encodeUs;uint16_t srcWidth;uint16_t srcHeight;uint16_t width;uint16_t height;uint8_t path;bool cached;};
+ClusterLiveFrameStats clusterCaptureLiveStats();
+// Drops the shared live frame (camera settings changed).
+void clusterCaptureLiveInvalidate();
+// Duration of one sensor line (OV3660/OV5640): shortest gap of consecutive
+// frames divided by the frame length register (VTS, 0x380E/0x380F). Exposure
+// time = aec_value * lineUs (approximate; a manual exposure longer than the
+// frame stretches the frame). Same refusals as the live frame; ~6 frames.
+bool clusterCaptureMeasureLineTime(float &lineUs,uint32_t &vts,float &frameMs,String &reason);
 String clusterCaptureLocalJson();
 bool clusterCapturePrepareCamera();
 bool clusterCaptureArmed();

@@ -6,6 +6,7 @@
 #include "cluster_camera.h"
 #include "cluster_capture.h"
 #include "config.h"
+#include <WiFi.h>
 
 extern int cfg_web_auth_enabled;
 
@@ -44,6 +45,13 @@ void handleCameraFrame()
         g_server->send(409, "text/plain; charset=utf-8", reason);
         return;
     }
+    // Timing for measurements: grab, thumbnail decode/encode (µs), sizes,
+    // path 1 = esp_new_jpeg, 2 = fallback, 0 = original; cached = shared grab.
+    const ClusterLiveFrameStats st = clusterCaptureLiveStats();
+    g_server->sendHeader("X-SF-Frame-Timing",
+                         String("grab_us=") + st.grabUs + ";decode_us=" + st.decodeUs + ";encode_us=" + st.encodeUs +
+                             ";src=" + st.srcWidth + "x" + st.srcHeight + ";out=" + st.width + "x" + st.height +
+                             ";path=" + st.path + ";cached=" + (st.cached ? 1 : 0));
     g_server->sendHeader("Cache-Control", "no-store");
     g_server->setContentLength(length);
     g_server->send(200, "image/jpeg", "");
@@ -74,7 +82,8 @@ bool readForm(WebServer &srv, int &autoExposure, int &aeLevel, CameraTuning::Val
     t.agcGain = argInt(srv, "agc_gain", 0);
     t.gainCeiling = argInt(srv, "gainceiling", 0);
     t.awb = argInt(srv, "awb", 1);
-    t.wbMode = argInt(srv, "wb_mode", 0);
+    // wb_mode: preset 0..4 or kelvin directly (API); "k" takes wb_kelvin (page).
+    t.wbMode = srv.arg("wb_mode") == "k" ? argInt(srv, "wb_kelvin", 0) : argInt(srv, "wb_mode", 0);
     t.awbGain = argInt(srv, "awb_gain", 1);
     t.brightness = argInt(srv, "brightness", 0);
     t.contrast = argInt(srv, "contrast", 0);
@@ -94,10 +103,78 @@ String jsonEscaped(const String &text)
     return m;
 }
 
+// JS string literal for inline scripts ('...', no '<' so no </script>).
+String jsQuoted(const String &text)
+{
+    String m = text;
+    m.replace("\\", "\\\\");
+    m.replace("'", "\\'");
+    m.replace("<", "\\x3c");
+    return "'" + m + "'";
+}
+
 int result(String &json, int code, bool ok, const String &message)
 {
     json = String("{\"ok\":") + (ok ? "true" : "false") + ",\"message\":\"" + jsonEscaped(message) + "\"}";
     return code;
+}
+
+const char *const kResolutions[] = {"160x120", "320x240", "640x480", "800x600",
+                                    "1024x768", "1280x1024", "1600x1200", "2048x1536"};
+
+// Largest resolution of the running sensor (from its report), 0x0 = unknown.
+void sensorMaxResolution(const ClusterCamera::Report &r, uint16_t &w, uint16_t &h)
+{
+    w = h = 0;
+    if (r.maxFramesize != ClusterCamera::kUnknown)
+        ClusterCamera::framesizeDims(r.maxFramesize, w, h);
+}
+
+bool resolutionFits(const char *res, uint16_t maxW, uint16_t maxH)
+{
+    unsigned w = 0, h = 0;
+    if (sscanf(res, "%ux%u", &w, &h) != 2)
+        return false;
+    return !maxW || (w <= maxW && h <= maxH);
+}
+
+// mode=resolution: save the camera resolution (camera settings path, same
+// checks as the camera page) and restart the camera. The recording frame rate
+// is lowered when the new resolution would exceed the board's pixel budget.
+int applyResolution(WebServer &srv, String &json)
+{
+    using namespace ClusterCamera;
+    const String res = srv.arg("resolution");
+    Report r;
+    cameraFillClusterReport(r);
+    if (r.profileState == (int32_t)ProfileState::Active || r.profileState == (int32_t)ProfileState::Pending)
+        return result(json, 409, false, "Cluster-Kameraprofil aktiv – die Auflösung gibt das Profil vor.");
+    uint16_t maxW = 0, maxH = 0;
+    sensorMaxResolution(r, maxW, maxH);
+    bool known = false;
+    for (const char *k : kResolutions)
+        known = known || res == k;
+    if (!known || !resolutionFits(res.c_str(), maxW, maxH))
+        return result(json, 400, false, "Auflösung nicht unterstützt: " + res);
+    int fps = cfg_fps;
+    String note;
+    const int maxFps = configRecordingPerformanceMaxFps(res, cfg_quality);
+    if (maxFps >= 1 && fps > maxFps) {
+        note = " Aufnahme-Bildrate von " + String(fps) + " auf " + String(maxFps) + " fps gesenkt.";
+        fps = maxFps;
+    }
+    String error;
+    configRefreshSdStatus();
+    const bool writeToSd = configSdAvailable() && configSdPresent();
+    const ConfigSaveResult saved = configSaveCameraSettings(
+        cfg_camera, res, fps, cfg_quality, cfg_camera_xclk_mhz, cfg_camera_auto_exposure, cfg_camera_ae_level,
+        cfg_rotation, cfg_camera_crop_zoom, cfg_camera_crop_x, cfg_camera_crop_y, writeToSd, error);
+    if (saved != CONFIG_SAVE_BOTH && saved != CONFIG_SAVE_INTERNAL_ONLY)
+        return result(json, 400, false, "Speichern fehlgeschlagen: " + error);
+    clusterCaptureLiveInvalidate();
+    if (!cameraRestartWithSettings(error))
+        return result(json, 200, true, "Auflösung " + res + " gespeichert; " + error + "." + note);
+    return result(json, 200, true, "Auflösung " + res + " gespeichert, Kamera neu gestartet." + note);
 }
 
 // POST /camera_tuning_apply
@@ -149,8 +226,14 @@ void handleCameraTuningPage()
 
     String html = g_header();
     html.reserve(9000);
-    html += "<div class='page-title'><div><h2>Bildabstimmung</h2><p>Feste Belichtung, Verstärkung und Weißabgleich – "
+    String host = cfg_hostname.length() ? cfg_hostname : String("SensorForge");
+    host.replace("&", "&amp;");
+    host.replace("<", "&lt;");
+    host.replace(">", "&gt;");
+    html += "<div class='page-title'><div><h2>Bildabstimmung – " + host + "</h2><p>Gerät <strong>" + host +
+            "</strong> (" + WiFi.localIP().toString() + ") · Feste Belichtung, Verstärkung und Weißabgleich – "
             "Grundlage für einheitliche Cluster-Kameras (Gaussian Splats)</p></div></div>";
+    html += "<script>document.title='Bildabstimmung – '+" + jsQuoted(cfg_hostname) + ";</script>";
     html += "<style>.tune-grid{display:grid;grid-template-columns:minmax(150px,220px) minmax(120px,1fr);gap:8px 12px;align-items:center}"
             ".tune-grid label{font-weight:700;margin:0}.tune-grid input,.tune-grid select{margin:0;max-width:240px}</style>";
     html += "<section class='settings-section'><p class='muted'>Sensor: <strong>" + String(sensorName(r.pid)) +
@@ -169,14 +252,41 @@ void handleCameraTuningPage()
     html += "<div style='display:flex;flex-wrap:wrap;gap:16px;align-items:flex-start'>"
             "<div style='flex:1 1 360px;min-width:0'><img id='tuneImg' alt='Live-Bild' "
             "style='display:block;width:100%;max-height:70vh;object-fit:contain;background:#1f2937;border-radius:8px'>"
-            "<div style='margin-top:6px'><label><input type='checkbox' id='tuneLive' checked> Live</label> "
-            "<label>Bildgröße <select id='tuneSize'><option value='small'>Klein</option>"
+            "<div style='margin-top:6px'><label><input type='checkbox' id='tuneLive' checked> Vorschau live aktualisieren</label> "
+            "<label>Vorschaugröße <select id='tuneSize'><option value='small'>Klein</option>"
             "<option value='medium' selected>Mittel (ca. 800 px)</option><option value='full'>Voll</option></select></label> "
-            "<span id='tuneImgState' class='muted'></span></div></div>";
+            "<span id='tuneImgState' class='muted'></span></div>"
+            "<p class='muted' style='margin:4px 0 0'>Vorschau-Einstellungen betreffen nur die Übertragung in den Browser, "
+            "nicht die Kamera.</p>";
+    {
+        uint16_t curW = 0, curH = 0, maxW = 0, maxH = 0;
+        framesizeDims(r.framesize, curW, curH);
+        sensorMaxResolution(r, maxW, maxH);
+        const String cur = String(curW) + "x" + String(curH);
+        const bool profileOwns = r.profileState == (int32_t)ProfileState::Active || r.profileState == (int32_t)ProfileState::Pending;
+        html += "<div style='margin-top:12px'><label for='tuneRes'><strong>Kamera-Auflösung</strong></label> "
+                "<select id='tuneRes'" + String(profileOwns ? " disabled" : "") + ">";
+        for (const char *k : kResolutions)
+            if (resolutionFits(k, maxW, maxH))
+                html += String("<option value='") + k + "'" + (cur == k ? " selected" : "") + ">" + k + "</option>";
+        html += "</select> <button type='button' id='tuneResApply'" + String(profileOwns ? " disabled" : "") +
+                ">Übernehmen (Kamera startet neu)</button>"
+                "<p class='muted' style='margin:4px 0 0'>" +
+                String(profileOwns ? "Cluster-Kameraprofil aktiv – die Auflösung gibt das Profil vor."
+                                   : "Gilt dauerhaft (wie auf der Kamera-Seite). Die Kamera startet kurz neu. Der "
+                                     "Belichtungswert zählt in Sensorzeilen – nach einem Wechsel ergibt derselbe Wert eine "
+                                     "andere Belichtungszeit.") +
+                "</p></div>";
+    }
+    html += "</div>";
     html += "<form id='tuneForm' style='flex:1 1 300px;min-width:0' onsubmit='return false'><div class='tune-grid'>";
     html += "<label>Belichtungsautomatik</label><select name='aec'" + dis(CapManualExposure) + ">" + opt(1, aec, "An") + opt(0, aec, "Aus") + "</select>";
     html += "<label>AE-Korrektur (bei Automatik)</label><input name='ae_level' type='number' min='-2' max='2' value='" + String(aeLevel) + "'" + dis(CapAeLevel) + ">";
-    html += "<label>Belichtungswert (Zeilen, bei Aus)</label><input name='aec_value' type='number' min='0' max='" + String(r.pid == 0x26 ? CameraTuning::kAecMaxOv2640 : CameraTuning::kAecMax) + "' value='" + String(aecValue) + "'" + dis(CapManualExposure) + ">";
+    html += "<label>Belichtungswert (Zeilen, bei Aus)</label><input name='aec_value' id='tuneAecValue' type='number' min='0' max='" + String(r.pid == 0x26 ? CameraTuning::kAecMaxOv2640 : CameraTuning::kAecMax) + "' value='" + String(aecValue) + "'" + dis(CapManualExposure) + ">";
+    html += "<label>Belichtungszeit (bei Aus)</label><div><select id='tuneShutter' disabled><option value=''>– Zeilenwert –</option>"
+            "<option value='30'>1/30 s</option><option value='60'>1/60 s</option><option value='125'>1/125 s</option>"
+            "<option value='250'>1/250 s</option><option value='500'>1/500 s</option><option value='1000'>1/1000 s</option>"
+            "<option value='2000'>1/2000 s</option></select> <span id='tuneShutterInfo' class='muted'>wird gemessen …</span></div>";
     html += "<label>Verstärkungsautomatik</label><select name='agc'" + dis(CapManualGain) + ">" + opt(1, agc, "An") + opt(0, agc, "Aus") + "</select>";
     html += "<label>Verstärkung (0–30, bei Aus)</label><input name='agc_gain' type='number' min='0' max='" + String(CameraTuning::kAgcMax) + "' value='" + String(agcGain) + "'" + dis(CapManualGain) + ">";
     html += "<label>Verstärkungsobergrenze (bei An)</label><select name='gainceiling'" + dis(CapGainCeiling) + ">";
@@ -184,19 +294,32 @@ void handleCameraTuningPage()
         html += opt(i, ceiling, String(2 << i) + "×");
     html += "</select>";
     html += "<label>Weißabgleich-Automatik</label><select name='awb'" + dis(CapAutoWb) + ">" + opt(1, awb, "An") + opt(0, awb, "Aus") + "</select>";
-    html += "<label>Weißabgleich-Voreinstellung</label><select name='wb_mode'" + dis(CapWbPresets) + ">" + opt(0, wbMode, "Auto") +
-            opt(1, wbMode, "Sonne") + opt(2, wbMode, "Wolken") + opt(3, wbMode, "Büro") + opt(4, wbMode, "Glühlampe") + "</select>";
+    const bool kelvin = CameraTuning::isKelvin(wbMode);
+    const bool kelvinCap = !caps || (caps & CapWbKelvin);
+    html += "<label>Weißabgleich-Voreinstellung</label><select name='wb_mode' id='tuneWb'" + dis(CapWbPresets) + ">" + opt(0, wbMode, "Auto") +
+            opt(1, wbMode, "Sonne") + opt(2, wbMode, "Wolken") + opt(3, wbMode, "Büro") + opt(4, wbMode, "Glühlampe") +
+            (kelvinCap ? String("<option value='k'") + (kelvin ? " selected" : "") + ">Farbtemperatur (Kelvin)</option>" : String()) +
+            "</select>";
+    html += "<label>Farbtemperatur (K, " + String(CameraTuning::kWbKelvinMin) + "–" + String(CameraTuning::kWbKelvinMax) +
+            ")</label><input name='wb_kelvin' id='tuneKelvin' type='number' step='100' min='" + String(CameraTuning::kWbKelvinMin) +
+            "' max='" + String(CameraTuning::kWbKelvinMax) + "' value='" + String(kelvin ? wbMode : 5500) + "'" +
+            (kelvinCap ? String() : String(" disabled title='Nur OV3660/OV5640'")) + ">";
     html += "<label>AWB-Gain</label><select name='awb_gain'" + dis(CapAwbGain) + ">" + opt(1, awbGain, "An") + opt(0, awbGain, "Aus") + "</select>";
     html += "<label>Helligkeit</label><input name='brightness' type='number' min='-2' max='2' value='" + String(bri) + "'" + dis(CapBrightness) + ">";
     html += "<label>Kontrast</label><input name='contrast' type='number' min='-2' max='2' value='" + String(con) + "'" + dis(CapContrast) + ">";
     html += "<label>Sättigung</label><input name='saturation' type='number' min='-2' max='2' value='" + String(sat) + "'" + dis(CapSaturation) + ">";
     html += "</div><p><button type='button' data-mode='session'>Anwenden (bis Neustart)</button> "
             "<button type='button' data-mode='save'>Dauerhaft speichern</button> "
-            "<button type='button' data-mode='reset'>Gespeicherte Abstimmung entfernen</button></p>"
+            "<button type='button' data-mode='reset'>Auf Standardwerte zurücksetzen</button></p>"
+            "<p><label><input type='checkbox' id='tuneAuto' checked> Änderungen sofort anwenden (bis Neustart)</label></p>"
             "<p id='tuneState' class='muted' role='status'></p>"
             "<p class='muted'>„Anwenden“ ändert die laufende Kamera sofort. „Dauerhaft speichern“ wirkt auch nach jedem "
-            "Kamerastart. Während einer geplanten Cluster-Aufnahme werden Änderungen abgelehnt.</p></form></div></section>";
+            "Kamerastart. „Auf Standardwerte zurücksetzen“ stellt alle Werte dieser Seite auf die Werkseinstellung "
+            "(Automatiken an, Weißabgleich Auto, Helligkeit/Kontrast/Sättigung 0) und speichert das. Farbtemperatur: "
+            "ungefährer Kelvin-Wert, 5500 K entspricht der Voreinstellung „Sonne“ des Sensors. Während einer geplanten Cluster-Aufnahme werden Änderungen abgelehnt.</p></form></div></section>";
     html += R"__TUNE__(<script>(function(){
+var wb=document.getElementById('tuneWb'),kel=document.getElementById('tuneKelvin');
+function wbView(){if(kel&&wb&&!kel.hasAttribute('title'))kel.disabled=wb.value!=='k';}if(wb){wb.addEventListener('change',wbView);wbView();}
 var img=document.getElementById('tuneImg'),live=document.getElementById('tuneLive'),size=document.getElementById('tuneSize'),ist=document.getElementById('tuneImgState'),st=document.getElementById('tuneState'),form=document.getElementById('tuneForm'),busy=false,again=false,timer=null;
 function next(){if(timer){clearTimeout(timer);timer=null;}if(live.checked&&!document.hidden)timer=setTimeout(load,800);}
 function load(){if(busy){again=true;return;}busy=true;again=false;var u='/camera_frame?size='+size.value+'&t='+Date.now();
@@ -205,12 +328,37 @@ function load(){if(busy){again=true;return;}busy=true;again=false;var u='/camera
  .catch(function(e){ist.textContent='Kein Bild: '+(e.message||e);}).then(function(){busy=false;if(again)load();else next();});}
 live.addEventListener('change',function(){if(live.checked)load();});size.addEventListener('change',load);
 document.addEventListener('visibilitychange',function(){if(!document.hidden&&live.checked)load();});
-form.addEventListener('click',function(e){var b=e.target.closest('button[data-mode]');if(!b)return;var m=b.getAttribute('data-mode');
- if(m==='reset'&&!confirm('Gespeicherte Abstimmung entfernen? Die Kamera nutzt nach dem nächsten Neustart wieder den Treiberstandard.'))return;
- // Disabled (unsupported) fields are sent too; the server needs a complete set.
+// Exposure time: aec_value (sensor lines) x measured line duration.
+var aecV=document.getElementById('tuneAecValue'),aecSel=form.querySelector('[name=aec]'),sh=document.getElementById('tuneShutter'),shi=document.getElementById('tuneShutterInfo'),lineUs=0;
+function fmtT(us){if(us>=1e6)return (us/1e6).toFixed(1)+' s';return '1/'+Math.round(1e6/us)+' s';}
+function shView(){if(!lineUs)return;var v=parseInt(aecV.value,10);shi.textContent=(v>0?'≈ '+fmtT(v*lineUs)+' · ':'')+'1 Zeile ≈ '+lineUs.toFixed(1)+' µs';}
+fetch('/camera_line_time',{cache:'no-store',credentials:'same-origin'}).then(function(r){return r.json();}).then(function(j){
+ if(!j.ok){shi.textContent='Zeit nicht messbar: '+j.message;return;}lineUs=j.line_us;var max=parseInt(aecV.max,10)||j.aec_max;
+ Array.from(sh.options).forEach(function(o){if(!o.value)return;var n=Math.round(1e6/(+o.value*lineUs));if(n<1||n>max){o.disabled=true;o.textContent+=n<1?' (zu kurz)':' (zu lang)';}});
+ sh.disabled=aecV.disabled;shView();}).catch(function(e){shi.textContent='Zeit nicht messbar: '+(e.message||e);});
+aecV.addEventListener('input',function(){sh.value='';shView();});
+sh.addEventListener('change',function(){if(!sh.value||!lineUs)return;aecV.value=Math.max(1,Math.round(1e6/(+sh.value*lineUs)));
+ if(aecSel&&!aecSel.disabled)aecSel.value='0';shView();aecV.dispatchEvent(new Event('change',{bubbles:true}));});
+// Camera resolution: saved like on the camera page, camera restarts.
+var resSel=document.getElementById('tuneRes'),resBtn=document.getElementById('tuneResApply');
+if(resBtn)resBtn.addEventListener('click',function(){if(!confirm('Kamera-Auflösung auf '+resSel.value+' ändern? Die Kamera startet neu.'))return;
+ var fd=new URLSearchParams();fd.append('mode','resolution');fd.append('resolution',resSel.value);st.textContent='Auflösung wird übernommen …';resBtn.disabled=true;
+ fetch('/camera_tuning_apply',{method:'POST',body:fd,credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json().catch(function(){return {ok:false,message:'HTTP '+r.status};});})
+ .then(function(j){st.textContent=(j.ok?'✓ ':'✗ ')+j.message;if(j.ok)setTimeout(function(){location.reload();},1500);else resBtn.disabled=false;}).catch(function(e){st.textContent='✗ '+(e.message||e);resBtn.disabled=false;});});
+var sending=false,queued=null,autoTimer=null,auto=document.getElementById('tuneAuto');
+// Disabled (unsupported) fields are sent too; the server needs a complete set.
+function send(m){if(sending){queued=m;return;}sending=true;queued=null;
  var fd=new URLSearchParams();Array.from(form.elements).forEach(function(el){if(el.name)fd.append(el.name,el.value);});fd.append('mode',m);st.textContent='Wird übertragen …';
  fetch('/camera_tuning_apply',{method:'POST',body:fd,credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json().catch(function(){return {ok:false,message:'HTTP '+r.status};});})
- .then(function(j){st.textContent=(j.ok?'✓ ':'✗ ')+j.message;if(j.ok)load();}).catch(function(e){st.textContent='✗ '+(e.message||e);});});
+ .then(function(j){st.textContent=(j.ok?'✓ ':'✗ ')+j.message;if(j.ok&&m==='reset'){setTimeout(function(){location.reload();},800);return;}if(j.ok)load();}).catch(function(e){st.textContent='✗ '+(e.message||e);})
+ .then(function(){sending=false;if(queued)send(queued);});}
+form.addEventListener('click',function(e){var b=e.target.closest('button[data-mode]');if(!b)return;var m=b.getAttribute('data-mode');
+ if(m==='reset'&&!confirm('Alle Werte dieser Seite auf die Standardwerte zurücksetzen und speichern?'))return;
+ if(autoTimer){clearTimeout(autoTimer);autoTimer=null;}send(m);});
+// Instant preview: every change is applied for the session after a short pause.
+function changed(e){if(!auto||!auto.checked||!e.target.name)return;if(e.target.type==='number'&&!e.target.checkValidity())return;
+ if(autoTimer)clearTimeout(autoTimer);autoTimer=setTimeout(function(){autoTimer=null;send('session');},e.type==='input'?600:150);}
+form.addEventListener('input',changed);form.addEventListener('change',changed);
 load();
 })();</script>)__TUNE__";
     html += g_footer();
@@ -225,33 +373,40 @@ int cameraTuningRequestFromArgs(WebServer &srv, String &json)
     if (clusterCaptureProtectionActive())
         return result(json, 409, false, "Cluster-Aufnahme geplant – bitte danach erneut.");
     const String mode = srv.arg("mode");
+    if (mode == "resolution")
+        return applyResolution(srv, json);
     int autoExposure = cfg_camera_auto_exposure, aeLevel = cfg_camera_ae_level;
     CameraTuning::Values t;
     String error;
     if (mode == "reset") {
-        // Driver defaults return with the next camera start.
+        // Firmware defaults: saved tuning removed, auto exposure/AE level reset,
+        // the default values applied to the running camera right away.
+        autoExposure = CameraTuning::kDefaultAutoExposure;
+        aeLevel = CameraTuning::kDefaultAeLevel;
     } else if (!readForm(srv, autoExposure, aeLevel, t, error)) {
         return result(json, 400, false, error);
     }
     if (mode == "save" || mode == "reset") {
         char text[80];
-        CameraTuning::format(t, text, sizeof(text));
+        CameraTuning::format(mode == "reset" ? CameraTuning::Values{} : t, text, sizeof(text));
         configRefreshSdStatus();
         const bool writeToSd = configSdAvailable() && configSdPresent();
         const ConfigSaveResult saved = configSaveCameraTuning(autoExposure, aeLevel, String(text), writeToSd, error);
         if (saved != CONFIG_SAVE_BOTH && saved != CONFIG_SAVE_INTERNAL_ONLY)
             return result(json, 500, false, "Speichern fehlgeschlagen: " + error);
         if (mode == "reset")
-            return result(json, 200, true, "Gespeicherte Abstimmung entfernt. Treiberstandard gilt nach dem nächsten Kamerastart.");
+            t.set = true; // apply the default values now
     } else if (mode != "session") {
-        return result(json, 400, false, "mode muss session, save oder reset sein");
+        return result(json, 400, false, "mode muss session, save, reset oder resolution sein");
     }
+    clusterCaptureLiveInvalidate();
     if (!cameraApplyTuningRuntime(autoExposure, aeLevel, t, error)) {
-        if (mode == "save")
+        if (mode == "save" || mode == "reset")
             return result(json, 200, true, "Gespeichert; wirkt beim nächsten Kamerastart (" + error + ").");
         return result(json, 409, false, error);
     }
-    return result(json, 200, true, mode == "save" ? "Gespeichert und angewendet." : "Angewendet (bis zum Neustart).");
+    return result(json, 200, true, mode == "reset" ? "Standardwerte gespeichert und angewendet."
+                                   : mode == "save" ? "Gespeichert und angewendet." : "Angewendet (bis zum Neustart).");
 }
 
 String cameraTuningJson()
@@ -282,6 +437,28 @@ String cameraTuningJson()
     return json;
 }
 
+String cameraLineTimeJson()
+{
+    float lineUs = 0, frameMs = 0;
+    uint32_t vts = 0;
+    String reason;
+    if (!clusterCaptureMeasureLineTime(lineUs, vts, frameMs, reason))
+        return "{\"ok\":false,\"message\":\"" + jsonEscaped(reason) + "\"}";
+    return "{\"ok\":true,\"line_us\":" + String(lineUs, 2) + ",\"vts\":" + String((unsigned long)vts) +
+           ",\"frame_ms\":" + String(frameMs, 1) + ",\"aec_max\":" + String(CameraTuning::kAecMax) + "}";
+}
+
+namespace {
+// GET /camera_line_time: measured sensor line duration for the exposure time display.
+void handleCameraLineTime()
+{
+    if (!requireAdmin())
+        return;
+    g_server->sendHeader("Cache-Control", "no-store");
+    g_server->send(200, "application/json; charset=utf-8", cameraLineTimeJson());
+}
+} // namespace
+
 void webconfigCameraTuningRegisterRoutes(WebServer &server, String (*htmlHeader)(), String (*htmlFooter)())
 {
     g_server = &server;
@@ -290,4 +467,5 @@ void webconfigCameraTuningRegisterRoutes(WebServer &server, String (*htmlHeader)
     server.on("/camera_frame", HTTP_GET, handleCameraFrame);
     server.on("/camera_tuning", HTTP_GET, handleCameraTuningPage);
     server.on("/camera_tuning_apply", HTTP_POST, handleCameraTuningApply);
+    server.on("/camera_line_time", HTTP_GET, handleCameraLineTime);
 }

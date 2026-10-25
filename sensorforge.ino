@@ -145,6 +145,8 @@ int wifiInfrastructureRssiDbm()
 // sensors keep the legacy deinit/reinit behavior.
 static uint8_t cameraFramebufferCount = 0;
 static bool cameraSoftPowerDownActive = false;
+// Colour temperature (K) whose manual WB gains are on the running camera; 0 = none.
+static int cameraWbKelvinApplied = 0;
 static bool cameraFastSleepCapabilityKnown = false;
 static bool cameraFastSleepSupported = false;
 static uint16_t cameraDetectedPid = 0;
@@ -6269,6 +6271,7 @@ static void cameraDeinitRuntime()
     cameraProfileAppliedVersion = 0;
     cameraFramebufferCount = 0;
     cameraSoftPowerDownActive = false;
+    cameraWbKelvinApplied = 0;
     cameraCropAppliedZoomX10 = 10;
     cameraCropAppliedX = -1;
     cameraCropAppliedY = -1;
@@ -6347,6 +6350,25 @@ static CameraProfileServiceResult cameraProfileServiceNow()
         return CAMERA_PROFILE_RESTART_FAILED;
     }
     return CAMERA_PROFILE_IN_EFFECT;
+}
+
+
+bool cameraRestartWithSettings(String &error)
+{
+    // A camera that is off uses the saved settings at its next start.
+    if (!cameraInitialized)
+        return true;
+    if (!cameraProfileRestartSafe()) {
+        error = "Kamera ist gerade belegt – Neustart der Kamera beim nächsten Kamerastart";
+        return false;
+    }
+    Serial.println("[CAMERA] settings changed, restarting camera");
+    cameraDeinitRuntime();
+    if (!initCamera(cfg_camera, cfg_resolution, cfg_quality)) {
+        error = "Kamera-Neustart fehlgeschlagen";
+        return false;
+    }
+    return true;
 }
 
 
@@ -8207,6 +8229,43 @@ static bool handleTransportModeBoot(
 }
 
 
+static bool cameraSensorSupportsWbKelvin(sensor_t *sensor)
+{
+    return sensor && sensor->set_wb_mode && sensor->set_reg && sensor->get_reg &&
+           (sensor->id.PID == 0x5640 || sensor->id.PID == 0x3660);
+}
+
+
+// Colour temperature on OV3660/OV5640: select the "sunny" preset (manual AWB
+// gains, registers 0x3400-0x3405), read its gains back as calibration and
+// overwrite R/B with CameraTuning::kelvinGains. False (sunny preset stays)
+// when the sensor is not supported or the read-back looks wrong.
+static bool cameraApplyWbKelvin(sensor_t *sensor, int kelvin)
+{
+    if (!cameraSensorSupportsWbKelvin(sensor) || !CameraTuning::isKelvin(kelvin))
+        return false;
+    sensor->set_wb_mode(sensor, 1);
+    int reg[6];
+    for (int i = 0; i < 6; ++i) {
+        reg[i] = sensor->get_reg(sensor, 0x3400 + i, 0xFF);
+        if (reg[i] < 0)
+            return false;
+    }
+    const int sunnyR = ((reg[0] & 0x0F) << 8) | reg[1];
+    const int sunnyG = ((reg[2] & 0x0F) << 8) | reg[3];
+    const int sunnyB = ((reg[4] & 0x0F) << 8) | reg[5];
+    // A real preset has G near 1.0 (0x400) and R/B in a sane gain range.
+    if (sunnyG < 0x200 || sunnyG > 0x800 || sunnyR < 0x100 || sunnyB < 0x100)
+        return false;
+    int r = 0, b = 0;
+    CameraTuning::kelvinGains(kelvin, sunnyR, sunnyB, r, b);
+    return sensor->set_reg(sensor, 0x3400, 0xFF, (r >> 8) & 0x0F) == 0 &&
+           sensor->set_reg(sensor, 0x3401, 0xFF, r & 0xFF) == 0 &&
+           sensor->set_reg(sensor, 0x3404, 0xFF, (b >> 8) & 0x0F) == 0 &&
+           sensor->set_reg(sensor, 0x3405, 0xFF, b & 0xFF) == 0;
+}
+
+
 // Image tuning (camera_tuning.h) on top of auto exposure / AE level. Unset
 // tuning keeps the driver defaults. Order: switch an automatic off before
 // writing its manual value.
@@ -8218,6 +8277,7 @@ static void cameraApplyTuning(
 {
     if (!sensor || !t.set)
         return;
+    cameraWbKelvinApplied = 0;
 
     if (!autoExposure && sensor->set_aec_value)
         sensor->set_aec_value(sensor, t.aecValue);
@@ -8235,8 +8295,12 @@ static void cameraApplyTuning(
         sensor->set_whitebal(sensor, t.awb);
     if (sensor->set_awb_gain)
         sensor->set_awb_gain(sensor, t.awbGain);
-    if (sensor->set_wb_mode)
+    if (CameraTuning::isKelvin(t.wbMode)) {
+        if (cameraApplyWbKelvin(sensor, t.wbMode))
+            cameraWbKelvinApplied = t.wbMode;
+    } else if (sensor->set_wb_mode) {
         sensor->set_wb_mode(sensor, t.wbMode);
+    }
 
     if (sensor->set_brightness)
         sensor->set_brightness(sensor, t.brightness);
@@ -17921,6 +17985,7 @@ void cameraFillClusterReport(ClusterCamera::Report &r)
         if (sensor->set_res_raw && sensor->id.PID == 0x3660) caps |= CapCrop;
         if (sensor->set_quality) caps |= CapQuality;
         if (sensor->set_framesize) caps |= CapFramesize;
+        if (cameraSensorSupportsWbKelvin(sensor)) caps |= CapWbKelvin;
         cachedCapMask = (int32_t)caps;
         camera_sensor_info_t *info = esp_camera_sensor_get_info(&sensor->id);
         cachedMaxFramesize = info ? (int32_t)info->max_size : kUnknown;
@@ -17948,7 +18013,7 @@ void cameraFillClusterReport(ClusterCamera::Report &r)
         r.gainCeiling = st.gainceiling;
         r.awb = st.awb ? 1 : 0;
         r.awbGain = st.awb_gain ? 1 : 0;
-        r.wbMode = st.wb_mode;
+        r.wbMode = cameraWbKelvinApplied ? cameraWbKelvinApplied : st.wb_mode;
         r.hmirror = st.hmirror ? 1 : 0;
         r.vflip = st.vflip ? 1 : 0;
         r.cropZoomX10 = cameraCropAppliedZoomX10;

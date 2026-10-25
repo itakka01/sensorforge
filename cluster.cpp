@@ -126,8 +126,8 @@ static const char *CLUSTER_JOB_CAPTURE_RECEIPT_MAGIC="SFJCA1";
 static const char *CLUSTER_JOB_TXPOWER_MAGIC = "SFJT1";
 static const char *CLUSTER_JOB_TXPOWER_ACK_MAGIC = "SFJTA1";
 // Cluster camera profile (camera_profile.h): coordinator -> node, node answer.
-static const char *CLUSTER_JOB_CAMPROFILE_MAGIC = "SFJP1";
-static const char *CLUSTER_JOB_CAMPROFILE_ACK_MAGIC = "SFJPA1";
+static const char *CLUSTER_JOB_CAMPROFILE_MAGIC = "SFJK1";
+static const char *CLUSTER_JOB_CAMPROFILE_ACK_MAGIC = "SFJKA1";
 static const uint32_t CLUSTER_CAMPROFILE_TIMEOUT_MS = 20000UL;
 static const char *CLUSTER_JOB_DRONE_MAGIC = "SFJD1";
 static const char *CLUSTER_JOB_DRONE_ACK_MAGIC = "SFJDA1";
@@ -3608,7 +3608,7 @@ static void processJobTxPowerAck(char **f, size_t n, const IPAddress &ip)
     }
 }
 
-// Node: SFJP1|tag|coord|coordBoot|epoch|node|nodeBoot|seq|mode|profile ("-" for clear).
+// Node: SFJK1|tag|coord|coordBoot|epoch|node|nodeBoot|seq|mode|profile ("-" for clear).
 static uint32_t camProfileSeenBoot = 0, camProfileSeenEpoch = 0, camProfileSeenSeq = 0;
 static void processJobCameraProfile(char **f, size_t n, const IPAddress &ip)
 {
@@ -3649,7 +3649,7 @@ static void processJobCameraProfile(char **f, size_t n, const IPAddress &ip)
                   (unsigned long)seq, (unsigned long)mode, version, CameraProfile::resultName(result));
 }
 
-// Coordinator: SFJPA1|tag|coord|coordBoot|epoch|node|nodeBoot|seq|result|version
+// Coordinator: SFJKA1|tag|coord|coordBoot|epoch|node|nodeBoot|seq|result|version
 static void processJobCameraProfileAck(char **f, size_t n, const IPAddress &ip)
 {
     if (n != 10 || !runtimeActive || !localIsCoordinator ||

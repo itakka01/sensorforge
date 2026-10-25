@@ -139,13 +139,10 @@ size_t liveLength=0;
 uint16_t liveMinWidth=0;
 uint32_t liveTakenMs=0;
 constexpr uint32_t kLiveReuseMs=700;
+ClusterLiveFrameStats liveStats={};
 void liveClear(){if(liveBytes)heap_caps_free(liveBytes);liveBytes=nullptr;liveLength=0;liveTakenMs=0;}
-}
-bool clusterCaptureLiveFrame(uint16_t minWidth,const uint8_t *&bytes,size_t &length,String &reason){
-    bytes=nullptr;length=0;
-    if(liveBytes && liveMinWidth==minWidth && uint32_t(millis()-liveTakenMs)<kLiveReuseMs){
-        bytes=liveBytes;length=liveLength;return true;
-    }
+// Camera free for a page grab (live frame, line-time measurement)?
+bool liveCameraReady(String &reason){
     // A planned cluster shot owns the camera from acceptance until after it.
     if(clusterCaptureProtectionActive()){reason="Cluster-Aufnahme geplant";return false;}
     if(recording || recorderIsOpen()){reason="Aufnahme läuft";return false;}
@@ -155,24 +152,73 @@ bool clusterCaptureLiveFrame(uint16_t minWidth,const uint8_t *&bytes,size_t &len
     if((!cameraInitialized || !esp_camera_sensor_get()) && !(droneModeEnabled() && clusterCapturePrepareCamera())){
         reason="Kamera ist aus";return false;
     }
+    return true;
+}
+}
+bool clusterCaptureLiveFrame(uint16_t minWidth,const uint8_t *&bytes,size_t &length,String &reason){
+    bytes=nullptr;length=0;
+    if(liveBytes && liveMinWidth==minWidth && uint32_t(millis()-liveTakenMs)<kLiveReuseMs){
+        bytes=liveBytes;length=liveLength;liveStats.cached=true;return true;
+    }
+    if(!liveCameraReady(reason))return false;
+    const int64_t grabStart=esp_timer_get_time(); // includes returning stale frames
     // Return queued older frames first (see clusterCapturePhoto).
     camera_fb_t *stale[2]={nullptr,nullptr};
     const uint8_t n=clusterCaptureFrameBufferCount();
     for(uint8_t i=0;i<n && i<2;++i) stale[i]=esp_camera_fb_get();
     for(uint8_t i=0;i<n && i<2;++i) if(stale[i]) esp_camera_fb_return(stale[i]);
     camera_fb_t *fb=esp_camera_fb_get();
+    const uint32_t grabUs=(uint32_t)(esp_timer_get_time()-grabStart);
     if(!fb){reason="Kamerabild fehlgeschlagen";return false;}
     if(fb->format!=PIXFORMAT_JPEG||!fb->buf||!fb->len){esp_camera_fb_return(fb);reason="Kamerabild fehlgeschlagen";return false;}
     liveClear();
     uint8_t *out=nullptr;size_t outLength=0;
-    if(!minWidth || !cameraMakeThumbnail(fb->buf,fb->len,fb->width,fb->height,minWidth,out,outLength)){
+    CameraThumbStats ts;
+    liveStats={};
+    liveStats.grabUs=grabUs;liveStats.srcWidth=fb->width;liveStats.srcHeight=fb->height;
+    if(!minWidth || !cameraMakeThumbnail(fb->buf,fb->len,fb->width,fb->height,minWidth,out,outLength,&ts)){
         out=static_cast<uint8_t*>(heap_caps_malloc(fb->len,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT));
         if(out){memcpy(out,fb->buf,fb->len);outLength=fb->len;}
+        liveStats.width=fb->width;liveStats.height=fb->height;
+    }else{
+        liveStats.width=ts.width;liveStats.height=ts.height;
     }
+    liveStats.decodeUs=ts.decodeUs;liveStats.encodeUs=ts.encodeUs;liveStats.path=ts.path;
     esp_camera_fb_return(fb);
     if(!out){reason="kein Speicher";return false;}
     liveBytes=out;liveLength=outLength;liveMinWidth=minWidth;liveTakenMs=millis();
     bytes=liveBytes;length=liveLength;
+    return true;
+}
+ClusterLiveFrameStats clusterCaptureLiveStats(){return liveStats;}
+void clusterCaptureLiveInvalidate(){liveClear();}
+bool clusterCaptureMeasureLineTime(float &lineUs,uint32_t &vts,float &frameMs,String &reason){
+    lineUs=0;vts=0;frameMs=0;
+    if(!liveCameraReady(reason))return false;
+    sensor_t *sensor=esp_camera_sensor_get();
+    if(!sensor||!sensor->get_reg||(sensor->id.PID!=0x5640&&sensor->id.PID!=0x3660)){reason="nur OV3660/OV5640";return false;}
+    // Return queued frames, then time consecutive frames. The shortest gap is
+    // one frame period (a skipped frame only makes a gap longer).
+    const uint8_t n=clusterCaptureFrameBufferCount();
+    for(uint8_t i=0;i<n && i<2;++i){camera_fb_t *f=esp_camera_fb_get();if(f)esp_camera_fb_return(f);}
+    constexpr int kFrames=6;
+    int64_t prev=0,best=0;
+    for(int i=0;i<kFrames;++i){
+        camera_fb_t *f=esp_camera_fb_get();
+        const int64_t got=esp_timer_get_time();
+        if(!f){reason="Kamerabild fehlgeschlagen";return false;}
+        const int64_t ts=(int64_t)f->timestamp.tv_sec*1000000LL+f->timestamp.tv_usec;
+        esp_camera_fb_return(f);
+        const int64_t t=ts>0?ts:got;
+        if(i&&t>prev&&(!best||t-prev<best))best=t-prev;
+        prev=t;
+    }
+    const int hi=sensor->get_reg(sensor,0x380E,0xFF),lo=sensor->get_reg(sensor,0x380F,0xFF);
+    if(hi<0||lo<0){reason="Sensorregister nicht lesbar";return false;}
+    vts=((uint32_t)hi<<8)|(uint32_t)lo;
+    if(best<5000||best>2000000||vts<100){reason="Messung unplausibel";return false;}
+    frameMs=best/1000.0f;
+    lineUs=(float)best/(float)vts;
     return true;
 }
 String clusterCaptureLocalJson(){
