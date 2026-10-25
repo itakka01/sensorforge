@@ -3,6 +3,7 @@
 #include "board_config.h"
 #include "config.h"
 #include "logger.h"
+#include "recorder.h"
 
 #include <FS.h>
 #include <esp_task_wdt.h>
@@ -12,95 +13,54 @@
 
 
 // =============================================================
-// REFERENCE-COUNTED STORAGE LOCK
+// COOPERATIVE SD GATES (owner bits, see storage_guard.h)
 // =============================================================
 
-// Reference counter for storage lock depth (thread-safe).
-std::atomic<int> g_storageLockDepth(0);
-
-// Cooperative global storage gate declared in storage_guard.h.
-// Now managed by reference counter - DO NOT modify directly!
-// Use StorageLockGuard instead.
 std::atomic<bool> g_storageLocked(false);
 
+static portMUX_TYPE g_sdGateMux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t g_storageOwners = 0;
+static uint32_t g_recordingOwners = 0;
 
-// =============================================================
-// RAII STORAGE LOCK GUARD IMPLEMENTATION
-// =============================================================
-
-// THREAD SAFETY: Mutex protects the critical section between fetch_sub and
-// store(false) to prevent race conditions where a destructor and constructor
-// could interleave and corrupt the lock state. See LOCK_SEMANTICS_ANALYSIS.md
-// Problem 1 for detailed proof-of-concept.
-//
-// IMPORTANT: Mutex is initialized explicitly in sensorforge.ino setup() to
-// avoid lazy-init race condition (two threads could create two mutexes).
-static SemaphoreHandle_t g_storageLockMutex = nullptr;
-
-void initStorageLockGuard() {
-    if (g_storageLockMutex == nullptr) {
-        g_storageLockMutex = xSemaphoreCreateMutex();
-    }
+// Callers hold g_sdGateMux.
+static void sdGatePublish()
+{
+    g_storageLocked.store(g_storageOwners != 0);
+    g_recordingStartBlocked.store(g_recordingOwners != 0);
 }
 
-StorageLockGuard::StorageLockGuard()
+void sdGateAcquire(uint32_t owner, bool storage, bool recording)
 {
-    // Mutex must be initialized by sensorforge.ino setup()
-    if (g_storageLockMutex == nullptr) {
-        Serial.println("[STORAGE LOCK] FATAL: Mutex not initialized! Call initStorageLockGuard() in setup()");
-        // Create it anyway as emergency fallback (better than crash)
-        g_storageLockMutex = xSemaphoreCreateMutex();
-    }
-
-    // THREAD SAFETY: Mutex protects counter + flag updates atomically
-    xSemaphoreTake(g_storageLockMutex, portMAX_DELAY);
-
-    int depth = g_storageLockDepth.fetch_add(1, std::memory_order_relaxed);
-    g_storageLocked.store(true, std::memory_order_relaxed);
-
-    // Debug: Log deep nesting (potential logic error)
-    if (depth > 5) {
-        Serial.printf(
-            "[STORAGE LOCK] WARNING: Deep lock nesting depth=%d\n",
-            depth + 1
-        );
-    }
-
-    xSemaphoreGive(g_storageLockMutex);
+    portENTER_CRITICAL(&g_sdGateMux);
+    if (storage) g_storageOwners |= owner;
+    if (recording) g_recordingOwners |= owner;
+    sdGatePublish();
+    portEXIT_CRITICAL(&g_sdGateMux);
 }
 
-StorageLockGuard::~StorageLockGuard()
+void sdGateRelease(uint32_t owner)
 {
-    if (g_storageLockMutex == nullptr) {
-        // Should never happen, but fail-safe
-        Serial.println("[STORAGE LOCK] FATAL: Mutex not initialized!");
-        return;
-    }
+    portENTER_CRITICAL(&g_sdGateMux);
+    g_storageOwners &= ~owner;
+    g_recordingOwners &= ~owner;
+    sdGatePublish();
+    portEXIT_CRITICAL(&g_sdGateMux);
+}
 
-    // THREAD SAFETY: Mutex protects counter + flag updates atomically
-    xSemaphoreTake(g_storageLockMutex, portMAX_DELAY);
+uint32_t sdGateStorageOwners()
+{
+    portENTER_CRITICAL(&g_sdGateMux);
+    const uint32_t v = g_storageOwners;
+    portEXIT_CRITICAL(&g_sdGateMux);
+    return v;
+}
 
-    int depth = g_storageLockDepth.fetch_sub(1, std::memory_order_relaxed);
-
-    // Sanity check: depth should never go negative
-    if (depth <= 0) {
-        Serial.println(
-            "[STORAGE LOCK] ERROR: Lock depth underflow! "
-            "Mismatched lock/unlock calls detected."
-        );
-        // Clamp to zero to prevent further damage
-        g_storageLockDepth.store(0, std::memory_order_relaxed);
-        g_storageLocked.store(false, std::memory_order_relaxed);
-        xSemaphoreGive(g_storageLockMutex);
-        return;
-    }
-
-    // Unlock only when depth reaches zero (all guards released)
-    if (depth == 1) {  // depth before decrement was 1, now 0
-        g_storageLocked.store(false, std::memory_order_relaxed);
-    }
-
-    xSemaphoreGive(g_storageLockMutex);
+uint32_t sdGateRecordingOwners()
+{
+    portENTER_CRITICAL(&g_sdGateMux);
+    const uint32_t v = g_recordingOwners;
+    portEXIT_CRITICAL(&g_sdGateMux);
+    return v;
 }
 
 // Hard I/O fault latch. A recorder/storage worker may set this from another

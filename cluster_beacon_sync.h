@@ -143,5 +143,18 @@ constexpr size_t kMinCalibrationSamples = 32;
 // Plausible range of a calibrated delay (airtime alone is about 1 ms).
 constexpr double kDelayMinUs = 0.0;
 constexpr double kDelayMaxUs = 10000.0;
+// The path delay of all nodes is nearly the same (hardware: 2017-2303 us). A
+// calibration far from the cluster delay is a disturbed series with a constant
+// bias that the spread check cannot see (beta151, antennas 5 cm apart: first
+// series of c001/c005 +1.3 ms). It is discarded and measured again. Without a
+// cluster delay (no node calibrated yet, or all own delays expired) every
+// calibration in range is taken, so a real shift of all nodes heals itself.
+constexpr double kDelayClusterToleranceUs = 400.0;
+inline bool delayPlausible(double delayUs, bool clusterKnown, double clusterUs) {
+    if (!(delayUs >= kDelayMinUs && delayUs <= kDelayMaxUs)) return false;
+    if (!clusterKnown) return true;
+    const double diff = delayUs - clusterUs;
+    return diff <= kDelayClusterToleranceUs && diff >= -kDelayClusterToleranceUs;
+}
 
 }  // namespace ClusterBeaconSync

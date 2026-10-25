@@ -61,7 +61,6 @@ struct ClusterWipePending {
     bool active = false;
     uint32_t coordinatorBoot = 0, coordinatorEpoch = 0, sequence = 0;
     SdClusterWipeDone callback = nullptr;
-    bool priorRecordingBlocked = false;
 };
 static ClusterWipePending g_clusterWipe;
 // Phase-one migration: only ClusterWipe uses the atomic admission lane.
@@ -707,8 +706,6 @@ static bool sdSecureAbortRequested = false;
 static bool sdSecureAborted = false;
 static bool sdSecureOperationOk = true;
 static bool sdSecureHadSdConfig = false;
-static bool sdSecurePreviousRecordingBlock = false;
-static bool sdSecurePreviousStorageLock = false;
 static uint64_t sdSecureCardTotalBytes = 0;
 static uint64_t sdSecureTargetBytes = 0;
 static uint64_t sdSecureOverwrittenBytes = 0;
@@ -1724,11 +1721,7 @@ static void releaseSecureEraseLocks()
     // current filesystem/config state is settled, then restore both gates.
     logInit();
 
-    g_recordingStartBlocked =
-        sdSecurePreviousRecordingBlock;
-
-    g_storageLocked =
-        sdSecurePreviousStorageLock;
+    sdGateRelease(SD_GATE_SECURE_ERASE);
     // Release only the reservation actually owned by this secure erase job.
     if (!g_sdAdmission.release(g_secureEraseLease))
         Serial.println("[SD] secure erase admission release failed");
@@ -1812,22 +1805,12 @@ static SdMaintenanceResult beginSecureEraseJob()
     }
     g_secureEraseLease = lease;
 
-    sdSecurePreviousRecordingBlock =
-        g_recordingStartBlocked;
-
-    sdSecurePreviousStorageLock =
-        g_storageLocked;
-
-    g_storageLocked = true;
-    g_recordingStartBlocked = true;
+    sdGateAcquire(SD_GATE_SECURE_ERASE, true, true);
 
     webPlayerStop();
 
     if (recorderIsOpen()) {
-        g_recordingStartBlocked =
-            sdSecurePreviousRecordingBlock;
-        g_storageLocked =
-            sdSecurePreviousStorageLock;
+        sdGateRelease(SD_GATE_SECURE_ERASE);
         g_sdAdmission.release(g_secureEraseLease);
         g_secureEraseLease = {};
         return
@@ -2215,31 +2198,17 @@ static SdMaintenanceResult performSdMaintenance(
             SD_MAINT_RESULT_CONFIG_SOURCE_FAILED;
     }
 
-    bool previousRecordingBlock =
-        g_recordingStartBlocked;
-
-    bool previousStorageLock =
-        g_storageLocked;
-
     // Raise both gates before closing any SD users. The generic storage gate
     // is intentionally separate from the recording-start gate so future
     // modules can also refuse new SD work during maintenance.
-    g_storageLocked =
-        true;
-
-    g_recordingStartBlocked =
-        true;
+    sdGateAcquire(SD_GATE_SD_MAINTENANCE, true, true);
 
     // Close player file handles before touching the filesystem. The WebServer
     // remains registered; webPlayerStop() only closes the playback session.
     webPlayerStop();
 
     if (recorderIsOpen()) {
-        g_recordingStartBlocked =
-            previousRecordingBlock;
-
-        g_storageLocked =
-            previousStorageLock;
+        sdGateRelease(SD_GATE_SD_MAINTENANCE);
 
         Serial.println(
             "SD maintenance aborted: recording became active"
@@ -2373,11 +2342,7 @@ static SdMaintenanceResult performSdMaintenance(
     // settled. This guarantees a fresh File handle on the current mount.
     logInit();
 
-    g_recordingStartBlocked =
-        previousRecordingBlock;
-
-    g_storageLocked =
-        previousStorageLock;
+    sdGateRelease(SD_GATE_SD_MAINTENANCE);
 
     if (!restoreOk) {
         return
@@ -5991,7 +5956,7 @@ static void handleSDBench()
 
             logFlush();
             logClose();
-            g_storageLocked = true;
+            sdGateAcquire(SD_GATE_SD_BENCHMARK, true, false);
 
         SdSfenc1EnduranceResult productionResult;
         bool productionSfenc1Ok =
@@ -6096,7 +6061,7 @@ static void handleSDBench()
             STORAGE.remove(sfenc1Path);
         }
 
-        g_storageLocked = false;
+        sdGateRelease(SD_GATE_SD_BENCHMARK);
 
         if (
             sdReady &&
@@ -6219,7 +6184,7 @@ static void handleSDBench()
             // the production mount is back.
             logFlush();
             logClose();
-            g_storageLocked = true;
+            sdGateAcquire(SD_GATE_SD_BENCHMARK, true, false);
 
             size_t clockMountOkCount = 0;
             size_t clockVerifyOkCount = 0;
@@ -6337,7 +6302,7 @@ static void handleSDBench()
                     restoreError;
             }
 
-            g_storageLocked = false;
+            sdGateRelease(SD_GATE_SD_BENCHMARK);
 
             if (
                 productionRestoreOk &&
@@ -6502,9 +6467,8 @@ bool webSdQueueClusterWipe(uint32_t coordinatorBoot, uint32_t coordinatorEpoch,
     g_clusterWipe.coordinatorEpoch = coordinatorEpoch;
     g_clusterWipe.sequence = sequence;
     g_clusterWipe.callback = callback;
-    g_clusterWipe.priorRecordingBlocked = g_recordingStartBlocked;
     // Close the admission gate immediately; never start another recording.
-    g_recordingStartBlocked = true;
+    sdGateAcquire(SD_GATE_CLUSTER_WIPE, false, true);
     return true;
 }
 
@@ -6521,9 +6485,8 @@ void webSdMaintenanceLoop()
     SdMaintenanceResult result = SD_MAINT_RESULT_RECORDING_ACTIVE;
     if (!recording && !recorderIsOpen() && sdReady && !g_storageLocked)
         result = performSdMaintenance(SD_MAINT_WIPE, true);
-    // performSdMaintenance saves/restores the recording gate, so remove the
-    // pending-job admission block only after all maintenance work has ended.
-    g_recordingStartBlocked = job.priorRecordingBlocked;
+    // Remove the pending-job admission block only after all maintenance work has ended.
+    sdGateRelease(SD_GATE_CLUSTER_WIPE);
     g_clusterWipe.active = false;
     // Release exactly the lease acquired on queueing; never clear another owner's ticket.
     const bool released = g_sdAdmission.release(g_clusterWipeLease);

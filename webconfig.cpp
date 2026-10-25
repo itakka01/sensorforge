@@ -55,6 +55,7 @@
 #include "webconfig_audio.h"
 #include "webconfig_wifi.h"
 #include "webconfig_transport.h"
+#include "webconfig_camera_tuning.h"
 #include "webconfig_cluster.h"
 #include "webconfig_firmware_auto.h"
 #include "cluster.h"
@@ -5700,6 +5701,11 @@ static void handleSave()
     text += String(rotation);
     text += '\n';
 
+    // Owned by /camera_tuning; a general save preserves it.
+    text += "camera_tuning=";
+    text += cfg_camera_tuning;
+    text += '\n';
+
     text += "recording_format=";
     text += recordingFormat;
     text += '\n';
@@ -8098,7 +8104,8 @@ static void handlePreview()
         "</div>";
 
     html +=
-        "<a class='button' href='/camera_advanced'>Erweiterte Einstellungen</a>";
+        "<a class='button' href='/camera_advanced'>Erweiterte Einstellungen</a>"
+        " <a class='button' href='/camera_tuning'>Bildabstimmung</a>";
 
     if (cameraSaveBlocked) {
         html +=
@@ -8940,7 +8947,8 @@ static void handleCameraAdvanced()
 
     html +=
         "<button id='cameraDefaultsBtn' type='button'" + String(cameraSaveBlocked ? " disabled" : "") + ">Standardwerte einsetzen</button>"
-        " <a class='button' href='/preview'>Zurück zur Kamera</a>";
+        " <a class='button' href='/preview'>Zurück zur Kamera</a>"
+        " <a class='button' href='/camera_tuning'>Bildabstimmung</a>";
 
     if (cameraSaveBlocked) {
         html +=
@@ -11256,7 +11264,6 @@ static const uint8_t WEB_FW_ESP_IMAGE_MAGIC = 0xE9U;
 static bool webFirmwareUploadAttempted = false;
 static bool webFirmwareUploadSucceeded = false;
 static bool webFirmwareUploadLocksHeld = false;
-static bool webFirmwarePreviousRecordingBlock = false;
 static size_t webFirmwareUploadBytes = 0;
 static size_t webFirmwarePackageBytes = 0;
 static size_t webFirmwareUploadCapacity = 0;
@@ -11357,8 +11364,7 @@ static void webFirmwareReleaseUploadLocks()
     if (!webFirmwareUploadLocksHeld)
         return;
 
-    g_recordingStartBlocked =
-        webFirmwarePreviousRecordingBlock;
+    sdGateRelease(SD_GATE_FIRMWARE_UPLOAD);
 
     webFirmwareUploadLocksHeld = false;
 }
@@ -11600,9 +11606,7 @@ static void handleFirmwareUploadData()
             return;
         }
 
-        webFirmwarePreviousRecordingBlock =
-            g_recordingStartBlocked;
-        g_recordingStartBlocked = true;
+        sdGateAcquire(SD_GATE_FIRMWARE_UPLOAD, false, true);
         webFirmwareUploadLocksHeld = true;
 
         // Release a playback file and reduce unnecessary SD activity. The SD
@@ -12693,10 +12697,7 @@ static void handleFirmwareInstall()
         return;
     }
 
-    bool previousRecordingBlock =
-        g_recordingStartBlocked;
-
-    g_recordingStartBlocked = true;
+    sdGateAcquire(SD_GATE_FIRMWARE_ACTIVATE, false, true);
     webPlayerStop();
 
     // The first boot of the newly selected WiFi image must not immediately be
@@ -12704,8 +12705,7 @@ static void handleFirmwareInstall()
     // one-shot NVS flag is consumed at the next firmware boot before the SD
     // auto-updater is considered.
     if (!firmwareInfoArmDirectOtaBoot()) {
-        g_recordingStartBlocked =
-            previousRecordingBlock;
+        sdGateRelease(SD_GATE_FIRMWARE_ACTIVATE);
 
         sendSystemPage(
             500,
@@ -12721,8 +12721,7 @@ static void handleFirmwareInstall()
 
     if (bootResult != ESP_OK) {
         firmwareInfoCancelDirectOtaBoot();
-        g_recordingStartBlocked =
-            previousRecordingBlock;
+        sdGateRelease(SD_GATE_FIRMWARE_ACTIVATE);
 
         sendSystemPage(
             500,
@@ -13290,7 +13289,7 @@ static void handleShutdownDo()
 
     // Prevent a new recording from starting during the short HTTP grace period
     // before the actual power-down sequence.
-    g_recordingStartBlocked = true;
+    sdGateAcquire(SD_GATE_SHUTDOWN, false, true);
 
     shutdownScheduled = true;
     shutdownAtMs =
@@ -13320,7 +13319,7 @@ bool webConfigScheduleShutdown(uint32_t delayMs, String &error)
 
     // Match the browser shutdown path: once shutdown is accepted, prevent a
     // new recording from starting during the short HTTP grace period.
-    g_recordingStartBlocked = true;
+    sdGateAcquire(SD_GATE_SHUTDOWN, false, true);
     shutdownScheduled = true;
     shutdownAtMs = millis() + (delayMs < 250UL ? 250UL : delayMs);
     return true;
@@ -13331,7 +13330,7 @@ static void performManualShutdown()
 {
     shutdownScheduled = false;
     rebootScheduled = false;
-    g_recordingStartBlocked = true;
+    sdGateAcquire(SD_GATE_SHUTDOWN, false, true);
 
     if (recorderIsOpen())
         stopRecording();
@@ -17028,7 +17027,7 @@ static void handleAudioTestRecord()
     AudioWavResult result = {};
     String error;
 
-    g_storageLocked = true;
+    sdGateAcquire(SD_GATE_AUDIO_MIC_TEST, true, false);
     bool ok = audioWavRecordTest(
         AUDIO_MIC_TEST_PATH,
         AUDIO_MIC_TEST_DURATION_MS,
@@ -17038,12 +17037,7 @@ static void handleAudioTestRecord()
         error,
         audioMicTestService
     );
-    // Do not clear a storage reservation established by the cluster while
-    // audioMicTestService() yielded to other firmware services.
-    // The initial lock was false (checked above). Keep it asserted if a
-    // concurrent cluster wipe has since blocked new recording starts.
-    // SAFETY: Atomic load/store instead of direct assignment (not copyable).
-    g_storageLocked.store(g_recordingStartBlocked.load());
+    sdGateRelease(SD_GATE_AUDIO_MIC_TEST);
 
     if (!ok) {
         server.send(500, "text/plain; charset=utf-8", error.length() ? error : "Mikrofontest fehlgeschlagen.");
@@ -19082,7 +19076,10 @@ void webConfigStart()
                 server.send(403,"text/plain","Administrator access required");return;
             }
             const uint8_t *data=nullptr;size_t length=0;
-            if(!server.hasArg("uuid")||!clusterCaptureGetJpeg(server.arg("uuid"),data,length)){
+            // thumb=1: downscaled copy for the overview (cluster_capture.h).
+            const bool thumb=server.hasArg("thumb") && server.arg("thumb")=="1";
+            if(!server.hasArg("uuid")||!(thumb ? clusterCaptureGetThumb(server.arg("uuid"),data,length)
+                                               : clusterCaptureGetJpeg(server.arg("uuid"),data,length))){
                 server.send(404,"text/plain","Photo not available (expired, unknown or rebooted)");return;
             }
             server.sendHeader("Cache-Control","no-store");
@@ -19194,6 +19191,7 @@ void webConfigStart()
 
     server.on("/preview", HTTP_GET, handlePreview);
     server.on("/camera_advanced", HTTP_GET, handleCameraAdvanced);
+    webconfigCameraTuningRegisterRoutes(server, htmlHeader, htmlFooter);
     server.on("/camera_settings_save", HTTP_POST, handleCameraSettingsSave);
     server.on("/snapshot", HTTP_GET, handleSnapshot);
     server.on("/preview_stop", HTTP_POST, handlePreviewStop);

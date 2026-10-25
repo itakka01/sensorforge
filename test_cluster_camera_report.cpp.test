@@ -73,7 +73,7 @@ int main() {
         return !decode(groups, r);
     };
     const char *ok[kGroupCount] = {"1,1,13920,20,1", "19,16449", "12,10,0,-1,2,1,0",
-                                   "0,0,37,-2,0,5,6", "1,1,3", "180,1,0,15,2,0", "0"};
+                                   "0,0,37,-2,0,5,6", "1,1,3", "180,1,0,15,2,0", "0,0,0"};
     Report r;
     CHECK(decode(ok, r), "reference fields decode");
     CHECK(rejects("1,1,13920,20", ok[1], ok[2], ok[3], ok[4], ok[5], ok[6]), "too few elements");
@@ -92,7 +92,9 @@ int main() {
     CHECK(rejects(ok[0], ok[1], ok[2], ok[3], ok[4], ok[5], ""), "missing source mask");
     CHECK(rejects(ok[0], ok[1], "12,1x,0,-1,2,1,0", ok[3], ok[4], ok[5], ok[6]), "non-numeric element");
     CHECK(rejects(ok[0], ok[1], "12,-,0,-1,2,1,0", ok[3], ok[4], ok[5], ok[6]), "bare minus");
-    CHECK(rejects(ok[0], ok[1], ok[2], ok[3], ok[4], ok[5], "-32768"), "sentinel value on the wire");
+    CHECK(rejects(ok[0], ok[1], ok[2], ok[3], ok[4], ok[5], "-32768,0,0"), "sentinel value on the wire");
+    CHECK(rejects(ok[0], ok[1], ok[2], ok[3], ok[4], ok[5], "0,5,9"), "profile state out of range");
+    CHECK(rejects(ok[0], ok[1], ok[2], ok[3], ok[4], ok[5], "0,-1,1"), "negative profile version");
     CHECK(rejects(nullptr, ok[1], ok[2], ok[3], ok[4], ok[5], ok[6]), "null group");
 
     printf("== provenance (prepared for phase 2)\n");
@@ -105,6 +107,8 @@ int main() {
     Report m = sampleOn();
     m.sourceMask = (int32_t)mask;
     CHECK(roundTrip(m, b) && b.sourceMask == (int32_t)mask, "source mask survives the wire");
+    m.profileVersion = 0x7ab3c19d; m.profileState = (int32_t)ProfileState::Active;
+    CHECK(roundTrip(m, b) && b.profileVersion == 0x7ab3c19d && b.profileState == 1, "profile version/state survive the wire");
     CHECK(2 * (unsigned)Group::Count <= 31, "all groups fit into the mask");
 
     printf("== helpers\n");

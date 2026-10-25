@@ -1,3 +1,79 @@
+## v87-beta156 — 2026-10-25 (KAMERAPROFIL JE SENSORTYP + API)
+
+Schritt 2 der einheitlichen Cluster-Kameras (Gaussian Splats); zusammen mit beta155 zu flashen.
+
+**NEU – Referenzkamera und Profil** (Bereich „Kameras im Cluster“ auf `/cluster_coordinate`):
+- ♡/♥ je Gerät wählt die Referenzkamera seines Sensortyps (OV2640/OV3660/OV5640 getrennt). Referenz und letztes Profil je Sensortyp speichert der Coordinator in NVS (`sf_camref`).
+- „Übertragen – nur Sitzung“ / „– dauerhaft“: der Coordinator bildet aus der aktuellen Meldung der Referenz (≤ 60 s alt, Kamera an) ein Profil mit Version (Auflösung, JPEG-Qualität, Belichtung, Verstärkung, Weißabgleich, Helligkeit/Kontrast/Sättigung; `camera_profile.h`) und sendet es signiert (`SFJP1`, Antwort `SFJPA1`, Job-Art 9) an jedes Online-Gerät mit gleichem Sensor. Unveränderte Werte behalten die Version.
+- „Profil entfernen“: alle Geräte des Sensortyps nutzen wieder ihre lokalen Werte.
+- Spalte „Profil“: ✓, „weicht ab: …“ (Werte der laufenden Kamera ≠ Profil, z. B. nach lokaler Änderung), altes/kein Profil (rot), „wartet auf Drone Mode“, „Kamera-Neustart ausstehend“, letzte Fehlerantwort.
+
+**NEU – mittlere Live-Bildgröße:** `/camera_frame?size=small|medium|full` (`full=1` = `size=full`). „Mittel“ verkleinert um 1/2, 1/4 oder 1/8 auf mindestens 800 px Breite (UXGA 1600×1200 → 800×600; ab 1280 px Breite und darunter liefert „Mittel“ das Originalbild). Die Bildabstimmung hat statt „Volle Auflösung“ eine Auswahl Klein/Mittel/Voll, Standard Mittel. Ein mittleres Bild braucht kurzzeitig ca. 2 MB PSRAM und blockiert die Loop beim Neukodieren (geschätzt unter 1 s, ungemessen).
+
+**Node:** Profil nur im Drone Mode und nur für den eigenen Sensor. Sitzung = RAM bis Neustart, dauerhaft = NVS `sf_camprof` (nie config.txt). `initCamera()` nutzt Auflösung/Qualität/Belichtung/Abstimmung des Profils; Drehung/Spiegelung bleiben lokal, ein Crop ruht. Ändert sich das gewünschte Profil (neu, entfernt, Drone Mode an/aus), startet `cameraProfileService()` die Kamera neu, sobald keine Cluster-Aufnahme geplant ist und weder Aufnahme, Streamer, API-Sitzung noch Vorschau sie belegt. Während einer geplanten Cluster-Aufnahme wird ein Profil-Auftrag abgelehnt (`busy`). SFK1 meldet zusätzlich Profilversion und -zustand; die Quellen der gemeinsamen Gruppen stehen dann auf „Cluster-Profil“.
+
+**NEU – API** (gleiche Logik wie die Oberfläche, `SENSORFORGE_API_V1.md`): `GET/POST /api/v1/camera/tuning` (Bildabstimmung des Geräts), `GET /api/v1/cluster/cameras`, `GET/POST /api/v1/cluster/camera_profile` (Referenz, Übertragen, Entfernen).
+
+**GEÄNDERT:** Belichtungswert der Bildabstimmung bis 65535 Zeilen (OV2640-Seite weiter max. 1200). Geräteliste: Job-Arten „Sendeleistung“ und „Kameraprofil“ benannt (Sendeleistung erschien als „Verbindungstest“).
+
+Host-Tests: `test_camera_profile` neu, `test_cluster_camera_report` (Profilfelder), `test_camera_tuning`. Statisch +120 B.
+
+## v87-beta155 — 2026-10-25 (BILDABSTIMMUNG UND KAMERA-ÜBERSICHT)
+
+**Anlass:** Der Cluster soll Bildsätze für Gaussian Splats liefern; dafür müssen alle Kameras gleich eingestellt sein. Schritt 1 von 2 (Schritt 2: Referenzkamera je Sensortyp, Profil an alle Nodes übertragen, nur Sitzung oder dauerhaft).
+
+**NEU – Bildabstimmung `/camera_tuning`** (Link auf der Kamera-Seite und in der Kamera-Übersicht): Live-Bild plus feste Belichtung (Sensorzeilen), Verstärkung bzw. Verstärkungsobergrenze, Weißabgleich-Automatik/Voreinstellung, AWB-Gain, Helligkeit, Kontrast, Sättigung; vom Sensor nicht unterstützte Felder sind gesperrt. „Anwenden“ wirkt sofort bis zum Neustart, „Dauerhaft speichern“ schreibt den neuen Schlüssel `camera_tuning` (Format `camera_tuning.h`, leer = Treiberstandard) plus `camera_auto_exposure`/`camera_ae_level`; `initCamera()` wendet ihn bei jedem Kamerastart an. Funktioniert auch im Drone Mode; während einer geplanten Cluster-Aufnahme abgelehnt. Die allgemeine Konfigurationsseite übernimmt `camera_tuning` unverändert.
+
+**NEU – Live-Bild `/camera_frame`** (`?full=1` = Originalgröße): frisches Kamerabild, sonst auf ca. 1/8 verkleinert (`camera_thumbnail.cpp`: esp_jpeg dekodiert direkt verkleinert, `jpeg_mini_encoder.cpp` kodiert neu). Abgelehnt bei geplanter Cluster-Aufnahme, Aufnahme, Streamer oder API-Sitzung; im Drone Mode wird die Kamera bei Bedarf gestartet. Anfragen innerhalb 0,7 s teilen sich ein Bild. Nur Admin.
+
+**NEU – Kamera-Übersicht** im Bereich „Kameras im Cluster“ (`/cluster_coordinate`): Kleinbilder aller Kameras als Raster, der Browser holt sie nacheinander direkt von den Geräten; optional laufend (2 s Pause je Runde). Links „Groß“ und „Abstimmen“ je Gerät.
+
+**GEÄNDERT:** Die Ergebnis-Galerie der Cluster-Aufnahme lädt Kleinbilder (`/capture_media?uuid=…&thumb=1`, einmal erzeugt und je Foto zwischengespeichert) statt der Originale; „Groß ansehen“/„Herunterladen“ unverändert.
+
+**Speicher:** Eigener JPEG-Encoder statt `fmt2jpg` der Kamera-Bibliothek: deren Encoder hätte ~7,3 KB statischen internen RAM belegt. Jetzt +96 B statisch; Arbeitspuffer nur während der Erzeugung im PSRAM. Host-Tests `test_camera_tuning`, `test_jpeg_mini_encoder` (Dekodierprüfung mit Pillow: 34–52 dB PSNR).
+
+## v87-beta154 — 2026-10-25 (BERICHTE MIT EMPFANGSBESTÄTIGUNG)
+
+**Anlass:** TX-Leistungstest im Gehäuse (Antennen ~5 cm): bei 13 dBm fehlten bei c004 13 Berichte, bei 8,5 dBm in der letzten Stunde bei c006 12. Die Nodes blieben dabei präzise; nur die Berichte gingen im dichten Funkverkehr verloren, weil sie als Broadcast ohne Bestätigung gesendet wurden.
+
+**GEÄNDERT:** `BeaconSyncReport` und `NodeSyncReport` gehen als Unicast an den Coordinator (MAC aus dessen Zeitsignal). Die Funkschicht bestätigt sie und wiederholt unbestätigte selbst. Bleibt die Bestätigung beim `BeaconSyncReport` trotzdem aus, sendet der Node ihn nach 300 ms neu (höchstens 2×). Ohne bekannten Coordinator weiter Broadcast. Neue Zähler in `espnow_time_local`: `reports_acked`, `reports_unacked`, `report_retries`.
+
+Nur Node-Firmware betroffen; alle Boards flashen.
+
+## v87-beta153 — 2026-10-25 (SD-SPERREN ÜBER BESITZER-BITS)
+
+**Anlass:** Punkt 5 der offenen Liste (CLAUDE.md P0/P1).
+
+**GEÄNDERT – SD-Sperren:** `g_storageLocked` und `g_recordingStartBlocked` wurden an ~40 Stellen direkt gesetzt und danach auf den gemerkten Wert zurückgesetzt. Überlappten zwei Abläufe (z. B. Firmware-Upload und SD-Wartung, Cluster-Wipe und Mikrofontest), konnte der zweite die Sperre des ersten aufheben. Zwei Stellen taten das sogar ohne Überlappung: der SD-Benchmark setzte am Ende `g_storageLocked = false`, der Mikrofontest kopierte die Aufnahmesperre in die Speichersperre. Jetzt hat jeder Nutzer ein eigenes Bit (`SdGateOwner`, storage_guard.h), gesetzt/gelöscht über `sdGateAcquire`/`sdGateRelease` unter einem Spinlock; eine Sperre ist zu, solange irgendein Bit gesetzt ist. Fail-safe nach fehlgeschlagenem Remount: `SD_GATE_REMOUNT_FAULT` bis Neustart (wie bisher „bleibt gesperrt“). Thermal-Notprogramm und Shutdown halten ihr Bit bis zum Schlaf/Neustart.
+
+**ENTFERNT:** `StorageLockGuard`, `RecordingBlockGuard`, `g_storageLockDepth`, `g_recordingBlockDepth`, `initStorageLockGuard/initRecordingBlockGuard` (nur der OTA-Pfad nutzte einen Guard; er nutzt jetzt `SD_GATE_FIRMWARE_OTA`); gemerkte Vorwerte (`sdSecurePrevious*`, `webFirmwarePreviousRecordingBlock`, `priorRecordingBlocked`, `ctx.previousRecordingBlock`). Veraltete Doku `RAII_GUARDS_MIGRATION_GUIDE.md`, `RAII_MIGRATION_REPORT.md`, `LOCK_SEMANTICS_ANALYSIS.md`, `THREAD_SAFETY_FINAL_REPORT.md`.
+
+**GEPRÜFT, keine Änderung:**
+- Schreibpuffer-Task (`RecordingWriteBufferedFile`): kein Use-After-Free; ein hängender Drain-Task behält seine Ressourcen, `openWrite` verweigert, der Destruktor wartet, der 30-s-Watchdog startet neu.
+- Kamera: alle 16 `esp_camera_fb_get()` im loopTask, zwischen `fb_get` und `fb_return` nur Netzwerk-Schreiben; gleichzeitige Zugriffe sind ausgeschlossen. CLAUDE.md korrigiert.
+
+Hardwaretest offen (Board mit SD): SD-Wartung/Formatieren, Secure Erase, SD-Benchmark, Firmware-Upload/Aktivieren, Mikrofontest, Löschen im Player, Aufnahme-Lasttest.
+
+## v87-beta152 — 2026-10-25 (FIX VERSCHOBENE ERSTE EINMESSUNG)
+
+**FIX:** Im Gehäuse-Aufbau (Antennen ~5 cm) ergab die erste Einmessung nach dem Start bei c005 3469 µs und tags zuvor bei c001 3416 µs (übrige Nodes 2017–2303 µs). Die Serie hatte eine konstante Verschiebung bei kleiner Streuung, die Streuungsprüfung sah sie nicht. Weil die eigene Laufzeit der Median der letzten 5 Einmessungen ist, galt der Wert bis zu ~20 min; der Node zeigte „präzise“, lag aber ~1,3 ms daneben, und der Cluster-Mittelwert stieg (2094 → 2160 µs). Jetzt wird eine Einmessung verworfen und neu gemessen, wenn sie mehr als 400 µs von der Cluster-Laufzeit abweicht (`ClusterBeaconSync::delayPlausible`, Host-Test `testDelayPlausible`). Ohne bekannte Cluster-Laufzeit gilt weiter nur 0–10 ms.
+
+Nur Node-Firmware betroffen; alle Boards flashen.
+
+## v87-beta151 — 2026-10-25 (ZEITANSICHT: FEHLENDE BERICHTE, EINMESS-RUNDE)
+
+Anlass: 5-h-Lauf mit beta150 (10 Boards, kein Neustart, 99,8 % präzise, 6,4 % spät gesendete Zeitsignale verworfen).
+
+**FIX Einmess-Runde:** Die Schätzung war aktive Nodes × mittlerer Abstand zwischen zwei Slot-Starts. Das misst den Bedarf: im Ruhebetrieb läuft sie gegen das Einmess-Intervall (5-h-Lauf: 489 s bei 9 Nodes) und hätte bei voller Auslastung eine falsche gelbe Kapazitätswarnung ausgelöst. Jetzt: aktive Nodes × (Slotlänge + Pause) je angenommener Serie; abgelehnte Serien sind eingerechnet.
+
+**Fehlende Berichte getrennt:** Bleiben die Berichte eines Nodes > 30 s aus, zählt der Coordinator das nicht mehr als Ausfall, sondern unter „Meldung“ als „fehlte“ (`gp`/`ga` in `/cluster_time_nodes`, CSV `report_gaps`, `last_gap_age_s`). Diese Zeit gilt als nicht überwacht. „Ausfälle“ zählt nur noch Meldungen präzise → nicht präzise. Anlass: devxiao2 zeigte 3 „Ausfälle“, war laut eigenem Status aber durchgehend präzise.
+
+**Diagnose abgelehnter Einmess-Serien:** Node-Zähler je Grund in `espnow_time_local` (`series_rejected_insufficient|spread|rtt|timeout`). Anlass: c006 26, c004 14 abgelehnte Serien in 5 h; der Grund war bisher nur für die letzte Serie sichtbar und wurde nach einer angenommenen gelöscht.
+
+**Doku:** CLAUDE.md – der Temperaturschutz nutzt den CPU-Sensor bereits (≥ 80 °C, 3 Proben, 5 min Deep Sleep); der Eintrag „nur RTC-basiert“ war veraltet.
+
+Coordinator und Nodes betroffen; alle Boards flashen.
+
 ## v87-beta150 — 2026-10-24 (FIX GLEICHZEITIGE AUSFÄLLE)
 
 **FIX gleichzeitige Ausfälle aller Nodes („Zeitsignal ausgeblieben“):** Der Filter für spät gesendete Zeitsignale verglich mit dem kürzesten Sendeweg der letzten 32 Signale. Ein einzelner ungewöhnlich schneller TX-Done (gemessen 1724 µs bei sonst ~2000 µs) ließ danach ~30 s lang fast alle Signale als „zu spät“ verwerfen; nach 15 s ohne gültiges Signal verloren alle Nodes gleichzeitig die Präzision (Hardware 2026-10-24: 4–5 Ausfälle je Node in 20 min, verworfene Signale 22 % statt 8 %). Bezug ist jetzt das untere Viertel der letzten 32 Sendewege (`txPathReferenceUs()`); Host-Test `testFastTxPathOutlier`. Die Simulation ist unverändert (gültig nach ~35 s wegen der 32-Signal-Regel; die Tabelle in der Doku zeigte noch 14 s).

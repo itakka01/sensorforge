@@ -542,10 +542,12 @@ function up(s){s=Math.max(0,Number(s)||0);return Math.floor(s/86400)+'d '+Math.f
 function isStandbyBroadcaster(n){var m=String(n&&n.mode||'');return m==='time_broadcaster'||m==='time_broadcaste';}
 function isActionableNode(n){return !!n&&!n.local&&!isStandbyBroadcaster(n)&&!!n.online;}
 function nodeUrl(n){var ip=String(n.ip||''),p=ip.split('.');if(p.length!==4||!p.every(function(x){return /^\d{1,3}$/.test(x)&&Number(x)<=255;})||ip==='0.0.0.0'||ip==='255.255.255.255')return '';return 'http://'+ip+'/';}
-function latestJob(n,jobs){var id=String(n.integration_id||'');var a=jobs.filter(function(j){return String(j.node)===id&&Number(j.kind)!==4;});if(!a.length)return '–';var j=a[a.length-1], kind=Number(j.kind),state=Number(j.state);var action=kind===1?'Neustart':kind===2?'Shutdown':kind===3?'SD Wipe':kind===6?'Foto':kind===7?'Drone Mode':'Verbindungstest';var stateText={1:'Wartet',2:'Gesendet',3:'ACK bestätigt',5:'Erfolgreich',6:'Abgelehnt',7:'Keine ACK'}[state]||'Status '+state;
+function latestJob(n,jobs){var id=String(n.integration_id||'');var a=jobs.filter(function(j){return String(j.node)===id&&Number(j.kind)!==4;});if(!a.length)return '–';var j=a[a.length-1], kind=Number(j.kind),state=Number(j.state);var action=kind===1?'Neustart':kind===2?'Shutdown':kind===3?'SD Wipe':kind===6?'Foto':kind===7?'Drone Mode':kind===8?'Sendeleistung':kind===9?'Kameraprofil':'Verbindungstest';var stateText={1:'Wartet',2:'Gesendet',3:'ACK bestätigt',5:'Erfolgreich',6:'Abgelehnt',7:'Keine ACK'}[state]||'Status '+state;
 if(kind===7&&state===5)stateText=Number(j.result)===1?'Eingeschaltet':'Ausgeschaltet';
+if(kind===9&&state===5)stateText=Number(j.result)===1?'Gespeichert (wirkt im Drone Mode)':Number(j.result)===7?'Entfernt':'Übernommen';
 if(kind===3&&state===6)stateText=Number(j.result)===100?'Keine SD / Wartung belegt':('SD Wipe fehlgeschlagen (Code '+(j.result||0)+')');
 else if(state===6)stateText=Number(j.result)===2?'Abgelehnt: Aufnahme/Sicherheitsbedingung':(Number(j.result)===1?'Sendefehler':'Fehler (Code '+(j.result||0)+')');
+if(kind===9&&state===6&&Number(j.result)>=100){var cr=Number(j.result)-100;stateText=cr===2?'Anderer Sensor':cr===4?'Abgelehnt: Aufnahme geplant':cr===5?'Nur Sitzung (Speichern fehlgeschlagen)':cr===6?'Kamera-Neustart fehlgeschlagen':'Ungültig';}
 if(j.boot_change_observed&&kind===1)stateText+=' · neuer Boot erkannt';
 if(j.ack_latency_ms!=null)stateText+=' · '+j.ack_latency_ms+' ms';
 return action+': '+stateText;}
@@ -624,7 +626,7 @@ function sfSafeCaptureMedia(j){
  if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(uuid))return null;
  try{var p=new URL(raw);if(p.protocol!=='http:'||p.pathname!=='/capture_media'||p.searchParams.get('uuid')!==uuid||p.username||p.password||p.hash||Array.from(p.searchParams.keys()).some(function(k){return k!=='uuid';}))return null;
  // URLs are emitted from authenticated coordinator status, never from free-form HTML.
- var view=new URL(p.href);view.searchParams.set('view','1');return {download:p.href,view:view.href,uuid:uuid};
+ var view=new URL(p.href);view.searchParams.set('view','1');var thumb=new URL(p.href);thumb.searchParams.set('thumb','1');return {download:p.href,view:view.href,thumb:thumb.href,uuid:uuid};
  }catch(ignore){return null;}
 }
 function sfRememberCapture(row){
@@ -642,7 +644,7 @@ function sfRenderCaptureGallery(){
   var card=document.createElement('article');card.style.cssText='border:1px solid #64748b66;border-radius:12px;padding:10px;min-width:0';
   var title=document.createElement('strong');title.textContent=e.name;card.appendChild(title);
   var a=document.createElement('a');a.href=e.media.view;a.target='_blank';a.rel='noopener noreferrer';a.title='Bild in voller Größe öffnen';
-  var img=document.createElement('img');img.loading='lazy';img.alt='JPEG-Vorschau von '+e.name;img.style.cssText='display:block;width:100%;height:170px;object-fit:contain;margin:8px 0;background:#1f2937;border-radius:8px';img.src=e.media.view;
+  var img=document.createElement('img');img.loading='lazy';img.alt='JPEG-Vorschau von '+e.name;img.style.cssText='display:block;width:100%;height:170px;object-fit:contain;margin:8px 0;background:#1f2937;border-radius:8px';img.src=e.media.thumb;
   a.appendChild(img);card.appendChild(a);
   var controls=document.createElement('div');controls.style.cssText='display:flex;gap:12px;flex-wrap:wrap';
   var view=document.createElement('a');view.href=e.media.view;view.target='_blank';view.rel='noopener noreferrer';view.textContent='Groß ansehen';controls.appendChild(view);

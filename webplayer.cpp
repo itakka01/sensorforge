@@ -5592,25 +5592,20 @@ static void handlePlayerFrame()
 // =============================================================
 
 // Temporarily block NEW recordings while the SD directory is modified.
-// Preserve the previous global state so a lock that was already set by
-// another subsystem is not accidentally cleared when this guard ends.
 class RecordingStartBlockGuard {
 public:
     RecordingStartBlockGuard()
-        : previousState(g_recordingStartBlocked)
     {
-        g_recordingStartBlocked =
-            true;
+        sdGateAcquire(SD_GATE_PLAYER_DELETE, false, true);
     }
 
     ~RecordingStartBlockGuard()
     {
-        g_recordingStartBlocked =
-            previousState;
+        sdGateRelease(SD_GATE_PLAYER_DELETE);
     }
 
-private:
-    bool previousState;
+    RecordingStartBlockGuard(const RecordingStartBlockGuard&) = delete;
+    RecordingStartBlockGuard& operator=(const RecordingStartBlockGuard&) = delete;
 };
 
 

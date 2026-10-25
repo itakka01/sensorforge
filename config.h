@@ -18,6 +18,8 @@ extern int cfg_camera_ae_level;        // -2..2
 extern String cfg_camera_crop_zoom;
 extern int cfg_camera_crop_x;
 extern int cfg_camera_crop_y;
+// Fixed exposure/gain/white balance (camera_tuning.h); empty = driver defaults.
+extern String cfg_camera_tuning;
 
 extern int cfg_rotation;
 
@@ -387,6 +389,16 @@ ConfigSaveResult configSaveCameraSettings(
     const String &cropZoom,
     int cropPositionX,
     int cropPositionY,
+    bool writeToSd,
+    String &error
+);
+
+// Persist the image tuning (camera page "Bildabstimmung") while preserving
+// every unrelated config key/comment.
+ConfigSaveResult configSaveCameraTuning(
+    int cameraAutoExposure,
+    int cameraAeLevel,
+    const String &tuning,
     bool writeToSd,
     String &error
 );

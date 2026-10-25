@@ -1,0 +1,54 @@
+// Host test: camera_profile.h text format.
+// g++ -std=c++17 -Wall -Wextra -I. -x c++ test_camera_profile.cpp.test -o /tmp/test_camera_profile && /tmp/test_camera_profile
+#include "camera_profile.h"
+
+#include <cstdio>
+#include <cstring>
+
+static int failures = 0;
+#define CHECK(c) do { if (!(c)) { std::printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++failures; } } while (0)
+
+static CameraProfile::Profile sample()
+{
+    CameraProfile::Profile p;
+    p.version = 0x1a2b3c4d; p.pid = 0x5640; p.width = 1600; p.height = 1200; p.quality = 10;
+    p.autoExposure = 0; p.aeLevel = -1;
+    p.tuning.set = true; p.tuning.aecValue = 1800; p.tuning.autoGain = 0; p.tuning.agcGain = 4;
+    p.tuning.awb = 1; p.tuning.wbMode = 1; p.tuning.saturation = 1;
+    return p;
+}
+
+int main()
+{
+    using namespace CameraProfile;
+    char text[160];
+    Profile a = sample(), b;
+    format(a, text, sizeof(text));
+    CHECK(std::strcmp(text, "P1,1a2b3c4d,5640,1600x1200,10,0,-1,1,1800,0,4,0,1,1,1,0,0,1") == 0);
+    CHECK(parse(text, b) && sameSettings(a, b) && b.version == a.version);
+
+    Profile c = a; c.tuning.agcGain = 5;
+    CHECK(!sameSettings(a, c));
+
+    Profile bad = a; bad.width = 1280; bad.height = 720;      // not a supported size
+    format(bad, text, sizeof(text));
+    CHECK(text[0] == '\0');
+    bad = a; bad.version = 0;
+    CHECK(!valid(bad));
+    bad = a; bad.tuning.set = false;
+    CHECK(!valid(bad));
+
+    CHECK(!parse("", b) && !parse(nullptr, b));
+    CHECK(!parse("P2,1,5640,1600x1200,10,0,-1,1,1800,0,4,0,1,1,1,0,0,1", b));
+    CHECK(!parse("P1,1,5640,1600x1200,10,0,-1", b));                           // no tuning
+    CHECK(!parse("P1,1,5640,1600x1200,10,0,-1,1,1800,0,4,0,1,1,1,0,0", b));    // short tuning
+    CHECK(!parse("P1,1,5640,1600x1200,99,0,-1,1,1800,0,4,0,1,1,1,0,0,1", b));  // quality
+    CHECK(!parse("P1,0,5640,1600x1200,10,0,-1,1,1800,0,4,0,1,1,1,0,0,1", b));  // version 0
+    CHECK(!parse("P1,80000000,5640,1600x1200,10,0,-1,1,1800,0,4,0,1,1,1,0,0,1", b));
+    CHECK(!parse("P1,1,5640,1600x1200,10,0,-1,1,1800,0,4,0,1,1,1,0,0,1|x", b));
+    CHECK(b.version == 0);
+    CHECK(std::strcmp(resultName(ResultWaiting), "waiting_drone") == 0);
+
+    std::printf(failures ? "camera profile: %d failures\n" : "camera profile: ok\n", failures);
+    return failures ? 1 : 0;
+}

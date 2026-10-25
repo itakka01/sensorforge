@@ -66,6 +66,11 @@ size_t clusterRequestTxPowerAll(int16_t valueX10, ClusterTxPowerMode mode,
                                 bool includeLocal, size_t &failed, String &error);
 // Board limits, local state and the last result per node.
 String clusterTxPowerJson();
+// Coordinator: signed cluster camera profile job (camera_profile.h) to one
+// node; mode CameraProfile::Mode, profileText ignored for ModeClear. The
+// node's answer arrives via clusterCameraNoteProfileResult().
+bool clusterRequestNodeCameraProfile(const String &nodeId, const String &profileText,
+                                     uint8_t mode, String &error);
 // Capture time in UTC microseconds; shared across all selected nodes.
 // testPulse: request the optional GPIO test pulse (SFJC1 field "tp1"), default off.
 bool clusterRequestNodeCapture(const String &nodeId, int64_t utcUs, String &error, bool testPulse = false);

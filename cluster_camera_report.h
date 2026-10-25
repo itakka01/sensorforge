@@ -78,7 +78,19 @@ struct Report {
     int32_t cropZoomX10;     // 10 = full frame, 15, 20
     int32_t cropX, cropY;    // 0..2
     // provenance
-    int32_t sourceMask;      // 2 bits per Group, phase 1: 0 (all local)
+    int32_t sourceMask;      // 2 bits per Group
+    // Cluster camera profile (phase 2): version in use (0 = none) and ProfileState.
+    int32_t profileVersion;
+    int32_t profileState;
+};
+
+// Node state of the cluster camera profile (camera_profile.h).
+enum class ProfileState : uint8_t {
+    None = 0,          // no profile stored
+    Active = 1,        // applied to the camera (Drone Mode)
+    Waiting = 2,       // stored, takes effect when Drone Mode is on
+    SensorMismatch = 3,// stored for another sensor type, not applied
+    Pending = 4,       // stored, camera restart still due (busy)
 };
 
 inline void reportClear(Report &r)
@@ -87,6 +99,8 @@ inline void reportClear(Report &r)
     for (size_t i = 0; i < sizeof(Report) / sizeof(int32_t); ++i)
         p[i] = kUnknown;
     r.sourceMask = 0;
+    r.profileVersion = 0;
+    r.profileState = 0;
 }
 
 inline bool reportEqual(const Report &a, const Report &b)
@@ -133,16 +147,16 @@ inline const char *sensorName(int32_t pid)
 //   exp  : aec,aec2,aecValue,aeLevel,agc,agcGain,gainCeiling
 //   wb   : awb,awbGain,wbMode
 //   geo  : rotation,hmirror,vflip,cropZoomX10,cropX,cropY
-//   src  : sourceMask
+//   src  : sourceMask,profileVersion,profileState
 static const size_t kGroupCount = 7;
-static const size_t kGroupSizes[kGroupCount] = {5, 2, 7, 7, 3, 6, 1};
+static const size_t kGroupSizes[kGroupCount] = {5, 2, 7, 7, 3, 6, 3};
 
 inline int32_t *reportField(Report &r, size_t index)
 {
     return reinterpret_cast<int32_t *>(&r) + index;
 }
 
-static_assert(sizeof(Report) == sizeof(int32_t) * (5 + 2 + 7 + 7 + 3 + 6 + 1),
+static_assert(sizeof(Report) == sizeof(int32_t) * (5 + 2 + 7 + 7 + 3 + 6 + 3),
               "wire groups must cover every Report field in order");
 
 inline void appendInt(char *&p, char *end, int32_t v)
@@ -243,6 +257,9 @@ inline bool decode(const char *const groups[kGroupCount], Report &out)
         !in(r.cropY, 0, 2))
         return false;
     if (r.capMask == kUnknown || r.capMask < 0 || r.sourceMask == kUnknown || r.sourceMask < 0)
+        return false;
+    if (r.profileVersion == kUnknown || r.profileVersion < 0 || r.profileState == kUnknown ||
+        r.profileState < 0 || r.profileState > 4)
         return false;
     out = r;
     return true;

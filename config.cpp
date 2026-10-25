@@ -1,3 +1,4 @@
+#include "camera_tuning.h"
 #include "config.h"
 #include "board_config.h"
 #include "config_secrets.h"
@@ -90,6 +91,8 @@ int cfg_camera_xclk_mhz = 20;
 int cfg_camera_auto_exposure = 1;
 int cfg_camera_ae_level = -1;
 String cfg_camera_crop_zoom = "1.0";
+// Fixed exposure/gain/white balance for uniform cluster cameras (camera_tuning.h).
+String cfg_camera_tuning = "";
 int cfg_camera_crop_x = 1;
 int cfg_camera_crop_y = 1;
 int cfg_post_ms     = 3000;
@@ -645,6 +648,7 @@ struct ConfigValues {
     int cameraAutoExposure;
     int cameraAeLevel;
     String cameraCropZoom;
+    String cameraTuning;
     int cameraCropX;
     int cameraCropY;
     int rotation;
@@ -778,6 +782,7 @@ struct ConfigSeen {
     bool cameraAutoExposure;
     bool cameraAeLevel;
     bool cameraCropZoom;
+    bool cameraTuning;
     bool cameraCropX;
     bool cameraCropY;
     bool rotation;
@@ -950,6 +955,9 @@ static void setDefaultValues(
 
     values.cameraCropZoom =
         "1.0";
+
+    values.cameraTuning =
+        "";
 
     values.cameraCropX =
         1;
@@ -1281,6 +1289,7 @@ static bool serializeConfigValues(
     APPEND_CONFIG_VALUE("camera_auto_exposure", String(values.cameraAutoExposure));
     APPEND_CONFIG_VALUE("camera_ae_level", String(values.cameraAeLevel));
     APPEND_CONFIG_VALUE("camera_crop_zoom", values.cameraCropZoom);
+    APPEND_CONFIG_VALUE("camera_tuning", values.cameraTuning);
     APPEND_CONFIG_VALUE("camera_crop_x", String(values.cameraCropX));
     APPEND_CONFIG_VALUE("camera_crop_y", String(values.cameraCropY));
     APPEND_CONFIG_VALUE("rotation", String(values.rotation));
@@ -2306,6 +2315,16 @@ static bool validateValues(
             "camera_crop_zoom must be 1.0, 1.5 or 2.0";
 
         return false;
+    }
+
+    {
+        CameraTuning::Values tuning;
+        if (!CameraTuning::parse(values.cameraTuning.c_str(), tuning)) {
+            error =
+                "camera_tuning invalid";
+
+            return false;
+        }
     }
 
 
@@ -3806,6 +3825,21 @@ static bool parseConfigText(
                 }
 
                 values.cameraCropZoom =
+                    value;
+
+            } else if (
+                key == "camera_tuning"
+            ) {
+
+                if (!markOnce(
+                        seen.cameraTuning,
+                        key,
+                        error
+                    )) {
+                    return false;
+                }
+
+                values.cameraTuning =
                     value;
 
             } else if (
@@ -5568,6 +5602,9 @@ static void applyValues(
 
     cfg_camera_crop_zoom =
         values.cameraCropZoom;
+
+    cfg_camera_tuning =
+        values.cameraTuning;
 
     cfg_camera_crop_x =
         values.cameraCropX;
@@ -8453,6 +8490,101 @@ ConfigSaveResult configSaveCameraSettings(
         cfg_camera_crop_zoom = normalizedCropZoom;
         cfg_camera_crop_x = cropPositionX;
         cfg_camera_crop_y = cropPositionY;
+    }
+
+    return result;
+}
+
+
+
+ConfigSaveResult configSaveCameraTuning(
+    int cameraAutoExposure,
+    int cameraAeLevel,
+    const String &tuning,
+    bool writeToSd,
+    String &error
+)
+{
+    error = "";
+
+    if (cameraAutoExposure != 0 && cameraAutoExposure != 1) {
+        error = "camera_auto_exposure must be 0 or 1";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (cameraAeLevel < -2 || cameraAeLevel > 2) {
+        error = "camera_ae_level out of range (-2..2)";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    CameraTuning::Values parsed;
+    if (!CameraTuning::parse(tuning.c_str(), parsed)) {
+        error = "camera_tuning invalid";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String text;
+    bool sourceRead = false;
+
+    // Preserve the complete active config including comments and future keys.
+    if (
+        activeConfigSource == CONFIG_SOURCE_SD &&
+        sdAvailableState &&
+        STORAGE.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    }
+
+    if (
+        !sourceRead &&
+        internalAvailableState &&
+        LittleFS.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(LittleFS, "/config.txt", text);
+    }
+
+    if (
+        !sourceRead &&
+        sdAvailableState &&
+        STORAGE.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    }
+
+    if (!sourceRead) {
+        error = "no persistent config.txt available for camera save";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        !replaceOrAppendConfigKey(text, "camera_auto_exposure", String(cameraAutoExposure)) ||
+        !replaceOrAppendConfigKey(text, "camera_ae_level", String(cameraAeLevel)) ||
+        !replaceOrAppendConfigKey(text, "camera_tuning", tuning)
+    ) {
+        error = "could not patch camera tuning keys";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String validationError;
+    if (!configValidateText(text, validationError)) {
+        error = "patched config invalid: " + validationError;
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    ConfigSaveResult result =
+        configSaveText(
+            text,
+            writeToSd,
+            error
+        );
+
+    if (
+        result == CONFIG_SAVE_BOTH ||
+        result == CONFIG_SAVE_INTERNAL_ONLY
+    ) {
+        cfg_camera_auto_exposure = cameraAutoExposure;
+        cfg_camera_ae_level = cameraAeLevel;
+        cfg_camera_tuning = tuning;
     }
 
     return result;

@@ -5,6 +5,7 @@
 #include "streamer.h"
 #include "drone_mode.h"
 #include "sync_api.h"
+#include "camera_thumbnail.h"
 #include "esp_camera.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
@@ -19,11 +20,17 @@ namespace {
 struct Frame {
     uint8_t *bytes=nullptr;
     size_t length=0;
+    uint16_t width=0, height=0;
+    // Downscaled copy for overview pages, made on first request.
+    uint8_t *thumb=nullptr;
+    size_t thumbLength=0;
     char uuid[37]={};
     uint64_t job=0;
     int64_t target=0, dispatch=0;
 };
 constexpr size_t kMaxFrames=3;
+// Overview thumbnails: at least this wide (1600 px -> 1/8 = 200 px).
+constexpr uint16_t kThumbMinWidth=160;
 Frame slots[kMaxFrames];
 size_t count=0;
 uint64_t activeJob=0;
@@ -42,7 +49,7 @@ void clusterCaptureBeginJob(uint64_t jobId){
     if(!jobId)return;
     // Capture lifecycle is single-threaded in loopTask. Clear at job acceptance,
     // not on read/download, so every run has a defined beginning.
-    for(auto &f:slots){if(f.bytes)heap_caps_free(f.bytes);f=Frame{};}
+    for(auto &f:slots){if(f.bytes)heap_caps_free(f.bytes);if(f.thumb)heap_caps_free(f.thumb);f=Frame{};}
     count=0;activeJob=jobId;
 }
 uint16_t clusterCapturePhoto(uint64_t jobId,int64_t targetUtcUs,int64_t &dispatchUtcUs,uint32_t &bytes,int64_t anchorUtcUs,int64_t anchorMonoUs,bool testPulse) {
@@ -80,6 +87,7 @@ uint16_t clusterCapturePhoto(uint64_t jobId,int64_t targetUtcUs,int64_t &dispatc
     if(!copy){esp_camera_fb_return(fb);return 6;} // Capacity exhausted; do not evict.
     memcpy(copy,fb->buf,fb->len);
     size_t size=fb->len;
+    const uint16_t width=fb->width, height=fb->height;
     esp_camera_fb_return(fb);
 
     // SAFETY: Double-check array bounds before access (defense-in-depth).
@@ -91,6 +99,7 @@ uint16_t clusterCapturePhoto(uint64_t jobId,int64_t targetUtcUs,int64_t &dispatc
 
     Frame &f=slots[count++];
     f.bytes=(uint8_t*)copy;f.length=size;f.job=jobId;
+    f.width=width;f.height=height;
     f.target=targetUtcUs;f.dispatch=dispatchUtcUs;
     generateUuid(f.uuid);
     bytes=(uint32_t)size;
@@ -108,6 +117,63 @@ bool clusterCaptureGetJpeg(const String &uuid,const uint8_t *&bytes,size_t &leng
         bytes=slots[i].bytes;length=slots[i].length;return bytes&&length;
     }
     return false;
+}
+bool clusterCaptureGetThumb(const String &uuid,const uint8_t *&bytes,size_t &length){
+    bytes=nullptr;length=0;
+    if(uuid.length()!=36)return false;
+    for(size_t i=0;i<count;i++) if(uuid.equals(slots[i].uuid)){
+        Frame &f=slots[i];
+        if(!f.bytes)return false;
+        if(!f.thumb && !cameraMakeThumbnail(f.bytes,f.length,f.width,f.height,kThumbMinWidth,f.thumb,f.thumbLength)){
+            // Already small or not convertible: the original serves as thumbnail.
+            bytes=f.bytes;length=f.length;return true;
+        }
+        bytes=f.thumb;length=f.thumbLength;return true;
+    }
+    return false;
+}
+namespace {
+// Live frame cache: polling browsers within kLiveReuseMs share one grab.
+uint8_t *liveBytes=nullptr;
+size_t liveLength=0;
+uint16_t liveMinWidth=0;
+uint32_t liveTakenMs=0;
+constexpr uint32_t kLiveReuseMs=700;
+void liveClear(){if(liveBytes)heap_caps_free(liveBytes);liveBytes=nullptr;liveLength=0;liveTakenMs=0;}
+}
+bool clusterCaptureLiveFrame(uint16_t minWidth,const uint8_t *&bytes,size_t &length,String &reason){
+    bytes=nullptr;length=0;
+    if(liveBytes && liveMinWidth==minWidth && uint32_t(millis()-liveTakenMs)<kLiveReuseMs){
+        bytes=liveBytes;length=liveLength;return true;
+    }
+    // A planned cluster shot owns the camera from acceptance until after it.
+    if(clusterCaptureProtectionActive()){reason="Cluster-Aufnahme geplant";return false;}
+    if(recording || recorderIsOpen()){reason="Aufnahme läuft";return false;}
+    if((streamerModeEnabled() && !droneModeEnabled()) || streamerReady()){reason="Kamera vom Streamer belegt";return false;}
+    if(syncApiExclusiveActive()){reason="API-Sitzung belegt die Kamera";return false;}
+    if(!psramFound()){reason="kein PSRAM";return false;}
+    if((!cameraInitialized || !esp_camera_sensor_get()) && !(droneModeEnabled() && clusterCapturePrepareCamera())){
+        reason="Kamera ist aus";return false;
+    }
+    // Return queued older frames first (see clusterCapturePhoto).
+    camera_fb_t *stale[2]={nullptr,nullptr};
+    const uint8_t n=clusterCaptureFrameBufferCount();
+    for(uint8_t i=0;i<n && i<2;++i) stale[i]=esp_camera_fb_get();
+    for(uint8_t i=0;i<n && i<2;++i) if(stale[i]) esp_camera_fb_return(stale[i]);
+    camera_fb_t *fb=esp_camera_fb_get();
+    if(!fb){reason="Kamerabild fehlgeschlagen";return false;}
+    if(fb->format!=PIXFORMAT_JPEG||!fb->buf||!fb->len){esp_camera_fb_return(fb);reason="Kamerabild fehlgeschlagen";return false;}
+    liveClear();
+    uint8_t *out=nullptr;size_t outLength=0;
+    if(!minWidth || !cameraMakeThumbnail(fb->buf,fb->len,fb->width,fb->height,minWidth,out,outLength)){
+        out=static_cast<uint8_t*>(heap_caps_malloc(fb->len,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT));
+        if(out){memcpy(out,fb->buf,fb->len);outLength=fb->len;}
+    }
+    esp_camera_fb_return(fb);
+    if(!out){reason="kein Speicher";return false;}
+    liveBytes=out;liveLength=outLength;liveMinWidth=minWidth;liveTakenMs=millis();
+    bytes=liveBytes;length=liveLength;
+    return true;
 }
 String clusterCaptureLocalJson(){
     String s="[";bool first=true;

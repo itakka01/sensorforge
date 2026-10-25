@@ -16,6 +16,9 @@ Die Tests sind **nicht** Teil des Arduino-Builds. Die Endung `.cpp.test` verhind
 | `test_psram_alloc.cpp.test` | PSRAM-Zuteilung ohne internen Rückfall | `-Itest_stubs` |
 | `test_wifi_power_policy.cpp.test` | WLAN-Stromsparmodus je Rolle | – |
 | `test_day_archive_tools.cpp.test` | EXAPAN-Konverter im Tages-ZIP | – |
+| `test_camera_tuning.cpp.test` | Textformat der Bildabstimmung (`camera_tuning`) | – |
+| `test_camera_profile.cpp.test` | Textformat des Cluster-Kameraprofils | – |
+| `test_jpeg_mini_encoder.cpp.test` | Kleinbild-JPEG-Encoder; schreibt JPEGs zur Prüfung mit Pillow | `jpeg_mini_encoder.cpp` |
 
 Beispiel:
 

@@ -1,0 +1,54 @@
+// Host test: jpeg_mini_encoder. Writes JPEGs for a decode check with Pillow:
+// g++ -std=c++17 -O2 -Wall -Wextra -I. -x c++ test_jpeg_mini_encoder.cpp.test -x none jpeg_mini_encoder.cpp -o /tmp/test_jpeg_mini && /tmp/test_jpeg_mini /tmp
+// python3 -c "from PIL import Image; [Image.open('/tmp/jpegmini_%d.jpg' % i).load() for i in range(3)]"
+#include "jpeg_mini_encoder.h"
+
+#include <cmath>
+#include <cstdio>
+#include <string>
+#include <vector>
+
+static int failures = 0;
+#define CHECK(c) do { if (!(c)) { std::printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++failures; } } while (0)
+
+// RGB565, low byte first (jpg2rgb565 order).
+static void put(std::vector<uint8_t> &img, int w, int x, int y, int r, int g, int b)
+{
+    const uint16_t v = static_cast<uint16_t>(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+    img[(y * w + x) * 2] = static_cast<uint8_t>(v);
+    img[(y * w + x) * 2 + 1] = static_cast<uint8_t>(v >> 8);
+}
+
+int main(int argc, char **argv)
+{
+    const std::string dir = argc > 1 ? argv[1] : ".";
+    struct Case { int w, h, quality; };
+    const Case cases[] = {{200, 150, 80}, {13, 7, 50}, {256, 192, 100}};
+    for (int i = 0; i < 3; ++i) {
+        const Case c = cases[i];
+        std::vector<uint8_t> img(c.w * c.h * 2);
+        for (int y = 0; y < c.h; ++y)
+            for (int x = 0; x < c.w; ++x) {
+                const bool square = ((x / 16) + (y / 16)) % 2;
+                put(img, c.w, x, y, x * 255 / c.w, y * 255 / c.h, square ? 230 : 20);
+            }
+        std::vector<uint8_t> out(c.w * c.h * 2 + 2048);
+        const size_t n = JpegMini::encodeRgb565Le(img.data(), c.w, c.h, c.quality, out.data(), out.size());
+        CHECK(n > 600);
+        CHECK(out[0] == 0xFF && out[1] == 0xD8 && out[n - 2] == 0xFF && out[n - 1] == 0xD9);
+        const std::string path = dir + "/jpegmini_" + std::to_string(i) + ".jpg";
+        FILE *f = std::fopen(path.c_str(), "wb");
+        CHECK(f != nullptr);
+        if (f) {
+            std::fwrite(out.data(), 1, n, f);
+            std::fclose(f);
+        }
+        std::printf("%dx%d q%d: %zu bytes -> %s\n", c.w, c.h, c.quality, n, path.c_str());
+        // Too small an output buffer: 0, never a partial image.
+        std::vector<uint8_t> tiny(300);
+        CHECK(JpegMini::encodeRgb565Le(img.data(), c.w, c.h, c.quality, tiny.data(), tiny.size()) == 0);
+    }
+    CHECK(JpegMini::encodeRgb565Le(nullptr, 8, 8, 80, nullptr, 0) == 0);
+    std::printf(failures ? "jpeg mini: %d failures\n" : "jpeg mini: ok\n", failures);
+    return failures ? 1 : 0;
+}

@@ -8,7 +8,7 @@
 
 ### 🛡️ Safety Status (NEU - 2026-10-16)
 ✅ **13 Critical Safety Fixes implementiert** - Siehe [`FIX_REPORT_V3.md`](FIX_REPORT_V3.md)
-- **Thread-Safety:** `std::atomic` + RAII Guards Framework
+- **SD-Sperren:** Besitzer-Bits je Nutzer (`sdGateAcquire/sdGateRelease`)
 - **Timer Overflow Protection:** millis() Rollover nach 49 Tagen geschützt
 - **Array Bounds:** Defense-in-Depth Double-Check
 - **Division by Zero:** Fallback-Protection
@@ -238,7 +238,6 @@ rather than accepting unauthenticated or stale broadcast commands.
 - **`FIX_REPORT_V3.md`** - Vollständiger Report (13 Fixes V1+V2+V3)
 - `FIX_REPORT_V2.md` - V2 Report (Option A + Option B)
 - `FIX_REPORT.md` - V1 Report (Quick Wins)
-- `RAII_GUARDS_MIGRATION_GUIDE.md` - RAII Guards Migration Guide
 
 ### Authoritative Project/Re-entry Documents
 

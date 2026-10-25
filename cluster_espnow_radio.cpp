@@ -75,6 +75,10 @@ constexpr uint32_t kClusterDelayRxMaxAgeMs=30000;
 constexpr int64_t kNoDelayNs=INT64_MIN;
 // Node reports: calibration state (joins the slot schedule) and beacon state.
 constexpr uint32_t kReportEveryMs=10000;
+// Beacon report the coordinator did not acknowledge: sent again after
+// kReportRetryMs, at most kReportRetryMax times per regular report.
+constexpr uint32_t kReportRetryMs=300;
+constexpr uint8_t kReportRetryMax=2;
 constexpr uint32_t kSeriesStatsEveryMs=30000;
 
 // --- Two-way calibration series
@@ -111,12 +115,14 @@ Diagnostics stats;
 constexpr size_t kTxPendingCapacity=24;
 // Every esp_now_send() registers an entry, so callbacks of other frames to the
 // same MAC cannot consume another frame's entry.
-constexpr uint8_t kTxClassOther=0, kTxClassBeacon=1;
+constexpr uint8_t kTxClassOther=0, kTxClassBeacon=1, kTxClassReport=2;
 struct TxPending { bool used=false; uint8_t mac[6]={}; int64_t enqueueUs=0; uint8_t frameClass=kTxClassOther; };
 TxPending txPending[kTxPendingCapacity];
 portMUX_TYPE txMux=portMUX_INITIALIZER_UNLOCKED;
 // TX-done callback of the last beacon, matched by its enqueue time.
 int64_t beaconTxDoneEnqueueUs=0, beaconTxDoneUs=0;
+// Unicast beacon reports acknowledged / not acknowledged by the coordinator.
+uint32_t reportTxAcked=0, reportTxUnacked=0;
 void txTimingReset() {
     portENTER_CRITICAL(&txMux);
     for(auto &entry:txPending)entry={};
@@ -161,6 +167,10 @@ void onSentMac(const uint8_t* mac,esp_now_send_status_t status) {
             beaconTxDoneEnqueueUs=txPending[match].enqueueUs;
             beaconTxDoneUs=now;
         }
+        if(txPending[match].frameClass==kTxClassReport) {
+            if(status==ESP_NOW_SEND_SUCCESS) ++reportTxAcked;
+            else ++reportTxUnacked;
+        }
     }
     portEXIT_CRITICAL(&txMux);
 }
@@ -181,7 +191,8 @@ uint32_t captureGuardUntilMs=0;
 uint32_t pauseStartedMs=0, pauseEndedMs=0;
 uint32_t permissionUntilMs=0, nextGrantMs=0;
 bool sendFrame(EspNowTimePackets::Frame& f,const uint8_t mac[6],
-               int64_t* txStampOut=nullptr, bool replyStamp=false);
+               int64_t* txStampOut=nullptr, bool replyStamp=false,
+               uint8_t frameClass=kTxClassOther);
 struct SlotPeer { uint8_t mac[6]={}; uint32_t boot=0; uint32_t seenMs=0;
                   ClusterSlotScheduler::PeerState sched; };
 // Calibration slot scheduling (cluster_slot_scheduler.h): a slot ends when the
@@ -231,9 +242,6 @@ constexpr size_t kUnicastPeerSlots=ESP_NOW_MAX_TOTAL_PEER_NUM-2;  // broadcast +
 UnicastPeer unicastPeers[kUnicastPeerSlots];
 uint32_t unicastPeerEvictions=0;
 ClusterSlotScheduler::Stats slotStats;
-uint32_t slotLastStartMs=0;
-uint64_t slotPeriodTotalMs=0;
-uint32_t slotPeriodCount=0;
 bool slotPeerActive(const SlotPeer &p, uint32_t now) {
     return p.boot && uint32_t(now-p.seenMs)<=kPeerActiveMs;
 }
@@ -327,8 +335,6 @@ void serviceSlots(uint32_t now,uint32_t epoch,uint64_t tag,uint32_t boot) {
         if(next>=0) {
             slotOwner=static_cast<int16_t>(next);
             ClusterSlotScheduler::onSlotStart(slotState,slotPeers[slotOwner].sched,now,slotStats);
-            if(slotLastStartMs){slotPeriodTotalMs+=uint32_t(now-slotLastStartMs);++slotPeriodCount;}
-            slotLastStartMs=now;
             slotStartedMs=now;nextGrantMs=now;
         }
     }
@@ -496,6 +502,11 @@ ClusterEspNowTwoWay::Exchange exchanges[kMaxSamplesPerSeries];
 uint8_t seriesCount=0;
 uint32_t seriesStartedMs=0;
 uint32_t nextReportMs=0, nextBeaconReportMs=0;
+// Beacon report retries (kReportRetryMs): unacknowledged reports seen so far,
+// retries of the current report, a retry is due.
+uint32_t reportUnackedSeen=0, reportRetriesTotal=0;
+uint8_t reportRetries=0;
+bool reportRetryPending=false;
 bool reportSoon=false;
 bool seriesPrecisionAccepted=false;
 // One entry per reporting node boot ID (PSRAM); when full, the entry heard
@@ -504,11 +515,10 @@ struct RemoteReport {
     NodeSyncReport report;
     uint32_t receivedAt=0, beaconReceivedAt=0;
     // Long-term statistics (see NodeSyncReport): accumulated precise time,
-    // first beacon report and the moment of the last precision loss.
-    uint64_t preciseMs=0;
-    uint32_t firstBeaconAt=0, lastLossAt=0;
-    bool lastLossGap=false;                      // reason of the last loss: report gap
-    PrecisionState lastLossState=PrecisionState::Valid;  // else the reported state
+    // unmonitored time of report gaps, first beacon report, last loss and gap.
+    uint64_t preciseMs=0, unmonitoredMs=0;
+    uint32_t firstBeaconAt=0, lastLossAt=0, lastGapAt=0;
+    PrecisionState lastLossState=PrecisionState::Valid;  // state the node reported
 };
 SfPsramArray<RemoteReport> remoteReports;
 
@@ -608,13 +618,17 @@ bool resolveCalibration(double thetaUs, int64_t nodeRefUs) {
     if(!beaconModel.model().valid ||
        beaconModel.model().samples<ClusterBeaconSync::kMinCalibrationSamples) return false;
     const double d=thetaUs-beaconModel.envelopeOffsetUs(nodeRefUs);
-    if(!std::isfinite(d) || d<ClusterBeaconSync::kDelayMinUs || d>ClusterBeaconSync::kDelayMaxUs) {
+    const uint32_t nowMs=millis();
+    const bool clusterKnown=clusterDelayNsRx!=kNoDelayNs && clusterDelayRxMs &&
+        uint32_t(nowMs-clusterDelayRxMs)<=kClusterDelayRxMaxAgeMs;
+    const double clusterUs=clusterKnown ? static_cast<double>(clusterDelayNsRx)/1000.0 : 0;
+    if(!ClusterBeaconSync::delayPlausible(d,clusterKnown,clusterUs)) {
         ++calibrationsDiscarded;
-        Serial.printf("[ESPNOW] calibration discarded: delay %.1f us out of range\n", d);
+        Serial.printf("[ESPNOW] calibration discarded: delay %.1f us (cluster %.1f us)\n", d, clusterUs);
         return true;  // handled (discarded)
     }
     ownDelay.add(d,nodeRefUs);
-    ownDelayLastMs=millis();
+    ownDelayLastMs=nowMs;
     return true;
 }
 void resetBeaconReceiver() {
@@ -630,8 +644,10 @@ void resetBeaconReceiver() {
 
 uint32_t successfulSeries=0, failedSeries=0, nextSeriesStatsReportMs=0;
 uint8_t lastSeriesFailure=0; // 1=invalid/insufficient; 2=spread; 3=RTT; 4=series deadline
+uint32_t failedSeriesByReason[5]={};
 void seriesFailed(uint8_t reason) {
     ++failedSeries;lastSeriesFailure=reason;reportSoon=true;
+    if(reason<5)++failedSeriesByReason[reason];
 }
 void acceptEstimate(const ClusterEspNowTwoWay::Estimate &e) {
     seriesPrecisionAccepted=false;
@@ -695,7 +711,7 @@ bool start(uint8_t channel) {
     for(auto &p:slotPeers)p={};slotOwner=-1;slotState={};
     slotStartedMs=0;slotGuardUntilMs=now+kSlotGuardMs;
     slotGrantsSent=slotRotations=0;
-    slotStats={};slotLastStartMs=0;slotPeriodTotalMs=0;slotPeriodCount=0;
+    slotStats={};
     for(auto &u:unicastPeers)u={};
     followUp={};
     resetBeaconReceiver();
@@ -703,12 +719,12 @@ bool start(uint8_t channel) {
 }
 uint32_t nextSequence(){++txSequence;if(!txSequence)++txSequence;return txSequence;}
 bool sendFrame(EspNowTimePackets::Frame& f,const uint8_t mac[6],
-               int64_t* txStampOut, bool replyStamp) {
+               int64_t* txStampOut, bool replyStamp, uint8_t frameClass) {
     f.sequence=nextSequence();
     // Prepare callback bookkeeping BEFORE sampling the transmission timestamp.
     // Otherwise queue bookkeeping unnecessarily biases t1/t3.
     const int64_t queuedAtUs=esp_timer_get_time();
-    const size_t slot=txPendingRegister(mac,kTxClassOther,queuedAtUs);
+    const size_t slot=txPendingRegister(mac,frameClass,queuedAtUs);
     // V2 Software Timestamp Correction:
     // - Probe: carries t1 (early) + delay from PREVIOUS Probe
     // - Reply: carries t2 (RX timestamp, no correction needed)
@@ -951,13 +967,18 @@ void acceptBeaconSyncReport(const EspNowTimePackets::Frame &f) {
     if(rr->beaconReceivedAt) {
         const uint32_t dt=nowMs-rr->beaconReceivedAt;
         const bool gap=dt>reportGapAllowanceMs(rr->beaconReceivedAt,nowMs);
-        // The interval since the last report keeps that report's state;
-        // a silent node is not precise from the end of the gap allowance.
+        // The interval since the last report keeps that report's state up to
+        // kReportGapMs. A longer silence is a missing report, not a precision
+        // loss: the rest of it is unmonitored and leaves the precise share alone.
         if(r.precisionValid) rr->preciseMs+=gap ? kReportGapMs : dt;
-        if(r.precisionValid && (gap || !precise)) {
+        if(gap) {
+            ++r.reportGaps;
+            rr->lastGapAt=rr->beaconReceivedAt+kReportGapMs;
+            rr->unmonitoredMs+=dt-kReportGapMs;
+        }
+        if(r.precisionValid && !precise) {
             ++r.precisionLosses;
-            rr->lastLossAt=gap ? rr->beaconReceivedAt+kReportGapMs : nowMs;
-            rr->lastLossGap=gap;
+            rr->lastLossAt=nowMs;
             rr->lastLossState=static_cast<PrecisionState>((f.nonce>>4)&0x0fU);
         }
     } else {
@@ -1004,13 +1025,20 @@ void acceptNodeReport(const EspNowTimePackets::Frame &f) {
         slotNotePrecisionReport(boot,true,r.sampleAgeMs);
     }
 }
+// Reports go to the coordinator as unicast: its MAC layer acknowledges them
+// and the sender repeats unacknowledged frames. Broadcast (no acknowledgement)
+// only until the coordinator's beacon is known.
+const uint8_t* reportDestination() {
+    if(beaconSourceKnown && ensurePeer(beaconSourceMac)) return beaconSourceMac;
+    return kBroadcastMac;
+}
 void sendSeriesStatistics(uint32_t epoch,uint64_t tag,uint32_t boot) {
     EspNowTimePackets::Frame f;
     f.type=EspNowTimePackets::Type::NodeSyncReport;
     f.epoch=epoch;f.coordinatorTag=tag;f.senderBoot=boot;
     f.timeUs=static_cast<int64_t>((static_cast<uint64_t>(successfulSeries)<<32)|failedSeries);
     f.nonce=kReportSeriesCounters;
-    sendFrame(f,kBroadcastMac);
+    sendFrame(f,reportDestination());
 }
 // Calibration state; joins the coordinator's slot schedule.
 void sendNodeReports(uint32_t epoch,uint64_t tag,uint32_t boot) {
@@ -1023,7 +1051,7 @@ void sendNodeReports(uint32_t epoch,uint64_t tag,uint32_t boot) {
         const uint32_t ageS=static_cast<uint32_t>(millis()-ownDelayLastMs)/1000UL;
         f.nonce=(std::min<uint32_t>(65535U,ageS)<<16) | kReportCalibrated;
     }
-    sendFrame(f,kBroadcastMac);
+    sendFrame(f,reportDestination());
 }
 void sendBeaconSyncReport(uint32_t epoch,uint64_t tag,uint32_t boot) {
     const uint32_t nowMs=millis();
@@ -1045,7 +1073,8 @@ void sendBeaconSyncReport(uint32_t epoch,uint64_t tag,uint32_t boot) {
     const uint64_t delayAge=ownDelayLastMs ? std::min<uint64_t>(0xffffU,uint32_t(nowMs-ownDelayLastMs)/1000U) : 0xffffU;
     const uint64_t jitter=static_cast<uint64_t>(llround(std::max(0.0,std::min(4294967295.0,m.jitterUs*10.0))));
     f.auxUs=static_cast<int64_t>((delayAge<<48)|jitter);
-    sendFrame(f,kBroadcastMac);
+    const uint8_t* dest=reportDestination();
+    sendFrame(f,dest,nullptr,false,dest==kBroadcastMac ? kTxClassOther : kTxClassReport);
 }
 bool acceptPeer(const uint8_t mac[6],const EspNowTimePackets::Frame &f) {
     PeerReplay* slot=nullptr;
@@ -1193,8 +1222,9 @@ void stop() {
     ++sourceChanges;
     for(auto &p:slotPeers)p={};slotOwner=-1;slotState={};
     slotStartedMs=slotGuardUntilMs=0;slotGrantsSent=slotRotations=0;
-    slotStats={};slotLastStartMs=0;slotPeriodTotalMs=0;slotPeriodCount=0;
+    slotStats={};
     successfulSeries=failedSeries=0;lastSeriesFailure=0;nextSeriesStatsReportMs=0;
+    for(auto &c:failedSeriesByReason)c=0;
     for(auto &r:remoteReports)r={};reportCount=0;
     followUp={};clusterDelayNsTx=kNoDelayNs;
     resetBeaconReceiver();
@@ -1235,21 +1265,21 @@ size_t nodeSyncReports(NodeSyncReport* out,size_t capacity){
         if(rr.beaconReceivedAt) {
             // Include the running interval since the newest report.
             const uint32_t open=nowMs-rr.beaconReceivedAt;
-            uint64_t precise=rr.preciseMs;
+            uint64_t precise=rr.preciseMs, unmonitored=rr.unmonitoredMs;
             if(rr.report.precisionValid) precise+=open<kReportGapMs ? open : kReportGapMs;
-            out[count].monitoredS=(nowMs-rr.firstBeaconAt)/1000UL;
-            out[count].preciseS=static_cast<uint32_t>(precise/1000ULL);
-            uint32_t losses=rr.report.precisionLosses, lossAt=rr.lastLossAt;
-            bool lossGap=rr.lastLossGap;
-            if(rr.report.precisionValid && open>reportGapAllowanceMs(rr.beaconReceivedAt,nowMs)) {
-                ++losses;  // currently silent
-                lossAt=rr.beaconReceivedAt+kReportGapMs;
-                lossGap=true;
+            uint32_t gaps=rr.report.reportGaps, gapAt=rr.lastGapAt;
+            if(open>reportGapAllowanceMs(rr.beaconReceivedAt,nowMs)) {
+                ++gaps;  // currently silent
+                gapAt=rr.beaconReceivedAt+kReportGapMs;
+                unmonitored+=open-kReportGapMs;
             }
-            out[count].precisionLosses=losses;
-            out[count].lastLossGap=lossGap;
+            const uint64_t span=nowMs-rr.firstBeaconAt;
+            out[count].monitoredS=static_cast<uint32_t>((span>unmonitored ? span-unmonitored : 0)/1000ULL);
+            out[count].preciseS=static_cast<uint32_t>(precise/1000ULL);
             out[count].lastLossState=rr.lastLossState;
-            out[count].lastLossAgeS=losses ? (nowMs-lossAt)/1000UL : UINT32_MAX;
+            out[count].lastLossAgeS=rr.report.precisionLosses ? (nowMs-rr.lastLossAt)/1000UL : UINT32_MAX;
+            out[count].reportGaps=gaps;
+            out[count].lastGapAgeS=gaps ? (nowMs-gapAt)/1000UL : UINT32_MAX;
         }
         ++count;
     }
@@ -1304,6 +1334,14 @@ Diagnostics diagnostics(){Diagnostics out=stats;
     out.seriesAccepted=successfulSeries;
     out.seriesRejected=failedSeries;
     out.seriesLastFailureReason=lastSeriesFailure;
+    out.seriesRejectedInsufficient=failedSeriesByReason[1];
+    out.seriesRejectedSpread=failedSeriesByReason[2];
+    out.seriesRejectedRtt=failedSeriesByReason[3];
+    out.seriesRejectedTimeout=failedSeriesByReason[4];
+    portENTER_CRITICAL(&txMux);
+    out.reportsAcked=reportTxAcked;out.reportsUnacked=reportTxUnacked;
+    portEXIT_CRITICAL(&txMux);
+    out.reportRetries=reportRetriesTotal;
     out.slotRefreshMs=kSlotRefreshAgeMs;
     out.slotLifetimeMs=kSlotLifetimeMs;
     if(wasCoordinator){
@@ -1316,8 +1354,11 @@ Diagnostics diagnostics(){Diagnostics out=stats;
             if(age>=kSlotLifetimeMs) ++out.slotExpiredPeers;
             if(age>out.slotOldestAgeMs) out.slotOldestAgeMs=age;
         }
-        const uint32_t periodMeanMs=slotPeriodCount ? static_cast<uint32_t>(slotPeriodTotalMs/slotPeriodCount) : 0;
-        out.slotCycleEstimateMs=out.slotActivePeers*periodMeanMs;
+        // Busy time per accepted series (slot length + guard, failed slots included).
+        // Start-to-start periods would measure demand: idle, they approach the refresh age.
+        const uint64_t busyMs=slotStats.totalSlotMs+uint64_t(slotStats.finishedSlots)*kSlotShortGuardMs;
+        const uint32_t perSeriesMs=slotStats.succeeded ? static_cast<uint32_t>(busyMs/slotStats.succeeded) : 0;
+        out.slotCycleEstimateMs=out.slotActivePeers*perSeriesMs;
         out.slotCapacity=slotPeers.size();
         out.slotTableFullRecent=slotTableFullLastMs && uint32_t(now-slotTableFullLastMs)<=kPeerActiveMs;
         out.slotRotations=slotRotations;
@@ -1608,7 +1649,19 @@ void service(bool allowed,bool coordinator,uint32_t epoch,const char* id,uint32_
     if(benchNodePhase){benchNodeTick(now);return;}
     // The node joins the calibration schedule once its beacon model is settled
     // (a delay needs the envelope offset); the beacon report goes out always.
+    uint32_t unacked;
+    portENTER_CRITICAL(&txMux);unacked=reportTxUnacked;portEXIT_CRITICAL(&txMux);
+    if(unacked!=reportUnackedSeen) {
+        reportUnackedSeen=unacked;
+        if(reportRetries<kReportRetryMax) {
+            ++reportRetries;++reportRetriesTotal;
+            reportRetryPending=true;
+            nextBeaconReportMs=now+kReportRetryMs;
+        }
+    }
     if(static_cast<int32_t>(now-nextBeaconReportMs)>=0){
+        if(!reportRetryPending) reportRetries=0;
+        reportRetryPending=false;
         nextBeaconReportMs=now+kReportEveryMs;
         sendBeaconSyncReport(epoch,tag,localBootNonce);
     }

@@ -1,3 +1,6 @@
+#include "cluster_camera.h"
+#include "cluster_camera_profile.h"
+#include "webconfig_camera_tuning.h"
 #include "sync_api.h"
 
 #include "board_config.h"
@@ -232,19 +235,9 @@ static SpiClockSwitchResult switchSpiStorageClock(
     if (!admission) return result; // Concurrent SD maintenance owns the card.
 
 
-    // SAFETY WARNING: Save/restore pattern for g_storageLocked has a theoretical
-    // race condition if another task modifies g_storageLocked between save and
-    // restore. The ScopedSyncSdRemount admission guard above prevents concurrent
-    // remounts, but g_storageLocked is also modified by web_sd_maintenance.cpp,
-    // webconfig.cpp, and sensorforge.ino. A reference-counted lock solution
-    // should be implemented to fully eliminate this risk.
-    bool previousStorageLock = g_storageLocked;
-    bool previousRecordingBlock = g_recordingStartBlocked;
-
-    // No SD File handle may survive a remount. Raise the existing cooperative
-    // gates first, stop the player, and close the persistent logger handle.
-    g_storageLocked = true;
-    g_recordingStartBlocked = true;
+    // No SD File handle may survive a remount. Raise the cooperative gates
+    // first, stop the player, and close the persistent logger handle.
+    sdGateAcquire(SD_GATE_SYNC_API_REMOUNT, true, true);
     webPlayerStop();
     logClose();
 
@@ -258,15 +251,13 @@ static SpiClockSwitchResult switchSpiStorageClock(
         // Reopen the logger on the fresh mount before restoring the old gates,
         // matching the established SD-maintenance ordering in WebConfig.
         logInit();
-        g_recordingStartBlocked = previousRecordingBlock;
-        g_storageLocked = previousStorageLock;
     } else {
         // Fail safe. The card could not be remounted at either requested clock.
         // Leave all new SD/recording work blocked; reboot performs normal init.
-        g_recordingStartBlocked = true;
-        g_storageLocked = true;
+        sdGateAcquire(SD_GATE_REMOUNT_FAULT, true, true);
         result.rebootRequired = true;
     }
+    sdGateRelease(SD_GATE_SYNC_API_REMOUNT);
 
     Serial.printf(
         "Sync API SD SPI switch | reason=%s | target=%lu MHz | target_ok=%s | fallback=%lu MHz | fallback_ok=%s | reboot_required=%s\n",
@@ -2155,13 +2146,7 @@ static void handleTestSdSpi()
     const uint32_t restoreHz = SD_SPI_MAX_FREQUENCY_HZ;
     const uint32_t restoreMhz = restoreHz / 1000000UL;
 
-    // SAFETY WARNING: Save/restore pattern for g_storageLocked - same race
-    // condition risk as switchSpiStorageClock() above. See comment there.
-    bool previousStorageLock = g_storageLocked;
-    bool previousRecordingBlock = g_recordingStartBlocked;
-
-    g_storageLocked = true;
-    g_recordingStartBlocked = true;
+    sdGateAcquire(SD_GATE_SYNC_API_SPI_TEST, true, true);
     webPlayerStop();
 
     // The normal logger deliberately keeps an SD File open. Close it before
@@ -2214,14 +2199,12 @@ static void handleTestSdSpi()
 
     if (restoreOk) {
         logInit();
-        g_recordingStartBlocked = previousRecordingBlock;
-        g_storageLocked = previousStorageLock;
     } else {
         // Fail safe: without a valid remount, keep storage and recording gated.
         // A reboot will execute the normal SD initialization path again.
-        g_recordingStartBlocked = true;
-        g_storageLocked = true;
+        sdGateAcquire(SD_GATE_REMOUNT_FAULT, true, true);
     }
+    sdGateRelease(SD_GATE_SYNC_API_SPI_TEST);
 
     float mbPerSecond = 0.0f;
     if (readBytes > 0 && elapsedMs > 0) {
@@ -2526,6 +2509,7 @@ static const ApiConfigFieldDef API_CONFIG_FIELDS[] = {
     {"camera_crop_zoom", "camera", false, true},
     {"camera_crop_x", "camera", false, true},
     {"camera_crop_y", "camera", false, true},
+    {"camera_tuning", "camera", false, true},
     {"rotation", "camera", false, true},
 
     {"recording_format", "recording", false, true},
@@ -3875,6 +3859,67 @@ static void handleClusterWifiTxPowerPost()
     server().send(code, "application/json; charset=utf-8", json);
 }
 
+// Cluster camera profile (coordinator): same logic as /cluster_camera_profile.
+static void handleClusterCameraProfileGet()
+{
+    if (!authenticate())
+        return;
+    sendApiVersionHeader();
+    server().sendHeader("Cache-Control", "no-store");
+    if (!clusterLocalIsCoordinator()) {
+        sendJsonError(403, "not_coordinator", "only on the active coordinator");
+        return;
+    }
+    server().send(200, "application/json; charset=utf-8", clusterCameraProfileJson());
+}
+
+static void handleClusterCamerasGet()
+{
+    if (!authenticate())
+        return;
+    sendApiVersionHeader();
+    server().sendHeader("Cache-Control", "no-store");
+    if (!clusterLocalIsCoordinator()) {
+        sendJsonError(403, "not_coordinator", "only on the active coordinator");
+        return;
+    }
+    server().send(200, "application/json; charset=utf-8", clusterCameraJson());
+}
+
+static void handleClusterCameraProfilePost()
+{
+    if (!authenticate())
+        return;
+    touchExclusiveLease();
+    String json;
+    const int code = clusterCameraProfileRequestFromArgs(server(), json);
+    sendApiVersionHeader();
+    server().sendHeader("Cache-Control", "no-store");
+    server().send(code, "application/json; charset=utf-8", json);
+}
+
+// Image tuning of this device: same logic as the /camera_tuning page.
+static void handleCameraTuningGet()
+{
+    if (!authenticate())
+        return;
+    sendApiVersionHeader();
+    server().sendHeader("Cache-Control", "no-store");
+    server().send(200, "application/json; charset=utf-8", cameraTuningJson());
+}
+
+static void handleCameraTuningPost()
+{
+    if (!authenticate())
+        return;
+    touchExclusiveLease();
+    String json;
+    const int code = cameraTuningRequestFromArgs(server(), json);
+    sendApiVersionHeader();
+    server().sendHeader("Cache-Control", "no-store");
+    server().send(code, "application/json; charset=utf-8", json);
+}
+
 static void handleSystemShutdown()
 {
     if (!authenticate())
@@ -4078,6 +4123,11 @@ void syncApiRegisterRoutes(WebServer &webServer)
     webServer.on("/api/v1/system/shutdown", HTTP_POST, handleSystemShutdown);
     webServer.on("/api/v1/cluster/wifi_tx_power", HTTP_GET, handleClusterWifiTxPowerGet);
     webServer.on("/api/v1/cluster/wifi_tx_power", HTTP_POST, handleClusterWifiTxPowerPost);
+    webServer.on("/api/v1/cluster/cameras", HTTP_GET, handleClusterCamerasGet);
+    webServer.on("/api/v1/cluster/camera_profile", HTTP_GET, handleClusterCameraProfileGet);
+    webServer.on("/api/v1/cluster/camera_profile", HTTP_POST, handleClusterCameraProfilePost);
+    webServer.on("/api/v1/camera/tuning", HTTP_GET, handleCameraTuningGet);
+    webServer.on("/api/v1/camera/tuning", HTTP_POST, handleCameraTuningPost);
 
     webServer.on("/api/v1/status", HTTP_GET, handleStatus);
     webServer.on("/api/v1/storage", HTTP_GET, handleStorageStatus);

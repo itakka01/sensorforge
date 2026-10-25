@@ -35,97 +35,9 @@ static RecorderFrameTiming lastFrameTiming = {};
 static String lastRecorderError;
 
 
-// =============================================================
-// REFERENCE-COUNTED RECORDING BLOCK
-// =============================================================
-
-// Reference counter for recording block depth (thread-safe).
-std::atomic<int> g_recordingBlockDepth(0);
-
-// Public global start lock declared in recorder.h.
-// Now managed by reference counter - DO NOT modify directly!
-// Use RecordingBlockGuard instead.
+// Recording-start gate declared in recorder.h, written only by the SD gate
+// owners in storage_guard.cpp.
 std::atomic<bool> g_recordingStartBlocked(false);
-
-
-// =============================================================
-// RAII RECORDING BLOCK GUARD IMPLEMENTATION
-// =============================================================
-
-// THREAD SAFETY: Mutex protects the critical section between fetch_sub and
-// store(false) to prevent race conditions where a destructor and constructor
-// could interleave and corrupt the lock state. See LOCK_SEMANTICS_ANALYSIS.md
-// Problem 1 for detailed proof-of-concept.
-//
-// IMPORTANT: Mutex is initialized explicitly in sensorforge.ino setup() to
-// avoid lazy-init race condition (two threads could create two mutexes).
-static SemaphoreHandle_t g_recordingBlockMutex = nullptr;
-
-void initRecordingBlockGuard() {
-    if (g_recordingBlockMutex == nullptr) {
-        g_recordingBlockMutex = xSemaphoreCreateMutex();
-    }
-}
-
-RecordingBlockGuard::RecordingBlockGuard()
-{
-    // Mutex must be initialized by sensorforge.ino setup()
-    if (g_recordingBlockMutex == nullptr) {
-        Serial.println("[RECORDING BLOCK] FATAL: Mutex not initialized! Call initRecordingBlockGuard() in setup()");
-        // Create it anyway as emergency fallback (better than crash)
-        g_recordingBlockMutex = xSemaphoreCreateMutex();
-    }
-
-    // THREAD SAFETY: Mutex protects counter + flag updates atomically
-    xSemaphoreTake(g_recordingBlockMutex, portMAX_DELAY);
-
-    int depth = g_recordingBlockDepth.fetch_add(1, std::memory_order_relaxed);
-    g_recordingStartBlocked.store(true, std::memory_order_relaxed);
-
-    // Debug: Log deep nesting (potential logic error)
-    if (depth > 5) {
-        Serial.printf(
-            "[RECORDING BLOCK] WARNING: Deep block nesting depth=%d\n",
-            depth + 1
-        );
-    }
-
-    xSemaphoreGive(g_recordingBlockMutex);
-}
-
-RecordingBlockGuard::~RecordingBlockGuard()
-{
-    if (g_recordingBlockMutex == nullptr) {
-        // Should never happen, but fail-safe
-        Serial.println("[RECORDING BLOCK] FATAL: Mutex not initialized!");
-        return;
-    }
-
-    // THREAD SAFETY: Mutex protects counter + flag updates atomically
-    xSemaphoreTake(g_recordingBlockMutex, portMAX_DELAY);
-
-    int depth = g_recordingBlockDepth.fetch_sub(1, std::memory_order_relaxed);
-
-    // Sanity check: depth should never go negative
-    if (depth <= 0) {
-        Serial.println(
-            "[RECORDING BLOCK] ERROR: Block depth underflow! "
-            "Mismatched block/unblock calls detected."
-        );
-        // Clamp to zero to prevent further damage
-        g_recordingBlockDepth.store(0, std::memory_order_relaxed);
-        g_recordingStartBlocked.store(false, std::memory_order_relaxed);
-        xSemaphoreGive(g_recordingBlockMutex);
-        return;
-    }
-
-    // Unblock only when depth reaches zero (all guards released)
-    if (depth == 1) {  // depth before decrement was 1, now 0
-        g_recordingStartBlocked.store(false, std::memory_order_relaxed);
-    }
-
-    xSemaphoreGive(g_recordingBlockMutex);
-}
 
 
 static String tempPathFor(

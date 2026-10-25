@@ -1,4 +1,4 @@
-# Kamera-Transparenz im Cluster (Phase 1, Stand 2026-10-23, nach v87-beta139)
+# Kameras im Cluster (Phase 1 Anzeige 2026-10-23; Phase 2: Bildabstimmung/Übersicht beta155, Profil je Sensortyp beta156)
 
 Phase 1 der zentralen Kamerasteuerung ist **reine Anzeige**. Jede Node meldet Sensortyp,
 Fähigkeiten und die tatsächlich wirksamen Kameraeinstellungen. Der Coordinator zeigt sie pro
@@ -93,3 +93,43 @@ zurückgesetzt beim Deinit). Das Kameraverhalten ändert sich dadurch nicht.
 - Ein Report ist nach Node-Neustart erst nach dem ersten Heartbeat wieder da (≤ 10 s).
 - Ein Hardware-Test steht aus: Anzeige je Board, Änderung von Crop oder Drehung lokal und
   Wirkung in der Übersicht, Verhalten bei laufender Aufnahmeplanung.
+
+## 7. Phase 2, Schritt 1 (beta155): Bildabstimmung und Kamera-Übersicht
+
+Ziel: einheitliche Kameras für Gaussian Splats. Vom User festgelegt (2026-10-25):
+- Referenzkamera (Herz) **je Sensortyp**; ihre Einstellungen werden als Profil mit Version an Nodes mit gleichem Sensor übertragen, wahlweise nur für die Sitzung oder dauerhaft in einem eigenen Profilspeicher (nicht `config.txt`; „Profil entfernen“ stellt die lokalen Werte wieder her). Nodes mit anderem Sensor werden markiert. → Schritt 2.
+- Übersicht über Kleinbilder mit den echten Einstellungen statt Umschalten auf 320×240 (Drone Mode sperrt die Vorschau; eine andere Auflösung ändert bei fester Belichtung die Belichtungszeit).
+
+Umgesetzt in Schritt 1:
+
+| Teil | Datei | Inhalt |
+|---|---|---|
+| Abstimmung | `camera_tuning.h`, `webconfig_camera_tuning.cpp` | Schlüssel `camera_tuning` (`1,aec_value,agc,agc_gain,gainceiling,awb,wb_mode,awb_gain,brightness,contrast,saturation`), Seite `/camera_tuning`, POST `/camera_tuning_apply` (`mode=session|save|reset`) |
+| Anwenden | `sensorforge.ino` | `cameraApplyTuning()` am Ende der Belichtungseinstellung in `initCamera()`; `cameraApplyTuningRuntime()` ohne Kameraneustart |
+| Live-Bild | `cluster_capture.cpp` (`clusterCaptureLiveFrame`), `/camera_frame` | frisches Bild, `size=small` (≈1/8, Standard), `medium` (≥ 800 px breit) oder `full`; gleiche Sperren wie eine Cluster-Aufnahme |
+| Kleinbild | `camera_thumbnail.cpp`, `jpeg_mini_encoder.cpp` | Dekodieren direkt in 1/2, 1/4 oder 1/8 (≥ 160 px breit), Neukodierung Qualität 80, 4:4:4 |
+| Übersicht | `webconfig_cluster_camera.cpp` | Raster aller Kameras, nacheinander geladen, optional laufend |
+
+Hinweise:
+- Der Belichtungswert zählt in Sensorzeilen und ist nur bei gleichem Sensor und gleicher Auflösung vergleichbar.
+- Bei laufender Belichtungsautomatik meldet der Treiberstatus den zuletzt gesetzten, nicht den von der Automatik gefundenen Wert.
+- Der Browser lädt die Bilder direkt von den Geräten; ist dort die Anmeldung aktiv, muss sie im Browser für jedes Gerät bestehen (wie bei der Ergebnis-Galerie).
+
+## 8. Phase 2, Schritt 2 (beta156): Kameraprofil je Sensortyp
+
+| Teil | Datei | Inhalt |
+|---|---|---|
+| Profilformat | `camera_profile.h` | `P1,<version>,<pid>,<WxH>,<quality>,<aec>,<ae_level>,<tuning>`, Ergebniscodes |
+| Node-Speicher | `camera_profile_store.cpp` | Sitzung (RAM) / dauerhaft (NVS `sf_camprof`) |
+| Node-Anwendung | `sensorforge.ino` | `cameraProfileWanted()` (Drone Mode + gleicher Sensor), Übernahme in `initCamera()`, `cameraProfileService()` startet die Kamera bei Änderung neu, `cameraProfileApplyJob()` |
+| Protokoll | `cluster.cpp` | `SFJP1` Coordinator → Node (Modus 0 Sitzung, 1 dauerhaft, 2 entfernen), `SFJPA1` Antwort; Job-Art 9 |
+| Coordinator | `cluster_camera_profile.cpp` | Referenz + letztes Profil je Sensortyp (NVS `sf_camref`), Profil aus der Referenz-Meldung, Verteilung |
+| Meldung | `cluster_camera_report.h` | Gruppe `src` = `sourceMask,profileVersion,profileState` |
+| Oberfläche/API | `webconfig_cluster_camera.cpp`, `sync_api.cpp` | Herz, Übertragen/Entfernen, Spalte „Profil“; `/api/v1/cluster/camera_profile`, `/api/v1/cluster/cameras`, `/api/v1/camera/tuning` |
+
+Ablauf: ♡ bei einem Gerät setzen → dessen Bildabstimmung öffnen, Werte einstellen, „Anwenden“ → am Coordinator „Übertragen“. Die Spalte „Profil“ vergleicht danach die gemeldeten Werte jedes Geräts mit dem Profil.
+
+Grenzen:
+- Die Verstärkungsobergrenze ist nur übertragbar, wenn die Referenz sie als Index 0–6 meldet (OV3660/OV5640 melden bis zum ersten Setzen über die Bildabstimmung den Rohwert); mit ausgeschalteter Verstärkungsautomatik spielt sie keine Rolle.
+- Profile gelten nur im Drone Mode; außerhalb gelten die lokalen Werte (bisherige Vorgabe: Overrides nur im Cluster-Aufnahmebetrieb).
+- Ein Gerät, das beim Übertragen offline ist, bekommt das Profil nicht automatisch nach; die Spalte zeigt es rot, erneut „Übertragen“ holt es nach (gleiche Version).

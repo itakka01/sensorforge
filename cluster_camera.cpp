@@ -2,6 +2,7 @@
 
 #include "cluster.h"
 #include "psram_alloc.h"
+#include "camera_profile.h"
 
 #include <string.h>
 
@@ -18,6 +19,11 @@ struct Entry {
     uint32_t reportSeq;
     uint32_t receivedMs;
     Report report;
+    // Last answer to a cluster camera profile job (camera_profile.h).
+    bool profileResultKnown;
+    uint8_t profileResult;
+    uint32_t profileResultVersion;
+    uint32_t profileResultMs;
 };
 
 // Lazily allocated in PSRAM, never internal RAM (see psram_alloc.h).
@@ -34,6 +40,17 @@ static Entry *entries()
         Serial.println("[CAMERA] no PSRAM for cluster camera table, overview disabled");
     }
     return g_entries;
+}
+
+static Entry *findEntryMutable(const char *integrationId)
+{
+    Entry *e = entries();
+    if (!e)
+        return nullptr;
+    for (size_t i = 0; i < kMaxEntries; ++i)
+        if (e[i].integrationId[0] && strcmp(e[i].integrationId, integrationId) == 0)
+            return &e[i];
+    return nullptr;
 }
 
 static const Entry *findEntry(const char *integrationId)
@@ -112,6 +129,14 @@ static void appendReport(String &json, const Report &r)
     appendNum(json, "crop_zoom_x10", r.cropZoomX10);
     appendNum(json, "crop_x", r.cropX);
     appendNum(json, "crop_y", r.cropY);
+    static const char *const profileStates[] = {"none", "active", "waiting_drone", "sensor_mismatch", "pending"};
+    char version[12];
+    snprintf(version, sizeof(version), "%lx", (unsigned long)(uint32_t)r.profileVersion);
+    json += ",\"profile_version\":";
+    json += r.profileVersion > 0 ? "\"" + String(version) + "\"" : String("null");
+    json += ",\"profile_state\":\"";
+    json += r.profileState >= 0 && r.profileState <= 4 ? profileStates[r.profileState] : "none";
+    json += '"';
     static const char *const groupKeys[] = {
         "resolution", "quality", "exposure", "gain", "white_balance", "image",
         "rotation", "mirror", "crop"};
@@ -135,6 +160,27 @@ static String safeText(const char *text)
 }
 
 } // namespace
+
+bool clusterCameraLatestReport(const char *integrationId, Report &out, uint32_t &ageMs)
+{
+    const Entry *e = findEntry(integrationId);
+    if (!e)
+        return false;
+    out = e->report;
+    ageMs = millis() - e->receivedMs;
+    return true;
+}
+
+void clusterCameraNoteProfileResult(const char *integrationId, uint8_t result, uint32_t version)
+{
+    Entry *e = findEntryMutable(integrationId);
+    if (!e)
+        return;
+    e->profileResultKnown = true;
+    e->profileResult = result;
+    e->profileResultVersion = version;
+    e->profileResultMs = millis();
+}
 
 void clusterCameraStoreReport(const char *integrationId, uint32_t bootNonce,
                               uint32_t reportSeq, const Report &report)
@@ -209,6 +255,17 @@ String clusterCameraJson()
         }
         json += ",\"report_known\":";
         json += known ? "true" : "false";
+        if (const Entry *e = n.local ? nullptr : findEntry(n.integrationId)) {
+            if (e->profileResultKnown) {
+                char version[12];
+                snprintf(version, sizeof(version), "%lx", (unsigned long)e->profileResultVersion);
+                json += ",\"profile_result\":\"" + String(CameraProfile::resultName(e->profileResult)) + "\"";
+                json += ",\"profile_result_version\":\"" + String(version) + "\"";
+                json += ",\"profile_result_age_s\":" + String((unsigned long)((now - e->profileResultMs) / 1000UL));
+            }
+        } else if (n.local) {
+            clusterCameraAppendLocalProfileResult(json, now);
+        }
         if (known) {
             json += ",\"age_s\":" + String((unsigned long)ageS);
             appendReport(json, r);

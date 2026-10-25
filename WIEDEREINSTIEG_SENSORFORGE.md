@@ -1,3 +1,23 @@
+## SD-Sperren über Besitzer-Bits, Punkt-5-Prüfung (2026-10-25) – v87-beta153
+
+- `g_storageLocked`/`g_recordingStartBlocked` nur noch über `sdGateAcquire/sdGateRelease` mit eigenem Bit je Nutzer (15 Besitzer + Remount-Fehler). Die alten RAII-Guards und Tiefenzähler sind entfernt.
+- Behoben: SD-Benchmark und Mikrofontest konnten die Speichersperre anderer Abläufe aufheben; jede Save/Restore-Stelle konnte das bei Überlappung.
+- Geprüft ohne Änderung: Schreibpuffer-Task (kein Use-After-Free, hängender Task → Watchdog-Neustart), Kamera-Zugriff (alles im loopTask, kein Dienstaufruf bei gehaltenem Frame).
+- Hardwaretest offen: SD-Wartung, Benchmark, Firmware-Upload, Mikrofontest, Wiedergabe-Löschen auf einem Board mit SD.
+
+## Fix verschobene erste Einmessung (2026-10-25) – v87-beta152
+
+- Einmessung > 400 µs neben der Cluster-Laufzeit wird verworfen und wiederholt (c005 3469 µs, c001 3416 µs im dichten Gehäuse-Aufbau).
+- Laufend: Vergleich Sendeleistung 13 dBm / 8,5 dBm mit Antennen 5 cm auseinander; abgelehnte Serien dort alle wegen Streuung.
+
+## Zeitansicht: fehlende Berichte, Einmess-Runde (2026-10-25) – v87-beta151
+
+- 5-h-Lauf beta150: 10 Boards ohne Neustart, 99,8 % präzise, keine echten Ausfälle; der Filter-Fix wirkt (6,4 % statt 22 % verworfen).
+- Fehlende Berichte zählen getrennt („fehlte“), nicht mehr als Ausfall.
+- Einmess-Runde misst jetzt die Kapazität (Slotzeit je angenommener Serie) statt des Bedarfs.
+- Neue Node-Zähler für den Grund abgelehnter Serien; offen: Auswertung für c006/c004 nach dem nächsten Lauf.
+- Temperaturschutz über CPU-Sensor existiert bereits (CLAUDE.md korrigiert).
+
 ## Fix gleichzeitige Ausfälle (2026-10-24) – v87-beta150
 TX-Pfad-Filter des Zeitsignal-Modells nutzt das untere Viertel statt des Minimums der letzten 32 Sendewege; ein einzelner schneller Wert ließ vorher ~30 s lang alle Signale verwerfen. Hardwaretest offen.
 
@@ -118,7 +138,6 @@ Präzisionszeit kommt jetzt aus einem Zeitsignal des Coordinators (jede Sekunde 
 
 **Neue Dateien:**
 - `heap_monitor.h` / `heap_monitor.cpp` (V2)
-- `RAII_GUARDS_MIGRATION_GUIDE.md` (V2)
 - `FIX_REPORT_V3.md` (Dieser Report)
 
 **Geänderte Dateien:**
@@ -154,7 +173,6 @@ SensorForge wird als verteilter Multi-Kamera-Cluster auf ESP32-S3 weiterentwicke
 - **`FIX_REPORT_V3.md`** – Vollständiger Safety-Fixes-Report (13 Fixes V1+V2+V3)
 - `FIX_REPORT_V2.md` – V2-Fixes-Report (Option A + Option B)
 - `FIX_REPORT.md` – V1-Fixes-Report (Quick Wins)
-- `RAII_GUARDS_MIGRATION_GUIDE.md` – RAII Guards Migration (6-10h Aufwand)
 - `heap_monitor.h/.cpp` – Heap-Fragmentierungs-Monitoring (alle 60s)
 
 ### Core Documentation
@@ -164,8 +182,8 @@ SensorForge wird als verteilter Multi-Kamera-Cluster auf ESP32-S3 weiterentwicke
 - `README.md` – Features, Entwicklungsregeln, Safety-Status
 
 ### Code-Module (mit V3-Verbesserungen)
-- `storage_guard.h/.cpp` – SD-Zugriffskontrolle + **RAII Guards** (V1+V2)
-- `recorder.h/.cpp` – Recording-Interface + **RAII Guards** (V2)
+- `storage_guard.h/.cpp` – SD-Zugriffskontrolle, SD-Sperren über Besitzer-Bits (beta153)
+- `recorder.h/.cpp` – Recording-Interface
 - `cluster.cpp`, `cluster_jobs.*` – Cluster-Runtime, signierte Befehle, Jobzustände, Statusmeldungen.
 - `cluster_capture.h/.cpp` – zeitgesteuerter Capture-/PSRAM-Medienpfad + **Array Bounds Defense** (V3)
 - `streamer.cpp` – RTSP/HTTP-Streaming + **Timer Overflow Protection** (V3)

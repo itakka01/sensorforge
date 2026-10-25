@@ -35,6 +35,7 @@
 - **Austausch:** `Probe` (Node, `t1`) → `Reply` (Coordinator, `t2` Empfang, `t3` Antwort) → `Final` (liefert `t3`). `t4` = Empfang des Reply am Node, nie des Final. `offset = ((t2 − t1) + (t3 − t4)) / 2`, `rtt = (t4 − t1) − (t3 − t2)`. Die vor dem Senden genommenen Zeitstempel werden um die gemessene Dauer bis zur Rückkehr von `esp_now_send()` korrigiert (`lastProbePreSendUs`, Reply-Wert im Final).
 - **Serie:** fest 16 Austausche, ~45 ms Abstand, Abbruch nach 12 s. Schätzer `cluster_espnow_twoway.*`: Median des unteren RTT-Quartils (mindestens 3 Werte). Angenommen bei ≥ 8 gültigen Austauschen, Spannweite ≤ 250 µs, Median-RTT ≤ 30 ms; sonst verworfen (Wiederholung nach 12–24 s, zufällig gestreut).
 - **Voraussetzung:** Der Node meldet sich erst zur Einmessung (`NodeSyncReport`), wenn sein Zeitsignal-Modell mindestens 32 Signale hat (`kMinCalibrationSamples`); eine früher fertige Serie wird bis 120 s aufgehoben. Mit nur 8 Signalen lag die erste Einmessung bis 150 µs daneben.
+- **Plausibilität (beta152):** Eine Einmessung, die mehr als 400 µs von der Cluster-Laufzeit abweicht, wird verworfen (`delayPlausible`, Zähler `calibrations_discarded`) und neu gemessen. Anlass: Antennen 5 cm auseinander, erste Serie von c001/c005 um +1,3 ms verschoben bei kleiner Streuung. Ohne Cluster-Laufzeit gilt nur der Bereich 0–10 ms.
 - **Zeitplan:** fällig nach 10 min (`kSlotRefreshAgeMs`), „abgelaufen“ (nur Diagnose) nach 30 min. Bei 100 Nodes dauert eine Runde ~6 min.
 
 ## 3. Slot-Planung (Coordinator, `cluster_slot_scheduler.h`)
@@ -54,7 +55,9 @@ Der Coordinator beantwortet Probes nur vom jeweiligen **Slot-Inhaber**; immer nu
 | `NodeSyncReport` (Typ 6) | 10 s + nach jeder Serie | `nonce` 0x100 = eingemessen (Bits 16–31 Alter in s), 0x200 = noch nicht eingemessen |
 | `NodeSyncReport` mit 0x1000 | 30 s | Serien angenommen / verworfen (`timeUs`) |
 
-Der Coordinator führt daraus je Node-Boot Langzeitwerte: Überwachungsdauer, präzise Zeit, Ausfälle (präzise → nicht präzise oder Bericht > 30 s ausgeblieben), Alter des letzten Ausfalls, größte Streuung im präzisen Zustand.
+Seit beta154 gehen alle Berichte als Unicast an den Coordinator (MAC aus dessen Zeitsignal; vorher Broadcast ohne Bestätigung). Dessen Funkschicht bestätigt jeden Bericht, unbestätigte wiederholt der Sender selbst. Meldet die Sendebestätigung beim `BeaconSyncReport` trotzdem einen Fehlschlag, sendet der Node ihn nach 300 ms erneut, höchstens 2× je regulärem Bericht. Solange der Coordinator unbekannt ist, wird weiter per Broadcast gesendet. Zähler in `espnow_time_local`: `reports_acked`, `reports_unacked`, `report_retries`.
+
+Der Coordinator führt daraus je Node-Boot Langzeitwerte: Überwachungsdauer, präzise Zeit, Ausfälle (Node meldet präzise → nicht präzise) mit Grund und Alter des letzten, fehlende Berichte (> 30 s ohne Bericht, getrennt gezählt; diese Zeit gilt als nicht überwacht), größte Streuung im präzisen Zustand. Die Einmess-Runde schätzt der Coordinator als aktive Nodes × Slotzeit je angenommener Serie (abgelehnte Serien eingerechnet).
 
 ## 5. Nachrichten und Sicherheit
 

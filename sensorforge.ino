@@ -37,6 +37,8 @@
 #include "board_config.h"
 #include "camera_select.h"
 #include "config.h"
+#include "camera_tuning.h"
+#include "camera_profile_store.h"
 #include "recorder.h"
 #include "logger.h"
 #include "webconfig.h"
@@ -146,6 +148,8 @@ static bool cameraSoftPowerDownActive = false;
 static bool cameraFastSleepCapabilityKnown = false;
 static bool cameraFastSleepSupported = false;
 static uint16_t cameraDetectedPid = 0;
+// Cluster camera profile version the running camera was started with (0 = local settings).
+static uint32_t cameraProfileAppliedVersion = 0;
 // Sensor crop currently programmed (cluster camera report only; reset on
 // deinit because a fresh init always starts with the full frame).
 static uint8_t cameraCropAppliedZoomX10 = 10;
@@ -520,6 +524,9 @@ static bool watchdogEnabled = false;
 static void resetSleepDelayTimer();
 bool initCamera(const String &model, const String &resolution, int quality);
 static bool cameraExitSoftPowerDown();
+static void cameraApplyTuning(sensor_t *sensor, int autoExposure, const CameraTuning::Values &t);
+static bool cameraProfileWanted(CameraProfile::Profile &profile);
+static void cameraDeinitRuntime();
 static bool rotateRecordingSegment(const String &reason);
 static void serviceRecordingSafetyCooldown();
 static void triggerRecordingEventSafetyLimit();
@@ -5262,18 +5269,7 @@ bool sdManualReadOnlyRecovery(
     }
 
 
-    bool previousRecordingBlock =
-        g_recordingStartBlocked;
-
-    bool previousStorageLock =
-        g_storageLocked;
-
-
-    g_recordingStartBlocked =
-        true;
-
-    g_storageLocked =
-        true;
+    sdGateAcquire(SD_GATE_SD_RECOVERY, true, true);
 
 
     // The boot path has no active SD logger when sdReady=false, but close it
@@ -5465,11 +5461,7 @@ bool sdManualReadOnlyRecovery(
     }
 
 
-    g_storageLocked =
-        previousStorageLock;
-
-    g_recordingStartBlocked =
-        previousRecordingBlock;
+    sdGateRelease(SD_GATE_SD_RECOVERY);
 
 
     if (recovered) {
@@ -5980,6 +5972,15 @@ bool initCamera(
     if (cameraInitialized)
         return true;
 
+    // Drone Mode with a cluster camera profile: its resolution, quality,
+    // exposure and tuning replace the local values (camera_profile.h).
+    CameraProfile::Profile profile;
+    const bool useProfile = cameraProfileWanted(profile);
+    const String effectiveResolution = useProfile
+        ? String(profile.width) + "x" + String(profile.height)
+        : resolution;
+    const int effectiveQuality = useProfile ? profile.quality : quality;
+
     camera_pins_t pins = selectCamera(model);
 
     // Wichtig: Struktur komplett initialisieren
@@ -6019,10 +6020,10 @@ bool initCamera(
 #endif
 
     cfg.frame_size =
-        getFrameSize(resolution);
+        getFrameSize(effectiveResolution);
 
     cfg.jpeg_quality =
-        quality;
+        effectiveQuality;
 
     cfg.pixel_format =
         PIXFORMAT_JPEG;
@@ -6071,16 +6072,25 @@ bool initCamera(
     
     sensor_t *sensor = esp_camera_sensor_get();
 
+    // A profile made for another sensor is not applied (resolution already
+    // chosen; cameraProfileService() restarts with the local values).
+    const bool profileSensorOk =
+        useProfile && sensor && sensor->id.PID == profile.pid;
+
     if (sensor) {
 
         int exposureResult = 0;
         int aeLevelResult = 0;
+        const int autoExposure =
+            profileSensorOk ? profile.autoExposure : cfg_camera_auto_exposure;
+        const int aeLevel =
+            profileSensorOk ? profile.aeLevel : cfg_camera_ae_level;
 
         if (sensor->set_exposure_ctrl) {
             exposureResult =
                 sensor->set_exposure_ctrl(
                     sensor,
-                    cfg_camera_auto_exposure
+                    autoExposure
                 );
         }
 
@@ -6088,16 +6098,17 @@ bool initCamera(
             aeLevelResult =
                 sensor->set_ae_level(
                     sensor,
-                    cfg_camera_ae_level
+                    aeLevel
                 );
         }
 
         if (cfg_debug_enabled) {
             Serial.printf(
-                "Camera tuning: quality=%d auto_exposure=%d ae_level=%d\n",
-                quality,
-                cfg_camera_auto_exposure,
-                cfg_camera_ae_level
+                "Camera tuning: quality=%d auto_exposure=%d ae_level=%d profile=%lx\n",
+                effectiveQuality,
+                autoExposure,
+                aeLevel,
+                (unsigned long)(useProfile ? profile.version : 0)
             );
         }
 
@@ -6111,6 +6122,12 @@ bool initCamera(
                 aeLevelResult
             );
         }
+
+        CameraTuning::Values tuning;
+        if (profileSensorOk)
+            cameraApplyTuning(sensor, autoExposure, profile.tuning);
+        else if (CameraTuning::parse(cfg_camera_tuning.c_str(), tuning))
+            cameraApplyTuning(sensor, autoExposure, tuning);
 
 
         bool effectiveHMirror = false;
@@ -6150,6 +6167,7 @@ bool initCamera(
     cameraInitialized = true;
     cameraFramebufferCount = cfg.fb_count;
     cameraSoftPowerDownActive = false;
+    cameraProfileAppliedVersion = useProfile ? profile.version : 0;
 
     // Cache the capability by the actually detected sensor, not by board or
     // config string. This cache deliberately survives camera deinit so an
@@ -6170,7 +6188,8 @@ bool initCamera(
     // Apply the persisted sensor crop only after the physical PID is known and
     // after rotation has been configured. 1.0x is deliberately a no-op here so
     // an upgraded installation keeps the exact legacy camera-init path.
-    if (cfg_camera_crop_zoom != "1.0") {
+    // The crop works on the local resolution: not while a profile is used.
+    if (cfg_camera_crop_zoom != "1.0" && !useProfile) {
 
         String cropError;
 
@@ -6247,11 +6266,144 @@ static void cameraDeinitRuntime()
     }
 
     cameraInitialized = false;
+    cameraProfileAppliedVersion = 0;
     cameraFramebufferCount = 0;
     cameraSoftPowerDownActive = false;
     cameraCropAppliedZoomX10 = 10;
     cameraCropAppliedX = -1;
     cameraCropAppliedY = -1;
+}
+
+
+// -------------------------------------------------------------
+// CLUSTER CAMERA PROFILE (node side, camera_profile_store.h)
+// -------------------------------------------------------------
+// The profile is used only in Drone Mode and only for its own sensor type.
+// initCamera() takes it into account; a change of the wanted profile (new or
+// removed profile, Drone Mode switched) restarts a running camera once it is
+// safe. Mounting values (rotation, mirror) stay local; the crop is skipped.
+
+static bool cameraProfileWanted(CameraProfile::Profile &profile)
+{
+    bool persistent = false;
+    if (!droneModeEnabled() || !CameraProfileStore::get(profile, persistent))
+        return false;
+    return !cameraDetectedPid || cameraDetectedPid == profile.pid;
+}
+
+
+static bool cameraProfileRestartSafe()
+{
+    return !clusterCaptureProtectionActive() &&
+        !recording &&
+        !recorderIsOpen() &&
+        !streamerReady() &&
+        !syncApiExclusiveActive() &&
+        !thermalEmergencyState &&
+        !(webConfigStarted && webConfigCameraPreviewActive());
+}
+
+
+static ClusterCamera::ProfileState cameraProfileState(uint32_t &version)
+{
+    using ClusterCamera::ProfileState;
+    CameraProfile::Profile profile;
+    bool persistent = false;
+    version = 0;
+    if (!CameraProfileStore::get(profile, persistent))
+        return ProfileState::None;
+    version = profile.version;
+    if (cameraDetectedPid && cameraDetectedPid != profile.pid)
+        return ProfileState::SensorMismatch;
+    if (!droneModeEnabled())
+        return ProfileState::Waiting;
+    if (cameraInitialized && cameraProfileAppliedVersion != profile.version)
+        return ProfileState::Pending;
+    return ProfileState::Active;
+}
+
+
+static CameraProfileServiceResult cameraProfileServiceNow()
+{
+    CameraProfile::Profile profile;
+    const uint32_t wanted =
+        cameraProfileWanted(profile) ? profile.version : 0;
+
+    // A camera that is off picks the profile up at its next start.
+    if (!cameraInitialized || wanted == cameraProfileAppliedVersion)
+        return CAMERA_PROFILE_IN_EFFECT;
+
+    if (!cameraProfileRestartSafe())
+        return CAMERA_PROFILE_DEFERRED;
+
+    Serial.printf(
+        "[CAMERA] profile %lx -> %lx, restarting camera\n",
+        (unsigned long)cameraProfileAppliedVersion,
+        (unsigned long)wanted
+    );
+    cameraDeinitRuntime();
+    if (!initCamera(cfg_camera, cfg_resolution, cfg_quality)) {
+        Serial.println("[CAMERA] camera restart for profile failed");
+        return CAMERA_PROFILE_RESTART_FAILED;
+    }
+    return CAMERA_PROFILE_IN_EFFECT;
+}
+
+
+void cameraProfileService()
+{
+    static uint32_t lastCheckMs = 0;
+    static uint32_t lastFailMs = 0;
+    const uint32_t now = millis();
+    if ((uint32_t)(now - lastCheckMs) < 1000UL)
+        return;
+    lastCheckMs = now;
+    // After a failed restart wait before trying again.
+    if (lastFailMs && (uint32_t)(now - lastFailMs) < 30000UL)
+        return;
+    lastFailMs = cameraProfileServiceNow() == CAMERA_PROFILE_RESTART_FAILED ? (now ? now : 1) : 0;
+}
+
+
+uint8_t cameraProfileApplyJob(
+    const CameraProfile::Profile &profile,
+    uint8_t mode
+)
+{
+    using namespace CameraProfile;
+    if (clusterCaptureProtectionActive())
+        return ResultBusy;
+
+    if (mode == ModeClear) {
+        String error;
+        if (!CameraProfileStore::clear(error))
+            Serial.println("[CAMERA] profile clear: " + error);
+        (void)cameraProfileServiceNow();
+        return ResultCleared;
+    }
+
+    if ((mode != ModeSession && mode != ModePersistent) || !valid(profile))
+        return ResultInvalid;
+    if (cameraDetectedPid && cameraDetectedPid != profile.pid)
+        return ResultSensorMismatch;
+
+    uint8_t result = ResultApplied;
+    if (mode == ModePersistent) {
+        String error;
+        if (!CameraProfileStore::setPersistent(profile, error)) {
+            Serial.println("[CAMERA] profile save failed: " + error);
+            CameraProfileStore::setSession(profile);
+            result = ResultSaveFailed;
+        }
+    } else {
+        CameraProfileStore::setSession(profile);
+    }
+
+    if (!droneModeEnabled())
+        return result == ResultApplied ? ResultWaiting : result;
+    if (cameraProfileServiceNow() == CAMERA_PROFILE_RESTART_FAILED)
+        return ResultCameraFailed;
+    return result;
 }
 
 
@@ -8055,6 +8207,67 @@ static bool handleTransportModeBoot(
 }
 
 
+// Image tuning (camera_tuning.h) on top of auto exposure / AE level. Unset
+// tuning keeps the driver defaults. Order: switch an automatic off before
+// writing its manual value.
+static void cameraApplyTuning(
+    sensor_t *sensor,
+    int autoExposure,
+    const CameraTuning::Values &t
+)
+{
+    if (!sensor || !t.set)
+        return;
+
+    if (!autoExposure && sensor->set_aec_value)
+        sensor->set_aec_value(sensor, t.aecValue);
+
+    if (sensor->set_gain_ctrl)
+        sensor->set_gain_ctrl(sensor, t.autoGain);
+    if (t.autoGain) {
+        if (sensor->set_gainceiling)
+            sensor->set_gainceiling(sensor, (gainceiling_t)t.gainCeiling);
+    } else if (sensor->set_agc_gain) {
+        sensor->set_agc_gain(sensor, t.agcGain);
+    }
+
+    if (sensor->set_whitebal)
+        sensor->set_whitebal(sensor, t.awb);
+    if (sensor->set_awb_gain)
+        sensor->set_awb_gain(sensor, t.awbGain);
+    if (sensor->set_wb_mode)
+        sensor->set_wb_mode(sensor, t.wbMode);
+
+    if (sensor->set_brightness)
+        sensor->set_brightness(sensor, t.brightness);
+    if (sensor->set_contrast)
+        sensor->set_contrast(sensor, t.contrast);
+    if (sensor->set_saturation)
+        sensor->set_saturation(sensor, t.saturation);
+}
+
+
+bool cameraApplyTuningRuntime(
+    int autoExposure,
+    int aeLevel,
+    const CameraTuning::Values &tuning,
+    String &error
+)
+{
+    sensor_t *sensor = cameraInitialized ? esp_camera_sensor_get() : nullptr;
+    if (!sensor) {
+        error = "Kamera ist aus";
+        return false;
+    }
+    if (sensor->set_exposure_ctrl)
+        sensor->set_exposure_ctrl(sensor, autoExposure);
+    if (sensor->set_ae_level)
+        sensor->set_ae_level(sensor, aeLevel);
+    cameraApplyTuning(sensor, autoExposure, tuning);
+    return true;
+}
+
+
 static bool cameraEnterSoftPowerDown()
 {
     if (!cameraInitialized)
@@ -9247,7 +9460,6 @@ struct RecordingLoadTestContext {
     bool active;
     bool resultReady;
     bool abortRequested;
-    bool previousRecordingBlock;
     bool cameraWasInitialized;
     bool cameraWasStandby;
 
@@ -9635,10 +9847,8 @@ static void recordingLoadFinalize(
     if (!storageIoFaultActive())
         recordingLoadRemoveTestMedia();
 
-    if (restoreRecordingStartBlock) {
-        g_recordingStartBlocked =
-            ctx.previousRecordingBlock;
-    }
+    if (restoreRecordingStartBlock)
+        sdGateRelease(SD_GATE_RECORDING_LOAD);
 
     if (!ctx.cameraWasInitialized) {
         cameraDeinitRuntime();
@@ -9972,8 +10182,6 @@ bool recordingLoadTestStart(
     ctx.audioStatsBaseline =
         audioCaptureStats();
 
-    ctx.previousRecordingBlock =
-        g_recordingStartBlocked;
 
     recorderSetDetailedFrameTimingEnabled(true);
 
@@ -10002,7 +10210,7 @@ bool recordingLoadTestStart(
     // The benchmark now runs from the normal firmware loop instead of keeping
     // one HTTP request open. Block all competing NEW recorder starts while the
     // test owns the camera/storage path.
-    g_recordingStartBlocked = true;
+    sdGateAcquire(SD_GATE_RECORDING_LOAD, false, true);
 
     result.recorderHealthy = true;
 
@@ -13368,8 +13576,7 @@ static void enterThermalEmergencySleep(
     thermalEmergencySourceMask =
         sourceMask;
 
-    g_recordingStartBlocked =
-        true;
+    sdGateAcquire(SD_GATE_THERMAL, false, true);
 
     thermalCooldownMarker =
         THERMAL_COOLDOWN_MAGIC;
@@ -15348,9 +15555,6 @@ void setup() {
     resetDiagnosticsBegin();
     droneModeBegin();
 
-    // Thread-Safety: Initialize mutexes before any Guard usage
-    initRecordingBlockGuard();
-    initStorageLockGuard();
     FirmwareUpdateAdmission::init();
 
     // WiFi link diagnostics (log only): register before the first WiFi start.
@@ -16559,6 +16763,7 @@ void loop() {
     // A prepared UTC Capture has precedence over noncritical loop services.
     // UDP processing remains ahead of this guard; camera owner is not shared.
     if (clusterCaptureArmed()) { delay(1); return; }
+    cameraProfileService();
 
     // A dedicated time broadcaster must take priority over Drone Mode.
     // Otherwise a default-enabled Drone Mode would run recorder and OTA
@@ -17759,13 +17964,49 @@ void cameraFillClusterReport(ClusterCamera::Report &r)
         r.quality = cfg_quality;
         r.aec = cfg_camera_auto_exposure ? 1 : 0;
         r.aeLevel = cfg_camera_ae_level;
+        CameraTuning::Values t;
+        CameraProfile::Profile profile;
+        const bool useProfile = cameraProfileWanted(profile);
+        if (useProfile) {
+            for (int32_t fs = 0; fs < kFramesizeCount; ++fs)
+                if (kFrameDims[fs].w == profile.width && kFrameDims[fs].h == profile.height)
+                    r.framesize = fs;
+            r.quality = profile.quality;
+            r.aec = profile.autoExposure;
+            r.aeLevel = profile.aeLevel;
+            t = profile.tuning;
+        } else if (!CameraTuning::parse(cfg_camera_tuning.c_str(), t)) {
+            t = CameraTuning::Values{};
+        }
+        if (t.set) {
+            if (!r.aec) r.aecValue = t.aecValue;
+            r.agc = t.autoGain;
+            if (t.autoGain) r.gainCeiling = t.gainCeiling;
+            else r.agcGain = t.agcGain;
+            r.awb = t.awb;
+            r.awbGain = t.awbGain;
+            r.wbMode = t.wbMode;
+            r.brightness = t.brightness;
+            r.contrast = t.contrast;
+            r.saturation = t.saturation;
+        }
         r.hmirror = hmirror ? 1 : 0;
         r.vflip = vflip ? 1 : 0;
         r.cropZoomX10 = cfg_camera_crop_zoom == "2.0" ? 20 : cfg_camera_crop_zoom == "1.5" ? 15 : 10;
         r.cropX = r.cropZoomX10 != 10 ? cfg_camera_crop_x : kUnknown;
         r.cropY = r.cropZoomX10 != 10 ? cfg_camera_crop_y : kUnknown;
     }
-    r.sourceMask = 0;   // phase 1: every value is the local setting
+    uint32_t profileVersion = 0;
+    const ProfileState profileState = cameraProfileState(profileVersion);
+    r.profileVersion = (int32_t)profileVersion;
+    r.profileState = (int32_t)profileState;
+    // Shared groups come from the cluster profile while it is in effect.
+    r.sourceMask = 0;
+    if (profileState == ProfileState::Active) {
+        for (Group g : {Group::Resolution, Group::Quality, Group::Exposure, Group::Gain,
+                        Group::WhiteBalance, Group::Image})
+            r.sourceMask |= (int32_t)Source::Cluster << (2 * (unsigned)g);
+    }
 }
 
 bool clusterCapturePrepareCamera() {

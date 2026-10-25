@@ -17,6 +17,7 @@
 #include "cluster_profiles.h"
 #include "cluster_groups.h"
 #include "cluster_camera.h"
+#include "camera_profile_store.h"
 #include "device_identity.h"
 #include "logger.h"
 #include "recorder.h"
@@ -124,6 +125,10 @@ static const char *CLUSTER_JOB_CAPTURE_RESULT_MAGIC="SFJCR1";
 static const char *CLUSTER_JOB_CAPTURE_RECEIPT_MAGIC="SFJCA1";
 static const char *CLUSTER_JOB_TXPOWER_MAGIC = "SFJT1";
 static const char *CLUSTER_JOB_TXPOWER_ACK_MAGIC = "SFJTA1";
+// Cluster camera profile (camera_profile.h): coordinator -> node, node answer.
+static const char *CLUSTER_JOB_CAMPROFILE_MAGIC = "SFJP1";
+static const char *CLUSTER_JOB_CAMPROFILE_ACK_MAGIC = "SFJPA1";
+static const uint32_t CLUSTER_CAMPROFILE_TIMEOUT_MS = 20000UL;
 static const char *CLUSTER_JOB_DRONE_MAGIC = "SFJD1";
 static const char *CLUSTER_JOB_DRONE_ACK_MAGIC = "SFJDA1";
 static uint32_t droneSeenBoot=0,droneSeenEpoch=0,droneSeenSeq=0;
@@ -3603,6 +3608,83 @@ static void processJobTxPowerAck(char **f, size_t n, const IPAddress &ip)
     }
 }
 
+// Node: SFJP1|tag|coord|coordBoot|epoch|node|nodeBoot|seq|mode|profile ("-" for clear).
+static uint32_t camProfileSeenBoot = 0, camProfileSeenEpoch = 0, camProfileSeenSeq = 0;
+static void processJobCameraProfile(char **f, size_t n, const IPAddress &ip)
+{
+    if (n != 10 || !runtimeActive || localIsCoordinator ||
+        strcmp(f[1], runtimeClusterTag) != 0 || strcmp(f[2], currentCoordinatorId) != 0 ||
+        strcmp(f[5], deviceIntegrationId().c_str()) != 0 || ip != currentCoordinatorIp)
+        return;
+    uint32_t cb = 0, epoch = 0, nb = 0, seq = 0, mode = 0;
+    if (!parseUint32Strict(f[3], cb, 16) || !parseUint32Strict(f[4], epoch) ||
+        !parseUint32Strict(f[6], nb, 16) || !parseUint32Strict(f[7], seq) ||
+        !parseUint32Strict(f[8], mode) || mode > CameraProfile::ModeClear ||
+        !cb || !epoch || !seq || nb != bootNonce || epoch != currentCoordinatorEpoch)
+        return;
+    const ClusterPeer *coord = findPeer(f[2]);
+    if (!coord || coord->bootNonce != cb || coord->ip != ip ||
+        (uint32_t)(millis() - coord->lastSeenMs) > 60000UL)
+        return;
+    if (camProfileSeenBoot == cb && camProfileSeenEpoch == epoch && seq <= camProfileSeenSeq)
+        return;
+    camProfileSeenBoot = cb; camProfileSeenEpoch = epoch; camProfileSeenSeq = seq;
+
+    CameraProfile::Profile profile;
+    uint8_t result;
+    if (mode != CameraProfile::ModeClear && !CameraProfile::parse(f[9], profile))
+        result = CameraProfile::ResultInvalid;
+    else
+        result = cameraProfileApplyJob(profile, (uint8_t)mode);
+
+    char own[9];
+    snprintf(own, sizeof(own), "%08lx", (unsigned long)bootNonce);
+    char version[9];
+    snprintf(version, sizeof(version), "%lx", (unsigned long)profile.version);
+    const String msg = String(CLUSTER_JOB_CAMPROFILE_ACK_MAGIC) + "|" + runtimeClusterTag + "|" +
+        currentCoordinatorId + "|" + f[3] + "|" + f[4] + "|" + deviceIntegrationId() + "|" +
+        own + "|" + f[7] + "|" + String((unsigned)result) + "|" + version;
+    sendSignedPayloadTo(msg, currentCoordinatorIp, CLUSTER_COORDINATOR_PORT, "camera profile result");
+    Serial.printf("[CLUSTER CAM] profile seq=%lu mode=%lu version=%s result=%s\n",
+                  (unsigned long)seq, (unsigned long)mode, version, CameraProfile::resultName(result));
+}
+
+// Coordinator: SFJPA1|tag|coord|coordBoot|epoch|node|nodeBoot|seq|result|version
+static void processJobCameraProfileAck(char **f, size_t n, const IPAddress &ip)
+{
+    if (n != 10 || !runtimeActive || !localIsCoordinator ||
+        strcmp(f[1], runtimeClusterTag) != 0 || strcmp(f[2], deviceIntegrationId().c_str()) != 0 ||
+        !integrationIdValid(f[5]))
+        return;
+    uint32_t cb = 0, epoch = 0, nb = 0, seq = 0, result = 0, version = 0;
+    if (!parseUint32Strict(f[3], cb, 16) || !parseUint32Strict(f[4], epoch) ||
+        !parseUint32Strict(f[6], nb, 16) || !parseUint32Strict(f[7], seq) ||
+        !parseUint32Strict(f[8], result) || !parseUint32Strict(f[9], version, 16) ||
+        result > CameraProfile::ResultCleared ||
+        cb != bootNonce || epoch != currentCoordinatorEpoch || !nb || !seq)
+        return;
+    const ClusterPeer *node = findPeer(f[5]);
+    if (!node || node->bootNonce != nb || node->ip != ip ||
+        (uint32_t)(millis() - node->lastSeenMs) > 60000UL)
+        return;
+    const uint64_t id = ((uint64_t)cb << 32) | seq;
+    const ClusterJobs::Entry *e = ClusterJobs::find(id);
+    if (!e || e->kind != ClusterJobs::Kind::CameraProfile || strcmp(e->nodeId, f[5]) != 0 ||
+        e->state != ClusterJobs::State::Sent)
+        return;
+    const uint32_t now = millis();
+    const bool ok = result == CameraProfile::ResultApplied || result == CameraProfile::ResultWaiting ||
+                    result == CameraProfile::ResultCleared;
+    if (ok) {
+        ClusterJobs::transition(id, epoch, ClusterJobs::State::Accepted, now);
+        ClusterJobs::transition(id, epoch, ClusterJobs::State::Running, now);
+        ClusterJobs::transition(id, epoch, ClusterJobs::State::Succeeded, now, (uint16_t)result);
+    } else {
+        ClusterJobs::transition(id, epoch, ClusterJobs::State::Failed, now, (uint16_t)(100 + result));
+    }
+    clusterCameraNoteProfileResult(f[5], (uint8_t)result, version);
+}
+
 static void processPacket(
     char *packet,
     size_t packetLength,
@@ -3670,6 +3752,10 @@ static void processPacket(
         processJobTxPower(fields, fieldCount, remoteIp);
     } else if (strcmp(fields[0], CLUSTER_JOB_TXPOWER_ACK_MAGIC) == 0) {
         processJobTxPowerAck(fields, fieldCount, remoteIp);
+    } else if (strcmp(fields[0], CLUSTER_JOB_CAMPROFILE_MAGIC) == 0) {
+        processJobCameraProfile(fields, fieldCount, remoteIp);
+    } else if (strcmp(fields[0], CLUSTER_JOB_CAMPROFILE_ACK_MAGIC) == 0) {
+        processJobCameraProfileAck(fields, fieldCount, remoteIp);
     } else if (strcmp(fields[0], CLUSTER_JOB_DRONE_MAGIC) == 0) {
         processJobDrone(fields,fieldCount,remoteIp);
     } else if (strcmp(fields[0], CLUSTER_JOB_DRONE_ACK_MAGIC) == 0) {
@@ -4914,6 +5000,38 @@ bool clusterApplyLocalTxPower(int16_t valueX10, ClusterTxPowerMode mode, String 
     return true;
 }
 
+bool clusterRequestNodeCameraProfile(const String &nodeId, const String &profileText,
+                                     uint8_t mode, String &error)
+{
+    if (!clusterLocalIsCoordinator()) { error = "Nur am Coordinator."; return false; }
+    if (mode > CameraProfile::ModeClear) { error = "Ungültiger Modus."; return false; }
+    ClusterPeer *peer = findPeer(nodeId.c_str());
+    if (!peer || !peer->used || !usableIp(peer->ip) || !peer->bootNonce ||
+        (uint32_t)(millis() - peer->lastSeenMs) > 60000UL) {
+        error = "Node nicht erreichbar/authentifiziert."; return false;
+    }
+    if (rejectStandbyNodeAction(peer, error)) return false;
+    if (++probeSeq == 0) ++probeSeq;
+    const uint64_t id = ((uint64_t)bootNonce << 32) | probeSeq;
+    if (!ClusterJobs::enqueue(id, currentCoordinatorEpoch, peer->integrationId,
+                              ClusterJobs::Kind::CameraProfile, millis(), CLUSTER_CAMPROFILE_TIMEOUT_MS)) {
+        error = "Job-Tabelle voll."; return false;
+    }
+    char cb[9], nb[9];
+    snprintf(cb, sizeof(cb), "%08lx", (unsigned long)bootNonce);
+    snprintf(nb, sizeof(nb), "%08lx", (unsigned long)peer->bootNonce);
+    const String msg = String(CLUSTER_JOB_CAMPROFILE_MAGIC) + "|" + runtimeClusterTag + "|" +
+        deviceIntegrationId() + "|" + cb + "|" + String((unsigned long)currentCoordinatorEpoch) +
+        "|" + nodeId + "|" + nb + "|" + String((unsigned long)probeSeq) + "|" +
+        String((unsigned)mode) + "|" + (mode == CameraProfile::ModeClear ? String("-") : profileText);
+    ClusterJobs::transition(id, currentCoordinatorEpoch, ClusterJobs::State::Sent, millis());
+    if (!sendSignedPayloadTo(msg, peer->ip, CLUSTER_COORDINATOR_PORT, "camera profile")) {
+        ClusterJobs::transition(id, currentCoordinatorEpoch, ClusterJobs::State::Failed, millis(), 1);
+        error = "Profil-Auftrag nicht gesendet."; return false;
+    }
+    return true;
+}
+
 size_t clusterRequestTxPowerAll(int16_t valueX10, ClusterTxPowerMode mode,
                                 bool includeLocal, size_t &failed, String &error)
 {
@@ -5335,6 +5453,12 @@ static String buildClusterStatusJson(ClusterStatusChunkSink sink, void *ctx)
     ju("exchanges_complete", esn.exchangesComplete); ju("exchange_timeouts", esn.exchangeTimeouts);
     ju("series_accepted", esn.seriesAccepted); ju("series_rejected", esn.seriesRejected);
     ju("series_last_failure_reason", esn.seriesLastFailureReason);
+    ju("series_rejected_insufficient", esn.seriesRejectedInsufficient);
+    ju("series_rejected_spread", esn.seriesRejectedSpread);
+    ju("series_rejected_rtt", esn.seriesRejectedRtt);
+    ju("series_rejected_timeout", esn.seriesRejectedTimeout);
+    ju("reports_acked", esn.reportsAcked); ju("reports_unacked", esn.reportsUnacked);
+    ju("report_retries", esn.reportRetries);
     ju("action_pause_remaining_ms", esn.capturePauseRemainingMs);
     // Coordinator only (0 on nodes): calibration slot scheduling (cluster_slot_scheduler.h).
     ju("slot_active_peers", esn.slotActivePeers);

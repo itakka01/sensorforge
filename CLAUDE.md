@@ -54,8 +54,8 @@ Physical (SD/LittleFS)
 - `recording_storage.cpp/h` - Verschlüsselte Datei-Abstraktion
 - `recording_write_buffer.cpp/h` - Asynchroner Drain-Task (FreeRTOS) + **Mutex Deadlock Protection (V3)**
 - `avi_writer.cpp/h`, `mkv_writer.cpp/h` - Container-Formate + **Division-by-Zero Protection (V3)**
-- `storage_guard.cpp/h` - **VERBESSERT (V1+V2):** `std::atomic` + RAII Guards + Reference Counting
-- `recorder.cpp/h` - **VERBESSERT (V2):** `std::atomic` + RAII Guards
+- `storage_guard.cpp/h` - SD-Sperren `g_storageLocked`/`g_recordingStartBlocked` über Besitzer-Bits (`sdGateAcquire/Release`, beta153)
+- `recorder.cpp/h` - Recording-Interface
 - `sd_admission_controller.h` - **PROTOTYP**, atomare Arbitrierung (⚠️ NICHT vollständig integriert)
 
 #### WebConfig & UI (15 Module)
@@ -133,14 +133,10 @@ Physical (SD/LittleFS)
 
 **Gesamtrisiko:** **HOCH → NIEDRIG** (13 Fixes implementiert, siehe `FIX_REPORT_V3.md`)
 
-#### ✅ Thread-Safety (V1+V2 - BEHOBEN)
-**Vorher:** `g_storageLocked`, `g_recordingStartBlocked` als volatile bool ohne Mutexe
-**Nachher:** `std::atomic<bool>` + RAII Guards + Reference Counting
-**Fixes:**
-- storage_guard.cpp/h: V1+V2 - atomic + StorageLockGuard RAII Class
-- recorder.cpp/h: V2 - atomic + RecordingBlockGuard RAII Class
+#### ✅ SD-Sperren (beta153 - BEHOBEN)
+**Vorher:** ~40 Stellen setzten `g_storageLocked`/`g_recordingStartBlocked` direkt und stellten den gemerkten Wert wieder her; überlappende Abläufe konnten die Sperre eines anderen aufheben (SD-Benchmark setzte am Ende `false`, Mikrofontest kopierte die Aufnahmesperre in die Speichersperre). RAII-Guards waren nur im OTA-Pfad im Einsatz.
+**Nachher:** Jeder Nutzer hat ein Besitzer-Bit (`SdGateOwner`), `sdGateAcquire/sdGateRelease` (storage_guard.h); eine Sperre ist zu, solange irgendein Bit gesetzt ist. Fehlgeschlagenes Remount → `SD_GATE_REMOUNT_FAULT` bis Neustart. Die beiden Flags werden nur noch in `storage_guard.cpp` geschrieben.
 - heap_monitor.cpp/h: V2 - Heap-Fragmentierungs-Monitoring
-**Status:** ✅ Framework vollständig, Migration ausstehend (siehe `RAII_GUARDS_MIGRATION_GUIDE.md`)
 
 #### ✅ Timer Overflow (V3 - BEHOBEN)
 **Problem:** millis() Rollover nach 49 Tagen → Integer-Overflow
@@ -171,18 +167,11 @@ Physical (SD/LittleFS)
 
 ### ⚠️ P0 - VERBLEIBENDE BLOCKER
 
-#### 1. SD-Admission-Controller - Migration ausstehend
-**Problem:** RAII Guards Framework implementiert, aber noch nicht vollständig migriert
-**Auswirkung:** 28 Save/Restore-Patterns in 6 Modulen nutzen noch alte Patterns
-**Status:** Framework ready (V2), Migration 6-10 Stunden Aufwand
-**Dokumentation:** `RAII_GUARDS_MIGRATION_GUIDE.md`
+#### 1. SD-Admission-Controller - Prototyp
+**Status:** SD-Sperren seit beta153 über Besitzer-Bits (siehe oben); `sd_admission_controller.h` weiter nur teilweise integriert.
 
-#### 2. Task-Lifecycle - Use-After-Free (TEILWEISE BEHOBEN)
-**Problem:** `RecordingWriteBufferedFile`-Destruktor kann Stack verlassen, während Drain-Task auf `this` zugreift
-**Auswirkung:** Crash, Datenverlust bei SD-Fehlern
-**Status:** Teilweise behoben (Audit 4b: Fertigmeldung), Restgefahr bei dauerhaft blockiertem SD
-**Code:** `recording_write_buffer.cpp` Zeile ~300-400
-**V3-Verbesserung:** Mutex-Deadlock-Prevention reduziert Risiko
+#### 2. Task-Lifecycle Schreibpuffer (geprüft 2026-10-25: kein Use-After-Free)
+`RecordingWriteBufferedFile`: der Drain-Task meldet sein Ende über `drainExited_`, nur der Schließende löscht ihn. Hängt der Task (SD blockiert), behält das Objekt alle Ressourcen, `openWrite` verweigert ein neues Öffnen, der Destruktor wartet unbegrenzt; der 30-s-Task-Watchdog des loopTask startet das Board dann neu. Restfolge: Neustart statt Speicherfehler.
 
 #### 3. Keine vollständigen Hardware-Tests
 **Problem:** V3-Fixes statisch geprüft, kein vollständiger ESP32-Compile
@@ -198,11 +187,10 @@ Physical (SD/LittleFS)
 **Status:** Monotone Deadline frozen (beta105), aber nur Software-Dispatch
 **Code:** `cluster_capture.cpp`, `clusterLoop()` in `cluster.cpp`
 
-#### 5. Kamera-Ownership - Keine Arbitrierung
-**Problem:** Recorder, Streamer, Cluster, Preview konkurrieren
-**Auswirkung:** Parallele `esp_camera_fb_get()` → Crash
-**Status:** Kooperative Flags, keine atomare Lease
-**Code:** Globale `recording`, `streaming` Flags
+#### 5. Kamera-Ownership (geprüft 2026-10-25)
+Alle 16 `esp_camera_fb_get()`-Aufrufe laufen im loopTask (WebServer, Streamer, Cluster-Capture, Recorder, Preview); kein anderer Task greift auf die Kamera zu, und kein Aufrufer ruft zwischen `fb_get` und `fb_return` einen anderen Dienst auf (nur Netzwerk-Schreiben). Gleichzeitige `fb_get` sind damit ausgeschlossen. Wer die Kamera nutzen darf, regeln weiter kooperative Flags (`recording`, Streamer, Preview, Drone Mode).
+**Regel:** Kamera nur im loopTask benutzen und während ein Frame gehalten wird keine Loop-Dienste (`webConfigLoop`, `clusterLoop`, Service-Callbacks) aufrufen.
+Seit beta155 holt auch `/camera_frame` (Live-Bild für Bildabstimmung/Kamera-Übersicht, `clusterCaptureLiveFrame`) Bilder im loopTask, gesperrt solange `clusterCaptureProtectionActive()`. JPEG-Neukodierung nur mit `jpeg_mini_encoder` (der Encoder der Kamera-Bibliothek belegt ~7 KB statischen internen RAM).
 
 #### 6. ESP-NOW Zeitsync - µs-Genauigkeit unbewiesen
 **Problem:** Hardware-Validierung fehlt
@@ -214,7 +202,7 @@ Physical (SD/LittleFS)
 - Kooperative Concurrency (Race-Conditions)
 - WireGuard-VPN inkompatibel (tcpip_adapter veraltet)
 - Power-Shooter/PSRAM ungetestet
-- Thermal-Emergency nur RTC-basiert (kein CPU-Sensor)
+- Thermal-Emergency: CPU-Sensor (≥ 80 °C) und DS3231 (≥ 55 °C) je 3× in Folge; Board ohne RTC nur über CPU-Sensor geschützt
 
 ---
 
@@ -376,7 +364,7 @@ SFJC1 empfangen → Signatur prüfen
 
 ### Sleep-Hierarchie
 ```
-1. Thermal-Emergency (80°C) → Deep-Sleep 10 Min
+1. Thermal-Emergency (CPU ≥ 80 °C oder RTC ≥ 55 °C) → Deep-Sleep 5 Min, Weiterstart erst unter Erholungsgrenze
 2. Storage-Fault → Deep-Sleep 5 Min
 3. Transport-Mode → Black-Cover-Check
 4. Normal → Light/Deep-Sleep
@@ -645,7 +633,6 @@ PCLK = GPIO13
 - `FIX_REPORT_V3.md` - **Vollständiger Safety-Fixes-Report** (13 Fixes, Stand 2026-10-16)
 - `FIX_REPORT_V2.md` - V2-Fixes-Report (Option A + Option B)
 - `FIX_REPORT.md` - V1-Fixes-Report (Quick Wins)
-- `RAII_GUARDS_MIGRATION_GUIDE.md` - RAII Guards Migration (6-10h Aufwand)
 
 #### System Architecture
 - `SD_RECORDER_HANDOFF_AUDIT.md` - SD-Admission-Details (P1)
@@ -783,7 +770,8 @@ PCLK = GPIO13
 
 **Thermal-Emergency:**
 ```
-RTC-Temp > 80°C → Deep-Sleep 10 Min (SFTH-Marker)
+CPU ≥ 80 °C oder RTC ≥ 55 °C (je 3 Proben à 5 s) → Deep-Sleep 5 Min (SFTH-Marker)
+Warnung ab CPU 70 °C / RTC 45 °C; Weiterstart erst unter 65 °C / 40 °C (thermal.h)
 ```
 
 **Watchdog:**
@@ -832,7 +820,8 @@ CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY=y
 
 - [ ] Keine Secrets exposen
 - [ ] SD-Admission beachten (`webSdAdmissionController()`)
-- [ ] Kamera-Ownership prüfen
+- [ ] Kamera nur im loopTask, kein Loop-Dienst während ein Frame gehalten wird
+- [ ] SD-Sperren nur über `sdGateAcquire/sdGateRelease` mit eigenem `SdGateOwner`-Bit
 - [ ] Task-Safety validieren
 - [ ] Globale Flags minimieren
 
@@ -863,11 +852,9 @@ bool recording = false;
 bool streaming = false;
 bool webConfigStarted = false;
 
-// SD-Admission (✅ VERBESSERT V1+V2: std::atomic + RAII Guards)
+// SD-Sperren: nur lesen; setzen über sdGateAcquire/sdGateRelease (storage_guard.h)
 std::atomic<bool> g_storageLocked(false);
 std::atomic<bool> g_recordingStartBlocked(false);
-std::atomic<int> g_storageLockDepth(0);        // V2: Reference Counter
-std::atomic<int> g_recordingBlockDepth(0);     // V2: Reference Counter
 
 // Cluster
 extern bool clusterEnabled;
@@ -929,7 +916,7 @@ Diese Referenz dokumentiert SensorForge **v87-beta126 + Safety Fixes V3** (Stand
 1. **FIX_REPORT_V3.md** lesen (Vollständige Safety-Fixes!)
 2. **CLAUDE.md** lesen (DIESE DATEI - Architektur-Referenz)
 3. **WIEDEREINSTIEG_SENSORFORGE.md** lesen (Audit-Status!)
-4. P0-Risiken beachten (RAII Migration ausstehend, Task-Lifecycle, keine HW-Tests)
+4. P0-Risiken beachten (keine vollständigen HW-Tests)
 5. Entwicklungsregeln befolgen (README.md)
 
 **Bei Fragen:**
@@ -938,13 +925,12 @@ Diese Referenz dokumentiert SensorForge **v87-beta126 + Safety Fixes V3** (Stand
 - Code lesen (niemals raten!)
 
 **Kritische Warnungen (Verbessert!):**
-✅ **Thread-Safety VERBESSERT:** std::atomic + RAII Guards Framework (Migration 6-10h)
+✅ **SD-Sperren:** Besitzer-Bits statt Save/Restore (beta153)
 ⚠️ **Cluster-Capture µs-Sync NICHT Hardware-validiert!**
 ⚠️ **V3-Fixes: Statische Prüfung, ESP32-Compile & Hardware-Tests EMPFOHLEN!**
 
 **Nächste Schritte:**
 1. ✅ **Kompilieren & Testen** (siehe FIX_REPORT_V3.md Testing-Sektion)
-2. **RAII Guards Migration Phase 1** (einfache Module, 1h)
 3. **Long-Running Stability Test** (24-48h)
 
 **Kontakt:** Supervisor für architektonische Entscheidungen

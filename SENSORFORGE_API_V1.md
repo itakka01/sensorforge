@@ -576,6 +576,77 @@ change; coordinator: any node heard; stand-alone: WiFi still associated).
 Otherwise the device restores its previous value itself, so a too low value
 cannot lock it out.
 
+## Camera image tuning (since v87-beta155)
+
+Same function as the page `/camera_tuning` of the device (fixed exposure, gain
+and white balance for uniform cluster cameras).
+
+### GET /api/v1/camera/tuning
+
+`sensor`, `camera_on`, `resolution`, `current` (driver values: `aec`,
+`ae_level`, `aec_value`, `agc`, `agc_gain`, `gainceiling`, `awb`, `wb_mode`,
+`awb_gain`, `brightness`, `contrast`, `saturation`; `null` when unknown),
+`saved` (`camera_auto_exposure`, `camera_ae_level`, `camera_tuning` text) and
+`cluster_profile` (`version` or null, `state`: `none`, `active`,
+`waiting_drone`, `sensor_mismatch`, `pending`).
+
+### POST /api/v1/camera/tuning
+
+| Parameter | Values |
+|---|---|
+| `mode` | `session` (apply now, until reboot), `save` (config.txt + apply), `reset` (remove the saved tuning; driver defaults from the next camera start) |
+| `aec`, `agc`, `awb`, `awb_gain` | 0 / 1 |
+| `ae_level`, `brightness`, `contrast`, `saturation` | -2 … 2 |
+| `aec_value` | 0 … 65535 sensor lines (OV2640 0 … 1200), used while `aec=0` |
+| `agc_gain` | 0 … 30, used while `agc=0` |
+| `gainceiling` | 0 … 6 (2× … 128×), used while `agc=1` |
+| `wb_mode` | 0 auto, 1 sunny, 2 cloudy, 3 office, 4 home |
+
+All value fields are required except for `mode=reset`. Answer
+`{"ok":true|false,"message":"..."}`: `200`, `400` invalid/missing value, `409`
+camera off (session) or cluster capture planned, `500` save failed.
+
+## Cluster camera profile (since v87-beta156, coordinator only)
+
+Same function as „Kameraprofil je Sensortyp“ on `/cluster_coordinate`. One
+reference camera per sensor type; its current settings become a versioned
+profile that the coordinator sends (signed) to every online node with the same
+sensor. Nodes use it only in Drone Mode; rotation/mirror stay per node, a crop
+is suspended. Persistent profiles are stored in NVS, never in config.txt.
+
+### GET /api/v1/cluster/camera_profile
+
+`sensors[]`: `pid` (hex), `sensor`, `reference` (integration id or null),
+`profile` (null or `version`, `text`, `resolution`, `quality`, `aec`,
+`ae_level`, `aec_value`, `agc`, `agc_gain`, `gainceiling`, `awb`, `wb_mode`,
+`awb_gain`, `brightness`, `contrast`, `saturation`).
+
+### GET /api/v1/cluster/cameras
+
+Camera report of every online device (same as the table „Kameras im
+Cluster“): sensor, effective settings, `profile_version`, `profile_state` and
+the last profile answer (`profile_result`, `profile_result_version`,
+`profile_result_age_s`).
+
+### POST /api/v1/cluster/camera_profile
+
+| `action` | Further parameters |
+|---|---|
+| `reference` | `node_id`: set this device as reference of its sensor type |
+| `distribute` | `pid` (hex, e.g. `5640`), `mode` = `session` or `persistent` |
+| `clear` | `pid`: remove the profile on all nodes of this sensor type |
+
+`distribute`/`clear` answer `202 {"ok":true,"pid":"5640","version":"…","sent":N,
+"failed":M,"other_sensor":K,"unknown_sensor":U,"errors":"…"}`; node answers
+arrive asynchronously. Errors: `400` parameter, `403` not coordinator, `404`
+unknown node, `409` no reference / reference offline or report older than
+60 s / reference values not transferable / nothing sent.
+
+Node answer (`profile_result`): `applied`, `waiting_drone` (stored, Drone Mode
+off), `sensor_mismatch`, `invalid`, `busy` (cluster capture planned, nothing
+changed), `save_failed` (active for this session only), `camera_failed`,
+`cleared`.
+
 ## API-exclusive transfer mode
 
 ### GET /api/v1/exclusive

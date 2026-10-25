@@ -75,6 +75,18 @@ static void testFastTxPathOutlier() {
     CHECK(e.add({t0 + 61000000LL, t0 + 61000000LL + 1000, 2400}) == AddResult::TxPathLate);
 }
 
+// A calibration far from the cluster delay is discarded (beta151 hardware:
+// 3469 us against a cluster delay of ~2100 us).
+static void testDelayPlausible() {
+    CHECK(delayPlausible(2100, true, 2100));
+    CHECK(delayPlausible(2465, true, 2100));
+    CHECK(!delayPlausible(3469, true, 2100));
+    CHECK(!delayPlausible(1600, true, 2100));
+    CHECK(delayPlausible(3469, false, 0));
+    CHECK(!delayPlausible(-5, false, 0));
+    CHECK(!delayPlausible(12000, false, 0));
+}
+
 static void testMedianAndDelay() {
     const double v[] = {5, 1, 4, 2, 3};
     CHECK(median(v, 5) == 3);
@@ -219,6 +231,7 @@ int main() {
     testBasics();
     testMedianAndDelay();
     testFastTxPathOutlier();
+    testDelayPlausible();
 
     const SimResult a = simulate(9, 900, 1, 100000, 0, true);
     print("9 nodes, all calibrated", a);

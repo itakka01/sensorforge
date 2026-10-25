@@ -1,0 +1,49 @@
+// Host test: camera_tuning.h text format.
+// g++ -std=c++17 -Wall -Wextra -I. -x c++ test_camera_tuning.cpp.test -o /tmp/test_camera_tuning && /tmp/test_camera_tuning
+#include "camera_tuning.h"
+
+#include <cstdio>
+#include <cstring>
+
+static int failures = 0;
+#define CHECK(c) do { if (!(c)) { std::printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++failures; } } while (0)
+
+int main()
+{
+    using namespace CameraTuning;
+    Values v;
+    CHECK(parse("", v) && !v.set);
+    CHECK(parse(nullptr, v) && !v.set);
+
+    Values a;
+    a.set = true;
+    a.aecValue = 412; a.autoGain = 0; a.agcGain = 7; a.gainCeiling = 3;
+    a.awb = 1; a.wbMode = 2; a.awbGain = 0; a.brightness = -1; a.contrast = 2; a.saturation = -2;
+    char text[80];
+    format(a, text, sizeof(text));
+    CHECK(std::strcmp(text, "1,412,0,7,3,1,2,0,-1,2,-2") == 0);
+    Values b;
+    CHECK(parse(text, b) && b.set);
+    CHECK(b.aecValue == 412 && b.autoGain == 0 && b.agcGain == 7 && b.gainCeiling == 3);
+    CHECK(b.awb == 1 && b.wbMode == 2 && b.awbGain == 0);
+    CHECK(b.brightness == -1 && b.contrast == 2 && b.saturation == -2);
+
+    Values unset;
+    format(unset, text, sizeof(text));
+    CHECK(text[0] == '\0');
+
+    CHECK(!parse("2,412,0,7,3,1,2,0,-1,2,-2", v));       // version
+    CHECK(!parse("1,412,0,7,3,1,2,0,-1,2", v));          // too short
+    CHECK(!parse("1,412,0,7,3,1,2,0,-1,2,-2,5", v));     // trailing field
+    CHECK(!parse("1,65536,0,7,3,1,2,0,-1,2,-2", v));     // exposure range
+    CHECK(parse("1,1201,0,7,3,1,2,0,-1,2,-2", v) && v.aecValue == 1201);  // OV3660/OV5640
+    CHECK(!parse("1,412,0,31,3,1,2,0,-1,2,-2", v));      // gain range
+    CHECK(!parse("1,412,0,7,7,1,2,0,-1,2,-2", v));       // gain ceiling range
+    CHECK(!parse("1,412,0,7,3,1,5,0,-1,2,-2", v));       // wb mode range
+    CHECK(!parse("1,412,0,7,3,1,2,0,-3,2,-2", v));       // brightness range
+    CHECK(!parse("1,412,0,7,3,1,2,0,-1,2,-2x", v));      // garbage
+    CHECK(!v.set);
+
+    std::printf(failures ? "camera tuning: %d failures\n" : "camera tuning: ok\n", failures);
+    return failures ? 1 : 0;
+}

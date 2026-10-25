@@ -19,9 +19,7 @@ namespace {
   // active() is called from multiple threads (e.g., cluster_capture.cpp, recorder.cpp)
   // without holding admissionMutex, so held must be atomic to avoid data race.
   std::atomic<bool> held(false);
-  RecordingBlockGuard* recordingGuard = nullptr;
   // THREAD SAFETY: Mutex protects Check-Then-Act sequence in tryAcquire().
-  // See LOCK_SEMANTICS_ANALYSIS.md Problem 2 for race condition proof.
   static SemaphoreHandle_t admissionMutex = nullptr;
 }
 
@@ -47,8 +45,7 @@ bool tryAcquire(String &reason) {
     return false;
   }
 
-  // SAFETY: Check both held flag and guard pointer for consistency.
-  if (held || recordingGuard != nullptr) {
+  if (held) {
     xSemaphoreGive(admissionMutex);
     reason = "OTA already reserved";
     return false;
@@ -80,11 +77,9 @@ bool tryAcquire(String &reason) {
     return false;
   }
 
-  // Cooperative reservation: ordinary recording starts check this flag.
+  // Cooperative reservation: ordinary recording starts check this gate.
   // Capture jobs additionally check active() at acceptance.
-  // SAFETY: RAII guard replaces manual save/restore pattern. Reference counter
-  // g_recordingBlockDepth is automatically managed.
-  recordingGuard = new RecordingBlockGuard();
+  sdGateAcquire(SD_GATE_FIRMWARE_OTA, false, true);
 
   // Recheck after reserving in case a service changed state meanwhile.
   if (recording || recorderIsOpen() || recordingLoadTestIsActive() ||
@@ -92,8 +87,7 @@ bool tryAcquire(String &reason) {
       webSdAdmissionController().busy() || syncApiExclusiveActive() ||
       clusterCaptureProtectionActive() ||
       ClusterHwTimeGpioLease::active() || !droneModeEnabled()) {
-    delete recordingGuard;
-    recordingGuard = nullptr;
+    sdGateRelease(SD_GATE_FIRMWARE_OTA);
     xSemaphoreGive(admissionMutex);
     reason = "System became busy during reservation";
     return false;
@@ -114,10 +108,7 @@ void release() {
   }
 
   held = false;
-  // SAFETY: RAII guard destructor restores g_recordingStartBlocked via
-  // reference counter (decrements g_recordingBlockDepth).
-  delete recordingGuard;
-  recordingGuard = nullptr;
+  sdGateRelease(SD_GATE_FIRMWARE_OTA);
 
   xSemaphoreGive(admissionMutex);
 }

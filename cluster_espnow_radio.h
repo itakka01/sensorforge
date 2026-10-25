@@ -77,10 +77,15 @@ struct Diagnostics {
     // 0=none, 1=invalid/insufficient, 2=spread, 3=RTT, 4=series deadline.
     uint32_t seriesAccepted=0, seriesRejected=0;
     uint8_t seriesLastFailureReason=0;
+    // Rejected series by reason (1..4 of seriesLastFailureReason).
+    uint32_t seriesRejectedInsufficient=0, seriesRejectedSpread=0, seriesRejectedRtt=0, seriesRejectedTimeout=0;
+    // Node: beacon reports to the coordinator (unicast), acknowledged / not
+    // acknowledged by its MAC layer, and repeats after a missing acknowledgement.
+    uint32_t reportsAcked=0, reportsUnacked=0, reportRetries=0;
 
     // Coordinator only: calibration slot scheduling (cluster_slot_scheduler.h).
-    // slotCycleEstimateMs = active peers x measured mean start-to-start slot period
-    // (0 until two slots started). slotRotations = finished slots.
+    // slotCycleEstimateMs = active peers x measured slot time per accepted series
+    // (0 until a series was accepted). slotRotations = finished slots.
     uint32_t slotActivePeers=0, slotCycleEstimateMs=0, slotRotations=0;
     uint32_t slotRefreshMs=0, slotLifetimeMs=0;
     // Slot table size and whether an active node found no free slot within
@@ -159,16 +164,18 @@ struct NodeSyncReport {
     double ownDelayUs=0;
     uint32_t ownDelayAgeS=0;
     // Coordinator-side statistics of this node boot, from its beacon reports.
-    // A report gap longer than kReportGapMs counts as not precise.
-    uint32_t monitoredS=0;             // since the first beacon report
+    // A report gap longer than kReportGapMs is no precision loss; its time
+    // beyond kReportGapMs is left out of monitoredS.
+    uint32_t monitoredS=0;             // since the first beacon report, without gaps
     uint32_t preciseS=0;
-    uint32_t precisionLosses=0;        // precise -> not precise or silent
+    uint32_t precisionLosses=0;        // reported precise -> not precise
     uint32_t lastLossAgeS=UINT32_MAX;  // UINT32_MAX = no loss yet
-    bool lastLossGap=false;            // last loss: reports stopped for longer than kReportGapMs
-    PrecisionState lastLossState=PrecisionState::Valid;  // else: state the node reported
+    PrecisionState lastLossState=PrecisionState::Valid;  // state the node reported
+    uint32_t reportGaps=0;             // reports missing for longer than kReportGapMs
+    uint32_t lastGapAgeS=UINT32_MAX;   // UINT32_MAX = no gap yet
     double maxJitterUs=0;              // largest jitter reported while precise
 };
-// Beacon reports arrive every 10 s; a longer silence than this is a loss.
+// Beacon reports arrive every 10 s; a longer silence than this is a report gap.
 constexpr uint32_t kReportGapMs = 30000;
 // Coordinator-side table size for node reports, slots and replay state
 // (100-node cluster plus rebooted/left nodes).
