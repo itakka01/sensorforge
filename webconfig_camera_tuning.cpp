@@ -374,24 +374,28 @@ fetch('/camera_line_time',{cache:'no-store',credentials:'same-origin'}).then(fun
 aecV.addEventListener('input',function(){sh.value='';shView();});
 sh.addEventListener('change',function(){if(!sh.value||!lineUs)return;aecV.value=Math.max(1,Math.round(1e6/(+sh.value*lineUs)));
  if(aecSel&&!aecSel.disabled)aecSel.value='0';shView();aecV.dispatchEvent(new Event('change',{bubbles:true}));});
+// A restarted device has a new per-boot CSRF token: a page loaded before the
+// restart gets 403 on every change. Reload it instead of failing silently.
+function tuneJson(r){if(r.status===403)return r.text().then(function(t){if(/csrf/i.test(t)){setTimeout(function(){location.reload();},2500);return {ok:false,message:'Seite veraltet (Gerät wurde neu gestartet) – wird neu geladen, danach die Änderung bitte wiederholen.'};}return {ok:false,message:t||'HTTP 403'};});
+ return r.json().catch(function(){return {ok:false,message:'HTTP '+r.status};});}
 // Camera resolution: saved like on the camera page, camera restarts.
 var resSel=document.getElementById('tuneRes'),resBtn=document.getElementById('tuneResApply');
 if(resBtn)resBtn.addEventListener('click',function(){if(!confirm('Kamera-Auflösung auf '+resSel.value+' ändern? Die Kamera startet neu.'))return;
  var fd=new URLSearchParams();fd.append('mode','resolution');fd.append('resolution',resSel.value);st.textContent='Auflösung wird übernommen …';resBtn.disabled=true;
- fetch('/camera_tuning_apply',{method:'POST',body:fd,credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json().catch(function(){return {ok:false,message:'HTTP '+r.status};});})
+ fetch('/camera_tuning_apply',{method:'POST',body:fd,credentials:'same-origin',cache:'no-store'}).then(tuneJson)
  .then(function(j){st.textContent=(j.ok?'✓ ':'✗ ')+j.message;if(j.ok)setTimeout(function(){location.reload();},1500);else resBtn.disabled=false;}).catch(function(e){st.textContent='✗ '+(e.message||e);resBtn.disabled=false;});});
 // Orientation: sensor mirror/flip, saved, camera restarts.
 var oriBtn=document.getElementById('tuneOriApply');
 if(oriBtn)oriBtn.addEventListener('click',function(){var fd=new URLSearchParams();fd.append('mode','orientation');
  fd.append('rotation',document.getElementById('tuneRot').value);fd.append('hmirror',document.getElementById('tuneHm').checked?'1':'0');fd.append('vflip',document.getElementById('tuneVf').checked?'1':'0');
  st.textContent='Ausrichtung wird übernommen …';oriBtn.disabled=true;
- fetch('/camera_tuning_apply',{method:'POST',body:fd,credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json().catch(function(){return {ok:false,message:'HTTP '+r.status};});})
+ fetch('/camera_tuning_apply',{method:'POST',body:fd,credentials:'same-origin',cache:'no-store'}).then(tuneJson)
  .then(function(j){st.textContent=(j.ok?'✓ ':'✗ ')+j.message;oriBtn.disabled=false;if(j.ok)setTimeout(load,1500);}).catch(function(e){st.textContent='✗ '+(e.message||e);oriBtn.disabled=false;});});
 var sending=false,queued=null,autoTimer=null,auto=document.getElementById('tuneAuto');
 // Disabled (unsupported) fields are sent too; the server needs a complete set.
 function send(m){if(sending){queued=m;return;}sending=true;queued=null;
  var fd=new URLSearchParams();Array.from(form.elements).forEach(function(el){if(el.name)fd.append(el.name,el.value);});fd.append('mode',m);st.textContent='Wird übertragen …';
- fetch('/camera_tuning_apply',{method:'POST',body:fd,credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json().catch(function(){return {ok:false,message:'HTTP '+r.status};});})
+ fetch('/camera_tuning_apply',{method:'POST',body:fd,credentials:'same-origin',cache:'no-store'}).then(tuneJson)
  .then(function(j){st.textContent=(j.ok?'✓ ':'✗ ')+j.message;if(j.ok&&m==='reset'){setTimeout(function(){location.reload();},800);return;}if(j.ok)load();}).catch(function(e){st.textContent='✗ '+(e.message||e);})
  .then(function(){sending=false;if(queued)send(queued);});}
 form.addEventListener('click',function(e){var b=e.target.closest('button[data-mode]');if(!b)return;var m=b.getAttribute('data-mode');

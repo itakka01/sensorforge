@@ -253,7 +253,7 @@ bool liveCameraReady(String &reason){
     // A planned cluster shot owns the camera from acceptance until after it.
     if(clusterCaptureProtectionActive()){reason="Cluster-Aufnahme geplant";return false;}
     // Armed for the instant shot: no slow side work that could delay a job.
-    if(clusterSharpActive()){reason="Kameras scharf geschaltet (Sofortaufnahme)";return false;}
+    if(clusterSharpActive()){reason="Kameras scharf geschaltet (Sofortaufnahme) – am Coordinator „Entschärfen“ oder Kamera-Übersicht starten";return false;}
     if(recording || recorderIsOpen()){reason="Aufnahme läuft";return false;}
     if((streamerModeEnabled() && !droneModeEnabled()) || streamerReady()){reason="Kamera vom Streamer belegt";return false;}
     if(syncApiExclusiveActive()){reason="API-Sitzung belegt die Kamera";return false;}

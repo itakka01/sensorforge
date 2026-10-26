@@ -485,7 +485,7 @@ window.sfOnStatus(function(d){sfRenderCapacity('sfCoordCapacityWarning',d);});
 <div class='cluster-select-tools'><strong>Foto in</strong> <label for='clusterCaptureHours'>Stunden</label> <input id='clusterCaptureHours' type='number' min='0' max='23' step='1' value='0' style='width:4.5em'> <label for='clusterCaptureMinutes'>Minuten</label> <input id='clusterCaptureMinutes' type='number' min='0' max='59' step='1' value='0' style='width:4.5em'> <label for='clusterCaptureSeconds'>Sekunden</label> <input id='clusterCaptureSeconds' type='number' min='0' max='59' step='1' value='5' style='width:4.5em'> <label title='Nur XIAO-Nodes mit aktueller Firmware: Impuls an D1/GPIO2 direkt am Start des aufnehmenden fb_get(). Ältere Firmware verwirft solche Aufträge.'><input type='checkbox' id='clusterCaptureTestPulse'> GPIO-Testimpuls (D1)</label> <button type='button' id='clusterBulkCapture'>Aufnahme planen</button> <output id='clusterPlannedTime' style='font-variant-numeric:tabular-nums;font-weight:700'>UTC-Zeit wird geladen …</output></div>
 <!-- Direkte UTC-Eingabe kann später wieder aktiviert werden. sfPlanUtcTarget() akzeptiert dafür einen optionalen UTC-ISO-Termin; aktuell nutzt das Formular ausschließlich relative Zeit. -->
 <div class='cluster-select-tools'><strong>Sofortaufnahme</strong> <label for='sfSharpMinutes'>scharf für</label> <select id='sfSharpMinutes'><option value='5'>5 min</option><option value='10' selected>10 min</option><option value='30'>30 min</option><option value='60'>60 min</option></select> <button type='button' id='sfSharpOn'>Kameras scharf schalten</button> <button type='button' id='sfSharpOff'>Entschärfen</button> <button type='button' id='sfCaptureNow' class='danger' disabled style='font-weight:800'>SOFORT AUSLÖSEN</button></div>
-<div id='sfSharpBanner' style='display:none;margin:8px 0;padding:12px 16px;border-radius:10px;background:#b91c1c;color:#fff;font-weight:800;font-size:1.15rem'></div>
+<div id='sfSharpBanner' style='display:none;position:sticky;top:0;z-index:50;margin:8px 0;padding:12px 16px;border-radius:10px;background:#b91c1c;color:#fff;font-weight:800;font-size:1.15rem'><span id='sfSharpBannerText'></span> <button type='button' id='sfSharpBannerOff' style='margin-left:8px'>Entschärfen</button></div>
 <div class='cluster-select-tools'><button type='button' id='sfSyncOpen'>Sync-Testbild im Vollbild öffnen</button> <span class='muted'>Beim Capture öffnet sich automatisch ein großes Vollbild-Popup. Countdown und Balken laufen bis 2 s nach dem Auslösezeitpunkt.</span></div>
 <div id='sfSyncScreen' aria-label='Visuelle Synchronisationsanzeige' style='display:none'>
  <div class='sf-sync-stage'><div class='sf-sync-top'><strong>CLUSTER SYNC · BILDSCHIRMTEST</strong><button id='sfSyncClose' type='button'>Anzeige schließen</button></div><div id='sfSyncPhase' class='sf-sync-phase'>BEREIT</div><div id='sfSyncClock' class='sf-sync-clock'>--:--.---</div><div id='sfSyncTarget' class='sf-sync-target'>Noch kein Capture geplant</div><div id='sfSyncBars' class='sf-sync-bars'></div><div class='sf-sync-foot'>Bildschirm-Refresh und Browser-Timing begrenzen die Genauigkeit. Balken sind eine visuelle Orientierung, kein Millisekunden-Nachweis.</div></div>
@@ -812,11 +812,11 @@ document.getElementById('clusterBulkCapture').addEventListener('click',async fun
 // Instant shot: arm (camera awake, no standby), then fire with the shortest
 // safe lead. The banner counts down locally and is corrected by the status.
 var sfSharpUntil=0,sfSharpTimer=null;
-function sfSharpRender(){var b=document.getElementById('sfSharpBanner'),now=Date.now(),left=Math.max(0,Math.round((sfSharpUntil-now)/1000)),btn=document.getElementById('sfCaptureNow');
+function sfSharpRender(){var b=document.getElementById('sfSharpBanner'),bt=document.getElementById('sfSharpBannerText'),now=Date.now(),left=Math.max(0,Math.round((sfSharpUntil-now)/1000)),btn=document.getElementById('sfCaptureNow');
  if(!left){b.style.display='none';btn.disabled=true;if(sfSharpTimer){clearInterval(sfSharpTimer);sfSharpTimer=null;}return;}
  var nodes=(sfLatestStatus&&Array.isArray(sfLatestStatus.nodes))?sfLatestStatus.nodes:[],armed=nodes.filter(function(n){return !n.local&&n.sharp_code===0&&Number(n.sharp_remaining_s)-Number(n.sharp_age_s)>0;}).length,bad=nodes.filter(function(n){return !n.local&&n.sharp_code>0;});
  b.style.display='block';btn.disabled=false;
- b.textContent='● KAMERAS SCHARF – noch '+Math.floor(left/60)+':'+String(left%60).padStart(2,'0')+' · '+armed+' Node(s) bestätigt'+(bad.length?' · nicht bereit: '+bad.map(function(n){return n.hostname+(n.sharp_code===2?' (kein Drone Mode)':' (Kamera)');}).join(', '):'')+' · Live-Bilder sind gesperrt';}
+ bt.textContent='● KAMERAS SCHARF – noch '+Math.floor(left/60)+':'+String(left%60).padStart(2,'0')+' · '+armed+' Node(s) bestätigt'+(bad.length?' · nicht bereit: '+bad.map(function(n){return n.hostname+(n.sharp_code===2?' (kein Drone Mode)':' (Kamera)');}).join(', '):'')+' · Live-Bilder sind gesperrt';}
 function sfSharpSet(seconds){sfSharpUntil=seconds>0?Date.now()+seconds*1000:0;if(!sfSharpTimer&&seconds>0)sfSharpTimer=setInterval(sfSharpRender,500);sfSharpRender();}
 window.sfOnStatus(function(d){if(d&&typeof d.sharp_remaining_s==='number'){var left=Number(d.sharp_remaining_s);if(Math.abs(sfSharpUntil-(Date.now()+left*1000))>2000||!left)sfSharpSet(left);else sfSharpRender();}});
 async function sfSharpSend(seconds){var ids=sfActionableSelectedIds(),out=document.getElementById('clusterCaptureFeedback');
@@ -828,6 +828,16 @@ async function sfSharpSend(seconds){var ids=sfActionableSelectedIds(),out=docume
  catch(e){out.textContent='Übertragungsfehler: '+(e.message||e);}}
 document.getElementById('sfSharpOn').addEventListener('click',function(){sfSharpSend(Number(document.getElementById('sfSharpMinutes').value)*60);});
 document.getElementById('sfSharpOff').addEventListener('click',function(){sfSharpSend(0);});
+document.getElementById('sfSharpBannerOff').addEventListener('click',function(){window.sfSharpDisarm(false);});
+// Disarm every node (not only the selected ones): before live images are
+// wanted (camera overview) and when the page is left - the arming otherwise
+// keeps all live images dark until it expires.
+window.sfSharpActive=function(){return sfSharpUntil>Date.now();};
+window.sfSharpDisarm=function(leaving){var ids=((sfLatestStatus&&sfLatestStatus.nodes)||[]).filter(function(n){return !n.local&&n.integration_id;}).map(function(n){return n.integration_id;});
+ var fd=new URLSearchParams();fd.append('node_ids',ids.join(','));fd.append('seconds','0');sfSharpSet(0);
+ var out=document.getElementById('clusterCaptureFeedback');if(out&&!leaving)out.textContent='Entschärft.';
+ return fetch('/cluster_sharp',{method:'POST',body:fd,credentials:'same-origin',cache:'no-store',keepalive:!!leaving}).catch(function(){});};
+window.addEventListener('pagehide',function(){if(window.sfSharpActive())window.sfSharpDisarm(true);});
 document.getElementById('sfCaptureNow').addEventListener('click',async function(){
  var ids=sfActionableSelectedIds(),out=document.getElementById('clusterCaptureFeedback');
  if(!ids.length){out.textContent='Bitte Nodes auswählen.';return;}

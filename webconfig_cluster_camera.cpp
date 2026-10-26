@@ -51,7 +51,7 @@ String webconfigClusterCameraSectionHtml()
 <tbody id='sfCamRows'><tr><td colspan='8' class='muted'>Zum Laden öffnen.</td></tr></tbody></table></div>
 <dialog id='sfCamDialog' style='width:min(94vw,560px);box-sizing:border-box;padding:16px;border-radius:12px'><div style='display:flex;justify-content:space-between;align-items:center;gap:12px'><h3 id='sfCamDlgTitle' style='margin:0'></h3><button type='button' id='sfCamDlgClose'>Schließen</button></div><table class='cluster-table' style='min-width:0;margin-top:10px'><tbody id='sfCamDlgRows'></tbody></table></dialog>
 <h4 style='margin:16px 0 4px'>Kamera-Übersicht</h4>
-<p class='muted'>Aktuelle Bilder aller Kameras als Kleinbild (ca. 1/8 der Auflösung, je ca. 5–15 KB), mit den echten Einstellungen. Der Browser holt sie direkt von den Geräten, eines nach dem anderen; bei „laufend“ beginnt nach jeder Runde nach 2 s die nächste. Auch im Drone Mode; während einer geplanten Cluster-Aufnahme liefern die Geräte kein Bild. „Abstimmen“ öffnet die Bildabstimmung des Geräts.</p>
+<p class='muted'>Aktuelle Bilder aller Kameras als Kleinbild (ca. 1/8 der Auflösung, je ca. 5–15 KB), mit den echten Einstellungen. Der Browser holt sie direkt von den Geräten, eines nach dem anderen; bei „laufend“ beginnt nach jeder Runde nach 2 s die nächste. Auch im Drone Mode; während einer geplanten Cluster-Aufnahme liefern die Geräte kein Bild. Sind die Kameras für die Sofortaufnahme scharf geschaltet, hebt „Übersicht starten“ das auf (ebenso das Verlassen der Cluster-Seite). „Abstimmen“ öffnet die Bildabstimmung des Geräts.</p>
 <div class='cluster-select-tools'><button type='button' id='sfCamOvStart'>Übersicht starten</button> <label><input type='checkbox' id='sfCamOvLive' checked> laufend auffrischen</label> <span id='sfCamOvState' class='muted' role='status'></span></div>
 <div id='sfCamOvGrid' style='display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px'></div>
 <details><summary>Sensorfähigkeiten</summary><p class='muted'>„ja“ heißt: Der Kameratreiber bietet die Funktion für diesen Sensor an (bekannte Platzhalter-Funktionen, z. B. Schärfe beim OV2640, sind ausgenommen). Die tatsächliche Wirkung ist damit noch nicht gemessen. Crop ist der SensorForge-Sensor-Crop (derzeit nur OV3660). Fähigkeiten werden ab dem ersten Kamerastart nach dem Booten gemeldet.</p>
@@ -101,7 +101,7 @@ function diffs(n,p){var d=[];function c(label,a,b){if(a!=null&&b!=null&&Number(a
  c('Weißabgleich',n.awb,p.awb);c('WB-Voreinstellung',n.wb_mode,p.wb_mode);c('AWB-Gain',n.awb_gain,p.awb_gain);
  c('Helligkeit',n.brightness,p.brightness);c('Kontrast',n.contrast,p.contrast);c('Sättigung',n.saturation,p.saturation);return d;}
 function profCell(n){var s=sensorOf(n.pid),p=s&&s.profile,ref=s&&s.reference===n.integration_id;
- var heart='<button type="button" data-ref="'+esc(n.integration_id)+'" title="'+(ref?'Referenzkamera für '+esc(n.sensor):'Als Referenz für '+esc(n.sensor)+' wählen')+'" style="padding:0 6px">'+(ref?'♥':'♡')+'</button> ';
+ var heart='<button type="button" data-ref="'+esc(n.integration_id)+'" title="'+(ref?'Referenzkamera für '+esc(n.sensor):'Als Referenz für '+esc(n.sensor)+' wählen')+'" style="padding:0 6px;vertical-align:middle">'+(ref?'<span style="color:#dc2626;font-size:1.8em;line-height:1">♥</span> <strong style="color:#dc2626">Referenz</strong>':'♡')+'</button> ';
  if(n.pid==null)return '<span class="muted">Sensor unbekannt</span>';
  var txt,col='';var st=n.profile_state||'none',v=n.profile_version||null;
  if(!p){txt=v?'Profil '+v+' (am Coordinator entfernt)':'kein Profil';col=v?'#b45309':'';}
@@ -116,7 +116,7 @@ function renderProfiles(){if(!prof.sensors||!prof.sensors.length){profBox.innerH
  profBox.innerHTML=prof.sensors.map(function(s){var refNode=last.find(function(n){return n.integration_id===s.reference;});var p=s.profile;
   var count=last.filter(function(n){return n.pid!=null&&Number(n.pid).toString(16)===s.pid;}).length;
   var summary=p?('Profil '+p.version+': '+p.resolution+' · Q '+p.quality+' · Belichtung '+(p.aec?'Auto':p.aec_value+' Zeilen')+' · Verstärkung '+(p.agc?'Auto':p.agc_gain)+' · WB '+(p.awb?wbName(p.wb_mode):'aus')):'Noch kein Profil übertragen.';
-  return '<div style="border:1px solid #64748b66;border-radius:10px;padding:8px;margin:6px 0"><strong>'+esc(s.sensor)+'</strong> <span class="muted">('+count+' Geräte)</span><br>Referenz: '+(s.reference?esc(refNode?name(refNode):s.reference):'<em>keine – ♡ in der Tabelle wählen</em>')+(s.reference?'<br><span class="muted">Werte an der Referenz einstellen (Kamera-Übersicht → '+esc(refNode?name(refNode):'Referenz')+' → „Abstimmen“), dann hier übertragen. Übertragen wird der Stand der Referenz, nicht der anderer Geräte.</span>':'')+'<br><span class="muted">'+esc(summary)+'</span><div style="margin-top:6px"><button type="button" data-dist="session" data-pid="'+esc(s.pid)+'"'+(s.reference?'':' disabled')+'>Übertragen – nur Sitzung</button> <button type="button" data-dist="persistent" data-pid="'+esc(s.pid)+'"'+(s.reference?'':' disabled')+'>Übertragen – dauerhaft</button> <button type="button" data-dist="clear" data-pid="'+esc(s.pid)+'">Profil entfernen</button></div></div>';}).join('');}
+  return '<div style="border:1px solid #64748b66;border-radius:10px;padding:8px;margin:6px 0"><strong>'+esc(s.sensor)+'</strong> <span class="muted">('+count+' Geräte)</span><br>Referenz: '+(s.reference?'<span style="color:#dc2626;font-size:1.4em;line-height:1">♥</span> <strong>'+esc(refNode?name(refNode):s.reference)+'</strong>':'<em>keine – ♡ in der Tabelle wählen</em>')+(s.reference?'<br><span class="muted">Werte an der Referenz einstellen (Kamera-Übersicht → '+esc(refNode?name(refNode):'Referenz')+' → „Abstimmen“), dann hier übertragen. Übertragen wird der Stand der Referenz, nicht der anderer Geräte.</span>':'')+'<br><span class="muted">'+esc(summary)+'</span><div style="margin-top:6px"><button type="button" data-dist="session" data-pid="'+esc(s.pid)+'"'+(s.reference?'':' disabled')+'>Übertragen – nur Sitzung</button> <button type="button" data-dist="persistent" data-pid="'+esc(s.pid)+'"'+(s.reference?'':' disabled')+'>Übertragen – dauerhaft</button> <button type="button" data-dist="clear" data-pid="'+esc(s.pid)+'">Profil entfernen</button></div></div>';}).join('');}
 function profPost(body){profSt.textContent='Wird gesendet …';return fetch('/cluster_camera_profile',{method:'POST',body:new URLSearchParams(body),credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json().catch(function(){return {ok:false,message:'HTTP '+r.status};});});}
 profBox.addEventListener('click',function(e){var b=e.target.closest('[data-dist]');if(!b)return;var m=b.getAttribute('data-dist'),pid=b.getAttribute('data-pid');
  if(m==='clear'&&!confirm('Profil für diesen Sensortyp auf allen Geräten entfernen? Die Geräte nutzen wieder ihre lokalen Werte.'))return;
@@ -156,19 +156,26 @@ function ovNext(){if(!ov.on)return;
  var t=setTimeout(function(){fin(false);},8000);
  im.onload=function(){fin(true);};im.onerror=function(){fin(false);};
  im.src=e.base+'/camera_frame?t='+Date.now();}
-function ovStart(){if(ov.on){ovStop();return;}ovSt.textContent='Lädt Geräteliste …';
- Promise.all([fetch('/cluster_cameras?t='+Date.now(),{cache:'no-store',credentials:'same-origin'}).then(function(r){if(!r.ok)throw Error('HTTP '+r.status);return r.json();}),window.sfCoordinateStatus(true)]).then(function(r){
+function ovStart(){if(ov.on){ovStop();return;}
+ // Armed cameras deliver no live images: disarm first (nodes need ~1 s).
+ var disarmed=window.sfSharpActive&&window.sfSharpActive();
+ if(disarmed){ovSt.textContent='Scharfschaltung wird aufgehoben …';window.sfSharpDisarm(false);setTimeout(ovLoad,1500);}else ovLoad();
+ function ovLoad(){ovSt.textContent=(disarmed?'Scharfschaltung aufgehoben · ':'')+'Lädt Geräteliste …';
+ Promise.all([fetch('/cluster_cameras?t='+Date.now(),{cache:'no-store',credentials:'same-origin'}).then(function(r){if(!r.ok)throw Error('HTTP '+r.status);return r.json();}),window.sfCoordinateStatus(true),getJson('/cluster_camera_profile').catch(function(){return null;})]).then(function(r){
+  if(r[2])prof=r[2];
   var ips={};((r[1]||{}).nodes||[]).forEach(function(n){ips[n.integration_id]=n.ip;});
   var ns=((r[0]||{}).nodes||[]).slice().sort(function(a,b){return name(a).localeCompare(name(b),'de',{numeric:true,sensitivity:'base'});});
   ovGrid.innerHTML='';ov.list=[];
   ns.forEach(function(n){var base=ovBase(n,ips);var card=document.createElement('article');card.style.cssText='border:1px solid #64748b66;border-radius:10px;padding:8px;min-width:0';
-   card.innerHTML='<strong>'+esc(name(n))+'</strong> <span class="muted">'+esc(n.sensor||'')+'</span><div class="sf-ov-pic" style="width:100%;aspect-ratio:4/3;background:#1f2937;border-radius:8px;margin:6px 0"></div><div class="muted sf-ov-st"></div>'+(base===null?'':'<div><a target="_blank" rel="noopener noreferrer" href="'+esc(base)+'/camera_frame?size=full">Groß</a> · <a target="_blank" rel="noopener noreferrer" href="'+esc(base)+'/camera_tuning">Abstimmen</a></div>');
+   var s=sensorOf(n.pid),ref=s&&s.reference===n.integration_id;
+   if(ref)card.style.cssText+=';border:2px solid #dc2626';
+   card.innerHTML=(ref?'<span title="Referenzkamera" style="color:#dc2626;font-size:1.6em;line-height:1;vertical-align:middle">♥</span> ':'')+'<strong>'+esc(name(n))+'</strong> <span class="muted">'+esc(n.sensor||'')+(ref?' · Referenz':'')+'</span><div class="sf-ov-pic" style="width:100%;aspect-ratio:4/3;background:#1f2937;border-radius:8px;margin:6px 0"></div><div class="muted sf-ov-st"></div>'+(base===null?'':'<div><a target="_blank" rel="noopener noreferrer" href="'+esc(base)+'/camera_frame?size=full">Groß</a> · <a target="_blank" rel="noopener noreferrer" href="'+esc(base)+'/camera_tuning">Abstimmen</a></div>');
    ovGrid.appendChild(card);var st=card.querySelector('.sf-ov-st');
    if(base===null){st.textContent='keine IP-Adresse bekannt';return;}
    ov.list.push({name:name(n),base:base,pic:card.querySelector('.sf-ov-pic'),st:st});});
   if(!ov.list.length){ovSt.textContent='Keine erreichbaren Geräte.';return;}
-  ov.on=true;ov.idx=0;ovBtn.textContent='Übersicht stoppen';ovSt.textContent='';ovNext();
- }).catch(function(e){ovSt.textContent='Fehler: '+(e.message||e);});}
+  ov.on=true;ov.idx=0;ovBtn.textContent='Übersicht stoppen';ovSt.textContent=disarmed?'Scharfschaltung aufgehoben.':'';ovNext();
+ }).catch(function(e){ovSt.textContent='Fehler: '+(e.message||e);});}}
 ovBtn.addEventListener('click',ovStart);
 })();</script></details>
 )__CAMERA__";

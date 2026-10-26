@@ -1,3 +1,15 @@
+## v87-beta178 — 2026-10-26 (BILDABSTIMMUNG: VERALTETE SEITE LÄDT NEU)
+
+Gemeldet: Drehen/Spiegeln/Kippen/Auflösung in der Bildabstimmung → HTTP 403. Geprüft auf c005: alle vier funktionieren (Bild entspricht exakt dem erwarteten gedrehten/gespiegelten/gekippten Bild, Sensorstatus stimmt, Auflösung 800×600 ↔ 1024×768). Ursache des 403: Seite vor einem Neustart des Geräts geladen (Rollout) – das CSRF-Token gilt je Boot, das Live-Bild (GET) lief weiter, jede Änderung (POST) wurde abgelehnt.
+
+- Bildabstimmung: bei 403 wegen CSRF meldet die Seite „Seite veraltet (Gerät wurde neu gestartet)“ und lädt nach 2,5 s neu.
+
+## v87-beta177 — 2026-10-26 (REFERENZKAMERA DEUTLICH, SCHARFSCHALTUNG AUTOMATISCH AUFHEBEN)
+
+- Referenzkamera: großes rotes ♥ mit „Referenz“ in der Tabelle, im Profilkasten und in der Kamera-Übersicht (Kachel mit rotem Rahmen).
+- Scharfschaltung: „Übersicht starten“ entschärft zuerst alle Nodes (scharfe Kameras liefern keine Live-Bilder); Verlassen der Cluster-Seite (anderes Menü, Neuladen, Tab schließen) entschärft ebenfalls (`pagehide`, `keepalive`). Das rote Banner bleibt beim Scrollen oben sichtbar und hat einen eigenen „Entschärfen“-Knopf. Entschärft werden immer alle Nodes, nicht nur die ausgewählten.
+- Abstimmen-Seite eines Nodes: Hinweistext bei gesperrtem Live-Bild nennt, wie die Scharfschaltung aufgehoben wird.
+
 ## v87-beta176 — 2026-10-26 (SOFORTAUFNAHME 200 MS, SENSOR-FREIGABE ZWEI PERIODEN VORHER)
 
 - Sofortaufnahme: Vorlauf 150 → 200 ms (`CLUSTER_INSTANT_LEAD_US`).
