@@ -56,7 +56,7 @@ void handlePage()
             "<p class='muted'>Coordinator: " SENSORFORGE_RELEASE_TAG " · Board " + String(firmwareSecurityLocalBoardId()) +
             ". Jedes Gerät lädt aus dem Manifest die höchste Version für sein Board, prüft Signatur, Board und "
             "Version und schaltet erst dann um. Nach dem Neustart bestätigt es die neue Firmware nach 60 s, sonst "
-            "fällt es auf die alte zurück. Der Rollout hält beim ersten Fehler an.</p>"
+            "fällt es auf die alte zurück. Kommt ein Gerät nicht zurück, wird es rot markiert und der Rollout macht mit dem nächsten weiter – das markierte Gerät kurz stromlos machen.</p>"
             "<p><label for='fwUrl'><strong>Manifest-URL</strong></label><br>"
             "<input id='fwUrl' type='text' style='width:100%;max-width:520px' placeholder='http://192.168.0.10:8765/manifest.json'></p>"
             "<p><label><input type='checkbox' id='fwOlder'> Ältere Version erlauben (Downgrade)</label></p>"

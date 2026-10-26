@@ -1,3 +1,18 @@
+## v87-beta162 — 2026-10-26 (SOFORTAUFNAHME MIT SCHARFSCHALTEN)
+
+- **Ersetzt die 2-s-Schnellaufnahme aus beta161** (nicht ausgerollt, entfernt). Es gibt nur noch die geplante Aufnahme (Stunden/Minuten/Sekunden, ≥ 2 s) und die Sofortaufnahme.
+- **„Kameras scharf schalten“** (5/10/30/60 min) / **„Entschärfen“**: signierter Auftrag `SFJH1` (Antwort `SFJHA1`: 0 bereit, 1 Kamera nicht bereit, 2 kein Drone Mode). Scharfe Nodes halten die Kamera wach (kein Standby), verweigern Live-/Kleinbilder (keine langsame Nebenarbeit, die einen Auftrag verzögern könnte) und nehmen Aufnahme-Aufträge schon ab 150 ms Vorlauf an (sonst weiter 1,5 s). Großes rotes Banner „KAMERAS SCHARF – noch m:ss · n Node(s) bestätigt · nicht bereit: …“.
+- **„SOFORT AUSLÖSEN“** (nur solange scharf): `/cluster_capture_now` setzt den Zeitpunkt auf jetzt + **300 ms** und sendet den normalen signierten Aufnahme-Auftrag an alle ausgewählten Nodes in einem Durchgang; Coordinator erlaubt den kurzen Vorlauf (≥ 250 ms) nur im scharfen Zustand. Gleiche Präzision wie bei geplanten Aufnahmen (eingefrorene Monotonic-Deadline).
+- **Reserve-Messung:** Die Annahme-Antwort (SFJCR1 Status 1) trägt die Reserve in ms (Zeit vom Empfang bis zum Auslösezeitpunkt); `cluster_status` je Node `capture_reserve_ms`/`_seq`. Die Seite zeigt nach jedem Sofort-Shot kleinste und größte Reserve – Grundlage, ob der Vorlauf verkürzt werden kann.
+- `cluster_status` hat `sharp_remaining_s` (Coordinator: Cluster scharf; Node: eigener Zustand) und je Node `sharp_code`, `sharp_remaining_s`, `sharp_age_s`.
+
+## v87-beta161 — 2026-10-26 (SOFORTAUFNAHME, KÜRZERER NACHLAUF, ROLLOUT OHNE ANHALTEN)
+
+- ~~„Sofort auslösen (2 s)“~~ (in beta162 durch die Sofortaufnahme mit Scharfschalten ersetzt): ein Auftrag `/cluster_capture_quick` (node_ids, lead_ms 2000–10000) plant dieselbe UTC-Aufnahme für alle ausgewählten Nodes in einem Durchgang (bisher ein Browser-Aufruf je Node, mindestens 5 s). Gleiche signierte Capture-Jobs, gleiche Ergebnisanzeige und Galerie. Nodes wecken die Kamera beim Empfang (Aufnahme < 2 s entfernt). Coordinator-Mindestvorlauf 2 s → 1,6 s (Nodes nehmen ab 1,5 s an).
+- Countdown/Vollbild-Anzeige endet 2 s statt 5 s nach dem Auslösezeitpunkt.
+- **Rollout hält bei Fehlern nicht mehr an:** ein Gerät, das nicht zurückkommt (jetzt nach 2 statt 4 min) oder einen Fehler meldet, wird rot markiert („kurz stromlos machen“), der Rollout macht mit dem nächsten weiter; am Ende Hinweis mit Anzahl. Erneuter Start überspringt aktuelle Geräte.
+- **Messung Kamera-Standby (beta160):** CPU-Temperatur c00x (OV5640) 64–69 °C → 44–47 °C (−16 bis −22 °C), devxiao3 −10 °C, devxiao2 −6 °C; Sendeleistung 8,5 dBm + 2 cm mehr Abstand: verworfene Zeitsignale 59 % → 10–20 %.
+
 ## v87-beta160 — 2026-10-26 (KAMERA-STANDBY IM DRONE MODE, MANIFEST-URL SPEICHERN)
 
 - **NEU – Kamera-Standby im Leerlauf** (`camera_power.h`): Im Drone Mode geht der Sensor nach 30 s ohne Nutzung in seinen Software-Power-Down (Register 0x3008 Bit 6, jetzt OV3660 **und** OV5640) – keine Bildausgabe, deutlich weniger Strom und Wärme, kein Bildverkehr. Geweckt wird mit `cameraWakeForUse()` von: geplanter Cluster-Aufnahme (2 s vorher über `clusterCapturePrepareCamera`, zusätzlich unmittelbar vor dem Bild), Live-Bild/Kleinbild, Zeilenmessung, Bildabstimmung (Anwenden), WebConfig-Vorschau, API-Bild, Streamer. Kein Standby während Aufnahme, Streamer, API-Sitzung, geplanter Cluster-Aufnahme, Vorschau oder Thermal-Notfall; endet der Drone Mode, wird die Kamera sofort geweckt. Der bisherige Lichtschlaf-Standby (nur OV3660) bleibt unverändert. Kamera-Übersicht zeigt den Zustand „standby“. Wirkung (Strom/Temperatur) noch zu messen.

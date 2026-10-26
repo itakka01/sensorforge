@@ -134,6 +134,16 @@ static const uint32_t CLUSTER_CAMPROFILE_TIMEOUT_MS = 20000UL;
 // Cluster firmware update (firmware_cluster_update.h): coordinator -> node, node answers.
 static const char *CLUSTER_JOB_FWUPDATE_MAGIC = "SFJU1";
 static const char *CLUSTER_JOB_FWUPDATE_ACK_MAGIC = "SFJUA1";
+// Arm cameras for the instant shot (coordinator -> node) and the answer.
+static const char *CLUSTER_JOB_SHARP_MAGIC = "SFJH1";
+static const char *CLUSTER_JOB_SHARP_ACK_MAGIC = "SFJHA1";
+// Node: armed until this millis(); 0 = not armed.
+static uint32_t sharpUntilMs = 0;
+// Coordinator: last arming sent to the cluster ends at this millis().
+static uint32_t coordSharpUntilMs = 0;
+static const uint32_t CLUSTER_SHARP_MAX_S = 3600;
+// Shortest lead a node accepts while armed (the coordinator plans 300 ms).
+static const int64_t CLUSTER_INSTANT_NODE_MIN_LEAD_US = 150000LL;
 static const char *CLUSTER_JOB_DRONE_MAGIC = "SFJD1";
 static const char *CLUSTER_JOB_DRONE_ACK_MAGIC = "SFJDA1";
 static uint32_t droneSeenBoot=0,droneSeenEpoch=0,droneSeenSeq=0;
@@ -301,6 +311,13 @@ struct ClusterPeer {
     int32_t cpuTempDeciC;
     uint32_t freeHeapBytes;
     bool mountValid;
+    // Instant shot: reserve of the last accepted capture (ms between the
+    // node receiving the job and the shot) and the last arming answer.
+    uint32_t captureReserveSeq;     // 0 = none
+    uint32_t captureReserveMs;
+    uint8_t sharpCode;              // answer code of SFJHA1
+    uint32_t sharpAckMs;            // 0 = no answer yet
+    uint32_t sharpRemainingS;
     ClusterGroups::Mount mount;
     // Last TX-power result reported by this node (coordinator side).
     int16_t txRequestedX10;
@@ -3023,7 +3040,9 @@ static void processJobCapture(char **f,size_t n,const IPAddress &ip) {
     char *end=nullptr;errno=0;
     int64_t utc=(int64_t)strtoll(f[8],&end,10);
     int64_t nowUtc=0;
-    if(errno||!end||*end||utc<=0||!clusterTimeNowUs(nowUtc)||utc-nowUtc<1500000LL||
+    // Armed (camera awake, standby off): the instant shot's short lead is fine.
+    const int64_t minLeadUs=clusterSharpActive()?CLUSTER_INSTANT_NODE_MIN_LEAD_US:1500000LL;
+    if(errno||!end||*end||utc<=0||!clusterTimeNowUs(nowUtc)||utc-nowUtc<minLeadUs||
        utc-nowUtc>1800000000LL||pendingCapture.active) {
         sendCaptureResult(cb,epoch,seq,3,1,0);return;
     }
@@ -3043,7 +3062,8 @@ static void processJobCapture(char **f,size_t n,const IPAddress &ip) {
                     acceptedMonoUs+remainingUs,
                     ClusterEspNowRadio::timeSourceGeneration(),testPulse};
     captureTestPulseState=testPulse?"requested":"off";
-    sendCaptureResult(cb,epoch,seq,1,0,0);
+    // Status 1 (accepted) carries the reserve in ms in the bytes field.
+    sendCaptureResult(cb,epoch,seq,1,0,(uint32_t)(remainingUs/1000LL));
 }
 static void processJobCaptureResult(char **f,size_t n,const IPAddress &ip) {
     if(n!=13||!runtimeActive||!localIsCoordinator||strcmp(f[1],runtimeClusterTag)!=0||
@@ -3069,6 +3089,10 @@ static void processJobCaptureResult(char **f,size_t n,const IPAddress &ip) {
         if((e->state!=ClusterJobs::State::Accepted && e->state!=ClusterJobs::State::Sent) ||
            static_cast<int32_t>(resultNowMs-e->deadlineMs)>=0 ||
            !ClusterJobs::setCaptureMedia(id,epoch,f[11],dispatch,bytes))return;
+    }
+    if(status==1){
+        ClusterPeer *rp=findPeer(f[5]);
+        if(rp && seq!=rp->captureReserveSeq){rp->captureReserveSeq=seq;rp->captureReserveMs=bytes;}
     }
     if(status==1&&e->state==ClusterJobs::State::Sent){
         if(ClusterJobs::transition(id,epoch,ClusterJobs::State::Accepted,resultNowMs))++captureAccepted;
@@ -3690,6 +3714,74 @@ static void processJobCameraProfileAck(char **f, size_t n, const IPAddress &ip)
     clusterCameraNoteProfileResult(f[5], (uint8_t)result, version);
 }
 
+// Node: SFJH1|tag|coord|coordBoot|epoch|node|nodeBoot|seq|seconds (0 = disarm).
+// Armed: camera awake, idle standby and slow camera side work (live frames)
+// off, capture jobs with the instant shot's short lead accepted.
+static uint32_t sharpSeenBoot = 0, sharpSeenEpoch = 0, sharpSeenSeq = 0;
+static void processJobSharp(char **f, size_t n, const IPAddress &ip)
+{
+    if (n != 9 || !runtimeActive || localIsCoordinator ||
+        strcmp(f[1], runtimeClusterTag) != 0 || strcmp(f[2], currentCoordinatorId) != 0 ||
+        strcmp(f[5], deviceIntegrationId().c_str()) != 0 || ip != currentCoordinatorIp)
+        return;
+    uint32_t cb = 0, epoch = 0, nb = 0, seq = 0, seconds = 0;
+    if (!parseUint32Strict(f[3], cb, 16) || !parseUint32Strict(f[4], epoch) ||
+        !parseUint32Strict(f[6], nb, 16) || !parseUint32Strict(f[7], seq) ||
+        !parseUint32Strict(f[8], seconds) || seconds > CLUSTER_SHARP_MAX_S ||
+        !cb || !epoch || !seq || nb != bootNonce || epoch != currentCoordinatorEpoch)
+        return;
+    const ClusterPeer *coord = findPeer(f[2]);
+    if (!coord || coord->bootNonce != cb || coord->ip != ip ||
+        (uint32_t)(millis() - coord->lastSeenMs) > 60000UL)
+        return;
+    if (sharpSeenBoot == cb && sharpSeenEpoch == epoch && seq <= sharpSeenSeq)
+        return;
+    sharpSeenBoot = cb; sharpSeenEpoch = epoch; sharpSeenSeq = seq;
+
+    // 0 armed / disarmed, 1 camera not ready, 2 not in Drone Mode
+    uint8_t code = 0;
+    if (!seconds) {
+        sharpUntilMs = 0;
+    } else if (!droneModeEnabled()) {
+        code = 2;
+    } else if (!clusterCapturePrepareCamera()) {
+        code = 1;
+    } else {
+        const uint32_t until = millis() + seconds * 1000UL;
+        sharpUntilMs = until ? until : 1;
+    }
+    char own[9];
+    snprintf(own, sizeof(own), "%08lx", (unsigned long)bootNonce);
+    const String msg = String(CLUSTER_JOB_SHARP_ACK_MAGIC) + "|" + runtimeClusterTag + "|" +
+        currentCoordinatorId + "|" + f[3] + "|" + f[4] + "|" + deviceIntegrationId() + "|" + own + "|" +
+        f[7] + "|" + String((unsigned)code) + "|" +
+        String((unsigned long)(clusterSharpActive() ? (sharpUntilMs - millis()) / 1000UL : 0));
+    sendSignedPayloadTo(msg, currentCoordinatorIp, CLUSTER_COORDINATOR_PORT, "sharp result");
+    Serial.printf("[CLUSTER] sharp %lu s -> code %u\n", (unsigned long)seconds, (unsigned)code);
+}
+
+// Coordinator: SFJHA1|tag|coord|coordBoot|epoch|node|nodeBoot|seq|code|remaining_s
+static void processJobSharpAck(char **f, size_t n, const IPAddress &ip)
+{
+    if (n != 10 || !runtimeActive || !localIsCoordinator ||
+        strcmp(f[1], runtimeClusterTag) != 0 || strcmp(f[2], deviceIntegrationId().c_str()) != 0 ||
+        !integrationIdValid(f[5]))
+        return;
+    uint32_t cb = 0, epoch = 0, nb = 0, seq = 0, code = 0, remaining = 0;
+    if (!parseUint32Strict(f[3], cb, 16) || !parseUint32Strict(f[4], epoch) ||
+        !parseUint32Strict(f[6], nb, 16) || !parseUint32Strict(f[7], seq) ||
+        !parseUint32Strict(f[8], code) || !parseUint32Strict(f[9], remaining) || code > 255 ||
+        cb != bootNonce || epoch != currentCoordinatorEpoch || !nb || !seq)
+        return;
+    ClusterPeer *node = findPeer(f[5]);
+    if (!node || node->bootNonce != nb || node->ip != ip)
+        return;
+    node->sharpCode = (uint8_t)code;
+    node->sharpRemainingS = remaining;
+    const uint32_t now = millis();
+    node->sharpAckMs = now ? now : 1;
+}
+
 // Node: SFJU1|tag|coord|coordBoot|epoch|node|nodeBoot|seq|allowOlder|manifestUrl
 static uint32_t fwUpdateSeenBoot = 0, fwUpdateSeenEpoch = 0, fwUpdateSeenSeq = 0;
 static void processJobFirmwareUpdate(char **f, size_t n, const IPAddress &ip)
@@ -3811,6 +3903,10 @@ static void processPacket(
         processJobCameraProfile(fields, fieldCount, remoteIp);
     } else if (strcmp(fields[0], CLUSTER_JOB_CAMPROFILE_ACK_MAGIC) == 0) {
         processJobCameraProfileAck(fields, fieldCount, remoteIp);
+    } else if (strcmp(fields[0], CLUSTER_JOB_SHARP_MAGIC) == 0) {
+        processJobSharp(fields, fieldCount, remoteIp);
+    } else if (strcmp(fields[0], CLUSTER_JOB_SHARP_ACK_MAGIC) == 0) {
+        processJobSharpAck(fields, fieldCount, remoteIp);
     } else if (strcmp(fields[0], CLUSTER_JOB_FWUPDATE_MAGIC) == 0) {
         processJobFirmwareUpdate(fields, fieldCount, remoteIp);
     } else if (strcmp(fields[0], CLUSTER_JOB_FWUPDATE_ACK_MAGIC) == 0) {
@@ -4935,8 +5031,13 @@ bool clusterRequestNodeShutdown(const String &nodeId, String &error)
 bool clusterRequestNodeCapture(const String &nodeId,int64_t utcUs,String &error,bool testPulse){
     if(!clusterLocalIsCoordinator()){error="Nur am Coordinator.";return false;}
     int64_t nowUtc=0;
-    if(!clusterTimeNowUs(nowUtc)||utcUs-nowUtc<2000000LL||utcUs-nowUtc>1800000000LL){
-        error="Capture-Zeit muss 2 Sekunden bis 30 Minuten in der Zukunft liegen.";return false;
+    // Nodes accept a job up to 1.5 s before the shot; the quick shot (2 s)
+    // reaches the last of many nodes a few ms later, so allow 1.6 s here.
+    // Armed cluster: instant shot (300 ms planned); otherwise 2 s as before.
+    const bool armed=coordSharpUntilMs && (int32_t)(coordSharpUntilMs-millis())>0;
+    const int64_t minLeadUs=armed?250000LL:2000000LL;
+    if(!clusterTimeNowUs(nowUtc)||utcUs-nowUtc<minLeadUs||utcUs-nowUtc>1800000000LL){
+        error=armed?"Sofortaufnahme: Zeitpunkt zu knapp.":"Capture-Zeit muss 2 Sekunden bis 30 Minuten in der Zukunft liegen.";return false;
     }
     const ClusterPeer *peer=findPeer(nodeId.c_str());
     if(!peer||!peer->used||!usableIp(peer->ip)||!peer->bootNonce||
@@ -5089,6 +5190,49 @@ bool clusterRequestNodeCameraProfile(const String &nodeId, const String &profile
         error = "Profil-Auftrag nicht gesendet."; return false;
     }
     return true;
+}
+
+bool clusterSharpActive()
+{
+    return sharpUntilMs && (int32_t)(sharpUntilMs - millis()) > 0;
+}
+
+uint32_t clusterCoordinatorSharpRemainingS()
+{
+    if (!coordSharpUntilMs || (int32_t)(coordSharpUntilMs - millis()) <= 0)
+        return 0;
+    return (coordSharpUntilMs - millis() + 999UL) / 1000UL;
+}
+
+bool clusterRequestNodeSharp(const String &nodeId, uint32_t seconds, String &error)
+{
+    if (!clusterLocalIsCoordinator()) { error = "Nur am Coordinator."; return false; }
+    if (seconds > CLUSTER_SHARP_MAX_S) { error = "Höchstens 3600 s."; return false; }
+    ClusterPeer *peer = findPeer(nodeId.c_str());
+    if (!peer || !peer->used || !usableIp(peer->ip) || !peer->bootNonce ||
+        (uint32_t)(millis() - peer->lastSeenMs) > 60000UL) {
+        error = "Node nicht erreichbar/authentifiziert."; return false;
+    }
+    if (rejectStandbyNodeAction(peer, error)) return false;
+    if (++probeSeq == 0) ++probeSeq;
+    char cb[9], nb[9];
+    snprintf(cb, sizeof(cb), "%08lx", (unsigned long)bootNonce);
+    snprintf(nb, sizeof(nb), "%08lx", (unsigned long)peer->bootNonce);
+    const String msg = String(CLUSTER_JOB_SHARP_MAGIC) + "|" + runtimeClusterTag + "|" +
+        deviceIntegrationId() + "|" + cb + "|" + String((unsigned long)currentCoordinatorEpoch) +
+        "|" + nodeId + "|" + nb + "|" + String((unsigned long)probeSeq) + "|" + String((unsigned long)seconds);
+    peer->sharpAckMs = 0;
+    if (!sendSignedPayloadTo(msg, peer->ip, CLUSTER_COORDINATOR_PORT, "sharp")) {
+        error = "Auftrag nicht gesendet."; return false;
+    }
+    return true;
+}
+
+void clusterCoordinatorSetSharp(uint32_t seconds)
+{
+    if (!seconds) { coordSharpUntilMs = 0; return; }
+    const uint32_t until = millis() + seconds * 1000UL;
+    coordSharpUntilMs = until ? until : 1;
 }
 
 bool clusterRequestNodeFirmwareUpdate(const String &nodeId, const String &manifestUrl, bool allowOlder,
@@ -5522,6 +5666,10 @@ static String buildClusterStatusJson(ClusterStatusChunkSink sink, void *ctx)
     json += ",\"drone_mode_local\":" + String(droneModeEnabled()?"true":"false");
     json += ",\"local_role\":\"" +
         String(localIsCoordinator ? "coordinator" : "node") + "\"";
+    // Instant shot: coordinator = armed cluster time left, node = own state.
+    json += ",\"sharp_remaining_s\":" + String((unsigned long)(localIsCoordinator
+        ? clusterCoordinatorSharpRemainingS()
+        : (clusterSharpActive() ? (sharpUntilMs - millis()) / 1000UL : 0)));
     json += ",\"coordinator_heartbeat_sec\":" +
         String((unsigned long)(CLUSTER_COORDINATOR_HEARTBEAT_MS / 1000UL));
     json += ",\"coordinator_lease_sec\":" +
@@ -5822,6 +5970,13 @@ static String buildClusterStatusJson(ClusterStatusChunkSink sink, void *ctx)
         json += ",\"coordinator_policy\":\"" +
             String(coordinatorPolicyName(peer.coordinatorPolicy)) + "\"";
         json += ",\"precision_sync\":\"" + String(precisionSyncName(peer.coordinationCapabilities)) + "\"";
+        if (peer.captureReserveSeq)
+            json += ",\"capture_reserve_ms\":" + String((unsigned long)peer.captureReserveMs) +
+                    ",\"capture_reserve_seq\":" + String((unsigned long)peer.captureReserveSeq);
+        if (peer.sharpAckMs)
+            json += ",\"sharp_code\":" + String((unsigned)peer.sharpCode) + ",\"sharp_remaining_s\":" +
+                    String((unsigned long)peer.sharpRemainingS) + ",\"sharp_age_s\":" +
+                    String((unsigned long)((millis() - peer.sharpAckMs) / 1000UL));
         appendMountJson(json, peer.mountValid, peer.mount);
         json += ",\"cluster_role\":\"" +
             String(

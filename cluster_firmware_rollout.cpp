@@ -51,7 +51,8 @@ struct Entry {
 constexpr uint32_t kAckTimeoutMs = 8000;
 constexpr uint8_t kSendAttempts = 2;
 constexpr uint32_t kUpdateTimeoutMs = 5UL * 60UL * 1000UL;
-constexpr uint32_t kRebootTimeoutMs = 4UL * 60UL * 1000UL;
+// A normal restart takes 12-30 s; a node not back after 2 min needs a power cycle.
+constexpr uint32_t kRebootTimeoutMs = 2UL * 60UL * 1000UL;
 
 std::vector<Entry> entries;
 String rolloutUrl;
@@ -128,7 +129,6 @@ void serviceEntry(Entry &e)
         if (!clusterRequestNodeFirmwareUpdate(e.id, rolloutUrl, rolloutAllowOlder, e.seq, error)) {
             setState(e, State::Failed);
             e.text = error;
-            stopRollout("Abgebrochen bei " + e.hostname + ": " + error);
             return;
         }
         ++e.sendAttempts;
@@ -146,7 +146,6 @@ void serviceEntry(Entry &e)
         }
         setState(e, State::Failed);
         e.text = "keine Antwort auf den Update-Auftrag";
-        stopRollout("Abgebrochen bei " + e.hostname + ": keine Antwort");
         return;
     case State::Accepted:
         if (checkReturned(e))
@@ -154,19 +153,14 @@ void serviceEntry(Entry &e)
         if (age > kUpdateTimeoutMs) {
             setState(e, State::Failed);
             e.text = "kein Ergebnis innerhalb von 5 min";
-            stopRollout("Abgebrochen bei " + e.hostname + ": Zeitüberschreitung");
         }
         return;
     case State::Selected:
-        if (checkReturned(e)) {
-            if (e.state == State::Failed)
-                stopRollout("Abgebrochen bei " + e.hostname + ": " + e.text);
+        if (checkReturned(e))
             return;
-        }
         if (age > kRebootTimeoutMs) {
             setState(e, State::Failed);
-            e.text = "nach dem Neustart nicht zurückgekehrt";
-            stopRollout("Abgebrochen bei " + e.hostname + ": nicht zurückgekehrt");
+            e.text = "nach dem Neustart nicht zurückgekehrt – Gerät kurz stromlos machen";
         }
         return;
     default:
@@ -234,8 +228,6 @@ void clusterFirmwareRolloutNote(const char *nodeId, uint32_t seq, uint8_t code, 
             setState(e, State::Failed);
             if (!text.length())
                 e.text = codeName(code);
-            if (rolloutRunning)
-                stopRollout("Abgebrochen bei " + e.hostname + ": " + e.text);
         }
         return;
     }
@@ -256,16 +248,24 @@ void clusterFirmwareRolloutService()
         stopRollout("Nicht mehr Coordinator");
         return;
     }
+    // One node at a time; a failed node is marked and the rollout continues.
+    size_t failedCount = 0;
     for (Entry &e : entries) {
-        if (e.state == State::Done || e.state == State::Skipped)
+        if (e.state == State::Failed) {
+            ++failedCount;
             continue;
-        if (e.state == State::Failed || e.state == State::Stopped)
-            return;
+        }
+        if (e.state == State::Done || e.state == State::Skipped || e.state == State::Stopped)
+            continue;
         serviceEntry(e);
-        return;   // one node at a time
+        return;
     }
     rolloutRunning = false;
-    rolloutMessage = "Alle Nodes bearbeitet. Den Coordinator zuletzt mit „Coordinator aktualisieren“.";
+    rolloutMessage = failedCount
+        ? String("Fertig, ") + String((unsigned)failedCount) +
+              " Gerät(e) rot markiert (kurz stromlos machen und den Rollout erneut starten – "
+              "aktuelle Geräte werden übersprungen). Den Coordinator zuletzt mit „Coordinator aktualisieren“."
+        : String("Alle Nodes bearbeitet. Den Coordinator zuletzt mit „Coordinator aktualisieren“.");
 }
 
 String clusterFirmwareRolloutJson()

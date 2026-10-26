@@ -73,6 +73,16 @@ bool clusterRequestNodeCameraProfile(const String &nodeId, const String &profile
                                      uint8_t mode, String &error);
 // Capture time in UTC microseconds; shared across all selected nodes.
 // testPulse: request the optional GPIO test pulse (SFJC1 field "tp1"), default off.
+// Instant shot: arm nodes (SFJH1; seconds 0 = disarm). Armed nodes keep the
+// camera awake, refuse live frames and accept capture jobs with a short lead.
+bool clusterRequestNodeSharp(const String &nodeId, uint32_t seconds, String &error);
+// Coordinator: the cluster counts as armed until the given time (planning
+// allows the instant shot's short lead only then).
+void clusterCoordinatorSetSharp(uint32_t seconds);
+uint32_t clusterCoordinatorSharpRemainingS();
+// Node: currently armed.
+bool clusterSharpActive();
+
 // Cluster firmware update (firmware_cluster_update.h, SFJU1/SFJUA1). seq
 // identifies the answers (clusterFirmwareRolloutNote).
 bool clusterRequestNodeFirmwareUpdate(const String &nodeId, const String &manifestUrl, bool allowOlder,

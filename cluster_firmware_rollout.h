@@ -5,8 +5,8 @@
 
 // Coordinator: cluster firmware rollout. Sends the signed update job
 // (clusterRequestNodeFirmwareUpdate) to one node at a time, waits until it is
-// back with a new boot and the new release, then the next one; stops at the
-// first failure. The coordinator itself is updated by a separate action
+// back with a new boot and the new release, then the next one; a failed node
+// is marked (operator power-cycles it) and the rollout continues. The coordinator itself is updated by a separate action
 // (FirmwareClusterUpdate::requestLocal). loopTask only.
 
 // Answer of a node (cluster.cpp, SFJUA1).

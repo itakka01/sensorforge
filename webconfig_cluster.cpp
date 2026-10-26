@@ -484,7 +484,9 @@ window.sfOnStatus(function(d){sfRenderCapacity('sfCoordCapacityWarning',d);});
 <dialog id='clusterActionDialog' style='max-width:min(90vw,650px);padding:24px;border-radius:14px'><h3>Cluster-Aktionen</h3><p>Drone Mode hält Nodes passiv bereit: kein automatisches Recording, kein Power Shooter, keine Bewegungserkennung und keine Hintergrund-SD-Recovery. Laufende Aufnahmen werden beim Einschalten kontrolliert beendet. Clusterzeit, geplante Capture-Jobs, Webverwaltung und Temperaturschutz bleiben verfügbar.</p><p>Sammelaktionen werden einzeln und signiert pro Node ausgeführt. Der Coordinator ist nicht auswählbar. Remote-Shutdown benötigt RESET oder Stromversorgung zum Wiederaufwachen.</p><p>HTTP-Annahme bestätigt nicht die Ausführung. Ergebnisse bitte im Status prüfen.</p><button type='button' id='clusterActionDialogClose'>Schließen</button></dialog>
 <div class='cluster-select-tools'><strong>Foto in</strong> <label for='clusterCaptureHours'>Stunden</label> <input id='clusterCaptureHours' type='number' min='0' max='23' step='1' value='0' style='width:4.5em'> <label for='clusterCaptureMinutes'>Minuten</label> <input id='clusterCaptureMinutes' type='number' min='0' max='59' step='1' value='0' style='width:4.5em'> <label for='clusterCaptureSeconds'>Sekunden</label> <input id='clusterCaptureSeconds' type='number' min='0' max='59' step='1' value='5' style='width:4.5em'> <label title='Nur XIAO-Nodes mit aktueller Firmware: Impuls an D1/GPIO2 direkt am Start des aufnehmenden fb_get(). Ältere Firmware verwirft solche Aufträge.'><input type='checkbox' id='clusterCaptureTestPulse'> GPIO-Testimpuls (D1)</label> <button type='button' id='clusterBulkCapture'>Aufnahme planen</button> <output id='clusterPlannedTime' style='font-variant-numeric:tabular-nums;font-weight:700'>UTC-Zeit wird geladen …</output></div>
 <!-- Direkte UTC-Eingabe kann später wieder aktiviert werden. sfPlanUtcTarget() akzeptiert dafür einen optionalen UTC-ISO-Termin; aktuell nutzt das Formular ausschließlich relative Zeit. -->
-<div class='cluster-select-tools'><button type='button' id='sfSyncOpen'>Sync-Testbild im Vollbild öffnen</button> <span class='muted'>Beim Capture öffnet sich automatisch ein großes Vollbild-Popup. Countdown und Balken laufen bis 5 s nach dem Auslösezeitpunkt.</span></div>
+<div class='cluster-select-tools'><strong>Sofortaufnahme</strong> <label for='sfSharpMinutes'>scharf für</label> <select id='sfSharpMinutes'><option value='5'>5 min</option><option value='10' selected>10 min</option><option value='30'>30 min</option><option value='60'>60 min</option></select> <button type='button' id='sfSharpOn'>Kameras scharf schalten</button> <button type='button' id='sfSharpOff'>Entschärfen</button> <button type='button' id='sfCaptureNow' class='danger' disabled style='font-weight:800'>SOFORT AUSLÖSEN</button></div>
+<div id='sfSharpBanner' style='display:none;margin:8px 0;padding:12px 16px;border-radius:10px;background:#b91c1c;color:#fff;font-weight:800;font-size:1.15rem'></div>
+<div class='cluster-select-tools'><button type='button' id='sfSyncOpen'>Sync-Testbild im Vollbild öffnen</button> <span class='muted'>Beim Capture öffnet sich automatisch ein großes Vollbild-Popup. Countdown und Balken laufen bis 2 s nach dem Auslösezeitpunkt.</span></div>
 <div id='sfSyncScreen' aria-label='Visuelle Synchronisationsanzeige' style='display:none'>
  <div class='sf-sync-stage'><div class='sf-sync-top'><strong>CLUSTER SYNC · BILDSCHIRMTEST</strong><button id='sfSyncClose' type='button'>Anzeige schließen</button></div><div id='sfSyncPhase' class='sf-sync-phase'>BEREIT</div><div id='sfSyncClock' class='sf-sync-clock'>--:--.---</div><div id='sfSyncTarget' class='sf-sync-target'>Noch kein Capture geplant</div><div id='sfSyncBars' class='sf-sync-bars'></div><div class='sf-sync-foot'>Bildschirm-Refresh und Browser-Timing begrenzen die Genauigkeit. Balken sind eine visuelle Orientierung, kein Millisekunden-Nachweis.</div></div>
 </div>
@@ -716,7 +718,7 @@ function sfCaptureClockFromStatus(d,receivedPerf){
 }
 function sfCaptureUtcNow(){return sfCaptureClock?sfCaptureClock.utcMs+(performance.now()-sfCaptureClock.perfMs):NaN;}
 // Visual test uses the same monotonic target anchor as the compact countdown.
-// The overlay remains visible for five seconds after the scheduled capture.
+// The overlay remains visible for two seconds after the scheduled capture.
 var sfCountdownTick=null,sfCountdownStartPerf=0,sfCountdownDelay=0,sfSyncRaf=null,sfSyncLastDraw=0,sfSyncAutoOpened=false,sfCountdownActive=false;
 var sfSyncPeriods=[['2 s',2000,'#ffffff'],['1 s',1000,'#ff4242'],['500 ms',500,'#00aaff'],['100 ms',100,'#00f070'],['50 ms',50,'#ffe600']];
 var sfSyncScreen=document.getElementById('sfSyncScreen'),sfSyncBarEls=[];
@@ -744,7 +746,7 @@ function sfStopCaptureCountdown(){
 function sfSyncPaint(now){
  if(!sfCountdownStartPerf)return;
  var elapsed=now-sfCountdownStartPerf,relative=elapsed-sfCountdownDelay,after=relative>=0;
- if(relative>5000){sfStopCaptureCountdown();return;}
+ if(relative>2000){sfStopCaptureCountdown();return;}
  var clock=document.getElementById('clusterCaptureClock'),panel=document.getElementById('clusterCaptureCountdown');
  var abs=Math.abs(relative),tenths=Math.floor(abs/100),secs=Math.floor(tenths/10);
  clock.textContent=(after?'+':'-')+String(Math.floor(secs/60)).padStart(2,'0')+':'+String(secs%60).padStart(2,'0')+'.'+String(tenths%10);
@@ -806,6 +808,52 @@ document.getElementById('clusterBulkCapture').addEventListener('click',async fun
  out.textContent='UTC '+new Date(target).toISOString()+' · '+accepted+'/'+ids.length+' angenommen'+(testPulse?' · mit GPIO-Testimpuls':'')+'. '+results.join(' | ')+'. Die grüne Anzeige kennzeichnet nur den geplanten Zeitpunkt; Capture-Ergebnisse stehen in der Node-Tabelle.';
  if(accepted&&!shown)sfShowCaptureCountdown(target);
  }finally{window.sfCoordinatorBulkActive=false;button.disabled=false;sfRenderCaptureReport();window.sfCoordinateStatus(true).catch(function(){});if(accepted)window.sfStatusBurst(Math.min(300000,Math.max(0,target-sfCaptureUtcNow())+60000));}
+});
+// Instant shot: arm (camera awake, no standby), then fire with the shortest
+// safe lead. The banner counts down locally and is corrected by the status.
+var sfSharpUntil=0,sfSharpTimer=null;
+function sfSharpRender(){var b=document.getElementById('sfSharpBanner'),now=Date.now(),left=Math.max(0,Math.round((sfSharpUntil-now)/1000)),btn=document.getElementById('sfCaptureNow');
+ if(!left){b.style.display='none';btn.disabled=true;if(sfSharpTimer){clearInterval(sfSharpTimer);sfSharpTimer=null;}return;}
+ var nodes=(sfLatestStatus&&Array.isArray(sfLatestStatus.nodes))?sfLatestStatus.nodes:[],armed=nodes.filter(function(n){return !n.local&&n.sharp_code===0&&Number(n.sharp_remaining_s)-Number(n.sharp_age_s)>0;}).length,bad=nodes.filter(function(n){return !n.local&&n.sharp_code>0;});
+ b.style.display='block';btn.disabled=false;
+ b.textContent='● KAMERAS SCHARF – noch '+Math.floor(left/60)+':'+String(left%60).padStart(2,'0')+' · '+armed+' Node(s) bestätigt'+(bad.length?' · nicht bereit: '+bad.map(function(n){return n.hostname+(n.sharp_code===2?' (kein Drone Mode)':' (Kamera)');}).join(', '):'')+' · Live-Bilder sind gesperrt';}
+function sfSharpSet(seconds){sfSharpUntil=seconds>0?Date.now()+seconds*1000:0;if(!sfSharpTimer&&seconds>0)sfSharpTimer=setInterval(sfSharpRender,500);sfSharpRender();}
+window.sfOnStatus(function(d){if(d&&typeof d.sharp_remaining_s==='number'){var left=Number(d.sharp_remaining_s);if(Math.abs(sfSharpUntil-(Date.now()+left*1000))>2000||!left)sfSharpSet(left);else sfSharpRender();}});
+async function sfSharpSend(seconds){var ids=sfActionableSelectedIds(),out=document.getElementById('clusterCaptureFeedback');
+ if(!ids.length){out.textContent='Bitte Nodes auswählen.';return;}
+ var fd=new URLSearchParams();fd.append('node_ids',ids.join(','));fd.append('seconds',String(seconds));
+ try{var r=await fetch('/cluster_sharp',{method:'POST',body:fd,credentials:'same-origin',cache:'no-store'});var j=await r.json().catch(function(){return {ok:false};});
+  out.textContent=seconds?('Scharf schalten an '+(j.sent||0)+'/'+ids.length+' Nodes gesendet'+((j.failed||[]).length?' · Fehler: '+j.failed.map(function(f){return f.id+': '+f.error;}).join(' | '):'')+'. Bestätigungen erscheinen im Banner.'):'Entschärft.';
+  if(j.ok||!seconds)sfSharpSet(seconds);window.sfStatusBurst(15000);}
+ catch(e){out.textContent='Übertragungsfehler: '+(e.message||e);}}
+document.getElementById('sfSharpOn').addEventListener('click',function(){sfSharpSend(Number(document.getElementById('sfSharpMinutes').value)*60);});
+document.getElementById('sfSharpOff').addEventListener('click',function(){sfSharpSend(0);});
+document.getElementById('sfCaptureNow').addEventListener('click',async function(){
+ var ids=sfActionableSelectedIds(),out=document.getElementById('clusterCaptureFeedback');
+ if(!ids.length){out.textContent='Bitte Nodes auswählen.';return;}
+ var button=this;button.disabled=true;
+ // Send first: every millisecond of waiting is lost lead. Status follows.
+ var fd=new URLSearchParams();fd.append('node_ids',ids.join(','));if((document.getElementById('clusterCaptureTestPulse')||{}).checked)fd.append('test_pulse','1');
+ var known=(sfLatestStatus&&Array.isArray(sfLatestStatus.job_probes))?sfLatestStatus.job_probes:[];
+ known.forEach(function(j){if(Number(j.kind)===6)sfSeenCaptureJobs.add(sfCaptureJobKey(j));});
+ try{
+  var r=await fetch('/cluster_capture_now',{method:'POST',body:fd,credentials:'same-origin',cache:'no-store'});
+  var j=await r.json().catch(function(){return {ok:false,message:'HTTP '+r.status};});
+  if(!j.target_utc_ms){out.textContent='Nicht ausgelöst: '+(j.message||('HTTP '+r.status));return;}
+  var target=Number(j.target_utc_ms),acc=new Set(j.accepted||[]),fail={};(j.failed||[]).forEach(function(f){fail[f.id]=f.error;});
+  sfCaptureGallery.clear();var gc=document.getElementById('sfCaptureGalleryCount');if(gc)gc.textContent='0';
+  var names=Array.isArray((sfLatestStatus||{}).nodes)?sfLatestStatus.nodes:[];
+  sfCaptureReport={target:target,rows:ids.map(function(id){var n=names.find(function(x){return String(x.integration_id)===id;});return {id:id,name:n?(n.hostname||id):id,http:acc.has(id)?'accepted':'error',job:null};})};
+  sfShowCaptureCountdown(target);sfRenderCaptureReport();
+  out.textContent='Sofortaufnahme UTC '+new Date(target).toISOString()+' (Vorlauf '+j.lead_ms+' ms) · '+acc.size+'/'+ids.length+' Aufträge gesendet'+(Object.keys(fail).length?' · '+Object.keys(fail).map(function(k){return k+': '+fail[k];}).join(' | '):'')+'.';
+  // Reserve check: every node reports how long before the shot it had the job.
+  setTimeout(function(){window.sfCoordinateStatus(true).then(function(d){var rows=(d.nodes||[]).filter(function(n){return acc.has(String(n.integration_id))&&n.capture_reserve_ms!=null;});
+   if(!rows.length){out.textContent+=' Reserve: keine Rückmeldung.';return;}
+   rows.sort(function(a,b){return a.capture_reserve_ms-b.capture_reserve_ms;});
+   out.textContent+=' Reserve: kleinste '+rows[0].capture_reserve_ms+' ms ('+rows[0].hostname+'), größte '+rows[rows.length-1].capture_reserve_ms+' ms; '+rows.length+'/'+acc.size+' Nodes gemeldet.';}).catch(function(){});},Math.max(1500,target-Date.now()+1500));
+  window.sfStatusBurst(60000);
+ }catch(e){out.textContent='Übertragungsfehler: '+(e.message||e)+' (Ausführung unbekannt)';}
+ finally{button.disabled=!(sfSharpUntil>Date.now());}
 });
 var sfActionDialog=document.getElementById('clusterActionDialog');
 document.getElementById('clusterActionInfo').addEventListener('click',function(){if(sfActionDialog.showModal)sfActionDialog.showModal();else sfActionDialog.setAttribute('open','');});
@@ -1529,6 +1577,99 @@ int clusterTxPowerRequestFromArgs(WebServer &srv, String &json)
     return 202;
 }
 
+// Splits "id,id,..." and calls fn(id) for each non-empty id.
+template <typename Fn>
+static void forEachNodeId(const String &ids, Fn fn)
+{
+    int start = 0;
+    while (start < (int)ids.length()) {
+        int comma = ids.indexOf(',', start);
+        if (comma < 0) comma = ids.length();
+        String id = ids.substring(start, comma);
+        id.trim();
+        start = comma + 1;
+        if (id.length())
+            fn(id);
+    }
+}
+
+// POST /cluster_sharp: node_ids=<id,...>&seconds=600 (0 = disarm). Arms the
+// nodes for the instant shot (camera awake, no standby, no live frames).
+static void handleClusterSharp()
+{
+    if (!clusterLocalIsCoordinator()) {
+        server.send(403, "text/plain; charset=utf-8", "Nur am Coordinator");
+        return;
+    }
+    const long seconds = server.arg("seconds").toInt();
+    if (seconds < 0 || seconds > 3600) {
+        server.send(400, "application/json; charset=utf-8",
+                    "{\"ok\":false,\"message\":\"seconds 0 bis 3600\"}");
+        return;
+    }
+    size_t sent = 0, failCount = 0;
+    String failed;
+    forEachNodeId(server.arg("node_ids"), [&](const String &id) {
+        String error;
+        if (clusterRequestNodeSharp(id, (uint32_t)seconds, error)) ++sent;
+        else failed += String(failCount++ ? "," : "") + "{\"id\":\"" + jsonEscapeLocal(id) +
+                       "\",\"error\":\"" + jsonEscapeLocal(error) + "\"}";
+        clusterServiceTimeCritical();
+    });
+    if (sent || !seconds)
+        clusterCoordinatorSetSharp((uint32_t)seconds);
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(sent ? 200 : 409, "application/json; charset=utf-8",
+                String("{\"ok\":") + (sent ? "true" : "false") + ",\"sent\":" + String((unsigned)sent) +
+                    ",\"failed\":[" + failed + "]}");
+}
+
+// Lead of the instant shot: delivery to every node plus a safety margin
+// (nodes report their reserve, capture_reserve_ms, to verify it).
+static const int64_t CLUSTER_INSTANT_LEAD_US = 300000LL;
+
+// POST /cluster_capture_now: node_ids=<id,...>[&test_pulse=1]. Only while the
+// cluster is armed. One UTC time = now + 300 ms, the normal signed capture job
+// to every node in one pass.
+static void handleClusterCaptureNow()
+{
+    if (!clusterLocalIsCoordinator()) {
+        server.send(403, "text/plain; charset=utf-8", "Nur am Coordinator");
+        return;
+    }
+    if (!clusterCoordinatorSharpRemainingS()) {
+        server.send(409, "application/json; charset=utf-8",
+                    "{\"ok\":false,\"message\":\"Kameras nicht scharf geschaltet\"}");
+        return;
+    }
+    int64_t nowUtc = 0;
+    if (!clusterTimeNowUs(nowUtc)) {
+        server.send(409, "application/json; charset=utf-8",
+                    "{\"ok\":false,\"message\":\"Keine gültige Clusterzeit\"}");
+        return;
+    }
+    const int64_t targetUs = ((nowUtc + CLUSTER_INSTANT_LEAD_US) / 1000LL) * 1000LL;
+    const bool testPulse = server.arg("test_pulse") == "1";
+    ClusterEspNowRadio::pauseForCapture(10000UL);
+    String accepted, failed;
+    size_t okCount = 0, failCount = 0;
+    forEachNodeId(server.arg("node_ids"), [&](const String &id) {
+        String error;
+        if (clusterRequestNodeCapture(id, targetUs, error, testPulse))
+            accepted += String(okCount++ ? "," : "") + "\"" + jsonEscapeLocal(id) + "\"";
+        else
+            failed += String(failCount++ ? "," : "") + "{\"id\":\"" + jsonEscapeLocal(id) +
+                      "\",\"error\":\"" + jsonEscapeLocal(error) + "\"}";
+    });
+    char target[24];
+    snprintf(target, sizeof(target), "%lld", (long long)(targetUs / 1000LL));
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(okCount ? 200 : 409, "application/json; charset=utf-8",
+                String("{\"ok\":") + (okCount ? "true" : "false") + ",\"target_utc_ms\":" + target +
+                    ",\"lead_ms\":" + String((long)(CLUSTER_INSTANT_LEAD_US / 1000LL)) +
+                    ",\"accepted\":[" + accepted + "],\"failed\":[" + failed + "]}");
+}
+
 void webconfigClusterSendLargeJson(WebServer &serverInstance, const String &json)
 {
     static const size_t kPartBytes = 4096;
@@ -1571,6 +1712,8 @@ void webconfigClusterRegisterRoutes(
     serverInstance.on("/cluster_node_shutdown", HTTP_POST, handleClusterNodeShutdown);
     serverInstance.on("/cluster_node_wipe", HTTP_POST, handleClusterNodeWipe);
     serverInstance.on("/cluster_node_capture", HTTP_POST, handleClusterNodeCapture);
+    serverInstance.on("/cluster_sharp", HTTP_POST, handleClusterSharp);
+    serverInstance.on("/cluster_capture_now", HTTP_POST, handleClusterCaptureNow);
     serverInstance.on("/cluster_node_drone", HTTP_POST, handleClusterNodeDrone);
     serverInstance.on("/cluster_tx_power", HTTP_GET, handleClusterTxPowerGet);
     serverInstance.on("/cluster_tx_power", HTTP_POST, handleClusterTxPowerPost);

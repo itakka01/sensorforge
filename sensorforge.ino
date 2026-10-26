@@ -8507,6 +8507,7 @@ bool cameraIdleStandbyActive()
 static bool cameraIdleStandbyAllowed()
 {
     return droneModeEnabled() &&
+        !clusterSharpActive() &&
         !recording &&
         !recorderIsOpen() &&
         !streamerReady() &&
