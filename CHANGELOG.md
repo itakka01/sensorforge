@@ -1,3 +1,9 @@
+## v87-beta160 — 2026-10-26 (KAMERA-STANDBY IM DRONE MODE, MANIFEST-URL SPEICHERN)
+
+- **NEU – Kamera-Standby im Leerlauf** (`camera_power.h`): Im Drone Mode geht der Sensor nach 30 s ohne Nutzung in seinen Software-Power-Down (Register 0x3008 Bit 6, jetzt OV3660 **und** OV5640) – keine Bildausgabe, deutlich weniger Strom und Wärme, kein Bildverkehr. Geweckt wird mit `cameraWakeForUse()` von: geplanter Cluster-Aufnahme (2 s vorher über `clusterCapturePrepareCamera`, zusätzlich unmittelbar vor dem Bild), Live-Bild/Kleinbild, Zeilenmessung, Bildabstimmung (Anwenden), WebConfig-Vorschau, API-Bild, Streamer. Kein Standby während Aufnahme, Streamer, API-Sitzung, geplanter Cluster-Aufnahme, Vorschau oder Thermal-Notfall; endet der Drone Mode, wird die Kamera sofort geweckt. Der bisherige Lichtschlaf-Standby (nur OV3660) bleibt unverändert. Kamera-Übersicht zeigt den Zustand „standby“. Wirkung (Strom/Temperatur) noch zu messen.
+- Sendeleistung aller Nodes per Coordinator auf 8,5 dBm gesetzt (dauerhaft; c004 war aus).
+- „Firmware im Cluster“: „Manifest prüfen & URL speichern“ speichert die URL, sobald das Manifest lesbar ist (bisher erst beim Start eines Rollouts oder „Coordinator aktualisieren“). API `action=check` ebenso.
+
 ## v87-beta159 — 2026-10-26 (TESTRELEASE FÜR DAS WLAN-UPDATE)
 
 Inhalt wie beta158, nur höhere Versionsnummer: erster Test des Cluster-Updates übers WLAN (beta158 → beta159).

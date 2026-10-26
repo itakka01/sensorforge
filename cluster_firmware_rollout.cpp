@@ -321,6 +321,13 @@ int clusterFirmwareRolloutRequestFromArgs(WebServer &srv, String &json)
         if (!argUrl(srv, url, json, code))
             return code;
         const bool ok = firmwareManifestList(url, list, detail);
+        // A readable manifest is remembered as the URL of this page.
+        if (ok) {
+            storeUrl(url);
+            if (!rolloutRunning)
+                rolloutUrl = url;
+            detail += " · URL gespeichert";
+        }
         json = String("{\"ok\":") + (ok ? "true" : "false") + ",\"message\":\"" + jsonEscape(detail) +
                "\",\"releases\":" + list + ",\"installed\":\"" SENSORFORGE_RELEASE_TAG "\"}";
         return ok ? 200 : 502;

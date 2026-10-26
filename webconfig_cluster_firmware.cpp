@@ -60,7 +60,7 @@ void handlePage()
             "<p><label for='fwUrl'><strong>Manifest-URL</strong></label><br>"
             "<input id='fwUrl' type='text' style='width:100%;max-width:520px' placeholder='http://192.168.0.10:8765/manifest.json'></p>"
             "<p><label><input type='checkbox' id='fwOlder'> Ältere Version erlauben (Downgrade)</label></p>"
-            "<p><button type='button' id='fwCheck'>Manifest prüfen</button> "
+            "<p><button type='button' id='fwCheck'>Manifest prüfen &amp; URL speichern</button> "
             "<button type='button' class='primary' id='fwStart'>Nodes aktualisieren (nacheinander)</button> "
             "<button type='button' id='fwStop'>Anhalten</button> "
             "<button type='button' id='fwLocal'>Coordinator aktualisieren</button> "

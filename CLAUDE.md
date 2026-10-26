@@ -190,7 +190,7 @@ Physical (SD/LittleFS)
 #### 5. Kamera-Ownership (geprüft 2026-10-25)
 Alle 16 `esp_camera_fb_get()`-Aufrufe laufen im loopTask (WebServer, Streamer, Cluster-Capture, Recorder, Preview); kein anderer Task greift auf die Kamera zu, und kein Aufrufer ruft zwischen `fb_get` und `fb_return` einen anderen Dienst auf (nur Netzwerk-Schreiben). Gleichzeitige `fb_get` sind damit ausgeschlossen. Wer die Kamera nutzen darf, regeln weiter kooperative Flags (`recording`, Streamer, Preview, Drone Mode).
 **Regel:** Kamera nur im loopTask benutzen und während ein Frame gehalten wird keine Loop-Dienste (`webConfigLoop`, `clusterLoop`, Service-Callbacks) aufrufen.
-Seit beta155 holt auch `/camera_frame` (Live-Bild für Bildabstimmung/Kamera-Übersicht, `clusterCaptureLiveFrame`) Bilder im loopTask, gesperrt solange `clusterCaptureProtectionActive()`. JPEG-Neukodierung über `esp_new_jpeg` (seit beta157, `camera_thumbnail.cpp`) mit `jpeg_mini_encoder` als Rückfall; nicht `fmt2jpg` (der Encoder der Kamera-Bibliothek belegt ~7 KB statischen internen RAM).
+Seit beta160 kann die Kamera im Drone Mode im Standby (Software-Power-Down) sein: jeder neue Kamera-Nutzer ruft vor `esp_camera_fb_get()` `cameraWakeForUse()` (camera_power.h) auf. Seit beta155 holt auch `/camera_frame` (Live-Bild für Bildabstimmung/Kamera-Übersicht, `clusterCaptureLiveFrame`) Bilder im loopTask, gesperrt solange `clusterCaptureProtectionActive()`. JPEG-Neukodierung über `esp_new_jpeg` (seit beta157, `camera_thumbnail.cpp`) mit `jpeg_mini_encoder` als Rückfall; nicht `fmt2jpg` (der Encoder der Kamera-Bibliothek belegt ~7 KB statischen internen RAM).
 
 #### 6. ESP-NOW Zeitsync - µs-Genauigkeit unbewiesen
 **Problem:** Hardware-Validierung fehlt

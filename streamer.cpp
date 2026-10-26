@@ -1,4 +1,5 @@
 #include "streamer.h"
+#include "camera_power.h"
 #include "onvif.h"
 
 #include "audio_capture.h"
@@ -2148,6 +2149,7 @@ static void captureAndDistributeFrame()
         return;
     lastFrameDueMs = now + intervalMs;
 
+    cameraWakeForUse();
     camera_fb_t *frame = esp_camera_fb_get();
     if (!frame) {
         ++consecutiveCaptureFailures;

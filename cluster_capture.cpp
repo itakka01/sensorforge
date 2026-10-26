@@ -6,6 +6,7 @@
 #include "drone_mode.h"
 #include "sync_api.h"
 #include "camera_thumbnail.h"
+#include "camera_power.h"
 #include "esp_camera.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
@@ -59,6 +60,8 @@ uint16_t clusterCapturePhoto(uint64_t jobId,int64_t targetUtcUs,int64_t &dispatc
     if (!cameraInitialized || !esp_camera_sensor_get() || recording || recorderIsOpen() ||
         (streamerModeEnabled() && !droneModeEnabled()) || streamerReady() || syncApiExclusiveActive()) return 1;
     if(!psramFound())return 2;
+    // Normally woken 2 s ahead (clusterCapturePrepareCamera); no-op then.
+    if(!cameraWakeForUse())return 1;
     // CAMERA_GRAB_WHEN_EMPTY can leave up to two completed, older frames
     // queued after an idle period. Hold all configured buffers simultaneously
     // before returning any: the subsequent get must wait for a new frame.
@@ -152,6 +155,7 @@ bool liveCameraReady(String &reason){
     if((!cameraInitialized || !esp_camera_sensor_get()) && !(droneModeEnabled() && clusterCapturePrepareCamera())){
         reason="Kamera ist aus";return false;
     }
+    if(!cameraWakeForUse()){reason="Kamera-Standby nicht beendet";return false;}
     return true;
 }
 }

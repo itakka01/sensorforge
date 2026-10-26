@@ -58,6 +58,7 @@
 #include "webconfig_camera_tuning.h"
 #include "webconfig_cluster_firmware.h"
 #include "firmware_ota_activation.h"
+#include "camera_power.h"
 #include "webconfig_cluster.h"
 #include "webconfig_firmware_auto.h"
 #include "cluster.h"
@@ -9098,6 +9099,7 @@ static void handleSnapshot()
     }
 
     noteCameraPreviewActivity();
+    cameraWakeForUse();
 
     camera_fb_t *fb = esp_camera_fb_get();
 

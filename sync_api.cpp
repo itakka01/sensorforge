@@ -2,6 +2,7 @@
 #include "cluster_camera_profile.h"
 #include "webconfig_camera_tuning.h"
 #include "cluster_firmware_rollout.h"
+#include "camera_power.h"
 #include "sync_api.h"
 
 #include "board_config.h"
@@ -1012,6 +1013,7 @@ static void handleCameraSnapshot()
         return;
     }
 
+    cameraWakeForUse();
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
         sendJsonError(500, "camera_capture_failed", "cannot_capture_jpeg_frame");

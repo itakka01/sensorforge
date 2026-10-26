@@ -39,6 +39,7 @@
 #include "config.h"
 #include "camera_tuning.h"
 #include "camera_profile_store.h"
+#include "camera_power.h"
 #include "firmware_cluster_update.h"
 #include "cluster_firmware_rollout.h"
 #include "recorder.h"
@@ -149,6 +150,10 @@ static uint8_t cameraFramebufferCount = 0;
 static bool cameraSoftPowerDownActive = false;
 // Colour temperature (K) whose manual WB gains are on the running camera; 0 = none.
 static int cameraWbKelvinApplied = 0;
+// Idle standby (camera_power.h): last camera use and whether the current
+// software power down was entered by the idle service.
+static uint32_t cameraLastUseMs = 0;
+static bool cameraIdleStandby = false;
 static bool cameraFastSleepCapabilityKnown = false;
 static bool cameraFastSleepSupported = false;
 static uint16_t cameraDetectedPid = 0;
@@ -6239,6 +6244,8 @@ bool initCamera(
     cameraInitialized = true;
     cameraFramebufferCount = cfg.fb_count;
     cameraSoftPowerDownActive = false;
+    cameraIdleStandby = false;
+    cameraLastUseMs = millis();
     cameraProfileAppliedVersion = useProfile ? profile.version : 0;
 
     // Cache the capability by the actually detected sensor, not by board or
@@ -6342,6 +6349,7 @@ static void cameraDeinitRuntime()
     cameraFramebufferCount = 0;
     cameraSoftPowerDownActive = false;
     cameraWbKelvinApplied = 0;
+    cameraIdleStandby = false;
     cameraCropAppliedZoomX10 = 10;
     cameraCropAppliedX = -1;
     cameraCropAppliedY = -1;
@@ -8394,6 +8402,7 @@ bool cameraApplyTuningRuntime(
         error = "Kamera ist aus";
         return false;
     }
+    cameraWakeForUse();
     if (sensor->set_exposure_ctrl)
         sensor->set_exposure_ctrl(sensor, autoExposure);
     if (sensor->set_ae_level)
@@ -8411,11 +8420,18 @@ static bool cameraEnterSoftPowerDown()
     if (cameraSoftPowerDownActive)
         return true;
 
-    if (!cameraSupportsFastLightSleepNow())
-        return false;
-
     sensor_t *sensor =
         esp_camera_sensor_get();
+
+    // Software power down (0x3008 bit 6) exists on OV3660 and OV5640. The
+    // light-sleep path additionally checks cameraSupportsFastLightSleepNow().
+    if (
+        !sensor ||
+        !sensor->set_reg ||
+        (sensor->id.PID != 0x3660 && sensor->id.PID != 0x5640)
+    ) {
+        return false;
+    }
 
     int result =
         sensor->set_reg(
@@ -8447,7 +8463,7 @@ static bool cameraExitSoftPowerDown()
     if (
         !sensor ||
         !sensor->set_reg ||
-        sensor->id.PID != 0x3660
+        (sensor->id.PID != 0x3660 && sensor->id.PID != 0x5640)
     ) {
         return false;
     }
@@ -8464,7 +8480,73 @@ static bool cameraExitSoftPowerDown()
         return false;
 
     cameraSoftPowerDownActive = false;
+    cameraIdleStandby = false;
     return true;
+}
+
+
+bool cameraWakeForUse()
+{
+    cameraLastUseMs = millis();
+    if (!cameraInitialized || !cameraSoftPowerDownActive)
+        return true;
+    const bool ok = cameraExitSoftPowerDown();
+    if (ok)
+        Serial.println("[CAMERA] standby ended (camera in use)");
+    return ok;
+}
+
+
+bool cameraIdleStandbyActive()
+{
+    return cameraIdleStandby && cameraSoftPowerDownActive;
+}
+
+
+// Nobody else may be using or about to use the camera.
+static bool cameraIdleStandbyAllowed()
+{
+    return droneModeEnabled() &&
+        !recording &&
+        !recorderIsOpen() &&
+        !streamerReady() &&
+        !syncApiExclusiveActive() &&
+        !clusterCaptureProtectionActive() &&
+        !clusterCaptureArmed() &&
+        !thermalEmergencyState &&
+        !(webConfigStarted && webConfigCameraPreviewActive());
+}
+
+
+void cameraIdleStandbyService()
+{
+    static uint32_t lastCheckMs = 0;
+    const uint32_t now = millis();
+    if ((uint32_t)(now - lastCheckMs) < 1000UL)
+        return;
+    lastCheckMs = now;
+
+    if (cameraIdleStandby) {
+        // Drone Mode ended or another owner appeared: hand over an awake camera.
+        if (cameraSoftPowerDownActive && !cameraIdleStandbyAllowed() &&
+            cameraExitSoftPowerDown()) {
+            cameraLastUseMs = now;
+            Serial.println("[CAMERA] standby ended (Drone Mode off or camera owner)");
+        }
+        if (!cameraSoftPowerDownActive)
+            cameraIdleStandby = false;
+        return;
+    }
+    if (!cameraInitialized || cameraSoftPowerDownActive || !cameraIdleStandbyAllowed())
+        return;
+    if (!cameraLastUseMs)
+        cameraLastUseMs = now;   // first check after boot starts the idle timer
+    if ((uint32_t)(now - cameraLastUseMs) < kCameraIdleStandbyMs)
+        return;
+    if (cameraEnterSoftPowerDown()) {
+        cameraIdleStandby = true;
+        Serial.println("[CAMERA] idle standby (Drone Mode, no camera use for 30 s)");
+    }
 }
 
 
@@ -16907,6 +16989,7 @@ void loop() {
     // success) and the coordinator's one-node-at-a-time rollout.
     FirmwareClusterUpdate::service();
     clusterFirmwareRolloutService();
+    cameraIdleStandbyService();
 
     // A dedicated time broadcaster must take priority over Drone Mode.
     // Otherwise a default-enabled Drone Mode would run recorder and OTA
@@ -18162,5 +18245,5 @@ bool clusterCapturePrepareCamera() {
         syncApiExclusiveActive() || thermalEmergencyState ||
         (webConfigStarted && webConfigCameraPreviewActive())) return false;
     if (!initCamera(cfg_camera,cfg_resolution,cfg_quality)) return false;
-    return cameraExitSoftPowerDown();
+    return cameraWakeForUse();
 }
