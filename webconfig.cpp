@@ -19118,6 +19118,10 @@ void webConfigStart()
                 server.send(404,"text/plain","Photo not available (expired, unknown or rebooted)");return;
             }
             server.sendHeader("Cache-Control","no-store");
+            // The coordinator page collects all photos of a shot into one ZIP
+            // (fetch from another device = other origin). The random UUID is
+            // the only handle; the login check above still applies.
+            server.sendHeader("Access-Control-Allow-Origin","*");
             server.sendHeader("Content-Disposition", (server.hasArg("view") && server.arg("view") == "1" ? "inline; filename=\"" : "attachment; filename=\"") + server.arg("uuid") + ".jpg\"");
             server.setContentLength(length);
             server.send(200,"image/jpeg","");

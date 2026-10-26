@@ -520,8 +520,9 @@ window.sfOnStatus(function(d){sfRenderCapacity('sfCoordCapacityWarning',d);});
  <h4 style='margin:0 0 8px'>Capture-Fertigstellungsbericht</h4>
  <div id='clusterCaptureReportSummary' role='status'>Noch kein Auftrag gestartet.</div>
  <button type='button' id='sfShowAllCaptureResults' style='margin:8px 0'>Alle Ergebnisse anzeigen (<span id='sfCaptureGalleryCount'>0</span>)</button>
+ <button type='button' id='sfDownloadAllCaptures' style='margin:8px 0'>Alle Bilder herunterladen (ZIP)</button> <span id='sfZipState' class='muted' role='status'></span>
  <div class='cluster-table-wrap'><table class='cluster-table' style='min-width:0'><thead><tr><th>Node</th><th>Auftrag</th><th>Ergebnis</th><th>Foto / Zeitpunkt / Abruf</th></tr></thead><tbody id='clusterCaptureReportRows'></tbody></table></div>
- <p class='muted' style='margin-bottom:0'>„JPEG erfolgreich“ bestätigt die Kamera-Rückmeldung des Nodes; kein Nachweis für exakten Belichtungsbeginn oder langfristige Speicherung. Bericht nur während dieser Browser-Sitzung; Job-Verlauf im Coordinator-RAM ist begrenzt.</p>
+ <p class='muted' style='margin-bottom:0'>„JPEG erfolgreich“ bestätigt die Kamera-Rückmeldung des Nodes; kein Nachweis für exakten Belichtungsbeginn oder langfristige Speicherung. Nach Neuladen der Seite wird der letzte Shot aus dem Job-Verlauf des Coordinators wiederhergestellt (solange der Coordinator läuft); die Bilder liegen im RAM der Nodes bis zum nächsten Shot oder Neustart des Nodes.</p>
 </div>
 <dialog id='sfCaptureGalleryDialog' style='width:min(96vw,1250px);max-width:1250px;max-height:90vh;box-sizing:border-box;padding:18px;border-radius:14px'>
  <div style='display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap'><h3 style='margin:0'>Ergebnisse des letzten Shots</h3><button type='button' id='sfCaptureGalleryClose'>Schließen</button></div>
@@ -638,7 +639,7 @@ function sfRememberCapture(row){
  var j=row.job||{},media=sfSafeCaptureMedia(j);
  if(Number(j.state)!==5||!media)return;
  var key=sfCaptureJobKey(j);if(sfCaptureGallery.has(key))return;
- sfCaptureGallery.set(key,{name:String(row.name),node:String(row.id),media:media,key:key});
+ sfCaptureGallery.set(key,{name:String(row.name),node:String(row.id),media:media,key:key,dispatch:String(j.dispatch_utc_us||'')});
  var count=document.getElementById('sfCaptureGalleryCount');if(count)count.textContent=String(sfCaptureGallery.size);
 }
 function sfRenderCaptureGallery(){
@@ -659,6 +660,37 @@ function sfRenderCaptureGallery(){
 document.getElementById('sfShowAllCaptureResults').addEventListener('click',function(){sfRenderCaptureGallery();var d=document.getElementById('sfCaptureGalleryDialog');if(d.showModal)d.showModal();else d.setAttribute('open','');});
 document.getElementById('sfCaptureGalleryClose').addEventListener('click',function(){var d=document.getElementById('sfCaptureGalleryDialog');if(d.close)d.close();else d.removeAttribute('open');});
 
+// All photos of the last shot as one ZIP: fetched one after another from the
+// nodes (full JPEG), packed in the browser (stored, no compression), plus
+// shot_info.csv with node, UUID and frame start (UTC).
+var sfCrcTable=null;
+function sfCrc32(b){if(!sfCrcTable){sfCrcTable=new Uint32Array(256);for(var n=0;n<256;n++){var c=n;for(var k=0;k<8;k++)c=c&1?0xEDB88320^(c>>>1):c>>>1;sfCrcTable[n]=c>>>0;}}
+ var crc=0xFFFFFFFF;for(var i=0;i<b.length;i++)crc=sfCrcTable[(crc^b[i])&255]^(crc>>>8);return (crc^0xFFFFFFFF)>>>0;}
+function sfZip(files){var parts=[],central=[],off=0,enc=new TextEncoder();
+ var d=new Date(),dt=((d.getHours()<<11)|(d.getMinutes()<<5)|(d.getSeconds()>>1))&0xFFFF,dd=(((d.getFullYear()-1980)<<9)|((d.getMonth()+1)<<5)|d.getDate())&0xFFFF;
+ files.forEach(function(f){var name=enc.encode(f.name),crc=sfCrc32(f.data),h=new DataView(new ArrayBuffer(30));
+  h.setUint32(0,0x04034b50,true);h.setUint16(4,20,true);h.setUint16(6,0x0800,true);h.setUint16(8,0,true);h.setUint16(10,dt,true);h.setUint16(12,dd,true);
+  h.setUint32(14,crc,true);h.setUint32(18,f.data.length,true);h.setUint32(22,f.data.length,true);h.setUint16(26,name.length,true);h.setUint16(28,0,true);
+  parts.push(h.buffer,name,f.data);
+  var c=new DataView(new ArrayBuffer(46));c.setUint32(0,0x02014b50,true);c.setUint16(4,20,true);c.setUint16(6,20,true);c.setUint16(8,0x0800,true);c.setUint16(10,0,true);
+  c.setUint16(12,dt,true);c.setUint16(14,dd,true);c.setUint32(16,crc,true);c.setUint32(20,f.data.length,true);c.setUint32(24,f.data.length,true);c.setUint16(28,name.length,true);
+  c.setUint32(42,off,true);central.push(c.buffer,name);off+=30+name.length+f.data.length;});
+ var csize=central.reduce(function(s,x){return s+(x.byteLength!==undefined?x.byteLength:x.length);},0),e=new DataView(new ArrayBuffer(22));
+ e.setUint32(0,0x06054b50,true);e.setUint16(8,files.length,true);e.setUint16(10,files.length,true);e.setUint32(12,csize,true);e.setUint32(16,off,true);
+ return new Blob(parts.concat(central,[e.buffer]),{type:'application/zip'});}
+function sfUtcText(us){return /^\d{16}$/.test(us)?new Date(Number(us.slice(0,-3))).toISOString():'';}
+document.getElementById('sfDownloadAllCaptures').addEventListener('click',async function(){
+ var btn=this,st=document.getElementById('sfZipState'),list=Array.from(sfCaptureGallery.values()).sort(function(a,b){return a.name.localeCompare(b.name,'de',{numeric:true,sensitivity:'base'});});
+ if(!list.length){st.textContent='Für den letzten Shot liegen noch keine bestätigten Bilder vor.';return;}
+ btn.disabled=true;var files=[],failed=[],csv='node;uuid;frame_start_utc;dispatch_utc_us\n',stamp=sfUtcText(list[0].dispatch)||new Date().toISOString();
+ for(var i=0;i<list.length;i++){var e=list[i];st.textContent='Lade '+(i+1)+'/'+list.length+': '+e.name+' …';
+  try{var r=await fetch(e.media.download,{cache:'no-store',mode:'cors',credentials:'omit'});if(!r.ok)throw Error('HTTP '+r.status);
+   var data=new Uint8Array(await r.arrayBuffer());files.push({name:e.name+'_'+(sfUtcText(e.dispatch)||e.media.uuid).replace(/:/g,'-')+'.jpg',data:data});
+   csv+=e.name+';'+e.media.uuid+';'+sfUtcText(e.dispatch)+';'+e.dispatch+'\n';}
+  catch(err){failed.push(e.name+' ('+(err.message||err)+')');}}
+ if(files.length){files.push({name:'shot_info.csv',data:new TextEncoder().encode(csv)});
+  var a=document.createElement('a'),url=URL.createObjectURL(sfZip(files));a.href=url;a.download='shot_'+stamp.replace(/:/g,'-')+'.zip';document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(url);},60000);}
+ st.textContent=(files.length?'✓ '+(files.length-1)+' Bild(er) als ZIP gespeichert':'✗ kein Bild geladen')+(failed.length?' · nicht geladen: '+failed.join(', '):'');btn.disabled=false;});
 function sfCaptureJobKey(j){return String(j.node)+'/'+String(j.job_boot)+'/'+String(j.job_seq);}
 function sfCaptureState(row,now,target){
  if(row.http==='error')return ['HTTP-Fehler','Übertragung fehlgeschlagen; Ausführung unbekannt',false];
@@ -695,7 +727,21 @@ function sfRenderCaptureReport(){
  }).join('');
  document.getElementById('clusterCaptureReportRows').innerHTML=html;
  var overall=pending?'Läuft / ausstehend':failed?'Abgeschlossen mit Fehlern':'Alle JPEGs bestätigt';
- document.getElementById('clusterCaptureReportSummary').textContent=overall+' · '+successes+'/'+report.rows.length+' erfolgreich · '+failed+' Fehler · '+pending+' ausstehend · UTC '+new Date(report.target).toISOString();
+ document.getElementById('clusterCaptureReportSummary').textContent=(report.restored?'Letzter Shot · ':'')+overall+' · '+successes+'/'+report.rows.length+' erfolgreich · '+failed+' Fehler · '+pending+' ausstehend · UTC '+new Date(report.target).toISOString();
+}
+// After a reload (or a shot started elsewhere) the last shot is rebuilt from
+// the coordinator's job history: the successful captures whose frame start
+// lies within 1 s of the newest one. Kept while the coordinator runs and the
+// nodes still hold the photos (PSRAM, until the next shot or restart).
+function sfRestoreLastShot(d,jobs){
+ if(sfCaptureReport&&!sfCaptureReport.restored)return;
+ var ok=jobs.filter(function(j){return Number(j.state)===5&&/^\d{16}$/.test(String(j.dispatch_utc_us||''))&&j.media_url;});if(!ok.length)return;
+ var newest=Math.max.apply(null,ok.map(function(j){return Number(String(j.dispatch_utc_us).slice(0,-3));}));
+ if(sfCaptureReport&&sfCaptureReport.target>=newest-1000)return;
+ var shot=ok.filter(function(j){return newest-Number(String(j.dispatch_utc_us).slice(0,-3))<1000;});
+ var names={};((d&&d.nodes)||[]).forEach(function(n){names[n.integration_id]=n.hostname||n.integration_id;});
+ sfCaptureGallery.clear();
+ sfCaptureReport={target:newest,restored:true,rows:shot.map(function(j){sfSeenCaptureJobs.add(sfCaptureJobKey(j));return {id:String(j.node),name:names[j.node]||String(j.node),http:'accepted',job:j};})};
 }
 window.sfCaptureReportUpdate=function(d){
  // Refresh the preview clock from each authenticated coordinator status snapshot.
@@ -703,6 +749,7 @@ window.sfCaptureReportUpdate=function(d){
  sfCaptureClock=sfCaptureClockFromStatus(d,performance.now());
  sfUpdatePlannedTime();
  sfLatestStatus=d;var jobs=(Array.isArray(d.job_probes)?d.job_probes:[]).filter(function(j){return Number(j.kind)===6;});
+ sfRestoreLastShot(d,jobs);
  if(sfCaptureReport){sfCaptureReport.rows.forEach(function(r){
   if(r.job)return;var candidates=jobs.filter(function(j){return String(j.node)===r.id&&!sfSeenCaptureJobs.has(sfCaptureJobKey(j));});
   if(candidates.length&&r.http!=='error'){r.job=candidates[candidates.length-1];sfSeenCaptureJobs.add(sfCaptureJobKey(r.job));}

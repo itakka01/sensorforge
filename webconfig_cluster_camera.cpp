@@ -73,7 +73,7 @@ window.sfCamText={
  gain:function(n){if(n.agc==null)return '–';if(n.agc===1)return 'Auto'+(n.gainceiling!=null?(n.gainceiling<=6?', max. '+Math.pow(2,n.gainceiling+1)+'×':', Obergrenze '+n.gainceiling):'');return 'Manuell, Stufe '+v(n.agc_gain);},
  wb:function(n){if(n.awb==null)return '–';if(n.awb===0)return 'aus'+(n.awb_gain?' · AWB-Gain':'');return (n.wb_mode!=null?wbName(n.wb_mode):'Auto')+(n.awb_gain===0?' · ohne AWB-Gain':'');},
  image:function(n){var p=[];if(n.brightness!=null)p.push('Hell. '+sg(n.brightness));if(n.contrast!=null)p.push('Kontr. '+sg(n.contrast));if(n.saturation!=null)p.push('Sätt. '+sg(n.saturation));if(n.sharpness!=null&&has(n,CAP.sharp))p.push('Schärfe '+sg(n.sharpness));if(n.denoise!=null&&has(n,CAP.dn))p.push('Rauschf. '+n.denoise);return p.length?p.join(' · '):'–';},
- geo:function(n){return v(n.rotation)+'° · Spiegelung H '+(n.hmirror==null?'–':(n.hmirror?'ja':'nein'))+' / V '+(n.vflip==null?'–':(n.vflip?'ja':'nein'));},
+ geo:function(n){return 'Drehung '+v(n.rotation)+'° · Sensor-Register Spiegeln H '+(n.hmirror==null?'–':(n.hmirror?'an':'aus'))+' / V '+(n.vflip==null?'–':(n.vflip?'an':'aus'))+' (Drehung und Platinenkorrektur eingerechnet; Lage einstellen unter „Abstimmen“)';},
  crop:function(n){if(n.pid!=null&&!has(n,CAP.crop)&&(n.crop_zoom_x10==null||n.crop_zoom_x10===10))return 'Vollbild (Crop nicht unterstützt)';if(n.crop_zoom_x10==null||n.crop_zoom_x10===10)return 'Vollbild';return (n.crop_zoom_x10/10).toFixed(1).replace('.',',')+'× · Position '+v(n.crop_x)+'/'+v(n.crop_y);},
  source:function(n){var s=n.sources||{},u={};Object.keys(s).forEach(function(k){u[s[k]]=1;});var names={local:'lokal',cluster:'Cluster-Profil',node:'Node-Override'};var l=Object.keys(u);return l.length?l.map(function(x){return names[x]||x;}).join(' + '):'–';}
 };
@@ -81,10 +81,11 @@ var T=window.sfCamText;
 var FEAT=[['Feste Belichtung',CAP.exp],['Feste Verstärkung',CAP.gain],['WB-Voreinstellungen',CAP.wbp],['Helligkeit',CAP.bri],['Kontrast',CAP.con],['Sättigung',CAP.sat],['Schärfe',CAP.sharp],['Rauschfilter',CAP.dn],['Spiegeln',CAP.mir],['Crop',CAP.crop]];
 function feats(n,want){return FEAT.filter(function(f){return has(n,f[1])===want;}).map(function(f){return f[0];}).join(', ')||'–';}
 function name(n){return n.hostname||n.integration_id||'';}
+function hasCam(n){return !(n.report_known&&n.pid==null&&n.cam_state==='off');}
 var last=[];
 function detail(i){var n=last[i];if(!n)return;
  document.getElementById('sfCamDlgTitle').textContent=name(n)+(n.sensor?' · '+n.sensor:'');
- var r=[['Kamera',T.cam(n)],['Auflösung',v(n.resolution)],['JPEG-Qualität',v(n.quality)],['Belichtung',T.exposure(n)],['Verstärkung',T.gain(n)],['Weißabgleich',T.wb(n)],['Bild',T.image(n)],['Drehung / Spiegelung',T.geo(n)],['Crop',T.crop(n)],['Quelle',T.source(n)],['Stand',n.local?'lokal':(v(n.age_s)+' s alt')],['Max. Auflösung',v(n.max_resolution)]];
+ var r=[['Kamera',T.cam(n)],['Auflösung',v(n.resolution)],['JPEG-Qualität',v(n.quality)],['Belichtung',T.exposure(n)],['Verstärkung',T.gain(n)],['Weißabgleich',T.wb(n)],['Bild',T.image(n)],['Lage (Sensor)',T.geo(n)],['Crop',T.crop(n)],['Quelle',T.source(n)],['Stand',n.local?'lokal':(v(n.age_s)+' s alt')],['Max. Auflösung',v(n.max_resolution)]];
  if(n.pid!=null){r.push(['Unterstützt',feats(n,true)]);r.push(['Nicht unterstützt',feats(n,false)]);}
  document.getElementById('sfCamDlgRows').innerHTML=r.map(function(x){return '<tr><th style="text-align:left;white-space:nowrap">'+esc(x[0])+'</th><td>'+esc(x[1])+'</td></tr>';}).join('');
  var dl=document.getElementById('sfCamDialog');if(dl.showModal)dl.showModal();else dl.setAttribute('open','');}
@@ -126,10 +127,13 @@ profBox.addEventListener('click',function(e){var b=e.target.closest('[data-dist]
   setTimeout(load,3000);setTimeout(load,8000);}).catch(function(e){profSt.textContent='Fehler: '+(e.message||e);});});
 rows.addEventListener('click',function(e){var b=e.target.closest('[data-ref]');if(!b)return;profPost({action:'reference',node_id:b.getAttribute('data-ref')}).then(function(j){profSt.textContent=j.ok?'Referenz für '+j.sensor+' gesetzt.':'Fehler: '+(j.message||j.error);load();});});
 function render(d){if(!d.ok){rows.innerHTML='<tr><td colspan="8">Übersicht nicht verfügbar ('+esc(d.error)+').</td></tr>';caps.innerHTML='';return;}
-var ns=(d.nodes||[]).slice().sort(function(a,b){return name(a).localeCompare(name(b),'de',{numeric:true,sensitivity:'base'});});last=ns;
+var all=(d.nodes||[]).slice().sort(function(a,b){return name(a).localeCompare(name(b),'de',{numeric:true,sensitivity:'base'});});
+// Devices without a detected camera (e.g. a coordinator without camera) are
+// only named below the table, not listed as cameras.
+var ns=all.filter(hasCam),noCam=all.filter(function(n){return !hasCam(n);});last=ns;
 var known=ns.filter(function(n){return n.report_known;}).length;
 var sensors={};ns.forEach(function(n){if(n.report_known)sensors[n.sensor]=(sensors[n.sensor]||0)+1;});
-sum.textContent='· '+known+' von '+ns.length+' Geräten melden · '+Object.keys(sensors).map(function(k){return sensors[k]+'× '+k;}).join(', ');
+sum.textContent='· '+known+' von '+ns.length+' Kameras melden'+(noCam.length?' · ohne Kamera: '+noCam.map(name).join(', '):'')+' · '+Object.keys(sensors).map(function(k){return sensors[k]+'× '+k;}).join(', ');
 rows.innerHTML=ns.map(function(n,i){var nm='<strong>'+esc(name(n))+'</strong>'+(n.local?' <span class="status-pill ok">LOKAL</span>':'');
  if(!n.report_known)return '<tr><td>'+nm+'</td><td colspan="7" class="muted">Keine Kameradaten (ältere Firmware oder noch nicht gemeldet)</td></tr>';
  var res=v(n.resolution)+(n.quality!=null?' · Q '+n.quality:'');
@@ -164,7 +168,7 @@ function ovStart(){if(ov.on){ovStop();return;}
  Promise.all([fetch('/cluster_cameras?t='+Date.now(),{cache:'no-store',credentials:'same-origin'}).then(function(r){if(!r.ok)throw Error('HTTP '+r.status);return r.json();}),window.sfCoordinateStatus(true),getJson('/cluster_camera_profile').catch(function(){return null;})]).then(function(r){
   if(r[2])prof=r[2];
   var ips={};((r[1]||{}).nodes||[]).forEach(function(n){ips[n.integration_id]=n.ip;});
-  var ns=((r[0]||{}).nodes||[]).slice().sort(function(a,b){return name(a).localeCompare(name(b),'de',{numeric:true,sensitivity:'base'});});
+  var ns=((r[0]||{}).nodes||[]).filter(hasCam).slice().sort(function(a,b){return name(a).localeCompare(name(b),'de',{numeric:true,sensitivity:'base'});});
   ovGrid.innerHTML='';ov.list=[];
   ns.forEach(function(n){var base=ovBase(n,ips);var card=document.createElement('article');card.style.cssText='border:1px solid #64748b66;border-radius:10px;padding:8px;min-width:0';
    var s=sensorOf(n.pid),ref=s&&s.reference===n.integration_id;

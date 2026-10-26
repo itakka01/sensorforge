@@ -1,3 +1,29 @@
+## v87-beta182 — 2026-10-26 (ALLE BILDER EINES SHOTS ALS ZIP)
+
+- Cluster-Seite, Aufnahme-Ergebnis: Knopf **„Alle Bilder herunterladen (ZIP)“**. Der Browser holt die JPEGs aller Nodes des letzten Shots nacheinander (volle Auflösung), packt sie zu `shot_<UTC>.zip` (ungepackt gespeichert) mit `shot_info.csv` (Node, UUID, Bildanfang UTC, dispatch_utc_us). Dateinamen `<Node>_<Bildanfang-UTC>.jpg`; nicht ladbare Nodes werden gemeldet.
+- **Letzter Shot bleibt nach Neuladen**: Ohne laufenden Bericht baut die Seite den letzten Shot aus dem Job-Verlauf des Coordinators wieder auf (erfolgreiche Aufnahmen mit Bildanfang innerhalb 1 s vom neuesten) – Tabelle mit Ansehen/Herunterladen, „Alle Ergebnisse anzeigen“ und ZIP. Auch ein woanders ausgelöster Shot erscheint so. Gilt, solange der Coordinator läuft und die Nodes die Bilder noch im RAM haben (bis zum nächsten Shot oder Neustart).
+- Node `/capture_media`: `Access-Control-Allow-Origin: *` (Abruf von der Coordinator-Seite; die zufällige UUID bleibt der einzige Zugriffsschlüssel, die Anmeldeprüfung gilt weiter).
+
+## v87-beta181 — 2026-10-26 (KAMERA-ÜBERSICHT OHNE GERÄTE OHNE KAMERA)
+
+Gemeldet: Bilder trotz Referenzkamera (c003) unterschiedlich; devxiao1 (Coordinator ohne Kamera) erscheint als „unknown“. Befund 23:00: Am Coordinator war für OV5640 kein Profil gespeichert, kein Node hatte eines – „nur Sitzung“ endet mit jedem Neustart des Nodes (die Rollouts am Abend). Neu übertragen (Sitzung, Version 11cf5193): alle 6 diymore „übernommen“, Bilder gleich hell (RGB-Mittel 60–64). Verbleibender Unterschied: Verstärkung steht im Profil auf Auto (Referenz so eingestellt) → je Kamera 6–7.
+
+- Kamera-Übersicht und Tabelle: Geräte ohne erkannte Kamera (Sensor unbekannt, Kamera aus) werden nicht mehr als Kamera geführt, nur in der Zusammenfassung „ohne Kamera: …“ genannt.
+
+## v87-beta180 — 2026-10-26 (BILDABSTIMMUNG: EINE AUSWAHL „LAGE DES BILDES“)
+
+Gemeldet: Drehung/Spiegeln/Kippen auf c003 undurchschaubar, keine Einstellung ergab das richtige Bild. Geprüft: Der Sensor setzt alle Kombinationen richtig um (c005 am Tag Pixel-genau verifiziert). Verwirrend war: drei Bedienelemente für nur vier mögliche Bilder (180° = horizontal + vertikal gespiegelt; 180° mit beiden Häkchen = Normal). Auf c003 war um 22:30 zudem gar nichts zu beurteilen: manuelle Belichtung 151 Zeilen im dunklen Raum → gleichmäßig graues Bild (Pixelwerte 53–55), alle Lagen sehen gleich aus.
+
+- Bildabstimmung: statt Drehung + zwei Häkchen + zwei Knöpfen **eine Auswahl „Lage des Bildes“**: Normal / Links und rechts vertauscht / Oben und unten vertauscht / Auf dem Kopf (180°). Wirkt sofort beim Auswählen; ältere Kombinationen werden als das Bild angezeigt, das sie ergeben. Meldungen nennen die Lage („Lage jetzt „Auf dem Kopf (180°)“ …“).
+- Kamera-Übersicht/Details: „Lage (Sensor)“ zeigt Drehung und die tatsächlichen Sensor-Register (mit Hinweis, dass Drehung und Platinenkorrektur eingerechnet sind) statt einer scheinbar dreifachen Spiegelung.
+
+## v87-beta179 — 2026-10-26 (BILDABSTIMMUNG: AUSRICHTUNG EINDEUTIG)
+
+Gemeldet: c003 „um 180° gedreht“ → Meldung „Kamera neu gestartet“, Bild und Wert unverändert. Ursache: Die Felder sind absolut, c003 stand bereits auf 180°; 180° zu übernehmen änderte nichts (die Kamera wurde trotzdem neu gestartet).
+
+- Anzeige „(aktuell 180° …)“ neben „Ausrichtung“, neuer Knopf **„Bild um 180° drehen“** (relativ zur aktuellen Lage), Hinweis, dass die Felder die gewünschte Lage angeben.
+- Gleiche Lage wie bisher → „Keine Änderung – die Kamera steht bereits auf …“, kein Kamera-Neustart; sonst „Ausrichtung jetzt … – gespeichert, Kamera neu gestartet.“
+
 ## v87-beta178 — 2026-10-26 (BILDABSTIMMUNG: VERALTETE SEITE LÄDT NEU)
 
 Gemeldet: Drehen/Spiegeln/Kippen/Auflösung in der Bildabstimmung → HTTP 403. Geprüft auf c005: alle vier funktionieren (Bild entspricht exakt dem erwarteten gedrehten/gespiegelten/gekippten Bild, Sensorstatus stimmt, Auflösung 800×600 ↔ 1024×768). Ursache des 403: Seite vor einem Neustart des Geräts geladen (Rollout) – das CSRF-Token gilt je Boot, das Live-Bild (GET) lief weiter, jede Änderung (POST) wurde abgelehnt.

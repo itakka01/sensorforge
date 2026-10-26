@@ -187,6 +187,15 @@ int applyOrientation(WebServer &srv, String &json)
     const int vflip = argInt(srv, "vflip", -1);
     if ((rotation != 0 && rotation != 180) || (hmirror != 0 && hmirror != 1) || (vflip != 0 && vflip != 1))
         return result(json, 400, false, "rotation muss 0/180, hmirror/vflip 0/1 sein");
+    // The fields are absolute: choosing the current orientation changes
+    // nothing (reported, no camera restart).
+    const bool eh = (rotation == 180) != (bool)hmirror, ev = (rotation == 180) != (bool)vflip;
+    const String target = eh && ev ? "„Auf dem Kopf (180°)“"
+                          : eh     ? "„Links und rechts vertauscht“"
+                          : ev     ? "„Oben und unten vertauscht“"
+                                   : "„Normal“";
+    if (rotation == cfg_rotation && (bool)hmirror == (bool)cfg_camera_hmirror && (bool)vflip == (bool)cfg_camera_vflip)
+        return result(json, 200, true, "Keine Änderung – Lage ist bereits " + target + ".");
     String error;
     configRefreshSdStatus();
     const bool writeToSd = configSdAvailable() && configSdPresent();
@@ -195,8 +204,8 @@ int applyOrientation(WebServer &srv, String &json)
         return result(json, 400, false, "Speichern fehlgeschlagen: " + error);
     clusterCaptureLiveInvalidate();
     if (!cameraRestartWithSettings(error))
-        return result(json, 200, true, "Ausrichtung gespeichert; " + error + ".");
-    return result(json, 200, true, "Ausrichtung gespeichert, Kamera neu gestartet.");
+        return result(json, 200, true, "Lage " + target + " gespeichert; " + error + ".");
+    return result(json, 200, true, "Lage jetzt " + target + " – gespeichert, Kamera neu gestartet.");
 }
 
 // POST /camera_tuning_apply
@@ -301,17 +310,27 @@ void handleCameraTuningPage()
                 "</p></div>";
         const bool mirrorCap = !caps || (caps & CapMirror);
         const String dm = mirrorCap ? String() : String(" disabled title='Vom Sensor nicht unterstützt'");
-        auto chk = [](const char *id, bool on) {
-            return String("<input type='checkbox' id='") + id + "'" + (on ? " checked" : "") + ">";
-        };
-        html += "<div style='margin-top:12px'><strong>Ausrichtung</strong> "
-                "<label>Drehung <select id='tuneRot'" + dm + ">" + opt(0, cfg_rotation, "0°") + opt(180, cfg_rotation, "180°") +
-                "</select></label> <label>" + chk("tuneHm", cfg_camera_hmirror) + " Horizontal spiegeln</label> "
-                "<label>" + chk("tuneVf", cfg_camera_vflip) + " Vertikal kippen</label> "
-                "<button type='button' id='tuneOriApply'" + dm + ">Übernehmen (Kamera startet neu)</button>"
-                "<p class='muted' style='margin:4px 0 0'>Macht der Sensor selbst (keine Bildumrechnung). 90° ist "
-                "mit diesen Sensoren nicht möglich. Gilt nur für dieses Gerät, das Cluster-Profil überträgt die "
-                "Ausrichtung nicht.</p></div>";
+        // One choice, four distinct images: the sensor can only mirror each
+        // axis, and 180° is both axes together. Older configs combining
+        // 180° with mirror/flip are shown as the image they produce.
+        const bool eh = (cfg_rotation == 180) != (bool)cfg_camera_hmirror;
+        const bool ev = (cfg_rotation == 180) != (bool)cfg_camera_vflip;
+        const int lage = eh && ev ? 3 : (eh ? 1 : (ev ? 2 : 0));
+        static const char *const kLage[4][2] = {
+            {"0,0,0", "Normal"},
+            {"0,1,0", "Links und rechts vertauscht (horizontal gespiegelt)"},
+            {"0,0,1", "Oben und unten vertauscht (vertikal gespiegelt)"},
+            {"180,0,0", "Auf dem Kopf (180° gedreht)"}};
+        html += "<div style='margin-top:12px'><label><strong>Lage des Bildes</strong> <select id='tuneLage'" + dm + ">";
+        for (int i = 0; i < 4; ++i)
+            html += String("<option value='") + kLage[i][0] + "'" + (i == lage ? " selected" : "") + ">" +
+                    kLage[i][1] + "</option>";
+        html += "</select></label> <span id='tuneOriState' class='muted'></span>"
+                "<p class='muted' style='margin:4px 0 0'>Wirkt sofort beim Auswählen (die Kamera startet kurz neu, "
+                "gespeichert). Die Auswahl ist die gewünschte Lage, nicht „um … drehen“. Macht der Sensor selbst "
+                "(keine Bildumrechnung); 90° ist mit diesen Sensoren nicht möglich. Gilt nur für dieses Gerät, das "
+                "Cluster-Profil überträgt die Lage nicht. Zum Beurteilen braucht es ein erkennbares Bild "
+                "(bei Dunkelheit Belichtung auf Auto).</p></div>";
     }
     html += "</div>";
     html += "<form id='tuneForm' style='flex:1 1 300px;min-width:0' onsubmit='return false'><div class='tune-grid'>";
@@ -384,13 +403,14 @@ if(resBtn)resBtn.addEventListener('click',function(){if(!confirm('Kamera-Auflös
  var fd=new URLSearchParams();fd.append('mode','resolution');fd.append('resolution',resSel.value);st.textContent='Auflösung wird übernommen …';resBtn.disabled=true;
  fetch('/camera_tuning_apply',{method:'POST',body:fd,credentials:'same-origin',cache:'no-store'}).then(tuneJson)
  .then(function(j){st.textContent=(j.ok?'✓ ':'✗ ')+j.message;if(j.ok)setTimeout(function(){location.reload();},1500);else resBtn.disabled=false;}).catch(function(e){st.textContent='✗ '+(e.message||e);resBtn.disabled=false;});});
-// Orientation: sensor mirror/flip, saved, camera restarts.
-var oriBtn=document.getElementById('tuneOriApply');
-if(oriBtn)oriBtn.addEventListener('click',function(){var fd=new URLSearchParams();fd.append('mode','orientation');
- fd.append('rotation',document.getElementById('tuneRot').value);fd.append('hmirror',document.getElementById('tuneHm').checked?'1':'0');fd.append('vflip',document.getElementById('tuneVf').checked?'1':'0');
- st.textContent='Ausrichtung wird übernommen …';oriBtn.disabled=true;
+// Image orientation: one of four positions, applied on selection.
+var lage=document.getElementById('tuneLage'),lageSt=document.getElementById('tuneOriState');
+if(lage){var lageOld=lage.value;lage.addEventListener('change',function(){var p=lage.value.split(','),fd=new URLSearchParams();
+ fd.append('mode','orientation');fd.append('rotation',p[0]);fd.append('hmirror',p[1]);fd.append('vflip',p[2]);
+ lage.disabled=true;lageSt.textContent='wird übernommen …';
  fetch('/camera_tuning_apply',{method:'POST',body:fd,credentials:'same-origin',cache:'no-store'}).then(tuneJson)
- .then(function(j){st.textContent=(j.ok?'✓ ':'✗ ')+j.message;oriBtn.disabled=false;if(j.ok)setTimeout(load,1500);}).catch(function(e){st.textContent='✗ '+(e.message||e);oriBtn.disabled=false;});});
+ .then(function(j){lageSt.textContent=(j.ok?'✓ ':'✗ ')+j.message;if(j.ok){lageOld=lage.value;setTimeout(load,1500);}else lage.value=lageOld;})
+ .catch(function(e){lageSt.textContent='✗ '+(e.message||e);lage.value=lageOld;}).then(function(){lage.disabled=false;});});}
 var sending=false,queued=null,autoTimer=null,auto=document.getElementById('tuneAuto');
 // Disabled (unsupported) fields are sent too; the server needs a complete set.
 function send(m){if(sending){queued=m;return;}sending=true;queued=null;
