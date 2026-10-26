@@ -1,3 +1,14 @@
+## v87-beta164 — 2026-10-26 (FIRMWARE-SEITE NACH COORDINATOR-NEUSTART)
+
+- „Firmware im Cluster“: Nach einem Neustart des Coordinators ist der CSRF-Schlüssel der offenen Seite ungültig (Knöpfe meldeten „HTTP 403“). Die Seite erkennt das jetzt und lädt sich mit Hinweis selbst neu; nach einem erfolgreichen „Coordinator aktualisieren“ lädt sie sich ebenfalls von selbst neu.
+
+## v87-beta163 — 2026-10-26 (FORTSCHRITTSANZEIGE „FIRMWARE IM CLUSTER“)
+
+- Fortschrittsbalken über der Tabelle: „Rollout läuft: 3 von 9 Nodes bearbeitet · gerade: c003 – lädt und prüft …“, grün, bei rot markierten Geräten orange.
+- Je Gerät ein Status-Abzeichen: pulsierend orange während „Auftrag gesendet / lädt und prüft / startet neu“ (mit Sekunden), grün „✓ aktualisiert“, rot „✗ kurz stromlos machen“, grau „aktuell – übersprungen“; dazu vier Schritt-Marken (Auftrag · Laden/Prüfen · Neustart · Fertig); aktive Zeile hinterlegt.
+- „Coordinator aktualisieren“: eigener Fortschrittskasten mit laufendem Balken, der den Coordinator durch das Update verfolgt („bereitet vor“ → „lädt und prüft“ → „startet neu … verbindet sich danach von selbst“ → „✓ läuft wieder – jetzt vX (nach n s)“, bzw. Fehlergrund; nach 4 min ohne Rückkehr Hinweis „kurz stromlos machen“).
+- Fehlermeldungen der Seite rot und fett statt grau.
+
 ## v87-beta162 — 2026-10-26 (SOFORTAUFNAHME MIT SCHARFSCHALTEN)
 
 - **Ersetzt die 2-s-Schnellaufnahme aus beta161** (nicht ausgerollt, entfernt). Es gibt nur noch die geplante Aufnahme (Stunden/Minuten/Sekunden, ≥ 2 s) und die Sofortaufnahme.
