@@ -1,0 +1,89 @@
+// Host test: firmware_package_format.h (package format 2 header, release
+// comparison, downgrade/board policy, download URL policy).
+// g++ -std=c++17 -Wall -Wextra -I. -x c++ test_firmware_package_format.cpp.test -o /tmp/test_fpf && /tmp/test_fpf
+#include "firmware_package_format.h"
+
+#include <cstdio>
+#include <string>
+#include <vector>
+
+static int failures = 0;
+#define CHECK(c) do { if (!(c)) { std::printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++failures; } } while (0)
+
+// Header of a package made by sensorforge_firmware_sign.py (DEV key, fake
+// diymore image, release v87-beta158).
+static const char *kHeaderHex = "534657504b47320002010001e428000064feb2b857fd3d43d962461820ae6d5334ca4b1f2e10ec127472a2e0c66743036469796d6f7265000000000000000000000000000000000000000000000000007638372d626574613135380000000000000000000000000000000000000000000000000000000000000000000000000047003045022064261b658454d1247b1dd875d47f7da24f84ae66191621d2b917764c2bde1a44022100b7cef38560c4f481cacf48e1e498ccf5cfd6bf64a98d96e2dbd1c2e40bff789200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+
+static std::vector<uint8_t> fromHex(const char *hex)
+{
+    std::vector<uint8_t> out;
+    for (size_t i = 0; hex[i] && hex[i + 1]; i += 2)
+        out.push_back((uint8_t)std::stoul(std::string(hex + i, 2), nullptr, 16));
+    return out;
+}
+
+int main()
+{
+    using namespace FirmwarePackage;
+    const char *err = nullptr;
+    std::vector<uint8_t> h = fromHex(kHeaderHex);
+    CHECK(h.size() == kHeaderSize);
+
+    Header hd;
+    CHECK(parseHeader(h.data(), h.size(), hd, err));
+    CHECK(std::string(hd.board) == "diymore" && std::string(hd.release) == "v87-beta158");
+    CHECK(hd.imageSize == 10468 && hd.signatureLength >= 64 && hd.signatureLength <= 72);
+    CHECK(memcmp(hd.signedBlock, h.data(), kSignedBlockSize) == 0);
+
+    std::vector<uint8_t> b = h;
+    CHECK(!parseHeader(b.data(), kHeaderSize - 1, hd, err));          // short
+    b[6] = '1';
+    CHECK(!parseHeader(b.data(), b.size(), hd, err) && strstr(err, "format 1"));
+    b = h; b[8] = 1;
+    CHECK(!parseHeader(b.data(), b.size(), hd, err));                  // format byte
+    b = h; b[48 + 31] = 'x';
+    CHECK(!parseHeader(b.data(), b.size(), hd, err));                  // board not terminated
+    b = h; b[80] = 0;
+    CHECK(!parseHeader(b.data(), b.size(), hd, err));                  // empty release
+    b = h; b[50] = '|';
+    CHECK(!parseHeader(b.data(), b.size(), hd, err));                  // separator in board
+    b = h; b[128] = 0; b[129] = 0;
+    CHECK(!parseHeader(b.data(), b.size(), hd, err));                  // no signature
+
+    Release r1, r2;
+    CHECK(parseRelease("v87-beta158", r1) && r1.major == 87 && r1.beta == 158 && !r1.stable);
+    CHECK(parseRelease("v88", r2) && r2.stable);
+    CHECK(!parseRelease("v87-beta", r1) && !parseRelease("87-beta1", r1) && !parseRelease("v87-rc1", r1));
+    auto cmp = [](const char *a, const char *b) { Release x, y; parseRelease(a, x); parseRelease(b, y); return compareRelease(x, y); };
+    CHECK(cmp("v87-beta158", "v87-beta157") > 0);
+    CHECK(cmp("v87-beta99", "v87-beta158") < 0);       // numeric, not text order
+    CHECK(cmp("v87", "v87-beta158") > 0);              // stable after its betas
+    CHECK(cmp("v88-beta1", "v87") > 0);
+    CHECK(cmp("v87-beta158", "v87-beta158") == 0);
+
+    CHECK(parseHeader(h.data(), h.size(), hd, err));
+    CHECK(checkPolicy(hd, "diymore", "v87-beta157", false, err));       // newer
+    CHECK(checkPolicy(hd, "diymore", "v87-beta158", false, err));       // same (reinstall)
+    CHECK(!checkPolicy(hd, "diymore", "v87-beta160", false, err) && strstr(err, "older"));
+    CHECK(checkPolicy(hd, "diymore", "v87-beta160", true, err));        // explicit downgrade
+    CHECK(!checkPolicy(hd, "xiao", "v87-beta157", true, err) && strstr(err, "board"));
+    CHECK(!checkPolicy(hd, "diymore", "custom", true, err));            // not comparable
+
+    CHECK(urlAllowed("https://firmware.example.com/c1/manifest.json", err));
+    CHECK(urlAllowed("http://192.168.0.10:8765/manifest.json", err));
+    CHECK(urlAllowed("http://10.1.2.3/m.json", err));
+    CHECK(urlAllowed("http://172.20.0.5:80/m.json", err));
+    CHECK(!urlAllowed("http://172.32.0.5/m.json", err));                // not private
+    CHECK(!urlAllowed("http://8.8.8.8/m.json", err));
+    CHECK(!urlAllowed("http://myhost.local/m.json", err));              // http needs an IP
+    CHECK(!urlAllowed("http://192.168.0.10.evil.com/m.json", err));
+    CHECK(!urlAllowed("http://user@192.168.0.10/m.json", err));
+    CHECK(!urlAllowed("http://192.168.0.10:99999/m.json", err));
+    CHECK(!urlAllowed("http://192.168.0.256/m.json", err));
+    CHECK(!urlAllowed("ftp://192.168.0.10/m.json", err));
+    CHECK(!urlAllowed("http://192.168.0.10/a|b", err));
+    CHECK(!urlAllowed("http://192.168.0.10/a b", err));
+
+    std::printf(failures ? "firmware package format: %d failures\n" : "firmware package format: ok\n", failures);
+    return failures ? 1 : 0;
+}

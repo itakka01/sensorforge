@@ -2,7 +2,16 @@
 
 Stand: 12.10.2026. Dokumentiert den Quellstand `SensorForge_beta105_OTA_integrationsstand_2026-10-12` plus **optionale Testfreigabe** `SensorForge_beta105_node_autoupdate_testfreigabe_delta.zip`. Die Funktion ist **nicht** durch einen vollständigen ESP32-Build, einen End-to-End-OTA-Test oder Rollback-Tests auf Hardware freigegeben.
 
-## Umfang und Grenzen
+## Stand v87-beta158: Cluster-Update vom PC
+
+- **Paketformat 2** (`firmware_package_format.h`): Board und Release sind signiert. Alle Installationswege (Browser-Upload, SD, Manifest, Cluster) prüfen in `firmwareSecurityHashFinishAndVerify` Prüfsumme, Signatur, Board und Version, bevor ein Image bootfähig wird. Ältere Versionen nur mit ausdrücklichem „Downgrade erlauben“.
+- **Quellen:** `https://` mit Zertifikatsprüfung oder `http://` nur zu einer privaten IPv4-Adresse (10/8, 172.16/12, 192.168/16); die Signatur authentifiziert das Paket, nicht der Transport. Board `diymore` ergänzt.
+- **Cluster-Update:** Coordinator-Seite `/cluster_firmware` (API `/api/v1/cluster/firmware`). Der Coordinator schickt jedem Node einen HMAC-signierten Auftrag `SFJU1` (nur Manifest-URL + Downgrade-Flag), der Node antwortet mit `SFJUA1` (angenommen / ausgewählt / Fehler mit Grund). Reihenfolge: ein Node nach dem anderen; weiter erst, wenn er mit neuem Boot und neuer Version zurück ist; Halt beim ersten Fehler. Den Coordinator zuletzt („Coordinator aktualisieren“). Die lokale Einstellung „automatische Updates“ ist dafür nicht nötig; Drone Mode und die OTA-Reservierung (keine Aufnahme, keine geplante Cluster-Aufnahme) schon.
+- **Rückfall:** `verifyRollbackLater()` liefert `true`, damit der Arduino-Core neue Images nicht schon beim Start bestätigt (bis beta157 war die 60-s-Bestätigung dadurch wirkungslos). Bestätigt wird nach 60 s stabiler Laufzeit oder vor absichtlichem Tiefschlaf/Herunterfahren (nicht beim Neustartschleifen-Schutz). Ein Neustart davor startet die vorherige Firmware.
+- **PC-Seite:** `tools/sf_firmware_publish.py` signiert die Builds, schreibt `manifest.json` und liefert nur Manifest und Pakete aus (keine Verzeichnisliste).
+- Hardwaretest steht aus (siehe Testprotokoll unten).
+
+## Umfang und Grenzen (Stand beta105, teilweise überholt)
 
 - Das Produkt heißt künftig exapan C1; der Projekt-/Firmware-Name bleibt SensorForge.
 - Standard-Manifest: `https://firmware.exapan.at/c1/manifest.json`. Die URL ist geplant; ein funktionierender Server an dieser Adresse ist nicht nachgewiesen.
@@ -50,7 +59,7 @@ Das JSON muss ein Objekt mit `schema: 1` und `releases` (maximal 32 Einträge) s
 }
 ```
 
-**Das ist ausschließlich ein Syntaxbeispiel.** URL, Größe und Prüfsumme sind Platzhalter; dieses Beispiel ist **kein** realer Release und kann keinen legitimen Updatevorgang begründen. Gültige Board-IDs sind `xiao` und `freenove`; Kanäle `beta` und `stable`. Die Manifest-URL und Paket-URLs müssen HTTPS verwenden. Die `.sfw`-Signatur liefert die unabhängige Paket-Authentifizierung; das Manifest wird nicht als signierte Installationsfreigabe betrachtet.
+**Das ist ausschließlich ein Syntaxbeispiel.** URL, Größe und Prüfsumme sind Platzhalter; dieses Beispiel ist **kein** realer Release und kann keinen legitimen Updatevorgang begründen. Gültige Board-IDs sind `xiao`, `freenove` und `diymore`; Kanäle `beta` und `stable`. Die Manifest-URL und Paket-URLs müssen HTTPS verwenden. Die `.sfw`-Signatur liefert die unabhängige Paket-Authentifizierung; das Manifest wird nicht als signierte Installationsfreigabe betrachtet.
 
 ## Test- und Freigabeprotokoll (noch offen)
 

@@ -19,6 +19,7 @@ Die Tests sind **nicht** Teil des Arduino-Builds. Die Endung `.cpp.test` verhind
 | `test_camera_tuning.cpp.test` | Textformat der Bildabstimmung (`camera_tuning`) | – |
 | `test_camera_profile.cpp.test` | Textformat des Cluster-Kameraprofils | – |
 | `test_jpeg_mini_encoder.cpp.test` | Kleinbild-JPEG-Encoder; schreibt JPEGs zur Prüfung mit Pillow | `jpeg_mini_encoder.cpp` |
+| `test_firmware_package_format.cpp.test` | .sfw-Format 2 (Kopf), Versionsvergleich, Board-/Downgrade-Regel, erlaubte Download-URLs | – |
 
 Beispiel:
 

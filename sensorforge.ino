@@ -39,6 +39,8 @@
 #include "config.h"
 #include "camera_tuning.h"
 #include "camera_profile_store.h"
+#include "firmware_cluster_update.h"
+#include "cluster_firmware_rollout.h"
 #include "recorder.h"
 #include "logger.h"
 #include "webconfig.h"
@@ -3779,6 +3781,7 @@ static bool firmwareFileContainsCompatMarker(
 static bool firmwareValidateCandidate(
     const String &candidatePath,
     size_t &firmwareSize,
+    SensorForgeFirmwarePackageInfo &packageInfo,
     String &error
 )
 {
@@ -3796,7 +3799,6 @@ static bool firmwareValidateCandidate(
         return false;
     }
 
-    SensorForgeFirmwarePackageInfo packageInfo;
 
     if (!firmwareSecurityReadHeader(
             firmware,
@@ -3881,6 +3883,16 @@ static bool firmwareValidateCandidate(
 }
 
 
+// New OTA images stay "pending verification" until this firmware confirms them
+// (FirmwareOtaActivation: 60 s stable or an intentional deep sleep). Without
+// this the Arduino core confirms every image at boot and the bootloader could
+// never fall back to the previous firmware after a crashing update.
+extern "C" bool verifyRollbackLater()
+{
+    return true;
+}
+
+
 const char *firmwareExpectedCompatibilityMarker()
 {
     return
@@ -3925,11 +3937,13 @@ static bool firmwareUpdateFromSdIfPresent()
     );
 
     size_t firmwareSize = 0;
+    SensorForgeFirmwarePackageInfo packageInfo;
     String validationError;
 
     if (!firmwareValidateCandidate(
             candidatePath,
             firmwareSize,
+            packageInfo,
             validationError
         )) {
 
@@ -4036,6 +4050,27 @@ static bool firmwareUpdateFromSdIfPresent()
     uint8_t *updateBuffer = update.data();
     const size_t updateBufferSize = update.size();
 
+    // The file was verified before; hash what is actually written as well, so
+    // a file replaced in between can never become bootable.
+    SensorForgeFirmwareHashContext flashHash;
+    String flashHashError;
+
+    if (!firmwareSecurityHashBegin(
+            flashHash,
+            flashHashError
+        )) {
+
+        Serial.println(
+            "Firmware update: ERROR - " +
+            flashHashError
+        );
+
+        firmware.close();
+        firmwareUpdateLedStop();
+        firmwareMoveWorkTo(failedPath);
+        return false;
+    }
+
     if (!Update.begin(
             firmwareSize,
             U_FLASH
@@ -4049,6 +4084,7 @@ static bool firmwareUpdateFromSdIfPresent()
             Update.errorString()
         );
 
+        firmwareSecurityHashAbort(flashHash);
         firmware.close();
         firmwareUpdateLedStop();
         firmwareMoveWorkTo(failedPath);
@@ -4083,6 +4119,20 @@ static bool firmwareUpdateFromSdIfPresent()
             writeOk = false;
             Serial.println(
                 "Firmware update: ERROR - unexpected end/read failure"
+            );
+            break;
+        }
+
+        if (!firmwareSecurityHashUpdate(
+                flashHash,
+                updateBuffer,
+                got,
+                flashHashError
+            )) {
+            writeOk = false;
+            Serial.println(
+                "Firmware update: ERROR - " +
+                flashHashError
             );
             break;
         }
@@ -4125,6 +4175,20 @@ static bool firmwareUpdateFromSdIfPresent()
     }
 
     firmware.close();
+
+    if (writeOk &&
+        !firmwareSecurityHashFinishAndVerify(
+            flashHash,
+            packageInfo,
+            flashHashError
+        )) {
+        writeOk = false;
+        Serial.println(
+            "Firmware update: REJECTED - written image failed verification: " +
+            flashHashError
+        );
+    }
+    firmwareSecurityHashAbort(flashHash);
 
     if (!writeOk) {
         Update.abort();
@@ -5583,6 +5647,12 @@ static void cameraEffectiveOrientation(
         vflip =
             !vflip;
     }
+
+    // User mirror/flip (page "Bildabstimmung"), done by the sensor itself.
+    if (cfg_camera_hmirror)
+        hmirror = !hmirror;
+    if (cfg_camera_vflip)
+        vflip = !vflip;
 }
 
 
@@ -7563,6 +7633,7 @@ static void enterTransportTimerSleep(
     Serial.flush();
     delay(30);
 
+    FirmwareOtaActivation::confirmRunningImage("Tiefschlaf");
     esp_deep_sleep_start();
 
     // Deep sleep should never return. If the platform ever does return here,
@@ -13622,6 +13693,7 @@ static void enterThermalCooldownSleepEarly(
 
     Serial.flush();
     delay(50);
+    FirmwareOtaActivation::confirmRunningImage("Tiefschlaf");
     esp_deep_sleep_start();
 }
 
@@ -13731,6 +13803,7 @@ static void enterThermalEmergencySleep(
 #endif
 
     delay(100);
+    FirmwareOtaActivation::confirmRunningImage("Tiefschlaf");
     esp_deep_sleep_start();
 }
 
@@ -14011,6 +14084,7 @@ static bool enterStorageFaultLowPowerSleep(
 #endif
 
     delay(100);
+    FirmwareOtaActivation::confirmRunningImage("Tiefschlaf");
     esp_deep_sleep_start();
 
     // Defensive only: esp_deep_sleep_start() does not return on success.
@@ -14126,6 +14200,7 @@ static void enterDeepSleep()
 
     delay(100);
 
+    FirmwareOtaActivation::confirmRunningImage("Tiefschlaf");
     esp_deep_sleep_start();
 }
 
@@ -16828,6 +16903,10 @@ void loop() {
     // UDP processing remains ahead of this guard; camera owner is not shared.
     if (clusterCaptureArmed()) { delay(1); return; }
     cameraProfileService();
+    // Cluster firmware update: node job (blocks for the download, restarts on
+    // success) and the coordinator's one-node-at-a-time rollout.
+    FirmwareClusterUpdate::service();
+    clusterFirmwareRolloutService();
 
     // A dedicated time broadcaster must take priority over Drone Mode.
     // Otherwise a default-enabled Drone Mode would run recorder and OTA

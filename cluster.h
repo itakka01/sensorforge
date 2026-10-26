@@ -73,6 +73,27 @@ bool clusterRequestNodeCameraProfile(const String &nodeId, const String &profile
                                      uint8_t mode, String &error);
 // Capture time in UTC microseconds; shared across all selected nodes.
 // testPulse: request the optional GPIO test pulse (SFJC1 field "tp1"), default off.
+// Cluster firmware update (firmware_cluster_update.h, SFJU1/SFJUA1). seq
+// identifies the answers (clusterFirmwareRolloutNote).
+bool clusterRequestNodeFirmwareUpdate(const String &nodeId, const String &manifestUrl, bool allowOlder,
+                                      uint32_t &seq, String &error);
+// Node: answer/progress of a coordinator update job.
+bool clusterSendFirmwareUpdateResult(uint32_t coordBoot, uint32_t epoch, uint32_t seq, uint8_t code,
+                                     const String &version, const String &text);
+struct ClusterFirmwareEntry {
+    char integrationId[36];
+    char hostname[64];
+    char release[32];
+    uint32_t bootNonce;
+    bool local;
+    bool online;
+};
+// Local device first, then every known peer (online flag by lease).
+size_t clusterFirmwareSnapshot(ClusterFirmwareEntry *out, size_t capacity);
+size_t clusterFirmwareSnapshotCapacity();
+// One peer by integration id (no snapshot copy).
+bool clusterFirmwarePeer(const char *integrationId, ClusterFirmwareEntry &out);
+
 bool clusterRequestNodeCapture(const String &nodeId, int64_t utcUs, String &error, bool testPulse = false);
 bool clusterRuntimeActive();
 bool clusterLocalIsCoordinator();

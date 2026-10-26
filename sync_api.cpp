@@ -1,6 +1,7 @@
 #include "cluster_camera.h"
 #include "cluster_camera_profile.h"
 #include "webconfig_camera_tuning.h"
+#include "cluster_firmware_rollout.h"
 #include "sync_api.h"
 
 #include "board_config.h"
@@ -2510,6 +2511,8 @@ static const ApiConfigFieldDef API_CONFIG_FIELDS[] = {
     {"camera_crop_x", "camera", false, true},
     {"camera_crop_y", "camera", false, true},
     {"camera_tuning", "camera", false, true},
+    {"camera_hmirror", "camera", false, true},
+    {"camera_vflip", "camera", false, true},
     {"rotation", "camera", false, true},
 
     {"recording_format", "recording", false, true},
@@ -3873,6 +3876,31 @@ static void handleClusterCameraProfileGet()
     server().send(200, "application/json; charset=utf-8", clusterCameraProfileJson());
 }
 
+static void handleClusterFirmwareGet()
+{
+    if (!authenticate())
+        return;
+    sendApiVersionHeader();
+    server().sendHeader("Cache-Control", "no-store");
+    if (!clusterLocalIsCoordinator()) {
+        sendJsonError(403, "not_coordinator", "only on the active coordinator");
+        return;
+    }
+    server().send(200, "application/json; charset=utf-8", clusterFirmwareRolloutJson());
+}
+
+static void handleClusterFirmwarePost()
+{
+    if (!authenticate())
+        return;
+    touchExclusiveLease();
+    String json;
+    const int code = clusterFirmwareRolloutRequestFromArgs(server(), json);
+    sendApiVersionHeader();
+    server().sendHeader("Cache-Control", "no-store");
+    server().send(code, "application/json; charset=utf-8", json);
+}
+
 static void handleClusterCamerasGet()
 {
     if (!authenticate())
@@ -4135,6 +4163,8 @@ void syncApiRegisterRoutes(WebServer &webServer)
     webServer.on("/api/v1/cluster/cameras", HTTP_GET, handleClusterCamerasGet);
     webServer.on("/api/v1/cluster/camera_profile", HTTP_GET, handleClusterCameraProfileGet);
     webServer.on("/api/v1/cluster/camera_profile", HTTP_POST, handleClusterCameraProfilePost);
+    webServer.on("/api/v1/cluster/firmware", HTTP_GET, handleClusterFirmwareGet);
+    webServer.on("/api/v1/cluster/firmware", HTTP_POST, handleClusterFirmwarePost);
     webServer.on("/api/v1/camera/tuning", HTTP_GET, handleCameraTuningGet);
     webServer.on("/api/v1/camera/tuning", HTTP_POST, handleCameraTuningPost);
     webServer.on("/api/v1/camera/line_time", HTTP_GET, handleCameraLineTimeGet);

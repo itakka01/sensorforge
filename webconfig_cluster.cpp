@@ -469,6 +469,9 @@ window.sfStatusBurst=function(ms){burstUntil=Math.max(burstUntil,Date.now()+ms);
  burstTimer=setInterval(function(){if(Date.now()>burstUntil){clearInterval(burstTimer);burstTimer=null;return;}if(!document.hidden)window.sfCoordinateStatus(true).catch(function(){});},3000);};})();
 window.sfOnStatus(function(d){sfRenderCapacity('sfCoordCapacityWarning',d);});
 </script>)__STATUS__";
+    html += "<section class='settings-section'><h3>Firmware im Cluster</h3><p class='muted'>Signierte Firmware "
+            "vom PC aus an alle Nodes verteilen, ein Gerät nach dem anderen.</p>"
+            "<a class='button' href='/cluster_firmware'>Firmware im Cluster öffnen</a></section>";
     html += webconfigClusterGroupsSectionHtml();
     html += webconfigClusterCameraSectionHtml();
     html += webconfigClusterTimeSectionHtml();

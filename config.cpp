@@ -93,6 +93,9 @@ int cfg_camera_ae_level = -1;
 String cfg_camera_crop_zoom = "1.0";
 // Fixed exposure/gain/white balance for uniform cluster cameras (camera_tuning.h).
 String cfg_camera_tuning = "";
+// Sensor mirror/flip on top of board correction and rotation (no software transform).
+int cfg_camera_hmirror = 0;
+int cfg_camera_vflip = 0;
 int cfg_camera_crop_x = 1;
 int cfg_camera_crop_y = 1;
 int cfg_post_ms     = 3000;
@@ -649,6 +652,8 @@ struct ConfigValues {
     int cameraAeLevel;
     String cameraCropZoom;
     String cameraTuning;
+    int cameraHmirror;
+    int cameraVflip;
     int cameraCropX;
     int cameraCropY;
     int rotation;
@@ -783,6 +788,8 @@ struct ConfigSeen {
     bool cameraAeLevel;
     bool cameraCropZoom;
     bool cameraTuning;
+    bool cameraHmirror;
+    bool cameraVflip;
     bool cameraCropX;
     bool cameraCropY;
     bool rotation;
@@ -958,6 +965,12 @@ static void setDefaultValues(
 
     values.cameraTuning =
         "";
+
+    values.cameraHmirror =
+        0;
+
+    values.cameraVflip =
+        0;
 
     values.cameraCropX =
         1;
@@ -1290,6 +1303,8 @@ static bool serializeConfigValues(
     APPEND_CONFIG_VALUE("camera_ae_level", String(values.cameraAeLevel));
     APPEND_CONFIG_VALUE("camera_crop_zoom", values.cameraCropZoom);
     APPEND_CONFIG_VALUE("camera_tuning", values.cameraTuning);
+    APPEND_CONFIG_VALUE("camera_hmirror", String(values.cameraHmirror));
+    APPEND_CONFIG_VALUE("camera_vflip", String(values.cameraVflip));
     APPEND_CONFIG_VALUE("camera_crop_x", String(values.cameraCropX));
     APPEND_CONFIG_VALUE("camera_crop_y", String(values.cameraCropY));
     APPEND_CONFIG_VALUE("rotation", String(values.rotation));
@@ -2313,6 +2328,16 @@ static bool validateValues(
 
         error =
             "camera_crop_zoom must be 1.0, 1.5 or 2.0";
+
+        return false;
+    }
+
+    if (
+        (values.cameraHmirror != 0 && values.cameraHmirror != 1) ||
+        (values.cameraVflip != 0 && values.cameraVflip != 1)
+    ) {
+        error =
+            "camera_hmirror/camera_vflip must be 0 or 1";
 
         return false;
     }
@@ -3841,6 +3866,32 @@ static bool parseConfigText(
 
                 values.cameraTuning =
                     value;
+
+            } else if (
+                key == "camera_hmirror" ||
+                key == "camera_vflip"
+            ) {
+
+                const bool h = key == "camera_hmirror";
+                if (
+                    !markOnce(
+                        h ? seen.cameraHmirror : seen.cameraVflip,
+                        key,
+                        error
+                    ) ||
+                    !parseIntegerStrict(
+                        value,
+                        numericValue
+                    )
+                ) {
+                    if (!error.length())
+                        error = "invalid " + key;
+
+                    return false;
+                }
+
+                (h ? values.cameraHmirror : values.cameraVflip) =
+                    (int)numericValue;
 
             } else if (
                 key == "camera_crop_x"
@@ -5605,6 +5656,12 @@ static void applyValues(
 
     cfg_camera_tuning =
         values.cameraTuning;
+
+    cfg_camera_hmirror =
+        values.cameraHmirror;
+
+    cfg_camera_vflip =
+        values.cameraVflip;
 
     cfg_camera_crop_x =
         values.cameraCropX;
@@ -8585,6 +8642,94 @@ ConfigSaveResult configSaveCameraTuning(
         cfg_camera_auto_exposure = cameraAutoExposure;
         cfg_camera_ae_level = cameraAeLevel;
         cfg_camera_tuning = tuning;
+    }
+
+    return result;
+}
+
+
+ConfigSaveResult configSaveCameraOrientation(
+    int rotation,
+    int hmirror,
+    int vflip,
+    bool writeToSd,
+    String &error
+)
+{
+    error = "";
+
+    if (rotation != 0 && rotation != 180) {
+        error = "rotation must be 0 or 180";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if ((hmirror != 0 && hmirror != 1) || (vflip != 0 && vflip != 1)) {
+        error = "camera_hmirror/camera_vflip must be 0 or 1";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String text;
+    bool sourceRead = false;
+
+    // Preserve the complete active config including comments and future keys.
+    if (
+        activeConfigSource == CONFIG_SOURCE_SD &&
+        sdAvailableState &&
+        STORAGE.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    }
+
+    if (
+        !sourceRead &&
+        internalAvailableState &&
+        LittleFS.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(LittleFS, "/config.txt", text);
+    }
+
+    if (
+        !sourceRead &&
+        sdAvailableState &&
+        STORAGE.exists("/config.txt")
+    ) {
+        sourceRead = readTextFile(STORAGE, "/config.txt", text);
+    }
+
+    if (!sourceRead) {
+        error = "no persistent config.txt available for camera save";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    if (
+        !replaceOrAppendConfigKey(text, "rotation", String(rotation)) ||
+        !replaceOrAppendConfigKey(text, "camera_hmirror", String(hmirror)) ||
+        !replaceOrAppendConfigKey(text, "camera_vflip", String(vflip))
+    ) {
+        error = "could not patch camera orientation keys";
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    String validationError;
+    if (!configValidateText(text, validationError)) {
+        error = "patched config invalid: " + validationError;
+        return CONFIG_SAVE_INTERNAL_FAILED;
+    }
+
+    ConfigSaveResult result =
+        configSaveText(
+            text,
+            writeToSd,
+            error
+        );
+
+    if (
+        result == CONFIG_SAVE_BOTH ||
+        result == CONFIG_SAVE_INTERNAL_ONLY
+    ) {
+        cfg_rotation = rotation;
+        cfg_camera_hmirror = hmirror;
+        cfg_camera_vflip = vflip;
     }
 
     return result;

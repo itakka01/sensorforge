@@ -1,34 +1,13 @@
 #include "firmware_security.h"
 #include "firmware_public_key.h"
 #include "psram_alloc.h"
+#include "board_config.h"
+#include "sensorforge_version.h"
 
 #include <mbedtls/pk.h>
 #include <string.h>
 
 namespace {
-
-static const uint8_t FIRMWARE_PACKAGE_MAGIC[8] = {
-    'S', 'F', 'W', 'P', 'K', 'G', '1', 0
-};
-
-static const uint8_t FIRMWARE_PACKAGE_VERSION = 1U;
-static const uint8_t FIRMWARE_SIGNATURE_ALGORITHM_ECDSA_P256_SHA256 = 1U;
-
-static uint16_t readU16LE(const uint8_t *value)
-{
-    return
-        (uint16_t)value[0] |
-        ((uint16_t)value[1] << 8);
-}
-
-static uint32_t readU32LE(const uint8_t *value)
-{
-    return
-        (uint32_t)value[0] |
-        ((uint32_t)value[1] << 8) |
-        ((uint32_t)value[2] << 16) |
-        ((uint32_t)value[3] << 24);
-}
 
 static bool firmwareSecurityVerifySignature(
     const uint8_t digest[32],
@@ -85,6 +64,51 @@ static bool firmwareSecurityVerifySignature(
 
 } // namespace
 
+// Read by sensorforge_firmware_sign.py to put the release into the signed
+// header; exactly one occurrence per image (also logged at boot, which keeps
+// it in the binary).
+static const char FIRMWARE_RELEASE_MARKER[] =
+    "SENSORFORGE|RELEASE=" SENSORFORGE_RELEASE_TAG "|END";
+
+const char *firmwareSecurityReleaseMarker()
+{
+    return FIRMWARE_RELEASE_MARKER;
+}
+
+const char *firmwareSecurityLocalBoardId()
+{
+#if defined(BOARD_XIAO)
+    return "xiao";
+#elif defined(BOARD_FREENOVE)
+    return "freenove";
+#elif defined(BOARD_DIYMORE_S3CAM)
+    return "diymore";
+#else
+    return "unknown";
+#endif
+}
+
+bool firmwareSecurityCheckPolicy(
+    const SensorForgeFirmwarePackageInfo &info,
+    String &error
+)
+{
+    const char *policyError = nullptr;
+    if (!FirmwarePackage::checkPolicy(
+            info.header,
+            firmwareSecurityLocalBoardId(),
+            SENSORFORGE_RELEASE_TAG,
+            info.allowOlder,
+            policyError
+        )) {
+        error = String(policyError) + " (package " + info.header.board + " " +
+            info.header.release + ", installed " + firmwareSecurityLocalBoardId() + " " +
+            SENSORFORGE_RELEASE_TAG + ")";
+        return false;
+    }
+    return true;
+}
+
 bool firmwareSecurityParseHeader(
     const uint8_t *header,
     size_t headerLength,
@@ -94,78 +118,12 @@ bool firmwareSecurityParseHeader(
 {
     error = "";
     info = SensorForgeFirmwarePackageInfo();
-
-    if (
-        !header ||
-        headerLength < SENSORFORGE_FIRMWARE_PACKAGE_HEADER_SIZE
-    ) {
-        error = "firmware package header is incomplete";
+    const char *parseError = nullptr;
+    if (!FirmwarePackage::parseHeader(header, headerLength, info.header, parseError)) {
+        error = parseError ? parseError : "invalid firmware package header";
         return false;
     }
-
-    if (
-        memcmp(
-            header,
-            FIRMWARE_PACKAGE_MAGIC,
-            sizeof(FIRMWARE_PACKAGE_MAGIC)
-        ) != 0
-    ) {
-        error = "not a SensorForge signed firmware package";
-        return false;
-    }
-
-    if (header[8] != FIRMWARE_PACKAGE_VERSION) {
-        error = "unsupported firmware package version";
-        return false;
-    }
-
-    if (
-        header[9] !=
-        FIRMWARE_SIGNATURE_ALGORITHM_ECDSA_P256_SHA256
-    ) {
-        error = "unsupported firmware signature algorithm";
-        return false;
-    }
-
-    if (
-        readU16LE(header + 10) !=
-        SENSORFORGE_FIRMWARE_PACKAGE_HEADER_SIZE
-    ) {
-        error = "invalid firmware package header size";
-        return false;
-    }
-
-    info.firmwareSize =
-        readU32LE(header + 12);
-
-    if (info.firmwareSize == 0) {
-        error = "firmware package contains an empty image";
-        return false;
-    }
-
-    memcpy(
-        info.expectedDigest,
-        header + 16,
-        sizeof(info.expectedDigest)
-    );
-
-    info.signatureLength =
-        readU16LE(header + 48);
-
-    if (
-        info.signatureLength == 0 ||
-        info.signatureLength > SENSORFORGE_FIRMWARE_SIGNATURE_MAX_BYTES
-    ) {
-        error = "firmware package signature length is invalid";
-        return false;
-    }
-
-    memcpy(
-        info.signature,
-        header + 50,
-        info.signatureLength
-    );
-
+    info.firmwareSize = info.header.imageSize;
     return true;
 }
 
@@ -322,7 +280,7 @@ bool firmwareSecurityHashFinishAndVerify(
     if (
         memcmp(
             digest,
-            info.expectedDigest,
+            info.header.imageDigest,
             sizeof(digest)
         ) != 0
     ) {
@@ -330,13 +288,35 @@ bool firmwareSecurityHashFinishAndVerify(
         return false;
     }
 
-    return
-        firmwareSecurityVerifySignature(
-            digest,
-            info.signature,
-            info.signatureLength,
+    // The signature covers the header block (image digest, board, release).
+    uint8_t blockDigest[32] = {};
+    size_t blockDigestLength = 0;
+    if (
+        psa_hash_compute(
+            PSA_ALG_SHA_256,
+            info.header.signedBlock,
+            sizeof(info.header.signedBlock),
+            blockDigest,
+            sizeof(blockDigest),
+            &blockDigestLength
+        ) != PSA_SUCCESS ||
+        blockDigestLength != sizeof(blockDigest)
+    ) {
+        error = "SHA-256 of the signed header failed";
+        return false;
+    }
+
+    if (!firmwareSecurityVerifySignature(
+            blockDigest,
+            info.header.signature,
+            info.header.signatureLength,
             error
-        );
+        )) {
+        return false;
+    }
+
+    // Only now are board and release trusted.
+    return firmwareSecurityCheckPolicy(info, error);
 }
 
 void firmwareSecurityHashAbort(

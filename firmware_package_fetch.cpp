@@ -5,6 +5,7 @@
 #include "firmware_update_admission.h"
 #include "firmware_ota_activation.h"
 #include <esp_ota_ops.h>
+#include <esp_task_wdt.h>
 #include <WiFi.h>
 #include <esp_http_client.h>
 #include <mbedtls/sha256.h>
@@ -46,16 +47,11 @@ static bool sha256Finish(mbedtls_sha256_context *ctx, unsigned char out[32]) {
 constexpr uint32_t kMaxPackageSize = 16U * 1024U * 1024U;
 constexpr int kChunk = 2048;
 
+// https:// or http:// to a private IPv4 (firmware_package_format.h); the
+// package signature authenticates the firmware either way.
 bool validUrl(const String &url) {
-    if (!url.startsWith("https://") || url.length() > 240 || url.length() < 12) return false;
-    const int hostEnd = url.indexOf('/', 8);
-    const String host = hostEnd < 0 ? url.substring(8) : url.substring(8, hostEnd);
-    if (host.isEmpty() || host.indexOf('@') >= 0 || host.indexOf('?') >= 0 || host.indexOf('#') >= 0) return false;
-    for (size_t i = 0; i < url.length(); ++i) {
-        const char c = url[i];
-        if (c <= 32 || c >= 127 || c == '@' || c == '#') return false;
-    }
-    return true;
+    const char *error = nullptr;
+    return FirmwarePackage::urlAllowed(url.c_str(), error);
 }
 
 bool validDigest(const String &sha) {
@@ -119,21 +115,25 @@ bool firmwarePackageDownloadInternal(const FirmwareManifestCandidate &candidate,
         result = "Kein Wi-Fi verbunden.";
         return false;
     }
-#if !defined(CONFIG_MBEDTLS_CERTIFICATE_BUNDLE) || !CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
-    result = "TLS-Zertifikatspruefung nicht verfuegbar.";
-    return false;
-#else
+    const bool https = candidate.packageUrl.startsWith("https://");
     esp_http_client_config_t config = {};
     config.url = candidate.packageUrl.c_str();
     config.timeout_ms = 5000;
-    config.crt_bundle_attach = esp_crt_bundle_attach;
+    if (https) {
+#if defined(CONFIG_MBEDTLS_CERTIFICATE_BUNDLE) && CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
+        config.crt_bundle_attach = esp_crt_bundle_attach;
+#else
+        result = "TLS-Zertifikatspruefung nicht verfuegbar.";
+        return false;
+#endif
+    }
     config.disable_auto_redirect = true;
     esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (!client) { result = "HTTPS-Client nicht verfuegbar."; return false; }
+    if (!client) { result = "HTTP-Client nicht verfuegbar."; return false; }
     esp_http_client_set_method(client, HTTP_METHOD_GET);
     esp_err_t error = esp_http_client_open(client, 0);
     if (error != ESP_OK) {
-        result = "HTTPS-Verbindung fehlgeschlagen.";
+        result = https ? "HTTPS-Verbindung fehlgeschlagen." : "HTTP-Verbindung fehlgeschlagen.";
         esp_http_client_cleanup(client);
         return false;
     }
@@ -179,11 +179,13 @@ bool firmwarePackageDownloadInternal(const FirmwareManifestCandidate &candidate,
     const uint32_t startMs = millis();
     while (ok && count < candidate.packageSize) {
         if (static_cast<uint32_t>(millis() - startMs) > 180000U) { ok = false; result = "Download-Zeitlimit erreicht."; break; }
+        // Runs in the loop task (30 s task watchdog); a download takes longer.
+        esp_task_wdt_reset();
         const int want = candidate.packageSize - count > kChunk ? kChunk : static_cast<int>(candidate.packageSize - count);
         const int n = esp_http_client_read(client, reinterpret_cast<char *>(chunk), want);
         if (n <= 0) { ok = false; result = "Paket unvollstaendig oder Verbindung abgebrochen."; break; }
         ok = sha256Update(&sha, chunk, static_cast<size_t>(n));
-        // .sfw = 128-byte signed header followed by the raw ESP application.
+        // .sfw = 256-byte signed header (format 2) followed by the raw ESP application.
         size_t pos = 0;
         if (ok && !headerOk) {
             const size_t take = static_cast<size_t>(n) < sizeof(header) - headerUsed
@@ -193,6 +195,12 @@ bool firmwarePackageDownloadInternal(const FirmwareManifestCandidate &candidate,
             pos += take;
             if (headerUsed == sizeof(header)) {
                 ok = firmwareSecurityParseHeader(header, sizeof(header), package, packageError);
+                // Board/downgrade check before anything is written (repeated
+                // after the signature check in firmwareOtaVerifyCompletePackage).
+                if (ok) {
+                    package.allowOlder = candidate.allowOlder;
+                    ok = firmwareSecurityCheckPolicy(package, packageError);
+                }
                 if (ok) {
                     ok = package.firmwareSize > 0 &&
                          package.firmwareSize <= inactive->size &&
@@ -275,12 +283,12 @@ bool firmwarePackageDownloadInternal(const FirmwareManifestCandidate &candidate,
         else if (result == "Paketdownload nicht gestartet.") result = "Download- oder SHA-256-Verarbeitung fehlgeschlagen.";
         return false;
     }
-    if (stage && !FirmwareOtaActivation::remember(inactive, candidate.version, result)) return false;
+    // The signed release, not the (untrusted) manifest version.
+    if (stage && !FirmwareOtaActivation::remember(inactive, String(package.header.release), result)) return false;
     result = stage
         ? "Signiertes Firmwarepaket in inaktiver OTA-Partition bereitgestellt; Fingerabdruck erfasst, kein Neustart."
         : "Paket vollstaendig geladen; SHA-256, Boardmarker und .sfw-Signatur verifiziert. Keine Speicherung, keine Installation.";
     return true;
-#endif
 }
 
 } // namespace

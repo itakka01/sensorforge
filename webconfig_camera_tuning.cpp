@@ -177,6 +177,28 @@ int applyResolution(WebServer &srv, String &json)
     return result(json, 200, true, "Auflösung " + res + " gespeichert, Kamera neu gestartet." + note);
 }
 
+// mode=orientation: rotation 0/180, hmirror/vflip 0/1 – done by the sensor
+// (set_hmirror/set_vflip), saved, camera restart. Not part of the cluster
+// profile: every camera is mounted differently.
+int applyOrientation(WebServer &srv, String &json)
+{
+    const int rotation = argInt(srv, "rotation", -1);
+    const int hmirror = argInt(srv, "hmirror", -1);
+    const int vflip = argInt(srv, "vflip", -1);
+    if ((rotation != 0 && rotation != 180) || (hmirror != 0 && hmirror != 1) || (vflip != 0 && vflip != 1))
+        return result(json, 400, false, "rotation muss 0/180, hmirror/vflip 0/1 sein");
+    String error;
+    configRefreshSdStatus();
+    const bool writeToSd = configSdAvailable() && configSdPresent();
+    const ConfigSaveResult saved = configSaveCameraOrientation(rotation, hmirror, vflip, writeToSd, error);
+    if (saved != CONFIG_SAVE_BOTH && saved != CONFIG_SAVE_INTERNAL_ONLY)
+        return result(json, 400, false, "Speichern fehlgeschlagen: " + error);
+    clusterCaptureLiveInvalidate();
+    if (!cameraRestartWithSettings(error))
+        return result(json, 200, true, "Ausrichtung gespeichert; " + error + ".");
+    return result(json, 200, true, "Ausrichtung gespeichert, Kamera neu gestartet.");
+}
+
 // POST /camera_tuning_apply
 void handleCameraTuningApply()
 {
@@ -277,6 +299,19 @@ void handleCameraTuningPage()
                                      "Belichtungswert zählt in Sensorzeilen – nach einem Wechsel ergibt derselbe Wert eine "
                                      "andere Belichtungszeit.") +
                 "</p></div>";
+        const bool mirrorCap = !caps || (caps & CapMirror);
+        const String dm = mirrorCap ? String() : String(" disabled title='Vom Sensor nicht unterstützt'");
+        auto chk = [](const char *id, bool on) {
+            return String("<input type='checkbox' id='") + id + "'" + (on ? " checked" : "") + ">";
+        };
+        html += "<div style='margin-top:12px'><strong>Ausrichtung</strong> "
+                "<label>Drehung <select id='tuneRot'" + dm + ">" + opt(0, cfg_rotation, "0°") + opt(180, cfg_rotation, "180°") +
+                "</select></label> <label>" + chk("tuneHm", cfg_camera_hmirror) + " Horizontal spiegeln</label> "
+                "<label>" + chk("tuneVf", cfg_camera_vflip) + " Vertikal kippen</label> "
+                "<button type='button' id='tuneOriApply'" + dm + ">Übernehmen (Kamera startet neu)</button>"
+                "<p class='muted' style='margin:4px 0 0'>Macht der Sensor selbst (keine Bildumrechnung). 90° ist "
+                "mit diesen Sensoren nicht möglich. Gilt nur für dieses Gerät, das Cluster-Profil überträgt die "
+                "Ausrichtung nicht.</p></div>";
     }
     html += "</div>";
     html += "<form id='tuneForm' style='flex:1 1 300px;min-width:0' onsubmit='return false'><div class='tune-grid'>";
@@ -345,6 +380,13 @@ if(resBtn)resBtn.addEventListener('click',function(){if(!confirm('Kamera-Auflös
  var fd=new URLSearchParams();fd.append('mode','resolution');fd.append('resolution',resSel.value);st.textContent='Auflösung wird übernommen …';resBtn.disabled=true;
  fetch('/camera_tuning_apply',{method:'POST',body:fd,credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json().catch(function(){return {ok:false,message:'HTTP '+r.status};});})
  .then(function(j){st.textContent=(j.ok?'✓ ':'✗ ')+j.message;if(j.ok)setTimeout(function(){location.reload();},1500);else resBtn.disabled=false;}).catch(function(e){st.textContent='✗ '+(e.message||e);resBtn.disabled=false;});});
+// Orientation: sensor mirror/flip, saved, camera restarts.
+var oriBtn=document.getElementById('tuneOriApply');
+if(oriBtn)oriBtn.addEventListener('click',function(){var fd=new URLSearchParams();fd.append('mode','orientation');
+ fd.append('rotation',document.getElementById('tuneRot').value);fd.append('hmirror',document.getElementById('tuneHm').checked?'1':'0');fd.append('vflip',document.getElementById('tuneVf').checked?'1':'0');
+ st.textContent='Ausrichtung wird übernommen …';oriBtn.disabled=true;
+ fetch('/camera_tuning_apply',{method:'POST',body:fd,credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json().catch(function(){return {ok:false,message:'HTTP '+r.status};});})
+ .then(function(j){st.textContent=(j.ok?'✓ ':'✗ ')+j.message;oriBtn.disabled=false;if(j.ok)setTimeout(load,1500);}).catch(function(e){st.textContent='✗ '+(e.message||e);oriBtn.disabled=false;});});
 var sending=false,queued=null,autoTimer=null,auto=document.getElementById('tuneAuto');
 // Disabled (unsupported) fields are sent too; the server needs a complete set.
 function send(m){if(sending){queued=m;return;}sending=true;queued=null;
@@ -375,6 +417,8 @@ int cameraTuningRequestFromArgs(WebServer &srv, String &json)
     const String mode = srv.arg("mode");
     if (mode == "resolution")
         return applyResolution(srv, json);
+    if (mode == "orientation")
+        return applyOrientation(srv, json);
     int autoExposure = cfg_camera_auto_exposure, aeLevel = cfg_camera_ae_level;
     CameraTuning::Values t;
     String error;
@@ -397,7 +441,7 @@ int cameraTuningRequestFromArgs(WebServer &srv, String &json)
         if (mode == "reset")
             t.set = true; // apply the default values now
     } else if (mode != "session") {
-        return result(json, 400, false, "mode muss session, save, reset oder resolution sein");
+        return result(json, 400, false, "mode muss session, save, reset, resolution oder orientation sein");
     }
     clusterCaptureLiveInvalidate();
     if (!cameraApplyTuningRuntime(autoExposure, aeLevel, t, error)) {

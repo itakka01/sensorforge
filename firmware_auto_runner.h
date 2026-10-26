@@ -38,3 +38,10 @@ enum class FirmwareAutoRebootStatus : uint8_t {
     RestartReturned
 };
 FirmwareAutoRebootStatus firmwareAutoStageSelectAndRebootOnce(String &detail);
+
+// Cluster update (signed coordinator job): manifest URL from the job, highest
+// release for this board (newer only unless allowOlder), staged and selected
+// for the next boot under one OTA reservation. Does not need the local
+// auto-update setting and does not reboot; version is the signed release.
+FirmwareAutoActivateStatus firmwareClusterStageAndSelectOnce(const String &manifestUrl, bool allowOlder,
+                                                              String &version, String &detail);

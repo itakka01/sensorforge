@@ -104,7 +104,7 @@ Umgesetzt in Schritt 1:
 
 | Teil | Datei | Inhalt |
 |---|---|---|
-| Abstimmung | `camera_tuning.h`, `webconfig_camera_tuning.cpp` | Schlüssel `camera_tuning` (`1,aec_value,agc,agc_gain,gainceiling,awb,wb_mode,awb_gain,brightness,contrast,saturation`), Seite `/camera_tuning`, POST `/camera_tuning_apply` (`mode=session|save|reset|resolution`, `reset` = Standardwerte speichern und anwenden, `resolution` = Auflösung speichern + Kamera-Neustart), `/camera_line_time` (gemessene Zeilendauer für die Belichtungszeit) |
+| Abstimmung | `camera_tuning.h`, `webconfig_camera_tuning.cpp` | Schlüssel `camera_tuning` (`1,aec_value,agc,agc_gain,gainceiling,awb,wb_mode,awb_gain,brightness,contrast,saturation`), Seite `/camera_tuning`, POST `/camera_tuning_apply` (`mode=session|save|reset|resolution`, `reset` = Standardwerte speichern und anwenden, `resolution` = Auflösung speichern + Kamera-Neustart, `orientation` = Drehung 0/180 + Spiegeln/Kippen über den Sensor, Schlüssel `camera_hmirror`/`camera_vflip`), `/camera_line_time` (gemessene Zeilendauer für die Belichtungszeit) |
 | Anwenden | `sensorforge.ino` | `cameraApplyTuning()` am Ende der Belichtungseinstellung in `initCamera()`; `cameraApplyTuningRuntime()` ohne Kameraneustart |
 | Live-Bild | `cluster_capture.cpp` (`clusterCaptureLiveFrame`), `/camera_frame` | frisches Bild, `size=small` (≈1/8, Standard), `medium` (≥ 800 px breit) oder `full`; gleiche Sperren wie eine Cluster-Aufnahme |
 | Kleinbild | `camera_thumbnail.cpp` (`esp_new_jpeg`, Rückfall `jpeg_mini_encoder.cpp`) | Verkleinern um 1/2, 1/4 oder 1/8 (≥ 160 px breit) direkt beim Dekodieren, Neukodierung Qualität 80, 4:2:0 (Rückfall 4:4:4); Zeiten im Header `X-SF-Frame-Timing` |

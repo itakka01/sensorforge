@@ -82,7 +82,7 @@ Physical (SD/LittleFS)
 
 #### Security & Licensing
 - `license.cpp/h` - ECDSA P-256 Board-Bound Activation (TRIAL/DEMO/FULL)
-- `firmware_security.cpp/h` - Ed25519 .sfw-Signatur-Verifikation
+- `firmware_security.cpp/h` - ECDSA-P256 .sfw-Prüfung (Format 2: Board + Release signiert, Downgrade-Schutz)
 - `recording_crypto.cpp/h` - SFENC1-Container (AES-256-GCM)
 
 #### Netzwerk & Streaming
@@ -414,6 +414,7 @@ SFJC1 empfangen → Signatur prüfen
 - `SFJC1` - Job Command (Ed25519)
 - `SFJCR1` - Job Result (Ed25519)
 - `SFJCA1` - Job Receipt (HMAC)
+- `SFJU1`/`SFJUA1` - Firmware-Update-Auftrag/Antwort (HMAC, seit beta158)
 
 **Zeitsynchronisation (seit beta147):**
 - Coordinator-Zeitsignal jede Sekunde (Beacon + FollowUp), Node-Modell aus oberer Hüllkurve
@@ -461,7 +462,7 @@ Download: http://<node-ip>/capture_media?uuid=<media-uuid>
 | Feature | Algorithmus | Trust-Domain |
 |---------|------------|--------------|
 | License | ECDSA P-256/SHA-256 | Board-Bound (eFuse MAC) |
-| Firmware | Ed25519 | .sfw-Pakete |
+| Firmware | ECDSA P-256/SHA-256 | .sfw-Pakete (Format 2) |
 | Recording | AES-256-GCM + HMAC | SFENC1-Container |
 | Config-Secrets | SFSEC1 | Passwörter |
 | Cluster | HMAC-SHA256 / Ed25519 | Jobs/Presence |
@@ -483,23 +484,24 @@ python sensorforge_license.py         # License-Code erstellen
 
 ### Firmware-Signierung
 
-**Tool:**
+**Format 2 (seit beta158, `firmware_package_format.h`):** 256-Byte-Kopf, ECDSA P-256/SHA-256 über die ersten 128 Byte (Image-SHA-256, Board-ID, Release). Board und Release sind damit signiert: jedes Gerät nimmt nur Pakete für sein Board und (ohne ausdrückliches „Downgrade erlauben“) keine ältere Version an. Format 1 wird abgelehnt.
+
+**Tools:**
 ```bash
-python sensorforge_firmware_sign.py firmware.bin
-  → firmware.sfw (signiert)
+python3 sensorforge_firmware_sign.py sign sensorforge.ino.bin   # → .sfw (Board + Release aus Markern im Image)
+python3 tools/sf_firmware_publish.py                            # sammelt Builds, signiert, manifest.json, Webserver im LAN
 ```
 
-**OTA-Prozess:**
-1. .sfw-Paket laden (SD oder WiFi)
-2. Ed25519-Signatur prüfen
-3. Kompatibilität prüfen
-4. OTA-Partition schreiben
-5. Boot-Umschaltung
+**Installationswege** (alle prüfen Signatur + Board + Version, bevor umgeschaltet wird; zentrale Stelle `firmwareSecurityHashFinishAndVerify`):
+- Upload im Browser (System → Firmware), SD `/firmware/*.sfw` (Prüfsumme auch beim Flashen), Manifest-Auto-Update, **Cluster-Update** (Coordinator-Seite `/cluster_firmware`, signierter Auftrag `SFJU1`, ein Node nach dem anderen; Manifest/Pakete per https:// oder http:// nur zu privater IPv4).
+- Rückfall: `verifyRollbackLater()` = true; ein neues Image wird erst nach 60 s (oder vor absichtlichem Tiefschlaf) bestätigt, ein Neustart vorher startet die alte Firmware.
+
+**Schlüssel:** `sensorforge_firmware_private_DEV.pem` liegt im Repo (Entwicklung). Vor echtem Einsatz neuen Schlüssel erzeugen (`keygen`) und außerhalb des Repos halten.
 
 **⚠️ Nicht implementiert:**
 - Secure Boot
 - Flash Encryption
-- Anti-Rollback
+- Hardware-Anti-Rollback (eFuse); der Versionsschutz ist reine Software
 
 ---
 

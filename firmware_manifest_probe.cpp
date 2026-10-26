@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include "sensorforge_version.h"
+#include "firmware_package_format.h"
+#include "firmware_security.h"
 #include <cJSON.h>
 #if defined(CONFIG_MBEDTLS_CERTIFICATE_BUNDLE) && CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
 #include <esp_crt_bundle.h>
@@ -40,21 +42,11 @@ const char *jsonString(const cJSON *obj, const char *key)
     return cJSON_IsString(field) ? field->valuestring : nullptr;
 }
 
-bool validHttpsPackageUrl(const char *url)
+// https:// or http:// to a private IPv4 (firmware_package_format.h).
+bool validPackageUrl(const char *url)
 {
-    if (!url) return false;
-    const size_t len = strlen(url);
-    if (len < 12 || len > 240 || strncmp(url, "https://", 8) != 0) return false;
-    // Forbid credentials and fragments; do not accept redirects later without
-    // a separate explicit URL policy.
-    const char *hostEnd = strpbrk(url + 8, "/?#");
-    const size_t hostLen = hostEnd ? static_cast<size_t>(hostEnd - (url + 8)) : strlen(url + 8);
-    if (hostLen == 0) return false;
-    for (size_t i = 8; i < len; ++i) {
-        const unsigned char c = static_cast<unsigned char>(url[i]);
-        if (c <= 32 || c >= 127 || c == '@' || c == '#') return false;
-    }
-    return true;
+    const char *error = nullptr;
+    return url && FirmwarePackage::urlAllowed(url, error);
 }
 
 bool validSha256(const char *sha)
@@ -68,22 +60,6 @@ bool validSha256(const char *sha)
     return true;
 }
 
-// Accept only the project's explicit numeric beta scheme for comparisons.
-// Unknown naming conventions must never be guessed into an upgrade order.
-bool parseBetaVersion(const char *version, unsigned long &major, unsigned long &beta)
-{
-    if (!version || version[0] != 'v') return false;
-    const char *p = version + 1;
-    if (*p < '0' || *p > '9') return false;
-    char *end = nullptr;
-    major = strtoul(p, &end, 10);
-    if (!end || end == p || major > 100000UL || strncmp(end, "-beta", 5) != 0) return false;
-    p = end + 5;
-    if (*p < '0' || *p > '9') return false;
-    beta = strtoul(p, &end, 10);
-    return end && *end == 0 && beta <= 100000UL;
-}
-
 bool validRelease(const cJSON *release)
 {
     if (!cJSON_IsObject(release)) return false;
@@ -91,7 +67,7 @@ bool validRelease(const cJSON *release)
     const char *channel = jsonString(release, "channel");
     const char *version = jsonString(release, "version");
     const cJSON *size = cJSON_GetObjectItemCaseSensitive(release, "size");
-    if (!board || (strcmp(board, "xiao") && strcmp(board, "freenove"))) return false;
+    if (!board || (strcmp(board, "xiao") && strcmp(board, "freenove") && strcmp(board, "diymore"))) return false;
     if (!channel || (strcmp(channel, "stable") && strcmp(channel, "beta"))) return false;
     if (!version || !*version || strlen(version) > 64) return false;
     for (const char *p = version; *p; ++p) {
@@ -103,28 +79,37 @@ bool validRelease(const cJSON *release)
     if (!cJSON_IsNumber(size) || size->valuedouble < 1 ||
         size->valuedouble > 16777216 ||
         size->valuedouble != static_cast<double>(static_cast<uint32_t>(size->valuedouble))) return false;
-    return validHttpsPackageUrl(jsonString(release, "url")) &&
+    return validPackageUrl(jsonString(release, "url")) &&
            validSha256(jsonString(release, "sha256"));
 }
 
 } // namespace
 
-bool firmwareManifestFindCandidate(const String &url, FirmwareManifestCandidate &candidate, String &result)
+namespace {
+// Download (https://, or http:// to a private IPv4) and schema check. On
+// success root is the parsed manifest (caller cJSON_Delete) and releases its
+// array.
+bool fetchManifest(const String &url, cJSON *&root, const cJSON *&releases, String &result)
 {
-    candidate = FirmwareManifestCandidate{};
+    root = nullptr;
+    releases = nullptr;
     result = "Manifest-Abfrage nicht gestartet";
     if (WiFi.status() != WL_CONNECTED) {
         result = "Kein WLAN verbunden";
         return false;
     }
-    if (!url.startsWith("https://") || url.length() > 240) {
-        result = "Nur HTTPS-Manifest-URLs erlaubt";
+    const char *urlError = nullptr;
+    if (!FirmwarePackage::urlAllowed(url.c_str(), urlError)) {
+        result = String("Manifest-URL abgelehnt: ") + urlError;
         return false;
     }
+    const bool https = url.startsWith("https://");
 #if !defined(CONFIG_MBEDTLS_CERTIFICATE_BUNDLE) || !CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
-    result = "TLS-Zertifikatspruefung nicht verfuegbar (CA-Bundle fehlt)";
-    return false;
-#else
+    if (https) {
+        result = "TLS-Zertifikatspruefung nicht verfuegbar (CA-Bundle fehlt)";
+        return false;
+    }
+#endif
     // Keep RAM bounded on memory-constrained ESP32-S3 devices.
     char *data = static_cast<char *>(malloc(kMaxManifest + 1));
     if (!data) {
@@ -137,12 +122,15 @@ bool firmwareManifestFindCandidate(const String &url, FirmwareManifestCandidate 
     config.timeout_ms = 4000;
     config.event_handler = onHttpEvent;
     config.user_data = &buffer;
-    config.crt_bundle_attach = esp_crt_bundle_attach;
+#if defined(CONFIG_MBEDTLS_CERTIFICATE_BUNDLE) && CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
+    if (https)
+        config.crt_bundle_attach = esp_crt_bundle_attach;
+#endif
     config.disable_auto_redirect = true;
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {
         free(data);
-        result = "HTTPS-Client konnte nicht initialisiert werden";
+        result = "HTTP-Client konnte nicht initialisiert werden";
         return false;
     }
     const esp_err_t err = esp_http_client_perform(client);
@@ -150,50 +138,53 @@ bool firmwareManifestFindCandidate(const String &url, FirmwareManifestCandidate 
     esp_http_client_cleanup(client);
     if (err != ESP_OK || buffer.overflow || status != 200 || buffer.count == 0) {
         result = buffer.overflow ? "Manifest zu gross (maximal 8 KiB)" :
-                 (err != ESP_OK ? "HTTPS-Verbindung oder Zertifikatspruefung fehlgeschlagen" :
+                 (err != ESP_OK ? (https ? "HTTPS-Verbindung oder Zertifikatspruefung fehlgeschlagen" : "HTTP-Verbindung fehlgeschlagen") :
                  "HTTP-Status " + String(status) + " (erwartet 200)");
         free(data);
         return false;
     }
     data[buffer.count] = 0;
-    cJSON *root = cJSON_ParseWithLength(data, buffer.count);
+    root = cJSON_ParseWithLength(data, buffer.count);
     free(data);
     if (!root) {
         result = "Antwort ist kein gueltiges JSON";
         return false;
     }
     const cJSON *schema = cJSON_GetObjectItemCaseSensitive(root, "schema");
-    const cJSON *releases = cJSON_GetObjectItemCaseSensitive(root, "releases");
+    releases = cJSON_GetObjectItemCaseSensitive(root, "releases");
     const bool valid = cJSON_IsObject(root) && cJSON_IsNumber(schema) &&
                        schema->valuedouble == 1 && cJSON_IsArray(releases) &&
                        cJSON_GetArraySize(releases) <= 32;
     if (!valid) {
         cJSON_Delete(root);
+        root = nullptr;
         result = "Manifest-Schema ungueltig (erwartet schema=1 und releases-Array, max. 32)";
         return false;
     }
+    return true;
+}
+} // namespace
+
+bool firmwareManifestFindCandidate(const String &url, FirmwareManifestCandidate &candidate, String &result,
+                                   bool allowOlder)
+{
+    candidate = FirmwareManifestCandidate{};
+    cJSON *root = nullptr;
+    const cJSON *releases = nullptr;
+    if (!fetchManifest(url, root, releases, result))
+        return false;
     const int count = cJSON_GetArraySize(releases);
     int boardMatches = 0;
     int badEntries = 0;
-    int comparableNewer = 0;
     int unknownVersion = 0;
     int duplicates = 0;
     String candidateVersion;
     String candidateUrl;
     String candidateSha;
     uint32_t candidateSize = 0;
-    unsigned long candidateMajor = 0, candidateBeta = 0;
-    unsigned long currentMajor = 0, currentBeta = 0;
-    const bool currentComparable = parseBetaVersion(SENSORFORGE_RELEASE_TAG, currentMajor, currentBeta);
-#if defined(BOARD_XIAO)
-    const char *localBoard = "xiao";
-#elif defined(BOARD_FREENOVE)
-    const char *localBoard = "freenove";
-#elif defined(BOARD_DIYMORE_S3CAM)
-    const char *localBoard = "diymore";
-#else
-    const char *localBoard = "unknown";
-#endif
+    FirmwarePackage::Release best, current;
+    const bool currentComparable = FirmwarePackage::parseRelease(SENSORFORGE_RELEASE_TAG, current);
+    const char *localBoard = firmwareSecurityLocalBoardId();
     for (int i = 0; i < count; ++i) {
         const cJSON *entry = cJSON_GetArrayItem(releases, i);
         if (!validRelease(entry)) {
@@ -202,25 +193,22 @@ bool firmwareManifestFindCandidate(const String &url, FirmwareManifestCandidate 
         }
         if (strcmp(jsonString(entry, "board"), localBoard) != 0) continue;
         ++boardMatches;
-        // A release never becomes installable through this read-only probe.
-        // Only compare beta-to-beta; stable and unknown schemes require a
-        // separate explicit version policy before any automatic selection.
-        if (strcmp(jsonString(entry, "channel"), "beta") != 0) continue;
-        unsigned long major = 0, beta = 0;
+        // Highest release for this board; normally only newer than the
+        // installed one, with allowOlder (explicit downgrade) any release.
+        FirmwarePackage::Release r;
         const char *version = jsonString(entry, "version");
-        if (!currentComparable || !parseBetaVersion(version, major, beta)) {
+        if (!currentComparable || !FirmwarePackage::parseRelease(version, r)) {
             ++unknownVersion;
             continue;
         }
-        if (major < currentMajor || (major == currentMajor && beta <= currentBeta)) continue;
-        ++comparableNewer;
-        if (candidateVersion.length() && major == candidateMajor && beta == candidateBeta) {
+        // The installed release itself is never a candidate (no reinstall).
+        const int vsCurrent = FirmwarePackage::compareRelease(r, current);
+        if (vsCurrent == 0 || (!allowOlder && vsCurrent < 0)) continue;
+        if (candidateVersion.length() && FirmwarePackage::compareRelease(r, best) == 0) {
             ++duplicates;
         }
-        if (!candidateVersion.length() || major > candidateMajor ||
-            (major == candidateMajor && beta > candidateBeta)) {
-            candidateMajor = major;
-            candidateBeta = beta;
+        if (!candidateVersion.length() || FirmwarePackage::compareRelease(r, best) > 0) {
+            best = r;
             candidateVersion = version;
             candidateUrl = jsonString(entry, "url");
             candidateSha = jsonString(entry, "sha256");
@@ -232,20 +220,20 @@ bool firmwareManifestFindCandidate(const String &url, FirmwareManifestCandidate 
     if (badEntries) {
         result = "Manifest abgelehnt: " + String(badEntries) +
                  " ungueltige Release-Eintraege von " + String(count) +
-                 ". Erwartet board, channel, version, url (HTTPS), size, sha256.";
+                 ". Erwartet board, channel, version, url (https:// oder http:// im LAN), size, sha256.";
         return false;
     }
-    result = "Manifest per HTTPS gelesen: " + String(count) +
+    result = String("Manifest gelesen: ") + String(count) +
              " formal gueltige Eintraege; " + String(boardMatches) +
              " fuer Board " + localBoard + ". Installiert: " SENSORFORGE_RELEASE_TAG ". ";
     if (!currentComparable) {
         result += "Versionsschema der installierten Firmware nicht vergleichbar. ";
     } else if (candidateVersion.length() && duplicates == 0) {
-        result += "Neuerer Beta-Kandidat (UNVERIFIZIERT): " + candidateVersion + ". ";
+        result += String(allowOlder ? "Kandidat" : "Neuerer Kandidat") + " (UNVERIFIZIERT): " + candidateVersion + ". ";
     } else if (duplicates) {
-        result += "Mehrdeutige hoechste Beta-Version; keine Auswahl. ";
+        result += "Mehrdeutige hoechste Version; keine Auswahl. ";
     } else {
-        result += "Kein eindeutig neuerer Beta-Kandidat gefunden. ";
+        result += "Kein eindeutig neuerer Kandidat gefunden. ";
     }
     if (currentComparable && candidateVersion.length() && duplicates == 0) {
         candidate.version = candidateVersion;
@@ -253,11 +241,11 @@ bool firmwareManifestFindCandidate(const String &url, FirmwareManifestCandidate 
         candidate.sha256Hex = candidateSha;
         candidate.packageSize = candidateSize;
         candidate.available = true;
+        candidate.allowOlder = allowOlder;
     }
-    if (unknownVersion) result += String(unknownVersion) + " Beta-Version(en) nicht vergleichbar. ";
+    if (unknownVersion) result += String(unknownVersion) + " Version(en) nicht vergleichbar. ";
     result += "Nur Metadaten; keine Manifest-Signaturpruefung, kein Paketdownload und keine Updatefreigabe.";
     return true;
-#endif
 }
 
 // Preserve the existing WebConfig read-only API.
@@ -265,4 +253,32 @@ bool firmwareManifestProbe(const String &url, String &result)
 {
     FirmwareManifestCandidate ignored;
     return firmwareManifestFindCandidate(url, ignored, result);
+}
+
+bool firmwareManifestList(const String &url, String &json, String &result)
+{
+    json = "[]";
+    cJSON *root = nullptr;
+    const cJSON *releases = nullptr;
+    if (!fetchManifest(url, root, releases, result))
+        return false;
+    String out = "[";
+    int bad = 0, n = 0;
+    const int count = cJSON_GetArraySize(releases);
+    for (int i = 0; i < count; ++i) {
+        const cJSON *entry = cJSON_GetArrayItem(releases, i);
+        if (!validRelease(entry)) {
+            ++bad;
+            continue;
+        }
+        // Values passed validRelease(): no quotes or control characters.
+        if (n++) out += ",";
+        out += String("{\"board\":\"") + jsonString(entry, "board") + "\",\"version\":\"" +
+               jsonString(entry, "version") + "\",\"channel\":\"" + jsonString(entry, "channel") +
+               "\",\"size\":" + String((unsigned long)cJSON_GetObjectItemCaseSensitive(entry, "size")->valuedouble) + "}";
+    }
+    cJSON_Delete(root);
+    json = out + "]";
+    result = String(n) + " Eintraege" + (bad ? ", " + String(bad) + " ungueltig" : String());
+    return bad == 0;
 }

@@ -20,6 +20,10 @@ extern int cfg_camera_crop_x;
 extern int cfg_camera_crop_y;
 // Fixed exposure/gain/white balance (camera_tuning.h); empty = driver defaults.
 extern String cfg_camera_tuning;
+// Sensor mirror/flip (0/1) on top of board correction and rotation; applied by
+// the sensor itself (set_hmirror/set_vflip), never by software.
+extern int cfg_camera_hmirror;
+extern int cfg_camera_vflip;
 
 extern int cfg_rotation;
 
@@ -399,6 +403,16 @@ ConfigSaveResult configSaveCameraTuning(
     int cameraAutoExposure,
     int cameraAeLevel,
     const String &tuning,
+    bool writeToSd,
+    String &error
+);
+
+// Persist rotation (0/180) and sensor mirror/flip (page "Bildabstimmung")
+// while preserving every unrelated config key/comment.
+ConfigSaveResult configSaveCameraOrientation(
+    int rotation,
+    int hmirror,
+    int vflip,
     bool writeToSd,
     String &error
 );

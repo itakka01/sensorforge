@@ -50,6 +50,20 @@ bool hashMatches() {
 }
 
 namespace FirmwareOtaActivation {
+bool confirmRunningImage(const char *reason) {
+  const esp_partition_t *running = esp_ota_get_running_partition();
+  esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+  if (!running || esp_ota_get_state_partition(running, &state) != ESP_OK ||
+      state != ESP_OTA_IMG_PENDING_VERIFY)
+    return true;   // USB-flashed or already confirmed
+  if (esp_ota_mark_app_valid_cancel_rollback() != ESP_OK) {
+    Serial.println("[OTA] Bestaetigung der neuen Firmware fehlgeschlagen.");
+    return false;
+  }
+  Serial.printf("[OTA] Neue Firmware bestaetigt (%s); kein Rueckfall mehr.\n", reason ? reason : "");
+  return true;
+}
+
 void reportStableBootOnce() {
   static bool completed = false;
   static uint32_t lastAttemptMs = 0;
@@ -61,6 +75,11 @@ void reportStableBootOnce() {
   if (attempted && static_cast<uint32_t>(now - lastAttemptMs) < 10000UL) return;
   attempted = true;
   lastAttemptMs = now;
+  // Every OTA path (WiFi upload, SD, manifest, cluster) boots the new image
+  // pending verification; the Arduino core leaves the confirmation to us
+  // (verifyRollbackLater() in sensorforge.ino). A reset before this point
+  // makes the bootloader start the previous firmware again.
+  if (!confirmRunningImage("60 s stabil")) return;
   // The namespace only exists after an OTA update was staged. Missing means
   // "nothing pending" (every USB-flashed device), not a read error.
   nvs_handle_t probe = 0;
@@ -89,16 +108,7 @@ void reportStableBootOnce() {
     completed = true;
     return;
   }
-  // Confirm an ESP-IDF rollback-pending app only after 60 s of runtime.
-  esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
-  if (esp_ota_get_state_partition(running, &state) == ESP_OK &&
-      state == ESP_OTA_IMG_PENDING_VERIFY) {
-    if (esp_ota_mark_app_valid_cancel_rollback() != ESP_OK) {
-      Serial.println("[OTA] Boot laeuft 60 s, aber Rollback-Bestaetigung fehlgeschlagen.");
-      return; // keep persistent expectation for diagnostics/retry on next boot
-    }
-  }
-  Serial.println("[OTA] Erwartete Partition gestartet und seit 60 s aktiv; Version laut Manifest: " + version + ". Kein Langzeit-Funktionstest.");
+  Serial.println("[OTA] Erwartete Partition gestartet und seit 60 s aktiv; signierte Version: " + version + ". Kein Langzeit-Funktionstest.");
   clearBootExpectation();
   completed = true;
 }
@@ -134,15 +144,17 @@ bool ready(String &version) {
   return true;
 }
 
-bool selectForNextBoot(String &reason) {
+bool selectForNextBoot(String &reason, bool requireAutoSetting) {
   // Must be called explicitly while an exclusive reservation is held.
   if (!FirmwareUpdateAdmission::active()) {
     reason = "Keine exklusive OTA-Reservierung.";
     return false;
   }
+  // The local auto-update setting gates the periodic self-update; a signed
+  // cluster update job from the coordinator is its own authorization.
   bool enabled = false;
   String url;
-  if (!webFirmwareAutoRead(enabled, url) || !enabled) {
+  if (requireAutoSetting && (!webFirmwareAutoRead(enabled, url) || !enabled)) {
     reason = "Automatische Updates nicht freigegeben.";
     return false;
   }

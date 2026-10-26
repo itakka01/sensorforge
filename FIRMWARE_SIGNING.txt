@@ -4,6 +4,32 @@ SENSORFORGE SIGNIERTE FIRMWARE-UPDATES (.sfw)
 SD- und WiFi-Updates akzeptieren ab v87-beta3 nur noch signierte .sfw-Pakete.
 Direktes Flashen per USB/Programmer verwendet weiterhin die normale Arduino-.bin.
 
+AB v87-beta158: PAKETFORMAT 2
+-----------------------------
+Die Signatur deckt jetzt auch Board und Release ab (256-Byte-Kopf, siehe
+firmware_package_format.h). Die Geraete nehmen nur Pakete fuer ihr Board an
+und keine aeltere Version, ausser "Aeltere Version erlauben" ist bewusst
+gewaehlt. Pakete im alten Format 1 werden abgelehnt - neu signieren.
+Das Signier-Tool liest Board und Release aus Markern im Image
+(SENSORFORGE|<board>|COMPAT=1, SENSORFORGE|RELEASE=<tag>|END).
+
+CLUSTER-UPDATE VOM PC
+---------------------
+python3 tools/sf_firmware_publish.py
+  - sammelt die neuesten Builds je Board (../sensorforge_builds/<board>/ und
+    Arduino-IDE-Cache), signiert sie nach ../sensorforge_builds/ota/,
+    schreibt manifest.json und startet einen Webserver (Port 8765)
+  - die ausgegebene Manifest-URL am Coordinator unter
+    "Cluster koordinieren -> Firmware im Cluster" eintragen
+  - tools/flash_board.sh legt das Paket nach jedem Build automatisch an;
+    tools/flash_board.sh all --ota-only baut alle Boards nur fuer WLAN;
+    danach: python3 tools/sf_firmware_publish.py --serve-only
+  - nach einem Build in der Arduino IDE: python3 tools/sf_firmware_publish.py
+  - Version festlegen (z. B. Downgrade): --pin v87-beta158, aufheben: --unpin,
+    anzeigen: --list. Ausfuehrliche Hilfe: python3 tools/sf_firmware_publish.py --help
+  - Standard-Schluessel: sensorforge_firmware_private_DEV.pem (Entwicklung),
+    anderer Schluessel mit --key oder SF_FIRMWARE_KEY
+
 SIGNIEREN
 ---------
 python3 sensorforge_firmware_sign.py sign sensorforge.ino.bin \

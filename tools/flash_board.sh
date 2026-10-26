@@ -7,8 +7,14 @@
 #   tools/flash_board.sh                      Menü (Board, Port, Bestätigung)
 #   tools/flash_board.sh diymore              Board vorgeben, Port per Menü
 #   tools/flash_board.sh diymore /dev/ttyACM0 Board und Port vorgeben
+#   tools/flash_board.sh diymore --ota-only   nur bauen + WLAN-Paket, nicht flashen
+#   tools/flash_board.sh all --ota-only       alle drei Boards bauen + WLAN-Pakete
+#   tools/flash_board.sh --compileall         dasselbe (Kurzform)
 #   Optionen: --rebuild  immer neu bauen
 #             --monitor  nach dem Flashen ohne Rückfrage seriellen Monitor starten
+#             --ota-only nicht flashen, nur Build + WLAN-Paket
+#             --no-ota   kein WLAN-Paket erzeugen
+#             --compileall (auch -compileall) = all --ota-only
 #
 # Was das Skript tut:
 #   1. Kopiert die Quelldateien des Sketch-Ordners nach
@@ -20,7 +26,11 @@
 #      Ergebnis: ../sensorforge_builds/<board>/ (außerhalb des Git-Repos).
 #      Unveränderte Quellen werden nicht erneut gebaut.
 #   3. Prüft die Größe gegen die echte Partition (tools/check_firmware_size.py).
-#   4. Flasht Bootloader, Partitionstabelle, boot_app0 und App - genau wie die
+#   4. Legt das signierte WLAN-Update-Paket an (tools/sf_firmware_publish.py):
+#      ../sensorforge_builds/ota/firmware/<board>/<release>.sfw und
+#      ../sensorforge_builds/ota/manifest.json (neueste Version je Board).
+#      Ausliefern mit: python3 tools/sf_firmware_publish.py --serve-only
+#   5. Flasht Bootloader, Partitionstabelle, boot_app0 und App - genau wie die
 #      IDE. Kein Löschen des Flash, nie merged.bin: Konfiguration, WLAN-Daten,
 #      Integration-ID (NVS) und LittleFS bleiben erhalten.
 #
@@ -258,16 +268,33 @@ BOARD=""
 PORT=""
 REBUILD=0
 AUTO_MONITOR=0
+OTA_ONLY=0
+NO_OTA=0
 for arg in "$@"; do
     case $arg in
         --rebuild) REBUILD=1 ;;
         --monitor) AUTO_MONITOR=1 ;;
-        -h|--help) sed -n '2,30p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        --ota-only) OTA_ONLY=1 ;;
+        --no-ota) NO_OTA=1 ;;
+        --compileall|-compileall) BOARD=all; OTA_ONLY=1 ;;
+        -h|--help) sed -n '2,40p' "${BASH_SOURCE[0]}"; exit 0 ;;
         /dev/*) PORT=$arg ;;
-        diymore|xiao|freenove) BOARD=$arg ;;
-        *) die "Unbekanntes Argument: $arg (erlaubt: diymore|xiao|freenove, /dev/tty..., --rebuild, --monitor)" ;;
+        diymore|xiao|freenove|all) BOARD=$arg ;;
+        *) die "Unbekanntes Argument: $arg (erlaubt: diymore|xiao|freenove|all, /dev/tty..., --rebuild, --monitor, --ota-only, --no-ota, --compileall)" ;;
     esac
 done
+[ "$OTA_ONLY" = 1 ] && [ "$NO_OTA" = 1 ] && die "--ota-only und --no-ota schließen sich aus."
+
+if [ "$BOARD" = all ]; then
+    [ "$OTA_ONLY" = 1 ] || die "'all' nur zusammen mit --ota-only (geflasht wird immer ein Board)."
+    for b in "${BOARDS[@]}"; do
+        "${BASH_SOURCE[0]}" "$b" --ota-only $([ "$REBUILD" = 1 ] && echo --rebuild) || die "$b fehlgeschlagen."
+    done
+    echo
+    echo "Alle Boards gebaut und als WLAN-Paket bereit. Ausliefern:"
+    echo "    python3 $REPO/tools/sf_firmware_publish.py --serve-only"
+    exit 0
+fi
 
 # ---------------------------------------------------------------- tools
 
@@ -284,7 +311,7 @@ if [ -z "$BOARD" ]; then
     for b in "${BOARDS[@]}"; do
         items+=("$b" "$(board_title "$b")")
     done
-    BOARD=$(menu "SensorForge flashen" "Welches Board soll geflasht werden?" "${items[@]}") || exit 1
+    BOARD=$(menu "SensorForge flashen" "Welches Board soll $([ "$OTA_ONLY" = 1 ] && echo gebaut || echo geflasht) werden?" "${items[@]}") || exit 1
 fi
 [ -n "$(board_define "$BOARD")" ] || die "Unbekanntes Board: $BOARD"
 
@@ -299,6 +326,11 @@ mkdir -p "$OUT"
 HASH=$(source_hash "$BOARD" "$FQBN")
 NEED_BUILD=1
 if [ "$REBUILD" = 0 ] && [ -f "$OUT/.source_hash" ] && [ -f "$OUT/sensorforge.ino.bin" ] &&
+   [ "$(cat "$OUT/.source_hash")" = "$HASH" ] && [ "$OTA_ONLY" = 1 ]; then
+    # Package only: an up-to-date build needs no question.
+    NEED_BUILD=0
+    echo "    $BOARD: Build vom aktuellen Quellstand vorhanden."
+elif [ "$REBUILD" = 0 ] && [ -f "$OUT/.source_hash" ] && [ -f "$OUT/sensorforge.ino.bin" ] &&
    [ "$(cat "$OUT/.source_hash")" = "$HASH" ]; then
     built_at=$(date -r "$OUT/sensorforge.ino.bin" '+%d.%m.%Y %H:%M')
     choice=$(menu "Build vorhanden" "Für $BOARD gibt es einen Build vom aktuellen Quellstand ($built_at)." \
@@ -344,6 +376,22 @@ python3 "$REPO/tools/check_firmware_size.py" "$OUT" || die "Größenprüfung feh
 for f in sensorforge.ino.bootloader.bin sensorforge.ino.partitions.bin boot_app0.bin sensorforge.ino.bin flash_args; do
     [ -f "$OUT/$f" ] || die "Build unvollständig, $f fehlt in $OUT (mit --rebuild neu bauen)."
 done
+
+# ---------------------------------------------------------------- WLAN-Update-Paket
+
+if [ "$NO_OTA" = 0 ]; then
+    info "WLAN-Update-Paket ($BOARD)"
+    # Signs only if the image changed; the manifest always lists the newest
+    # release per board. A failure here never blocks the USB flash.
+    python3 "$REPO/tools/sf_firmware_publish.py" "$OUT/sensorforge.ino.bin" --no-serve 2>&1 | sed 's/^/    /'
+    [ "${PIPESTATUS[0]}" = 0 ] || echo "    WARNUNG: WLAN-Paket nicht erzeugt (siehe oben); USB-Flash ist davon unabhängig."
+fi
+
+if [ "$OTA_ONLY" = 1 ]; then
+    info "Fertig: $BOARD gebaut, WLAN-Paket bereit (nicht geflasht)."
+    echo "    Ausliefern: python3 $REPO/tools/sf_firmware_publish.py --serve-only"
+    exit 0
+fi
 
 # ---------------------------------------------------------------- port
 

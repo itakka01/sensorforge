@@ -5,6 +5,7 @@
 #include "storage_guard.h"
 #include "log_storage.h"
 #include "sensorforge_version.h"
+#include "firmware_security.h"
 
 #include <FS.h>
 #include <Preferences.h>
@@ -523,6 +524,8 @@ void firmwareInfoLogStatus()
         String(SENSORFORGE_RELEASE_TAG) +
         " | release_date=" +
         String(SENSORFORGE_RELEASE_DATE) +
+        " | package_id=" +
+        String(firmwareSecurityReleaseMarker()) +
         " | build=" +
         firmwareBuildTimestamp() +
         " | installed=" +

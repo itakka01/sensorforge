@@ -105,6 +105,39 @@ FirmwareAutoActivateStatus firmwareAutoStageAndSelectOnce(String &detail) {
     return FirmwareAutoActivateStatus::BootSelected;
 }
 
+FirmwareAutoActivateStatus firmwareClusterStageAndSelectOnce(const String &manifestUrl, bool allowOlder,
+                                                              String &version, String &detail) {
+    version = "";
+    detail = "";
+    ScopedOtaAdmission admission;
+    if (!admission.acquire(detail)) {
+        detail = "OTA-Reservierung abgelehnt: " + detail;
+        return FirmwareAutoActivateStatus::Busy;
+    }
+    FirmwareOtaActivation::forget();
+    FirmwareManifestCandidate candidate;
+    if (!firmwareManifestFindCandidate(manifestUrl, candidate, detail, allowOlder))
+        return FirmwareAutoActivateStatus::CheckFailed;
+    if (!candidate.available) {
+        detail = "Kein passender neuerer Firmware-Kandidat im Manifest.";
+        return FirmwareAutoActivateStatus::NoUpdate;
+    }
+    if (!firmwarePackageStageDownloadAdmitted(candidate, detail)) {
+        FirmwareOtaActivation::forget();
+        return FirmwareAutoActivateStatus::StageFailed;
+    }
+    if (!FirmwareOtaActivation::ready(version)) {
+        FirmwareOtaActivation::forget();
+        detail = "Bereitgestelltes Image nicht mehr unveraendert.";
+        return FirmwareAutoActivateStatus::ActivationFailed;
+    }
+    if (!FirmwareOtaActivation::selectForNextBoot(detail, false)) {
+        FirmwareOtaActivation::forget();
+        return FirmwareAutoActivateStatus::ActivationFailed;
+    }
+    return FirmwareAutoActivateStatus::BootSelected;
+}
+
 // Explicit maintenance-only entry point. May NOT return after a successful
 // activation: the ESP restarts to boot the selected, signed OTA image.
 // Call only from the Arduino loop task after the operator/controller has

@@ -56,6 +56,8 @@
 #include "webconfig_wifi.h"
 #include "webconfig_transport.h"
 #include "webconfig_camera_tuning.h"
+#include "webconfig_cluster_firmware.h"
+#include "firmware_ota_activation.h"
 #include "webconfig_cluster.h"
 #include "webconfig_firmware_auto.h"
 #include "cluster.h"
@@ -5704,6 +5706,12 @@ static void handleSave()
     // Owned by /camera_tuning; a general save preserves it.
     text += "camera_tuning=";
     text += cfg_camera_tuning;
+    text += '\n';
+    text += "camera_hmirror=";
+    text += String(cfg_camera_hmirror);
+    text += '\n';
+    text += "camera_vflip=";
+    text += String(cfg_camera_vflip);
     text += '\n';
 
     text += "recording_format=";
@@ -11692,6 +11700,24 @@ static void handleFirmwareUploadData()
                     return;
                 }
 
+                // Board/downgrade check before writing (repeated after the
+                // signature check). Older releases only with the explicit
+                // "Ältere Version erlauben" choice of the upload form.
+                webFirmwarePackageInfo.allowOlder =
+                    server.arg("allow_older") == "1";
+
+                if (!firmwareSecurityCheckPolicy(
+                        webFirmwarePackageInfo,
+                        packageError
+                    )) {
+                    webFirmwareFailUpload(
+                        "Firmware rejected: " +
+                        packageError + "."
+                    );
+                    webFirmwareCleanupPartial();
+                    return;
+                }
+
                 if (
                     webFirmwarePackageInfo.firmwareSize == 0 ||
                     webFirmwarePackageInfo.firmwareSize >
@@ -12536,6 +12562,9 @@ static void sendSystemPage(
             "var s=document.getElementById('fwUploadState');if(s)s.hidden=false;\">"
             "<label for='firmwareFile'><b>Signiertes Firmware-Paket (.sfw) auswählen</b></label><br>"
             "<input id='firmwareFile' type='file' name='firmware' accept='.sfw,application/octet-stream' required>"
+            "<br><label><input type='checkbox' id='fwAllowOlder' "
+            "onchange=\"this.form.action='/firmware_upload'+(this.checked?'?allow_older=1':'');\"> "
+            "Ältere Version erlauben (Downgrade)</label>"
             "<br><button id='fwUploadButton' class='primary' type='submit'>HOCHLADEN &amp; PRÜFEN</button>"
             "<span id='fwUploadState' class='muted' hidden> Bitte Verbindung und Stromversorgung nicht unterbrechen.</span>"
             "</form>";
@@ -12548,7 +12577,9 @@ static void sendSystemPage(
     if (readyExists) {
         if (readyValid) {
             html +=
-                "<p>✓ Signatur und Image geprüft &nbsp; · &nbsp; Größe: <b>" +
+                "<p>✓ Signatur und Image geprüft &nbsp; · &nbsp; Version: <b>" +
+                htmlEscape(String(webFirmwarePackageInfo.header.release)) +
+                "</b> &nbsp; · &nbsp; Größe: <b>" +
                 webFirmwareFormatBytes(
                     webFirmwareReadyBytes
                 ) +
@@ -13366,6 +13397,8 @@ static void performManualShutdown()
         ESP_SLEEP_WAKEUP_ALL
     );
 
+    // Intentional shutdown: keep a freshly installed firmware.
+    FirmwareOtaActivation::confirmRunningImage("Herunterfahren");
     Serial.flush();
     esp_deep_sleep_start();
 }
@@ -19192,6 +19225,7 @@ void webConfigStart()
     server.on("/preview", HTTP_GET, handlePreview);
     server.on("/camera_advanced", HTTP_GET, handleCameraAdvanced);
     webconfigCameraTuningRegisterRoutes(server, htmlHeader, htmlFooter);
+    webconfigClusterFirmwareRegisterRoutes(server, htmlHeader, htmlFooter);
     server.on("/camera_settings_save", HTTP_POST, handleCameraSettingsSave);
     server.on("/snapshot", HTTP_GET, handleSnapshot);
     server.on("/preview_stop", HTTP_POST, handlePreviewStop);

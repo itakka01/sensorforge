@@ -18,6 +18,8 @@
 #include "cluster_groups.h"
 #include "cluster_camera.h"
 #include "camera_profile_store.h"
+#include "firmware_cluster_update.h"
+#include "cluster_firmware_rollout.h"
 #include "device_identity.h"
 #include "logger.h"
 #include "recorder.h"
@@ -129,6 +131,9 @@ static const char *CLUSTER_JOB_TXPOWER_ACK_MAGIC = "SFJTA1";
 static const char *CLUSTER_JOB_CAMPROFILE_MAGIC = "SFJK1";
 static const char *CLUSTER_JOB_CAMPROFILE_ACK_MAGIC = "SFJKA1";
 static const uint32_t CLUSTER_CAMPROFILE_TIMEOUT_MS = 20000UL;
+// Cluster firmware update (firmware_cluster_update.h): coordinator -> node, node answers.
+static const char *CLUSTER_JOB_FWUPDATE_MAGIC = "SFJU1";
+static const char *CLUSTER_JOB_FWUPDATE_ACK_MAGIC = "SFJUA1";
 static const char *CLUSTER_JOB_DRONE_MAGIC = "SFJD1";
 static const char *CLUSTER_JOB_DRONE_ACK_MAGIC = "SFJDA1";
 static uint32_t droneSeenBoot=0,droneSeenEpoch=0,droneSeenSeq=0;
@@ -3685,6 +3690,56 @@ static void processJobCameraProfileAck(char **f, size_t n, const IPAddress &ip)
     clusterCameraNoteProfileResult(f[5], (uint8_t)result, version);
 }
 
+// Node: SFJU1|tag|coord|coordBoot|epoch|node|nodeBoot|seq|allowOlder|manifestUrl
+static uint32_t fwUpdateSeenBoot = 0, fwUpdateSeenEpoch = 0, fwUpdateSeenSeq = 0;
+static void processJobFirmwareUpdate(char **f, size_t n, const IPAddress &ip)
+{
+    if (n != 10 || !runtimeActive ||
+        strcmp(f[1], runtimeClusterTag) != 0 || strcmp(f[2], currentCoordinatorId) != 0 ||
+        strcmp(f[5], deviceIntegrationId().c_str()) != 0 || ip != currentCoordinatorIp)
+        return;
+    uint32_t cb = 0, epoch = 0, nb = 0, seq = 0, allowOlder = 0;
+    if (!parseUint32Strict(f[3], cb, 16) || !parseUint32Strict(f[4], epoch) ||
+        !parseUint32Strict(f[6], nb, 16) || !parseUint32Strict(f[7], seq) ||
+        !parseUint32Strict(f[8], allowOlder) || allowOlder > 1 ||
+        !cb || !epoch || !seq || nb != bootNonce || epoch != currentCoordinatorEpoch)
+        return;
+    const ClusterPeer *coord = findPeer(f[2]);
+    if (!coord || coord->bootNonce != cb || coord->ip != ip ||
+        (uint32_t)(millis() - coord->lastSeenMs) > 60000UL)
+        return;
+    if (fwUpdateSeenBoot == cb && fwUpdateSeenEpoch == epoch && seq <= fwUpdateSeenSeq)
+        return;
+    fwUpdateSeenBoot = cb; fwUpdateSeenEpoch = epoch; fwUpdateSeenSeq = seq;
+
+    const uint8_t code = localIsCoordinator
+        ? (uint8_t)FirmwareClusterUpdate::IsCoordinator
+        : FirmwareClusterUpdate::requestFromCoordinator(String(f[9]), allowOlder == 1, cb, epoch, seq);
+    clusterSendFirmwareUpdateResult(cb, epoch, seq, code, String(), String());
+}
+
+// Coordinator: SFJUA1|tag|coord|coordBoot|epoch|node|nodeBoot|seq|code|version|text
+static void processJobFirmwareUpdateAck(char **f, size_t n, const IPAddress &ip)
+{
+    if (n != 11 || !runtimeActive || !localIsCoordinator ||
+        strcmp(f[1], runtimeClusterTag) != 0 || strcmp(f[2], deviceIntegrationId().c_str()) != 0 ||
+        !integrationIdValid(f[5]))
+        return;
+    uint32_t cb = 0, epoch = 0, nb = 0, seq = 0, code = 0;
+    if (!parseUint32Strict(f[3], cb, 16) || !parseUint32Strict(f[4], epoch) ||
+        !parseUint32Strict(f[6], nb, 16) || !parseUint32Strict(f[7], seq) ||
+        !parseUint32Strict(f[8], code) || code > 255 ||
+        cb != bootNonce || epoch != currentCoordinatorEpoch || !nb || !seq)
+        return;
+    const ClusterPeer *node = findPeer(f[5]);
+    if (!node || node->bootNonce != nb || node->ip != ip ||
+        (uint32_t)(millis() - node->lastSeenMs) > 60000UL)
+        return;
+    clusterFirmwareRolloutNote(f[5], seq, (uint8_t)code,
+                               strcmp(f[9], "-") == 0 ? String() : String(f[9]),
+                               strcmp(f[10], "-") == 0 ? String() : String(f[10]));
+}
+
 static void processPacket(
     char *packet,
     size_t packetLength,
@@ -3756,6 +3811,10 @@ static void processPacket(
         processJobCameraProfile(fields, fieldCount, remoteIp);
     } else if (strcmp(fields[0], CLUSTER_JOB_CAMPROFILE_ACK_MAGIC) == 0) {
         processJobCameraProfileAck(fields, fieldCount, remoteIp);
+    } else if (strcmp(fields[0], CLUSTER_JOB_FWUPDATE_MAGIC) == 0) {
+        processJobFirmwareUpdate(fields, fieldCount, remoteIp);
+    } else if (strcmp(fields[0], CLUSTER_JOB_FWUPDATE_ACK_MAGIC) == 0) {
+        processJobFirmwareUpdateAck(fields, fieldCount, remoteIp);
     } else if (strcmp(fields[0], CLUSTER_JOB_DRONE_MAGIC) == 0) {
         processJobDrone(fields,fieldCount,remoteIp);
     } else if (strcmp(fields[0], CLUSTER_JOB_DRONE_ACK_MAGIC) == 0) {
@@ -5029,6 +5088,110 @@ bool clusterRequestNodeCameraProfile(const String &nodeId, const String &profile
         ClusterJobs::transition(id, currentCoordinatorEpoch, ClusterJobs::State::Failed, millis(), 1);
         error = "Profil-Auftrag nicht gesendet."; return false;
     }
+    return true;
+}
+
+bool clusterRequestNodeFirmwareUpdate(const String &nodeId, const String &manifestUrl, bool allowOlder,
+                                      uint32_t &seq, String &error)
+{
+    seq = 0;
+    if (!clusterLocalIsCoordinator()) { error = "Nur am Coordinator."; return false; }
+    if (manifestUrl.indexOf('|') >= 0 || manifestUrl.length() > 240) { error = "Ungültige URL."; return false; }
+    ClusterPeer *peer = findPeer(nodeId.c_str());
+    if (!peer || !peer->used || !usableIp(peer->ip) || !peer->bootNonce ||
+        (uint32_t)(millis() - peer->lastSeenMs) > 60000UL) {
+        error = "Node nicht erreichbar/authentifiziert."; return false;
+    }
+    if (rejectStandbyNodeAction(peer, error)) return false;
+    if (++probeSeq == 0) ++probeSeq;
+    char cb[9], nb[9];
+    snprintf(cb, sizeof(cb), "%08lx", (unsigned long)bootNonce);
+    snprintf(nb, sizeof(nb), "%08lx", (unsigned long)peer->bootNonce);
+    const String msg = String(CLUSTER_JOB_FWUPDATE_MAGIC) + "|" + runtimeClusterTag + "|" +
+        deviceIntegrationId() + "|" + cb + "|" + String((unsigned long)currentCoordinatorEpoch) +
+        "|" + nodeId + "|" + nb + "|" + String((unsigned long)probeSeq) + "|" +
+        (allowOlder ? "1" : "0") + "|" + manifestUrl;
+    if (!sendSignedPayloadTo(msg, peer->ip, CLUSTER_COORDINATOR_PORT, "firmware update")) {
+        error = "Update-Auftrag nicht gesendet."; return false;
+    }
+    seq = probeSeq;
+    return true;
+}
+
+bool clusterSendFirmwareUpdateResult(uint32_t coordBoot, uint32_t epoch, uint32_t seq, uint8_t code,
+                                     const String &version, const String &text)
+{
+    // Only to the coordinator that sent the job (same boot and epoch).
+    const ClusterPeer *coord = findPeer(currentCoordinatorId);
+    if (!runtimeActive || localIsCoordinator || !coord || coord->bootNonce != coordBoot ||
+        epoch != currentCoordinatorEpoch)
+        return false;
+    // Free text field: no separators, bounded length.
+    auto clean = [](const String &in, size_t maxLen) {
+        String out;
+        for (size_t i = 0; i < in.length() && out.length() < maxLen; ++i) {
+            const char c = in[i];
+            out += (c == '|' || c < 32 || c > 126) ? ' ' : c;
+        }
+        return out.length() ? out : String("-");
+    };
+    char cb[9], own[9];
+    snprintf(cb, sizeof(cb), "%08lx", (unsigned long)coordBoot);
+    snprintf(own, sizeof(own), "%08lx", (unsigned long)bootNonce);
+    const String msg = String(CLUSTER_JOB_FWUPDATE_ACK_MAGIC) + "|" + runtimeClusterTag + "|" +
+        currentCoordinatorId + "|" + cb + "|" + String((unsigned long)epoch) + "|" + deviceIntegrationId() + "|" +
+        own + "|" + String((unsigned long)seq) + "|" + String((unsigned)code) + "|" + clean(version, 31) + "|" +
+        clean(text, 120);
+    return sendSignedPayloadTo(msg, currentCoordinatorIp, CLUSTER_COORDINATOR_PORT, "firmware update result");
+}
+
+size_t clusterFirmwareSnapshot(ClusterFirmwareEntry *out, size_t capacity)
+{
+    if (!out || !capacity)
+        return 0;
+    size_t n = 0;
+    ClusterFirmwareEntry &self = out[n++];
+    memset(&self, 0, sizeof(self));
+    strncpy(self.integrationId, deviceIntegrationId().c_str(), sizeof(self.integrationId) - 1);
+    strncpy(self.hostname, cfg_hostname.c_str(), sizeof(self.hostname) - 1);
+    strncpy(self.release, SENSORFORGE_RELEASE_TAG, sizeof(self.release) - 1);
+    self.bootNonce = bootNonce;
+    self.local = true;
+    self.online = true;
+    if (!runtimeActive)
+        return n;
+    const uint32_t nowMs = millis();
+    for (size_t i = 0; i < peerSlots && n < capacity; ++i) {
+        const ClusterPeer &peer = peers[i];
+        if (!peer.used || peerIsStandbyTimeBroadcaster(&peer))
+            continue;
+        ClusterFirmwareEntry &e = out[n++];
+        memset(&e, 0, sizeof(e));
+        strncpy(e.integrationId, peer.integrationId, sizeof(e.integrationId) - 1);
+        strncpy(e.hostname, peer.hostname, sizeof(e.hostname) - 1);
+        strncpy(e.release, peer.release, sizeof(e.release) - 1);
+        e.bootNonce = peer.bootNonce;
+        e.online = (uint64_t)(nowMs - peer.lastSeenMs) <= (uint64_t)peerLeaseSeconds(peer) * 1000ULL;
+    }
+    return n;
+}
+
+size_t clusterFirmwareSnapshotCapacity()
+{
+    return CLUSTER_MAX_PEERS + 1;
+}
+
+bool clusterFirmwarePeer(const char *integrationId, ClusterFirmwareEntry &out)
+{
+    memset(&out, 0, sizeof(out));
+    const ClusterPeer *peer = runtimeActive && integrationId ? findPeer(integrationId) : nullptr;
+    if (!peer || !peer->used)
+        return false;
+    strncpy(out.integrationId, peer->integrationId, sizeof(out.integrationId) - 1);
+    strncpy(out.hostname, peer->hostname, sizeof(out.hostname) - 1);
+    strncpy(out.release, peer->release, sizeof(out.release) - 1);
+    out.bootNonce = peer->bootNonce;
+    out.online = (uint64_t)(millis() - peer->lastSeenMs) <= (uint64_t)peerLeaseSeconds(*peer) * 1000ULL;
     return true;
 }
 

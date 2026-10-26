@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import re
 import struct
 import sys
 from pathlib import Path
@@ -25,9 +26,13 @@ except ImportError as exc:
         "  python3 -m pip install cryptography"
     ) from exc
 
-HEADER_SIZE = 128
-MAGIC = b"SFWPKG1\0"
-FORMAT_VERSION = 1
+# Package format 2 (see firmware_package_format.h): 256-byte header, the first
+# 128 bytes (image size/digest, board, release) are signed.
+HEADER_SIZE = 256
+SIGNED_BLOCK = 128
+FIELD = 32
+MAGIC = b"SFWPKG2\0"
+FORMAT_VERSION = 2
 ALGORITHM_ECDSA_P256_SHA256 = 1
 SIGNATURE_MAX = 72
 
@@ -123,6 +128,27 @@ def detect_board(image: bytes) -> str:
     return matches[0]
 
 
+RELEASE_MARKER = re.compile(rb"SENSORFORGE\|RELEASE=([A-Za-z0-9._+-]{1,31})\|END")
+
+
+def detect_release(image: bytes) -> str:
+    """Release tag compiled into the image (firmware_security.cpp marker)."""
+    found = {m.group(1) for m in RELEASE_MARKER.finditer(image)}
+    if len(found) != 1:
+        raise ValueError(
+            "firmware must contain exactly one SENSORFORGE|RELEASE=...|END marker "
+            "(built from v87-beta158 or later?)"
+        )
+    return found.pop().decode("ascii")
+
+
+def _field(text: str) -> bytes:
+    raw = text.encode("ascii")
+    if not raw or len(raw) >= FIELD or b"|" in raw:
+        raise ValueError(f"invalid header text field: {text!r}")
+    return raw + b"\0" * (FIELD - len(raw))
+
+
 def load_private_key(path: Path):
     if not path.exists():
         raise ValueError(
@@ -139,19 +165,11 @@ def load_private_key(path: Path):
     return key
 
 
-def make_package(image: bytes, private_key) -> bytes:
+def make_package(image: bytes, private_key, board: str, release: str) -> bytes:
     if not image or image[0] != 0xE9:
         raise ValueError("input is not an ESP32 application .bin (missing 0xE9 image magic)")
     if len(image) > 0xFFFFFFFF:
-        raise ValueError("firmware image is too large for SFW package format v1")
-
-    digest = hashlib.sha256(image).digest()
-    signature = private_key.sign(
-        digest,
-        ec.ECDSA(utils.Prehashed(hashes.SHA256())),
-    )
-    if len(signature) > SIGNATURE_MAX:
-        raise ValueError(f"unexpected ECDSA signature length: {len(signature)}")
+        raise ValueError("firmware image is too large for the SFW package format")
 
     header = bytearray(HEADER_SIZE)
     header[0:8] = MAGIC
@@ -159,60 +177,86 @@ def make_package(image: bytes, private_key) -> bytes:
     header[9] = ALGORITHM_ECDSA_P256_SHA256
     struct.pack_into("<H", header, 10, HEADER_SIZE)
     struct.pack_into("<I", header, 12, len(image))
-    header[16:48] = digest
-    struct.pack_into("<H", header, 48, len(signature))
-    header[50 : 50 + len(signature)] = signature
+    header[16:48] = hashlib.sha256(image).digest()
+    header[48:80] = _field(board)
+    header[80:112] = _field(release)
 
+    # ECDSA over SHA-256 of the signed block (device: firmware_security.cpp).
+    signature = private_key.sign(bytes(header[:SIGNED_BLOCK]), ec.ECDSA(hashes.SHA256()))
+    if len(signature) > SIGNATURE_MAX:
+        raise ValueError(f"unexpected ECDSA signature length: {len(signature)}")
+    struct.pack_into("<H", header, 128, len(signature))
+    header[130 : 130 + len(signature)] = signature
     return bytes(header) + image
 
 
-def verify_package(package: bytes, public_key) -> tuple[int, str]:
+def _text(raw: bytes) -> str:
+    end = raw.index(b"\0")
+    if end == 0 or any(raw[end:]):
+        raise ValueError("invalid header text field")
+    return raw[:end].decode("ascii")
+
+
+def verify_package(package: bytes, public_key) -> dict:
     if len(package) < HEADER_SIZE:
         raise ValueError("package is too short")
     header = package[:HEADER_SIZE]
     if header[:8] != MAGIC:
-        raise ValueError("invalid package magic")
+        raise ValueError("invalid package magic (format 2 expected)")
     if header[8] != FORMAT_VERSION or header[9] != ALGORITHM_ECDSA_P256_SHA256:
         raise ValueError("unsupported package format")
     if struct.unpack_from("<H", header, 10)[0] != HEADER_SIZE:
         raise ValueError("invalid package header size")
-
     image_size = struct.unpack_from("<I", header, 12)[0]
     if len(package) != HEADER_SIZE + image_size:
         raise ValueError("package size mismatch")
-    digest = header[16:48]
-    sig_len = struct.unpack_from("<H", header, 48)[0]
+    image = package[HEADER_SIZE:]
+    if hashlib.sha256(image).digest() != header[16:48]:
+        raise ValueError("SHA-256 mismatch")
+    sig_len = struct.unpack_from("<H", header, 128)[0]
     if sig_len == 0 or sig_len > SIGNATURE_MAX:
         raise ValueError("invalid signature length")
-    signature = header[50 : 50 + sig_len]
-    image = package[HEADER_SIZE:]
-    actual = hashlib.sha256(image).digest()
-    if actual != digest:
-        raise ValueError("SHA-256 mismatch")
-    public_key.verify(signature, digest, ec.ECDSA(utils.Prehashed(hashes.SHA256())))
-    return image_size, detect_board(image)
+    public_key.verify(bytes(header[130 : 130 + sig_len]), bytes(header[:SIGNED_BLOCK]),
+                      ec.ECDSA(hashes.SHA256()))
+    board = _text(header[48:80])
+    release = _text(header[80:112])
+    if board != detect_board(image):
+        raise ValueError("header board does not match the image marker")
+    if release != detect_release(image):
+        raise ValueError("header release does not match the image marker")
+    return {"size": image_size, "board": board, "release": release,
+            "sha256": hashlib.sha256(package).hexdigest()}
+
+
+def sign_file(image_path: Path, private_key, output_path: Path | None = None,
+              expect_board: str | None = None) -> dict:
+    """Sign one .bin; returns the verified package info (used by sf_firmware_publish.py)."""
+    image = image_path.read_bytes()
+    board = detect_board(image)
+    if expect_board and board != expect_board:
+        raise ValueError(f"firmware marker is for {board}, not requested board {expect_board}")
+    release = detect_release(image)
+    package = make_package(image, private_key, board, release)
+    info = verify_package(package, private_key.public_key())
+    out = output_path or image_path.with_suffix(".sfw")
+    tmp = out.with_name(out.name + ".tmp")
+    tmp.write_bytes(package)
+    tmp.replace(out)
+    info["path"] = out
+    return info
 
 
 def command_sign(args: argparse.Namespace) -> int:
     image_path = Path(args.input)
     key_path = Path(args.key)
-    output_path = Path(args.output) if args.output else image_path.with_suffix(".sfw")
-
-    image = image_path.read_bytes()
-    board = detect_board(image)
-    if args.board and board != args.board:
-        raise ValueError(f"firmware marker is for {board}, not requested board {args.board}")
-
-    private_key = load_private_key(key_path)
-    package = make_package(image, private_key)
-    output_path.write_bytes(package)
-
-    image_size, verified_board = verify_package(package, private_key.public_key())
-    print(f"Created: {output_path}")
+    output_path = Path(args.output) if args.output else None
+    info = sign_file(image_path, load_private_key(key_path), output_path, args.board)
+    print(f"Created: {info['path']}")
     print(f"Key:     {key_path}")
-    print(f"Board:   {verified_board}")
-    print(f"Image:   {image_size} bytes")
-    print(f"SHA256:  {hashlib.sha256(image).hexdigest()}")
+    print(f"Board:   {info['board']}")
+    print(f"Release: {info['release']}")
+    print(f"Image:   {info['size']} bytes")
+    print(f"SHA256:  {info['sha256']} (package)")
     return 0
 
 

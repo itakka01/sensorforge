@@ -594,7 +594,7 @@ and white balance for uniform cluster cameras).
 
 | Parameter | Values |
 |---|---|
-| `mode` | `session` (apply now, until reboot), `save` (config.txt + apply), `resolution` (since beta157: `resolution=WxH` from 160x120 … 2048x1536 within the sensor's maximum; saved like the camera page, the recording fps is lowered to the board's limit if needed, the camera restarts; `409` while a cluster camera profile is active), `reset` (since beta157: firmware defaults – saved tuning removed, `camera_auto_exposure=1`, `camera_ae_level=-1`, saved and applied now) |
+| `mode` | `session` (apply now, until reboot), `save` (config.txt + apply), `orientation` (since beta158: `rotation=0|180`, `hmirror=0|1`, `vflip=0|1`; done by the sensor, saved, camera restarts; not part of the cluster profile), `resolution` (since beta157: `resolution=WxH` from 160x120 … 2048x1536 within the sensor's maximum; saved like the camera page, the recording fps is lowered to the board's limit if needed, the camera restarts; `409` while a cluster camera profile is active), `reset` (since beta157: firmware defaults – saved tuning removed, `camera_auto_exposure=1`, `camera_ae_level=-1`, saved and applied now) |
 | `aec`, `agc`, `awb`, `awb_gain` | 0 / 1 |
 | `ae_level`, `brightness`, `contrast`, `saturation` | -2 … 2 |
 | `aec_value` | 0 … 65535 sensor lines (OV2640 0 … 1200), used while `aec=0` |
@@ -602,7 +602,7 @@ and white balance for uniform cluster cameras).
 | `gainceiling` | 0 … 6 (2× … 128×), used while `agc=1` |
 | `wb_mode` | 0 auto, 1 sunny, 2 cloudy, 3 office, 4 home, or (since beta157) 2000 … 10000 = colour temperature in kelvin (OV3660/OV5640 only; approximate, 5500 K = the sensor's sunny preset). `current.wb_mode` reports the kelvin value while it is applied. |
 
-All value fields are required except for `mode=reset` and `mode=resolution`. Answer
+All value fields are required except for `mode=reset`, `mode=resolution` and `mode=orientation`. Answer
 `{"ok":true|false,"message":"..."}`: `200`, `400` invalid/missing value, `409`
 camera off (session) or cluster capture planned, `500` save failed.
 
@@ -613,6 +613,31 @@ consecutive frames divided by the frame length register 0x380E/0x380F), so
 exposure time ≈ `aec_value` × `line_us`. Takes about 6 frames.
 `{"ok":true,"line_us":29.6,"vts":1000,"frame_ms":29.6,"aec_max":65535}` or
 `{"ok":false,"message":"..."}` (camera off/busy, other sensor).
+
+## Cluster firmware update (since v87-beta158, coordinator only)
+
+Same function as the coordinator page `/cluster_firmware`. Nodes download the
+signed `.sfw` for their board from the manifest (https:// or http:// to a
+private IPv4) and verify signature, board and release before switching.
+
+### GET /api/v1/cluster/firmware
+
+`url` (last manifest URL), `allow_older`, `running`, `local_busy`,
+`local_result` (coordinator's own update), `message`, `devices[]`: `id`,
+`hostname`, `release`, `local`, `online`, and while in a rollout `state`
+(`pending`, `sent`, `updating`, `restarting`, `done`, `skipped`, `failed`,
+`stopped`), `code`/`code_name` (node answer), `version` (selected release),
+`text`, `state_age_s`.
+
+### POST /api/v1/cluster/firmware
+
+| `action` | Parameters | Effect |
+|---|---|---|
+| `check` | `url` | Loads the manifest, returns `releases[]` (`board`, `version`, `channel`, `size`) |
+| `start` | `url`, `allow_older=0|1` | Updates all online nodes one after another, stops at the first failure |
+| `stop` | – | No further nodes (a running update finishes) |
+| `local` | `url`, `allow_older=0|1` | Updates the coordinator itself (restarts on success) |
+| `clear` | – | Clears the rollout table |
 
 ## Cluster camera profile (since v87-beta156, coordinator only)
 
