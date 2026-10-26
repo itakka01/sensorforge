@@ -23,7 +23,9 @@ python3 tools/sf_firmware_publish.py
     "Cluster koordinieren -> Firmware im Cluster" eintragen
   - tools/flash_board.sh legt das Paket nach jedem Build automatisch an;
     tools/flash_board.sh all --ota-only baut alle Boards nur fuer WLAN;
-    danach: python3 tools/sf_firmware_publish.py --serve-only
+    Manifest + Pakete landen automatisch im lokalen Apache:
+      http://<PC>/sensorforge-ota/manifest.json  (Ordner /var/www/html/sensorforge-ota)
+    eigener Server statt Apache: python3 tools/sf_firmware_publish.py --serve-only
   - nach einem Build in der Arduino IDE: python3 tools/sf_firmware_publish.py
   - Version festlegen (z. B. Downgrade): --pin v87-beta158, aufheben: --unpin,
     anzeigen: --list. Ausfuehrliche Hilfe: python3 tools/sf_firmware_publish.py --help

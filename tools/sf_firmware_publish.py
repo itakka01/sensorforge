@@ -13,9 +13,15 @@ WAS DAS SKRIPT MACHT
      Ein unverändertes Image wird nicht neu signiert. Alte Pakete bleiben liegen.
   3. Manifest: schreibt ../sensorforge_builds/ota/manifest.json mit GENAU EINEM
      Eintrag je Board – normalerweise der höchsten vorhandenen Version.
-  4. Ausliefern: startet einen Webserver (Port 8765), der nur das Manifest und
-     die Pakete liefert, und zeigt die Manifest-URL. Diese URL am Coordinator
-     unter "Cluster koordinieren -> Firmware im Cluster" eintragen.
+  4. Bereitstellen: kopiert das Manifest und genau die darin genannten Pakete
+     in den lokalen Webserver (Apache), Ordner /var/www/html/sensorforge-ota,
+     und zeigt die Manifest-URL, z. B.
+       http://192.168.0.200/sensorforge-ota/manifest.json
+     Diese URL einmal am Coordinator unter "Cluster koordinieren -> Firmware
+     im Cluster" eintragen; sie bleibt gleich. Es muss kein Server mehr
+     gestartet werden.
+     Ohne beschreibbaren Apache-Ordner (oder mit --no-webroot / --serve-only)
+     startet das Skript wie früher einen eigenen Server auf Port 8765.
 
 WAS DIE GERÄTE PRÜFEN
   Ein Gerät installiert ein Paket nur mit gültiger Signatur, für sein eigenes
@@ -39,9 +45,10 @@ VERSION FESTLEGEN (PIN) – z. B. FÜR EIN DOWNGRADE
     3. danach: python3 tools/sf_firmware_publish.py --unpin --no-serve
 
 BEISPIELE
-  python3 tools/sf_firmware_publish.py                  sammeln, signieren, ausliefern
+  python3 tools/sf_firmware_publish.py                  sammeln, signieren, nach Apache kopieren
+  python3 tools/sf_firmware_publish.py --url            nur die Manifest-URL anzeigen
   python3 tools/sf_firmware_publish.py --no-serve       nur signieren + Manifest
-  python3 tools/sf_firmware_publish.py --serve-only     vorhandene Pakete ausliefern
+  python3 tools/sf_firmware_publish.py --serve-only     eigener Server statt Apache (Port 8765)
   python3 tools/sf_firmware_publish.py a.bin b.bin      genau diese Builds nehmen
   python3 tools/sf_firmware_publish.py --list           Pakete im Ordner und Pin anzeigen
   python3 tools/sf_firmware_publish.py --pin v87-beta158 --no-serve
@@ -62,6 +69,7 @@ import os
 import re
 import socket
 import sys
+import urllib.request
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -71,6 +79,10 @@ import sensorforge_firmware_sign as signer  # noqa: E402
 DEFAULT_OUT = REPO.parent / "sensorforge_builds" / "ota"
 DEFAULT_KEY = REPO / "sensorforge_firmware_private_DEV.pem"
 DEFAULT_PORT = 8765
+# Local Apache (DocumentRoot /var/www/html, writable by the user): packages and
+# manifest are copied there, so no extra server has to run.
+DEFAULT_WEBROOT = Path("/var/www/html/sensorforge-ota")
+WEB_PATH = "sensorforge-ota"
 BOARDS = sorted(signer.BOARD_MARKERS)
 
 
@@ -200,6 +212,56 @@ def write_manifest(out: Path, base_url: str, public_key, pin: str | None) -> lis
     return releases
 
 
+def webroot_usable(webroot: Path) -> bool:
+    parent = webroot.parent
+    return (webroot.is_dir() and os.access(webroot, os.W_OK)) or (
+        not webroot.exists() and parent.is_dir() and os.access(parent, os.W_OK))
+
+
+def _copy_atomic(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(dst.name + ".tmp")
+    tmp.write_bytes(src.read_bytes())
+    os.chmod(tmp, 0o644)
+    tmp.replace(dst)
+
+
+def sync_webroot(out: Path, webroot: Path, releases: list[dict]) -> None:
+    """Exactly the packages of the manifest plus manifest.json; others removed.
+    Each file appears atomically (written as .tmp, then renamed)."""
+    keep = set()
+    for r in releases:
+        name = r["url"].rsplit("/", 1)[1]
+        rel = Path("firmware") / r["board"] / name
+        keep.add(rel)
+        src, dst = out / rel, webroot / rel
+        if not dst.is_file() or dst.stat().st_size != src.stat().st_size or dst.read_bytes() != src.read_bytes():
+            _copy_atomic(src, dst)
+    _copy_atomic(out / "manifest.json", webroot / "manifest.json")
+    # No directory listings (Apache "Indexes").
+    for d in (webroot, webroot / "firmware", *(webroot / "firmware").glob("*")):
+        index = d / "index.html"
+        if d.is_dir() and not index.exists():
+            index.write_text("<!doctype html><title>SensorForge OTA</title><p>SensorForge firmware.</p>\n",
+                             encoding="utf-8")
+            os.chmod(index, 0o644)
+    for old in (webroot / "firmware").glob("*/*.sfw"):
+        if old.relative_to(webroot) not in keep:
+            old.unlink()
+    for d in (webroot, webroot / "firmware", *(webroot / "firmware").glob("*")):
+        if d.is_dir():
+            os.chmod(d, 0o755)
+
+
+def check_url(url: str) -> str:
+    try:
+        with urllib.request.urlopen(url, timeout=3) as resp:
+            json.loads(resp.read())
+        return "erreichbar"
+    except Exception as exc:  # noqa: BLE001
+        return f"NICHT erreichbar ({exc})"
+
+
 class Handler(http.server.SimpleHTTPRequestHandler):
     """Read-only: manifest.json and firmware/<board>/<file>.sfw, no listings."""
 
@@ -250,6 +312,15 @@ def main() -> int:
                          "z. B. für ein Downgrade, siehe unten")
     ap.add_argument("--unpin", action="store_true", help="gespeicherten Pin aufheben: wieder neueste Version je Board")
     ap.add_argument("--list", action="store_true", help="vorhandene Pakete je Board und den Pin anzeigen, dann beenden")
+    ap.add_argument("--webroot", default=str(DEFAULT_WEBROOT),
+                    help=f"Ordner im lokalen Webserver (Apache), in den Manifest und Pakete kopiert werden "
+                         f"(Standard: {DEFAULT_WEBROOT})")
+    ap.add_argument("--web-url", default=None,
+                    help=f"URL dieses Ordners (Standard: http://<LAN-Adresse>/{WEB_PATH})")
+    ap.add_argument("--no-webroot", action="store_true",
+                    help="nicht in den Webserver-Ordner kopieren (dann eigener Server wie bisher)")
+    ap.add_argument("--url", action="store_true",
+                    help="nur die Manifest-URL für \"Firmware im Cluster\" ausgeben, dann beenden")
     args = ap.parse_args()
     if args.pin and args.unpin:
         ap.error("--pin und --unpin schließen sich aus")
@@ -281,10 +352,17 @@ def main() -> int:
         print(f"Pin gesetzt auf {args.pin} (Boards mit Paket: {', '.join(sorted(have))}).")
     pin = read_pin(out)
 
+    host = args.host or lan_ip()
+    webroot = Path(args.webroot)
+    # Apache unless disabled, not writable, or the own server is wanted.
+    use_web = not args.no_webroot and not args.serve_only and webroot_usable(webroot)
+    web_url = (args.web_url or f"http://{host}/{WEB_PATH}").rstrip("/")
+    base_url = web_url if use_web else f"http://{host}:{args.port}"
+    if args.url:
+        print(f"{base_url}/manifest.json")
+        return 0
     if key_path.name.endswith("_DEV.pem"):
         print(f"Hinweis: signiert mit dem Entwicklungsschlüssel {key_path.name} (liegt im Repository).")
-    host = args.host or lan_ip()
-    base_url = f"http://{host}:{args.port}"
 
     if not args.serve_only:
         want = None if args.any_release else repo_release()
@@ -319,6 +397,12 @@ def main() -> int:
     missing = [b for b in BOARDS if b not in {r['board'] for r in releases}]
     if missing:
         print(f"  (kein Paket für: {', '.join(missing)})")
+    if use_web:
+        sync_webroot(out, webroot, releases)
+        print(f"\nIm Webserver bereitgestellt: {webroot}")
+        print(f"Manifest-URL für \"Firmware im Cluster\" am Coordinator:\n  {base_url}/manifest.json"
+              f"   [{check_url(base_url + '/manifest.json')}]")
+        return 0
     if args.no_serve:
         return 0
 

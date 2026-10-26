@@ -29,7 +29,8 @@
 #   4. Legt das signierte WLAN-Update-Paket an (tools/sf_firmware_publish.py):
 #      ../sensorforge_builds/ota/firmware/<board>/<release>.sfw und
 #      ../sensorforge_builds/ota/manifest.json (neueste Version je Board).
-#      Ausliefern mit: python3 tools/sf_firmware_publish.py --serve-only
+#      und kopiert Manifest + Pakete in den lokalen Apache
+#      (/var/www/html/sensorforge-ota, URL .../sensorforge-ota/manifest.json).
 #   5. Flasht Bootloader, Partitionstabelle, boot_app0 und App - genau wie die
 #      IDE. Kein Löschen des Flash, nie merged.bin: Konfiguration, WLAN-Daten,
 #      Integration-ID (NVS) und LittleFS bleiben erhalten.
@@ -291,8 +292,9 @@ if [ "$BOARD" = all ]; then
         "${BASH_SOURCE[0]}" "$b" --ota-only $([ "$REBUILD" = 1 ] && echo --rebuild) || die "$b fehlgeschlagen."
     done
     echo
-    echo "Alle Boards gebaut und als WLAN-Paket bereit. Ausliefern:"
-    echo "    python3 $REPO/tools/sf_firmware_publish.py --serve-only"
+    echo "Alle Boards gebaut und als WLAN-Paket bereit."
+    echo "Manifest-URL für \"Firmware im Cluster\" am Coordinator:"
+    echo "    $(python3 "$REPO/tools/sf_firmware_publish.py" --url)"
     exit 0
 fi
 
@@ -389,7 +391,7 @@ fi
 
 if [ "$OTA_ONLY" = 1 ]; then
     info "Fertig: $BOARD gebaut, WLAN-Paket bereit (nicht geflasht)."
-    echo "    Ausliefern: python3 $REPO/tools/sf_firmware_publish.py --serve-only"
+    echo "    Manifest-URL: $(python3 "$REPO/tools/sf_firmware_publish.py" --url)"
     exit 0
 fi
 

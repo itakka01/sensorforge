@@ -6,6 +6,8 @@ Ablehnungstests an devxiao2 (beta158, Browser-Upload) bestanden: diymore-Paket a
 
 **Ganzer Cluster per WLAN auf beta159 (00:27–01:03):** alle 9 Nodes und zuletzt der Coordinator („Coordinator aktualisieren“, nach ~25 s zurück). Je Node ~12–30 s Download + Prüfung. **Auffällig:** 2 von 6 diymore-Boards (c001, c004) kamen nach dem Software-Neustart nicht zurück, beide erst nach Strom aus/an – dann mit beta159, also ohne Rückfall: der Chip hat die neue Firmware nicht gestartet (Verdacht: Boot-Pins beim Software-Neustart, z. B. GPIO0 über die USB-Seriell-Reset-Schaltung). Der Rollout hielt jeweils korrekt an. Normale Neustarts und zwei Updates per Browser auf c001 liefen ohne Hänger.
 
+**`tools/sf_firmware_publish.py` → lokaler Apache:** Manifest und genau die darin genannten Pakete werden nach `/var/www/html/sensorforge-ota/` kopiert (atomar, ältere Pakete dort entfernt, keine Verzeichnislisten); Manifest-URL `http://<PC>/sensorforge-ota/manifest.json` bleibt gleich, kein eigener Server nötig. `--url` gibt sie aus (auch am Ende von `flash_board.sh`), `--no-webroot`/`--serve-only` wie bisher mit eigenem Server.
+
 Profiltest bestanden: Referenz c003, „nur Sitzung“ → alle 6 OV5640 übernehmen Profil 50599a76 (Job-Status 5), „Profil entfernen“ → alle wieder lokal.
 
 ## v87-beta158 — 2026-10-25 (FIRMWARE-UPDATE ÜBERS CLUSTER, AUSRICHTUNG)
