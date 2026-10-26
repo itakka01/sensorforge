@@ -1,3 +1,24 @@
+## v87-beta176 — 2026-10-26 (SOFORTAUFNAHME 200 MS, SENSOR-FREIGABE ZWEI PERIODEN VORHER)
+
+- Sofortaufnahme: Vorlauf 150 → 200 ms (`CLUSTER_INSTANT_LEAD_US`).
+- Bildtakt-Sync: Sensor-Freigabe **zwei** Bildperioden vor dem Termin (Aufnahmebild = drittes Bild nach dem Wiederanlauf), wenn die Zeit reicht, sonst eine (`last_sync_state` = ok / ok_1period, `last_sync_periods`). Gegen die seltenen schwarzen Bilder (beide ersten Bilder nach dem Wiederanlauf schwarz, ~1,5 % in beta174/175). Freenove (72 ms Periode) braucht ~155 ms Rest und fällt bei knapper Zustellung auf eine Periode zurück.
+
+Messung beta176 (20:20–20:29, 30 Sofortaufnahmen, 9 Nodes): alle 270 Node-Aufnahmen erfolgreich, immer mit zwei Perioden (`ok`); Bildanfang-Streuung je Aufnahme Median 126 µs (max 0,9 ms). Eine Periode zu spät: 3× (Aufnahmebild vom Treiber verworfen). **Schwarze Bilder nicht beseitigt:** 4× – jeweils zwei diymore im selben Gehäuse gleichzeitig (c001+c006, c004+c006), alle drei Bilder nach dem Wiederanlauf schwarz → gemeinsame Ursache wahrscheinlich (Versorgung beim gleichzeitigen Anlauf), nicht die Zahl der Perioden.
+
+Gegenprobe 20:39–20:55 (Stromversorgung geteilt: c001/c004/c006 an zweitem Netzteil, c002/c003/c005 am 8-Port-Netzteil; nur diese 6 im Cluster): 37 Sofortaufnahmen × 6 = 222 Node-Aufnahmen – **kein schwarzes Bild, keine verspätete**, Bildanfang-Streuung Median 102 µs (max 0,32 ms). Die schwarzen Bilder kamen also mit großer Wahrscheinlichkeit vom gemeinsam überlasteten Netzteil.
+
+## v87-beta175 — 2026-10-26 (VERLORENE BILDER NACH DER SENSOR-FREIGABE)
+
+Diagnose beta174 (20 Sofortaufnahmen, 7 Nodes): devxiao3 verlor das erste Bild nach der Freigabe 7× und das Aufnahmebild 6× (→ eine Periode später). Das erste Bild nach dem Aufwachen ist Rauschen bei hoher Verstärkung (dunkle Szene) und auf devxiao3 bis 156 KB groß – fast der ganze JPEG-Puffer des Treibers (1024×768: 157 KB). Größere laufen über, der Treiber verwirft es, und der Überlauf kostet oft auch das nächste Bild. Andere Nodes: erstes Bild 16–68 KB, Aufnahmebild 1× in 140 verloren.
+
+- Das erste Bild nach der Freigabe wird mit der niedrigsten JPEG-Qualität kodiert (beim Anhalten gesetzt), 5 ms nach der Freigabe – das Bild läuft dann schon – wird die eingestellte Qualität wiederhergestellt; jede Kamera-Nutzung (`cameraWakeForUse`) stellt sie ebenfalls wieder her (abgebrochene Aufnahme).
+
+Messung beta175 (20 Sofortaufnahmen, 6 Nodes): erstes Bild auf devxiao3 jetzt höchstens 55 KB (vorher 156 KB), Aufnahmebild verloren 1× in 20 (vorher 6×). Bildanfang aller Nodes −0,6…+0,3 ms um den Termin (Ausreißer nur bei der ersten, lernenden Aufnahme). Selten (4 von ~260 Node-Aufnahmen, beta174+175) sind beide Bilder nach der Freigabe komplett schwarz (15987 B) – Sensor braucht dann länger zum Wiederanlaufen.
+
+## v87-beta174 — 2026-10-26 (DIAGNOSE: BILDER NACH DER SENSOR-FREIGABE)
+
+- `capture_diagnostics.last_frames`: jedes nach der Freigabe erhaltene Bild als „Beginn relativ zur Freigabe [µs]/JPEG-Länge“ – zur Untersuchung der verlorenen Bilder auf devxiao3 (~3 von 10 Aufnahmen eine Periode später).
+
 ## v87-beta172 — 2026-10-26 (BILDTAKT-SYNC: FREIGABE EINE BILDPERIODE VOR DEM TERMIN)
 
 beta171 lieferte das erste Bild nach der Freigabe – zu kurz belichtet (diymore ~60 % Helligkeit, c002 schwarz); XIAO/Freenove lieferten teils erst das 2./3. Bild.

@@ -31,3 +31,7 @@ bool cameraFrameSyncHold();
 // Release at the deadline (one SCCB write); true when it was held and is running.
 bool cameraFrameSyncRelease();
 bool cameraFrameSyncHeld();
+// Restores the JPEG quality lowered for the restart frame (no-op otherwise).
+// Called by the shot once the restart frame has started, and by every
+// cameraWakeForUse(). False if the sensor refused the write.
+bool cameraFrameSyncRestoreQuality();

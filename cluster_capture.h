@@ -7,7 +7,10 @@ void clusterCaptureBeginJob(uint64_t jobId);
 // frames and the moment the capturing fb_get started.
 struct ClusterCaptureShotTiming{int64_t drainStartUs;int64_t drainEndUs;uint8_t drained;uint8_t lateDrained;
     int64_t releaseStartUs;int64_t dispatchMonoUs;int64_t frameReturnedUs;int64_t frameTimestampUs;
-    uint8_t framesSkipped;};
+    uint8_t framesSkipped;
+    // Every frame the shot received after the release (skipped ones first):
+    // start relative to the release start [us] and JPEG length.
+    uint8_t frameCount;int32_t frameRelUs[5];uint32_t frameLen[5];};
 // Sensor frame period (driver frame timestamps, min of consecutive spacings).
 // Measure: blocking, ~5 frame periods (camera awake, loopTask). Track:
 // non-blocking, one ready frame per call (while the cameras are armed).

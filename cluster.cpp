@@ -143,7 +143,7 @@ static uint32_t sharpUntilMs = 0;
 // Coordinator: last arming sent to the cluster ends at this millis().
 static uint32_t coordSharpUntilMs = 0;
 static const uint32_t CLUSTER_SHARP_MAX_S = 3600;
-// Shortest lead a node accepts while armed (the coordinator plans 150 ms;
+// Shortest lead a node accepts while armed (the coordinator plans 200 ms;
 // measured delivery to 9 nodes took at most 35 ms).
 static const int64_t CLUSTER_INSTANT_NODE_MIN_LEAD_US = 60000LL;
 // Final approach: the loop task spins (no delay(1) tick) for at most this long
@@ -185,15 +185,19 @@ static int64_t captureLastDispatchOffsetUs=0;
 static int64_t captureLastSpinUs=0, captureLastLateUs=0, captureLastDrainUs=0, captureLastDispatchAfterDeadlineUs=0;
 static uint8_t captureLastDrained=0, captureLastLateDrained=0;
 static bool captureFrameSync=false, captureLastFrameSync=false;
-// Frame-clock sync (beta172): the sensor is released one frame period before
-// the deadline (captureSpinTargetUs), the first frame starting at the deadline
-// is taken. captureReleaseToFrameUs = release start -> start of that second
-// frame minus one period (SCCB write + sensor restart, ~1.9-2.9 ms); the
-// whole lead is learned per node (captureLearnedLeadUs, averaged over shots).
+// Frame-clock sync (beta172/176): the sensor is released two frame periods
+// before the deadline (one if time is short; captureSyncPeriods), the first
+// frame starting at the deadline is taken. Two periods: a sensor that restarts
+// with black frames (~1.5 % of restarts measured) has one more frame to
+// recover. captureReleaseToFrameUs = release start -> start of the first
+// frame (SCCB write + sensor restart, ~1.6-2.9 ms); captureLearnedLeadUs =
+// release -> first frame + one period, averaged over shots per node.
 static int64_t captureSpinTargetUs=0, captureSyncPeriodUs=0, captureReleaseToFrameUs=2500;
 static int64_t captureLearnedLeadUs=0;
+static uint8_t captureSyncPeriods=0, captureLastSyncPeriods=0;
 static int64_t captureLastFrameStartRelUs=0, captureLastPeriodUs=0, captureLastReleaseLeadUs=0;
 static uint8_t captureLastFramesSkipped=0;
+static String captureLastFramesText;   // "start_us/len,..." per received frame
 static const char *captureLastSyncState="";
 static int64_t captureLastFrameWaitUs=0, captureLastFrameTsMinusDispatchUs=0;
 static uint32_t captureLastSize=0;
@@ -3237,15 +3241,17 @@ static void serviceScheduledCapture(){
             // Learned lead (release -> second frame) unless the period changed.
             if(captureLearnedLeadUs && llabs(captureLearnedLeadUs-(period+captureReleaseToFrameUs))>1500)
                 captureLearnedLeadUs=0;
-            const int64_t lead=captureLearnedLeadUs?captureLearnedLeadUs:period+captureReleaseToFrameUs;
+            const int64_t lead1=captureLearnedLeadUs?captureLearnedLeadUs:period+captureReleaseToFrameUs;
             const int64_t leftNow=pendingCapture.deadlineMonoUs-esp_timer_get_time();
+            const int64_t margin=CLUSTER_CAPTURE_SPIN_US+5000LL;
+            const uint8_t periods=leftNow>=lead1+period+margin?2:(leftNow>=lead1+margin?1:0);
             if(!period||age>10000000LL)captureLastSyncState="no_period";
-            else if(leftNow<lead+CLUSTER_CAPTURE_SPIN_US+5000LL)captureLastSyncState="too_late";
+            else if(!periods)captureLastSyncState="too_late";
             else if(!cameraFrameSyncHold())captureLastSyncState="no_hold";
             else {
-                captureFrameSync=true;captureSyncPeriodUs=period;
-                captureSpinTargetUs=pendingCapture.deadlineMonoUs-lead;
-                captureLastSyncState="ok";
+                captureFrameSync=true;captureSyncPeriodUs=period;captureSyncPeriods=periods;
+                captureSpinTargetUs=pendingCapture.deadlineMonoUs-lead1-(periods-1)*period;
+                captureLastSyncState=periods==2?"ok":"ok_1period";
             }
             // Configure the test-pulse output now, outside the time-critical
             // dispatch. A refused pin never blocks the shot itself.
@@ -3286,6 +3292,12 @@ static void serviceScheduledCapture(){
         captureLastLateDrained=t.lateDrained;
         captureLastFrameSync=captureFrameSync;
         captureLastFramesSkipped=t.framesSkipped;
+        captureLastSyncPeriods=captureFrameSync?captureSyncPeriods:0;
+        captureLastFramesText="";
+        for(uint8_t i=0;i<t.frameCount;++i){
+            if(i)captureLastFramesText+=",";
+            captureLastFramesText+=String((long)t.frameRelUs[i])+"/"+String((unsigned long)t.frameLen[i]);
+        }
         captureLastPeriodUs=captureFrameSync?captureSyncPeriodUs:0;
         captureLastReleaseLeadUs=captureFrameSync&&t.releaseStartUs?p.deadlineMonoUs-t.releaseStartUs:0;
         captureLastFrameStartRelUs=t.frameTimestampUs?t.frameTimestampUs-p.deadlineMonoUs:0;
@@ -3293,10 +3305,11 @@ static void serviceScheduledCapture(){
             // Learn the lead from shots that got the second frame after the
             // release (a dropped frame makes it one period later: ignored).
             const int64_t rel=t.frameTimestampUs-t.releaseStartUs;
-            const int64_t off=rel-captureSyncPeriodUs;
+            const int64_t off=rel-captureSyncPeriods*captureSyncPeriodUs;
             if(off>0&&off<6000){
+                const int64_t lead1=off+captureSyncPeriodUs;
                 captureReleaseToFrameUs=off;
-                captureLearnedLeadUs=captureLearnedLeadUs?(3*captureLearnedLeadUs+rel)/4:rel;
+                captureLearnedLeadUs=captureLearnedLeadUs?(3*captureLearnedLeadUs+lead1)/4:lead1;
             }
         }
         captureFrameSync=false;
@@ -5164,7 +5177,7 @@ bool clusterRequestNodeCapture(const String &nodeId,int64_t utcUs,String &error,
     int64_t nowUtc=0;
     // Nodes accept a job up to 1.5 s before the shot; the quick shot (2 s)
     // reaches the last of many nodes a few ms later, so allow 1.6 s here.
-    // Armed cluster: instant shot (150 ms planned); otherwise 2 s as before.
+    // Armed cluster: instant shot (200 ms planned); otherwise 2 s as before.
     const bool armed=coordSharpUntilMs && (int32_t)(coordSharpUntilMs-millis())>0;
     const int64_t minLeadUs=armed?120000LL:2000000LL;
     if(!clusterTimeNowUs(nowUtc)||utcUs-nowUtc<minLeadUs||utcUs-nowUtc>1800000000LL){
@@ -6278,6 +6291,8 @@ static String buildClusterStatusJson(ClusterStatusChunkSink sink, void *ctx)
         ",\"last_frames_skipped\":"+String((unsigned)captureLastFramesSkipped)+
         ",\"release_to_frame_us\":"+String((long)captureReleaseToFrameUs)+
         ",\"learned_lead_us\":"+String((long)captureLearnedLeadUs)+
+        ",\"last_sync_periods\":"+String((unsigned)captureLastSyncPeriods)+
+        ",\"last_frames\":\""+captureLastFramesText+"\""+
         ",\"last_frame_wait_us\":"+String((long)captureLastFrameWaitUs)+
         ",\"last_frame_ts_minus_dispatch_us\":"+String((long)captureLastFrameTsMinusDispatchUs);
     json += ",\"last_size_bytes\":"+String((unsigned long)captureLastSize);

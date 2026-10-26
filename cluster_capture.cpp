@@ -162,13 +162,26 @@ uint16_t clusterCapturePhoto(uint64_t jobId,int64_t targetUtcUs,int64_t &dispatc
     // Software dispatch, NOT sensor exposure-start timestamp.
     lastShot.dispatchMonoUs=esp_timer_get_time();
     dispatchUtcUs=anchorUtcUs+(lastShot.dispatchMonoUs-anchorMonoUs);
+    if(frameSync && frameNotBeforeMonoUs){
+        // The restart frame starts ~1.6-2.0 ms after the release: restore
+        // the JPEG quality once it is under way (cameraFrameSyncHold).
+        while(esp_timer_get_time()-lastShot.releaseStartUs<5000){}
+        if(!cameraFrameSyncRestoreQuality()){if(testPulse)clusterCapturePulseFall();return 3;}
+    }
     camera_fb_t *fb=esp_camera_fb_get();
     if(testPulse)clusterCapturePulseFall();
+    auto noteFrame=[](const camera_fb_t *f){
+        if(!f||lastShot.frameCount>=5)return;
+        lastShot.frameRelUs[lastShot.frameCount]=(int32_t)(frameTsUs(f)-lastShot.releaseStartUs);
+        lastShot.frameLen[lastShot.frameCount++]=f->len;
+    };
+    noteFrame(fb);
     while(fb && frameSync && frameNotBeforeMonoUs && frameTsUs(fb)<frameNotBeforeMonoUs &&
           lastShot.framesSkipped<4){
         esp_camera_fb_return(fb);
         ++lastShot.framesSkipped;
         fb=esp_camera_fb_get();
+        noteFrame(fb);
     }
     if(!fb)return 3;
     lastShot.frameReturnedUs=esp_timer_get_time();

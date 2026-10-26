@@ -1626,10 +1626,12 @@ static void handleClusterSharp()
 
 // Lead of the instant shot: delivery to every node plus a safety margin
 // (nodes report their reserve, capture_reserve_ms, to verify it).
-static const int64_t CLUSTER_INSTANT_LEAD_US = 150000LL;
+// 200 ms: the nodes restart their sensors two frame periods (OV5640 2x52 ms)
+// before the shot, see cluster.cpp captureSyncPeriods.
+static const int64_t CLUSTER_INSTANT_LEAD_US = 200000LL;
 
 // POST /cluster_capture_now: node_ids=<id,...>[&test_pulse=1]. Only while the
-// cluster is armed. One UTC time = now + 150 ms, the normal signed capture job
+// cluster is armed. One UTC time = now + 200 ms, the normal signed capture job
 // to every node in one pass.
 static void handleClusterCaptureNow()
 {

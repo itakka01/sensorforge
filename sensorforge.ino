@@ -157,6 +157,9 @@ static bool cameraIdleStandby = false;
 // Frame-clock sync (camera_power.h). Not the idle standby: the idle service
 // never touches a held sensor (capture protection is active meanwhile).
 static bool cameraFrameSyncHolding = false;
+// JPEG quality saved while the restart frame is encoded at the lowest quality
+// (-1 = nothing to restore). See cameraFrameSyncHold().
+static int cameraFrameSyncSavedQuality = -1;
 static bool cameraFastSleepCapabilityKnown = false;
 static bool cameraFastSleepSupported = false;
 static uint16_t cameraDetectedPid = 0;
@@ -6354,6 +6357,7 @@ static void cameraDeinitRuntime()
     cameraWbKelvinApplied = 0;
     cameraIdleStandby = false;
     cameraFrameSyncHolding = false;
+    cameraFrameSyncSavedQuality = -1;
     cameraCropAppliedZoomX10 = 10;
     cameraCropAppliedX = -1;
     cameraCropAppliedY = -1;
@@ -8492,6 +8496,8 @@ static bool cameraExitSoftPowerDown()
 bool cameraWakeForUse()
 {
     cameraLastUseMs = millis();
+    // An aborted frame-sync shot must not leave the lowest JPEG quality behind.
+    cameraFrameSyncRestoreQuality();
     if (!cameraInitialized || !cameraSoftPowerDownActive)
         return true;
     const bool ok = cameraExitSoftPowerDown();
@@ -8506,9 +8512,35 @@ bool cameraFrameSyncHold()
     if (!cameraInitialized)
         return false;
     cameraIdleStandby = false;
-    if (!cameraEnterSoftPowerDown())
+    // The first frame after the release is noise at high gain and can exceed
+    // the driver's JPEG buffer (1024x768: 157 KB, measured up to 156 KB on
+    // devxiao3); the overflow then also costs the next frame, the shot. It is
+    // encoded at the lowest quality and the quality restored right after it
+    // started (cameraFrameSyncRestoreQuality).
+    sensor_t *sensor = esp_camera_sensor_get();
+    if (sensor && sensor->set_quality && cameraFrameSyncSavedQuality < 0) {
+        const int quality = sensor->status.quality;
+        if (sensor->set_quality(sensor, 63) == 0)
+            cameraFrameSyncSavedQuality = quality;
+    }
+    if (!cameraEnterSoftPowerDown()) {
+        cameraFrameSyncRestoreQuality();
         return false;
+    }
     cameraFrameSyncHolding = true;
+    return true;
+}
+
+bool cameraFrameSyncRestoreQuality()
+{
+    if (cameraFrameSyncSavedQuality < 0)
+        return true;
+    sensor_t *sensor = esp_camera_sensor_get();
+    if (!cameraInitialized || !sensor || !sensor->set_quality)
+        return false;
+    if (sensor->set_quality(sensor, cameraFrameSyncSavedQuality) != 0)
+        return false;
+    cameraFrameSyncSavedQuality = -1;
     return true;
 }
 
