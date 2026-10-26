@@ -20,6 +20,7 @@
 #include "camera_profile_store.h"
 #include "firmware_cluster_update.h"
 #include "cluster_firmware_rollout.h"
+#include "camera_power.h"
 #include "device_identity.h"
 #include "logger.h"
 #include "recorder.h"
@@ -142,8 +143,18 @@ static uint32_t sharpUntilMs = 0;
 // Coordinator: last arming sent to the cluster ends at this millis().
 static uint32_t coordSharpUntilMs = 0;
 static const uint32_t CLUSTER_SHARP_MAX_S = 3600;
-// Shortest lead a node accepts while armed (the coordinator plans 300 ms).
-static const int64_t CLUSTER_INSTANT_NODE_MIN_LEAD_US = 150000LL;
+// Shortest lead a node accepts while armed (the coordinator plans 150 ms;
+// measured delivery to 9 nodes took at most 35 ms).
+static const int64_t CLUSTER_INSTANT_NODE_MIN_LEAD_US = 60000LL;
+// Final approach: the loop task spins (no delay(1) tick) for at most this long
+// before the deadline, so the shot starts within µs instead of up to 1 ms late.
+static const int64_t CLUSTER_CAPTURE_SPIN_US = 3000LL;
+// Replies sent by all nodes at the same moment overflow the coordinator's UDP
+// receive queue; each node delays them by a per-boot offset.
+struct DeferredCaptureAck { bool active; uint32_t sendAtMs, cb, epoch, seq, reserveMs; };
+static DeferredCaptureAck deferredCaptureAck = {};
+struct DeferredSharpAck { bool active; uint32_t sendAtMs; String msg; };
+static DeferredSharpAck deferredSharpAck;
 static const char *CLUSTER_JOB_DRONE_MAGIC = "SFJD1";
 static const char *CLUSTER_JOB_DRONE_ACK_MAGIC = "SFJDA1";
 static uint32_t droneSeenBoot=0,droneSeenEpoch=0,droneSeenSeq=0;
@@ -170,6 +181,21 @@ static uint32_t coordinatorCaptureGuardUntilMs=0;
 static uint32_t captureSeenBoot=0,captureSeenEpoch=0,captureSeenSeq=0;
 static uint32_t captureSent=0,captureAccepted=0,captureCompleted=0,captureFailed=0;
 static int64_t captureLastDispatchOffsetUs=0;
+// Diagnostics of the last shot relative to its monotonic deadline (µs).
+static int64_t captureLastSpinUs=0, captureLastLateUs=0, captureLastDrainUs=0, captureLastDispatchAfterDeadlineUs=0;
+static uint8_t captureLastDrained=0, captureLastLateDrained=0;
+static bool captureFrameSync=false, captureLastFrameSync=false;
+// Frame-clock sync (beta172): the sensor is released one frame period before
+// the deadline (captureSpinTargetUs), the first frame starting at the deadline
+// is taken. captureReleaseToFrameUs = release start -> start of that second
+// frame minus one period (SCCB write + sensor restart, ~1.9-2.9 ms); the
+// whole lead is learned per node (captureLearnedLeadUs, averaged over shots).
+static int64_t captureSpinTargetUs=0, captureSyncPeriodUs=0, captureReleaseToFrameUs=2500;
+static int64_t captureLearnedLeadUs=0;
+static int64_t captureLastFrameStartRelUs=0, captureLastPeriodUs=0, captureLastReleaseLeadUs=0;
+static uint8_t captureLastFramesSkipped=0;
+static const char *captureLastSyncState="";
+static int64_t captureLastFrameWaitUs=0, captureLastFrameTsMinusDispatchUs=0;
 static uint32_t captureLastSize=0;
 static uint16_t captureLastError=0;
 // At most one unacknowledged terminal result per node. A newly accepted
@@ -1927,6 +1953,12 @@ static void processPresence(
     const uint8_t preservedTxResult = sameBoot ? peer->txResult : 0;
     const uint8_t preservedTxMode = sameBoot ? peer->txMode : 0;
     const uint32_t preservedTxUpdatedMs = sameBoot ? peer->txUpdatedMs : 0;
+    // Instant shot: reserve and arming answer (same boot only).
+    const uint32_t preservedCaptureReserveSeq = sameBoot ? peer->captureReserveSeq : 0;
+    const uint32_t preservedCaptureReserveMs = sameBoot ? peer->captureReserveMs : 0;
+    const uint8_t preservedSharpCode = sameBoot ? peer->sharpCode : 0;
+    const uint32_t preservedSharpAckMs = sameBoot ? peer->sharpAckMs : 0;
+    const uint32_t preservedSharpRemainingS = sameBoot ? peer->sharpRemainingS : 0;
 
     *peer = ClusterPeer{};
     peer->used = true;
@@ -1971,6 +2003,11 @@ static void processPresence(
     peer->txResult = preservedTxResult;
     peer->txMode = preservedTxMode;
     peer->txUpdatedMs = preservedTxUpdatedMs;
+    peer->captureReserveSeq = preservedCaptureReserveSeq;
+    peer->captureReserveMs = preservedCaptureReserveMs;
+    peer->sharpCode = preservedSharpCode;
+    peer->sharpAckMs = preservedSharpAckMs;
+    peer->sharpRemainingS = preservedSharpRemainingS;
     peer->lastSeenMs = now;
 
     if (!runtimeProfileRemembered) {
@@ -2984,6 +3021,18 @@ static void queueCaptureTerminalResult(uint32_t cb,uint32_t epoch,uint32_t seq,
     sendCaptureResult(cb,epoch,seq,status,error,bytes,r.uuid,dispatch);
     r.attempts=1;r.lastSendMs=millis();
 }
+static void serviceDeferredAcks(uint32_t now){
+    if(deferredCaptureAck.active && (int32_t)(now-deferredCaptureAck.sendAtMs)>=0){
+        const DeferredCaptureAck a=deferredCaptureAck;deferredCaptureAck.active=false;
+        sendCaptureResult(a.cb,a.epoch,a.seq,1,0,a.reserveMs);
+    }
+    if(deferredSharpAck.active && (int32_t)(now-deferredSharpAck.sendAtMs)>=0){
+        deferredSharpAck.active=false;
+        if(runtimeActive && !localIsCoordinator && usableIp(currentCoordinatorIp))
+            sendSignedPayloadTo(deferredSharpAck.msg,currentCoordinatorIp,CLUSTER_COORDINATOR_PORT,"sharp result");
+        deferredSharpAck.msg=String();
+    }
+}
 static void serviceCaptureResultRetry(uint32_t now){
     CaptureResultRetry &r=captureResultRetry;
     if(!r.active)return;
@@ -3042,7 +3091,13 @@ static void processJobCapture(char **f,size_t n,const IPAddress &ip) {
     int64_t nowUtc=0;
     // Armed (camera awake, standby off): the instant shot's short lead is fine.
     const int64_t minLeadUs=clusterSharpActive()?CLUSTER_INSTANT_NODE_MIN_LEAD_US:1500000LL;
-    if(errno||!end||*end||utc<=0||!clusterTimeNowUs(nowUtc)||utc-nowUtc<minLeadUs||
+    // Cluster time and monotonic clock read at the same instant: the frozen
+    // deadline must not absorb the time spent between them (pauseForCapture
+    // below took ~1 ms, different per node -> late and scattered shots).
+    const bool parseOk=!errno&&end&&!*end;   // before anything else can touch errno
+    const bool clusterTimeOk=clusterTimeNowUs(nowUtc);
+    const int64_t nowMonoUs=esp_timer_get_time();
+    if(!parseOk||utc<=0||!clusterTimeOk||utc-nowUtc<minLeadUs||
        utc-nowUtc>1800000000LL||pendingCapture.active) {
         sendCaptureResult(cb,epoch,seq,3,1,0);return;
     }
@@ -3050,9 +3105,10 @@ static void processJobCapture(char **f,size_t n,const IPAddress &ip) {
     // Pause BEFORE accepting the shot; retain the last calibrated time model.
     ClusterEspNowRadio::pauseForCapture(
         static_cast<uint32_t>((utc - nowUtc) / 1000LL) + 5000UL);
-    // Freeze the mapping immediately, before sending the acceptance ACK.
-    // Future cluster/NTP adjustments only influence *future* jobs.
-    const int64_t acceptedMonoUs=esp_timer_get_time();
+    // Freeze the mapping (taken together with nowUtc above), before sending
+    // the acceptance ACK. Future cluster/NTP adjustments only influence
+    // *future* jobs.
+    const int64_t acceptedMonoUs=nowMonoUs;
     const int64_t remainingUs=utc-nowUtc;
     captureResultRetry=CaptureResultRetry{};
     clusterCaptureBeginJob(((uint64_t)cb<<32)|seq);
@@ -3062,8 +3118,9 @@ static void processJobCapture(char **f,size_t n,const IPAddress &ip) {
                     acceptedMonoUs+remainingUs,
                     ClusterEspNowRadio::timeSourceGeneration(),testPulse};
     captureTestPulseState=testPulse?"requested":"off";
-    // Status 1 (accepted) carries the reserve in ms in the bytes field.
-    sendCaptureResult(cb,epoch,seq,1,0,(uint32_t)(remainingUs/1000LL));
+    // Status 1 (accepted) carries the reserve in ms in the bytes field; sent
+    // 0-28 ms later (per node) so that all nodes do not answer at once.
+    deferredCaptureAck={true,millis()+(bootNonce%8U)*4U,cb,epoch,seq,(uint32_t)(remainingUs/1000LL)};
 }
 static void processJobCaptureResult(char **f,size_t n,const IPAddress &ip) {
     if(n!=13||!runtimeActive||!localIsCoordinator||strcmp(f[1],runtimeClusterTag)!=0||
@@ -3168,6 +3225,28 @@ static void serviceScheduledCapture(){
                 queueCaptureTerminalResult(p.cb,p.epoch,p.seq,3,1,0);return;
             }
             clusterCaptureArmedFlag=true;
+            // Frame-clock sync: hold the sensor and restart it one frame
+            // period before the deadline, so every camera's frame grid
+            // starts together (camera_power.h). Needs a fresh period (planned
+            // shots measure it now, armed cameras track it continuously) and
+            // enough time; otherwise the sensor keeps free-running frames.
+            captureFrameSync=false;captureSpinTargetUs=pendingCapture.deadlineMonoUs;
+            int64_t age=0;int64_t period=clusterCaptureFramePeriodUs(&age);
+            if((!period||age>3000000LL) && leftUs>400000LL &&
+               clusterCaptureMeasureFramePeriod())period=clusterCaptureFramePeriodUs(&age);
+            // Learned lead (release -> second frame) unless the period changed.
+            if(captureLearnedLeadUs && llabs(captureLearnedLeadUs-(period+captureReleaseToFrameUs))>1500)
+                captureLearnedLeadUs=0;
+            const int64_t lead=captureLearnedLeadUs?captureLearnedLeadUs:period+captureReleaseToFrameUs;
+            const int64_t leftNow=pendingCapture.deadlineMonoUs-esp_timer_get_time();
+            if(!period||age>10000000LL)captureLastSyncState="no_period";
+            else if(leftNow<lead+CLUSTER_CAPTURE_SPIN_US+5000LL)captureLastSyncState="too_late";
+            else if(!cameraFrameSyncHold())captureLastSyncState="no_hold";
+            else {
+                captureFrameSync=true;captureSyncPeriodUs=period;
+                captureSpinTargetUs=pendingCapture.deadlineMonoUs-lead;
+                captureLastSyncState="ok";
+            }
             // Configure the test-pulse output now, outside the time-critical
             // dispatch. A refused pin never blocks the shot itself.
             if(pendingCapture.testPulse){
@@ -3175,17 +3254,58 @@ static void serviceScheduledCapture(){
                 captureTestPulseState=clusterCapturePulsePrepare(reason)?"prepared":reason;
             }
         }
-        return;
+        // Spin target: the deadline, or the sensor release with frame sync.
+        const int64_t spinLeftUs=captureSpinTargetUs-nowMonoUs;
+        if(!clusterCaptureArmedFlag||spinLeftUs>CLUSTER_CAPTURE_SPIN_US)return;
+        // Spin to the exact monotonic target (≤ 3 ms). WiFi/ESP-NOW run on
+        // the other core; the loop task's 1 ms tick no longer delays the shot.
+        captureLastSpinUs=spinLeftUs>0?spinLeftUs:0;
+        // Drop old frames now, not at the target (each return ~0.5 ms).
+        clusterCapturePreDrain();
+        while(esp_timer_get_time()<captureSpinTargetUs){}
+    } else {
+        captureLastSpinUs=0;   // deadline already passed: the spin window was missed
+        if(!captureFrameSync)captureSpinTargetUs=pendingCapture.deadlineMonoUs;
     }
+    captureLastLateUs=esp_timer_get_time()-captureSpinTargetUs;
     PendingCapture p=pendingCapture;pendingCapture.active=false;
     uint32_t bytes=0;int64_t dispatch=0;
     uint16_t rc=clusterCapturePhoto(((uint64_t)p.cb<<32)|p.seq,p.utc,dispatch,bytes,
                                     p.anchorUtcUs,p.anchorMonoUs,
-                                    p.testPulse&&clusterCapturePulsePrepared());
+                                    p.testPulse&&clusterCapturePulsePrepared(),
+                                    captureFrameSync?p.deadlineMonoUs-captureSyncPeriodUs/2:0);
     if(p.testPulse&&!clusterCapturePulsePrepared()&&!strcmp(captureTestPulseState,"requested"))
         captureTestPulseState="not_prepared";  // arming step was never reached
     releaseCaptureTestPulse(clusterCapturePulseEmitted()?"emitted":"not_emitted");
     captureLastDispatchOffsetUs=dispatch?dispatch-p.utc:0;
+    {
+        const ClusterCaptureShotTiming t=clusterCaptureLastShotTiming();
+        captureLastDrainUs=t.drainEndUs-t.drainStartUs;
+        captureLastDrained=t.drained;
+        captureLastDispatchAfterDeadlineUs=t.dispatchMonoUs?t.dispatchMonoUs-p.deadlineMonoUs:0;
+        captureLastLateDrained=t.lateDrained;
+        captureLastFrameSync=captureFrameSync;
+        captureLastFramesSkipped=t.framesSkipped;
+        captureLastPeriodUs=captureFrameSync?captureSyncPeriodUs:0;
+        captureLastReleaseLeadUs=captureFrameSync&&t.releaseStartUs?p.deadlineMonoUs-t.releaseStartUs:0;
+        captureLastFrameStartRelUs=t.frameTimestampUs?t.frameTimestampUs-p.deadlineMonoUs:0;
+        if(captureFrameSync&&t.frameTimestampUs&&t.releaseStartUs&&captureSyncPeriodUs>0){
+            // Learn the lead from shots that got the second frame after the
+            // release (a dropped frame makes it one period later: ignored).
+            const int64_t rel=t.frameTimestampUs-t.releaseStartUs;
+            const int64_t off=rel-captureSyncPeriodUs;
+            if(off>0&&off<6000){
+                captureReleaseToFrameUs=off;
+                captureLearnedLeadUs=captureLearnedLeadUs?(3*captureLearnedLeadUs+rel)/4:rel;
+            }
+        }
+        captureFrameSync=false;
+        // How long the capturing fb_get waited for the next frame, and the
+        // driver's frame timestamp relative to the dispatch (same clock if
+        // the driver stamps with esp_timer): the sensor's frame phase.
+        captureLastFrameWaitUs=t.frameReturnedUs&&t.dispatchMonoUs?t.frameReturnedUs-t.dispatchMonoUs:0;
+        captureLastFrameTsMinusDispatchUs=t.frameTimestampUs&&t.dispatchMonoUs?t.frameTimestampUs-t.dispatchMonoUs:0;
+    }
     captureLastSize=bytes;captureLastError=rc;
     clusterCaptureArmedFlag=false;
     char mediaUuid[37]={};int64_t actualDispatch=0;
@@ -3749,6 +3869,9 @@ static void processJobSharp(char **f, size_t n, const IPAddress &ip)
     } else {
         const uint32_t until = millis() + seconds * 1000UL;
         sharpUntilMs = until ? until : 1;
+        // Frame period for frame-clock sync; kept fresh while armed
+        // (clusterCaptureTrackFramePeriod in clusterLoop).
+        clusterCaptureMeasureFramePeriod();
     }
     char own[9];
     snprintf(own, sizeof(own), "%08lx", (unsigned long)bootNonce);
@@ -3756,7 +3879,10 @@ static void processJobSharp(char **f, size_t n, const IPAddress &ip)
         currentCoordinatorId + "|" + f[3] + "|" + f[4] + "|" + deviceIntegrationId() + "|" + own + "|" +
         f[7] + "|" + String((unsigned)code) + "|" +
         String((unsigned long)(clusterSharpActive() ? (sharpUntilMs - millis()) / 1000UL : 0));
-    sendSignedPayloadTo(msg, currentCoordinatorIp, CLUSTER_COORDINATOR_PORT, "sharp result");
+    // All armed nodes answer together: spread the answers by 0-180 ms.
+    deferredSharpAck.active = true;
+    deferredSharpAck.sendAtMs = millis() + (bootNonce % 16U) * 12U;
+    deferredSharpAck.msg = msg;
     Serial.printf("[CLUSTER] sharp %lu s -> code %u\n", (unsigned long)seconds, (unsigned)code);
 }
 
@@ -4733,13 +4859,17 @@ void clusterLoop()
     // Service it BEFORE potentially expensive UDP authentication, peer expiry,
     // heartbeat and clock-maintenance work. Packet handling must never be
     // permitted to push an armed photo past its local deadline.
+    // Armed cameras: keep the frame period fresh for frame-clock sync (one
+    // ready frame per pass, no waiting; the camera is reserved while armed).
+    if (runtimeActive && !pendingCapture.active && clusterSharpActive())
+        clusterCaptureTrackFramePeriod();
     if (runtimeActive && pendingCapture.active) {
         {
             LoopLoadDiag::Scope loadScope(LoopLoadDiag::ClusterCapture);
             serviceScheduledCapture();
         }
         if (pendingCapture.active && clusterCaptureArmedFlag &&
-            pendingCapture.deadlineMonoUs - esp_timer_get_time() <= 50000LL) {
+            captureSpinTargetUs - esp_timer_get_time() <= 50000LL) {
             // Reserve the last 50 ms for the local camera dispatcher.
             // No busy-wait: loopTask yields as usual in sensorforge.ino.
             return;
@@ -4889,6 +5019,7 @@ void clusterLoop()
     // Newly accepted jobs are handled on the next loop iteration. Do not
     // spend additional UDP/clock work before dispatching an armed capture.
     serviceCaptureResultRetry(millis());
+    serviceDeferredAcks(millis());
     LoopLoadDiag::lap(LoopLoadDiag::ClusterTimeRequest, loadMarkUs);
 }
 
@@ -5033,9 +5164,9 @@ bool clusterRequestNodeCapture(const String &nodeId,int64_t utcUs,String &error,
     int64_t nowUtc=0;
     // Nodes accept a job up to 1.5 s before the shot; the quick shot (2 s)
     // reaches the last of many nodes a few ms later, so allow 1.6 s here.
-    // Armed cluster: instant shot (300 ms planned); otherwise 2 s as before.
+    // Armed cluster: instant shot (150 ms planned); otherwise 2 s as before.
     const bool armed=coordSharpUntilMs && (int32_t)(coordSharpUntilMs-millis())>0;
-    const int64_t minLeadUs=armed?250000LL:2000000LL;
+    const int64_t minLeadUs=armed?120000LL:2000000LL;
     if(!clusterTimeNowUs(nowUtc)||utcUs-nowUtc<minLeadUs||utcUs-nowUtc>1800000000LL){
         error=armed?"Sofortaufnahme: Zeitpunkt zu knapp.":"Capture-Zeit muss 2 Sekunden bis 30 Minuten in der Zukunft liegen.";return false;
     }
@@ -6135,6 +6266,20 @@ static String buildClusterStatusJson(ClusterStatusChunkSink sink, void *ctx)
     json += ",\"result_receipts\":"+String((unsigned long)captureResultReceiptReceived);
     json += ",\"result_retry_exhausted\":"+String((unsigned long)captureResultRetryExhausted);
     json += ",\"last_dispatch_offset_us\":"+String((long)captureLastDispatchOffsetUs);
+    json += ",\"last_spin_us\":"+String((long)captureLastSpinUs)+",\"last_late_us\":"+String((long)captureLastLateUs)+
+        ",\"last_drain_us\":"+String((long)captureLastDrainUs)+",\"last_drained\":"+String((unsigned)captureLastDrained)+
+        ",\"last_dispatch_after_deadline_us\":"+String((long)captureLastDispatchAfterDeadlineUs)+
+        ",\"last_late_drained\":"+String((unsigned)captureLastLateDrained)+
+        ",\"last_frame_sync\":"+String(captureLastFrameSync?"true":"false")+
+        ",\"last_sync_state\":\""+String(captureLastSyncState)+"\""+
+        ",\"last_frame_start_rel_us\":"+String((long)captureLastFrameStartRelUs)+
+        ",\"last_frame_period_us\":"+String((long)captureLastPeriodUs)+
+        ",\"last_release_lead_us\":"+String((long)captureLastReleaseLeadUs)+
+        ",\"last_frames_skipped\":"+String((unsigned)captureLastFramesSkipped)+
+        ",\"release_to_frame_us\":"+String((long)captureReleaseToFrameUs)+
+        ",\"learned_lead_us\":"+String((long)captureLearnedLeadUs)+
+        ",\"last_frame_wait_us\":"+String((long)captureLastFrameWaitUs)+
+        ",\"last_frame_ts_minus_dispatch_us\":"+String((long)captureLastFrameTsMinusDispatchUs);
     json += ",\"last_size_bytes\":"+String((unsigned long)captureLastSize);
     json += ",\"last_error\":"+String((unsigned)captureLastError);
     json += ",\"local_frames\":"+clusterCaptureLocalJson();

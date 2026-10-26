@@ -53,38 +53,129 @@ void clusterCaptureBeginJob(uint64_t jobId){
     for(auto &f:slots){if(f.bytes)heap_caps_free(f.bytes);if(f.thumb)heap_caps_free(f.thumb);f=Frame{};}
     count=0;activeJob=jobId;
 }
-uint16_t clusterCapturePhoto(uint64_t jobId,int64_t targetUtcUs,int64_t &dispatchUtcUs,uint32_t &bytes,int64_t anchorUtcUs,int64_t anchorMonoUs,bool testPulse) {
+static ClusterCaptureShotTiming lastShot={};
+ClusterCaptureShotTiming clusterCaptureLastShotTiming(){return lastShot;}
+static inline int64_t frameTsUs(const camera_fb_t *fb){
+    return (int64_t)fb->timestamp.tv_sec*1000000LL+fb->timestamp.tv_usec;
+}
+static int64_t framePeriodUs=0, framePeriodAtUs=0;
+static int64_t trackPrevTsUs=0;
+static int64_t trackSamples[4]={};
+static uint8_t trackCount=0;
+// Spacings shorter than 10 ms or longer than 250 ms are not a frame period.
+static void notePeriodSample(int64_t d){
+    if(d<10000||d>250000)return;
+    trackSamples[trackCount++]=d;
+    if(trackCount<4)return;
+    trackCount=0;
+    // Mean of the 4 spacings near the shortest one: a missed frame doubles a
+    // spacing and is left out; the timestamp jitter averages out.
+    int64_t mn=trackSamples[0];
+    for(uint8_t i=1;i<4;++i)if(trackSamples[i]<mn)mn=trackSamples[i];
+    int64_t sum=0;uint8_t n=0;
+    for(uint8_t i=0;i<4;++i)if(trackSamples[i]<mn+mn/4){sum+=trackSamples[i];++n;}
+    framePeriodUs=sum/n;framePeriodAtUs=esp_timer_get_time();
+}
+int64_t clusterCaptureFramePeriodUs(int64_t *ageUs){
+    if(ageUs)*ageUs=framePeriodUs?esp_timer_get_time()-framePeriodAtUs:0;
+    return framePeriodUs;
+}
+bool clusterCaptureMeasureFramePeriod(){
+    if(!cameraInitialized||!esp_camera_sensor_get()||!cameraWakeForUse())return false;
+    for(uint8_t i=0;i<4 && esp_camera_available_frames();++i){
+        camera_fb_t *old=esp_camera_fb_get();
+        if(!old)break;
+        esp_camera_fb_return(old);
+    }
+    trackPrevTsUs=0;trackCount=0;
+    const int64_t before=framePeriodAtUs;
+    for(uint8_t i=0;i<5;++i){
+        camera_fb_t *fb=esp_camera_fb_get();
+        if(!fb)return false;
+        const int64_t ts=frameTsUs(fb);
+        esp_camera_fb_return(fb);
+        if(trackPrevTsUs)notePeriodSample(ts-trackPrevTsUs);
+        trackPrevTsUs=ts;
+    }
+    return framePeriodAtUs!=before;
+}
+void clusterCaptureTrackFramePeriod(){
+    if(!cameraInitialized||cameraFrameSyncHeld()||cameraIdleStandbyActive()||
+       !esp_camera_sensor_get()||!esp_camera_available_frames())return;
+    camera_fb_t *fb=esp_camera_fb_get();
+    if(!fb)return;
+    const int64_t ts=frameTsUs(fb);
+    esp_camera_fb_return(fb);
+    if(trackPrevTsUs)notePeriodSample(ts-trackPrevTsUs);
+    trackPrevTsUs=ts;
+}
+void clusterCapturePreDrain(){
+    lastShot={};
+    if(!cameraInitialized||!esp_camera_sensor_get())return;
+    // A sensor held for frame-clock sync stays held (released at dispatch);
+    // drained here are frames (or truncated ones) from before the hold.
+    if(!cameraFrameSyncHeld())cameraWakeForUse();
+    lastShot.drainStartUs=esp_timer_get_time();
+    for(uint8_t i=0;i<4 && esp_camera_available_frames();++i){
+        camera_fb_t *old=esp_camera_fb_get();
+        if(!old)break;
+        esp_camera_fb_return(old);
+        ++lastShot.drained;
+    }
+    lastShot.drainEndUs=esp_timer_get_time();
+}
+uint16_t clusterCapturePhoto(uint64_t jobId,int64_t targetUtcUs,int64_t &dispatchUtcUs,uint32_t &bytes,int64_t anchorUtcUs,int64_t anchorMonoUs,bool testPulse,int64_t frameNotBeforeMonoUs) {
     bytes=0;dispatchUtcUs=0;
     if(jobId!=activeJob)return 5;
     if(count>=kMaxFrames)return 6; // Job full: NEVER overwrite earlier synchronized images.
     if (!cameraInitialized || !esp_camera_sensor_get() || recording || recorderIsOpen() ||
         (streamerModeEnabled() && !droneModeEnabled()) || streamerReady() || syncApiExclusiveActive()) return 1;
     if(!psramFound())return 2;
-    // Normally woken 2 s ahead (clusterCapturePrepareCamera); no-op then.
-    if(!cameraWakeForUse())return 1;
-    // CAMERA_GRAB_WHEN_EMPTY can leave up to two completed, older frames
-    // queued after an idle period. Hold all configured buffers simultaneously
-    // before returning any: the subsequent get must wait for a new frame.
-    camera_fb_t *stale[2]={nullptr,nullptr};
+    // Normally woken 2 s ahead (clusterCapturePrepareCamera); a sensor held for
+    // frame-clock sync is released only at the dispatch below.
+    const bool frameSync=cameraFrameSyncHeld();
+    if(!frameSync && !cameraWakeForUse())return 1;
+    // CAMERA_GRAB_WHEN_EMPTY can leave completed, older frames queued. Drop
+    // exactly those that are already complete - without waiting (the old
+    // "hold every buffer" flush could block on a frame and made the dispatch
+    // moment vary by up to ~1 ms). The get below then waits for a new frame.
     uint8_t n=clusterCaptureFrameBufferCount();
     if(n<1 || n>2)return 3; // Current camera setup uses one or two buffers.
-    for(uint8_t i=0;i<n;++i){
-        stale[i]=esp_camera_fb_get();
-        if(!stale[i]){
-            for(uint8_t j=0;j<i;++j)esp_camera_fb_return(stale[j]);
-            return 3;
-        }
+    // Old frames were dropped before the deadline (clusterCapturePreDrain); a
+    // frame that completed during the final approach is dropped here.
+    for(uint8_t i=0;i<4 && esp_camera_available_frames();++i){
+        camera_fb_t *old=esp_camera_fb_get();
+        if(!old)break;
+        esp_camera_fb_return(old);
+        ++lastShot.lateDrained;
     }
-    for(uint8_t i=0;i<n;++i)esp_camera_fb_return(stale[i]);
     // Optional test pulse (SFJC1 "tp1"): rising edge = start of the capturing
     // fb_get, i.e. the same instant as the dispatch timestamp below. Pin was
     // configured at arming; this is one IRAM register write (no measurable delay).
     if(testPulse)clusterCapturePulseRise();
+    // Frame-clock sync: restart the sensor now (one frame period before the
+    // deadline). Its first frame started with the release and is under-
+    // exposed; the shot is the first frame starting at/after
+    // frameNotBeforeMonoUs, on the same frame grid on every node.
+    lastShot.releaseStartUs=esp_timer_get_time();
+    if(frameSync && !cameraFrameSyncRelease()){if(testPulse)clusterCapturePulseFall();return 3;}
     // Software dispatch, NOT sensor exposure-start timestamp.
-    dispatchUtcUs=anchorUtcUs+(esp_timer_get_time()-anchorMonoUs);
+    lastShot.dispatchMonoUs=esp_timer_get_time();
+    dispatchUtcUs=anchorUtcUs+(lastShot.dispatchMonoUs-anchorMonoUs);
     camera_fb_t *fb=esp_camera_fb_get();
     if(testPulse)clusterCapturePulseFall();
+    while(fb && frameSync && frameNotBeforeMonoUs && frameTsUs(fb)<frameNotBeforeMonoUs &&
+          lastShot.framesSkipped<4){
+        esp_camera_fb_return(fb);
+        ++lastShot.framesSkipped;
+        fb=esp_camera_fb_get();
+    }
     if(!fb)return 3;
+    lastShot.frameReturnedUs=esp_timer_get_time();
+    lastShot.frameTimestampUs=frameTsUs(fb);
+    // With frame-clock sync the frame start is the meaningful shot time.
+    if(frameSync && frameNotBeforeMonoUs)
+        dispatchUtcUs=anchorUtcUs+(lastShot.frameTimestampUs-anchorMonoUs);
     if(fb->format!=PIXFORMAT_JPEG||!fb->buf||!fb->len){esp_camera_fb_return(fb);return 3;}
     void *copy=heap_caps_malloc(fb->len,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
     if(!copy){esp_camera_fb_return(fb);return 6;} // Capacity exhausted; do not evict.

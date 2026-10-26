@@ -93,7 +93,7 @@ tr.fw-row-active td{background:#fff7e6}tr.fw-row-fail td{background:#fee2e2}
 </style><script>(function(){
 var url=document.getElementById('fwUrl'),older=document.getElementById('fwOlder'),msg=document.getElementById('fwMsg'),rows=document.getElementById('fwRows'),man=document.getElementById('fwManifest'),timer=null,urlSet=false;
 var prog=document.getElementById('fwProg'),progText=document.getElementById('fwProgText'),progBar=document.getElementById('fwProgBar');
-var loc=document.getElementById('fwLocalBox'),locText=document.getElementById('fwLocalText'),localWatch=null;
+var loc=document.getElementById('fwLocalBox'),locText=document.getElementById('fwLocalText');
 // state -> [label, css, step 0..4]
 var ST={pending:['wartet','fw-idle',0],sent:['Auftrag gesendet','fw-active',1],updating:['lädt und prüft …','fw-active',2],restarting:['startet neu …','fw-active',3],done:['✓ aktualisiert','fw-ok',4],skipped:['aktuell – übersprungen','fw-idle',4],failed:['✗ kurz stromlos machen','fw-fail',4],stopped:['angehalten','fw-idle',0]};
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
@@ -118,23 +118,28 @@ function render(d){if(!urlSet&&d.url){url.value=d.url;urlSet=true;}
   var cls=s&&s[1]==='fw-active'?'fw-row-active':(n.state==='failed'?'fw-row-fail':'');
   return '<tr class="'+cls+'"><td><strong>'+esc(n.hostname)+'</strong>'+(n.online?'':' <span class="muted">offline</span>')+'</td><td>'+esc(n.release)+(n.version&&n.version!==n.release?' → '+esc(n.version):'')+'</td><td>'+badge+'</td><td class="muted">'+esc(n.text||'')+'</td></tr>';}).join('');
  clearTimeout(timer);timer=setTimeout(load,(d.running||d.local_busy)?1500:8000);}
-function load(){fetch('/cluster_firmware_status',{cache:'no-store',credentials:'same-origin'}).then(function(r){return r.json();}).then(render).catch(function(e){if(!localWatch)say('Status nicht abrufbar: '+(e.message||e),true);clearTimeout(timer);timer=setTimeout(load,4000);});}
+function load(){if(localActive){clearTimeout(timer);timer=setTimeout(load,4000);return;}
+ fetch('/cluster_firmware_status',{cache:'no-store',credentials:'same-origin'}).then(function(r){return r.json();}).then(render).catch(function(e){if(!localActive)say('Status nicht abrufbar: '+(e.message||e),true);clearTimeout(timer);timer=setTimeout(load,4000);});}
 function act(a,confirmText){if(confirmText&&!confirm(confirmText))return;say('Wird gesendet …');post({action:a,url:url.value.trim(),allow_older:older.checked?'1':'0'}).then(function(j){say((j.ok?'✓ ':'✗ ')+j.message,!j.ok);load();});}
-// Coordinator update: follow it until it is back (it restarts and the page
-// loses the connection for a while).
-function watchLocal(before){var t0=Date.now(),seenDown=false;loc.hidden=false;
- function step(){var sec=Math.round((Date.now()-t0)/1000);
-  fetch('/cluster_firmware_status',{cache:'no-store',credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
-   var me=(d.devices||[]).find(function(n){return n.local;})||{};
-   if(me.release&&me.release!==before){locText.textContent='✓ Coordinator läuft wieder – jetzt '+me.release+' (nach '+sec+' s). Seite wird neu geladen …';loc.querySelector('.fw-bar').hidden=true;localWatch=null;render(d);setTimeout(function(){location.reload();},3000);return;}
-   if(d.local_busy){locText.textContent='Coordinator lädt und prüft die Firmware … ('+sec+' s)';}
-   else if(d.local_result&&d.local_result.code_name!=='selected'&&!seenDown){locText.textContent='✗ Coordinator-Update: '+d.local_result.code_name+(d.local_result.text?' – '+d.local_result.text:'');loc.querySelector('.fw-bar').hidden=true;localWatch=null;return;}
-   else locText.textContent=seenDown?'Coordinator ist zurück, Version wird geprüft … ('+sec+' s)':'Coordinator bereitet das Update vor … ('+sec+' s)';
-   localWatch=setTimeout(step,1500);
-  }).catch(function(){seenDown=true;locText.textContent='Coordinator startet neu … ('+sec+' s) – die Seite verbindet sich danach von selbst wieder.';
-   if(sec>240){locText.textContent='✗ Coordinator nach 4 min nicht zurück – kurz stromlos machen.';loc.querySelector('.fw-bar').hidden=true;localWatch=null;return;}
-   localWatch=setTimeout(step,2000);});}
- loc.querySelector('.fw-bar').hidden=false;step();}
+// Coordinator update: follow it until it is back. While it downloads,
+// verifies and restarts it does not answer at all (its loop is busy), so the
+// text runs on its own clock and failed requests are expected, not errors.
+var localActive=false;
+function watchLocal(before){var t0=Date.now(),phase='Coordinator bereitet das Update vor',done=false;loc.hidden=false;localActive=true;
+ var bar=loc.querySelector('.fw-bar');bar.hidden=false;
+ function show(){if(done)return;var sec=Math.round((Date.now()-t0)/1000);locText.textContent=phase+' … ('+sec+' s)';
+  if(sec>240){done=true;localActive=false;bar.hidden=true;locText.textContent='✗ Coordinator nach 4 min nicht zurück – kurz stromlos machen.';}}
+ var tick=setInterval(function(){if(done){clearInterval(tick);return;}show();},1000);
+ function finish(text){done=true;localActive=false;bar.hidden=true;locText.textContent=text;clearInterval(tick);}
+ function step(){if(done)return;var ctrl=new AbortController(),to=setTimeout(function(){ctrl.abort();},4000);
+  fetch('/cluster_firmware_status',{cache:'no-store',credentials:'same-origin',signal:ctrl.signal}).then(function(r){return r.json();}).then(function(d){
+   clearTimeout(to);var me=(d.devices||[]).find(function(n){return n.local;})||{},sec=Math.round((Date.now()-t0)/1000);
+   if(me.release&&me.release!==before){finish('✓ Coordinator läuft wieder – jetzt '+me.release+' (nach '+sec+' s). Seite wird neu geladen …');render(d);setTimeout(function(){location.reload();},3000);return;}
+   if(d.local_result&&d.local_result.code_name!=='selected'&&!d.local_busy){finish('✗ Coordinator-Update: '+d.local_result.code_name+(d.local_result.text?' – '+d.local_result.text:''));return;}
+   phase=d.local_busy?'Coordinator lädt und prüft die Firmware':'Coordinator bereitet das Update vor';show();setTimeout(step,1500);
+  }).catch(function(){clearTimeout(to);
+   phase='Coordinator lädt, prüft und startet neu – er antwortet währenddessen nicht, die Seite verbindet sich danach von selbst';show();setTimeout(step,2000);});}
+ show();step();}
 document.getElementById('fwCheck').addEventListener('click',function(){say('Manifest wird geladen …');man.innerHTML='';
  post({action:'check',url:url.value.trim()}).then(function(j){say((j.ok?'✓ ':'✗ ')+j.message,!j.ok);
   if(j.releases&&j.releases.length)man.innerHTML='<p><strong>Im Manifest:</strong> '+j.releases.map(function(r){return esc(r.board)+' '+esc(r.version)+' ('+Math.round(r.size/1024)+' KB)';}).join(' · ')+'</p>';});});

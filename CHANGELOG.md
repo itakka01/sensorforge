@@ -1,3 +1,63 @@
+## v87-beta172 — 2026-10-26 (BILDTAKT-SYNC: FREIGABE EINE BILDPERIODE VOR DEM TERMIN)
+
+beta171 lieferte das erste Bild nach der Freigabe – zu kurz belichtet (diymore ~60 % Helligkeit, c002 schwarz); XIAO/Freenove lieferten teils erst das 2./3. Bild.
+
+- Jeder Node misst die Bildperiode seines Sensors aus den Zeitstempeln des Treibers (Minimum von 4 Abständen): geplante Aufnahme beim Vorbereiten (≤ 2 s vorher, wenn älter als 3 s), scharf geschaltete Kameras beim Scharfschalten und danach laufend ohne Warten (`clusterCaptureTrackFramePeriod`).
+- Der Sensor wird **eine Bildperiode plus Freigabezeit vor dem Termin** freigegeben; genommen wird das erste Bild, dessen Anfang nicht früher als eine halbe Periode vor dem Termin liegt (Auswahl nach Zeitstempel, verworfene Bilder in `last_frames_skipped`). Die Freigabezeit (SCCB + Sensor-Neustart, ~1,6–2,0 ms) lernt jeder Node aus der letzten Aufnahme.
+- Gemeldete Aufnahmezeit (`dispatch_utc_us`) ist mit Bildtakt-Sync der Bildanfang laut Treiber.
+- Ohne frische Periode oder bei zu wenig Zeit bleibt der freie Bildtakt (`last_sync_state`: ok / no_period / too_late / no_hold).
+- Diagnose: `last_frame_start_rel_us` (Bildanfang relativ zum Termin), `last_frame_period_us`, `last_release_lead_us`, `release_to_frame_us`, `learned_lead_us`.
+- **beta173:** Vorlauf Freigabe→Bild wird je Node über die Aufnahmen gemittelt gelernt (`learned_lead_us`, gleitend 3:1), Periode = Mittel der 4 Abstände ohne übersprungene Bilder (erste Version: Minimum und letzter Einzelwert → ±0,5 ms Schwingen).
+
+Messung beta173 (18:53–19:02, 8 Nodes mit beta173 – OV5640/OV3660/Freenove gemischt): nach der ersten (lernenden) Aufnahme liegt der Bildanfang aller Kameras **11–171 µs nach dem Termin, Streuung 63–105 µs** (beta170: bis ~50 ms); Helligkeit normal (diymore ~115–125 statt ~20 in beta171), kein schwarzes Bild. Offen: devxiao3 liefert in ~3 von 10 Aufnahmen ein Bild eine Periode später (+36 ms, vermutlich vom Treiber verworfenes Bild); geplante Aufnahmen in den ersten ~2–3 min nach Coordinator-Neustart abgelehnt (Zeitsignal noch nicht bereit).
+
+## v87-beta171 — 2026-10-26 (BILDTAKT-SYNCHRONISATION DER SENSOREN, EXPERIMENTELL)
+
+Ergebnis beta170 (15:30–15:40): Auslösung µs-genau (43–62 µs nach dem Termin, ~20 µs Streuung zwischen Nodes). Dafür sichtbar: das aufgenommene Bild beginnt je Kamera 0–69 ms nach dem Auslösen (freier Bildtakt des Sensors, OV5640 ~52 ms, OV3660 ~36 ms), Wartezeit auf das Bild 38–141 ms.
+
+- **Bildtakt-Synchronisation:** Beim Scharfmachen eines Aufnahme-Auftrags (≤ 2 s vorher, bei Sofortaufnahme beim Empfang) wird der Sensor in den Software-Power-Down gehalten (`cameraFrameSyncHold`, OV3660/OV5640); exakt zum Termin gibt jeder Node ihn frei (`cameraFrameSyncRelease`, ein SCCB-Schreibzugriff) und nimmt das erste Bild danach. Damit startet der Bildtakt aller Sensoren im selben Moment. Sensoren ohne Power-Down (OV2640) unverändert.
+- Diagnose: `last_frame_sync` je Node.
+
+Messung 17:17–17:24 (9 Nodes, 3 geplante + 7 Sofortaufnahmen, alle erfolgreich): Bildanfang aller diymore-Kameras 1606–1631 µs nach dem Termin (Streuung ~25 µs, vorher bis ~50 ms); XIAO/Freenove auf demselben Raster, liefern aber oft erst das 2./3. Bild (+36/+73 ms). Freigabe kostet konstant ~1,2 ms (SCCB). **Offen:** das erste Bild nach der Freigabe ist teils deutlich dunkler, auf c002 schwarz (Belichtung beginnt erst mit der Freigabe).
+
+## v87-beta170 — 2026-10-26 (ALTE BILDER VOR DEM TERMIN VERWERFEN)
+
+Diagnose beta169 (15:05–15:10): aktive Warteschleife wirkt (Eintritt 2,0–2,9 ms vor dem Termin, danach 0–1 µs Verspätung); das Verwerfen der 2 alten Bilder nach dem Termin dauerte 1,0–1,45 ms (~0,5–0,7 ms je zurückgegebenem Puffer) – genau der Versatz und die Streuung.
+
+- Alte Bilder werden jetzt zu Beginn der Warteschleife verworfen (`clusterCapturePreDrain`), zum Termin wird nur noch das aufnehmende `fb_get` gestartet. Ein Bild, das in den letzten ~2 ms fertig wurde, wird zum Termin noch verworfen (`last_late_drained`).
+- Diagnose zusätzlich: `last_frame_wait_us` (Wartezeit des aufnehmenden `fb_get` auf das nächste Bild) und `last_frame_ts_minus_dispatch_us` (Zeitstempel des Bildes relativ zum Auslösen) – zeigt die Phase des Sensor-Bildtakts.
+
+## v87-beta169 — 2026-10-26 (DIAGNOSE DER AUSLÖSEZEIT)
+
+Ergebnis beta168 (14:42–14:48): unverändert ~1,1–1,4 ms Versatz nach dem Termin, Streuung 224–362 µs; alles andere einwandfrei (geplant 3× 8/8, sofort 8/8, Bestätigungen vollständig, Reserve 110–141 ms).
+
+- Node-Diagnose in `capture_diagnostics`: `last_spin_us` (Restzeit beim Eintritt in die aktive Warteschleife; 0 = Fenster verpasst), `last_late_us` (Verspätung nach der Schleife), `last_drain_us`/`last_drained` (Verwerfen alter Bilder), `last_dispatch_after_deadline_us` (Termin → aufnehmendes `fb_get`).
+
+## v87-beta168 — 2026-10-26 (AUSLÖSETERMIN OHNE VERSATZ)
+
+Ergebnis beta167 (14:18–14:28): Scharf-Bestätigungen und Reserven jetzt von allen 8 Nodes; geplant 3× 8/8, sofort 10× 8/8; Reserve 103–142 ms bei 150 ms Vorlauf; Streuung weiter 265–423 µs, alle Nodes lösten konstant 1,0–1,5 ms nach dem Termin aus.
+
+- **Ursache des Versatzes:** Beim Annehmen eines Aufnahme-Auftrags wurde die Clusterzeit gelesen, dann `pauseForCapture()` ausgeführt (je nach laufender Funkmessung unterschiedlich lang, ~1 ms) und erst danach die monotone Uhr für die eingefrorene Deadline. Die Zeit dazwischen verschob jeden Node individuell. Jetzt werden Clusterzeit und monotone Uhr unmittelbar nacheinander gelesen (`processJobCapture`).
+
+## v87-beta167 — 2026-10-26 (AUSLÖSEN OHNE WARTEN AUF PUFFER, ANZEIGE-FIX)
+
+Ergebnis beta166 (26.10. 13:57–14:09): Streuung der Auslösezeitpunkte geplant 350–769 µs (vorher 668–1161), sofort 262–440 µs (vorher 565–1019); Reserve bei 150 ms Vorlauf 124–139 ms; alle scharfen Nodes erfolgreich.
+
+- **Auslösen:** Nach dem Termin wurden bisher alle Kamerapuffer „festgehalten“ (konnte auf ein Bild warten, Dispatch bis ~1 ms später und je Node verschieden). Jetzt werden nur bereits fertige, alte Bilder ohne Warten verworfen (`esp_camera_available_frames`), danach sofort das aufnehmende `fb_get`.
+- **Fix Anzeige Reserve/Scharf:** Der Coordinator baut den Datensatz eines Nodes bei jedem Lebenszeichen neu auf und übernimmt nur ausgewählte Felder – Reserve und Scharf-Bestätigung gingen dabei nach Sekunden verloren (sah aus wie verlorene Antworten). Jetzt werden sie übernommen.
+
+## v87-beta166 — 2026-10-26 (PRÄZISERES AUSLÖSEN, SOFORTAUFNAHME 150 MS)
+
+Auswertung des Autotests (beta164, 26.10. 12:59–13:10): geplante Aufnahmen aus dem Standby 3× 9/9 erfolgreich; Sofortaufnahme 10× 8/8 scharfe Nodes erfolgreich (c004 noch beta160 lehnte korrekt ab); Reserve bei 300 ms Vorlauf min 265 / Median 279 / max 289 ms; Streuung der Auslösezeitpunkte zwischen Nodes 0,6–1,2 ms (geplant und sofort gleich); Scharf-Bestätigungen nur von 2 der 8 Nodes sichtbar.
+
+- **Präziseres Auslösen:** Die Streuung kam von der 1-ms-Taktung der Hauptschleife im scharfen Zustand (`delay(1)`). In den letzten 3 ms vor dem Termin wartet der Node jetzt aktiv auf die monotone Deadline (`CLUSTER_CAPTURE_SPIN_US`), danach wie bisher Puffer leeren und `fb_get`. Gilt für geplante und Sofortaufnahmen.
+- **Sofortaufnahme-Vorlauf 300 → 150 ms** (Coordinator erlaubt im scharfen Zustand ab 120 ms, Nodes nehmen ab 60 ms an).
+- **Gestaffelte Antworten:** Annahme-Bestätigung (mit Reserve) 0–28 ms und Scharf-Bestätigung 0–180 ms je Node versetzt (aus der Boot-Kennung), damit die UDP-Empfangswarteschlange des Coordinators nicht überläuft.
+
+## v87-beta165 — 2026-10-26 (ANZEIGE COORDINATOR-UPDATE)
+
+- „Coordinator aktualisieren“: Der Coordinator beantwortet während Download, Prüfung und Neustart keine Anfragen (seine Hauptschleife ist belegt). Die Anzeige zählt jetzt sekündlich selbst weiter, Abfragen haben eine Frist von 4 s, und der Text lautet in dieser Zeit „Coordinator lädt, prüft und startet neu – er antwortet währenddessen nicht …“. Die Fehlermeldung „Status nicht abrufbar: Failed to fetch“ erscheint während des Updates nicht mehr.
+
 ## v87-beta164 — 2026-10-26 (FIRMWARE-SEITE NACH COORDINATOR-NEUSTART)
 
 - „Firmware im Cluster“: Nach einem Neustart des Coordinators ist der CSRF-Schlüssel der offenen Seite ungültig (Knöpfe meldeten „HTTP 403“). Die Seite erkennt das jetzt und lädt sich mit Hinweis selbst neu; nach einem erfolgreichen „Coordinator aktualisieren“ lädt sie sich ebenfalls von selbst neu.

@@ -3,7 +3,27 @@
 // New accepted job clears ring. No rollover: full ring means stop creating frames.
 void clusterCaptureBeginJob(uint64_t jobId);
 // testPulse: drive the prepared GPIO test pulse around the capturing fb_get().
-uint16_t clusterCapturePhoto(uint64_t jobId,int64_t targetUtcUs,int64_t &dispatchUtcUs,uint32_t &bytes,int64_t anchorUtcUs,int64_t anchorMonoUs,bool testPulse=false);
+// Timing of the last shot for diagnostics (µs, monotonic): drain of old
+// frames and the moment the capturing fb_get started.
+struct ClusterCaptureShotTiming{int64_t drainStartUs;int64_t drainEndUs;uint8_t drained;uint8_t lateDrained;
+    int64_t releaseStartUs;int64_t dispatchMonoUs;int64_t frameReturnedUs;int64_t frameTimestampUs;
+    uint8_t framesSkipped;};
+// Sensor frame period (driver frame timestamps, min of consecutive spacings).
+// Measure: blocking, ~5 frame periods (camera awake, loopTask). Track:
+// non-blocking, one ready frame per call (while the cameras are armed).
+// Period: 0 = unknown; ageUs = time since the last measurement.
+bool clusterCaptureMeasureFramePeriod();
+void clusterCaptureTrackFramePeriod();
+int64_t clusterCaptureFramePeriodUs(int64_t *ageUs=nullptr);
+// Drops already completed (old) frames without waiting. Called at the start of
+// the final approach (~2-3 ms before the deadline): returning a buffer to the
+// driver takes ~0.5 ms, too slow for the moment of the shot itself.
+void clusterCapturePreDrain();
+ClusterCaptureShotTiming clusterCaptureLastShotTiming();
+// frameNotBeforeMonoUs (frame-clock sync): frames whose driver timestamp is
+// earlier are dropped; the first later frame is the shot and dispatchUtcUs is
+// its frame start. 0 = take the next frame (dispatch = software dispatch).
+uint16_t clusterCapturePhoto(uint64_t jobId,int64_t targetUtcUs,int64_t &dispatchUtcUs,uint32_t &bytes,int64_t anchorUtcUs,int64_t anchorMonoUs,bool testPulse=false,int64_t frameNotBeforeMonoUs=0);
 bool clusterCaptureLatestMedia(uint64_t jobId,char uuid[37],int64_t &dispatchUtcUs);
 bool clusterCaptureGetJpeg(const String &uuid,const uint8_t *&bytes,size_t &length);
 // Downscaled copy (~1/8) of a capture result, made on first request; the

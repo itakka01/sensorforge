@@ -20,3 +20,14 @@ void cameraIdleStandbyService();
 
 // True while the camera is in idle standby (not the light-sleep standby).
 bool cameraIdleStandbyActive();
+
+// Frame-clock sync for cluster shots: the sensor's frame timing is free
+// running, so "the next frame" after a µs-exact trigger starts anywhere within
+// one frame period (OV5640 ~52 ms). Holding the sensor in software power down
+// until the deadline and releasing it there restarts every sensor's frame
+// clock at the same moment; the first frame after the release is captured.
+// Hold: true when the sensor is (now) held (OV3660/OV5640 only).
+bool cameraFrameSyncHold();
+// Release at the deadline (one SCCB write); true when it was held and is running.
+bool cameraFrameSyncRelease();
+bool cameraFrameSyncHeld();

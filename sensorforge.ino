@@ -154,6 +154,9 @@ static int cameraWbKelvinApplied = 0;
 // software power down was entered by the idle service.
 static uint32_t cameraLastUseMs = 0;
 static bool cameraIdleStandby = false;
+// Frame-clock sync (camera_power.h). Not the idle standby: the idle service
+// never touches a held sensor (capture protection is active meanwhile).
+static bool cameraFrameSyncHolding = false;
 static bool cameraFastSleepCapabilityKnown = false;
 static bool cameraFastSleepSupported = false;
 static uint16_t cameraDetectedPid = 0;
@@ -6350,6 +6353,7 @@ static void cameraDeinitRuntime()
     cameraSoftPowerDownActive = false;
     cameraWbKelvinApplied = 0;
     cameraIdleStandby = false;
+    cameraFrameSyncHolding = false;
     cameraCropAppliedZoomX10 = 10;
     cameraCropAppliedX = -1;
     cameraCropAppliedY = -1;
@@ -8494,6 +8498,32 @@ bool cameraWakeForUse()
     if (ok)
         Serial.println("[CAMERA] standby ended (camera in use)");
     return ok;
+}
+
+
+bool cameraFrameSyncHold()
+{
+    if (!cameraInitialized)
+        return false;
+    cameraIdleStandby = false;
+    if (!cameraEnterSoftPowerDown())
+        return false;
+    cameraFrameSyncHolding = true;
+    return true;
+}
+
+bool cameraFrameSyncRelease()
+{
+    if (!cameraFrameSyncHolding)
+        return false;
+    cameraFrameSyncHolding = false;
+    cameraLastUseMs = millis();
+    return cameraExitSoftPowerDown();
+}
+
+bool cameraFrameSyncHeld()
+{
+    return cameraFrameSyncHolding && cameraSoftPowerDownActive;
 }
 
 
