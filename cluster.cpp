@@ -1,4 +1,5 @@
 #include "cluster.h"
+#include "cluster_shot_archive.h"
 #include "cluster_espnow_packets.h"
 #include "cluster_espnow_radio.h"
 #include "cluster_jobs.h"
@@ -4845,6 +4846,9 @@ void clusterMdnsAdvertise()
 void clusterLoop()
 {
     ensureClusterTables();
+    // Shot archive on the coordinator SD: job watch only, download in its own task.
+    if (localIsCoordinator)
+        clusterShotArchiveLoop();
     // TX-power probation also runs without cluster runtime (API on a
     // stand-alone device).
     serviceTxProbation();
@@ -5816,6 +5820,8 @@ static String buildClusterStatusJson(ClusterStatusChunkSink sink, void *ctx)
     json += ",\"sharp_remaining_s\":" + String((unsigned long)(localIsCoordinator
         ? clusterCoordinatorSharpRemainingS()
         : (clusterSharpActive() ? (sharpUntilMs - millis()) / 1000UL : 0)));
+    if (localIsCoordinator)
+        json += ",\"shot_archive\":" + clusterShotArchiveStatusJson();
     json += ",\"coordinator_heartbeat_sec\":" +
         String((unsigned long)(CLUSTER_COORDINATOR_HEARTBEAT_MS / 1000UL));
     json += ",\"coordinator_lease_sec\":" +
@@ -6435,6 +6441,50 @@ bool clusterEspNowTimeVerify(const uint8_t *data, size_t len,
     const bool valid = constantTimeEqual(expected, mac, sizeof(expected));
     secureWipe(expected, sizeof(expected));
     return valid;
+}
+
+// Photo fetch by the coordinator (shot archive on its SD card): token = the
+// first 16 bytes of HMAC-SHA256(cluster runtime key, "SFMEDIA1|<uuid>") as
+// hex. Lets a node serve /capture_media to the coordinator while the
+// WebConfig login is on; only cluster members hold the key.
+static bool clusterMediaTokenText(const String &uuid, char out[33])
+{
+    out[0] = '\0';
+    if (!runtimeActive || uuid.length() != 36)
+        return false;
+    const String text = "SFMEDIA1|" + uuid;
+    uint8_t mac[32] = {};
+    if (!computePacketMac(reinterpret_cast<const uint8_t *>(text.c_str()), text.length(), mac))
+        return false;
+    bytesToHex(mac, 16, out);
+    secureWipe(mac, sizeof(mac));
+    return true;
+}
+
+bool clusterMediaTokenValid(const String &uuid, const String &token)
+{
+    char expected[33];
+    if (token.length() != 32 || !clusterMediaTokenText(uuid, expected))
+        return false;
+    const bool valid = constantTimeEqual(reinterpret_cast<const uint8_t *>(expected),
+                                         reinterpret_cast<const uint8_t *>(token.c_str()), 32);
+    secureWipe(expected, sizeof(expected));
+    return valid;
+}
+
+bool clusterCaptureMediaSource(const char *nodeId, const char *uuid, String &url, String &hostname)
+{
+    url = "";
+    hostname = "";
+    const ClusterPeer *peer = runtimeActive && nodeId ? findPeer(nodeId) : nullptr;
+    if (!peer || !peer->used || !usableIp(peer->ip) || !uuid)
+        return false;
+    char token[33];
+    if (!clusterMediaTokenText(String(uuid), token))
+        return false;
+    url = "http://" + peer->ip.toString() + "/capture_media?uuid=" + String(uuid) + "&ct=" + String(token);
+    hostname = peer->hostname[0] ? String(peer->hostname) : String(nodeId);
+    return true;
 }
 
 size_t clusterMountSnapshotCapacity()

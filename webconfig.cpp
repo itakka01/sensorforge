@@ -19036,7 +19036,15 @@ void webConfigStart()
             // ONVIF owns authentication inside its SOAP handlers. Some Device
             // operations are PRE_AUTH by specification, while authenticated
             // clients may use either HTTP Digest or WS-Security UsernameToken.
-            if (cfg_web_auth_enabled && !onvifRequest) {
+            // The coordinator fetches shot photos for its SD archive with a
+            // cluster media token instead of a login (cluster_shot_archive.cpp).
+            const bool clusterMediaRequest =
+                cfg_web_auth_enabled &&
+                requestServer.uri() == "/capture_media" &&
+                requestServer.hasArg("ct") &&
+                clusterMediaTokenValid(requestServer.arg("uuid"), requestServer.arg("ct"));
+
+            if (cfg_web_auth_enabled && !onvifRequest && !clusterMediaRequest) {
                 role = accessControlWebRole(requestServer);
 
                 if (role == SENSORFORGE_ACCESS_NONE) {
@@ -19107,7 +19115,8 @@ void webConfigStart()
         server.on("/capture_media", HTTP_GET, [](){
             // A UUID is an identifier, not authorization. Respect existing WebConfig login.
             // Restrict to administrator even if media viewer accounts are configured.
-            if(cfg_web_auth_enabled && accessControlWebRole(server)!=SENSORFORGE_ACCESS_ADMIN){
+            if(cfg_web_auth_enabled && accessControlWebRole(server)!=SENSORFORGE_ACCESS_ADMIN &&
+               !clusterMediaTokenValid(server.arg("uuid"),server.arg("ct"))){
                 server.send(403,"text/plain","Administrator access required");return;
             }
             const uint8_t *data=nullptr;size_t length=0;

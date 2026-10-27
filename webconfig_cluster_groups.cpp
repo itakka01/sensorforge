@@ -156,7 +156,7 @@ String webconfigClusterGroupsSectionHtml()
 {
     return R"__GROUPS__(<details class='settings-section' id='sfGroups'><summary><strong>Gruppenverwaltung</strong> <span id='sfGroupsSummary' class='muted'></span></summary>
 <p class='muted'>Gruppen entstehen automatisch aus der Gruppe, die Nodes in ihren Montagedaten melden. Ausrichtung und Abstand zum Objekt werden nur hier am Coordinator gespeichert. Gruppen ohne Nodes online bleiben als <em>inaktiv</em> erhalten. Wird eine Gruppe nach längerer Abwesenheit (≥ 10 min) wieder genutzt, gelten ihre alten Werte nur als <em>Vorschlag</em> und müssen bestätigt werden – sie sind keine vermessene Geometrie.</p>
-<div class='cluster-select-tools'><button type='button' id='sfGroupsReload'>Aktualisieren</button> <label><input type='checkbox' id='sfGroupsShowInactive' checked> Inaktive anzeigen</label> <span id='sfGroupsState' class='muted' role='status'></span></div>
+<div class='cluster-select-tools'><button type='button' id='sfGroupsReload'>Aktualisieren</button> <label><input type='checkbox' id='sfGroupsShowInactive' checked style='width:auto;margin:0 4px 0 0;vertical-align:middle'> Inaktive anzeigen</label> <span id='sfGroupsState' class='muted' role='status'></span></div>
 <div class='cluster-table-wrap'><table class='cluster-table' style='min-width:900px'><thead><tr><th>Gruppe</th><th>Status</th><th>Nodes online</th><th>Ausrichtung (°)</th><th>Abstand zum Objekt (mm)</th><th>Aktion</th></tr></thead>
 <tbody id='sfGroupsRows'><tr><td colspan='6' class='muted'>Zum Laden öffnen.</td></tr></tbody></table></div>
 <script>(function(){

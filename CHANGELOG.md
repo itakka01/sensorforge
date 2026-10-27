@@ -1,3 +1,23 @@
+## v88-beta189 — 2026-10-27 (HÄKCHEN AUF DEN CLUSTER-SEITEN)
+
+- Häkchen direkt beim Text statt weit links davon (die allgemeine Feldbreite galt auch für Häkchen): „automatisch alle 30 s“, „nur Probleme“ (Cluster koordinieren), „Live“ (Kamera-Übersicht), „Downgrade erlauben“ (Firmware im Cluster), inaktive Gruppen anzeigen (Gruppenverwaltung).
+
+## v88-beta188 — 2026-10-27 (SHOT-ARCHIV AUF DER SD DES COORDINATORS)
+
+- Cluster-Seite, unter „Sofortaufnahme“: Häkchen **„Bilder am Coordinator auf SD als ZIP sammeln“** (gilt für geplante und Sofortaufnahme, wird im Browser gemerkt; ohne SD-Karte im Coordinator ausgegraut). Nach dem Shot wartet der Coordinator auf die Ergebnisse aller beteiligten Nodes (bis 60 s nach dem Termin), holt die Bilder nacheinander und schreibt `/cluster_shots/shot_<UTC>.zip` – gleicher Aufbau wie das Browser-ZIP (`<Node>_<Bildanfang-UTC>.jpg` + `shot_info.csv`, ungepackt). Fortschritt und Ergebnis (mit Download-Link) neben dem Häkchen; Knopf **„Gespeicherte Shots“** listet alle Archive auf der SD.
+- Ablauf (`cluster_shot_archive.cpp`): Job-Überwachung im loopTask, Download und SD-Schreiben in eigenem Task auf Core 0 (Zeitsignal und Webserver laufen weiter); erst `.part`, nach vollständigem Schreiben umbenannt. Abbruch, wenn die SD für Wartung gesperrt wird.
+- Abruf der Bilder mit **Cluster-Medien-Token** (`&ct=`, HMAC mit dem Cluster-Schlüssel über die UUID): `/capture_media` liefert damit auch bei eingeschalteter Anmeldung an den Coordinator.
+- Neue Endpunkte am Coordinator: `POST /cluster_shot_archive` (node_ids, target_utc_ms), `GET /cluster_shot_archives`, `GET /cluster_shot_archive_file?name=` (Download in Teilen, Zeitsignal dazwischen bedient; während ein Archiv geschrieben wird abgelehnt). `/cluster_status` am Coordinator: `shot_archive` {sd, state, done, failed, bytes, file, message}.
+- Häkchen „GPIO-Testimpuls“ und „Bilder … sammeln“ direkt beim Text (die allgemeine Feldbreite schob sie weit nach links).
+
+Test 09:30 (Coordinator devxiao1 mit SD, 8 Nodes): geplanter Shot → ZIP mit 8 Bildern + CSV nach 13 s (Ergebnisse abwarten 9 s, Laden 4 s), Sofortaufnahme → nach 4,4 s; beide ZIP-Prüfsummen fehlerfrei, Download 237 KB in 0,35 s. Nicht getestet: Abruf bei eingeschalteter Anmeldung (Token-Weg).
+
+## v88-beta186 — 2026-10-27 (CLUSTER-ÜBERSICHT: TECHNISCHE DETAILS ALS POPUP)
+
+- Cluster-Übersicht: der aufklappbare Bereich „Technische Details anzeigen“ (13-Spalten-Tabelle) entfällt. Jede Zeile der Übersicht hat einen Knopf **„Details“**, der ein Fenster mit den technischen Angaben des Geräts öffnet (Rolle, Policy, Integration-ID, IP, Mode, Status, Release, Zeit, Lease, Coordinator-Link, WiFi, zuletzt gesehen). Beim lokalen Gerät (meist der Coordinator) zusätzlich Clusterzeit-, ACK-, Job-Probe- und Neustart-Diagnose, Election-Verlauf und die Erklärung zu Presence/Lease. Das offene Fenster aktualisiert sich mit jeder Statusabfrage.
+- beta185 (nur intern ausgerollt) hatte den Popup-Code im Skript des GPIO-Messgeräts, das nicht auf jedem Gerät ausgeliefert wird → u. a. auf devxiao1 „Cluster-Status konnte nicht angezeigt werden“; in beta186 im Skript der Übersicht.
+- Release-Nummer 88 (Folgeversion nach der stabilen v87; Beta-Zählung läuft weiter).
+
 ## v87 — 2026-10-27 (ERSTE STABILE VERSION)
 
 Stabiler Stand aus v87-beta184, Code unverändert bis auf die Versionskennung. Ein Paket „v87“ gilt als neuer als jede v87-beta (`firmware_package_format.h`); Nodes mit beta184 nehmen es per Cluster-Update ohne „Downgrade erlauben“ an.

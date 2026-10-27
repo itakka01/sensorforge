@@ -202,6 +202,11 @@ bool clusterEspNowTimeSign(const uint8_t *data, size_t length,
 bool clusterEspNowTimeVerify(const uint8_t *data, size_t length,
                              const uint8_t mac[32], void *user);
 
+// Shot archive (cluster_shot_archive.cpp): signed photo URL of a peer for the
+// coordinator (includes the media token) and the node-side token check.
+bool clusterCaptureMediaSource(const char *nodeId, const char *uuid, String &url, String &hostname);
+bool clusterMediaTokenValid(const String &uuid, const String &token);
+
 // True from accepting/planning a shot through its protected deadline.
 // Storage/OTA admission must treat this as stronger than the 2s armed flag.
 bool clusterCaptureProtectionActive();

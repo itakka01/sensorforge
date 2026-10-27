@@ -3,6 +3,9 @@
 #include "webconfig_cluster.h"
 
 #include "cluster.h"
+#include "cluster_shot_archive.h"
+#include "psram_alloc.h"
+#include <WiFi.h>
 #include "cluster_espnow_radio.h"
 #include "loop_load_diag.h"
 #include "cluster_hw_time_meter.h"
@@ -216,22 +219,27 @@ static String clusterPageHtml()
         "<div id='clusterPrecisionWarningDevices' class='muted' style='margin-top:4px'></div></div>"
         + clusterCapacityWarningHtml("clusterCapacityWarning") +
         "<div class='cluster-table-wrap'><table class='cluster-table cluster-simple-table'>"
-        "<thead><tr><th>Gerät</th><th>Rolle</th><th>Status</th><th>IP</th><th>Zuletzt gesehen</th></tr></thead>"
-        "<tbody id='clusterSimpleRows'><tr><td colspan='5' class='muted'>Status wird geladen …</td></tr></tbody>"
+        "<thead><tr><th>Gerät</th><th>Rolle</th><th>Status</th><th>IP</th><th>Zuletzt gesehen</th><th></th></tr></thead>"
+        "<tbody id='clusterSimpleRows'><tr><td colspan='6' class='muted'>Status wird geladen …</td></tr></tbody>"
         "</table></div>"
-        "<details class='cluster-tech-details'><summary>Technische Details anzeigen</summary>"
+        // Technical details per device open in a popup (button in each row); the
+        // local diagnostics below are filled by render() and shown in the popup of
+        // the local device.
+        "<div id='clusterLocalDiag' hidden>"
         "<p id='clusterTimeDiagnostics' class='muted'>Clusterzeit: wartet auf Zeitquelle</p>"
-        "<div class='cluster-table-wrap'><table class='cluster-table'>"
-        "<thead><tr><th>Gerät</th><th>Cluster-Rolle</th><th>Policy</th><th>Integration-ID</th><th>IP</th><th>Mode</th><th>Status</th><th>Release</th><th>Zeit</th><th>Lease</th><th>Coordinator-Link</th><th>WiFi noch ca.</th><th>Zuletzt gesehen</th></tr></thead>"
-        "<tbody id='clusterNodeRows'><tr><td colspan='13' class='muted'>Status wird geladen …</td></tr></tbody>"
-        "</table></div>"
-        "<p class='muted' id='clusterAckDiagnostics' style='margin-top:10px'>ACK-Diagnose wird geladen …</p><p class='muted' id='clusterJobDiagnostics'>Job-Diagnose wird geladen …</p><p class='muted' id='clusterRestartDiagnostics'>Neustart-Diagnose wird geladen …</p>"
+        "<p class='muted' id='clusterAckDiagnostics'>ACK-Diagnose wird geladen …</p><p class='muted' id='clusterJobDiagnostics'>Job-Diagnose wird geladen …</p><p class='muted' id='clusterRestartDiagnostics'>Neustart-Diagnose wird geladen …</p>"
         "<pre class='muted' id='clusterElectionTrace' style='white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px'>Election-Verlauf wird geladen …</pre>"
         "<p class='muted' style='margin-top:12px'>Multicast-Presence standardmäßig alle 10 Sekunden, Lease 60 Sekunden. "
         "Zusätzlich sendet jeder Node dem gewählten Coordinator alle 10 Sekunden einen signierten Unicast-Heartbeat und erhält ein ACK. "
         "Beim geordneten WiFi-Abschalten sendet ein Gerät ein signiertes LEAVE; bei Strom- oder Funkverlust läuft die Lease aus. "
         "Der Cluster öffnet oder verlängert WiFi niemals selbst.</p>"
-        "</details></section>";
+        "</div>"
+        "<dialog id='clusterNodeDialog' style='width:min(94vw,640px);max-height:88vh;box-sizing:border-box;padding:16px;border-radius:12px'>"
+        "<div style='display:flex;justify-content:space-between;align-items:center;gap:12px'><h3 id='clusterNodeDlgTitle' style='margin:0'></h3>"
+        "<button type='button' id='clusterNodeDlgClose'>Schließen</button></div>"
+        "<table class='cluster-table' style='min-width:0;margin-top:10px'><tbody id='clusterNodeDlgRows'></tbody></table>"
+        "<div id='clusterNodeDlgLocal' style='margin-top:10px;overflow-wrap:anywhere'></div></dialog>"
+        "</section>";
 
     html +=
         "<details class='settings-section cluster-tech-details'><summary>Angekündigte Ressourcen</summary>"
@@ -285,7 +293,7 @@ box.addEventListener('toggle',poll);setInterval(poll,2000);
     html += kClusterCapacityJs;
     html += R"__JS__(
 <script>(function(){
-var f=document.getElementById('clusterSettingsForm'),b=document.getElementById('clusterSaveBar'),s=document.getElementById('clusterSaveState'),btn=document.getElementById('clusterSaveButton'),rows=document.getElementById('clusterNodeRows'),resRows=document.getElementById('clusterResourceRows'),line=document.getElementById('clusterRuntimeLine');
+var f=document.getElementById('clusterSettingsForm'),b=document.getElementById('clusterSaveBar'),s=document.getElementById('clusterSaveState'),btn=document.getElementById('clusterSaveButton'),rows=document.getElementById('clusterSimpleRows'),resRows=document.getElementById('clusterResourceRows'),line=document.getElementById('clusterRuntimeLine');
 var choice=document.getElementById('clusterChoice'),idField=document.getElementById('clusterId'),nameField=document.getElementById('clusterName'),epochField=document.getElementById('clusterCredentialEpoch'),passwordField=document.getElementById('clusterPassword'),credentialHint=document.getElementById('clusterCredentialHint');
 var choiceData={},choiceSignature='';
 var clusterEnabled=document.getElementById('clusterEnabled'),joinFields=document.getElementById('clusterJoinFields');
@@ -341,7 +349,7 @@ function renderChoices(d){
  if(sig===choiceSignature)return;choiceSignature=sig;var selected=choice.value||current;choice.innerHTML='<option value="">Manuell / neuer Cluster</option>'+entries.map(function(e){var label=e.name+' · '+e.id+(e.online?' · '+e.nodes+' online':' · bekannt/offline')+(e.coord?' · Coordinator':'')+(e.saved&&!e.stale?' · Passwort gespeichert':'')+(e.stale?' · Passwort geändert?':'')+(e.conflict?' · CREDENTIAL-EPOCH-KONFLIKT':'')+(e.authMismatch?' · NICHT AUTHENTIFIZIERT':'');return '<option value="'+esc(e.id)+'"'+(e.conflict?' disabled':'')+'>'+esc(label)+'</option>';}).join('');if(selected&&choiceData[selected]&&!choiceData[selected].conflict)choice.value=selected;}
  if(choice){choice.addEventListener('change',function(){var e=choiceData[choice.value];if(!e)return;if(idField)idField.value=e.id;if(nameField)nameField.value=e.name;if(epochField)epochField.value=String(e.epoch||1);if(passwordField){passwordField.value='';passwordField.placeholder=(e.saved&&!e.stale)?'Gespeichertes Passwort wird verwendet':(e.stale?'Passwort erneut eingeben':'Mindestens 8 Zeichen');}if(credentialHint)credentialHint.textContent=e.stale?'Der sichtbare Cluster meldet eine andere Credential-Epoch. Das gespeicherte Passwort wird nicht automatisch verwendet.':((e.saved&&!e.stale)?'Passwort für diesen Cluster ist auf diesem Gerät hardwaregebunden gespeichert. Leeres Feld verwendet es intern.':'Für diesen Cluster ist kein passendes Passwort gespeichert.');dirty();});}
  if(idField)idField.addEventListener('input',function(){if(choice)choice.value='';});if(nameField)nameField.addEventListener('input',function(){if(choice)choice.value='';});
-function render(d){if(!rows||!line)return;renderChoices(d);var pills=[];pills.push('<span class="status-pill '+(d.runtime_active?'ok':'warn')+'">Runtime '+(d.runtime_active?'AKTIV':'AUS')+'</span>');var coord=String(d.coordinator_id||'');pills.push('<span class="status-pill '+(coord?'ok':'warn')+'">Coordinator '+(coord?esc(coord):'keiner')+(d.coordinator_epoch?(' · Epoch '+esc(d.coordinator_epoch)):'')+'</span>');var ct=d.cluster_time||{};pills.push('<span class="status-pill '+(ct.valid?'ok':'warn')+'">Clusterzeit '+(ct.valid?'aktiv':'wartet auf Zeitquelle')+'</span>');if(d.restart_required)pills.push('<span class="status-pill warn">NEUSTART ERFORDERLICH</span>');if(d.error)pills.push('<span class="status-pill danger">'+esc(d.error)+'</span>');line.innerHTML=pills.join(' ');var diag=document.getElementById('clusterAckDiagnostics'),q=d.ack_diagnostics||{};if(diag){diag.textContent='ACK-Diagnose (seit Runtime-Start, lokal): HB gesendet '+(q.hb_sent||0)+' / Sendefehler '+(q.hb_send_failed||0)+' · ACK-Sendeversuche '+(q.ack_send_attempted||0)+' / Sendefehler '+(q.ack_send_failed||0)+' · signierte ACK empfangen '+(q.ack_authenticated||0)+' / akzeptiert '+(q.ack_accepted||0)+' / abgelehnt '+(q.ack_rejected||0)+' · Coordinator-Wechsel '+(q.coordinator_changes||0)+' / Epoch-Wechsel '+(q.coordinator_epoch_changes||0)+' / ACK-Kontext-Resets '+(q.ack_context_resets||0)+' / unvollständige Coordinator-Meldungen '+(q.incomplete_coord_announcements||0)+' · letzter Ablehnungsgrund '+(q.last_reject||'none');}var jd=document.getElementById('clusterJobDiagnostics'),j=d.job_probe_diagnostics||{};if(jd)jd.textContent='Job-Probe (lokal): empfangen '+(j.received||0)+' / ACK gesendet '+(j.ack_sent||0)+' / abgelehnt '+(j.rejected||0)+' ('+(j.last_reject||'none')+') · ACK empfangen '+(j.ack_received||0)+' / abgelehnt '+(j.ack_rejected||0)+' ('+(j.last_ack_reject||'none')+')';var rd=document.getElementById('clusterRestartDiagnostics'),r=d.job_restart_diagnostics||{};if(rd)rd.textContent='Neustart-Diagnose (lokal): Aufträge empfangen '+(r.received||0)+' / geplant und ACK gesendet '+(r.accepted||0)+' / abgelehnt '+(r.rejected||0)+' ('+(r.last_reject||'none')+') · ACK empfangen '+(r.ack_received||0)+' / akzeptiert '+(r.ack_accepted||0)+' / abgelehnt '+(r.ack_rejected||0)+' ('+(r.last_ack_reject||'none')+')';var td=document.getElementById('clusterTimeDiagnostics');if(td){var t=d.cluster_time||{};td.textContent='Clusterzeit: '+(t.valid?'gültig':'noch nicht verfügbar')+' · Quelle '+(t.source||'-')+' · Messungen '+(t.accepted||0)+' / verworfen '+(t.rejected||0)+' · RTT '+(t.last_rtt_us||0)+' µs · Alter '+(t.sample_age_ms||0)+' ms · Abweichung zur Geräteuhr '+(t.local_offset_available?((Number(t.local_offset_us||0)/1000).toFixed(2)+' ms'):'nicht messbar')+' · grobe Unsicherheit ±'+(Number(t.uncertainty_estimate_us||0)/1000).toFixed(2)+' ms (Schätzung, keine Garantie; keine Frame-Synchronität)';}var tr=document.getElementById('clusterElectionTrace');if(tr){var entries=Array.isArray(d.election_trace)?d.election_trace:[];tr.textContent='Letzte Election-Übergänge (RAM):\\n'+(entries.length?entries.join('\\n'):'keine');}var a=orderedNodes(Array.isArray(d.nodes)?d.nodes:[],d);var pw=document.getElementById('clusterPrecisionWarning'),pwd=document.getElementById('clusterPrecisionWarningDevices');if(pw){var lim=a.filter(function(n){return (n.local?!!d.runtime_active:!!n.online)&&n.precision_sync==='no';});pw.hidden=!lim.length;if(pwd)pwd.textContent=lim.length?'Betroffene Geräte: '+lim.map(function(n){return n.hostname||n.integration_id||'-';}).join(', '):'';}sfRenderCapacity('clusterCapacityWarning',d);var simple=document.getElementById('clusterSimpleRows');if(simple){simple.innerHTML=a.length?a.map(function(n){return '<tr><td><strong>'+esc(n.hostname||'-')+'</strong>'+(n.local?' <span class="status-pill ok">LOKAL</span>':'')+sfPrecisionBadge(n)+'</td><td>'+esc(displayRole(n))+nodeNavigationLink(n,d)+'</td><td>'+esc(statusText(n))+'</td><td>'+esc(n.ip||'-')+'</td><td>'+esc(age(n.age_ms,n.local))+'</td></tr>';}).join(''):'<tr><td colspan="5" class="muted">Keine Geräte sichtbar.</td></tr>';}if(!a.length){rows.innerHTML='<tr><td colspan="13" class="muted">Keine Geräte sichtbar.</td></tr>';}else{rows.innerHTML=a.map(function(n){return '<tr><td><strong>'+esc(n.hostname||'-')+'</strong>'+(n.local?' <span class="status-pill ok">LOKAL</span>':'')+sfPrecisionBadge(n)+'</td><td><strong>'+esc(displayRole(n))+'</strong></td><td>'+esc(policyText(n.coordinator_policy))+'</td><td class="cluster-id">'+esc(n.integration_id||'-')+'</td><td>'+esc(n.ip||'-')+'</td><td>'+esc(n.mode||'-')+'</td><td>'+esc(statusText(n))+'</td><td>'+esc(n.release||'-')+'</td><td>'+esc(timeText(n))+'</td><td>'+esc(leaseText(n))+'</td><td>'+esc(linkText(n,d))+'</td><td>'+esc(wifiText(n))+'</td><td>'+esc(age(n.age_ms,n.local))+'</td></tr>';}).join('');}
+var sfNodeDlg={nodes:[],d:{},id:null};function sfNodeDlgFill(){var n=null;for(var i=0;i<sfNodeDlg.nodes.length;i++){if(String(sfNodeDlg.nodes[i].integration_id||'')===sfNodeDlg.id){n=sfNodeDlg.nodes[i];break;}}var t=document.getElementById('clusterNodeDlgTitle'),b=document.getElementById('clusterNodeDlgRows'),l=document.getElementById('clusterNodeDlgLocal');if(!n){b.innerHTML='<tr><td class="muted">Gerät nicht mehr in der Liste.</td></tr>';l.innerHTML='';return;}var d=sfNodeDlg.d;t.textContent='Technische Details – '+(n.hostname||n.integration_id||'-');var f=[['Cluster-Rolle',displayRole(n)],['Policy',policyText(n.coordinator_policy)],['Integration-ID',n.integration_id||'-'],['IP',n.ip||'-'],['Mode',n.mode||'-'],['Status',statusText(n)],['Release',n.release||'-'],['Zeit',timeText(n)],['Lease',leaseText(n)],['Coordinator-Link',linkText(n,d)],['WiFi noch ca.',wifiText(n)],['Zuletzt gesehen',age(n.age_ms,n.local)]];b.innerHTML=f.map(function(r){return '<tr><th style="text-align:left;white-space:nowrap">'+esc(r[0])+'</th><td'+(r[0]==='Integration-ID'?' class="cluster-id"':'')+'>'+esc(r[1])+'</td></tr>';}).join('');var ld=document.getElementById('clusterLocalDiag');l.innerHTML=(n.local&&ld)?'<h4 style="margin:6px 0">Diagnose dieses Geräts</h4>'+ld.innerHTML:'';}function sfNodeDlgClose(){var dl=document.getElementById('clusterNodeDialog');sfNodeDlg.id=null;if(dl.close)dl.close();else dl.removeAttribute('open');}document.getElementById('clusterSimpleRows').addEventListener('click',function(e){var bt=e.target.closest?e.target.closest('button[data-sf-node]'):null;if(!bt)return;sfNodeDlg.id=bt.getAttribute('data-sf-node');sfNodeDlgFill();var dl=document.getElementById('clusterNodeDialog');if(dl.showModal){if(!dl.open)dl.showModal();}else dl.setAttribute('open','');});document.getElementById('clusterNodeDlgClose').addEventListener('click',sfNodeDlgClose);document.getElementById('clusterNodeDialog').addEventListener('close',function(){sfNodeDlg.id=null;});function render(d){if(!rows||!line)return;renderChoices(d);var pills=[];pills.push('<span class="status-pill '+(d.runtime_active?'ok':'warn')+'">Runtime '+(d.runtime_active?'AKTIV':'AUS')+'</span>');var coord=String(d.coordinator_id||'');pills.push('<span class="status-pill '+(coord?'ok':'warn')+'">Coordinator '+(coord?esc(coord):'keiner')+(d.coordinator_epoch?(' · Epoch '+esc(d.coordinator_epoch)):'')+'</span>');var ct=d.cluster_time||{};pills.push('<span class="status-pill '+(ct.valid?'ok':'warn')+'">Clusterzeit '+(ct.valid?'aktiv':'wartet auf Zeitquelle')+'</span>');if(d.restart_required)pills.push('<span class="status-pill warn">NEUSTART ERFORDERLICH</span>');if(d.error)pills.push('<span class="status-pill danger">'+esc(d.error)+'</span>');line.innerHTML=pills.join(' ');var diag=document.getElementById('clusterAckDiagnostics'),q=d.ack_diagnostics||{};if(diag){diag.textContent='ACK-Diagnose (seit Runtime-Start, lokal): HB gesendet '+(q.hb_sent||0)+' / Sendefehler '+(q.hb_send_failed||0)+' · ACK-Sendeversuche '+(q.ack_send_attempted||0)+' / Sendefehler '+(q.ack_send_failed||0)+' · signierte ACK empfangen '+(q.ack_authenticated||0)+' / akzeptiert '+(q.ack_accepted||0)+' / abgelehnt '+(q.ack_rejected||0)+' · Coordinator-Wechsel '+(q.coordinator_changes||0)+' / Epoch-Wechsel '+(q.coordinator_epoch_changes||0)+' / ACK-Kontext-Resets '+(q.ack_context_resets||0)+' / unvollständige Coordinator-Meldungen '+(q.incomplete_coord_announcements||0)+' · letzter Ablehnungsgrund '+(q.last_reject||'none');}var jd=document.getElementById('clusterJobDiagnostics'),j=d.job_probe_diagnostics||{};if(jd)jd.textContent='Job-Probe (lokal): empfangen '+(j.received||0)+' / ACK gesendet '+(j.ack_sent||0)+' / abgelehnt '+(j.rejected||0)+' ('+(j.last_reject||'none')+') · ACK empfangen '+(j.ack_received||0)+' / abgelehnt '+(j.ack_rejected||0)+' ('+(j.last_ack_reject||'none')+')';var rd=document.getElementById('clusterRestartDiagnostics'),r=d.job_restart_diagnostics||{};if(rd)rd.textContent='Neustart-Diagnose (lokal): Aufträge empfangen '+(r.received||0)+' / geplant und ACK gesendet '+(r.accepted||0)+' / abgelehnt '+(r.rejected||0)+' ('+(r.last_reject||'none')+') · ACK empfangen '+(r.ack_received||0)+' / akzeptiert '+(r.ack_accepted||0)+' / abgelehnt '+(r.ack_rejected||0)+' ('+(r.last_ack_reject||'none')+')';var td=document.getElementById('clusterTimeDiagnostics');if(td){var t=d.cluster_time||{};td.textContent='Clusterzeit: '+(t.valid?'gültig':'noch nicht verfügbar')+' · Quelle '+(t.source||'-')+' · Messungen '+(t.accepted||0)+' / verworfen '+(t.rejected||0)+' · RTT '+(t.last_rtt_us||0)+' µs · Alter '+(t.sample_age_ms||0)+' ms · Abweichung zur Geräteuhr '+(t.local_offset_available?((Number(t.local_offset_us||0)/1000).toFixed(2)+' ms'):'nicht messbar')+' · grobe Unsicherheit ±'+(Number(t.uncertainty_estimate_us||0)/1000).toFixed(2)+' ms (Schätzung, keine Garantie; keine Frame-Synchronität)';}var tr=document.getElementById('clusterElectionTrace');if(tr){var entries=Array.isArray(d.election_trace)?d.election_trace:[];tr.textContent='Letzte Election-Übergänge (RAM):\\n'+(entries.length?entries.join('\\n'):'keine');}var a=orderedNodes(Array.isArray(d.nodes)?d.nodes:[],d);var pw=document.getElementById('clusterPrecisionWarning'),pwd=document.getElementById('clusterPrecisionWarningDevices');if(pw){var lim=a.filter(function(n){return (n.local?!!d.runtime_active:!!n.online)&&n.precision_sync==='no';});pw.hidden=!lim.length;if(pwd)pwd.textContent=lim.length?'Betroffene Geräte: '+lim.map(function(n){return n.hostname||n.integration_id||'-';}).join(', '):'';}sfRenderCapacity('clusterCapacityWarning',d);var simple=document.getElementById('clusterSimpleRows');if(simple){simple.innerHTML=a.length?a.map(function(n){return '<tr><td><strong>'+esc(n.hostname||'-')+'</strong>'+(n.local?' <span class="status-pill ok">LOKAL</span>':'')+sfPrecisionBadge(n)+'</td><td>'+esc(displayRole(n))+nodeNavigationLink(n,d)+'</td><td>'+esc(statusText(n))+'</td><td>'+esc(n.ip||'-')+'</td><td>'+esc(age(n.age_ms,n.local))+'</td><td><button type="button" class="secondary" data-sf-node="'+esc(n.integration_id||'')+'" title="Technische Details" style="padding:3px 10px;font-size:12px">Details</button></td></tr>';}).join(''):'<tr><td colspan="6" class="muted">Keine Geräte sichtbar.</td></tr>';}sfNodeDlg.nodes=a;sfNodeDlg.d=d;if(sfNodeDlg.id!==null)sfNodeDlgFill();
 if(resRows){var byId={};a.forEach(function(n){byId[String(n.integration_id||'')]=n.hostname||n.integration_id||'-';});var rr=Array.isArray(d.resources)?d.resources:[];if(!rr.length){resRows.innerHTML='<tr><td colspan="7" class="muted">Noch keine Ressourcen angekündigt.</td></tr>';}else{resRows.innerHTML=rr.map(function(r){var owner=byId[String(r.owner_integration_id||'')]||r.owner_integration_id||'-';return '<tr><td><strong>'+esc(owner)+'</strong><div class="cluster-subtle">'+esc(r.source_ip||'-')+'</div></td><td class="cluster-id">'+esc(r.resource_id||'-')+'</td><td>'+esc(r.type||'-')+'</td><td>'+esc(resourceTime(r.timestamp_us))+'</td><td>'+esc(sizeText(r.size_bytes))+'</td><td>'+esc(duration(r.ttl_remaining_sec,'-'))+'</td><td class="cluster-id">'+esc(r.locator||'-')+'</td></tr>';}).join('');}}}
 function poll(){fetch('/cluster_status?t='+Date.now(),{cache:'no-store',credentials:'same-origin'}).then(function(r){if(!r.ok)throw new Error();return r.json();}).then(render).catch(function(e){console.error('Cluster-Status: Abruf oder Anzeige fehlgeschlagen',e);if(line)line.innerHTML='<span class="status-pill danger">Cluster-Status konnte nicht angezeigt werden</span>';});}poll();setInterval(poll,3000);document.addEventListener('visibilitychange',function(){if(!document.hidden)poll();});
 })();</script>
@@ -477,14 +485,16 @@ window.sfOnStatus(function(d){sfRenderCapacity('sfCoordCapacityWarning',d);});
     html += webconfigClusterTimeSectionHtml();
     html += R"__HEALTH__(<section class='settings-section'><h3>Cluster-Geräte</h3>
 <p class='muted'>Aktuelle Werte der verbundenen Geräte. Die Liste lädt nur bei „Aktualisieren“ (oder alle 30 s, wenn angehakt) und während einer Aktion kurzzeitig alle 3 s – so bleibt die Last am Coordinator auch bei 100 Nodes klein. SD-Daten melden die Nodes etwa einmal pro Minute. Fehlende Werte werden nicht geschätzt.</p>
-<div class='cluster-select-tools'><button type='button' id='sfDevRefresh'>Aktualisieren</button> <label><input type='checkbox' id='sfDevAuto'> automatisch alle 30 s</label> <label for='sfDevSort'>Sortierung:</label> <select id='sfDevSort'><option value='problem'>Probleme zuerst</option><option value='name'>Name</option><option value='group'>Gruppe</option></select> <label><input type='checkbox' id='sfDevOnlyProblems'> nur Probleme</label> <span id='sfDevStamp' class='muted' role='status'></span></div>
+<div class='cluster-select-tools'><button type='button' id='sfDevRefresh'>Aktualisieren</button> <label><input type='checkbox' id='sfDevAuto' style='width:auto;margin:0 4px 0 0;vertical-align:middle'> automatisch alle 30 s</label> <label for='sfDevSort'>Sortierung:</label> <select id='sfDevSort'><option value='problem'>Probleme zuerst</option><option value='name'>Name</option><option value='group'>Gruppe</option></select> <label><input type='checkbox' id='sfDevOnlyProblems' style='width:auto;margin:0 4px 0 0;vertical-align:middle'> nur Probleme</label> <span id='sfDevStamp' class='muted' role='status'></span></div>
 <div class='cluster-select-tools'><button type='button' id='clusterSelectAll'>Alle sichtbaren Nodes auswählen</button> <button type='button' id='clusterSelectNone'>Auswahl aufheben</button> <span id='clusterSelectionCount'>0 ausgewählt</span></div>
 <div class='cluster-select-tools'><label for='clusterActionChoice'>Aktion für ausgewählte Nodes:</label> <select id='clusterActionChoice'><option value=''>Aktion auswählen …</option><option value='clusterBulkProbe'>Verbindung testen</option><option value='clusterBulkDroneOn'>Drone Mode einschalten</option><option value='clusterBulkDroneOff'>Drone Mode ausschalten</option><option value='clusterBulkRestart'>Neu starten</option><option value='clusterBulkShutdown'>Herunterfahren</option><option value='clusterBulkWipe'>SD vollständig löschen</option></select> <button type='button' id='clusterActionRun'>Ausführen</button> <button type='button' id='clusterActionInfo' aria-label='Hinweise zu Cluster-Aktionen' title='Hinweise zu Cluster-Aktionen'>Info</button></div>
 <div id='clusterActionHandlers' style='display:none'><button type='button' id='clusterBulkDroneOn'>Drone Mode EIN</button><button type='button' id='clusterBulkDroneOff'>Drone Mode AUS</button><button type='button' id='clusterBulkProbe'>Verbindung testen</button><button type='button' id='clusterBulkRestart'>Neustart</button><button type='button' id='clusterBulkShutdown'>Shutdown</button><button type='button' id='clusterBulkWipe'>SD löschen</button></div>
 <dialog id='clusterActionDialog' style='max-width:min(90vw,650px);padding:24px;border-radius:14px'><h3>Cluster-Aktionen</h3><p>Drone Mode hält Nodes passiv bereit: kein automatisches Recording, kein Power Shooter, keine Bewegungserkennung und keine Hintergrund-SD-Recovery. Laufende Aufnahmen werden beim Einschalten kontrolliert beendet. Clusterzeit, geplante Capture-Jobs, Webverwaltung und Temperaturschutz bleiben verfügbar.</p><p>Sammelaktionen werden einzeln und signiert pro Node ausgeführt. Der Coordinator ist nicht auswählbar. Remote-Shutdown benötigt RESET oder Stromversorgung zum Wiederaufwachen.</p><p>HTTP-Annahme bestätigt nicht die Ausführung. Ergebnisse bitte im Status prüfen.</p><button type='button' id='clusterActionDialogClose'>Schließen</button></dialog>
-<div class='cluster-select-tools'><strong>Foto in</strong> <label for='clusterCaptureHours'>Stunden</label> <input id='clusterCaptureHours' type='number' min='0' max='23' step='1' value='0' style='width:4.5em'> <label for='clusterCaptureMinutes'>Minuten</label> <input id='clusterCaptureMinutes' type='number' min='0' max='59' step='1' value='0' style='width:4.5em'> <label for='clusterCaptureSeconds'>Sekunden</label> <input id='clusterCaptureSeconds' type='number' min='0' max='59' step='1' value='5' style='width:4.5em'> <label title='Nur XIAO-Nodes mit aktueller Firmware: Impuls an D1/GPIO2 direkt am Start des aufnehmenden fb_get(). Ältere Firmware verwirft solche Aufträge.'><input type='checkbox' id='clusterCaptureTestPulse'> GPIO-Testimpuls (D1)</label> <button type='button' id='clusterBulkCapture'>Aufnahme planen</button> <output id='clusterPlannedTime' style='font-variant-numeric:tabular-nums;font-weight:700'>UTC-Zeit wird geladen …</output></div>
+<div class='cluster-select-tools'><strong>Foto in</strong> <label for='clusterCaptureHours'>Stunden</label> <input id='clusterCaptureHours' type='number' min='0' max='23' step='1' value='0' style='width:4.5em'> <label for='clusterCaptureMinutes'>Minuten</label> <input id='clusterCaptureMinutes' type='number' min='0' max='59' step='1' value='0' style='width:4.5em'> <label for='clusterCaptureSeconds'>Sekunden</label> <input id='clusterCaptureSeconds' type='number' min='0' max='59' step='1' value='5' style='width:4.5em'> <label title='Nur XIAO-Nodes mit aktueller Firmware: Impuls an D1/GPIO2 direkt am Start des aufnehmenden fb_get(). Ältere Firmware verwirft solche Aufträge.'><input type='checkbox' id='clusterCaptureTestPulse' style='width:auto;margin:0 4px 0 0;vertical-align:middle'> GPIO-Testimpuls (D1)</label> <button type='button' id='clusterBulkCapture'>Aufnahme planen</button> <output id='clusterPlannedTime' style='font-variant-numeric:tabular-nums;font-weight:700'>UTC-Zeit wird geladen …</output></div>
 <!-- Direkte UTC-Eingabe kann später wieder aktiviert werden. sfPlanUtcTarget() akzeptiert dafür einen optionalen UTC-ISO-Termin; aktuell nutzt das Formular ausschließlich relative Zeit. -->
 <div class='cluster-select-tools'><strong>Sofortaufnahme</strong> <label for='sfSharpMinutes'>scharf für</label> <select id='sfSharpMinutes'><option value='5'>5 min</option><option value='10' selected>10 min</option><option value='30'>30 min</option><option value='60'>60 min</option></select> <button type='button' id='sfSharpOn'>Kameras scharf schalten</button> <button type='button' id='sfSharpOff'>Entschärfen</button> <button type='button' id='sfCaptureNow' class='danger' disabled style='font-weight:800'>SOFORT AUSLÖSEN</button></div>
+<div class='cluster-select-tools'><label title='Der Coordinator holt nach dem Shot die Bilder aller beteiligten Nodes und speichert sie als ZIP auf seiner SD-Karte (Ordner /cluster_shots).'><input type='checkbox' id='sfArchiveSd' style='width:auto;margin:0 4px 0 0;vertical-align:middle'> Bilder am Coordinator auf SD als ZIP sammeln (geplante und Sofortaufnahme)</label> <span id='sfArchiveState' class='muted'></span> <button type='button' id='sfArchiveListOpen'>Gespeicherte Shots</button></div>
+<dialog id='sfArchiveDialog' style='width:min(94vw,560px);box-sizing:border-box;padding:16px;border-radius:12px'><div style='display:flex;justify-content:space-between;align-items:center;gap:12px'><h3 style='margin:0'>Gespeicherte Shots (SD am Coordinator)</h3><button type='button' id='sfArchiveDialogClose'>Schließen</button></div><div id='sfArchiveList' style='margin-top:10px;max-height:60vh;overflow:auto;overflow-wrap:anywhere'></div></dialog>
 <div id='sfSharpBanner' style='display:none;position:sticky;top:0;z-index:50;margin:8px 0;padding:12px 16px;border-radius:10px;background:#b91c1c;color:#fff;font-weight:800;font-size:1.15rem'><span id='sfSharpBannerText'></span> <button type='button' id='sfSharpBannerOff' style='margin-left:8px'>Entschärfen</button></div>
 <div class='cluster-select-tools'><button type='button' id='sfSyncOpen'>Sync-Testbild im Vollbild öffnen</button> <span class='muted'>Beim Capture öffnet sich automatisch ein großes Vollbild-Popup. Countdown und Balken laufen bis 2 s nach dem Auslösezeitpunkt.</span></div>
 <div id='sfSyncScreen' aria-label='Visuelle Synchronisationsanzeige' style='display:none'>
@@ -837,7 +847,7 @@ document.getElementById('clusterBulkCapture').addEventListener('click',async fun
  var galleryDialog=document.getElementById('sfCaptureGalleryDialog');
  if(galleryDialog&&galleryDialog.open){if(galleryDialog.close)galleryDialog.close();else galleryDialog.removeAttribute('open');}
  var testPulse=!!(document.getElementById('clusterCaptureTestPulse')||{}).checked;
- var button=this;button.disabled=true;window.sfCoordinatorBulkActive=true;var results=[],accepted=0,shown=false;
+ var button=this;button.disabled=true;window.sfCoordinatorBulkActive=true;var results=[],accepted=0,shown=false,acceptedIds=[];
  // Use the freshly fetched pre-submit status, not the possibly stale UI poll status.
  // Otherwise an old completed JPEG can be assigned to the next capture report.
  (Array.isArray(snap.job_probes)?snap.job_probes:[]).forEach(function(j){if(Number(j.kind)===6)sfSeenCaptureJobs.add(sfCaptureJobKey(j));});
@@ -847,13 +857,14 @@ document.getElementById('clusterBulkCapture').addEventListener('click',async fun
   var fd=new FormData();fd.append('node_id',ids[i]);fd.append('utc_ms',String(Math.round(target)));if(testPulse)fd.append('test_pulse','1');
   var ctrl=new AbortController(),timer=setTimeout(function(){ctrl.abort();},12000);
   try{var r=await fetch('/cluster_node_capture',{method:'POST',body:fd,credentials:'same-origin',redirect:'manual',cache:'no-store',signal:ctrl.signal});
-      if(r.ok||r.status===303||r.status===0){accepted++;if(!shown){sfShowCaptureCountdown(target);shown=true;}sfCaptureReport.rows[i].http='accepted';results.push(ids[i]+': angenommen');}
+      if(r.ok||r.status===303||r.status===0){accepted++;acceptedIds.push(ids[i]);if(!shown){sfShowCaptureCountdown(target);shown=true;}sfCaptureReport.rows[i].http='accepted';results.push(ids[i]+': angenommen');}
       else{sfCaptureReport.rows[i].http='error';var msg='';try{msg=(await r.text()).slice(0,110);}catch(ignored){}results.push(ids[i]+': HTTP '+r.status+(msg?' '+msg:''));}}
   catch(e){sfCaptureReport.rows[i].http='error';results.push(ids[i]+': Übertragungsfehler ('+(e.name==='AbortError'?'Zeitlimit':String(e.message||e))+'); Ausführung unbekannt');}
   finally{clearTimeout(timer);sfRenderCaptureReport();}
  }
  out.textContent='UTC '+new Date(target).toISOString()+' · '+accepted+'/'+ids.length+' angenommen'+(testPulse?' · mit GPIO-Testimpuls':'')+'. '+results.join(' | ')+'. Die grüne Anzeige kennzeichnet nur den geplanten Zeitpunkt; Capture-Ergebnisse stehen in der Node-Tabelle.';
  if(accepted&&!shown)sfShowCaptureCountdown(target);
+ sfArchiveRequest(acceptedIds,target);
  }finally{window.sfCoordinatorBulkActive=false;button.disabled=false;sfRenderCaptureReport();window.sfCoordinateStatus(true).catch(function(){});if(accepted)window.sfStatusBurst(Math.min(300000,Math.max(0,target-sfCaptureUtcNow())+60000));}
 });
 // Instant shot: arm (camera awake, no standby), then fire with the shortest
@@ -901,7 +912,7 @@ document.getElementById('sfCaptureNow').addEventListener('click',async function(
   sfCaptureGallery.clear();var gc=document.getElementById('sfCaptureGalleryCount');if(gc)gc.textContent='0';
   var names=Array.isArray((sfLatestStatus||{}).nodes)?sfLatestStatus.nodes:[];
   sfCaptureReport={target:target,rows:ids.map(function(id){var n=names.find(function(x){return String(x.integration_id)===id;});return {id:id,name:n?(n.hostname||id):id,http:acc.has(id)?'accepted':'error',job:null};})};
-  sfShowCaptureCountdown(target);sfRenderCaptureReport();
+  sfShowCaptureCountdown(target);sfRenderCaptureReport();sfArchiveRequest(Array.from(acc),target);
   out.textContent='Sofortaufnahme UTC '+new Date(target).toISOString()+' (Vorlauf '+j.lead_ms+' ms) · '+acc.size+'/'+ids.length+' Aufträge gesendet'+(Object.keys(fail).length?' · '+Object.keys(fail).map(function(k){return k+': '+fail[k];}).join(' | '):'')+'.';
   // Reserve check: every node reports how long before the shot it had the job.
   setTimeout(function(){window.sfCoordinateStatus(true).then(function(d){var rows=(d.nodes||[]).filter(function(n){return acc.has(String(n.integration_id))&&n.capture_reserve_ms!=null;});
@@ -912,6 +923,33 @@ document.getElementById('sfCaptureNow').addEventListener('click',async function(
  }catch(e){out.textContent='Übertragungsfehler: '+(e.message||e)+' (Ausführung unbekannt)';}
  finally{button.disabled=!(sfSharpUntil>Date.now());}
 });
+// Shot archive on the coordinator SD card (cluster_shot_archive.cpp): the
+// coordinator collects the photos of the shot itself and stores one ZIP.
+var sfArchiveBox=document.getElementById('sfArchiveSd'),sfArchiveOut=document.getElementById('sfArchiveState');
+try{sfArchiveBox.checked=localStorage.getItem('sfArchiveSd')==='1';}catch(e){}
+sfArchiveBox.addEventListener('change',function(){try{localStorage.setItem('sfArchiveSd',sfArchiveBox.checked?'1':'0');}catch(e){}});
+function sfArchiveMb(b){return (Number(b||0)/1048576).toLocaleString('de-DE',{maximumFractionDigits:1})+' MB';}
+function sfArchiveLink(name){var a=document.createElement('a');a.href='/cluster_shot_archive_file?name='+encodeURIComponent(name);a.textContent=name;a.setAttribute('download',name);return a;}
+window.sfOnStatus(function(d){var a=d&&d.shot_archive;
+ if(!a){sfArchiveBox.disabled=true;sfArchiveOut.textContent='(nur am Coordinator)';return;}
+ sfArchiveBox.disabled=!a.sd;sfArchiveOut.textContent='';
+ if(!a.sd){sfArchiveOut.textContent='– keine SD-Karte im Coordinator';return;}
+ if(a.state==='waiting'||a.state==='collecting')sfArchiveOut.textContent=a.message;
+ else if(a.state==='done'){sfArchiveOut.appendChild(document.createTextNode('✓ '));sfArchiveOut.appendChild(sfArchiveLink(a.file));sfArchiveOut.appendChild(document.createTextNode(' · '+a.done+' Bild(er), '+sfArchiveMb(a.bytes)+(a.failed?' · '+a.failed+' Node(s) ohne Bild':'')));}
+ else if(a.state==='failed')sfArchiveOut.textContent='✗ Archiv '+a.file+': '+a.message;});
+function sfArchiveRequest(ids,target){if(!sfArchiveBox.checked||sfArchiveBox.disabled||!ids.length)return;
+ var fd=new URLSearchParams();fd.append('node_ids',ids.join(','));fd.append('target_utc_ms',String(Math.round(target)));
+ fetch('/cluster_shot_archive',{method:'POST',body:fd,credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json();})
+  .then(function(j){sfArchiveOut.textContent=j.ok?'Archiv vorgemerkt – wartet auf die Bilder …':'Kein Archiv: '+(j.message||'Fehler');})
+  .catch(function(){sfArchiveOut.textContent='Archiv-Auftrag nicht übertragen';});}
+document.getElementById('sfArchiveListOpen').addEventListener('click',function(){var dl=document.getElementById('sfArchiveDialog'),box=document.getElementById('sfArchiveList');box.textContent='Lädt …';
+ if(dl.showModal)dl.showModal();else dl.setAttribute('open','');
+ fetch('/cluster_shot_archives',{cache:'no-store',credentials:'same-origin'}).then(function(r){return r.json();}).then(function(j){
+  if(!j.sd){box.textContent='Keine SD-Karte im Coordinator.';return;}
+  if(!j.files.length){box.textContent='Noch keine Shots gespeichert.';return;}
+  box.textContent='';j.files.forEach(function(f){var row=document.createElement('div');row.style.padding='4px 0';row.appendChild(sfArchiveLink(f.name));row.appendChild(document.createTextNode(' · '+sfArchiveMb(f.bytes)));box.appendChild(row);});})
+  .catch(function(){box.textContent='Liste nicht abrufbar.';});});
+document.getElementById('sfArchiveDialogClose').addEventListener('click',function(){var dl=document.getElementById('sfArchiveDialog');if(dl.close)dl.close();else dl.removeAttribute('open');});
 var sfActionDialog=document.getElementById('clusterActionDialog');
 document.getElementById('clusterActionInfo').addEventListener('click',function(){if(sfActionDialog.showModal)sfActionDialog.showModal();else sfActionDialog.setAttribute('open','');});
 document.getElementById('clusterActionDialogClose').addEventListener('click',function(){if(sfActionDialog.close)sfActionDialog.close();else sfActionDialog.removeAttribute('open');});
@@ -1729,6 +1767,70 @@ static void handleClusterCaptureNow()
                     ",\"accepted\":[" + accepted + "],\"failed\":[" + failed + "]}");
 }
 
+// POST /cluster_shot_archive: node_ids=<id,...>&target_utc_ms=<ms>. Right
+// after a shot was scheduled: the coordinator collects its photos into one ZIP
+// on its SD card (cluster_shot_archive.cpp).
+static void handleClusterShotArchive()
+{
+    String message;
+    const int64_t target = strtoll(server.arg("target_utc_ms").c_str(), nullptr, 10);
+    const bool ok = target > 0 && clusterShotArchiveRequest(server.arg("node_ids"), target, message);
+    if (target <= 0)
+        message = "Zielzeit fehlt";
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(ok ? 200 : 409, "application/json; charset=utf-8",
+                String("{\"ok\":") + (ok ? "true" : "false") + ",\"message\":\"" + jsonEscapeLocal(message) + "\"}");
+}
+
+// GET /cluster_shot_archives: archives on the coordinator SD card.
+static void handleClusterShotArchives()
+{
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json; charset=utf-8",
+                String("{\"sd\":") + (clusterShotArchiveSdReady() ? "true" : "false") +
+                    ",\"files\":" + clusterShotArchiveListJson(200) + "}");
+}
+
+// GET /cluster_shot_archive_file?name=shot_<UTC>.zip. Sent in parts with the
+// time-critical cluster service in between (the coordinator keeps its time
+// signal running during a download of several MB).
+static void handleClusterShotArchiveFile()
+{
+    String path;
+    const String name = server.arg("name");
+    if (!clusterShotArchivePath(name, path)) {
+        server.send(400, "text/plain; charset=utf-8", "Ungültiger Dateiname");
+        return;
+    }
+    if (!clusterShotArchiveSdReady() || clusterShotArchiveBusy()) {
+        server.send(409, "text/plain; charset=utf-8", "SD nicht bereit oder Archiv wird gerade geschrieben – bitte gleich nochmal versuchen");
+        return;
+    }
+    File f = STORAGE.open(path.c_str(), FILE_READ);
+    if (!f || f.isDirectory()) {
+        server.send(404, "text/plain; charset=utf-8", "Archiv nicht gefunden");
+        return;
+    }
+    SfPsramBuffer buffer(8192);
+    if (!buffer) {
+        f.close();
+        server.send(503, "text/plain; charset=utf-8", "Kein Speicher frei");
+        return;
+    }
+    server.sendHeader("Cache-Control", "no-store");
+    server.sendHeader("Content-Disposition", "attachment; filename=\"" + name + "\"");
+    server.setContentLength(f.size());
+    server.send(200, "application/zip", "");
+    WiFiClient client = server.client();
+    while (f.available()) {
+        const size_t n = f.read(buffer.data(), buffer.size());
+        if (!n || client.write(buffer.data(), n) != n)
+            break;
+        clusterServiceTimeCritical();
+    }
+    f.close();
+}
+
 void webconfigClusterSendLargeJson(WebServer &serverInstance, const String &json)
 {
     static const size_t kPartBytes = 4096;
@@ -1773,6 +1875,9 @@ void webconfigClusterRegisterRoutes(
     serverInstance.on("/cluster_node_capture", HTTP_POST, handleClusterNodeCapture);
     serverInstance.on("/cluster_sharp", HTTP_POST, handleClusterSharp);
     serverInstance.on("/cluster_capture_now", HTTP_POST, handleClusterCaptureNow);
+    serverInstance.on("/cluster_shot_archive", HTTP_POST, handleClusterShotArchive);
+    serverInstance.on("/cluster_shot_archives", HTTP_GET, handleClusterShotArchives);
+    serverInstance.on("/cluster_shot_archive_file", HTTP_GET, handleClusterShotArchiveFile);
     serverInstance.on("/cluster_node_drone", HTTP_POST, handleClusterNodeDrone);
     serverInstance.on("/cluster_tx_power", HTTP_GET, handleClusterTxPowerGet);
     serverInstance.on("/cluster_tx_power", HTTP_POST, handleClusterTxPowerPost);
