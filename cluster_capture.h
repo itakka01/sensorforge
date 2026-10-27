@@ -10,7 +10,10 @@ struct ClusterCaptureShotTiming{int64_t drainStartUs;int64_t drainEndUs;uint8_t 
     uint8_t framesSkipped;
     // Every frame the shot received after the release (skipped ones first):
     // start relative to the release start [us] and JPEG length.
-    uint8_t frameCount;int32_t frameRelUs[5];uint32_t frameLen[5];};
+    uint8_t frameCount;int32_t frameRelUs[5];uint32_t frameLen[5];
+    // Sensor orientation registers right after the shot (OV3660/OV5640
+    // 0x3820 flip, 0x3821 mirror; -1 = not read).
+    int16_t reg3820;int16_t reg3821;};
 // Sensor frame period (driver frame timestamps, min of consecutive spacings).
 // Measure: blocking, ~5 frame periods (camera awake, loopTask). Track:
 // non-blocking, one ready frame per call (while the cameras are armed).

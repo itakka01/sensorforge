@@ -198,6 +198,7 @@ static uint8_t captureSyncPeriods=0, captureLastSyncPeriods=0;
 static int64_t captureLastFrameStartRelUs=0, captureLastPeriodUs=0, captureLastReleaseLeadUs=0;
 static uint8_t captureLastFramesSkipped=0;
 static String captureLastFramesText;   // "start_us/len,..." per received frame
+static int16_t captureLastReg3820=-1, captureLastReg3821=-1;
 static const char *captureLastSyncState="";
 static int64_t captureLastFrameWaitUs=0, captureLastFrameTsMinusDispatchUs=0;
 static uint32_t captureLastSize=0;
@@ -3293,6 +3294,7 @@ static void serviceScheduledCapture(){
         captureLastFrameSync=captureFrameSync;
         captureLastFramesSkipped=t.framesSkipped;
         captureLastSyncPeriods=captureFrameSync?captureSyncPeriods:0;
+        captureLastReg3820=t.reg3820;captureLastReg3821=t.reg3821;
         captureLastFramesText="";
         for(uint8_t i=0;i<t.frameCount;++i){
             if(i)captureLastFramesText+=",";
@@ -6292,6 +6294,7 @@ static String buildClusterStatusJson(ClusterStatusChunkSink sink, void *ctx)
         ",\"release_to_frame_us\":"+String((long)captureReleaseToFrameUs)+
         ",\"learned_lead_us\":"+String((long)captureLearnedLeadUs)+
         ",\"last_sync_periods\":"+String((unsigned)captureLastSyncPeriods)+
+        ",\"last_reg3820\":"+String((int)captureLastReg3820)+",\"last_reg3821\":"+String((int)captureLastReg3821)+
         ",\"last_frames\":\""+captureLastFramesText+"\""+
         ",\"last_frame_wait_us\":"+String((long)captureLastFrameWaitUs)+
         ",\"last_frame_ts_minus_dispatch_us\":"+String((long)captureLastFrameTsMinusDispatchUs);

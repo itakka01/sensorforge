@@ -1,3 +1,38 @@
+## v87 — 2026-10-27 (ERSTE STABILE VERSION)
+
+Stabiler Stand aus v87-beta184, Code unverändert bis auf die Versionskennung. Ein Paket „v87“ gilt als neuer als jede v87-beta (`firmware_package_format.h`); Nodes mit beta184 nehmen es per Cluster-Update ohne „Downgrade erlauben“ an.
+
+Schwerpunkte seit beta170:
+- **Cluster-Aufnahme am Sensor-Bildtakt** (beta171–176, 183): Sensor beim Scharfschalten im Power-Down, Freigabe zwei Bildperioden vor dem Termin, Aufnahmebild = erstes Bild mit Bildanfang ≥ Termin − P/2; gelernter Vorlauf je Node; Bildperiode ohne übersprungene Bilder (2×/3× verworfen).
+- **Scharfschalten/Sofortaufnahme** (200 ms Vorlauf), rotes Banner mit „Entschärfen“, automatisches Entschärfen beim Verlassen der Seite (beta176–177).
+- **Shot-Ergebnis:** ZIP aller Bilder mit `shot_info.csv`, letzter Shot bleibt nach Neuladen (beta182).
+- **Bildabstimmung:** eine Auswahl „Lage des Bildes“, CSRF-Neuladen (beta178–180); Referenzkamera mit ♥, Geräte ohne Kamera ausgeblendet (beta177, 181).
+- **Regel OV5640:** kein vertikales Kippen (auch nicht in 180° enthalten) – halbiert die Bildrate (104 statt 52 ms) und verschiebt das Aufnahmebild um eine Periode. Eingebaute diymore: „Links und rechts vertauscht“ (Kamera steht auf dem Kopf).
+
+Dauertest beta184 (2026-10-27 01:11–07:30, 6 diymore OV5640, Coordinator devxiao1, persistentes Profil von c003, aec 300→600 Zeilen, feste Verstärkung 6):
+- 41 Shots (34 geplant alle 10 min, 7 Sofortaufnahmen): jedes Mal 6/6 erfolgreich, kein Neustart, CPU 41–44 °C (Coordinator 53 °C), Zeit-Jitter 8–12 µs.
+- Bildanfang-Streuung je Shot 17–143 µs (Mittel ~85 µs), kein schwarzes oder gespiegeltes Bild aus der Kamera (02:37 alle sechs gleichzeitig dunkel: Szene dunkler, Belichtung nachgeregelt).
+
+Bekannte Einschränkungen:
+- **Selten ein Bild eine Periode zu spät:** c002 um 03:14 +52 ms (1 von 246 Node-Aufnahmen); Ursache offen, die Diagnose hält nur den letzten Shot.
+- c006 zeitweise schwaches WLAN (Bild-Downloads abgebrochen, Ping bis 62 ms) – vermutlich Antennenkabel wie bei c004.
+- XIAO/Freenove auf diesem Stand nicht neu getestet; Firmware-Signierschlüssel ist noch der Entwicklungsschlüssel im Repo.
+
+## v87-beta184 — 2026-10-27 (DIAGNOSE: SPIEGEL-REGISTER BEIM SHOT)
+
+Gemeldet (ZIP shot_2026-10-26T22-59-49.880Z): Aufnahmen seitenverkehrt, Live-Vorschau richtig. Im Code ändert der Aufnahmeweg die Spiegelung nicht, die Live-Vorschau rechnet nicht um.
+
+Befund 00:20: Register beim Shot und live identisch (0x3820=0x07, 0x3821=0x27) – der Aufnahmeweg spiegelt nicht. Richtige Lage für die eingebauten diymore ist „Oben und unten vertauscht“ (so hatte der Anwender c003 eingestellt; die Umstellung aller auf 180° um 23:55 war falsch). Alle sechs darauf gestellt. **Neu entdeckt:** Mit vertikalem Kippen (auch in 180° enthalten) liefert der OV5640 nur jedes zweite Bild (Abstand 104 statt 52 ms, gemessen auf c006 für alle vier Lagen); nach der Sensor-Freigabe kommen die ersten beiden Bilder noch im 52-ms-Abstand → Bild eine Periode (52 ms) vor dem Termin, auf allen Nodes gleich.
+Lösung (00:40): Kameras dürfen auf dem Kopf stehen; Lage „Links und rechts vertauscht“ (ohne vertikales Kippen) ergibt das richtige Bild, alle wieder 52 ms Bildabstand. Zwei Test-Shots: Bildanfang aller 5 Nodes 41–345 µs nach dem Termin (Streuung 45 bzw. 28 µs). c004 nicht erreichbar, noch umzustellen.
+- `capture_diagnostics.last_reg3820/last_reg3821`: Sensor-Register Kippen/Spiegeln direkt nach dem Shot; `GET /camera_orient_regs`: aktuelle Register und Treiberstatus.
+
+## v87-beta183 — 2026-10-27 (BILDPERIODE: ÜBERSPRUNGENE BILDER NICHT ALS PERIODE)
+
+Gemeldet (ZIP shot_2026-10-26T22-38-36.821Z): Ausrichtung uneinheitlich und c003 52 ms früher als die anderen. Ausrichtung: nur c003 stand auf 180°, die anderen auf Normal (gleich eingebaut → Text auf dem Kopf); alle sechs auf „Auf dem Kopf (180°)“ gestellt (Lage ist je Gerät, nicht Teil des Profils). Zeit: c003 hatte die Bildperiode als 104 statt 52 ms gemessen – bei viel Last (Live-Vorschau der Bildabstimmung offen) holt die Schleife die Bilder zu spät, der Treiber überspringt jedes zweite, alle Abstände sind doppelt so lang. Mit 104 ms nahm c003 das Bild eine Periode zu früh.
+
+- Periodenschätzung: kürzere Werte gelten sofort, ein ganzzahliges Vielfaches (2×/3×) der bekannten Periode wird verworfen, ein anderer längerer Wert braucht zwei Messfenster hintereinander.
+- Die Bilder direkt nach der Sensor-Freigabe folgen lückenlos aufeinander: ihr Abstand korrigiert eine zu lange Schätzung sofort.
+
 ## v87-beta182 — 2026-10-26 (ALLE BILDER EINES SHOTS ALS ZIP)
 
 - Cluster-Seite, Aufnahme-Ergebnis: Knopf **„Alle Bilder herunterladen (ZIP)“**. Der Browser holt die JPEGs aller Nodes des letzten Shots nacheinander (volle Auflösung), packt sie zu `shot_<UTC>.zip` (ungepackt gespeichert) mit `shot_info.csv` (Node, UUID, Bildanfang UTC, dispatch_utc_us). Dateinamen `<Node>_<Bildanfang-UTC>.jpg`; nicht ladbare Nodes werden gemeldet.

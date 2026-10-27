@@ -1,5 +1,7 @@
 #include "webconfig_camera_tuning.h"
 
+#include "esp_camera.h"
+
 #include "access_control.h"
 #include "camera_tuning.h"
 #include "cluster.h"
@@ -536,4 +538,18 @@ void webconfigCameraTuningRegisterRoutes(WebServer &server, String (*htmlHeader)
     server.on("/camera_tuning", HTTP_GET, handleCameraTuningPage);
     server.on("/camera_tuning_apply", HTTP_POST, handleCameraTuningApply);
     server.on("/camera_line_time", HTTP_GET, handleCameraLineTime);
+    // Diagnosis: current sensor orientation registers next to the driver status.
+    server.on("/camera_orient_regs", HTTP_GET, []() {
+        sensor_t *s = esp_camera_sensor_get();
+        String j = "{\"ok\":";
+        if (!s || !s->get_reg || (s->id.PID != 0x5640 && s->id.PID != 0x3660)) {
+            j += "false}";
+        } else {
+            j += "true,\"reg3820\":" + String(s->get_reg(s, 0x3820, 0xFF)) + ",\"reg3821\":" +
+                 String(s->get_reg(s, 0x3821, 0xFF)) + ",\"status_hmirror\":" + String(s->status.hmirror) +
+                 ",\"status_vflip\":" + String(s->status.vflip) + "}";
+        }
+        g_server->sendHeader("Cache-Control", "no-store");
+        g_server->send(200, "application/json; charset=utf-8", j);
+    });
 }

@@ -74,7 +74,22 @@ static void notePeriodSample(int64_t d){
     for(uint8_t i=1;i<4;++i)if(trackSamples[i]<mn)mn=trackSamples[i];
     int64_t sum=0;uint8_t n=0;
     for(uint8_t i=0;i<4;++i)if(trackSamples[i]<mn+mn/4){sum+=trackSamples[i];++n;}
-    framePeriodUs=sum/n;framePeriodAtUs=esp_timer_get_time();
+    const int64_t p=sum/n;
+    // A busy loop (e.g. live preview requests) fetches frames too late and
+    // the driver skips every other one: all spacings are then 2x (or 3x) the
+    // period (measured 104 instead of 52 ms on c003, the shot came one period
+    // early). Shorter is trusted at once; a whole multiple of the known
+    // period is rejected; any other longer value needs two windows in a row.
+    static int64_t pendingUs=0;
+    if(framePeriodUs){
+        for(int k=2;k<=3;++k)
+            if(p>framePeriodUs*k-framePeriodUs/10 && p<framePeriodUs*k+framePeriodUs/10)return;
+        if(p>framePeriodUs+framePeriodUs/30){
+            if(!pendingUs||llabs(p-pendingUs)>pendingUs/30){pendingUs=p;return;}
+        }
+    }
+    pendingUs=0;
+    framePeriodUs=p;framePeriodAtUs=esp_timer_get_time();
 }
 int64_t clusterCaptureFramePeriodUs(int64_t *ageUs){
     if(ageUs)*ageUs=framePeriodUs?esp_timer_get_time()-framePeriodAtUs:0;
@@ -184,7 +199,17 @@ uint16_t clusterCapturePhoto(uint64_t jobId,int64_t targetUtcUs,int64_t &dispatc
         noteFrame(fb);
     }
     if(!fb)return 3;
+    // The frames right after the release are consecutive: their spacing caps
+    // a period estimate that came out as a multiple (skipped frames).
+    for(uint8_t i=1;i<lastShot.frameCount;++i){
+        const int64_t d=(int64_t)lastShot.frameRelUs[i]-lastShot.frameRelUs[i-1];
+        if(d>10000 && framePeriodUs>d+d/2){framePeriodUs=d;framePeriodAtUs=esp_timer_get_time();}
+    }
     lastShot.frameReturnedUs=esp_timer_get_time();
+    lastShot.reg3820=lastShot.reg3821=-1;
+    if(sensor_t *s=esp_camera_sensor_get())
+        if(s->get_reg&&(s->id.PID==0x5640||s->id.PID==0x3660)){
+            lastShot.reg3820=(int16_t)s->get_reg(s,0x3820,0xFF);lastShot.reg3821=(int16_t)s->get_reg(s,0x3821,0xFF);}
     lastShot.frameTimestampUs=frameTsUs(fb);
     // With frame-clock sync the frame start is the meaningful shot time.
     if(frameSync && frameNotBeforeMonoUs)
