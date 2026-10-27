@@ -1,3 +1,14 @@
+## v88-beta190 — 2026-10-27 (SD SECURE ERASE MIT DEM LÖSCHBEFEHL DER KARTE)
+
+- Secure Erase arbeitet jetzt auf der ganzen Karte unterhalb des Dateisystems (`sd_card_erase.cpp`): FatFs-Volume abhängen, **Löschbefehl der Karte** (CMD32/33/38) über alle Sektoren, danach FAT32 neu, Config wiederherstellen, Neustart. Vorher wurden die Dateien gelöscht und nur der freie Bereich über eine Datei mit Nullen gefüllt (devxiao2, 32-GB-Karte: 1,4 MB/s → rund 6 h; bei Abbruch blieb der Rest lesbar).
+- **Nachweis:** vor dem Löschen 64 Markierungssektoren über die Karte verteilt geschrieben (inkl. Sektor 0 und letzter Sektor); danach müssen alle einheitlich 0x00 oder 0xFF lesen. Sonst – oder ohne nutzbaren Löschbefehl – **Rückfall Überschreiben** aller Sektoren mit Nullen direkt auf der Karte: zuerst jeder achte 32-KB-Block (größere Dateien schnell unbrauchbar), dann der Rest.
+- SPI (XIAO): ein Löschbefehl für die ganze Karte, Busy-Abfrage ohne Blockieren, danach Neuinitialisierung der Karte (CMD0/59/8/ACMD41/ACMD42). Ohne Neuinitialisierung ignorierte die Karte weitere Löschbefehle (256-MB-Abschnitte: nur der erste gelöscht, Status ohne Fehler) bzw. lieferte Lesefehler. „Bereit“ erst bei mehreren 0xFF in Folge (ein Byte direkt nach CS zeigte „fertig“, obwohl die Karte noch löschte). SD_MMC (diymore/Freenove): `sdmmc_erase_sectors` in 32-MB-Abschnitten – **noch ohne Hardwaretest**, die Markierungsprüfung schaltet bei Bedarf auf Überschreiben.
+- Statusabfrage `/sd_secure_status`: zusätzlich `stage` „erase“, `pass`, `verified`, `method`, `note` (Ergebnis Löschbefehl/Prüfung), `elapsedMs`; Abbrechen auch während des Löschbefehls (wirkt nach dem laufenden Befehl). Logzeile „SD Secure Erase: method …“.
+- **SD Format** funktioniert jetzt auch bei einer Karte ohne lesbares Dateisystem (neue Karte, abgebrochenes Löschen): erst Einbinden mit FatFs-Formatierung, dann das übliche FAT32 mit 32-KB-Clustern. Vorher war dafür ein PC nötig.
+- Format/Wipe und Secure Erase starten nicht, solange der Coordinator ein Shot-Archiv auf die SD schreibt.
+
+Test devxiao2 (XIAO, SDHC 32 GB): Löschbefehl 30.528 MB in ~2 s, 64/64 Markierungen gelöscht, gesamter Ablauf bis Neustart 8–10 s; vorhandene Logdatei danach weg; SD Format mit und ohne Dateisystem ok. Danach auf alle Geräte ausgerollt; Secure Erase zusätzlich getestet auf devfreenove1 (SD_MMC, 32-MB-Abschnitte: 30.528 MB in 5 s, verified, gesamt 9 s) und Coordinator devxiao1 (SPI: 3 s, verified, gesamt 9 s; Shot-ZIPs und Log weg). Coordinator nach dem Neustart rund 5 min träge (Statusabfrage 6–10 s), danach normal (60 ms).
+
 ## v88-beta189 — 2026-10-27 (HÄKCHEN AUF DEN CLUSTER-SEITEN)
 
 - Häkchen direkt beim Text statt weit links davon (die allgemeine Feldbreite galt auch für Häkchen): „automatisch alle 30 s“, „nur Probleme“ (Cluster koordinieren), „Live“ (Kamera-Übersicht), „Downgrade erlauben“ (Firmware im Cluster), inaktive Gruppen anzeigen (Gruppenverwaltung).

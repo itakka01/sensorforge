@@ -169,7 +169,7 @@ static const UiTextEntry UI_TEXTS[] = {
     {"SD Format nicht unterstützt", "SD format not supported"}, // UI_NOTICE_SD_FORMAT_UNSUPPORTED_TITLE
     {"Der aktive Storage-Backend/Core stellt die für SensorForge benötigten RAW-/Remount-Funktionen nicht bereit. Es wurden keine Daten verändert.", "The active storage backend/core does not provide the RAW/remount functions required by SensorForge. No data was changed."}, // UI_NOTICE_SD_FORMAT_UNSUPPORTED_BODY
     {"Secure Erase abgeschlossen", "Secure erase completed"}, // UI_NOTICE_SD_SECURE_DONE_TITLE
-    {"Der adressierbare freie Datenbereich wurde mit Nullen überschrieben und FAT neu erzeugt. Die vorherige Config-Policy wurde beibehalten.", "The addressable free data area was overwritten with zeros and FAT was recreated. The previous config policy was preserved."}, // UI_NOTICE_SD_SECURE_DONE_BODY
+    {"Die ganze SD-Karte wurde gelöscht (Löschbefehl der Karte oder Überschreiben mit Nullen) und FAT neu erzeugt. Die vorherige Config-Policy wurde beibehalten.", "The whole SD card was erased (card erase command or zero overwrite) and FAT was recreated. The previous config policy was preserved."}, // UI_NOTICE_SD_SECURE_DONE_BODY
     {"Secure Erase nicht vollständig", "Secure erase incomplete"}, // UI_NOTICE_SD_SECURE_FAILED_TITLE
     {"Überschreiben oder Neuformatierung konnte nicht vollständig abgeschlossen werden. Die vorherige Config-Policy wurde soweit möglich beibehalten. Bitte SD-Status prüfen.", "Overwrite or reformatting could not be completed. The previous config policy was preserved where possible. Check SD status."}, // UI_NOTICE_SD_SECURE_FAILED_BODY
     {"Secure Erase nicht unterstützt", "Secure erase not supported"}, // UI_NOTICE_SD_SECURE_UNSUPPORTED_TITLE

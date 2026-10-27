@@ -3109,7 +3109,9 @@ static void sdSpiSendIdleClocks()
 }
 
 
-bool initSD() {
+// formatIfEmpty: a card without a readable filesystem gets one from the
+// FatFs auto-format (only for the explicit SD Format action, never at boot).
+static bool initSDMount(bool formatIfEmpty) {
 
 #if defined(STORAGE_SDMMC)
 
@@ -3133,7 +3135,7 @@ bool initSD() {
     if (!SD_MMC.begin(
             "/sdcard",
             true,                  // 1-bit mode
-            false,                 // no auto-format
+            formatIfEmpty,         // auto-format only on request
             SDMMC_FREQ_DEFAULT,
             5
         )) {
@@ -3174,7 +3176,7 @@ bool initSD() {
             SD_SPI_NORMAL_FREQUENCY_HZ,
             "/sd",
             5,
-            false
+            formatIfEmpty
         )) {
 
         Serial.println("SPI SD mount failed");
@@ -3246,6 +3248,16 @@ bool initSD() {
     );
 
     return true;
+}
+
+
+bool initSD() {
+    return initSDMount(false);
+}
+
+
+bool initSDFormatIfEmpty() {
+    return initSDMount(true);
 }
 
 

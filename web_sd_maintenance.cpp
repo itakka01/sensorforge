@@ -11,7 +11,9 @@
 #include "recording_write_buffer.h"
 #include "storage_guard.h"
 #include "sd_admission_controller.h"
+#include "sd_card_erase.h"
 #include "sd_presence_policy.h"
+#include "cluster_shot_archive.h"
 #include "webplayer.h"
 
 #include <FS.h>
@@ -32,6 +34,7 @@
 extern bool recording;
 extern bool sdReady;
 extern bool recoverSD();
+extern bool initSDFormatIfEmpty();
 extern void stopRecording();
 
 
@@ -689,6 +692,7 @@ enum SdMaintenanceResult : uint8_t {
 
 enum SdSecureJobStage : uint8_t {
     SD_SECURE_JOB_IDLE = 0,
+    SD_SECURE_JOB_ERASE,
     SD_SECURE_JOB_OVERWRITE,
     SD_SECURE_JOB_FORMAT,
     SD_SECURE_JOB_RESTORE,
@@ -698,7 +702,13 @@ enum SdSecureJobStage : uint8_t {
 
 // Secure Erase is intentionally processed incrementally from webConfigLoop().
 // This keeps the synchronous WebServer responsive enough for progress polling
-// and an Abort request while the logical overwrite is running.
+// and an Abort request while the card is erased or overwritten.
+//
+// Since v88-beta190 it works on the whole card below FatFs (sd_card_erase.h):
+// the FatFs volume is detached, the card's own ERASE command clears all
+// sectors (checked with marker sectors); only if that is unavailable or not
+// verified, all sectors are overwritten with zeros (coarse pass first). Then
+// FAT32 is created again and the config restored.
 static SdSecureJobStage sdSecureJobStage = SD_SECURE_JOB_IDLE;
 static bool sdSecureJobActive = false;
 static bool sdSecureJobDone = false;
@@ -709,9 +719,16 @@ static bool sdSecureHadSdConfig = false;
 static uint64_t sdSecureCardTotalBytes = 0;
 static uint64_t sdSecureTargetBytes = 0;
 static uint64_t sdSecureOverwrittenBytes = 0;
-static size_t sdSecureBufferSize = 0;
-static uint8_t *sdSecureZeroBuffer = nullptr;
-static File sdSecureEraseFile;
+static const char *sdSecureMethodText = "none";
+// Why the card erase command was not used or not verified (status + log).
+static String sdSecureEraseNote;
+static char sdSecureDrive[3] = { 0, 0, 0 };
+static FATFS *sdSecureFilesystem = nullptr;
+static uint32_t sdSecureSectorCount = 0;
+static bool sdSecureEraseVerified = false;
+static uint32_t sdSecureStartMs = 0;
+// Time budget per loop pass for erase/overwrite steps.
+static const uint32_t SD_SECURE_STEP_BUDGET_MS = 40;
 static String sdSecureConfigText;
 static String sdSecureLastError;
 static SdMaintenanceResult sdSecureFinalResult =
@@ -1416,24 +1433,16 @@ static bool findMountedFatDrive(
 }
 
 
-static bool formatSdFilesystem(
+#if defined(STORAGE_SPI) || defined(STORAGE_SDMMC)
+
+// Detach (if still attached), FAT32-format and re-attach one FatFs drive.
+static bool formatFatDrive(
+    const char *drive,
+    FATFS *filesystem,
     String &error
 )
 {
-#if defined(STORAGE_SPI) || defined(STORAGE_SDMMC)
-
     error = "";
-
-    char drive[3] = { 0, 0, 0 };
-    FATFS *filesystem = nullptr;
-
-    if (!findMountedFatDrive(
-            drive,
-            filesystem,
-            error
-        )) {
-        return false;
-    }
 
     // Keep the Arduino VFS registration and physical SD driver intact. Only
     // detach the FatFs volume, format that already mounted logical drive, and
@@ -1559,6 +1568,36 @@ static bool formatSdFilesystem(
     );
 
     return true;
+}
+
+#endif
+
+
+static bool formatSdFilesystem(
+    String &error
+)
+{
+#if defined(STORAGE_SPI) || defined(STORAGE_SDMMC)
+
+    error = "";
+
+    char drive[3] = { 0, 0, 0 };
+    FATFS *filesystem = nullptr;
+
+    if (!findMountedFatDrive(
+            drive,
+            filesystem,
+            error
+        )) {
+        return false;
+    }
+
+    return
+        formatFatDrive(
+            drive,
+            filesystem,
+            error
+        );
 
 #else
 
@@ -1699,22 +1738,6 @@ static bool overwriteFreeSpaceWithZeros(
 static bool sdFormatBackendSupported();
 
 
-static void closeSecureEraseOverwriteFile()
-{
-    if (sdSecureEraseFile) {
-        sdSecureEraseFile.flush();
-        sdSecureEraseFile.close();
-    }
-
-    if (sdSecureZeroBuffer) {
-        free(sdSecureZeroBuffer);
-        sdSecureZeroBuffer = nullptr;
-    }
-
-    sdSecureBufferSize = 0;
-}
-
-
 static void releaseSecureEraseLocks()
 {
     // The logger was closed when the job started. Reopen it only after the
@@ -1729,23 +1752,117 @@ static void releaseSecureEraseLocks()
 }
 
 
-static bool secureEraseCoverageSufficient()
+static uint8_t secureErasePdrv()
 {
-    uint64_t tolerance =
-        sdSecureTargetBytes / 50ULL;
+    return (uint8_t)(sdSecureDrive[0] - '0');
+}
 
-    const uint64_t minTolerance =
-        8ULL * 1024ULL * 1024ULL;
 
-    if (tolerance < minTolerance)
-        tolerance = minTolerance;
+// Detaches the FatFs volume and starts the card erase (or, without a usable
+// erase command, the zero overwrite) over all sectors.
+static void startSecureEraseCardJob()
+{
+    uint64_t cardBytes =
+        STORAGE.cardSize();
 
-    if (tolerance > sdSecureTargetBytes)
-        tolerance = sdSecureTargetBytes;
+    uint64_t sectorCount64 =
+        cardBytes / 512ULL;
 
-    return
-        sdSecureOverwrittenBytes + tolerance >=
-        sdSecureTargetBytes;
+    sdSecureSectorCount =
+        sectorCount64 > 0xFFFFFFFFULL
+        ? 0
+        : (uint32_t)sectorCount64;
+
+    sdSecureCardTotalBytes =
+        cardBytes;
+
+    sdSecureTargetBytes =
+        (uint64_t)sdSecureSectorCount * 512ULL;
+
+    String error;
+
+    if (sdSecureSectorCount == 0) {
+        sdSecureOperationOk = false;
+        sdSecureLastError =
+            "invalid SD sector geometry";
+        sdSecureJobStage =
+            SD_SECURE_JOB_FORMAT;
+        return;
+    }
+
+    if (!findMountedFatDrive(
+            sdSecureDrive,
+            sdSecureFilesystem,
+            error
+        )) {
+        sdSecureFilesystem = nullptr;
+        sdSecureOperationOk = false;
+        sdSecureLastError =
+            error;
+        sdSecureJobStage =
+            SD_SECURE_JOB_FORMAT;
+        return;
+    }
+
+    FRESULT unmountResult =
+        f_mount(
+            nullptr,
+            sdSecureDrive,
+            0
+        );
+
+    if (unmountResult != FR_OK) {
+        sdSecureOperationOk = false;
+        sdSecureLastError =
+            "FatFs unmount before secure erase failed: " +
+            String((int)unmountResult);
+        sdSecureJobStage =
+            SD_SECURE_JOB_FORMAT;
+        return;
+    }
+
+    if (
+        sdCardEraseCommandSupported() &&
+        sdCardEraseWriteMarkers(
+            secureErasePdrv(),
+            sdSecureSectorCount,
+            error
+        ) &&
+        sdCardEraseBegin(
+            SD_CARD_METHOD_ERASE,
+            secureErasePdrv(),
+            sdSecureSectorCount,
+            error
+        )
+    ) {
+        sdSecureJobStage =
+            SD_SECURE_JOB_ERASE;
+        return;
+    }
+
+    sdSecureEraseNote =
+        "erase command not started: " + error;
+    Serial.println(
+        "SensorForge SD secure erase: " +
+        sdSecureEraseNote
+    );
+
+    if (!sdCardEraseBegin(
+            SD_CARD_METHOD_OVERWRITE,
+            secureErasePdrv(),
+            sdSecureSectorCount,
+            error
+        )) {
+        sdSecureOperationOk = false;
+        sdSecureLastError =
+            error;
+        sdSecureJobStage =
+            SD_SECURE_JOB_FORMAT;
+        return;
+    }
+
+    sdSecureJobStage =
+        SD_SECURE_JOB_OVERWRITE;
 }
 
 
@@ -1756,7 +1873,7 @@ static SdMaintenanceResult beginSecureEraseJob()
             SD_MAINT_RESULT_STORAGE_LOCKED;
     }
 
-    if (g_storageLocked) {
+    if (g_storageLocked || clusterShotArchiveBusy()) {
         return
             SD_MAINT_RESULT_STORAGE_LOCKED;
     }
@@ -1834,104 +1951,143 @@ static SdMaintenanceResult beginSecureEraseJob()
         SD_MAINT_RESULT_OK;
     sdSecureConfigText =
         configText;
+    memset(sdSecureDrive, 0, sizeof(sdSecureDrive));
+    sdSecureFilesystem = nullptr;
+    sdSecureSectorCount = 0;
+    sdSecureEraseVerified = false;
+    sdSecureMethodText = "none";
+    sdSecureEraseNote = "";
+    sdSecureStartMs = millis();
 
     Serial.println(
         "SensorForge SD maintenance: SECURE ERASE start"
     );
 
-    // Deleting the directory tree is normally fast compared with the full
-    // overwrite. It remains synchronous, while the long zero-fill itself is
-    // chunked from webConfigLoop() so the browser can poll and abort it.
-    bool wipeOk =
-        deleteTree("/");
-
-    if (!wipeOk) {
-        sdSecureOperationOk = false;
-        sdSecureLastError =
-            "SD wipe failed before secure overwrite";
-        Serial.println(
-            "SensorForge SD secure wipe warning: " +
-            sdSecureLastError
-        );
-    }
-
-    sdSecureCardTotalBytes =
-        STORAGE.totalBytes();
-
-    uint64_t used =
-        STORAGE.usedBytes();
-
-    if (
-        sdSecureCardTotalBytes == 0 ||
-        used > sdSecureCardTotalBytes
-    ) {
-        sdSecureOperationOk = false;
-        sdSecureLastError =
-            "cannot determine SD free space";
-        sdSecureJobStage =
-            SD_SECURE_JOB_FORMAT;
-        return
-            SD_MAINT_RESULT_OK;
-    }
-
-    sdSecureTargetBytes =
-        sdSecureCardTotalBytes - used;
-
-    sdSecureEraseFile =
-        STORAGE.open(
-            "/.__sensorforge_secure_erase.bin",
-            FILE_WRITE
-        );
-
-    if (!sdSecureEraseFile) {
-        sdSecureOperationOk = false;
-        sdSecureLastError =
-            "cannot create secure erase overwrite file";
-        sdSecureJobStage =
-            SD_SECURE_JOB_FORMAT;
-        return
-            SD_MAINT_RESULT_OK;
-    }
-
-    sdSecureBufferSize =
-        32U * 1024U;
-
-    sdSecureZeroBuffer =
-        (uint8_t *)calloc(
-            1,
-            sdSecureBufferSize
-        );
-
-    if (!sdSecureZeroBuffer) {
-        sdSecureBufferSize =
-            4096U;
-
-        sdSecureZeroBuffer =
-            (uint8_t *)calloc(
-                1,
-                sdSecureBufferSize
-            );
-    }
-
-    if (!sdSecureZeroBuffer) {
-        closeSecureEraseOverwriteFile();
-        STORAGE.remove(
-            "/.__sensorforge_secure_erase.bin"
-        );
-        sdSecureOperationOk = false;
-        sdSecureLastError =
-            "cannot allocate secure erase buffer";
-        sdSecureJobStage =
-            SD_SECURE_JOB_FORMAT;
-        return
-            SD_MAINT_RESULT_OK;
-    }
-
-    sdSecureJobStage =
-        SD_SECURE_JOB_OVERWRITE;
+    startSecureEraseCardJob();
 
     return
         SD_MAINT_RESULT_OK;
+}
+
+
+static void processSecureEraseCardStep()
+{
+    if (sdSecureAbortRequested && !sdSecureAborted) {
+        sdSecureAborted = true;
+        sdCardEraseStop();
+    }
+
+    String stepError;
+
+    SdCardEraseStepResult step =
+        sdCardEraseStep(
+            SD_SECURE_STEP_BUDGET_MS,
+            stepError
+        );
+
+    sdSecureOverwrittenBytes =
+        (uint64_t)sdCardEraseSectorsDone() * 512ULL;
+
+    serviceLongOperation();
+
+    if (step == SD_CARD_STEP_RUNNING)
+        return;
+
+    uint32_t seconds =
+        (millis() - sdSecureStartMs) / 1000UL;
+
+    if (sdSecureJobStage == SD_SECURE_JOB_ERASE) {
+        if (step == SD_CARD_STEP_FAILED) {
+            sdSecureEraseNote =
+                "erase command failed after " +
+                String((unsigned long)(sdSecureOverwrittenBytes / 1048576ULL)) +
+                " MB: " + stepError;
+            Serial.println(
+                "SensorForge SD secure erase: " +
+                sdSecureEraseNote
+            );
+        } else if (!sdSecureAborted) {
+            String verifyError;
+            sdSecureEraseVerified =
+                sdCardEraseVerifyMarkers(
+                    secureErasePdrv(),
+                    sdSecureSectorCount,
+                    verifyError
+                );
+            Serial.printf(
+                "SensorForge SD secure erase command: %llu bytes in %lu s, %s\n",
+                (unsigned long long)sdSecureOverwrittenBytes,
+                (unsigned long)seconds,
+                sdSecureEraseVerified ? "verified" : verifyError.c_str()
+            );
+            sdSecureEraseNote =
+                "erase command " +
+                String((unsigned long)(sdSecureOverwrittenBytes / 1048576ULL)) +
+                " MB in " + String((unsigned long)seconds) + " s, " +
+                (sdSecureEraseVerified ? String("verified") : verifyError);
+            if (sdSecureEraseVerified) {
+                sdSecureMethodText = "erase";
+                sdCardEraseEnd();
+                sdSecureJobStage =
+                    SD_SECURE_JOB_FORMAT;
+                return;
+            }
+        }
+
+        if (sdSecureAborted) {
+            Serial.printf(
+                "SensorForge SD secure erase aborted at %llu bytes\n",
+                (unsigned long long)sdSecureOverwrittenBytes
+            );
+            sdSecureMethodText = "erase (aborted)";
+            sdCardEraseEnd();
+            sdSecureJobStage =
+                SD_SECURE_JOB_FORMAT;
+            return;
+        }
+
+        // Erase command not usable on this card: overwrite every sector.
+        String error;
+        sdSecureOverwrittenBytes = 0;
+        if (sdCardEraseBegin(
+                SD_CARD_METHOD_OVERWRITE,
+                secureErasePdrv(),
+                sdSecureSectorCount,
+                error
+            )) {
+            sdSecureJobStage =
+                SD_SECURE_JOB_OVERWRITE;
+        } else {
+            sdSecureOperationOk = false;
+            sdSecureLastError =
+                error;
+            sdSecureJobStage =
+                SD_SECURE_JOB_FORMAT;
+        }
+        return;
+    }
+
+    if (step == SD_CARD_STEP_FAILED) {
+        sdSecureOperationOk = false;
+        sdSecureLastError =
+            stepError;
+    }
+
+    sdSecureMethodText =
+        sdSecureAborted ? "overwrite (aborted)" : "overwrite";
+
+    Serial.printf(
+        "SensorForge SD secure overwrite: %llu / %llu bytes in %lu s%s\n",
+        (unsigned long long)sdSecureOverwrittenBytes,
+        (unsigned long long)sdSecureTargetBytes,
+        (unsigned long)seconds,
+        step == SD_CARD_STEP_FAILED ? " (failed)" :
+            (sdSecureAborted ? " (aborted)" : "")
+    );
+
+    sdCardEraseEnd();
+    sdSecureJobStage =
+        SD_SECURE_JOB_FORMAT;
 }
 
 
@@ -1941,92 +2097,10 @@ static void processSecureEraseJob()
         return;
 
     if (
-        sdSecureJobStage ==
-        SD_SECURE_JOB_OVERWRITE
+        sdSecureJobStage == SD_SECURE_JOB_ERASE ||
+        sdSecureJobStage == SD_SECURE_JOB_OVERWRITE
     ) {
-        if (sdSecureAbortRequested) {
-            sdSecureAborted = true;
-
-            Serial.printf(
-                "SensorForge SD secure overwrite aborted at %llu bytes\n",
-                (unsigned long long)sdSecureOverwrittenBytes
-            );
-
-            closeSecureEraseOverwriteFile();
-
-            // Removing the temporary file only frees FAT cluster metadata;
-            // the bytes already written remain zeroed. This also leaves room
-            // for config recovery if formatting itself should fail.
-            STORAGE.remove(
-                "/.__sensorforge_secure_erase.bin"
-            );
-
-            sdSecureJobStage =
-                SD_SECURE_JOB_FORMAT;
-            return;
-        }
-
-        if (
-            !sdSecureEraseFile ||
-            !sdSecureZeroBuffer ||
-            sdSecureBufferSize == 0
-        ) {
-            sdSecureOperationOk = false;
-            sdSecureLastError =
-                "secure overwrite state invalid";
-            closeSecureEraseOverwriteFile();
-            STORAGE.remove(
-                "/.__sensorforge_secure_erase.bin"
-            );
-            sdSecureJobStage =
-                SD_SECURE_JOB_FORMAT;
-            return;
-        }
-
-        size_t written =
-            sdSecureEraseFile.write(
-                sdSecureZeroBuffer,
-                sdSecureBufferSize
-            );
-
-        sdSecureOverwrittenBytes +=
-            written;
-
-        if (
-            (sdSecureOverwrittenBytes &
-             0x000FFFFFULL) <
-            sdSecureBufferSize
-        ) {
-            serviceLongOperation();
-        }
-
-        if (written < sdSecureBufferSize) {
-            closeSecureEraseOverwriteFile();
-
-            bool covered =
-                secureEraseCoverageSufficient();
-
-            if (!covered) {
-                sdSecureOperationOk = false;
-                sdSecureLastError =
-                    "secure overwrite stopped before covering the logical free area";
-            }
-
-            Serial.printf(
-                "SensorForge SD secure overwrite: %llu / %llu bytes%s\n",
-                (unsigned long long)sdSecureOverwrittenBytes,
-                (unsigned long long)sdSecureTargetBytes,
-                covered ? "" : " (incomplete)"
-            );
-
-            STORAGE.remove(
-                "/.__sensorforge_secure_erase.bin"
-            );
-
-            sdSecureJobStage =
-                SD_SECURE_JOB_FORMAT;
-        }
-
+        processSecureEraseCardStep();
         return;
     }
 
@@ -2034,20 +2108,32 @@ static void processSecureEraseJob()
         sdSecureJobStage ==
         SD_SECURE_JOB_FORMAT
     ) {
-        closeSecureEraseOverwriteFile();
-
-        // Ensure no giant temporary overwrite file remains if we arrived here
-        // through Abort or an overwrite error.
-        STORAGE.remove(
-            "/.__sensorforge_secure_erase.bin"
-        );
+        sdCardEraseEnd();
 
         String formatError;
 
         bool formatOk =
+            false;
+
+#if defined(STORAGE_SPI) || defined(STORAGE_SDMMC)
+        // The volume was detached for the card job: format that drive and
+        // attach it again. Without a known drive use the normal path.
+        formatOk =
+            sdSecureFilesystem
+            ? formatFatDrive(
+                  sdSecureDrive,
+                  sdSecureFilesystem,
+                  formatError
+              )
+            : formatSdFilesystem(
+                  formatError
+              );
+#else
+        formatOk =
             formatSdFilesystem(
                 formatError
             );
+#endif
 
         if (!formatOk) {
             sdSecureOperationOk = false;
@@ -2098,6 +2184,18 @@ static void processSecureEraseJob()
 
         configRefreshSdStatus();
         releaseSecureEraseLocks();
+
+        logWrite(
+            "SD Secure Erase: method " +
+            String(sdSecureMethodText) +
+            ", " +
+            String((unsigned long)((millis() - sdSecureStartMs) / 1000UL)) +
+            " s" +
+            (sdSecureEraseNote.length() ? ", " + sdSecureEraseNote : String("")) +
+            (sdSecureOperationOk ? String("") : ", error: " + sdSecureLastError)
+        );
+        // Persist now: a successful run reboots 3 s later.
+        logFlush();
 
         if (!restoreOk) {
             sdSecureFinalResult =
@@ -2156,7 +2254,7 @@ static SdMaintenanceResult performSdMaintenance(
 
     // Another module may reserve the SD for a future critical operation.
     // Never start nested maintenance while the global storage gate is held.
-    if (g_storageLocked ||
+    if (g_storageLocked || clusterShotArchiveBusy() ||
         (g_clusterWipe.active && !admittedClusterWipe)) {
         return
             SD_MAINT_RESULT_STORAGE_LOCKED;
@@ -2241,10 +2339,23 @@ static SdMaintenanceResult performSdMaintenance(
             "SensorForge SD maintenance: FORMAT start"
         );
 
-        operationOk =
-            formatSdFilesystem(
-                error
-            );
+        // A card without a readable filesystem (new card, or one left
+        // unformatted by an interrupted secure erase) is mounted with the
+        // FatFs auto-format first, then formatted as usual.
+        if (
+            STORAGE.totalBytes() == 0 &&
+            !initSDFormatIfEmpty()
+        ) {
+            operationOk =
+                false;
+            error =
+                "SD card without filesystem could not be mounted";
+        } else {
+            operationOk =
+                formatSdFilesystem(
+                    error
+                );
+        }
 
     } else {
 
@@ -2914,8 +3025,8 @@ static String sdMaintenancePage(
 
     String secureEraseInfo =
         de
-        ? "Löscht zunächst alle Dateien, überschreibt danach den logisch freien Datenbereich mit Nullen und formatiert anschließend neu. Das kann je nach Kartengröße sehr lange dauern. Während des Überschreibens werden Datenmenge und Fortschritt live angezeigt. Ein Abbruch stoppt nur das weitere Überschreiben; die Formatierung wird danach trotzdem ausgeführt. Nach erfolgreichem Abschluss wird SensorForge automatisch neu gestartet.\n\nWichtig: Wegen Wear-Leveling und internen Reserveblöcken einer SD-Karte ist keine forensische Garantie für physisch nicht mehr auslesbare NAND-Zellen möglich."
-        : "First deletes all files, then overwrites the logically free data area with zeros and finally reformats the card. This can take a long time depending on card size. Progress is shown live. Aborting only stops further overwriting; formatting still follows. SensorForge restarts automatically after successful completion.\n\nImportant: Wear levelling and reserved internal blocks mean that no forensic guarantee can be made that every physical NAND cell is no longer readable.";
+        ? "Löscht die ganze SD-Karte mit dem eigenen Löschbefehl der Karte (meist Sekunden bis wenige Minuten) und prüft das an Markierungssektoren. Unterstützt die Karte das nicht, werden alle Sektoren mit Nullen überschrieben: zuerst jeder achte Block, damit größere Dateien schnell unbrauchbar sind, dann der Rest. Danach wird neu formatiert. Der Fortschritt wird live angezeigt. Ein Abbruch stoppt nur das weitere Löschen; die Formatierung wird danach trotzdem ausgeführt. Nach erfolgreichem Abschluss wird SensorForge automatisch neu gestartet.\n\nWichtig: Wegen Wear-Leveling und internen Reserveblöcken einer SD-Karte ist keine forensische Garantie für physisch nicht mehr auslesbare NAND-Zellen möglich."
+        : "Erases the whole SD card with the card's own erase command (usually seconds to a few minutes) and checks this on marker sectors. If the card does not support it, all sectors are overwritten with zeros: first every eighth block so larger files become unusable quickly, then the rest. The card is reformatted afterwards. Progress is shown live. Aborting only stops further erasing; formatting still follows. SensorForge restarts automatically after successful completion.\n\nImportant: Wear levelling and reserved internal blocks mean that no forensic guarantee can be made that every physical NAND cell is no longer readable.";
 
     html +=
         "<section class='settings-section'>"
@@ -3127,7 +3238,7 @@ static String sdMaintenancePage(
                     "Stromversorgung und SD-Karte jetzt nicht unterbrechen."
                 "</div>"
                 "<button id='sdSecureAbortButton' class='danger sd-abort-button' type='button' hidden>"
-                    "ÜBERSCHREIBEN ABBRECHEN &amp; FORMATIEREN"
+                    "ABBRECHEN &amp; FORMATIEREN"
                 "</button>"
             "</div>"
         "</div>"
@@ -3162,7 +3273,7 @@ static String sdMaintenancePage(
             "var abort=document.getElementById('sdSecureAbortButton');"
             "var icon=m?m.querySelector('.sd-busy-icon'):null;"
             "if(!m)return;"
-            "if(abort){abort.hidden=true;abort.disabled=false;abort.textContent='ÜBERSCHREIBEN ABBRECHEN & FORMATIEREN';}"
+            "if(abort){abort.hidden=true;abort.disabled=false;abort.textContent='ABBRECHEN & FORMATIEREN';}"
             "if(icon){icon.textContent='⚠';icon.style.color='';}"
             "if(kind==='benchmark'){"
                 "pill.textContent='SD BENCHMARK';"
@@ -3182,7 +3293,7 @@ static String sdMaintenancePage(
             "}else if(kind==='secure'){"
                 "pill.textContent='SECURE ERASE';"
                 "title.textContent='Secure Erase wird vorbereitet';"
-                "text.textContent='Dateien werden gelöscht, danach wird der logisch freie Datenbereich mit Nullen überschrieben.';"
+                "text.textContent='Die ganze SD-Karte wird mit ihrem eigenen Löschbefehl gelöscht; nur wenn das nicht greift, wird sie mit Nullen überschrieben.';"
                 "note.textContent='Danach wird die SD-Karte automatisch formatiert und SensorForge neu gestartet.';"
                 "if(metrics)metrics.textContent='Löschbereich wird ermittelt …';"
                 "sdSetIndeterminate(false);"
@@ -3201,16 +3312,22 @@ static String sdMaintenancePage(
             "var pct=Math.max(0,Math.min(100,Number(s.percentX10||0)/10));"
             "sdSetIndeterminate(false);"
             "if(fill)fill.style.width=pct.toFixed(1)+'%';"
-            "var amount=sdFmtBytes(s.overwrittenBytes)+' / '+sdFmtBytes(s.targetBytes)+' Löschbereich ('+pct.toFixed(1)+' %)';"
-            "if(Number(s.totalBytes||0)>0)amount+=' · SD gesamt '+sdFmtBytes(s.totalBytes);"
+            "var amount=sdFmtBytes(s.overwrittenBytes)+' / '+sdFmtBytes(s.targetBytes)+(s.stage==='erase'?' gelöscht':' überschrieben')+' ('+pct.toFixed(1)+' %)';"
+            "if(Number(s.elapsedMs||0)>0)amount+=' · '+Math.round(s.elapsedMs/1000)+' s';"
             "if(metrics)metrics.textContent=amount;"
-            "if(s.stage==='overwrite'){"
-                "title.textContent='Secure Erase – Überschreiben';"
-                "text.textContent='Der logisch freie Datenbereich wird mit Nullen überschrieben.';"
-                "note.textContent=s.abortRequested?'Abbruch angefordert. Das Überschreiben wird beendet und anschließend formatiert.':'Mit Abbrechen wird nur das weitere Überschreiben gestoppt; anschließend wird trotzdem formatiert.';"
-                "if(abort){abort.hidden=false;abort.disabled=!!s.abortRequested;abort.textContent=s.abortRequested?'ABBRUCH ANGEFORDERT …':'ÜBERSCHREIBEN ABBRECHEN & FORMATIEREN';}"
+            "var abortNote=s.abortRequested?'Abbruch angefordert. Der laufende Abschnitt wird beendet, danach wird formatiert.':'Mit Abbrechen wird nur das weitere Löschen gestoppt; anschließend wird trotzdem formatiert.';"
+            "if(s.stage==='erase'||s.stage==='overwrite'){"
+                "note.textContent=abortNote;"
+                "if(abort){abort.hidden=false;abort.disabled=!!s.abortRequested;abort.textContent=s.abortRequested?'ABBRUCH ANGEFORDERT …':'ABBRECHEN & FORMATIEREN';}"
+            "}"
+            "if(s.stage==='erase'){"
+                "title.textContent='Secure Erase – Löschbefehl der Karte';"
+                "text.textContent='Die SD-Karte löscht alle Sektoren selbst, Abschnitt für Abschnitt.';"
+            "}else if(s.stage==='overwrite'){"
+                "title.textContent=Number(s.pass)===1?'Secure Erase – Überschreiben (Grobdurchgang)':'Secure Erase – Überschreiben (Restdurchgang)';"
+                "text.textContent=Number(s.pass)===1?'Zuerst wird jeder achte Block mit Nullen überschrieben, damit größere Dateien schnell unbrauchbar sind.':'Die übrigen Blöcke werden mit Nullen überschrieben.';"
             "}else if(s.stage==='format'){"
-                "title.textContent=s.aborted?'Überschreiben abgebrochen – Formatierung läuft':'Überschreiben abgeschlossen – Formatierung läuft';"
+                "title.textContent=s.aborted?'Löschen abgebrochen – Formatierung läuft':'Löschen abgeschlossen – Formatierung läuft';"
                 "text.textContent='Das FAT-Dateisystem wird jetzt neu aufgebaut.';"
                 "note.textContent='Stromversorgung und SD-Karte jetzt nicht unterbrechen.';"
                 "if(abort)abort.hidden=true;"
@@ -3249,7 +3366,7 @@ static String sdMaintenancePage(
             "if(!f)return;"
             "f.addEventListener('submit',function(e){"
                 "e.preventDefault();"
-                "if(!confirm('SECURE ERASE wirklich starten? Der Vorgang kann sehr lange dauern und überschreibt den logischen Datenbereich.'))return;"
+                "if(!confirm('SECURE ERASE wirklich starten? Die ganze SD-Karte wird gelöscht und neu formatiert.'))return;"
                 "if(b){b.disabled=true;b.textContent='SECURE ERASE LÄUFT...';}"
                 "showSdBusy('secure');"
                 "fetch('/sd_secure_erase_do',{method:'POST',cache:'no-store'})"
@@ -3263,7 +3380,7 @@ static String sdMaintenancePage(
         "}"
         "var sdAbort=document.getElementById('sdSecureAbortButton');"
         "if(sdAbort){sdAbort.addEventListener('click',function(){"
-            "if(!confirm('Überschreiben jetzt abbrechen? Bereits überschriebene Daten bleiben überschrieben; anschließend wird die SD-Karte automatisch formatiert.'))return;"
+            "if(!confirm('Löschen jetzt abbrechen? Bereits gelöschte Bereiche bleiben gelöscht; anschließend wird die SD-Karte automatisch formatiert.'))return;"
             "sdAbort.disabled=true;sdAbort.textContent='ABBRUCH ANGEFORDERT …';"
             "fetch('/sd_secure_abort',{method:'POST',cache:'no-store'}).catch(function(){});"
         "});}"
@@ -3336,6 +3453,8 @@ static void handleSDRealFormatDo()
 static const char *secureEraseStageName()
 {
     switch (sdSecureJobStage) {
+        case SD_SECURE_JOB_ERASE:
+            return "erase";
         case SD_SECURE_JOB_OVERWRITE:
             return "overwrite";
         case SD_SECURE_JOB_FORMAT:
@@ -3496,6 +3615,30 @@ static void handleSDSecureStatus()
     json +=
         u64Text;
     json +=
+        ",\"pass\":";
+    json +=
+        String(sdCardErasePass());
+    json +=
+        ",\"verified\":";
+    json +=
+        sdSecureEraseVerified ? "true" : "false";
+    json +=
+        ",\"method\":\"";
+    json +=
+        sdSecureMethodText;
+    json +=
+        "\",\"note\":\"";
+    String note =
+        sdSecureEraseNote;
+    note.replace("\\", "/");
+    note.replace("\"", "'");
+    json +=
+        note;
+    json +=
+        "\",\"elapsedMs\":";
+    json +=
+        String((unsigned long)(sdSecureJobActive ? millis() - sdSecureStartMs : 0UL));
+    json +=
         ",\"percentX10\":";
     json +=
         String(percentX10);
@@ -3528,8 +3671,8 @@ static void handleSDSecureAbort()
 
     if (
         !sdSecureJobActive ||
-        sdSecureJobStage !=
-            SD_SECURE_JOB_OVERWRITE
+        (sdSecureJobStage != SD_SECURE_JOB_OVERWRITE &&
+         sdSecureJobStage != SD_SECURE_JOB_ERASE)
     ) {
         webServer().send(
             409,

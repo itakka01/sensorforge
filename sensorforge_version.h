@@ -21,13 +21,13 @@
 // WebConfig, so a running device can be mapped back to the exact Git tag.
 
 #define SENSORFORGE_RELEASE_NUMBER 88
-#define SENSORFORGE_RELEASE_TAG "v88-beta189"
+#define SENSORFORGE_RELEASE_TAG "v88-beta190"
 #define SENSORFORGE_RELEASE_DATE "2026-10-27"
 #define SENSORFORGE_RELEASE_SUMMARY \
     "v87 stable: cluster capture synchronised to the sensor frame clock (frame starts within ~0.1 ms), signed cluster OTA, camera reference profiles."
 
-// Current source-tree stage. v88-beta189: checkbox alignment on the cluster pages.
-#define SENSORFORGE_WORKTREE_STAGE "v88-beta189"
+// Current source-tree stage. v88-beta190: SD Secure Erase with the card erase command.
+#define SENSORFORGE_WORKTREE_STAGE "v88-beta190"
 #define SENSORFORGE_WORKTREE_DATE "2026-10-27"
 #define SENSORFORGE_WORKTREE_SUMMARY \
     "v87 stable: frame-clock capture sync, sharp/instant capture, shot ZIP download, image orientation select, camera reference profiles."
